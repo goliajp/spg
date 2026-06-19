@@ -2254,11 +2254,15 @@ pub enum Literal {
     /// BIGINT[] value carried through the prepared-bind path.
     BigIntArray(Vec<Option<i64>>),
     /// `INTERVAL '<n> <unit> [<n> <unit> ...]'` — calendar-aware span.
-    /// Split into a months part (because a month is not a fixed number of
-    /// days) and a microseconds part (everything sub-month). `text` keeps
-    /// the original spelling so Display round-trips byte-for-byte.
+    /// Three independent dimensions: `months` (variable-length;
+    /// year/month), `days` (fixed 86400 seconds at non-DST, but
+    /// preserved as its own dimension so `'1 day'` ≠ `'24 hours'`
+    /// stays distinguishable), and `micros` (sub-day; can carry).
+    /// `text` keeps the original spelling so Display round-trips
+    /// byte-for-byte. v7.37.5 β added the `days` field for PG parity.
     Interval {
         months: i32,
+        days: i32,
         micros: i64,
         text: String,
     },

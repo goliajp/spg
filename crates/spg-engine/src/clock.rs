@@ -47,10 +47,15 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
         Value::TextArray(items) => Literal::TextArray(items),
         Value::IntArray(items) => Literal::IntArray(items),
         Value::BigIntArray(items) => Literal::BigIntArray(items),
-        Value::Interval { months, micros } => Literal::Interval {
+        Value::Interval {
             months,
+            days,
             micros,
-            text: eval::format_interval(months, micros),
+        } => Literal::Interval {
+            months,
+            days,
+            micros,
+            text: eval::format_interval(months, days, micros),
         },
         // SQ8 / halfvec cells dequantise to f32 before reaching the
         // substitute walker; pgwire's Bind path handles that.

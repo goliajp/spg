@@ -3131,10 +3131,16 @@ fn encode_one(out: &mut String, v: &Value) {
             out.push_str(&t.to_string());
             out.push('|');
         }
-        Value::Interval { months, micros } => {
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
             out.push('i');
             out.push_str(&months.to_string());
             out.push('m');
+            out.push_str(&days.to_string());
+            out.push('d');
             out.push_str(&micros.to_string());
             out.push('|');
         }

@@ -211,7 +211,11 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::IntArray2D(rows) => format_int_2d_text(rows),
         Value::BigIntArray2D(rows) => format_bigint_2d_text(rows),
         Value::TextArray2D(rows) => format_text_2d_text(rows),
-        Value::Interval { months, micros } => eval::format_interval(*months, *micros),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => eval::format_interval(*months, *days, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
             // Unreachable in practice (vector columns are filtered

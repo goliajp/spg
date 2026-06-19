@@ -1026,7 +1026,16 @@ pub(crate) fn literal_to_value(l: Literal) -> Value {
         Literal::TextArray(items) => Value::TextArray(items),
         Literal::IntArray(items) => Value::IntArray(items),
         Literal::BigIntArray(items) => Value::BigIntArray(items),
-        Literal::Interval { months, micros, .. } => Value::Interval { months, micros },
+        Literal::Interval {
+            months,
+            days,
+            micros,
+            ..
+        } => Value::Interval {
+            months,
+            days,
+            micros,
+        },
     }
 }
 

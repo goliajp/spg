@@ -112,11 +112,14 @@ fn current_date_works() {
 fn bare_interval_literal_evaluates() {
     let mut e = eng();
     let v = first_value(&mut e, "SELECT INTERVAL '30 days'");
+    // v7.37.5 β — `'30 days'` lands in `days` (PG byte-equal),
+    // not micros.
     assert!(matches!(
         v,
         Value::Interval {
             months: 0,
-            micros: 2_592_000_000_000
+            days: 30,
+            micros: 0,
         }
     ));
 }

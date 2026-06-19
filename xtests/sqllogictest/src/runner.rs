@@ -234,7 +234,11 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::IntArray2D(rows) => spg_engine::format_int_2d_text_pub(rows),
         Value::BigIntArray2D(rows) => spg_engine::format_bigint_2d_text_pub(rows),
         Value::TextArray2D(rows) => spg_engine::format_text_2d_text_pub(rows),
-        Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => spg_engine::eval::format_interval(*months, *days, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
         // canonical text form so fixtures can assert on

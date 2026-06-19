@@ -32,11 +32,18 @@ fn interval_cast_arithmetic_with_now() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    let Value::Interval { months, micros } = rows[0].values[0] else {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = rows[0].values[0]
+    else {
         panic!()
     };
+    // v7.37.5 β — `'1 day'` lands in `days`, not `micros`.
     assert_eq!(months, 0);
-    assert_eq!(micros, 86_400_000_000);
+    assert_eq!(days, 1);
+    assert_eq!(micros, 0);
 }
 
 #[test]

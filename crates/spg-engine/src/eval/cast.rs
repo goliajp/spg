@@ -375,14 +375,25 @@ fn decode_text_array_external(s: &str) -> Result<Vec<Option<String>>, EvalError>
 
 fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
     match v {
-        Value::Interval { months, micros } => Ok(Value::Interval { months, micros }),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Ok(Value::Interval {
+            months,
+            days,
+            micros,
+        }),
         Value::Text(s) => {
-            let (months, micros) = spg_sql::parser::parse_interval_text(&s).ok_or_else(|| {
-                EvalError::TypeMismatch {
+            let (months, days, micros) =
+                spg_sql::parser::parse_interval_text(&s).ok_or_else(|| EvalError::TypeMismatch {
                     detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
-                }
-            })?;
-            Ok(Value::Interval { months, micros })
+                })?;
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
         }
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(

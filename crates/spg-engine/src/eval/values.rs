@@ -164,7 +164,11 @@ pub(super) fn value_to_text(v: &Value) -> String {
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
-        Value::Interval { months, micros } => format_interval(*months, *micros),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format_interval(*months, *days, *micros),
         Value::Null => "NULL".into(),
         // v7.10.4 — BYTEA renders as PG hex form.
         Value::Bytes(b) => format_bytea_hex(b),
