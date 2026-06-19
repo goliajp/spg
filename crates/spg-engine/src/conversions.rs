@@ -773,6 +773,68 @@ pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<V
     })
 }
 
+/// v7.37.5 δ — parse a PG multirange external form into a Vec of
+/// `RangeSpan`. Grammar: `{}` empty, `{range1,range2,...}` with
+/// each range in canonical `[/(/]/)` brackets. Empty subranges
+/// (`empty`) are accepted but get dropped on round-trip per PG
+/// semantics. The bounds parser reuses `parse_range_str` by
+/// wrapping each subrange in the parent kind.
+pub(crate) fn parse_multirange_str(
+    s: &str,
+    kind: spg_storage::RangeKind,
+) -> Option<Vec<spg_storage::RangeSpan>> {
+    let s = s.trim();
+    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}'))?;
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    // Split the inner on commas that sit *between* ranges — not the
+    // commas inside `[a,b)`. Walk depth: bump on `[` / `(`, drop on
+    // `]` / `)`. Commas at depth 0 are range separators.
+    let mut spans: Vec<spg_storage::RangeSpan> = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for i in 0..=bytes.len() {
+        let cut = i == bytes.len()
+            || (depth == 0 && bytes[i] == b',');
+        if !cut {
+            match bytes.get(i) {
+                Some(b'[') | Some(b'(') => depth += 1,
+                Some(b']') | Some(b')') => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        let piece = inner[start..i].trim();
+        if piece.is_empty() {
+            return None;
+        }
+        let r = parse_range_str(piece, kind)?;
+        let Value::Range {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+            ..
+        } = r
+        else {
+            return None;
+        };
+        spans.push(spg_storage::RangeSpan {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        });
+        start = i + 1;
+    }
+    Some(spans)
+}
+
 /// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
 /// the matching element Value for the RangeKind.
 pub(crate) fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value> {
@@ -836,6 +898,37 @@ pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
         out.push_str(&format_range_element(u));
     }
     out.push(if *upper_inc { ']' } else { ')' });
+    out
+}
+
+/// v7.37.5 δ — render a Multirange in PG external form
+/// `{[a,b),[c,d)}`. Empty multirange renders as `{}`. Each range
+/// element is formatted with the same `[/(/]/)` bracket grammar
+/// as scalar `Value::Range`. RangeSpan carries no `kind` (it
+/// lives on the parent Multirange), so this routes element
+/// formatting through `format_range_element` as Value::Range does.
+pub fn format_multirange(ranges: &[spg_storage::RangeSpan]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    out.push('{');
+    for (i, r) in ranges.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if r.empty {
+            out.push_str("empty");
+            continue;
+        }
+        out.push(if r.lower_inc { '[' } else { '(' });
+        if let Some(l) = &r.lower {
+            out.push_str(&format_range_element(l));
+        }
+        out.push(',');
+        if let Some(u) = &r.upper {
+            out.push_str(&format_range_element(u));
+        }
+        out.push(if r.upper_inc { ']' } else { ')' });
+    }
+    out.push('}');
     out
 }
 
@@ -1081,6 +1174,14 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::BytesArray => DataType::BytesArray,
         ColumnTypeName::VarcharArray => DataType::VarcharArray,
         ColumnTypeName::CharArray => DataType::CharArray,
+        ColumnTypeName::Multirange(k) => DataType::Multirange(match k {
+            spg_sql::ast::RangeKindAst::Int4 => spg_storage::RangeKind::Int4,
+            spg_sql::ast::RangeKindAst::Int8 => spg_storage::RangeKind::Int8,
+            spg_sql::ast::RangeKindAst::Num => spg_storage::RangeKind::Num,
+            spg_sql::ast::RangeKindAst::Ts => spg_storage::RangeKind::Ts,
+            spg_sql::ast::RangeKindAst::TsTz => spg_storage::RangeKind::TsTz,
+            spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
+        }),
     }
 }
 
@@ -1492,6 +1593,23 @@ pub(crate) fn coerce_value(
         },
         // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
         (v @ Value::Range { .. }, DataType::Text) => Some(Value::Text(format_range_str(&v))),
+        // v7.37.5 δ — Text → Multirange. Accepts `{}` empty and
+        // `{[a,b),[c,d),...}` comma-separated ranges; each
+        // subrange parses with the parent kind.
+        (Value::Text(s), DataType::Multirange(kind)) => match parse_multirange_str(&s, kind) {
+            Some(ranges) => Some(Value::Multirange { kind, ranges }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for multirange type: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Multirange → Text canonical form (`{[a,b),[c,d)}`).
+        (Value::Multirange { ranges, .. }, DataType::Text) => {
+            Some(Value::Text(format_multirange(&ranges)))
+        }
         // v7.17.0 Phase 3.P0-39 — Text → Hstore.
         (Value::Text(s), DataType::Hstore) => match parse_hstore_str(&s) {
             Some(pairs) => Some(Value::Hstore(pairs)),

@@ -3459,6 +3459,15 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::BytesArray => 1001,       // _bytea
         DataType::VarcharArray => 1015,     // _varchar
         DataType::CharArray => 1014,        // _bpchar
+        // v7.37.5 δ — PG 14+ multirange OIDs (pg_type.dat).
+        DataType::Multirange(k) => match k {
+            spg_storage::RangeKind::Int4 => 4451,
+            spg_storage::RangeKind::Int8 => 4537,
+            spg_storage::RangeKind::Num => 4536,
+            spg_storage::RangeKind::Ts => 4533,
+            spg_storage::RangeKind::TsTz => 4534,
+            spg_storage::RangeKind::Date => 4535,
+        },
     }
 }
 

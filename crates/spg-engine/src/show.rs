@@ -391,5 +391,13 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BytesArray => "BYTEA[]".into(),
         DataType::VarcharArray => "VARCHAR[]".into(),
         DataType::CharArray => "CHAR[]".into(),
+        DataType::Multirange(k) => match k {
+            spg_storage::RangeKind::Int4 => "INT4MULTIRANGE".into(),
+            spg_storage::RangeKind::Int8 => "INT8MULTIRANGE".into(),
+            spg_storage::RangeKind::Num => "NUMMULTIRANGE".into(),
+            spg_storage::RangeKind::Ts => "TSMULTIRANGE".into(),
+            spg_storage::RangeKind::TsTz => "TSTZMULTIRANGE".into(),
+            spg_storage::RangeKind::Date => "DATEMULTIRANGE".into(),
+        },
     }
 }

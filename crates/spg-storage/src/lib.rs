@@ -201,6 +201,19 @@ pub enum DataType {
     BytesArray,       // PG `_bytea`       OID 1001, tag 46
     VarcharArray,     // PG `_varchar`     OID 1015, tag 47
     CharArray,        // PG `_bpchar`      OID 1014, tag 48
+    /// v7.37.5 δ — PG 14+ multirange types. A multirange is an
+    /// ordered collection of non-overlapping ranges of the same
+    /// element kind (e.g. `int4multirange(int4range(1,5),
+    /// int4range(10,15))` → `{[1,5),[10,15)}`). The same DataType
+    /// variant covers all six builtin multiranges; `RangeKind`
+    /// pins the element type so encode/decode/display can route
+    /// off one switch (parallel to `Range(RangeKind)`).
+    /// Wire OIDs: int4multirange=4451, int8multirange=4537,
+    /// nummultirange=4536, tsmultirange=4533, tstzmultirange=4534,
+    /// datemultirange=4535. Catalog tag 49 + 1-byte RangeKind on
+    /// the dense type-tag side. FILE_VERSION 48+ (same window as
+    /// β/γ, no separate bump).
+    Multirange(RangeKind),
     /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
     /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
     /// Catalog FILE_VERSION 20+. Storage shape is row-codec
@@ -385,6 +398,14 @@ impl fmt::Display for DataType {
             Self::BytesArray => f.write_str("BYTEA[]"),
             Self::VarcharArray => f.write_str("VARCHAR[]"),
             Self::CharArray => f.write_str("CHAR[]"),
+            Self::Multirange(k) => f.write_str(match k {
+                RangeKind::Int4 => "INT4MULTIRANGE",
+                RangeKind::Int8 => "INT8MULTIRANGE",
+                RangeKind::Num => "NUMMULTIRANGE",
+                RangeKind::Ts => "TSMULTIRANGE",
+                RangeKind::TsTz => "TSTZMULTIRANGE",
+                RangeKind::Date => "DATEMULTIRANGE",
+            }),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -534,6 +555,19 @@ pub enum Value {
     BytesArray(Vec<Option<Vec<u8>>>),
     VarcharArray(Vec<Option<String>>),
     CharArray(Vec<Option<String>>),
+    /// v7.37.5 δ — PG 14+ multirange. `ranges` is a Vec of
+    /// non-overlapping bounds spans of the shared `kind`. PG's
+    /// canonical text form is `{[a,b),[c,d),...}` (comma-separated
+    /// ranges in braces; `{}` for the empty multirange). SPG's
+    /// constructor enforces no overlap/coalescing — for now the
+    /// engine trusts the caller (mirrors PG's `_construct_array`
+    /// pattern). Catalog tag 49 + 1-byte RangeKind on the dense
+    /// type-tag side; schema-less path is unreachable (multirange
+    /// is column-typed only).
+    Multirange {
+        kind: RangeKind,
+        ranges: Vec<RangeSpan>,
+    },
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
     /// positions + weights. The engine enforces sort/dedup on
     /// construction; consumers can rely on `lexemes.windows(2)`
@@ -599,6 +633,20 @@ pub enum Value {
         empty: bool,
     },
     Null,
+}
+
+/// v7.37.5 δ — single-range bounds without the kind tag. Used as
+/// the element type of `Value::Multirange { kind, ranges }` so a
+/// multirange carries one shared `RangeKind` plus N bounds-only
+/// spans (saves 1 byte/elem vs duplicating the kind). The five
+/// other fields mirror `Value::Range` exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeSpan {
+    pub lower: Option<alloc::boxed::Box<Value>>,
+    pub upper: Option<alloc::boxed::Box<Value>>,
+    pub lower_inc: bool,
+    pub upper_inc: bool,
+    pub empty: bool,
 }
 
 /// v7.37.5 β-P4 — element type for `Value::IntervalArray`. Mirrors
@@ -669,6 +717,7 @@ impl Value {
             Self::BytesArray(_) => Some(DataType::BytesArray),
             Self::VarcharArray(_) => Some(DataType::VarcharArray),
             Self::CharArray(_) => Some(DataType::CharArray),
+            Self::Multirange { kind, .. } => Some(DataType::Multirange(*kind)),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
@@ -1045,7 +1094,11 @@ impl IndexKey {
             | Value::JsonbArray(_)
             | Value::BytesArray(_)
             | Value::VarcharArray(_)
-            | Value::CharArray(_) => None,
+            | Value::CharArray(_)
+            // v7.37.5 δ — multirange not indexable (PG uses GiST/
+            // SP-GiST + a custom operator class; SPG plans the same
+            // axis under v7.37.8 with ranges).
+            | Value::Multirange { .. } => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
