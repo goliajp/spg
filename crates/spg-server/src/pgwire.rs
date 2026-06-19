@@ -1547,6 +1547,30 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
             Ok(Value::Timestamp(pg_micros + PG_EPOCH_MICROS_FROM_UNIX))
         }
         1700 => decode_binary_numeric(bytes),
+        1186 => {
+            // v7.37.5 β-P3 — PG `interval` binary format is a fixed
+            // 16-byte payload: i64 microseconds (signed, BE) +
+            // i32 days (BE) + i32 months (BE). sqlx-postgres,
+            // pgx and the typed driver surfaces all send INTERVAL
+            // parameters in this shape with format=1 by default.
+            // SPG's internal codec stores the same field order
+            // little-endian (catalog tag 34); only the byte order
+            // differs across the wire/disk boundary.
+            if bytes.len() != 16 {
+                return Err(format!(
+                    "Bind binary INTERVAL must be 16 bytes, got {}",
+                    bytes.len()
+                ));
+            }
+            let micros = i64::from_be_bytes(bytes[0..8].try_into().unwrap());
+            let days = i32::from_be_bytes(bytes[8..12].try_into().unwrap());
+            let months = i32::from_be_bytes(bytes[12..16].try_into().unwrap());
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
         2950 => {
             // v7.37.5 — PG `uuid` binary format is the raw 16-byte
             // RFC 4122 value (network byte order is irrelevant for
@@ -3760,6 +3784,63 @@ mod tests {
             let bytes = vec![0u8; len];
             let r = decode_binary_param(2950, &bytes);
             assert!(r.is_err(), "len={len} must reject (UUID is 16 bytes)");
+        }
+    }
+
+    /// v7.37.5 β-P3 — `decode_binary_param` OID 1186 (INTERVAL)
+    /// round-trips the PG-canonical 16-byte payload:
+    /// `i64 BE micros + i32 BE days + i32 BE months`. The
+    /// engine-side `Value::Interval` field order is host-independent
+    /// (named fields), so this verifies the byte-swap into the
+    /// internal three-field shape rather than the SPG codec's LE
+    /// disk format.
+    #[test]
+    fn decode_binary_param_interval_16_bytes_round_trip() {
+        // INTERVAL '1 month 2 days 3 microseconds':
+        //   months = 1, days = 2, micros = 3.
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&3_i64.to_be_bytes()); // micros
+        bytes[8..12].copy_from_slice(&2_i32.to_be_bytes()); // days
+        bytes[12..16].copy_from_slice(&1_i32.to_be_bytes()); // months
+        let v = decode_binary_param(1186, &bytes).expect("INTERVAL binary BIND must succeed");
+        assert_eq!(
+            v,
+            spg_storage::Value::Interval {
+                months: 1,
+                days: 2,
+                micros: 3,
+            }
+        );
+    }
+
+    /// Negative dimensions thread through unchanged (PG INTERVAL
+    /// allows them — `INTERVAL '-1 day' = INTERVAL '-1 day'`).
+    #[test]
+    fn decode_binary_param_interval_signed_round_trip() {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&(-86_400_000_000_i64).to_be_bytes());
+        bytes[8..12].copy_from_slice(&(-1_i32).to_be_bytes());
+        bytes[12..16].copy_from_slice(&(-1_i32).to_be_bytes());
+        let v = decode_binary_param(1186, &bytes).expect("signed INTERVAL binary BIND must succeed");
+        assert_eq!(
+            v,
+            spg_storage::Value::Interval {
+                months: -1,
+                days: -1,
+                micros: -86_400_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_binary_param_interval_rejects_wrong_length() {
+        for &len in &[0usize, 1, 8, 12, 15, 17, 32] {
+            let bytes = vec![0u8; len];
+            let r = decode_binary_param(1186, &bytes);
+            assert!(
+                r.is_err(),
+                "len={len} must reject (INTERVAL binary is 16 bytes)"
+            );
         }
     }
 }
