@@ -6176,6 +6176,11 @@ impl Parser {
             // surface for Django / Rails / Hibernate's default
             // PK pattern.
             "uuid" => ColumnTypeName::Uuid,
+            // v7.37.5 β-P2 — PG `INTERVAL` as a column type.
+            // Storage = three-field {months, days, micros}, catalog
+            // tag 34, FILE_VERSION 48+, wire OID 1186. Prior to this
+            // line `INTERVAL` was parser-rejected at CREATE TABLE.
+            "interval" => ColumnTypeName::Interval,
             // v7.17.0 Phase 3.P0-32 — PG `TIME` (without time zone).
             // i64 microseconds since 00:00:00. Wire OID 1083.
             "time" => ColumnTypeName::Time,
@@ -9315,6 +9320,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "tsvector" => ColumnTypeName::TsVector,
         "tsquery" => ColumnTypeName::TsQuery,
         "uuid" => ColumnTypeName::Uuid,
+        "interval" => ColumnTypeName::Interval,
         "time" => ColumnTypeName::Time,
         "year" => ColumnTypeName::Year,
         "timetz" => ColumnTypeName::TimeTz,
