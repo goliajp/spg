@@ -2416,6 +2416,21 @@ pub enum BinOp {
     /// when every key/value in `sub_json` is structurally present in
     /// the left side. Matches PG semantics (top-level + recursive).
     JsonContains,
+    /// v7.37.6-A `json <@ sub_json` — contained-by. Returns BOOL;
+    /// `a <@ b` is defined as `b @> a` (same semantics, swapped
+    /// sides). Eval dispatch reuses `JsonContains` with swapped args.
+    JsonContainedBy,
+    /// v7.37.6-A `json ? key` — key-exists. RHS is TEXT;
+    /// returns BOOL. For an object, true if `key` is an existing
+    /// member name; for an array, true if any element is the string
+    /// `key` (PG semantics).
+    JsonKeyExists,
+    /// v7.37.6-A `json ?| keys` — any-key-exists. RHS is TEXT[];
+    /// returns BOOL.
+    JsonKeysAny,
+    /// v7.37.6-A `json ?& keys` — all-keys-exist. RHS is TEXT[];
+    /// returns BOOL.
+    JsonKeysAll,
     /// v7.12.2 `tsvector @@ tsquery` — FTS match. Returns BOOL;
     /// 3VL on NULL. Symmetric: PG also accepts `tsquery @@
     /// tsvector` and engine eval normalises either ordering.
@@ -4389,6 +4404,10 @@ impl fmt::Display for BinOp {
             Self::JsonGetPath => "#>",
             Self::JsonGetPathText => "#>>",
             Self::JsonContains => "@>",
+            Self::JsonContainedBy => "<@",
+            Self::JsonKeyExists => "?",
+            Self::JsonKeysAny => "?|",
+            Self::JsonKeysAll => "?&",
             Self::TsMatch => "@@",
             Self::InetContainedBy => "<<",
             Self::InetContainedByEq => "<<=",

@@ -118,6 +118,11 @@ pub(super) fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalE
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
         BinOp::JsonGetPathText => crate::json::path_walk(&l, &r, true),
         BinOp::JsonContains => crate::json::contains(&l, &r),
+        // v7.37.6-A `<@` reuses `@>` with swapped args.
+        BinOp::JsonContainedBy => crate::json::contains(&r, &l),
+        BinOp::JsonKeyExists => crate::json::key_exists(&l, &r),
+        BinOp::JsonKeysAny => crate::json::keys_any(&l, &r),
+        BinOp::JsonKeysAll => crate::json::keys_all(&l, &r),
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
@@ -1020,6 +1025,10 @@ pub(super) fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalErro
         | BinOp::JsonGetPath
         | BinOp::JsonGetPathText
         | BinOp::JsonContains
+        | BinOp::JsonContainedBy
+        | BinOp::JsonKeyExists
+        | BinOp::JsonKeysAny
+        | BinOp::JsonKeysAll
         | BinOp::TsMatch
         | BinOp::IsDistinctFrom
         | BinOp::IsNotDistinctFrom

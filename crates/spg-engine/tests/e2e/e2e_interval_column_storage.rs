@@ -130,7 +130,7 @@ fn compound_interval_round_trips_through_storage() {
         Value::Interval {
             months: 14,
             days: 3,
-            micros: ((4 * 3600 + 5 * 60 + 6) * 1_000_000) as i64,
+            micros: (4_i64 * 3600 + 5 * 60 + 6) * 1_000_000,
         }
     );
 }

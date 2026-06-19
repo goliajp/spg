@@ -9208,6 +9208,10 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::JsonGetPath => (BinOp::JsonGetPath, 7),
         Token::JsonGetPathText => (BinOp::JsonGetPathText, 7),
         Token::JsonContains => (BinOp::JsonContains, 7),
+        Token::JsonContainedBy => (BinOp::JsonContainedBy, 7),
+        Token::JsonKeyExists => (BinOp::JsonKeyExists, 7),
+        Token::JsonKeysAny => (BinOp::JsonKeysAny, 7),
+        Token::JsonKeysAll => (BinOp::JsonKeysAll, 7),
         // v7.12.2 — `@@` binds at the comparison rung (looser than
         // arithmetic, tighter than AND / OR). PG places `@@` at
         // the same precedence as `=` / `<`, so we follow.
