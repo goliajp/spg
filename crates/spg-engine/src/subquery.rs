@@ -14,8 +14,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{
-    BinOp, ColumnName, Expr, FromJoin, JoinKind, Literal, SelectItem, SelectStatement, TableRef,
-    UnOp,
+    BinOp, ColumnName, Cte, Expr, FromJoin, JoinKind, LimitExpr, Literal, SelectItem,
+    SelectStatement, TableRef, UnOp,
 };
 use spg_storage::{Row, Value};
 
@@ -1108,16 +1108,494 @@ impl Engine {
     /// the existing per-row resolver then handles whatever's left.
     pub(crate) fn pull_up_correlated_limit_one_subqueries(
         &self,
-        _stmt: &mut SelectStatement,
+        stmt: &mut SelectStatement,
     ) -> bool {
-        // Phase 1 skeleton — walker + try-fn signatures are scaffolded
-        // (try_pull_up_limit_one currently returns None for every shape).
-        // No-op pass: identical input/output, identical results, every
-        // gate green. Phase 2+ wire the actual rewrite.
+        // Phase 5 differential knob: an `AtomicBool` switch will land
+        // alongside the byte-equal differential e2e (no_std rules out
+        // std::env::var here). Production keeps the pass default-on.
         //
-        // Env knob (used by differential e2e in Phase 5):
-        //   SPG_PULLUP_LIMIT1_DISABLE=1 short-circuits the pass entirely.
-        false
+        // Outer FROM required (no FROM → nothing to JOIN against);
+        // outer wildcards (`SELECT *`) widen the projection and would
+        // surface the joined CTE's columns — refuse for safety.
+        if stmt.from.is_none() || stmt.items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+            return false;
+        }
+        // Aliases an outer-correlation column may qualify to. Same
+        // collection rule as `pull_up_unique_correlated_agg_subqueries`.
+        let outer_aliases: alloc::collections::BTreeSet<String> = {
+            let from = stmt.from.as_ref().expect("from present");
+            let mut s = alloc::collections::BTreeSet::new();
+            let push = |s: &mut alloc::collections::BTreeSet<String>, t: &TableRef| {
+                s.insert(
+                    t.alias
+                        .clone()
+                        .unwrap_or_else(|| t.name.clone())
+                        .to_ascii_lowercase(),
+                );
+            };
+            push(&mut s, &from.primary);
+            for j in &from.joins {
+                push(&mut s, &j.table);
+            }
+            s
+        };
+        let outer_has_group_by = stmt.group_by.is_some() || stmt.group_by_all;
+        let mut new_ctes: Vec<Cte> = Vec::new();
+        let mut new_joins: Vec<FromJoin> = Vec::new();
+        let cte_seed = stmt.ctes.len();
+        for item in &mut stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.pull_up_walk_limit_one(
+                    expr,
+                    false,
+                    &outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    &mut new_ctes,
+                    &mut new_joins,
+                );
+            }
+        }
+        if new_ctes.is_empty() {
+            return false;
+        }
+        stmt.ctes.extend(new_ctes);
+        stmt.from
+            .as_mut()
+            .expect("from present")
+            .joins
+            .extend(new_joins);
+        true
+    }
+
+    /// v7.37.4 — recursive mutable walk over a select-list expression
+    /// for the LIMIT 1 pullup. Tracks `in_agg` so a ScalarSubquery
+    /// already inside an aggregate doesn't get a redundant MAX wrapper
+    /// (the outer aggregate folds whatever cell value the join supplies).
+    #[allow(clippy::too_many_arguments)]
+    fn pull_up_walk_limit_one(
+        &self,
+        e: &mut Expr,
+        in_agg: bool,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+        outer_has_group_by: bool,
+        cte_seed: usize,
+        ctes_out: &mut Vec<Cte>,
+        joins_out: &mut Vec<FromJoin>,
+    ) {
+        match e {
+            Expr::ScalarSubquery(inner) => {
+                if let Some((cte, join, cte_col)) =
+                    self.try_pull_up_limit_one(inner, outer_aliases, cte_seed + ctes_out.len())
+                {
+                    ctes_out.push(cte);
+                    joins_out.push(join);
+                    // Outer needs a single scalar per outer row. With a
+                    // LEFT JOIN against the CTE (sq.jk UNIQUE by GROUP
+                    // BY), sq.pj is functionally a single value per
+                    // join key — but a strict GROUP BY checker won't
+                    // know that. When the outer query has its own
+                    // GROUP BY and this position isn't already wrapped
+                    // in an aggregate, wrap in MAX(sq.pj) so the
+                    // checker sees an aggregate; MAX over a single
+                    // value equals the value (any aggregate would).
+                    let col_expr = Expr::Column(cte_col);
+                    *e = if outer_has_group_by && !in_agg {
+                        Expr::FunctionCall {
+                            name: "max".into(),
+                            args: alloc::vec![col_expr],
+                        }
+                    } else {
+                        col_expr
+                    };
+                }
+                // Otherwise leave for the existing per-row resolver.
+                // The subquery body is a separate scope — don't descend.
+            }
+            Expr::FunctionCall { name, args } => {
+                let child = in_agg || aggregate::is_aggregate_name(name);
+                for a in args.iter_mut() {
+                    self.pull_up_walk_limit_one(
+                        a,
+                        child,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+            }
+            Expr::AggregateOrdered {
+                call,
+                order_by,
+                filter,
+                ..
+            } => {
+                self.pull_up_walk_limit_one(
+                    call,
+                    true,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+                for o in order_by.iter_mut() {
+                    self.pull_up_walk_limit_one(
+                        &mut o.expr,
+                        true,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+                if let Some(f) = filter {
+                    self.pull_up_walk_limit_one(
+                        f,
+                        true,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.pull_up_walk_limit_one(
+                    lhs,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+                self.pull_up_walk_limit_one(
+                    rhs,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.pull_up_walk_limit_one(
+                    expr,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.pull_up_walk_limit_one(
+                    expr,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+                self.pull_up_walk_limit_one(
+                    pattern,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+            }
+            Expr::InList { expr, list, .. } => {
+                self.pull_up_walk_limit_one(
+                    expr,
+                    in_agg,
+                    outer_aliases,
+                    outer_has_group_by,
+                    cte_seed,
+                    ctes_out,
+                    joins_out,
+                );
+                for it in list.iter_mut() {
+                    self.pull_up_walk_limit_one(
+                        it,
+                        in_agg,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    self.pull_up_walk_limit_one(
+                        o,
+                        in_agg,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+                for (w, t) in branches.iter_mut() {
+                    self.pull_up_walk_limit_one(
+                        w,
+                        in_agg,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                    self.pull_up_walk_limit_one(
+                        t,
+                        in_agg,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+                if let Some(eb) = else_branch {
+                    self.pull_up_walk_limit_one(
+                        eb,
+                        in_agg,
+                        outer_aliases,
+                        outer_has_group_by,
+                        cte_seed,
+                        ctes_out,
+                        joins_out,
+                    );
+                }
+            }
+            // Same boundary policy as `pull_up_walk` — don't descend
+            // into window calls, EXISTS, etc.
+            _ => {}
+        }
+    }
+
+    /// v7.37.4 — decide whether a correlated scalar subquery qualifies
+    /// for the LIMIT 1 → CTE pullup. Returns the CTE to add to outer
+    /// `WITH`, the LEFT JOIN to append, and the (qualified) column
+    /// that replaces the subquery node. None means: leave it for the
+    /// per-row resolver.
+    fn try_pull_up_limit_one(
+        &self,
+        inner: &SelectStatement,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+        alias_n: usize,
+    ) -> Option<(Cte, FromJoin, ColumnName)> {
+        // Inner shape gates.
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.group_by_all
+            || inner.having.is_some()
+            || inner.distinct
+            || inner.offset.is_some()
+            || inner.items.len() != 1
+            || inner.order_by.is_empty()
+        {
+            return None;
+        }
+        // LIMIT must be the literal 1 (placeholders bind late; we
+        // can't guarantee the value here).
+        match inner.limit {
+            Some(LimitExpr::Literal(1)) => {}
+            _ => return None,
+        }
+        let from = inner.from.as_ref()?;
+        // Phase 2: single plain-table inner. Phase 3 lifts this gate
+        // to allow inner INNER JOINs whose ON clauses are all-inner.
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return None;
+        }
+        let inner_table = from.primary.name.clone();
+        let inner_alias = from
+            .primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| inner_table.clone());
+        let is_inner = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(&inner_alias))
+        };
+        let is_outer = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
+        };
+        // Projection: scalar expression; reject aggregates / windows /
+        // nested subqueries / outer references (the pulled-up SELECT
+        // is uncorrelated GROUP BY — an outer column reference would
+        // dangle).
+        let SelectItem::Expr {
+            expr: proj_expr,
+            alias: _,
+        } = &inner.items[0]
+        else {
+            return None;
+        };
+        if proj_has_disqualifying_shape(proj_expr, &inner_alias, outer_aliases) {
+            return None;
+        }
+        // WHERE: exactly one `inner.k = outer.col`, plus all-inner
+        // residual predicates.
+        let where_ = inner.where_.as_ref()?;
+        let mut corr: Option<(String, ColumnName)> = None;
+        let mut non_corr: Vec<Expr> = Vec::new();
+        for c in reorder::split_and_conjunctions(where_) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.name.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.name.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some(p) = pair {
+                    if corr.is_some() {
+                        return None; // more than one correlation key
+                    }
+                    corr = Some(p);
+                    continue;
+                }
+            }
+            if !expr_is_all_inner(c, &inner_alias) {
+                return None;
+            }
+            non_corr.push(c.clone());
+        }
+        let (inner_key, outer_col) = corr?;
+        // ORDER BY: every key must be all-inner. Outer-referencing
+        // sort keys would dangle after pullup.
+        for ob in &inner.order_by {
+            if !expr_is_all_inner(&ob.expr, &inner_alias) {
+                return None;
+            }
+        }
+        // Proj must also be all-inner (uncorrelated CTE body).
+        if !expr_is_all_inner(proj_expr, &inner_alias) {
+            return None;
+        }
+        // Build the CTE body:
+        //   SELECT <inner.k> AS jk,
+        //          (array_agg(<proj> ORDER BY <sort_keys>))[1] AS pj
+        //     FROM <inner.from> WHERE <non_corr_AND_chain>
+        //    GROUP BY <inner.k>
+        let cte_name = alloc::format!("__cl1_{alias_n}");
+        let jk_expr = Expr::Column(ColumnName {
+            qualifier: Some(inner_alias.clone()),
+            name: inner_key.clone(),
+        });
+        let argmax = Expr::ArraySubscript {
+            target: alloc::boxed::Box::new(Expr::AggregateOrdered {
+                call: alloc::boxed::Box::new(Expr::FunctionCall {
+                    name: "array_agg".into(),
+                    args: alloc::vec![proj_expr.clone()],
+                }),
+                order_by: inner.order_by.clone(),
+                distinct: false,
+                filter: None,
+            }),
+            index: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(1))),
+        };
+        let body_where = if non_corr.is_empty() {
+            None
+        } else {
+            let mut iter = non_corr.into_iter();
+            let head = iter.next().expect("non_corr nonempty in this branch");
+            Some(iter.fold(head, |acc, p| Expr::Binary {
+                lhs: alloc::boxed::Box::new(acc),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(p),
+            }))
+        };
+        let body = SelectStatement {
+            ctes: Vec::new(),
+            distinct: false,
+            items: alloc::vec![
+                SelectItem::Expr {
+                    expr: jk_expr.clone(),
+                    alias: Some("jk".into()),
+                },
+                SelectItem::Expr {
+                    expr: argmax,
+                    alias: Some("pj".into()),
+                },
+            ],
+            from: Some(from.clone()),
+            where_: body_where,
+            group_by: Some(alloc::vec![jk_expr]),
+            group_by_all: false,
+            having: None,
+            unions: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_with_ties: false,
+        };
+        let cte = Cte {
+            name: cte_name.clone(),
+            body,
+            recursive: false,
+            column_overrides: Vec::new(),
+        };
+        // LEFT JOIN __cl1_N ON __cl1_N.jk = <outer_col>
+        let join = FromJoin {
+            kind: JoinKind::Left,
+            table: TableRef {
+                name: cte_name.clone(),
+                alias: None,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: None,
+            },
+            on: Some(Expr::Binary {
+                lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                    qualifier: Some(cte_name.clone()),
+                    name: "jk".into(),
+                })),
+                op: BinOp::Eq,
+                rhs: alloc::boxed::Box::new(Expr::Column(outer_col)),
+            }),
+        };
+        let repl = ColumnName {
+            qualifier: Some(cte_name),
+            name: "pj".into(),
+        };
+        Some((cte, join, repl))
     }
 
     pub(crate) fn pull_up_unique_correlated_agg_subqueries(
@@ -1829,6 +2307,82 @@ impl Engine {
 /// and `e` contains no nested subquery. Used by the sublink pull-up to
 /// confirm a non-correlation conjunct is purely inner (safe to carry into
 /// the join ON after a qualifier rename).
+/// v7.37.4 — refuse projection expressions that would dangle after
+/// the LIMIT 1 pullup: aggregates / window calls / EXISTS / scalar
+/// subqueries / outer-qualified columns (the pulled-up CTE body is
+/// uncorrelated, so an outer reference inside the projection has no
+/// scope to bind against). All-inner column references are fine.
+fn proj_has_disqualifying_shape(
+    e: &Expr,
+    inner_alias: &str,
+    outer_aliases: &alloc::collections::BTreeSet<String>,
+) -> bool {
+    match e {
+        Expr::AggregateOrdered { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists { .. } => true,
+        Expr::FunctionCall { name, args } => {
+            if aggregate::is_aggregate_name(name) {
+                return true;
+            }
+            args.iter()
+                .any(|a| proj_has_disqualifying_shape(a, inner_alias, outer_aliases))
+        }
+        Expr::Column(c) => {
+            // Reject outer-qualified columns inside the projection
+            // (they'd dangle in the uncorrelated CTE body). Unqualified
+            // columns are ambiguous in a multi-table inner — for the
+            // phase-2 single-table gate they resolve to `inner_alias`
+            // anyway, accept them. Qualified inner refs are OK.
+            if let Some(q) = c.qualifier.as_deref() {
+                outer_aliases.contains(&q.to_ascii_lowercase())
+                    && !q.eq_ignore_ascii_case(inner_alias)
+            } else {
+                false
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            proj_has_disqualifying_shape(lhs, inner_alias, outer_aliases)
+                || proj_has_disqualifying_shape(rhs, inner_alias, outer_aliases)
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            proj_has_disqualifying_shape(expr, inner_alias, outer_aliases)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            proj_has_disqualifying_shape(expr, inner_alias, outer_aliases)
+                || proj_has_disqualifying_shape(pattern, inner_alias, outer_aliases)
+        }
+        Expr::InList { expr, list, .. } => {
+            proj_has_disqualifying_shape(expr, inner_alias, outer_aliases)
+                || list
+                    .iter()
+                    .any(|it| proj_has_disqualifying_shape(it, inner_alias, outer_aliases))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| proj_has_disqualifying_shape(o, inner_alias, outer_aliases))
+                || branches.iter().any(|(w, t)| {
+                    proj_has_disqualifying_shape(w, inner_alias, outer_aliases)
+                        || proj_has_disqualifying_shape(t, inner_alias, outer_aliases)
+                })
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|b| proj_has_disqualifying_shape(b, inner_alias, outer_aliases))
+        }
+        Expr::ArraySubscript { target, index } => {
+            proj_has_disqualifying_shape(target, inner_alias, outer_aliases)
+                || proj_has_disqualifying_shape(index, inner_alias, outer_aliases)
+        }
+        _ => false,
+    }
+}
+
 fn expr_is_all_inner(e: &Expr, inner_alias: &str) -> bool {
     let mut cols: Vec<ColumnName> = Vec::new();
     let mut subs: Vec<&SelectStatement> = Vec::new();

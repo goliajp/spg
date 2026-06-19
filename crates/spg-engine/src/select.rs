@@ -1045,6 +1045,13 @@ impl Engine {
             // sublink pull-up to semi/anti-join, before the resolver gets
             // a chance to walk per-row.
             self.pull_up_exists_sublinks(&mut stmt_owned);
+            // v7.37.4 — if the LIMIT 1 pullup added CTEs, route through
+            // exec_with_ctes so they materialise once before the body
+            // SELECT runs. exec_with_ctes strips ctes from the body
+            // clone, then re-enters select.
+            if !stmt_owned.ctes.is_empty() {
+                return self.exec_with_ctes(&stmt_owned, cancel);
+            }
             self.resolve_select_subqueries(&mut stmt_owned, cancel)?;
             &stmt_owned
         } else {
