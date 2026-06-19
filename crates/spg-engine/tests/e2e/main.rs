@@ -104,6 +104,7 @@ mod e2e_memoize;
 mod e2e_memory_stats;
 mod e2e_merge;
 mod e2e_mod;
+mod e2e_multi_col_exists_pullup;
 mod e2e_multi_col_index;
 mod e2e_mysql_conditional;
 mod e2e_mysql_inline_enum;
