@@ -386,8 +386,10 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
         }),
         Value::Text(s) => {
             let (months, days, micros) =
-                spg_sql::parser::parse_interval_text(&s).ok_or_else(|| EvalError::TypeMismatch {
-                    detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
+                spg_sql::parser::parse_interval_text(&s).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
+                    }
                 })?;
             Ok(Value::Interval {
                 months,

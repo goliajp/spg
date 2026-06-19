@@ -6458,9 +6458,7 @@ impl Parser {
                 ColumnTypeName::Varchar(_) => ColumnTypeName::VarcharArray,
                 ColumnTypeName::Char(_) => ColumnTypeName::CharArray,
                 other => {
-                    return Err(self.err(alloc::format!(
-                        "{other:?}[] not yet supported"
-                    )));
+                    return Err(self.err(alloc::format!("{other:?}[] not yet supported")));
                 }
             };
             // v7.17.0 Phase 3.P0-40 — second `[]` widens 1D → 2D
@@ -9958,12 +9956,17 @@ mod tests {
         // an unknown type ident parses as Text + `user_type_ref`
         // so CREATE TABLE can resolve user-defined enum / domain
         // types — rejection of truly-unknown types moved to the
-        // engine's catalog lookup.
-        let stmt = parse_statement("CREATE TABLE x (a xml)").unwrap();
+        // engine's catalog lookup. v7.37.5 ζ-A then promoted XML
+        // to a first-class built-in, so this probe switched to a
+        // synthetic name nothing in the lexer will ever recognise.
+        let stmt = parse_statement("CREATE TABLE x (a my_user_type)").unwrap();
         let Statement::CreateTable(t) = stmt else {
             panic!("expected CreateTable");
         };
-        assert_eq!(t.columns[0].user_type_ref.as_deref(), Some("xml"));
+        assert_eq!(
+            t.columns[0].user_type_ref.as_deref(),
+            Some("my_user_type")
+        );
     }
 
     #[test]
@@ -10241,7 +10244,10 @@ mod tests {
         // `'1 day'` and `'24 hours'` no longer collide (PG parity).
         // Single unit.
         assert_eq!(parse_interval_text("1 day"), Some((0, 1, 0)));
-        assert_eq!(parse_interval_text("24 hours"), Some((0, 0, 86_400_000_000)));
+        assert_eq!(
+            parse_interval_text("24 hours"),
+            Some((0, 0, 86_400_000_000))
+        );
         assert_eq!(parse_interval_text("1 second"), Some((0, 0, 1_000_000)));
         assert_eq!(parse_interval_text("1 month"), Some((1, 0, 0)));
         assert_eq!(parse_interval_text("2 years"), Some((24, 0, 0)));

@@ -238,7 +238,9 @@ pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
 fn node_has_key(v: &JsonValue, key: &str) -> bool {
     match v {
         JsonValue::Object(members) => members.iter().any(|(k, _)| k == key),
-        JsonValue::Array(items) => items.iter().any(|item| matches!(item, JsonValue::String(s) if s == key)),
+        JsonValue::Array(items) => items
+            .iter()
+            .any(|item| matches!(item, JsonValue::String(s) if s == key)),
         JsonValue::String(s) => s == key,
         _ => false,
     }
@@ -249,9 +251,7 @@ fn node_has_key(v: &JsonValue, key: &str) -> bool {
 fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
     match v {
         Value::Null => Ok(None),
-        Value::TextArray(items) => Ok(Some(
-            items.iter().filter_map(|x| x.clone()).collect(),
-        )),
+        Value::TextArray(items) => Ok(Some(items.iter().filter_map(|x| x.clone()).collect())),
         Value::Text(s) => Ok(Some(alloc::vec![s.clone()])),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(

@@ -25,7 +25,13 @@ fn one_value(e: &mut Engine, sql: &str) -> Value {
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows for {sql}");
     };
-    rows.into_iter().next().expect("row").values.into_iter().next().expect("col")
+    rows.into_iter()
+        .next()
+        .expect("row")
+        .values
+        .into_iter()
+        .next()
+        .expect("col")
 }
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
@@ -165,10 +171,7 @@ fn containment_object_subset() {
 #[test]
 fn containment_not_subset() {
     let mut e = Engine::new();
-    let v = one_value(
-        &mut e,
-        r#"SELECT '{"a":1}'::jsonb @> '{"a":2}'::jsonb"#,
-    );
+    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb @> '{"a":2}'::jsonb"#);
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -216,10 +219,7 @@ fn path_get_jsonb() {
 #[test]
 fn path_get_text() {
     let mut e = Engine::new();
-    let v = one_value(
-        &mut e,
-        r#"SELECT '{"a":{"b":"deep"}}'::jsonb #>> '{a,b}'"#,
-    );
+    let v = one_value(&mut e, r#"SELECT '{"a":{"b":"deep"}}'::jsonb #>> '{a,b}'"#);
     assert_eq!(v, Value::Text("deep".into()));
 }
 
@@ -272,15 +272,9 @@ fn key_exists_array_element_as_string() {
 #[test]
 fn keys_any_with_text_array() {
     let mut e = Engine::new();
-    let v = one_value(
-        &mut e,
-        r#"SELECT '{"a":1,"b":2}'::jsonb ?| ARRAY['z','b']"#,
-    );
+    let v = one_value(&mut e, r#"SELECT '{"a":1,"b":2}'::jsonb ?| ARRAY['z','b']"#);
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(
-        &mut e,
-        r#"SELECT '{"a":1}'::jsonb ?| ARRAY['x','y','z']"#,
-    );
+    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb ?| ARRAY['x','y','z']"#);
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -292,9 +286,6 @@ fn keys_all_with_text_array() {
         r#"SELECT '{"a":1,"b":2,"c":3}'::jsonb ?& ARRAY['a','b']"#,
     );
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(
-        &mut e,
-        r#"SELECT '{"a":1,"b":2}'::jsonb ?& ARRAY['a','c']"#,
-    );
+    let v = one_value(&mut e, r#"SELECT '{"a":1,"b":2}'::jsonb ?& ARRAY['a','c']"#);
     assert_eq!(v, Value::Bool(false));
 }

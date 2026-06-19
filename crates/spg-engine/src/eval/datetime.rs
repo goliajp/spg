@@ -52,9 +52,7 @@ pub(super) fn extract_field(
             // total seconds in the interval (months count as 30 days,
             // days count their own 86_400, PG's justify_interval
             // convention).
-            F::Epoch => {
-                i64::from(months) * 30 * 86_400 + i64::from(days) * 86_400 + secs_total
-            }
+            F::Epoch => i64::from(months) * 30 * 86_400 + i64::from(days) * 86_400 + secs_total,
         };
         return Ok(Value::BigInt(result));
     }

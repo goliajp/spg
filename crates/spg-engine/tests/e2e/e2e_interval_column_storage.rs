@@ -122,8 +122,10 @@ fn compound_interval_round_trips_through_storage() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, span INTERVAL NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO t VALUES (1, INTERVAL '1 year 2 months 3 days 4 hours 5 minutes 6 seconds')")
-        .unwrap();
+    e.execute(
+        "INSERT INTO t VALUES (1, INTERVAL '1 year 2 months 3 days 4 hours 5 minutes 6 seconds')",
+    )
+    .unwrap();
     let r = rows(e.execute("SELECT span FROM t").unwrap());
     assert_eq!(
         r[0][0],
@@ -209,10 +211,7 @@ fn many_intervals_round_trip_unchanged() {
         // Insert via parameterised literal — months as `N mons`, days
         // as `N days`, micros as `N microseconds`. Negatives are
         // explicit `INTERVAL '-N units'` strings.
-        let lit = format!(
-            "INTERVAL '{} mons {} days {} microseconds'",
-            m, d, us
-        );
+        let lit = format!("INTERVAL '{} mons {} days {} microseconds'", m, d, us);
         e.execute(&format!("INSERT INTO t VALUES ({}, {})", idx, lit))
             .unwrap();
     }

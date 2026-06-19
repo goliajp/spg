@@ -3020,3 +3020,210 @@ fn promote_then_refreeze_does_not_leave_orphan_locators() {
         );
     }
 }
+
+// v7.37.6-B(sentori Epic 2 P0)— partition_role catalog round-trip 钉。
+// 普通表(None)/ Parent / Range child / Default child 各自序列化-反
+// 序列化身份恒等;Parent 同时保 index_template_sources Vec<String> 而
+// 不丢序;Range 边界 MinValue / MaxValue / TimestampTz 三态都跑过一次。
+
+fn partition_parent_schema() -> TableSchema {
+    let mut s = TableSchema::new(
+        "events_partitioned",
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("ts", DataType::Timestamptz, false),
+            ColumnSchema::new("payload", DataType::Jsonb, true),
+        ],
+    );
+    s.partition_role = Some(PartitionRole::Parent {
+        kind: PartitionKind::Range,
+        key_column_positions: vec![1],
+        index_template_sources: vec![
+            "CREATE INDEX events_partitioned_ts_idx ON events_partitioned (ts DESC)".to_string(),
+            "CREATE INDEX events_partitioned_pid_ts_idx ON events_partitioned (payload, ts)"
+                .to_string(),
+        ],
+    });
+    s
+}
+
+fn partition_range_child_schema(name: &str, lower_micros: i64, upper_micros: i64) -> TableSchema {
+    let mut s = TableSchema::new(
+        name,
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("ts", DataType::Timestamptz, false),
+            ColumnSchema::new("payload", DataType::Jsonb, true),
+        ],
+    );
+    s.partition_role = Some(PartitionRole::Range {
+        parent_name: "events_partitioned".to_string(),
+        lower: PartitionBound::TimestampTz(lower_micros),
+        upper: PartitionBound::TimestampTz(upper_micros),
+    });
+    s
+}
+
+fn partition_default_child_schema(name: &str) -> TableSchema {
+    let mut s = TableSchema::new(
+        name,
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("ts", DataType::Timestamptz, false),
+            ColumnSchema::new("payload", DataType::Jsonb, true),
+        ],
+    );
+    s.partition_role = Some(PartitionRole::Default {
+        parent_name: "events_partitioned".to_string(),
+    });
+    s
+}
+
+/// Plain table(`partition_role = None`) round-trips byte-identical.
+/// Defends the FILE_VERSION 49 "one tag byte for普通表" guarantee — a
+/// table with no partition role should add exactly one zero byte
+/// to its appendix.
+#[test]
+fn partition_role_none_round_trips() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "plain",
+        vec![ColumnSchema::new("id", DataType::BigInt, false)],
+    ))
+    .unwrap();
+    let bytes = c.serialize();
+    let back = Catalog::deserialize(&bytes).unwrap();
+    assert!(back.get("plain").unwrap().schema().partition_role.is_none());
+    // 二次序列化恒等 — 旧→新→旧 zero drift。
+    assert_eq!(bytes, back.serialize());
+}
+
+/// Parent + 3 child(2 range + 1 DEFAULT)的完整 catalog 经
+/// serialize → deserialize 后,每张表的 partition_role 与原始
+/// 一致(变体 + 字段 + 序),且 catalog 二次序列化字节恒等。
+#[test]
+fn partition_role_all_three_variants_round_trip() {
+    let mut c = Catalog::new();
+    c.create_table(partition_parent_schema()).unwrap();
+    c.create_table(partition_range_child_schema(
+        "events_2026_06",
+        1_748_736_000_000_000, // 2026-06-01T00:00:00Z micros
+        1_751_328_000_000_000, // 2026-07-01T00:00:00Z micros
+    ))
+    .unwrap();
+    c.create_table(partition_range_child_schema(
+        "events_2026_07",
+        1_751_328_000_000_000,
+        1_754_006_400_000_000,
+    ))
+    .unwrap();
+    c.create_table(partition_default_child_schema("events_default"))
+        .unwrap();
+
+    let bytes = c.serialize();
+    let back = Catalog::deserialize(&bytes).unwrap();
+
+    // Parent 完整保 templates 顺序 + key 列位置 + Range kind。
+    match back
+        .get("events_partitioned")
+        .unwrap()
+        .schema()
+        .partition_role
+        .as_ref()
+        .unwrap()
+    {
+        PartitionRole::Parent {
+            kind,
+            key_column_positions,
+            index_template_sources,
+        } => {
+            assert_eq!(*kind, PartitionKind::Range);
+            assert_eq!(key_column_positions, &vec![1usize]);
+            assert_eq!(index_template_sources.len(), 2);
+            assert!(index_template_sources[0].contains("ts DESC"));
+            assert!(index_template_sources[1].contains("payload, ts"));
+        }
+        other => panic!("expected Parent, got {other:?}"),
+    }
+
+    // Range child:边界值 + parent_name 完整。
+    match back
+        .get("events_2026_06")
+        .unwrap()
+        .schema()
+        .partition_role
+        .as_ref()
+        .unwrap()
+    {
+        PartitionRole::Range {
+            parent_name,
+            lower,
+            upper,
+        } => {
+            assert_eq!(parent_name, "events_partitioned");
+            assert_eq!(*lower, PartitionBound::TimestampTz(1_748_736_000_000_000));
+            assert_eq!(*upper, PartitionBound::TimestampTz(1_751_328_000_000_000));
+        }
+        other => panic!("expected Range, got {other:?}"),
+    }
+
+    // Default child:仅 parent_name。
+    match back
+        .get("events_default")
+        .unwrap()
+        .schema()
+        .partition_role
+        .as_ref()
+        .unwrap()
+    {
+        PartitionRole::Default { parent_name } => {
+            assert_eq!(parent_name, "events_partitioned");
+        }
+        other => panic!("expected Default, got {other:?}"),
+    }
+
+    // 二次序列化字节恒等 — drift-free。
+    assert_eq!(bytes, back.serialize());
+}
+
+/// Bound 三态(MinValue / MaxValue / TimestampTz)各自 codec 都能
+/// round-trip。直接构 Range child 用 MinValue 当 lower、MaxValue 当
+/// upper(MINVALUE / MAXVALUE 语义,sentori 不要但 zero-cost 留口)。
+#[test]
+fn partition_bound_minvalue_maxvalue_round_trip() {
+    let mut c = Catalog::new();
+    c.create_table(partition_parent_schema()).unwrap();
+
+    let mut s = TableSchema::new(
+        "events_all_time",
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("ts", DataType::Timestamptz, false),
+            ColumnSchema::new("payload", DataType::Jsonb, true),
+        ],
+    );
+    s.partition_role = Some(PartitionRole::Range {
+        parent_name: "events_partitioned".to_string(),
+        lower: PartitionBound::MinValue,
+        upper: PartitionBound::MaxValue,
+    });
+    c.create_table(s).unwrap();
+
+    let bytes = c.serialize();
+    let back = Catalog::deserialize(&bytes).unwrap();
+    match back
+        .get("events_all_time")
+        .unwrap()
+        .schema()
+        .partition_role
+        .as_ref()
+        .unwrap()
+    {
+        PartitionRole::Range { lower, upper, .. } => {
+            assert_eq!(*lower, PartitionBound::MinValue);
+            assert_eq!(*upper, PartitionBound::MaxValue);
+        }
+        other => panic!("expected Range, got {other:?}"),
+    }
+    assert_eq!(bytes, back.serialize());
+}

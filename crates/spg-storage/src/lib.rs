@@ -188,7 +188,7 @@ pub enum DataType {
     /// 36..48; wire OIDs from PG `pg_type.dat`. Per-element body
     /// uses the scalar's existing `write_value_body` shape.
     /// FILE_VERSION 48+ (same window as β; no separate bump).
-    BoolArray,        // PG `_bool`        OID 1000, tag 36
+    BoolArray, // PG `_bool`        OID 1000, tag 36
     SmallIntArray,    // PG `_int2`        OID 1005, tag 37
     FloatArray,       // PG `_float8`      OID 1022, tag 38
     NumericArray,     // PG `_numeric`     OID 1231, tag 39
@@ -1091,6 +1091,56 @@ pub struct TableSchema {
     /// Persisted in catalog FILE_VERSION 23+. Older catalogs
     /// deserialise with an empty vec.
     pub checks: Vec<String>,
+    /// v7.37.6-B — declarative partition role(sentori Epic 2 P0).
+    /// `None` = 普通表(后向兼容,< v49 catalog 默认 None)。
+    /// `Some(Parent { … })` = `CREATE TABLE p (...) PARTITION BY RANGE (key_col)` 父表 —
+    /// 父表自己 `rows` 永远空,INSERT 在引擎层路由到命中的 child。
+    /// `Some(Range { … })` = `CREATE TABLE c PARTITION OF p FOR VALUES FROM (a) TO (b)` 范围子表。
+    /// `Some(Default { … })` = `CREATE TABLE c PARTITION OF p DEFAULT` 兜底子表。
+    /// 持久化于 FILE_VERSION 49+。
+    pub partition_role: Option<PartitionRole>,
+}
+
+/// v7.37.6-B — partition 三态(parent / range child / default child)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionRole {
+    Parent {
+        kind: PartitionKind,
+        /// 父表 columns 中 key 列的下标(单列 v7.37.6-B,
+        /// `Vec` 为将来扩多列预留)。
+        key_column_positions: Vec<usize>,
+        /// `CREATE INDEX ON parent (…)` 的 Display-form 源串。
+        /// child 创建时再 parse + 在 child 上 execute,这样 future
+        /// child 也自动继承父表索引。fan-out 实施在引擎层。
+        index_template_sources: Vec<String>,
+    },
+    Range {
+        parent_name: String,
+        /// 半开区间下界(`>=`,SQL `FROM (lower)`).
+        lower: PartitionBound,
+        /// 半开区间上界(`<`,SQL `TO (upper)`).
+        upper: PartitionBound,
+    },
+    Default {
+        parent_name: String,
+    },
+}
+
+/// v7.37.6-B — 分区策略(v7.37.6-B 只 Range;留 enum 给将来 List/Hash)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionKind {
+    Range,
+}
+
+/// v7.37.6-B — partition 边界 literal。v7.37.6-B 锁 TIMESTAMPTZ
+/// (i64 microseconds since epoch — 与 `Value::Timestamptz` 同存储);
+/// `MinValue` / `MaxValue` 对应 SQL `MINVALUE` / `MAXVALUE`(sentori
+/// 不依赖,但 zero cost 留口)。后续 phase 扩 DateInt / Int8 等。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionBound {
+    MinValue,
+    MaxValue,
+    TimestampTz(i64),
 }
 
 /// v7.9.19 — composite UNIQUE / PRIMARY KEY constraint persisted
@@ -4261,6 +4311,7 @@ impl TableSchema {
             foreign_keys: Vec::new(),
             uniqueness_constraints: Vec::new(),
             checks: Vec::new(),
+            partition_role: None,
         }
     }
 }
@@ -4472,7 +4523,25 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     identically; v47 readers fed a v48 catalog that contains
 ///     INTERVAL hit the explicit "unknown data type tag: 34"
 ///     fence in `read_data_type`.
-const FILE_VERSION: u8 = 48;
+/// v49 introduces (v7.37.6-B, sentori Epic 2 P0):
+///   * Per-table partition role appendix(declarative
+///     `PARTITION BY RANGE` parent / range child / DEFAULT
+///     child)。Layout, written **after** the inline_set_variants
+///     appendix and **before** the per-table block close:
+///       `[u8 role_tag]`
+///         0 = `None`(普通表,后向兼容默认)
+///         1 = `Parent`:  `[u8 kind_tag (0=Range)]`
+///                        `[u16 key_col_count]` `(× u16 col_pos)`
+///                        `[u16 tmpl_count]` `(× str source)`
+///         2 = `Range`:   `[str parent_name]` `[Bound]` `[Bound]`
+///         3 = `Default`: `[str parent_name]`
+///     `PartitionBound` codec:
+///       `[u8 bound_tag]` 0=MinValue 1=MaxValue 2=TimestampTz(`[i64 LE micros]`)
+///     v48-and-below readers stop after the inline_set_variants
+///     block — they don't see this appendix and deserialise every
+///     table with `partition_role = None`. v49 writers always emit
+///     `[0]` for plain tables, so the encoding stays one-byte-cheap.
+const FILE_VERSION: u8 = 49;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4959,6 +5028,9 @@ impl Catalog {
                     write_str(&mut out, v.as_str());
                 }
             }
+            // v7.37.6-B — partition role appendix(FILE_VERSION 49+)。
+            // Layout 详见 FILE_VERSION 49 docstring。普通表 = 单字节 0。
+            write_partition_role(&mut out, t.schema.partition_role.as_ref());
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier

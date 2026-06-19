@@ -65,6 +65,7 @@ fn wide_users_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         uniqueness_constraints: Vec::new(),
         checks: Vec::new(),
+        partition_role: None,
     }
 }
 

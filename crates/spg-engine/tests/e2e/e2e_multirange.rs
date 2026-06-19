@@ -101,7 +101,9 @@ fn int8multirange_round_trip() {
         panic!();
     };
     assert_eq!(*kind, RangeKind::Int8);
-    assert!(matches!(&ranges[0].lower, Some(b) if matches!(b.as_ref(), Value::BigInt(1_000_000_000))));
+    assert!(
+        matches!(&ranges[0].lower, Some(b) if matches!(b.as_ref(), Value::BigInt(1_000_000_000)))
+    );
 }
 
 #[test]

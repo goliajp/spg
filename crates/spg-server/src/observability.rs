@@ -620,9 +620,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // (~4 elements × per-element body size).
                 DataType::BoolArray => 8,
                 DataType::SmallIntArray => 12,
-                DataType::FloatArray
-                | DataType::TimestampArray
-                | DataType::TimestamptzArray => 36,
+                DataType::FloatArray | DataType::TimestampArray | DataType::TimestamptzArray => 36,
                 DataType::DateArray => 20,
                 DataType::NumericArray => 72,
                 DataType::UuidArray => 68,
