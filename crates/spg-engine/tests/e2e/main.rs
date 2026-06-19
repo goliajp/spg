@@ -26,6 +26,7 @@ mod e2e_compaction;
 mod e2e_compiled_expr;
 mod e2e_concat;
 mod e2e_concat_ws;
+mod e2e_corr_limit1_pullup;
 mod e2e_correlated_subquery_batch;
 mod e2e_count_short_circuit;
 mod e2e_create_extension;
