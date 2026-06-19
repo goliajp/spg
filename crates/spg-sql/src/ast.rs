@@ -1293,6 +1293,16 @@ pub struct ColumnDef {
     /// value list. Distinct from ENUM (subset semantics rather
     /// than pick-one). None for all non-SET columns.
     pub inline_set_variants: Option<Vec<String>>,
+    /// v7.37.7(sentori Epic 3 P1)— `GENERATED ALWAYS AS (<expr>)
+    /// STORED` computed-column source. When `Some`, the engine
+    /// stores the Display-form of the parsed expression on
+    /// `ColumnSchema.generated_stored_expr` at CREATE TABLE time
+    /// and re-evaluates the expression against every INSERT /
+    /// UPDATE candidate row, overwriting whatever the caller
+    /// supplied for this column. Boxed to keep `ColumnDef` from
+    /// blowing past the `large_enum_variant` clippy ceiling
+    /// (`Expr` widens with vector literals).
+    pub generated_stored_expr: Option<Box<Expr>>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced
@@ -3731,6 +3741,13 @@ impl fmt::Display for ColumnDef {
         // now()), so that spelling is the lossless round trip.
         if self.on_update_runtime.is_some() {
             f.write_str(" ON UPDATE CURRENT_TIMESTAMP")?;
+        }
+        // v7.37.7 — render GENERATED ALWAYS AS (…) STORED so WAL
+        // replay reconstructs the computed-column declaration. The
+        // expression sits inside a single set of parens; STORED is
+        // the only variant the parser accepts.
+        if let Some(gen_expr) = &self.generated_stored_expr {
+            write!(f, " GENERATED ALWAYS AS ({gen_expr}) STORED")?;
         }
         Ok(())
     }

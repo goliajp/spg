@@ -1021,6 +1021,16 @@ pub struct ColumnSchema {
     /// Persisted in catalog FILE_VERSION 42+; older catalogs
     /// deserialise with None.
     pub inline_set_variants: Option<Vec<String>>,
+    /// v7.37.7(sentori Epic 3 P1)— `GENERATED ALWAYS AS (<expr>)
+    /// STORED` computed-column source. When `Some`, INSERT / UPDATE
+    /// recompute the cell against the candidate row(re-parse the
+    /// stored Display form and evaluate)and overwrite any
+    /// user-supplied value, matching PG's stored-generated-column
+    /// semantics. `None` (the default) preserves the regular
+    /// "column value is whatever the caller passed" path.
+    /// Persisted in catalog FILE_VERSION 50+; older catalogs
+    /// deserialise with None.
+    pub generated_stored_expr: Option<String>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -4272,6 +4282,7 @@ impl ColumnSchema {
             is_unsigned: false,
             inline_enum_variants: None,
             inline_set_variants: None,
+            generated_stored_expr: None,
         }
     }
 
@@ -4541,7 +4552,19 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     block — they don't see this appendix and deserialise every
 ///     table with `partition_role = None`. v49 writers always emit
 ///     `[0]` for plain tables, so the encoding stays one-byte-cheap.
-const FILE_VERSION: u8 = 49;
+/// v50 introduces (v7.37.7, sentori Epic 3 P1):
+///   * Per-table `generated_stored_expr` appendix(stored generated
+///     columns — `GENERATED ALWAYS AS (<expr>) STORED`)。Layout,
+///     written **after** the partition_role appendix and before
+///     the per-table block close:
+///       `[u16 binding_count]`
+///       `binding_count × { [u16 col_pos][str expr_source] }`
+///     Sparse — only generated columns land here, so plain-shape
+///     catalogs stay byte-for-byte identical save for the new
+///     u16 zero count. v49-and-below readers stop after the
+///     partition_role appendix; v50 readers default every column
+///     to `generated_stored_expr = None` when this block is absent.
+const FILE_VERSION: u8 = 50;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5031,6 +5054,23 @@ impl Catalog {
             // v7.37.6-B — partition role appendix(FILE_VERSION 49+)。
             // Layout 详见 FILE_VERSION 49 docstring。普通表 = 单字节 0。
             write_partition_role(&mut out, t.schema.partition_role.as_ref());
+            // v7.37.7 — per-table generated_stored_expr appendix
+            // (FILE_VERSION 50+). Sparse: only columns whose
+            // generated_stored_expr is Some land here.
+            let mut gen_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(src) = &c.generated_stored_expr {
+                    gen_bindings.push((i, src.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(gen_bindings.len()).expect("≤ 65k GENERATED STORED columns/table"),
+            );
+            for (pos, src) in gen_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, src);
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
