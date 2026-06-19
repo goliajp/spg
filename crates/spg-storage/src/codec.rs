@@ -418,6 +418,21 @@ fn deserialize_indices(
                 let map = read_gin_map(cur)?;
                 t.restore_gin_fulltext_index(idx_name, &column_name, map)?;
             }
+            6 => {
+                // v7.37.8(sentori Epic 5 P2)— JSONB-GIN tag.
+                // Same payload shape as tags 3/4/5(String →
+                // posting list); only emitted by FILE_VERSION 51+
+                // writers. Pre-7.37.8 the same DDL loaded as a
+                // BTree fallback so v50 catalogs never wrote a 6.
+                if version < 51 {
+                    return Err(StorageError::Corrupt(format!(
+                        "JSONB-GIN index tag 6 found in catalog FILE_VERSION {version}; \
+                         FILE_VERSION 51+ required (v7.37.8 introduced this tag)"
+                    )));
+                }
+                let map = read_gin_map(cur)?;
+                t.restore_gin_jsonb_index(idx_name, &column_name, map)?;
+            }
             other => {
                 return Err(StorageError::Corrupt(format!(
                     "unknown index kind tag: {other}"

@@ -15,6 +15,7 @@ pub mod bloom;
 mod codec;
 pub mod fts_simple;
 pub mod halfvec;
+pub mod jsonb_gin;
 mod nsw;
 pub mod persistent;
 pub mod persistent_btree;
@@ -1582,6 +1583,17 @@ pub enum IndexKind {
     /// walker. Persisted via tag-5 index payload in
     /// `FILE_VERSION` 33+.
     GinFulltext(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    /// v7.37.8(sentori Epic 5 P2)— `USING gin (col)` over a
+    /// `JSON` / `JSONB` column. Posting lists map a canonical
+    /// `(path, leaf)` token(see [`crate::jsonb_gin::extract_tokens`])
+    /// to row locators so the planner can resolve
+    /// `<col> @> <jsonb_literal>` to a candidate row set via
+    /// posting-list intersection + per-row `json::contains`
+    /// re-verification. Pre-7.37.8 the same DDL loaded as a
+    /// BTree fallback so `pg_dump` JSONB-GIN scripts kept loading
+    /// without query-time acceleration. Persisted via tag-6 index
+    /// payload in `FILE_VERSION` 51+.
+    GinJsonb(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
 impl IndexKind {
@@ -1626,7 +1638,10 @@ impl IndexKind {
             // summaries live in cold-segment sidecars on disk); the
             // resident footprint is just the column-type token.
             IndexKind::Brin { .. } => core::mem::size_of::<DataType>() as u64,
-            IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => map
+            IndexKind::Gin(map)
+            | IndexKind::GinTrgm(map)
+            | IndexKind::GinFulltext(map)
+            | IndexKind::GinJsonb(map) => map
                 .iter()
                 .map(|(word, postings)| {
                     (word.len() + HEADER + HEADER + postings.len() * loc) as u64
@@ -1821,6 +1836,25 @@ impl Index {
         }
     }
 
+    /// v7.37.8(sentori Epic 5 P2)— JSONB-GIN constructor. Same
+    /// shape as the other GIN-family indexes; posting-list keys
+    /// are the canonical `(path, leaf)` tokens emitted by
+    /// `crate::jsonb_gin::extract_tokens`. Maintains posting
+    /// lists from `Value::Json` cells(JSONB is a synonym for the
+    /// same in-memory string-backed Value).
+    fn new_gin_jsonb(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::GinJsonb(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
+            partial_predicate: None,
+            expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
+        }
+    }
+
     /// v7.34.4 — descending-order iterator over `(IndexKey, locators)`
     /// pairs for a BTree index, with O(log N) descent to the rightmost
     /// leaf and lazy emission thereafter. Returns an empty iterator
@@ -1839,7 +1873,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => alloc::boxed::Box::new(core::iter::empty()),
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => alloc::boxed::Box::new(core::iter::empty()),
         }
     }
 
@@ -1855,7 +1890,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => alloc::boxed::Box::new(core::iter::empty()),
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => alloc::boxed::Box::new(core::iter::empty()),
         }
     }
 
@@ -1877,7 +1913,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => &[][..],
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => &[][..],
         }
     }
 
@@ -1895,7 +1932,8 @@ impl Index {
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
-            | IndexKind::GinTrgm(_) => &[][..],
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinJsonb(_) => &[][..],
         }
     }
 
@@ -1910,6 +1948,24 @@ impl Index {
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => &[][..],
+        }
+    }
+
+    /// v7.37.8(sentori Epic 5 P2)— JSONB-GIN posting-list lookup.
+    /// Returns the row locators whose indexed JSONB cell carries
+    /// the canonical `token`(see [`crate::jsonb_gin::extract_tokens`]).
+    /// Empty when the token is absent or this isn't a JSONB-GIN
+    /// index. Planners drive `<col> @> <jsonb_literal>` through here.
+    pub fn gin_jsonb_lookup(&self, token: &str) -> &[RowLocator] {
+        match &self.kind {
+            IndexKind::GinJsonb(m) => m.get(&String::from(token)).map_or(&[][..], Vec::as_slice),
+            IndexKind::BTree(_)
+            | IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_) => &[][..],
         }
     }
@@ -1923,7 +1979,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => None,
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => None,
         }
     }
 
@@ -1955,6 +2012,13 @@ impl Index {
     /// column into MATCH AGAINST acceleration.
     pub const fn is_gin_fulltext(&self) -> bool {
         matches!(self.kind, IndexKind::GinFulltext(_))
+    }
+
+    /// v7.37.8(sentori Epic 5 P2)— true when this index is a
+    /// real JSONB-GIN(posting-list backed). Used by the planner
+    /// to opt `<col> @> <jsonb_literal>` into posting-list seek.
+    pub const fn is_gin_jsonb(&self) -> bool {
+        matches!(self.kind, IndexKind::GinJsonb(_))
     }
 }
 
@@ -3955,7 +4019,8 @@ impl Catalog {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => {
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -4564,7 +4629,16 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     u16 zero count. v49-and-below readers stop after the
 ///     partition_role appendix; v50 readers default every column
 ///     to `generated_stored_expr = None` when this block is absent.
-const FILE_VERSION: u8 = 50;
+/// v51 introduces (v7.37.8, sentori Epic 5 P2):
+///   * Per-index tag byte 6 = `GinJsonb`(real posting-list GIN
+///     over a JSONB column). Payload shape mirrors tag-3 / 4 / 5:
+///     `[u32 posting_list_count]` then `(str token, u32 locator_count,
+///     locators …)` per posting list. Same `write_str` /
+///     `RowLocator::write_le` codec as the rest of the GIN family.
+///     v50 catalogs never wrote tag 6(the same DDL loaded as a
+///     BTree fallback); v51 readers see tag 6 explicitly and dispatch
+///     into `IndexKind::GinJsonb`.
+const FILE_VERSION: u8 = 51;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4745,6 +4819,32 @@ impl Catalog {
                         );
                         for (lex, locators) in map {
                             write_str(&mut out, lex);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
+                    IndexKind::GinJsonb(map) => {
+                        // v7.37.8 — tag byte 6 = GinJsonb
+                        // (real posting-list GIN over a JSONB
+                        // column; sentori Epic 5 P2). Payload
+                        // shape mirrors tag-3 / 4 / 5 — keys are
+                        // the canonical `(path, leaf)` tokens
+                        // from `jsonb_gin::extract_tokens`.
+                        // FILE_VERSION 51+; v50 catalogs never
+                        // wrote a JSONB-GIN (the same DDL loaded
+                        // as a BTree fallback).
+                        out.push(6);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G JSONB-GIN posting lists"),
+                        );
+                        for (token, locators) in map {
+                            write_str(&mut out, token);
                             write_u32(
                                 &mut out,
                                 u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),

@@ -923,12 +923,28 @@ impl Engine {
                     table
                         .add_gin_index(stmt.name.clone(), &stmt.column)
                         .map_err(EngineError::Storage)?;
+                } else if matches!(
+                    col_ty,
+                    spg_storage::DataType::Json | spg_storage::DataType::Jsonb
+                ) {
+                    // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
+                    // posting list. Pre-7.37.8 the same DDL loaded
+                    // as a BTree fallback so `pg_dump` scripts that
+                    // named GIN on JSONB stayed loadable but the
+                    // posting-list acceleration was missing; the
+                    // sentori dashboard's `labels @> '...'` queries
+                    // fell back to full scan. The planner picks
+                    // this index up via the `@>` seek in
+                    // `index_access::try_gin_jsonb_seek`.
+                    table
+                        .add_gin_jsonb_index(stmt.name.clone(), &stmt.column)
+                        .map_err(EngineError::Storage)?;
                 } else {
                     // v7.9.26b BTree fallback — the catalog still
                     // gets an index entry on the leading column so
-                    // pg_dump scripts that name GIN on JSONB / etc.
-                    // load clean; query-time gain stays opt-in for
-                    // tsvector callers.
+                    // pg_dump scripts that name GIN on other column
+                    // types load clean; query-time gain stays opt-in
+                    // for tsvector / JSONB callers.
                     table.add_index(stmt.name.clone(), &stmt.column)?;
                 }
             }

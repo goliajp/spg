@@ -564,6 +564,140 @@ pub(crate) fn try_gin_seek<'a>(
     Some(out)
 }
 
+/// v7.37.8(sentori Epic 5 P2)— JSONB-GIN candidate seek for
+/// `WHERE col @> <jsonb_literal>`. Mirrors `try_gin_seek`'s
+/// AND walker(individual GIN seeks union safely under AND)but
+/// drops OR — a non-overlapping containment query on one branch
+/// vs another would broaden the candidate set unsafely without
+/// the OR's full-result containment requirement that's already
+/// checked per row downstream.
+pub(crate) fn try_gin_jsonb_seek<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &'a Table,
+    table_alias: &str,
+) -> Option<Vec<Cow<'a, Row>>> {
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    {
+        if let Some(rows) = try_gin_jsonb_seek(lhs, schema_cols, table, table_alias) {
+            return Some(rows);
+        }
+        return try_gin_jsonb_seek(rhs, schema_cols, table, table_alias);
+    }
+    let Expr::Binary {
+        lhs,
+        op: BinOp::JsonContains,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    // Column on the left, jsonb literal on the right — sentori's
+    // shape. Resolve column ↔ literal generally so `<lit> @> <col>`
+    // (PG also accepts) lands here too(swap drops the seek because
+    // `lit @> col` requires the literal to contain a column-defined
+    // value, which can't be answered by a constant token lookup).
+    let col_pos = resolve_jsonb_column(lhs, schema_cols, table_alias)?;
+    let literal = resolve_jsonb_literal(rhs)?;
+    let idx = table
+        .indices()
+        .iter()
+        .find(|i| i.column_position == col_pos && i.is_gin_jsonb())?;
+    let tokens = spg_storage::jsonb_gin::extract_tokens(&literal);
+    if tokens.is_empty() {
+        // An empty token list — `'{}' @> '{}'` — is trivially true
+        // for every row. Best to let the full scan handle it so the
+        // existing eval path renders the empty-containment answer.
+        return None;
+    }
+    // Intersect posting lists.
+    let mut candidates: Vec<spg_storage::RowLocator> = idx.gin_jsonb_lookup(&tokens[0]).to_vec();
+    candidates.sort_by_key(locator_sort_key);
+    candidates.dedup_by_key(|l| locator_sort_key(l));
+    for tok in &tokens[1..] {
+        let mut next: Vec<spg_storage::RowLocator> = idx.gin_jsonb_lookup(tok).to_vec();
+        next.sort_by_key(locator_sort_key);
+        next.dedup_by_key(|l| locator_sort_key(l));
+        // Sorted-merge intersection.
+        let mut out: Vec<spg_storage::RowLocator> = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < candidates.len() && j < next.len() {
+            let lk = locator_sort_key(&candidates[i]);
+            let rk = locator_sort_key(&next[j]);
+            match lk.cmp(&rk) {
+                core::cmp::Ordering::Less => i += 1,
+                core::cmp::Ordering::Greater => j += 1,
+                core::cmp::Ordering::Equal => {
+                    out.push(candidates[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        candidates = out;
+        if candidates.is_empty() {
+            break;
+        }
+    }
+    let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
+    for loc in candidates {
+        if let spg_storage::RowLocator::Hot(i) = loc
+            && let Some(row) = table.rows().get(i)
+        {
+            out.push(Cow::Borrowed(row));
+        }
+    }
+    Some(out)
+}
+
+fn resolve_jsonb_column(
+    e: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<usize> {
+    if let Expr::Column(c) = e {
+        if let Some(q) = &c.qualifier
+            && !q.eq_ignore_ascii_case(table_alias)
+        {
+            return None;
+        }
+        let pos = schema_cols
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+        if matches!(
+            schema_cols[pos].ty,
+            spg_storage::DataType::Json | spg_storage::DataType::Jsonb
+        ) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+fn resolve_jsonb_literal(e: &Expr) -> Option<alloc::string::String> {
+    use spg_sql::ast::Literal;
+    match e {
+        // `'{"team":"ios"}'::jsonb` is the canonical sentori shape.
+        // The parser surfaces it as `Cast { expr: Literal(String),
+        // target: Jsonb }`. We accept any cast target since the
+        // engine's full `@>` re-eval guards correctness; here we
+        // only need the string body so the JSONB tokenizer can run.
+        Expr::Cast { expr, .. } => match expr.as_ref() {
+            Expr::Literal(Literal::String(s)) => Some(s.clone()),
+            _ => None,
+        },
+        // Bare `Literal::String` works too — `WHERE col @> '{}'`
+        // without a cast still names a JSONB-shape literal because
+        // the operator's left side is JSONB-typed.
+        Expr::Literal(Literal::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// v7.15.0 — trigram-GIN-accelerated candidate seek for
 /// `WHERE col LIKE '<pat>'` and `WHERE col ILIKE '<pat>'` when
 /// the column has a `gin_trgm_ops` GIN index.

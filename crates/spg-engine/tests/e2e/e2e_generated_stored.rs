@@ -81,10 +81,8 @@ fn insert_overrides_user_supplied_generated_value() {
          )",
     )
     .unwrap();
-    e.execute(
-        "INSERT INTO box_with_area (id, w, h, area) VALUES (1, 5, 6, 999)",
-    )
-    .expect("user-supplied area is ignored");
+    e.execute("INSERT INTO box_with_area (id, w, h, area) VALUES (1, 5, 6, 999)")
+        .expect("user-supplied area is ignored");
     // 30 = 5 * 6 (not 999).
     assert_eq!(
         one_i64(&mut e, "SELECT area FROM box_with_area WHERE id = 1"),
@@ -111,7 +109,8 @@ fn update_recomputes_generated_stored_column() {
         one_i64(&mut e, "SELECT area FROM box_with_area WHERE id = 1"),
         10
     );
-    e.execute("UPDATE box_with_area SET w = 7 WHERE id = 1").unwrap();
+    e.execute("UPDATE box_with_area SET w = 7 WHERE id = 1")
+        .unwrap();
     // 7 * 5 = 35; the engine recomputes area even though UPDATE only
     // bound `w`.
     assert_eq!(

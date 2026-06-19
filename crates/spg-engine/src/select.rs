@@ -31,8 +31,8 @@ use crate::{
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
-    try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek, value_is_integer,
-    value_to_i64,
+    try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n,
+    try_trgm_seek, value_is_integer, value_to_i64,
 };
 
 impl Engine {
@@ -1681,6 +1681,15 @@ impl Engine {
                     // Over-approximate candidate set; the WHERE
                     // re-eval verifies the LIKE per row.
                     try_trgm_seek(w, schema_cols, table, alias)
+                })
+                .or_else(|| {
+                    // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
+                    // accelerated `WHERE col @> <jsonb_literal>`
+                    // when the column has a `USING gin` index. The
+                    // posting-list intersection returns an over-
+                    // approximate candidate set; the WHERE re-eval
+                    // verifies the full `@>` predicate per row.
+                    try_gin_jsonb_seek(w, schema_cols, table, alias)
                 })
         });
 

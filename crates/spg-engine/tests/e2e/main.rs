@@ -68,6 +68,7 @@ mod e2e_generate_series;
 mod e2e_generated_stored;
 mod e2e_geometry;
 mod e2e_get_ddl;
+mod e2e_gin_jsonb;
 mod e2e_gin_trgm_partial;
 mod e2e_greatest_least;
 mod e2e_group_by_all;
