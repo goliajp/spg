@@ -341,6 +341,25 @@ impl Table {
                         }
                     }
                 }
+                IndexKind::GinJsonb(map) => {
+                    // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN.
+                    // Extract canonical `(path, leaf)` tokens from
+                    // the cell text and extend each token's posting
+                    // list. NULL or non-Json cell contributes no
+                    // tokens(`labels @> '...'` against a NULL row
+                    // is always false so absence here is correct).
+                    let json_cell = match &row.values[idx.column_position] {
+                        Value::Json(s) => Some(s.as_str()),
+                        _ => None,
+                    };
+                    if let Some(s) = json_cell {
+                        for tok in jsonb_gin::extract_tokens(s) {
+                            let mut entries = map.get(&tok).cloned().unwrap_or_default();
+                            entries.push(RowLocator::Hot(new_row_idx));
+                            map.insert_mut(tok, entries);
+                        }
+                    }
+                }
                 // NSW handled below after the row push (so the new row
                 // is visible to the kNN-graph connect step). BRIN
                 // carries no per-row state.
@@ -452,7 +471,8 @@ impl Table {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => {
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -776,6 +796,74 @@ impl Table {
         Ok(())
     }
 
+    /// v7.37.8(sentori Epic 5 P2)— JSONB-GIN over a `Json` /
+    /// `Jsonb` column. Walks every row, extracts canonical
+    /// `(path, leaf)` tokens via
+    /// [`crate::jsonb_gin::extract_tokens`], and builds the
+    /// posting-list map. NULL or non-Json cells contribute no
+    /// tokens(`<col> @> <jsonb>` against a NULL row is always
+    /// false so absence here is correct).
+    pub fn add_gin_jsonb_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if !matches!(
+            self.schema.columns[column_position].ty,
+            DataType::Json | DataType::Jsonb
+        ) {
+            return Err(StorageError::Corrupt(format!(
+                "JSONB-GIN index {name:?} requires a JSON/JSONB column; \
+                 {column_name:?} is {:?}",
+                self.schema.columns[column_position].ty
+            )));
+        }
+        let mut idx = Index::new_gin_jsonb(name, column_position);
+        if let IndexKind::GinJsonb(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Value::Json(s) = &row.values[column_position] {
+                    for tok in jsonb_gin::extract_tokens(s) {
+                        let mut entries = map.get(&tok).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(i));
+                        map.insert_mut(tok, entries);
+                    }
+                }
+            }
+        }
+        self.indices.push(idx);
+        Ok(())
+    }
+
+    /// v7.37.8 — restore a JSONB-GIN from its catalog snapshot
+    /// payload. Mirrors [`Self::restore_gin_fulltext_index`].
+    pub fn restore_gin_jsonb_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new_gin_jsonb(name, column_position);
+        idx.kind = IndexKind::GinJsonb(map);
+        self.indices.push(idx);
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -811,7 +899,8 @@ impl Table {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => {
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -850,7 +939,12 @@ impl Table {
             // v7.17.0 Phase 2.2 — fulltext-GIN posting lists are
             // shape-compatible with tsvector / trigram GINs, so
             // cold-locator re-attach handles all three.
-            IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => map,
+            // v7.37.8 — JSONB-GIN shares the same posting-list shape,
+            // so it joins the same re-attach path.
+            IndexKind::Gin(map)
+            | IndexKind::GinTrgm(map)
+            | IndexKind::GinFulltext(map)
+            | IndexKind::GinJsonb(map) => map,
             IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
                     "register_gin_cold_locators: index {index_name:?} is not GIN"
@@ -896,7 +990,8 @@ impl Table {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => {
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -1205,7 +1300,8 @@ impl Table {
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
                 | IndexKind::GinTrgm(_)
-                | IndexKind::GinFulltext(_) => {
+                | IndexKind::GinFulltext(_)
+                | IndexKind::GinJsonb(_) => {
                     fixes.clear();
                     fixes.push(IdxFix::FullRebuild);
                     break;
@@ -1315,7 +1411,8 @@ impl Table {
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
                 | IndexKind::GinTrgm(_)
-                | IndexKind::GinFulltext(_) => None,
+                | IndexKind::GinFulltext(_)
+                | IndexKind::GinJsonb(_) => None,
             })
             .collect();
 
@@ -1334,7 +1431,10 @@ impl Table {
                 // share the `String → Vec<RowLocator>` shape, so
                 // cold preservation handles all three GIN flavours
                 // in one pass.
-                IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => {
+                IndexKind::Gin(map)
+                | IndexKind::GinTrgm(map)
+                | IndexKind::GinFulltext(map)
+                | IndexKind::GinJsonb(map) => {
                     let cold: Vec<(String, RowLocator)> = map
                         .iter()
                         .flat_map(|(w, locs)| {
@@ -1366,6 +1466,7 @@ impl Table {
             Gin,
             GinTrgm,
             GinFulltext,
+            GinJsonb,
         }
         let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
@@ -1378,6 +1479,7 @@ impl Table {
                     IndexKind::Gin(_) => RebuildKind::Gin,
                     IndexKind::GinTrgm(_) => RebuildKind::GinTrgm,
                     IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
+                    IndexKind::GinJsonb(_) => RebuildKind::GinJsonb,
                 };
                 (idx.name.clone(), idx.column_position, kind)
             })
@@ -1458,6 +1560,23 @@ impl Table {
                                     let mut entries = map.get(&lex).cloned().unwrap_or_default();
                                     entries.push(RowLocator::Hot(i));
                                     map.insert_mut(lex, entries);
+                                }
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
+                RebuildKind::GinJsonb => {
+                    // v7.37.8 — re-derive the JSONB posting list
+                    // from each `Value::Json` cell.
+                    let mut idx = Index::new_gin_jsonb(name, column_position);
+                    if let IndexKind::GinJsonb(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Value::Json(s) = &row.values[column_position] {
+                                for tok in jsonb_gin::extract_tokens(s) {
+                                    let mut entries = map.get(&tok).cloned().unwrap_or_default();
+                                    entries.push(RowLocator::Hot(i));
+                                    map.insert_mut(tok, entries);
                                 }
                             }
                         }

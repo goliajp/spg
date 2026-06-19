@@ -762,7 +762,8 @@ fn nsw_clone_is_o1() {
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
-        | IndexKind::GinFulltext(_) => {
+        | IndexKind::GinFulltext(_)
+        | IndexKind::GinJsonb(_) => {
             panic!("expected NSW")
         }
     };
@@ -1128,7 +1129,8 @@ fn nsw_index_topology_persists_through_round_trip() {
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
-        | IndexKind::GinFulltext(_) => {
+        | IndexKind::GinFulltext(_)
+        | IndexKind::GinJsonb(_) => {
             panic!("expected NSW")
         }
     };
@@ -1140,7 +1142,8 @@ fn nsw_index_topology_persists_through_round_trip() {
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
-        | IndexKind::GinFulltext(_) => {
+        | IndexKind::GinFulltext(_)
+        | IndexKind::GinJsonb(_) => {
             panic!("expected NSW")
         }
     };
@@ -1985,6 +1988,10 @@ fn encode_as_v8(cat: &Catalog) -> Vec<u8> {
                 IndexKind::GinFulltext(_) => panic!(
                     "v8 catalog writer cannot serialise fulltext-GIN — \
                      tests with FULLTEXT KEY must use the current writer"
+                ),
+                IndexKind::GinJsonb(_) => panic!(
+                    "v8 catalog writer cannot serialise JSONB-GIN — \
+                     tests with JSONB-GIN must use the current writer"
                 ),
             }
         }
