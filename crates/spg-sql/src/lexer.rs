@@ -116,6 +116,17 @@ pub enum Token {
     /// every key/value in `sub` is present in `j` with structural
     /// containment for objects + arrays.
     JsonContains,
+    /// v7.37.6-A `<@` — JSON contained-by. `a <@ b` ⇔ `b @> a`.
+    JsonContainedBy,
+    /// v7.37.6-A `?` — JSON key exists (object), or element-as-text
+    /// exists (array). `j ? 'key'` returns BOOL.
+    JsonKeyExists,
+    /// v7.37.6-A `?|` — JSON any-key-exists. `j ?| ARRAY['a','b']`
+    /// returns BOOL; true if any one of the listed keys exists in `j`.
+    JsonKeysAny,
+    /// v7.37.6-A `?&` — JSON all-keys-exist. `j ?& ARRAY['a','b']`
+    /// returns BOOL; true if every listed key exists in `j`.
+    JsonKeysAll,
     /// v7.12.2 `@@` — tsvector / tsquery match. Either ordering
     /// (`vec @@ q` or `q @@ vec`) parses; engine eval normalises
     /// before matching.
@@ -382,6 +393,19 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 i += consumed;
             }
             b'+' => single(&mut out, Token::Plus, &mut i),
+            // v7.37.6-A — PG JSONB `?` / `?|` / `?&`. Longest-match
+            // order matters: try `?|` and `?&` before bare `?`.
+            // SPG doesn't use `?` as a placeholder (uses `$N`
+            // instead), so the bare `?` slot is free for JSONB.
+            b'?' if peek_eq(bytes, i + 1, b'|') => {
+                out.push(Token::JsonKeysAny);
+                i += 2;
+            }
+            b'?' if peek_eq(bytes, i + 1, b'&') => {
+                out.push(Token::JsonKeysAll);
+                i += 2;
+            }
+            b'?' => single(&mut out, Token::JsonKeyExists, &mut i),
             b'-' => {
                 // v4.14: `->>` and `->` for JSON path access. `->>`
                 // must be tried before `->` (longest match).
@@ -487,6 +511,10 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 } else if peek_eq(bytes, i + 1, b'<') {
                     // v7.17.0 Phase 3.P0-47 — PG INET `<<` strict contained.
                     out.push(Token::InetContainedBy);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'@') {
+                    // v7.37.6-A — PG JSONB `<@` contained-by.
+                    out.push(Token::JsonContainedBy);
                     i += 2;
                 } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::LtEq);

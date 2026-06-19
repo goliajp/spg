@@ -197,6 +197,119 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalE
 ///   - Objects: every (key, value) in rhs exists in lhs with a
 ///     containing value
 ///   - Arrays: every element in rhs has a containing element in lhs
+/// v7.37.6-A — PG `jsonb ? text`. Returns BOOL: true iff the key
+/// exists at the top level of the document.
+///   - Object: true iff `key` is a member name.
+///   - Array:  true iff any element is exactly the JSON string `key`.
+///   - Scalar string: true iff the scalar equals `key`.
+///   - Other scalars / null: false.
+/// NULL on either side → NULL (SQL 3VL).
+pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+    let lhs_text = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON ?: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let key = match rhs {
+        Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON ?: right side must be TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of ?: {e}"),
+    })?;
+    Ok(Value::Bool(node_has_key(&doc, key)))
+}
+
+fn node_has_key(v: &JsonValue, key: &str) -> bool {
+    match v {
+        JsonValue::Object(members) => members.iter().any(|(k, _)| k == key),
+        JsonValue::Array(items) => items.iter().any(|item| matches!(item, JsonValue::String(s) if s == key)),
+        JsonValue::String(s) => s == key,
+        _ => false,
+    }
+}
+
+/// Helper for `?|` / `?&` — extract a Vec of keys from either a
+/// TEXT[] Value or a single TEXT Value (PG accepts both).
+fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::TextArray(items) => Ok(Some(
+            items.iter().filter_map(|x| x.clone()).collect(),
+        )),
+        Value::Text(s) => Ok(Some(alloc::vec![s.clone()])),
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "JSON ?|/?&: right side must be TEXT[] or TEXT, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+/// v7.37.6-A — PG `jsonb ?| text[]`. Returns BOOL: true iff any one
+/// of the listed keys exists at the top level.
+pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+    let lhs_text = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON ?|: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let Some(keys) = collect_keys(rhs)? else {
+        return Ok(Value::Null);
+    };
+    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of ?|: {e}"),
+    })?;
+    Ok(Value::Bool(keys.iter().any(|k| node_has_key(&doc, k))))
+}
+
+/// v7.37.6-A — PG `jsonb ?& text[]`. Returns BOOL: true iff every
+/// one of the listed keys exists at the top level.
+pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+    let lhs_text = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON ?&: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let Some(keys) = collect_keys(rhs)? else {
+        return Ok(Value::Null);
+    };
+    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of ?&: {e}"),
+    })?;
+    Ok(Value::Bool(keys.iter().all(|k| node_has_key(&doc, k))))
+}
+
 pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
     let lhs_text = match lhs {
         Value::Json(s) | Value::Text(s) => s.as_str(),
