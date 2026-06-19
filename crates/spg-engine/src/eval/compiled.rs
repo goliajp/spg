@@ -300,7 +300,9 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
         }
         Expr::Cast { expr, target } => {
             compile_into(expr, ctx, steps);
-            steps.push(Step::Cast { target: *target });
+            steps.push(Step::Cast {
+                target: target.clone(),
+            });
         }
         other => steps.push(Step::Subtree(other.clone())),
     }
@@ -608,7 +610,7 @@ pub(crate) fn eval_compiled_ref(
             }
             Step::Cast { target } => {
                 let v = stack.pop().unwrap_or(Value::Null);
-                stack.push(super::cast::cast_value(v, *target)?);
+                stack.push(super::cast::cast_value(v, target.clone())?);
             }
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }

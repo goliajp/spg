@@ -6189,6 +6189,12 @@ impl Parser {
     > {
         let mut ty_ident = match self.advance() {
             Token::Ident(s) => s,
+            // v7.37.5 β-P2 — `INTERVAL` lexes as a reserved keyword
+            // (Token::Interval) since v7.9.25 to drive the `INTERVAL
+            // '<span>'` literal grammar. As a column type it lands
+            // here directly; downstream resolution still uses the
+            // canonical lowercase string.
+            Token::Interval => "interval".to_string(),
             other => {
                 return Err(ParseError {
                     message: format!("expected column type, got {other:?}"),
@@ -8120,16 +8126,28 @@ impl Parser {
                 // or escape form (`'\\x05\\x00'`). Closes
                 // mailrs D-pre #3 reverse-acceptance gap.
                 "bytea" => CastTarget::Bytea,
-                // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
-                // `::macaddr`. SPG stores these as Text (Phase 7);
-                // the cast is a no-op passthrough so containment
-                // and overlap operators can read the textual form.
-                "inet" | "cidr" | "macaddr" => CastTarget::Text,
+                // v7.37.5 ship triage — generic typed-cast escape.
+                // Anything the long-tail PG type ident table knows
+                // about(network/bit/geometry/multirange/etc.)flows
+                // through `CastTarget::Named(canonical)`; the engine
+                // resolves via `column_type_to_data_type` and dispatches
+                // through the typed `coerce_value` path. Truly
+                // unrecognised idents still hit the error arm below
+                // because the engine rejects them.
                 other => {
-                    return Err(ParseError {
-                        message: format!("unsupported cast target `::{other}`"),
-                        token_pos: self.pos.saturating_sub(1),
-                    });
+                    // Optional postfix `[]` widens to the array form —
+                    // `::BOOL[]`, `::NUMERIC[]`, `::SMALLINT[]`, etc.
+                    // The engine's `type_name_to_data_type` recognises
+                    // the canonical `<ty>_array` form.
+                    let mut name = other.to_string();
+                    if matches!(self.peek(), Token::LBracket)
+                        && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                    {
+                        self.advance();
+                        self.advance();
+                        name.push_str("_array");
+                    }
+                    CastTarget::Named(name)
                 }
             },
             Token::Interval => CastTarget::Interval,
@@ -8140,6 +8158,46 @@ impl Parser {
                 });
             }
         };
+        // v7.37.5 ship triage — postfix `[]` widens a scalar cast
+        // target to its array sibling. Closed-enum arms (Bool /
+        // SmallInt / Numeric / Float / Date / …) didn't carry the
+        // explicit widening that Text / Int / BigInt did, so
+        // `::BOOL[]` / `::NUMERIC[]` etc. surfaced as a parse
+        // error. The widening here mirrors the per-arm Text /
+        // Int / BigInt logic above + folds the new ζ-A first-class
+        // types through `CastTarget::Named("<ty>_array")`.
+        if matches!(self.peek(), Token::LBracket)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+        {
+            let widened = match &target {
+                CastTarget::Bool => Some(CastTarget::Named("bool_array".to_string())),
+                CastTarget::Date => Some(CastTarget::Named("date_array".to_string())),
+                CastTarget::Timestamp | CastTarget::Timestamptz => {
+                    Some(CastTarget::Named("timestamptz_array".to_string()))
+                }
+                CastTarget::Uuid => Some(CastTarget::Named("uuid_array".to_string())),
+                CastTarget::Json | CastTarget::Jsonb => {
+                    Some(CastTarget::Named("jsonb_array".to_string()))
+                }
+                CastTarget::Bytea => Some(CastTarget::Named("bytea_array".to_string())),
+                CastTarget::Interval => Some(CastTarget::Named("interval_array".to_string())),
+                CastTarget::Float => Some(CastTarget::Named("float_array".to_string())),
+                CastTarget::Named(name) => {
+                    let mut a = name.clone();
+                    a.push_str("_array");
+                    Some(CastTarget::Named(a))
+                }
+                // Int / BigInt / Text / Vector / TsVector / TsQuery /
+                // RegType / RegClass / TextArray / IntArray /
+                // BigIntArray already finalised — leave as is.
+                _ => None,
+            };
+            if let Some(w) = widened {
+                self.advance();
+                self.advance();
+                return Ok(w);
+            }
+        }
         Ok(target)
     }
 

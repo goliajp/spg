@@ -2916,7 +2916,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         },
         Expr::Cast { expr, target } => Expr::Cast {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
-            target: *target,
+            target: target.clone(),
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),

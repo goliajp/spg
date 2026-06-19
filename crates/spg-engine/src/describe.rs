@@ -192,6 +192,11 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 CastTarget::TsQuery => DataType::TsQuery,
                 CastTarget::Uuid => DataType::Uuid,
                 CastTarget::Bytea => DataType::Bytes,
+                // v7.37.5 — generic typed-cast escape. Resolve the
+                // ident to a `DataType` for prepare-time schema
+                // information; truly-unknown idents bail (describe
+                // returns None so prepare reports an Unsupported).
+                CastTarget::Named(name) => crate::conversions::type_name_to_data_type(name)?,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),

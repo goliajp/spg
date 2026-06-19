@@ -18,7 +18,10 @@ fn inet_column_type_accepted() {
     e.execute("INSERT INTO peers VALUES (1, '192.168.1.1')")
         .unwrap();
     let r = rows(e.execute("SELECT addr FROM peers").unwrap());
-    assert_eq!(r[0][0], Value::Text("192.168.1.1".into()));
+    // v7.37.5 ζ-A — INET is a first-class typed Value::Inet now,
+    // not Value::Text. The text form survives via the
+    // pgwire / CAST(addr AS TEXT) paths.
+    assert!(matches!(r[0][0], Value::Inet { .. }), "got {:?}", r[0][0]);
 }
 
 #[test]
@@ -29,7 +32,7 @@ fn cidr_column_type_accepted() {
     e.execute("INSERT INTO nets VALUES (1, '10.0.0.0/8')")
         .unwrap();
     let r = rows(e.execute("SELECT net FROM nets").unwrap());
-    assert_eq!(r[0][0], Value::Text("10.0.0.0/8".into()));
+    assert!(matches!(r[0][0], Value::Cidr { .. }), "got {:?}", r[0][0]);
 }
 
 #[test]
@@ -40,7 +43,7 @@ fn macaddr_column_type_accepted() {
     e.execute("INSERT INTO hw VALUES (1, '00:50:56:c0:00:01')")
         .unwrap();
     let r = rows(e.execute("SELECT mac FROM hw").unwrap());
-    assert_eq!(r[0][0], Value::Text("00:50:56:c0:00:01".into()));
+    assert!(matches!(r[0][0], Value::Macaddr(_)), "got {:?}", r[0][0]);
 }
 
 #[test]

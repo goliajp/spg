@@ -242,24 +242,32 @@ pub(super) fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Val
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
-    let (lt, rt) = match (l, r) {
-        (Value::Text(a), Value::Text(b)) => (a, b),
-        _ => {
-            return Err(EvalError::TypeMismatch {
+    // v7.37.5 ζ-A — INET/CIDR are first-class typed Values. Accept
+    // both the typed shape (no re-parse) and the legacy Text shape
+    // (re-parse on demand, since old columns / `'1.2.3.4'::text`
+    // literals still flow through here).
+    let to_inet = |v: &Value| -> Result<InetNet, EvalError> {
+        match v {
+            Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                Ok(InetNet {
+                    bytes: *addr,
+                    family_bytes: *family,
+                    prefix_bits: *bits,
+                })
+            }
+            Value::Text(s) => parse_inet_text(s).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("invalid inet text: {s:?}"),
+            }),
+            _ => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "inet operator requires TEXT/INET operands, got {:?} and {:?}",
-                    l.data_type(),
-                    r.data_type()
+                    "inet operator requires INET/CIDR/TEXT operands, got {:?}",
+                    v.data_type()
                 ),
-            });
+            }),
         }
     };
-    let a = parse_inet_text(lt).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("invalid inet text: {:?}", lt),
-    })?;
-    let b = parse_inet_text(rt).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("invalid inet text: {:?}", rt),
-    })?;
+    let a = to_inet(l)?;
+    let b = to_inet(r)?;
     let result = match op {
         BinOp::InetContainedByEq => inet_contained_eq(&a, &b),
         BinOp::InetContainedBy => inet_contained_eq(&a, &b) && !inet_networks_equal(&a, &b),

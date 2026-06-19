@@ -279,7 +279,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         }
         Expr::Cast { expr, target } => {
             let v = eval_expr(expr, row, ctx)?;
-            cast_value(v, *target)
+            cast_value(v, target.clone())
         }
         Expr::IsNull { expr, negated } => {
             let v = eval_expr(expr, row, ctx)?;

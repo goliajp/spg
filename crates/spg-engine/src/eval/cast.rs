@@ -171,6 +171,21 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
+        CastTarget::Named(name) => {
+            // v7.37.5 ship triage — generic typed-cast dispatch.
+            // Resolve the ident to a `DataType` and route the value
+            // through the existing `coerce_value` text-decoder for
+            // every v7.37.5 γ/δ/ε/ζ-A type that already speaks
+            // Text→typed via codec.
+            let dt = crate::conversions::type_name_to_data_type(&name).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("unsupported cast target `::{name}`"),
+                }
+            })?;
+            crate::conversions::coerce_value(v, dt, &name, 0).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("{e}"),
+            })
+        }
     }
 }
 
