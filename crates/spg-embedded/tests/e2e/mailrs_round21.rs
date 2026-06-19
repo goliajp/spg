@@ -79,11 +79,32 @@ fn big_bytea_and_text_array_survive_crash_replay() {
     db.checkpoint().unwrap();
 }
 
-/// Round-21 B — a lock recorded in a DIFFERENT host/container must
-/// report UNDECIDABLE (with a force_unlock pointer), not "locked by
-/// pid 1" (the prober's own init is always alive).
+/// Round-21 B — a lock recorded in a DIFFERENT host/container with a
+/// PID-1 owner.
+///
+/// v7.27 (round-21 acceptance, 2026-06-16): we refused the open with
+/// "different host/container" and pointed the operator at
+/// `force_unlock` — the cross-namespace case was framed as
+/// undecidable from inside.
+///
+/// v7.37.10 (round-21 follow-up, 2026-06-19 recurrence): mailrs filed
+/// a P0 saying the 2026-06-16 acceptance is itself broken — `docker
+/// compose up -d` re-creates the container with a new hostname every
+/// time, so a PID-1 owner ALWAYS surfaces as "different host" on
+/// restart even when the prior generation is dead. The right call is
+/// to skip host-identity when the recorded owner is PID 1
+/// (containerised by construction) and let the start-time check
+/// declare staleness. The test now asserts auto-recovery, no
+/// `force_unlock` required, matching the 2026-06-19 acceptance.
+///
+/// Linux-only: the recovery hinges on `/proc/<pid>/stat` start-time
+/// readability. On macOS PID 1 is `launchd` — a genuinely live system
+/// process — so the platform fallback intentionally keeps the safer
+/// pid-alive refusal there (the bug we're fixing is a containerised
+/// Linux deployment story).
+#[cfg(target_os = "linux")]
 #[test]
-fn foreign_namespace_lock_reports_undecidable() {
+fn foreign_namespace_pid1_lock_auto_recovers_on_container_restart() {
     let dir = tmpdir("lock");
     let db_path = dir.join("t.spg");
     {
@@ -91,19 +112,13 @@ fn foreign_namespace_lock_reports_undecidable() {
         db.execute("CREATE TABLE t (n BIGINT)").unwrap();
     }
     // Forge the lock as container A would have left it: pid 1,
-    // hostname that is not ours.
+    // hostname that is not ours, no start-time (pre-v7.34 shape).
     let lock = dir.join("t.spg.lock");
     std::fs::create_dir(&lock).unwrap();
     std::fs::write(lock.join("pid"), "1\ncontainer-aaaa\nboot-xyz\n").unwrap();
-    let err = Database::open_path(&db_path).unwrap_err().to_string();
-    assert!(err.contains("different host/container"), "{err}");
-    assert!(err.contains("force_unlock"), "{err}");
-    assert!(
-        !err.contains("locked by another process (pid 1)"),
-        "must not misreport pid-1 liveness: {err}"
-    );
-    // force_unlock is the documented recovery — and it works.
-    Database::force_unlock(&db_path).unwrap();
+    // v7.37.10: opens cleanly without force_unlock — the lock
+    // auto-reclaims because the recorded owner is PID 1 and the
+    // start-time check sees a clearly-stale entry.
     let mut db = Database::open_path(&db_path).unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
 }

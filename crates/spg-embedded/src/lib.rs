@@ -3872,13 +3872,39 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                 let lock_host = lines.next().unwrap_or("").trim().to_string();
                 let lock_boot = lines.next().unwrap_or("").trim().to_string();
                 let lock_start = lines.next().unwrap_or("").trim().to_string();
+                // Note(v7.37.10 design choice): we do NOT auto-reclaim a
+                // lock whose (pid, start-time) matches OUR own process.
+                // Tempting fix for the mailrs 2026-06-19 recurrence —
+                // "the prior open_path future got cancelled, its lock
+                // leaked" — but `AsyncDatabase::open_path` runs the
+                // blocking `Database::open_path` inside
+                // `tokio::task::spawn_blocking`, which CANNOT be
+                // cancelled mid-flight. When the awaiting future is
+                // dropped (pool acquire-timeout), the spawn_blocking
+                // task keeps running and STILL HOLDS the lock; auto-
+                // reclaiming would let a concurrent retry steal a live
+                // task's lock and corrupt WAL replay. The mailrs flow
+                // is correctly resolved by waiting for the in-flight
+                // replay to finish — sentori's spg-sqlx pool config
+                // needs a higher `acquire_timeout` than spg's worst-
+                // case replay time. Tracking that separately as a
+                // spg-sqlx pool-default change for v7.38.
                 // v7.27 — identity check BEFORE the pid probe. A pid
                 // recorded in another namespace is undecidable both
                 // ways (a stale lock can look held, a held lock can
                 // look stale — the unsafe direction). Old-format
                 // locks (pid only) keep the legacy same-host
                 // assumption.
-                if !lock_host.is_empty() {
+                // v7.37.10 — skip host_identity when the recorded owner
+                // is PID 1. PID 1 means containerised; `docker compose
+                // up -d` recreates the container with a new hostname so
+                // a strict host-identity match would refuse every
+                // restart even when the start-time check below would
+                // correctly declare the old generation stale. The
+                // start-time check is more accurate for the container
+                // case anyway — let it decide.
+                let lock_is_pid1 = owner == Some(1);
+                if !lock_host.is_empty() && !lock_is_pid1 {
                     let (my_host, my_boot) = host_identity();
                     let same_env = lock_host == my_host
                         && (lock_boot.is_empty() || my_boot.is_empty() || lock_boot == my_boot);
@@ -3907,15 +3933,25 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                 //  - genuine double-open (same live process): start-time
                 //    matches (it wrote it) → held — correctly refused, so a
                 //    second writer can't steal a live lock.
-                // An empty/uncomparable start-time (old-format lock or a
-                // non-Linux owner with no /proc) falls back to the
-                // pid-alive answer (the pre-v7.34 behaviour).
+                // v7.37.10 — for PID-1 owners with no recorded start-time
+                // (a pre-v7.34 lock from a previous container generation),
+                // treat as stale: a new container's PID 1 cannot share
+                // identity with the previous container's PID 1. Gated on
+                // `process_start_time` having returned `Some(_)` so the
+                // arm only fires on Linux (where /proc is queryable); on
+                // macOS, where PID 1 is `launchd` (a real long-running
+                // system process), the empty-start-time fallback keeps
+                // the safer pid-alive answer.
                 let owner_alive = owner.is_some_and(|p| {
-                    pid_alive(p)
-                        && match process_start_time(p) {
-                            Some(now) if !lock_start.is_empty() => now == lock_start,
-                            _ => true,
-                        }
+                    if !pid_alive(p) {
+                        return false;
+                    }
+                    let now = process_start_time(p);
+                    match (now, lock_start.is_empty()) {
+                        (Some(t), false) => t == lock_start,
+                        (Some(_), true) if p == 1 => false,
+                        _ => true,
+                    }
                 });
                 if owner_alive {
                     return Err(EngineError::Unsupported(format!(

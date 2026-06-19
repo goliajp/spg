@@ -124,6 +124,57 @@ fn reused_pid_lock_is_reclaimed_via_start_time() {
     let _db = Database::open_path(&p).unwrap();
 }
 
+/// v7.37.10 (mailrs 2026-06-19 recurrence) — container PID-1 restart
+/// MUST recover without intervention. The pre-fix behaviour refused
+/// with "different host" because `docker compose up -d` recreates the
+/// container with a new hostname, so the lock file's recorded hostname
+/// never matched the prober's. Skip the host-identity check when the
+/// recorded owner is PID 1; the start-time check below is more accurate
+/// for the container case and correctly declares the prior generation
+/// stale.
+#[cfg(target_os = "linux")]
+#[test]
+fn container_pid1_lock_recovers_across_hostname_change() {
+    let p = tmpdb("container-pid1-hostname");
+    let mut lock_path = p.clone();
+    let name = lock_path.file_name().unwrap().to_os_string();
+    let mut s = name.clone();
+    s.push(".lock");
+    lock_path.set_file_name(s);
+    std::fs::create_dir_all(&lock_path).unwrap();
+    // Owner = pid 1 (containerised), recorded on a hostname that is
+    // NOT this process's host, with a start-time that cannot match
+    // pid 1's current /proc/1/stat (we use "1" — a sentinel from
+    // boot jiffies that will never be the actual value at test time).
+    std::fs::write(
+        lock_path.join("pid"),
+        "1\nold-container-7eb2c\nbootabc\n1\n",
+    )
+    .unwrap();
+    // Reclaimed without force_unlock — clean open succeeds.
+    let _db = Database::open_path(&p).unwrap();
+}
+
+/// v7.37.10 — pre-v7.34 lock format (no start-time line) on a PID-1
+/// owner is unambiguously stale in containers, because the previous
+/// container's PID 1 cannot share identity with the new container's
+/// PID 1. Treat as stale and reclaim.
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_pid1_lock_without_start_time_is_reclaimed() {
+    let p = tmpdb("legacy-pid1-no-start");
+    let mut lock_path = p.clone();
+    let name = lock_path.file_name().unwrap().to_os_string();
+    let mut s = name.clone();
+    s.push(".lock");
+    lock_path.set_file_name(s);
+    std::fs::create_dir_all(&lock_path).unwrap();
+    // Owner = pid 1, no host, no boot, no start-time — pre-v7.34
+    // lock shape from an old container generation that died unclean.
+    std::fs::write(lock_path.join("pid"), "1\n").unwrap();
+    let _db = Database::open_path(&p).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn live_self_lock_with_matching_start_time_is_held() {
