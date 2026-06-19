@@ -35,6 +35,21 @@ pub static BATCHED_SCALAR_KEYED_PROBE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static BATCHED_SCALAR_FALL_THROUGH_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.4 A' — EXISTS path counters. Distinguish whether mailrs
+/// prod's 2-column NOT EXISTS goes through the cheap
+/// `try_batch_correlated_exists` (one inner scan + per-row hash
+/// probe) or the slow `pull_up_exists_sublinks` rewrite (rejects
+/// multi-column correlation today). Ablation finding 2026-06-19:
+/// the NOT EXISTS conjunct in `/api/conversations` costs ~165 ms
+/// per 100k bench iteration — figure out which path is actually
+/// being taken.
+pub static EXISTS_PULLUP_FIRE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static EXISTS_BATCH_FIRE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static EXISTS_BATCH_FALL_THROUGH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -139,6 +154,12 @@ impl Engine {
                     let built = self
                         .try_batch_correlated_exists(sub, cancel)?
                         .map(alloc::rc::Rc::new);
+                    if built.is_some() {
+                        EXISTS_BATCH_FIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        EXISTS_BATCH_FALL_THROUGH_COUNT
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                     eplan.push(built);
                 }
                 m.exists_plans.insert(key, eplan);
@@ -1969,6 +1990,99 @@ impl Engine {
         let Some(where_expr) = stmt.where_.take() else {
             return false;
         };
+        // v7.37.4 A'' — pre-disambiguate outer unqualified column refs
+        // whose name would collide with a future pulled-up inner
+        // table's columns. mailrs `/api/conversations` uses bare
+        // `thread_id != ''` in outer WHERE; once we add
+        // `__exsj_0 LEFT JOIN snoozed_conversations` (also with a
+        // `thread_id` column), the resolver raises "ambiguous column".
+        // Conservative: scan EXISTS / NOT EXISTS subqueries in the
+        // WHERE we just took out, look up each inner plain-table's
+        // column set, and for every collision column that exists in
+        // exactly one outer table, pre-qualify it to that owning alias.
+        let outer_aliases_lc: alloc::collections::BTreeSet<String> = {
+            let from = stmt.from.as_ref().expect("from present");
+            let mut s = alloc::collections::BTreeSet::new();
+            let push = |s: &mut alloc::collections::BTreeSet<String>, t: &TableRef| {
+                s.insert(
+                    t.alias
+                        .clone()
+                        .unwrap_or_else(|| t.name.clone())
+                        .to_ascii_lowercase(),
+                );
+            };
+            push(&mut s, &from.primary);
+            for j in &from.joins {
+                push(&mut s, &j.table);
+            }
+            s
+        };
+        let mut collision_names: alloc::collections::BTreeSet<String> =
+            alloc::collections::BTreeSet::new();
+        for c in reorder::split_and_conjunctions(&where_expr) {
+            let inner_subq: Option<&SelectStatement> = match c {
+                Expr::Exists { subquery, .. } => Some(subquery.as_ref()),
+                Expr::Unary {
+                    op: UnOp::Not,
+                    expr,
+                } => match expr.as_ref() {
+                    Expr::Exists { subquery, .. } => Some(subquery.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(inner) = inner_subq else { continue };
+            let Some(from) = &inner.from else { continue };
+            if !from.joins.is_empty() {
+                continue;
+            }
+            let Some(t) = self.active_catalog().get(&from.primary.name) else {
+                continue;
+            };
+            for col in &t.schema().columns {
+                collision_names.insert(col.name.to_ascii_lowercase());
+            }
+        }
+        let mut where_expr = where_expr;
+        if !collision_names.is_empty() {
+            let from = stmt.from.as_ref().expect("from present");
+            let outer_tables: Vec<(String, String)> = {
+                let mut v = Vec::new();
+                let collect = |v: &mut Vec<(String, String)>, t: &TableRef| {
+                    let alias = t.alias.clone().unwrap_or_else(|| t.name.clone());
+                    v.push((alias, t.name.clone()));
+                };
+                collect(&mut v, &from.primary);
+                for j in &from.joins {
+                    collect(&mut v, &j.table);
+                }
+                v
+            };
+            let mut owner: alloc::collections::BTreeMap<String, String> =
+                alloc::collections::BTreeMap::new();
+            for col_lc in &collision_names {
+                let mut matches: Vec<String> = Vec::new();
+                for (alias, tname) in &outer_tables {
+                    let Some(t) = self.active_catalog().get(tname) else {
+                        continue;
+                    };
+                    if t.schema()
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(col_lc))
+                    {
+                        matches.push(alias.clone());
+                    }
+                }
+                if matches.len() == 1 {
+                    owner.insert(col_lc.clone(), matches.remove(0));
+                }
+            }
+            if !owner.is_empty() {
+                disambiguate_stmt_unqualified_columns(stmt, &owner, &outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(&mut where_expr, &owner, &outer_aliases_lc);
+            }
+        }
         let outer_aliases: alloc::collections::BTreeSet<String> = {
             let from = stmt.from.as_ref().expect("from present");
             let mut s = alloc::collections::BTreeSet::new();
@@ -2042,6 +2156,7 @@ impl Engine {
             stmt.where_ = Some(where_expr);
             return false;
         }
+        EXISTS_PULLUP_FIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if !new_joins.is_empty() {
             stmt.from
                 .as_mut()
@@ -2218,7 +2333,24 @@ impl Engine {
                 .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
         };
         let w = inner.where_.as_ref()?;
-        let mut corr: Option<(String, ColumnName)> = None;
+        // v7.37.4 A'' (mailrs prod /api/conversations 2-col anti-join) —
+        // accept multi-column correlation. Today's single-pair restriction
+        // forced mailrs's
+        //   NOT EXISTS (SELECT 1 FROM sc WHERE sc.thread_id = m.thread_id
+        //                                  AND sc.account_address = mb.user_address
+        //                                  AND sc.snoozed_until > 0)
+        // to fall back to the batch `try_batch_correlated_exists` path,
+        // which builds the inner set fine but then pays a per-row host-
+        // expression clone + AST walk + eval to splice each EXISTS node
+        // into a Bool literal (line 194-211 above). 100k join survivors ×
+        // ~1.5 µs per splice = ~150 ms on the mini cold bench. Pulling
+        // multi-col is the same shape SPG / PG / MySQL / MariaDB plan a
+        // multi-key anti-join: LEFT JOIN sc ON (sc.thread_id = m.thread_id
+        //   AND sc.account_address = mb.user_address [AND inner preds])
+        // + WHERE sc.<first key> IS NULL. NULL semantics: a NULL on any
+        // join key means no match, identical to NOT EXISTS three-valued
+        // logic (the IS NULL probe matches the pad row).
+        let mut corr_pairs: Vec<(String, ColumnName)> = Vec::new();
         let mut rest: Vec<Expr> = Vec::new();
         for c in reorder::split_and_conjunctions(w) {
             if let Expr::Binary {
@@ -2236,10 +2368,7 @@ impl Engine {
                     None
                 };
                 if let Some(p) = pair {
-                    if corr.is_some() {
-                        return None;
-                    }
-                    corr = Some(p);
+                    corr_pairs.push(p);
                     continue;
                 }
             }
@@ -2248,29 +2377,49 @@ impl Engine {
             }
             rest.push(c.clone());
         }
-        let (inner_key, outer_col) = corr?;
-        // EXISTS (semi-join) requires uniqueness so the INNER JOIN can't
-        // multiply outer rows. NOT EXISTS (anti-join) uses LEFT + IS NULL
-        // and is safe regardless.
-        if !negated && !self.column_is_single_unique(&inner_table, &inner_key) {
+        if corr_pairs.is_empty() {
             return None;
         }
+        // EXISTS (semi-join) requires uniqueness on EVERY inner key so
+        // the INNER JOIN can't multiply outer rows when more than one
+        // inner row matches the tuple. NOT EXISTS (anti-join) uses
+        // LEFT + IS NULL and is safe regardless of inner key uniqueness:
+        // duplicate inner matches collapse into "matched" for the
+        // anti-join probe.
+        if !negated {
+            // For multi-col EXISTS today we conservatively require each
+            // inner column to carry a single-column UNIQUE / PRIMARY KEY
+            // — the join cardinality guarantee is per-column. A truer
+            // composite-unique gate could relax this; the prod hot
+            // path (mailrs) is negated so deferring is safe.
+            for (k, _) in &corr_pairs {
+                if !self.column_is_single_unique(&inner_table, k) {
+                    return None;
+                }
+            }
+        }
         let fresh = alloc::format!("__exsj_{alias_n}");
-        let key_eq = Expr::Binary {
+        // Build the ON conjunction: every (inner_key = outer_col) pair
+        // joined by AND, then folded with the all-inner residual.
+        let mut on_iter = corr_pairs.iter().map(|(ik, oc)| Expr::Binary {
             lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
                 qualifier: Some(fresh.clone()),
-                name: inner_key.clone(),
+                name: ik.clone(),
             })),
             op: BinOp::Eq,
-            rhs: alloc::boxed::Box::new(Expr::Column(outer_col)),
-        };
+            rhs: alloc::boxed::Box::new(Expr::Column(oc.clone())),
+        });
+        let first_key_eq = on_iter
+            .next()
+            .expect("corr_pairs non-empty post `is_empty()` gate");
         let on = rest
             .into_iter()
             .map(|mut e| {
                 rename_qualifier(&mut e, &inner_alias, &fresh);
                 e
             })
-            .fold(key_eq, |acc, pred| Expr::Binary {
+            .chain(on_iter)
+            .fold(first_key_eq, |acc, pred| Expr::Binary {
                 lhs: alloc::boxed::Box::new(acc),
                 op: BinOp::And,
                 rhs: alloc::boxed::Box::new(pred),
@@ -2293,12 +2442,15 @@ impl Engine {
             on: Some(on),
         };
         let residual = if negated {
-            // anti-join: keep only outer rows whose LEFT-JOIN extension
-            // was a NULL pad — i.e. no match in the inner table.
+            // anti-join: pick the FIRST inner key as the IS NULL probe.
+            // Any IS NULL on a joined-side column is sufficient — the
+            // LEFT-JOIN pad row sets ALL inner columns to NULL atomically,
+            // so a single column witnesses "no match".
+            let probe_key = corr_pairs[0].0.clone();
             Some(Expr::IsNull {
                 expr: alloc::boxed::Box::new(Expr::Column(ColumnName {
                     qualifier: Some(fresh),
-                    name: inner_key,
+                    name: probe_key,
                 })),
                 negated: false,
             })
@@ -2451,6 +2603,117 @@ fn proj_has_disqualifying_shape(
                 || proj_has_disqualifying_shape(index, inner_alias, outer_aliases)
         }
         _ => false,
+    }
+}
+
+/// v7.37.4 A'' — walk every Expr field of a SelectStatement and
+/// qualify any unqualified column whose name is in `owner`. Skips
+/// nested subqueries' bodies (they own their own scope) but covers
+/// SELECT items, WHERE, GROUP BY, HAVING, ORDER BY, and the
+/// outer FROM clause's join ON predicates. Pulled-up join names
+/// (`__exsj_*` / `__cl1_*` / `__plj_*`) are NOT in `owner`, so this
+/// pass is idempotent under re-runs.
+fn disambiguate_stmt_unqualified_columns(
+    stmt: &mut SelectStatement,
+    owner: &alloc::collections::BTreeMap<String, String>,
+    outer_aliases_lc: &alloc::collections::BTreeSet<String>,
+) {
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+        }
+    }
+    if let Some(from) = &mut stmt.from {
+        for j in &mut from.joins {
+            if let Some(on) = &mut j.on {
+                disambiguate_expr_unqualified_columns(on, owner, outer_aliases_lc);
+            }
+        }
+    }
+    if let Some(g) = &mut stmt.group_by {
+        for e in g.iter_mut() {
+            disambiguate_expr_unqualified_columns(e, owner, outer_aliases_lc);
+        }
+    }
+    if let Some(h) = &mut stmt.having {
+        disambiguate_expr_unqualified_columns(h, owner, outer_aliases_lc);
+    }
+    for ob in &mut stmt.order_by {
+        disambiguate_expr_unqualified_columns(&mut ob.expr, owner, outer_aliases_lc);
+    }
+}
+
+fn disambiguate_expr_unqualified_columns(
+    e: &mut Expr,
+    owner: &alloc::collections::BTreeMap<String, String>,
+    outer_aliases_lc: &alloc::collections::BTreeSet<String>,
+) {
+    match e {
+        Expr::Column(c) => {
+            if c.qualifier.is_none()
+                && let Some(alias) = owner.get(&c.name.to_ascii_lowercase())
+            {
+                c.qualifier = Some(alias.clone());
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            disambiguate_expr_unqualified_columns(lhs, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(rhs, owner, outer_aliases_lc);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                disambiguate_expr_unqualified_columns(a, owner, outer_aliases_lc);
+            }
+        }
+        Expr::AggregateOrdered {
+            call,
+            order_by,
+            filter,
+            ..
+        } => {
+            disambiguate_expr_unqualified_columns(call, owner, outer_aliases_lc);
+            for ob in order_by.iter_mut() {
+                disambiguate_expr_unqualified_columns(&mut ob.expr, owner, outer_aliases_lc);
+            }
+            if let Some(f) = filter {
+                disambiguate_expr_unqualified_columns(f, owner, outer_aliases_lc);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(pattern, owner, outer_aliases_lc);
+        }
+        Expr::InList { expr, list, .. } => {
+            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+            for it in list.iter_mut() {
+                disambiguate_expr_unqualified_columns(it, owner, outer_aliases_lc);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                disambiguate_expr_unqualified_columns(o, owner, outer_aliases_lc);
+            }
+            for (w, t) in branches.iter_mut() {
+                disambiguate_expr_unqualified_columns(w, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(t, owner, outer_aliases_lc);
+            }
+            if let Some(eb) = else_branch {
+                disambiguate_expr_unqualified_columns(eb, owner, outer_aliases_lc);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            disambiguate_expr_unqualified_columns(target, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(index, owner, outer_aliases_lc);
+        }
+        // Subquery bodies own their own scope — leave untouched.
+        _ => {}
     }
 }
 

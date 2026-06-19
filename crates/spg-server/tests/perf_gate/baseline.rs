@@ -1356,11 +1356,15 @@ fn baseline_mailrs_prod_real_100k() {
     use core::sync::atomic::Ordering;
     use spg_engine::{
         BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
-        BATCHED_SCALAR_KEYED_PROBE_COUNT,
+        BATCHED_SCALAR_KEYED_PROBE_COUNT, EXISTS_BATCH_FALL_THROUGH_COUNT, EXISTS_BATCH_FIRE_COUNT,
+        EXISTS_PULLUP_FIRE_COUNT,
     };
     let fb = BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Ordering::Relaxed);
     let pb = BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Ordering::Relaxed);
     let tb = BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
+    let epb = EXISTS_PULLUP_FIRE_COUNT.load(Ordering::Relaxed);
+    let ebb = EXISTS_BATCH_FIRE_COUNT.load(Ordering::Relaxed);
+    let etb = EXISTS_BATCH_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
     time_query(
         &mut db,
         MAILRS_PROD_REAL_SQL,
@@ -1371,11 +1375,20 @@ fn baseline_mailrs_prod_real_100k() {
     let fa = BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Ordering::Relaxed);
     let pa = BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Ordering::Relaxed);
     let ta = BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
+    let epa = EXISTS_PULLUP_FIRE_COUNT.load(Ordering::Relaxed);
+    let eba = EXISTS_BATCH_FIRE_COUNT.load(Ordering::Relaxed);
+    let eta = EXISTS_BATCH_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
     eprintln!(
         "[A'] mailrs_prod_real_100k batched-scalar: keyed_fires={} keyed_probes={} fall_through={}",
         fa - fb,
         pa - pb,
         ta - tb,
+    );
+    eprintln!(
+        "[A'] mailrs_prod_real_100k EXISTS: pullup_fires={} batch_fires={} batch_fall_through={}",
+        epa - epb,
+        eba - ebb,
+        eta - etb,
     );
 }
 
@@ -1566,6 +1579,231 @@ fn baseline_mailrs_prod_no_subq_100k() {
         10,
         "mailrs_prod_no_subq_100k",
         10_000.0,
+    );
+}
+
+// v7.37.4 A' ablation panel — finer-grained than the prod_no_* family.
+// Each constant drops ONE structural element from MAILRS_PROD_REAL_SQL
+// so the per-element cost lands as a clean delta on the same 100k seed.
+
+// prod_real - NOT EXISTS (snoozed_conversations anti-join). The
+// pull_up_exists_sublinks rewrite (v7.34.2) should already turn this
+// into a hash anti-join, but per-row vs amortised cost matters when
+// outer width is 14 aggs.
+const MAILRS_PROD_NO_NOT_EXISTS_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       BOOL_OR((m.flags & 4) != 0), \
+       COALESCE( \
+         (SELECT LEFT(ea_snip.summary, 80) FROM email_analysis ea_snip \
+            JOIN messages m_snip ON ea_snip.message_id = m_snip.id \
+           WHERE m_snip.thread_id = m.thread_id \
+             AND ea_snip.summary IS NOT NULL \
+             AND ea_snip.summary != '' \
+           ORDER BY m_snip.internal_date DESC LIMIT 1), \
+         (SELECT LEFT(m3.text_body, 80) FROM messages m3 \
+           WHERE m3.thread_id = m.thread_id \
+             AND m3.text_body IS NOT NULL \
+             AND m3.text_body != '' \
+           ORDER BY m3.internal_date DESC LIMIT 1), \
+         ''), \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+// prod_real - HAVING. Replace the two bool_or HAVING preds with
+// constant TRUE so every group passes; isolates the per-group HAVING
+// eval cost from the rest of the post-aggregate path.
+const MAILRS_PROD_NO_HAVING_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       BOOL_OR((m.flags & 4) != 0), \
+       COALESCE( \
+         (SELECT LEFT(ea_snip.summary, 80) FROM email_analysis ea_snip \
+            JOIN messages m_snip ON ea_snip.message_id = m_snip.id \
+           WHERE m_snip.thread_id = m.thread_id \
+             AND ea_snip.summary IS NOT NULL \
+             AND ea_snip.summary != '' \
+           ORDER BY m_snip.internal_date DESC LIMIT 1), \
+         (SELECT LEFT(m3.text_body, 80) FROM messages m3 \
+           WHERE m3.thread_id = m.thread_id \
+             AND m3.text_body IS NOT NULL \
+             AND m3.text_body != '' \
+           ORDER BY m3.internal_date DESC LIMIT 1), \
+         ''), \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+// prod_real - DISTINCT family. Replace the 4 COUNT(DISTINCT CASE …)
+// + string_agg(DISTINCT …) with their non-distinct counterparts.
+// Confirms (or refutes) the 95 ms DISTINCT estimate from the
+// minimal → minimal+DISTINCT gap.
+const MAILRS_PROD_NO_DISTINCT_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(m.sender, ','), \
+       COUNT(CASE WHEN m.message_id != '' \
+                  THEN m.message_id \
+                  ELSE CAST(m.id AS TEXT) END), \
+       COUNT(CASE WHEN (m.flags & 1) = 0 \
+                  THEN CASE WHEN m.message_id != '' \
+                            THEN m.message_id \
+                            ELSE CAST(m.id AS TEXT) END \
+                  END), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       BOOL_OR((m.flags & 4) != 0), \
+       COALESCE( \
+         (SELECT LEFT(ea_snip.summary, 80) FROM email_analysis ea_snip \
+            JOIN messages m_snip ON ea_snip.message_id = m_snip.id \
+           WHERE m_snip.thread_id = m.thread_id \
+             AND ea_snip.summary IS NOT NULL \
+             AND ea_snip.summary != '' \
+           ORDER BY m_snip.internal_date DESC LIMIT 1), \
+         (SELECT LEFT(m3.text_body, 80) FROM messages m3 \
+           WHERE m3.thread_id = m.thread_id \
+             AND m3.text_body IS NOT NULL \
+             AND m3.text_body != '' \
+           ORDER BY m3.internal_date DESC LIMIT 1), \
+         ''), \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                  THEN m.message_id \
+                  WHEN mb.name = 'Sent' \
+                  THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+#[test]
+#[ignore = "P0 mailrs A' ablation; --include-ignored to run"]
+fn baseline_mailrs_prod_no_not_exists_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_NOT_EXISTS_SQL,
+        10,
+        "mailrs_prod_no_not_exists_100k",
+        20_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs A' ablation; --include-ignored to run"]
+fn baseline_mailrs_prod_no_having_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_HAVING_SQL,
+        10,
+        "mailrs_prod_no_having_100k",
+        20_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs A' ablation; --include-ignored to run"]
+fn baseline_mailrs_prod_no_distinct_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_DISTINCT_SQL,
+        10,
+        "mailrs_prod_no_distinct_100k",
+        20_000.0,
     );
 }
 
