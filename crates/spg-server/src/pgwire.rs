@@ -1547,6 +1547,22 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
             Ok(Value::Timestamp(pg_micros + PG_EPOCH_MICROS_FROM_UNIX))
         }
         1700 => decode_binary_numeric(bytes),
+        2950 => {
+            // v7.37.5 — PG `uuid` binary format is the raw 16-byte
+            // RFC 4122 value (network byte order is irrelevant for
+            // an opaque 128-bit identifier; PG ships the bytes as
+            // stored). sqlx-postgres and other typed drivers send
+            // UUID parameters in this format by default.
+            if bytes.len() != 16 {
+                return Err(format!(
+                    "Bind binary UUID must be 16 bytes, got {}",
+                    bytes.len()
+                ));
+            }
+            let mut b = [0u8; 16];
+            b.copy_from_slice(bytes);
+            Ok(Value::Uuid(b))
+        }
         0 => Err(
             "Bind: binary format requires the parameter OID to be declared in Parse \
              (got OID=0 meaning unknown)"
@@ -3712,5 +3728,30 @@ mod tests {
         assert!(parse_copy_intent("SELECT 1").is_none());
         // File-based COPY: pgwire intentionally doesn't handle.
         assert!(parse_copy_intent("COPY t FROM '/etc/passwd'").is_none());
+    }
+
+    /// v7.37.5 α — `decode_binary_param` OID 2950 (UUID) round-trips the
+    /// raw 16-byte RFC 4122 payload that sqlx-postgres and other typed
+    /// drivers send for typed `Uuid` parameters in binary format.
+    #[test]
+    fn decode_binary_param_uuid_16_bytes_round_trip() {
+        let bytes = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        let v = decode_binary_param(2950, &bytes).expect("UUID binary BIND must succeed");
+        match v {
+            spg_storage::Value::Uuid(b) => assert_eq!(b, bytes),
+            other => panic!("expected Value::Uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_param_uuid_rejects_wrong_length() {
+        for &len in &[0usize, 1, 8, 15, 17, 32] {
+            let bytes = vec![0u8; len];
+            let r = decode_binary_param(2950, &bytes);
+            assert!(r.is_err(), "len={len} must reject (UUID is 16 bytes)");
+        }
     }
 }
