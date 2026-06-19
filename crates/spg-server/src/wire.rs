@@ -138,6 +138,16 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::BytesArray
         | DataType::VarcharArray
         | DataType::CharArray
+        // v7.37.5 ε — geometry collapses to PG external text
+        // forms ((x,y) / [(x1,y1),(x2,y2)] / etc). RowDescription
+        // advertises 600/601/602/603/604/628/718.
+        | DataType::Point
+        | DataType::Lseg
+        | DataType::Path
+        | DataType::PgBox
+        | DataType::Polygon
+        | DataType::Line
+        | DataType::Circle
         // v7.37.5 δ — multirange collapses to PG external text
         // form `{[a,b),[c,d)}` on the wire. RowDescription
         // advertises 4451/4537/4536/4533/4534/4535 via
@@ -298,6 +308,18 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Multirange { kind: _, ranges } => {
             WireValue::Text(spg_engine::format_multirange(ranges))
         }
+        // v7.37.5 ε — geometry external forms.
+        Value::Point(p) => WireValue::Text(spg_engine::format_point(*p)),
+        Value::Lseg(p1, p2) => WireValue::Text(spg_engine::format_lseg(*p1, *p2)),
+        Value::PgBox(ur, ll) => WireValue::Text(spg_engine::format_pg_box(*ur, *ll)),
+        Value::Line { a, b, c } => WireValue::Text(spg_engine::format_line(*a, *b, *c)),
+        Value::Circle { center, radius } => {
+            WireValue::Text(spg_engine::format_circle(*center, *radius))
+        }
+        Value::Path { points, closed } => {
+            WireValue::Text(spg_engine::format_path(points, *closed))
+        }
+        Value::Polygon(points) => WireValue::Text(spg_engine::format_polygon(points)),
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

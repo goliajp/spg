@@ -901,6 +901,191 @@ pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
     out
 }
 
+/// v7.37.5 ε — render a Point as PG canonical `(x,y)`.
+pub fn format_point(p: spg_storage::Point2D) -> alloc::string::String {
+    alloc::format!("({},{})", p.x, p.y)
+}
+
+/// v7.37.5 ε — render an Lseg as PG canonical `[(x1,y1),(x2,y2)]`.
+pub fn format_lseg(p1: spg_storage::Point2D, p2: spg_storage::Point2D) -> alloc::string::String {
+    alloc::format!("[({},{}),({},{})]", p1.x, p1.y, p2.x, p2.y)
+}
+
+/// v7.37.5 ε — render a Box as PG canonical `(ux,uy),(lx,ly)`.
+/// PG normalises the corner order on input; we trust the engine's
+/// constructor has already normalised so the field order here is
+/// the canonical upper-right + lower-left.
+pub fn format_pg_box(ur: spg_storage::Point2D, ll: spg_storage::Point2D) -> alloc::string::String {
+    alloc::format!("({},{}),({},{})", ur.x, ur.y, ll.x, ll.y)
+}
+
+/// v7.37.5 ε — render a Line as PG canonical `{a,b,c}` (Ax+By+C=0).
+pub fn format_line(a: f64, b: f64, c: f64) -> alloc::string::String {
+    alloc::format!("{{{},{},{}}}", a, b, c)
+}
+
+/// v7.37.5 ε — render a Circle as PG canonical `<(x,y),r>`.
+pub fn format_circle(center: spg_storage::Point2D, radius: f64) -> alloc::string::String {
+    alloc::format!("<({},{}),{}>", center.x, center.y, radius)
+}
+
+/// v7.37.5 ε — render a Path as PG canonical `[(x,y),...]` open
+/// or `((x,y),...)` closed.
+pub fn format_path(points: &[spg_storage::Point2D], closed: bool) -> alloc::string::String {
+    let (open, close) = if closed { ('(', ')') } else { ('[', ']') };
+    let mut out = alloc::string::String::new();
+    out.push(open);
+    for (i, p) in points.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&alloc::format!("({},{})", p.x, p.y));
+    }
+    out.push(close);
+    out
+}
+
+/// v7.37.5 ε — render a Polygon as PG canonical `((x,y),...)`.
+pub fn format_polygon(points: &[spg_storage::Point2D]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    out.push('(');
+    for (i, p) in points.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&alloc::format!("({},{})", p.x, p.y));
+    }
+    out.push(')');
+    out
+}
+
+/// v7.37.5 ε — parse a single `(x,y)` or bare `x,y` Point text.
+/// Surrounding whitespace OK. Returns `None` on malformed input.
+fn parse_point(s: &str) -> Option<spg_storage::Point2D> {
+    let s = s.trim();
+    let inner = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(s);
+    let (xs, ys) = inner.split_once(',')?;
+    let x: f64 = xs.trim().parse().ok()?;
+    let y: f64 = ys.trim().parse().ok()?;
+    Some(spg_storage::Point2D { x, y })
+}
+
+/// v7.37.5 ε — parse N points from a comma-separated PG point
+/// list (`(x1,y1),(x2,y2),...`). Depth-aware split so the commas
+/// inside each `(...)` aren't taken as separators. Returns `None`
+/// on malformed input.
+fn parse_point_list(s: &str) -> Option<Vec<spg_storage::Point2D>> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<spg_storage::Point2D> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for i in 0..=bytes.len() {
+        let cut = i == bytes.len() || (depth == 0 && bytes[i] == b',');
+        if !cut {
+            match bytes.get(i) {
+                Some(b'(') | Some(b'[') | Some(b'<') => depth += 1,
+                Some(b')') | Some(b']') | Some(b'>') => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        let piece = s[start..i].trim();
+        if !piece.is_empty() {
+            out.push(parse_point(piece)?);
+        }
+        start = i + 1;
+    }
+    Some(out)
+}
+
+/// v7.37.5 ε — parse Lseg text `[(x1,y1),(x2,y2)]`.
+pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Point2D)> {
+    let s = s.trim();
+    let inner = s.strip_prefix('[').and_then(|x| x.strip_suffix(']'))?;
+    let pts = parse_point_list(inner)?;
+    if pts.len() != 2 {
+        return None;
+    }
+    Some((pts[0], pts[1]))
+}
+
+/// v7.37.5 ε — parse Box text `(ux,uy),(lx,ly)`. PG normalises
+/// any two-corner input into upper-right + lower-left; we do
+/// the same.
+pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Point2D)> {
+    let pts = parse_point_list(s)?;
+    if pts.len() != 2 {
+        return None;
+    }
+    let (a, b) = (pts[0], pts[1]);
+    // Normalise: upper-right has the larger x AND larger y.
+    let ur = spg_storage::Point2D { x: a.x.max(b.x), y: a.y.max(b.y) };
+    let ll = spg_storage::Point2D { x: a.x.min(b.x), y: a.y.min(b.y) };
+    Some((ur, ll))
+}
+
+/// v7.37.5 ε — parse Line text `{a,b,c}`.
+pub fn parse_line_text(s: &str) -> Option<(f64, f64, f64)> {
+    let s = s.trim();
+    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}'))?;
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let a: f64 = parts[0].trim().parse().ok()?;
+    let b: f64 = parts[1].trim().parse().ok()?;
+    let c: f64 = parts[2].trim().parse().ok()?;
+    Some((a, b, c))
+}
+
+/// v7.37.5 ε — parse Circle text `<(x,y),r>` or `((x,y),r)`.
+pub fn parse_circle_text(s: &str) -> Option<(spg_storage::Point2D, f64)> {
+    let s = s.trim();
+    let inner = if let Some(i) = s.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+        i
+    } else {
+        s.strip_prefix('(').and_then(|x| x.strip_suffix(')'))?
+    };
+    // The last comma at depth 0 splits the center from the radius.
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut split_at: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => depth -= 1,
+            b',' if depth == 0 => split_at = Some(i),
+            _ => {}
+        }
+    }
+    let i = split_at?;
+    let center = parse_point(&inner[..i])?;
+    let radius: f64 = inner[i + 1..].trim().parse().ok()?;
+    Some((center, radius))
+}
+
+/// v7.37.5 ε — parse Path text `[(x,y),...]` (open) or
+/// `((x,y),...)` (closed). The leading bracket pins openness.
+pub fn parse_path_text(s: &str) -> Option<(Vec<spg_storage::Point2D>, bool)> {
+    let s = s.trim();
+    let (closed, inner) = if let Some(i) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        (false, i)
+    } else if let Some(i) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        (true, i)
+    } else {
+        return None;
+    };
+    let pts = parse_point_list(inner)?;
+    Some((pts, closed))
+}
+
+/// v7.37.5 ε — parse Polygon text `((x,y),...)` (implicit closed).
+pub fn parse_polygon_text(s: &str) -> Option<Vec<spg_storage::Point2D>> {
+    let s = s.trim();
+    let inner = s.strip_prefix('(').and_then(|x| x.strip_suffix(')'))?;
+    parse_point_list(inner)
+}
+
 /// v7.37.5 δ — render a Multirange in PG external form
 /// `{[a,b),[c,d)}`. Empty multirange renders as `{}`. Each range
 /// element is formatted with the same `[/(/]/)` bracket grammar
@@ -1182,6 +1367,13 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
             spg_sql::ast::RangeKindAst::TsTz => spg_storage::RangeKind::TsTz,
             spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
         }),
+        ColumnTypeName::Point => DataType::Point,
+        ColumnTypeName::Lseg => DataType::Lseg,
+        ColumnTypeName::Path => DataType::Path,
+        ColumnTypeName::PgBox => DataType::PgBox,
+        ColumnTypeName::Polygon => DataType::Polygon,
+        ColumnTypeName::Line => DataType::Line,
+        ColumnTypeName::Circle => DataType::Circle,
     }
 }
 
@@ -1593,6 +1785,77 @@ pub(crate) fn coerce_value(
         },
         // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
         (v @ Value::Range { .. }, DataType::Text) => Some(Value::Text(format_range_str(&v))),
+        // v7.37.5 ε — Text → geometry coerce. Each parser returns
+        // None on malformed input; we surface a TypeMismatch with
+        // the column name so the engine error is debuggable.
+        (Value::Text(s), DataType::Point) => match parse_point(&s) {
+            Some(p) => Some(Value::Point(p)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for POINT: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::Lseg) => match parse_lseg_text(&s) {
+            Some((p1, p2)) => Some(Value::Lseg(p1, p2)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for LSEG: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::PgBox) => match parse_box_text(&s) {
+            Some((ur, ll)) => Some(Value::PgBox(ur, ll)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for BOX: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::Line) => match parse_line_text(&s) {
+            Some((a, b, c)) => Some(Value::Line { a, b, c }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for LINE: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::Circle) => match parse_circle_text(&s) {
+            Some((center, radius)) => Some(Value::Circle { center, radius }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for CIRCLE: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::Path) => match parse_path_text(&s) {
+            Some((points, closed)) => Some(Value::Path { points, closed }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for PATH: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::Polygon) => match parse_polygon_text(&s) {
+            Some(points) => Some(Value::Polygon(points)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for POLYGON: {s:?} (column `{col_name}`)"),
+                }));
+            }
+        },
+        // v7.37.5 ε — geometry → Text canonical forms.
+        (Value::Point(p), DataType::Text) => Some(Value::Text(format_point(p))),
+        (Value::Lseg(p1, p2), DataType::Text) => Some(Value::Text(format_lseg(p1, p2))),
+        (Value::PgBox(ur, ll), DataType::Text) => Some(Value::Text(format_pg_box(ur, ll))),
+        (Value::Line { a, b, c }, DataType::Text) => Some(Value::Text(format_line(a, b, c))),
+        (Value::Circle { center, radius }, DataType::Text) => {
+            Some(Value::Text(format_circle(center, radius)))
+        }
+        (Value::Path { points, closed }, DataType::Text) => {
+            Some(Value::Text(format_path(&points, closed)))
+        }
+        (Value::Polygon(points), DataType::Text) => Some(Value::Text(format_polygon(&points))),
         // v7.37.5 δ — Text → Multirange. Accepts `{}` empty and
         // `{[a,b),[c,d),...}` comma-separated ranges; each
         // subrange parses with the parent kind.

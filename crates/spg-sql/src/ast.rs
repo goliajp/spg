@@ -1515,6 +1515,16 @@ pub enum ColumnTypeName {
     /// all six builtin multiranges, kind pins the element type.
     /// Wire OIDs in pgwire.
     Multirange(RangeKindAst),
+    /// v7.37.5 ε — PG geometry scalar family. Each maps one-to-
+    /// one to a PG type: point/lseg/path/box/polygon/line/circle.
+    /// Wire OIDs in pgwire.
+    Point,
+    Lseg,
+    Path,
+    PgBox,
+    Polygon,
+    Line,
+    Circle,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1601,6 +1611,13 @@ impl fmt::Display for ColumnTypeName {
                 RangeKindAst::TsTz => "TSTZMULTIRANGE",
                 RangeKindAst::Date => "DATEMULTIRANGE",
             }),
+            Self::Point => f.write_str("POINT"),
+            Self::Lseg => f.write_str("LSEG"),
+            Self::Path => f.write_str("PATH"),
+            Self::PgBox => f.write_str("BOX"),
+            Self::Polygon => f.write_str("POLYGON"),
+            Self::Line => f.write_str("LINE"),
+            Self::Circle => f.write_str("CIRCLE"),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),

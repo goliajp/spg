@@ -62,8 +62,9 @@ pub(crate) use clock::{rewrite_clock_calls, value_to_literal};
 use constraints::*;
 use conversions::*;
 pub use conversions::{
-    format_bigint_2d_text_pub, format_hstore_text, format_int_2d_text_pub, format_multirange,
-    format_range_text, format_text_2d_text_pub,
+    format_bigint_2d_text_pub, format_circle, format_hstore_text, format_int_2d_text_pub,
+    format_line, format_lseg, format_multirange, format_path, format_pg_box, format_point,
+    format_polygon, format_range_text, format_text_2d_text_pub,
 };
 pub(crate) use ddl::{
     canonicalize_set_value, enforce_enum_label, eval_runtime_default_free,

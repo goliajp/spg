@@ -391,6 +391,13 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BytesArray => "BYTEA[]".into(),
         DataType::VarcharArray => "VARCHAR[]".into(),
         DataType::CharArray => "CHAR[]".into(),
+        DataType::Point => "POINT".into(),
+        DataType::Lseg => "LSEG".into(),
+        DataType::Path => "PATH".into(),
+        DataType::PgBox => "BOX".into(),
+        DataType::Polygon => "POLYGON".into(),
+        DataType::Line => "LINE".into(),
+        DataType::Circle => "CIRCLE".into(),
         DataType::Multirange(k) => match k {
             spg_storage::RangeKind::Int4 => "INT4MULTIRANGE".into(),
             spg_storage::RangeKind::Int8 => "INT8MULTIRANGE".into(),

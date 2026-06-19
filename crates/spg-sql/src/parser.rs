@@ -6207,6 +6207,14 @@ impl Parser {
             "tsmultirange" => ColumnTypeName::Multirange(RangeKindAst::Ts),
             "tstzmultirange" => ColumnTypeName::Multirange(RangeKindAst::TsTz),
             "datemultirange" => ColumnTypeName::Multirange(RangeKindAst::Date),
+            // v7.37.5 ε — PG geometry scalar keywords.
+            "point" => ColumnTypeName::Point,
+            "lseg" => ColumnTypeName::Lseg,
+            "path" => ColumnTypeName::Path,
+            "box" => ColumnTypeName::PgBox,
+            "polygon" => ColumnTypeName::Polygon,
+            "line" => ColumnTypeName::Line,
+            "circle" => ColumnTypeName::Circle,
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
             "hstore" => ColumnTypeName::Hstore,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM

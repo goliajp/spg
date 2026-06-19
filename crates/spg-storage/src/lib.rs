@@ -214,6 +214,26 @@ pub enum DataType {
     /// the dense type-tag side. FILE_VERSION 48+ (same window as
     /// β/γ, no separate bump).
     Multirange(RangeKind),
+    /// v7.37.5 ε — PG geometry scalar family. Mirrors PG's seven
+    /// builtin geometric types one-for-one. Body shapes (LE):
+    ///   Point   = 16 B fixed (f64 x + f64 y)            OID 600
+    ///   Lseg    = 32 B fixed (Point p1 + Point p2)      OID 601
+    ///   Path    = varlena ([u8 closed][u32 n][Point*n]) OID 602
+    ///   Box     = 32 B fixed (Point ur + Point ll)      OID 603
+    ///   Polygon = varlena ([u32 n][Point*n])            OID 604
+    ///   Line    = 24 B fixed (f64 a + f64 b + f64 c)    OID 628
+    ///   Circle  = 24 B fixed (Point center + f64 r)     OID 718
+    /// Catalog tags 50..56. FILE_VERSION 48+ (same window as β/γ/δ;
+    /// no separate bump). Geometric operators (`<->` / `@>` / `&&`
+    /// / `<<` / `>>` / `~=`) are a planner-integration follow-up,
+    /// parallel to the Range operator defer in e2e_pg_range.rs.
+    Point,
+    Lseg,
+    Path,
+    PgBox,
+    Polygon,
+    Line,
+    Circle,
     /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
     /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
     /// Catalog FILE_VERSION 20+. Storage shape is row-codec
@@ -406,6 +426,13 @@ impl fmt::Display for DataType {
                 RangeKind::TsTz => "TSTZMULTIRANGE",
                 RangeKind::Date => "DATEMULTIRANGE",
             }),
+            Self::Point => f.write_str("POINT"),
+            Self::Lseg => f.write_str("LSEG"),
+            Self::Path => f.write_str("PATH"),
+            Self::PgBox => f.write_str("BOX"),
+            Self::Polygon => f.write_str("POLYGON"),
+            Self::Line => f.write_str("LINE"),
+            Self::Circle => f.write_str("CIRCLE"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -568,6 +595,37 @@ pub enum Value {
         kind: RangeKind,
         ranges: Vec<RangeSpan>,
     },
+    /// v7.37.5 ε — PG geometry scalars. Per-type Vec/struct shape;
+    /// codec body shape is described on the matching DataType
+    /// variant. PG canonical text forms:
+    ///   Point   `(x,y)`
+    ///   Lseg    `[(x1,y1),(x2,y2)]`
+    ///   Path    open `[(x,y),(x,y),...]` / closed `((x,y),(x,y),...)`
+    ///   Box     `(ux,uy),(lx,ly)` (PG normalises to upper-right + lower-left)
+    ///   Polygon `((x,y),(x,y),...)` (implicit closed)
+    ///   Line    `{a,b,c}` (Ax + By + C = 0)
+    ///   Circle  `<(x,y),r>`
+    Point(Point2D),
+    Lseg(Point2D, Point2D),
+    /// `closed = true` is `((p,p,...))`; `false` is `[(p,p,...)]`.
+    Path {
+        points: Vec<Point2D>,
+        closed: bool,
+    },
+    /// PG `box` — stored as `(upper_right, lower_left)` (PG's
+    /// normalised order). The engine accepts both endpoint
+    /// orderings at parse time and normalises here.
+    PgBox(Point2D, Point2D),
+    Polygon(Vec<Point2D>),
+    Line {
+        a: f64,
+        b: f64,
+        c: f64,
+    },
+    Circle {
+        center: Point2D,
+        radius: f64,
+    },
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
     /// positions + weights. The engine enforces sort/dedup on
     /// construction; consumers can rely on `lexemes.windows(2)`
@@ -633,6 +691,18 @@ pub enum Value {
         empty: bool,
     },
     Null,
+}
+
+/// v7.37.5 ε — PG `point` building block. Shared by every other
+/// geometric type (lseg / path / box / polygon / circle all
+/// reduce to compositions of `Point2D`). Packed `{x: f64, y: f64}`,
+/// 16 B, on-disk LE field order matches the PG binary point
+/// format byte-for-byte (so a future binary BIND path lands
+/// without rearrangement).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point2D {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// v7.37.5 δ — single-range bounds without the kind tag. Used as
@@ -718,6 +788,13 @@ impl Value {
             Self::VarcharArray(_) => Some(DataType::VarcharArray),
             Self::CharArray(_) => Some(DataType::CharArray),
             Self::Multirange { kind, .. } => Some(DataType::Multirange(*kind)),
+            Self::Point(_) => Some(DataType::Point),
+            Self::Lseg(_, _) => Some(DataType::Lseg),
+            Self::Path { .. } => Some(DataType::Path),
+            Self::PgBox(_, _) => Some(DataType::PgBox),
+            Self::Polygon(_) => Some(DataType::Polygon),
+            Self::Line { .. } => Some(DataType::Line),
+            Self::Circle { .. } => Some(DataType::Circle),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
@@ -1098,7 +1175,17 @@ impl IndexKey {
             // v7.37.5 δ — multirange not indexable (PG uses GiST/
             // SP-GiST + a custom operator class; SPG plans the same
             // axis under v7.37.8 with ranges).
-            | Value::Multirange { .. } => None,
+            | Value::Multirange { .. }
+            // v7.37.5 ε — geometric scalars not B-tree indexable
+            // (PG uses GiST/SP-GiST for these too; SPG plans the
+            // same axis under v7.37.8).
+            | Value::Point(_)
+            | Value::Lseg(_, _)
+            | Value::Path { .. }
+            | Value::PgBox(_, _)
+            | Value::Polygon(_)
+            | Value::Line { .. }
+            | Value::Circle { .. } => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

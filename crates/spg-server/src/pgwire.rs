@@ -3459,6 +3459,14 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::BytesArray => 1001,       // _bytea
         DataType::VarcharArray => 1015,     // _varchar
         DataType::CharArray => 1014,        // _bpchar
+        // v7.37.5 ε — PG geometry OIDs (pg_type.dat).
+        DataType::Point => 600,
+        DataType::Lseg => 601,
+        DataType::Path => 602,
+        DataType::PgBox => 603,
+        DataType::Polygon => 604,
+        DataType::Line => 628,
+        DataType::Circle => 718,
         // v7.37.5 δ — PG 14+ multirange OIDs (pg_type.dat).
         DataType::Multirange(k) => match k {
             spg_storage::RangeKind::Int4 => 4451,
