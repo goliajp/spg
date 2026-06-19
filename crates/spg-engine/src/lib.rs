@@ -81,7 +81,8 @@ pub(crate) use select::{build_projection, infer_column_types, value_to_order_key
 pub(crate) use show::render_create_table;
 pub use subquery::{
     BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
-    BATCHED_SCALAR_KEYED_PROBE_COUNT, PULLUP_LIMIT1_FIRE_COUNT,
+    BATCHED_SCALAR_KEYED_PROBE_COUNT, EXISTS_BATCH_FALL_THROUGH_COUNT, EXISTS_BATCH_FIRE_COUNT,
+    EXISTS_PULLUP_FIRE_COUNT, PULLUP_LIMIT1_FIRE_COUNT,
 };
 pub(crate) use subquery::{
     build_in_list_set, collect_scalar_subqueries, expr_has_subquery, expr_tree_has_subquery,
