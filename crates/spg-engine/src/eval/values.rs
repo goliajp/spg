@@ -200,6 +200,39 @@ pub(super) fn value_to_text(v: &Value) -> String {
         Value::IntArray2D(rows) => crate::conversions::format_int_2d_text_pub(rows),
         Value::BigIntArray2D(rows) => crate::conversions::format_bigint_2d_text_pub(rows),
         Value::TextArray2D(rows) => crate::conversions::format_text_2d_text_pub(rows),
+        // v7.37.5 γ — complete array-family rendering for the
+        // ζ-A/γ/δ/ε first-class types.
+        Value::BoolArray(items) => crate::eval::format_bool_array(items),
+        Value::SmallIntArray(items) => crate::eval::format_smallint_array(items),
+        Value::FloatArray(items) => crate::eval::format_float_array(items),
+        Value::NumericArray(items) => crate::eval::format_numeric_array(items),
+        Value::DateArray(items) => crate::eval::format_date_array(items),
+        Value::TimestampArray(items) => crate::eval::format_timestamp_array(items, false),
+        Value::TimestamptzArray(items) => crate::eval::format_timestamp_array(items, true),
+        Value::UuidArray(items) => crate::eval::format_uuid_array(items),
+        Value::JsonArray(items) | Value::JsonbArray(items) => crate::eval::format_text_array(items),
+        Value::BytesArray(items) => crate::eval::format_bytea_array(items),
+        Value::IntervalArray(items) => crate::eval::format_interval_array(items),
+        Value::MoneyArray(items) => crate::conversions::format_money_array(items),
+        // v7.37.5 ε — geometry canonical PG text.
+        Value::Point(p) => crate::conversions::format_point(*p),
+        Value::Lseg(a, b) => crate::conversions::format_lseg(*a, *b),
+        Value::Path { points, closed } => crate::conversions::format_path(points, *closed),
+        Value::PgBox(ur, ll) => crate::conversions::format_pg_box(*ur, *ll),
+        Value::Polygon(points) => crate::conversions::format_polygon(points),
+        Value::Line { a, b, c } => crate::conversions::format_line(*a, *b, *c),
+        Value::Circle { center, radius } => crate::conversions::format_circle(*center, *radius),
+        // v7.37.5 δ — multirange canonical PG text.
+        Value::Multirange { ranges, .. } => crate::conversions::format_multirange(ranges),
+        // v7.37.5 ζ-A — network/MAC/bit/XML/char1.
+        Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+            crate::conversions::format_inet(*family, *bits, addr)
+        }
+        Value::Macaddr(b) => crate::conversions::format_macaddr(b),
+        Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),
+        Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
+        Value::Xml(s) => s.clone(),
+        Value::Char1(b) => format!("{}", *b as char),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }

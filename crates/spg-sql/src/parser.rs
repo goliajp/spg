@@ -6654,6 +6654,9 @@ impl Parser {
                 // element precision is per-row, not column-wide).
                 ColumnTypeName::Varchar(_) => ColumnTypeName::VarcharArray,
                 ColumnTypeName::Char(_) => ColumnTypeName::CharArray,
+                // v7.37.5 ζ-A — MONEY[] (OID 791) ship-triage
+                // follow-up.
+                ColumnTypeName::Money => ColumnTypeName::MoneyArray,
                 other => {
                     return Err(self.err(alloc::format!("{other:?}[] not yet supported")));
                 }
@@ -8135,11 +8138,43 @@ impl Parser {
                 // unrecognised idents still hit the error arm below
                 // because the engine rejects them.
                 other => {
+                    // Optional `(N[, M])` precision args — `::numeric(10,2)`,
+                    // `::varchar(255)`, etc. Capture into the canonical
+                    // `name(p,s)` form so `type_name_to_data_type` can
+                    // reconstruct the `DataType::Numeric { precision,
+                    // scale }` (and similar param-carrying types).
+                    let mut name = other.to_string();
+                    if matches!(self.peek(), Token::LParen) {
+                        let mut buf = alloc::string::String::from("(");
+                        let mut depth = 0usize;
+                        loop {
+                            match self.advance() {
+                                Token::LParen => {
+                                    depth += 1;
+                                    if depth > 1 {
+                                        buf.push('(');
+                                    }
+                                }
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        buf.push(')');
+                                        break;
+                                    }
+                                    buf.push(')');
+                                }
+                                Token::Comma => buf.push(','),
+                                Token::Integer(n) => buf.push_str(&alloc::format!("{n}")),
+                                Token::Eof => break,
+                                _ => {}
+                            }
+                        }
+                        name.push_str(&buf);
+                    }
                     // Optional postfix `[]` widens to the array form —
                     // `::BOOL[]`, `::NUMERIC[]`, `::SMALLINT[]`, etc.
                     // The engine's `type_name_to_data_type` recognises
                     // the canonical `<ty>_array` form.
-                    let mut name = other.to_string();
                     if matches!(self.peek(), Token::LBracket)
                         && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
                     {
@@ -9615,7 +9650,10 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
                 let n32 = i32::try_from(n).ok()?;
                 days = days.checked_add(n32.checked_mul(7)?)?;
             }
-            "month" => {
+            // v7.37.5 ship triage — accept PG's `format_interval`
+            // canonical output (`0 mons 0 days 0 microseconds`) so
+            // a round-trip Display → re-parse stays lossless.
+            "month" | "mon" => {
                 let n32 = i32::try_from(n).ok()?;
                 months = months.checked_add(n32)?;
             }
@@ -10619,9 +10657,14 @@ mod tests {
 
     #[test]
     fn unsupported_cast_target_errors() {
-        // `::numeric` isn't in the v1.3 cast target set.
-        let err = parse_statement("SELECT 1::numeric FROM t").unwrap_err();
-        assert!(err.message.contains("unsupported cast target"));
+        // v7.37.5 ship triage promoted the parser to accept every
+        // ident as a `CastTarget::Named(canonical)`; the engine
+        // surfaces the "unsupported cast target" error at eval
+        // time when `type_name_to_data_type` can't resolve it.
+        // Parser-side error now requires a NON-ident after `::`
+        // (e.g. a punctuation token).
+        let err = parse_statement("SELECT 1::, FROM t").unwrap_err();
+        assert!(err.message.contains("expected type ident after `::`"));
     }
 
     #[test]
