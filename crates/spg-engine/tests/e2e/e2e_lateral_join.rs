@@ -144,3 +144,61 @@ fn regular_join_still_works() {
     );
     assert_eq!(r.len(), 4);
 }
+
+// v7.37.7 (sentori Epic 4 P1) — `LEFT JOIN LATERAL … ON TRUE` shape
+// from the endpoint-probe runtime query. SPG already had head-position
+// LATERAL since v7.17.0 P0-41; this case pins the JOIN-position shape
+// sentori actually uses.
+
+#[test]
+fn left_join_lateral_on_true_matches_per_outer_row() {
+    let mut e = Engine::new();
+    // endpoint_check + endpoint_probe — sentori's exact tables.
+    e.execute(
+        "CREATE TABLE endpoint_check (
+             id BIGINT PRIMARY KEY,
+             project_id BIGINT NOT NULL,
+             url TEXT NOT NULL,
+             method TEXT NOT NULL,
+             paused BOOL NOT NULL DEFAULT FALSE
+         )",
+    )
+    .unwrap();
+    e.execute(
+        "CREATE TABLE endpoint_probe (
+             id BIGINT PRIMARY KEY,
+             check_id BIGINT NOT NULL,
+             ts TIMESTAMPTZ NOT NULL
+         )",
+    )
+    .unwrap();
+    e.execute("INSERT INTO endpoint_check VALUES (1, 100, 'https://a', 'GET', FALSE)")
+        .unwrap();
+    e.execute("INSERT INTO endpoint_check VALUES (2, 100, 'https://b', 'GET', FALSE)")
+        .unwrap();
+    // Check 1 has two probes; we want the latest. Check 2 has none.
+    e.execute("INSERT INTO endpoint_probe VALUES (10, 1, '2026-06-01 00:00:00+00')")
+        .unwrap();
+    e.execute("INSERT INTO endpoint_probe VALUES (11, 1, '2026-06-15 00:00:00+00')")
+        .unwrap();
+    let result = rows(
+        e.execute(
+            "SELECT c.id, lp.ts \
+             FROM endpoint_check c \
+             LEFT JOIN LATERAL ( \
+                 SELECT ts FROM endpoint_probe \
+                  WHERE check_id = c.id \
+                  ORDER BY ts DESC LIMIT 1 \
+             ) lp ON TRUE \
+             ORDER BY c.id",
+        )
+        .expect("LEFT JOIN LATERAL parses and runs"),
+    );
+    // Two outer rows. Check 1 ⇒ latest probe ts = 2026-06-15.
+    // Check 2 ⇒ no probe, lateral row absent ⇒ ts is NULL.
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0][0], Value::BigInt(1));
+    assert!(matches!(result[0][1], Value::Timestamp(_)));
+    assert_eq!(result[1][0], Value::BigInt(2));
+    assert_eq!(result[1][1], Value::Null);
+}
