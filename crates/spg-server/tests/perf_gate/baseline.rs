@@ -1349,15 +1349,33 @@ fn baseline_mailrs_prod_real_100k() {
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 100_000);
     dump_explain(&mut db, "mailrs_prod_real_100k", MAILRS_PROD_REAL_SQL);
-    // Loose budget — reproducing the prod 1.6 s engine time is the
-    // signal we're after. If it lands at ~1.6 s, root-cause hunt
-    // moves to operator-level profiling.
+    // v7.37.4 A' instrumentation — snapshot batched-scalar fire/probe
+    // counters before/after the 10-iteration timing loop to confirm
+    // whether the LIMIT 1 + ORDER BY 1 subqueries actually take the
+    // keyed-restriction path (or fall through to all-keys batch).
+    use core::sync::atomic::Ordering;
+    use spg_engine::{
+        BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
+        BATCHED_SCALAR_KEYED_PROBE_COUNT,
+    };
+    let fb = BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Ordering::Relaxed);
+    let pb = BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Ordering::Relaxed);
+    let tb = BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
     time_query(
         &mut db,
         MAILRS_PROD_REAL_SQL,
         10,
         "mailrs_prod_real_100k",
         20_000.0,
+    );
+    let fa = BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Ordering::Relaxed);
+    let pa = BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Ordering::Relaxed);
+    let ta = BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Ordering::Relaxed);
+    eprintln!(
+        "[A'] mailrs_prod_real_100k batched-scalar: keyed_fires={} keyed_probes={} fall_through={}",
+        fa - fb,
+        pa - pb,
+        ta - tb,
     );
 }
 

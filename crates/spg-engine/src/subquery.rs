@@ -24,6 +24,17 @@ use spg_sql::ast::{
 /// ordering is fine: tests synchronize on full query execution.
 pub static PULLUP_LIMIT1_FIRE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.4 A' — per-keyed-probe / per-fallback counters for the
+/// batched scalar subquery resolver. Used by perf-gate instrumentation
+/// to distinguish "keyed path fires but per-probe is slow" from
+/// "keyed path never fires" — A' targets the former.
+pub static BATCHED_SCALAR_KEYED_FIRE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static BATCHED_SCALAR_KEYED_PROBE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static BATCHED_SCALAR_FALL_THROUGH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -796,9 +807,24 @@ impl Engine {
             Some((rows, rctx))
         });
         let rows = if let Some((restrict_rows, rctx)) = keyed {
+            BATCHED_SCALAR_KEYED_FIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // v7.37.4 A' — collect the deduped surviving correlation
+            // keys, then issue ONE `inner.k IN (lit1, …, litN)` probe
+            // instead of N separate `inner.k = lit` probes. The v7.34.3
+            // IN-list seek path treats the literal list as a bitmap-
+            // style index sweep (single index lookup per literal,
+            // unioned), so the total cost is O(N seeks + matched rows)
+            // — same asymptotic as the N-probe loop but without N
+            // rounds of stmt clone + plan + executor stack overhead.
+            //
+            // Per-probe overhead measured on mailrs prod 100k:
+            //   - sequential: 50 probes × ~1.7 ms = ~85 ms per subq
+            //   - 3 subqueries × ~85 ms = ~255 ms of the 388 ms total
+            // IN-list batched probe is one stmt + N IN-list literals,
+            // amortising the plan + setup over all keys.
             let mut seen: alloc::collections::BTreeSet<String> =
                 alloc::collections::BTreeSet::new();
-            let mut all_rows: Vec<Row> = Vec::new();
+            let mut key_lits: Vec<Expr> = Vec::new();
             for srow in restrict_rows {
                 cancel.check()?;
                 let kv = eval::eval_expr(&Expr::Column(outer_col.clone()), srow, rctx)
@@ -809,26 +835,35 @@ impl Engine {
                 if !seen.insert(aggregate::encode_key(core::slice::from_ref(&kv))) {
                     continue;
                 }
-                let key_eq = Expr::Binary {
-                    lhs: alloc::boxed::Box::new(Expr::Column(inner_col.clone())),
-                    op: BinOp::Eq,
-                    rhs: alloc::boxed::Box::new(value_to_literal_expr(kv)?),
+                key_lits.push(value_to_literal_expr(kv)?);
+            }
+            if key_lits.is_empty() {
+                Vec::new()
+            } else {
+                let in_pred = Expr::InList {
+                    expr: alloc::boxed::Box::new(Expr::Column(inner_col.clone())),
+                    list: key_lits,
+                    negated: false,
                 };
                 let mut probe = batch.clone();
                 probe.where_ = Some(match probe.where_.take() {
                     Some(w) => Expr::Binary {
                         lhs: alloc::boxed::Box::new(w),
                         op: BinOp::And,
-                        rhs: alloc::boxed::Box::new(key_eq),
+                        rhs: alloc::boxed::Box::new(in_pred),
                     },
-                    None => key_eq,
+                    None => in_pred,
                 });
+                BATCHED_SCALAR_KEYED_PROBE_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if let QueryResult::Rows { rows, .. } = self.exec_select_cancel(&probe, cancel)? {
-                    all_rows.extend(rows);
+                    rows
+                } else {
+                    Vec::new()
                 }
             }
-            all_rows
         } else {
+            BATCHED_SCALAR_FALL_THROUGH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let r = self.exec_select_cancel(&batch, cancel)?;
             let QueryResult::Rows { rows, .. } = r else {
                 return Ok(None);
