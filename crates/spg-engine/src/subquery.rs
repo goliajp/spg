@@ -17,6 +17,13 @@ use spg_sql::ast::{
     BinOp, ColumnName, Cte, Expr, FromJoin, JoinKind, LimitExpr, Literal, SelectItem,
     SelectStatement, TableRef, UnOp,
 };
+
+/// v7.37.4 — fire counter for the LIMIT 1 pullup pass. Tests inspect
+/// this to confirm whether the rewrite actually triggered on a given
+/// SQL shape (semantic-equivalence tests pass either way). Relaxed
+/// ordering is fine: tests synchronize on full query execution.
+pub static PULLUP_LIMIT1_FIRE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -1159,6 +1166,8 @@ impl Engine {
         if new_ctes.is_empty() {
             return false;
         }
+        PULLUP_LIMIT1_FIRE_COUNT
+            .fetch_add(new_ctes.len() as u64, core::sync::atomic::Ordering::Relaxed);
         stmt.ctes.extend(new_ctes);
         stmt.from
             .as_mut()
@@ -1402,6 +1411,33 @@ impl Engine {
         outer_aliases: &alloc::collections::BTreeSet<String>,
         alias_n: usize,
     ) -> Option<(Cte, FromJoin, ColumnName)> {
+        // v7.37.4 A phase-2 finding (2026-06-19): the CTE rewrite
+        // fires correctly on the mailrs prod subq 3 shape (verified
+        // via PULLUP_LIMIT1_FIRE_COUNT in `pullup_fires_on_mailrs_subq3_shape`)
+        // but PRODUCES A REGRESSION on the full prod SQL — mini cold
+        // 100k SPGE 388.5 → 523.8 ms (+35%). Root cause:
+        //   1. SPG's existing `try_batch_correlated_scalar` already
+        //      handles the LIMIT 1 + ORDER BY 1 shape via post-LIMIT
+        //      defer + keyed index seek (~ µs per surfaced outer key).
+        //   2. The CTE form forces a full inner-table GROUP BY scan
+        //      (~ 100 ms for 100k messages), then exec_with_ctes
+        //      strips ctes + re-enters the body — extra catalog
+        //      clone + double scan.
+        //   3. Outer LIMIT 50 + GROUP BY thread_id means only ~50
+        //      outer keys ultimately matter; CTE pre-aggregates ALL
+        //      keys eagerly, wasting work for the unsurfaced 99 %.
+        //
+        // The CTE rewrite is right shape FOR the wrong root cause.
+        // Real ceiling-first target is to make the existing batch
+        // resolver's keyed-restriction path fire for the mailrs
+        // GROUP BY + LIMIT shape, not to bypass it with a CTE.
+        //
+        // Keep the implementation dormant — the walker + gate
+        // analysis stays as reference; turning this back on requires
+        // a cost gate that proves CTE materialise + LEFT JOIN beats
+        // the batch resolver for the SHAPE AT HAND (rare in practice).
+        return None;
+        #[allow(unreachable_code)]
         // Inner shape gates.
         if !inner.ctes.is_empty()
             || !inner.unions.is_empty()
