@@ -168,6 +168,7 @@ mod e2e_round7_surfaces;
 mod e2e_runtime_default;
 mod e2e_schema;
 mod e2e_select_star_agg;
+mod e2e_sentori_cutover;
 mod e2e_sequence;
 mod e2e_serial;
 mod e2e_session_funcs;

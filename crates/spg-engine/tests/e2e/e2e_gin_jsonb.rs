@@ -51,8 +51,10 @@ fn gin_on_jsonb_accelerates_simple_containment() {
         .unwrap();
     e.execute(r#"INSERT INTO issues (id, labels) VALUES (2, '{"team":"android"}'::jsonb)"#)
         .unwrap();
-    e.execute(r#"INSERT INTO issues (id, labels) VALUES (3, '{"team":"ios","sev":"high"}'::jsonb)"#)
-        .unwrap();
+    e.execute(
+        r#"INSERT INTO issues (id, labels) VALUES (3, '{"team":"ios","sev":"high"}'::jsonb)"#,
+    )
+    .unwrap();
     // `labels @> '{"team":"ios"}'` matches rows 1 and 3.
     let result = rows(
         &mut e,
@@ -70,12 +72,16 @@ fn gin_on_jsonb_handles_multi_key_containment() {
         .unwrap();
     e.execute("CREATE INDEX issues_labels_gin ON issues USING GIN (labels)")
         .unwrap();
-    e.execute(r#"INSERT INTO issues (id, labels) VALUES (1, '{"team":"ios","sev":"high"}'::jsonb)"#)
-        .unwrap();
+    e.execute(
+        r#"INSERT INTO issues (id, labels) VALUES (1, '{"team":"ios","sev":"high"}'::jsonb)"#,
+    )
+    .unwrap();
     e.execute(r#"INSERT INTO issues (id, labels) VALUES (2, '{"team":"ios","sev":"low"}'::jsonb)"#)
         .unwrap();
-    e.execute(r#"INSERT INTO issues (id, labels) VALUES (3, '{"team":"android","sev":"high"}'::jsonb)"#)
-        .unwrap();
+    e.execute(
+        r#"INSERT INTO issues (id, labels) VALUES (3, '{"team":"android","sev":"high"}'::jsonb)"#,
+    )
+    .unwrap();
     // Both keys must match — only row 1.
     let result = rows(
         &mut e,
