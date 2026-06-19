@@ -378,5 +378,18 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BigIntArray2D => "BIGINT[][]".into(),
         DataType::TextArray2D => "TEXT[][]".into(),
         DataType::IntervalArray => "INTERVAL[]".into(),
+        DataType::BoolArray => "BOOL[]".into(),
+        DataType::SmallIntArray => "SMALLINT[]".into(),
+        DataType::FloatArray => "FLOAT[]".into(),
+        DataType::NumericArray => "NUMERIC[]".into(),
+        DataType::DateArray => "DATE[]".into(),
+        DataType::TimestampArray => "TIMESTAMP[]".into(),
+        DataType::TimestamptzArray => "TIMESTAMPTZ[]".into(),
+        DataType::UuidArray => "UUID[]".into(),
+        DataType::JsonArray => "JSON[]".into(),
+        DataType::JsonbArray => "JSONB[]".into(),
+        DataType::BytesArray => "BYTEA[]".into(),
+        DataType::VarcharArray => "VARCHAR[]".into(),
+        DataType::CharArray => "CHAR[]".into(),
     }
 }

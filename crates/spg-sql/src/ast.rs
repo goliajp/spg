@@ -1495,6 +1495,21 @@ pub enum ColumnTypeName {
     /// interval text contains spaces / colons
     /// (`{"1 day","24:00:00",NULL}`).
     IntervalArray,
+    /// v7.37.5 γ — full PG array-of-scalar family. Each variant
+    /// mirrors a scalar `ColumnTypeName` that already existed.
+    BoolArray,
+    SmallIntArray,
+    FloatArray,
+    NumericArray,
+    DateArray,
+    TimestampArray,
+    TimestamptzArray,
+    UuidArray,
+    JsonArray,
+    JsonbArray,
+    BytesArray,
+    VarcharArray,
+    CharArray,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1560,6 +1575,19 @@ impl fmt::Display for ColumnTypeName {
             Self::Hstore => f.write_str("HSTORE"),
             Self::Interval => f.write_str("INTERVAL"),
             Self::IntervalArray => f.write_str("INTERVAL[]"),
+            Self::BoolArray => f.write_str("BOOL[]"),
+            Self::SmallIntArray => f.write_str("SMALLINT[]"),
+            Self::FloatArray => f.write_str("FLOAT[]"),
+            Self::NumericArray => f.write_str("NUMERIC[]"),
+            Self::DateArray => f.write_str("DATE[]"),
+            Self::TimestampArray => f.write_str("TIMESTAMP[]"),
+            Self::TimestamptzArray => f.write_str("TIMESTAMPTZ[]"),
+            Self::UuidArray => f.write_str("UUID[]"),
+            Self::JsonArray => f.write_str("JSON[]"),
+            Self::JsonbArray => f.write_str("JSONB[]"),
+            Self::BytesArray => f.write_str("BYTEA[]"),
+            Self::VarcharArray => f.write_str("VARCHAR[]"),
+            Self::CharArray => f.write_str("CHAR[]"),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),

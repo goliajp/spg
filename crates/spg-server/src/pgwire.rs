@@ -3445,6 +3445,20 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::TextArray2D => 1009,
         // v7.37.5 β-P4 — PG `_interval` (INTERVAL[]) OID 1187.
         DataType::IntervalArray => 1187,
+        // v7.37.5 γ — array-of-scalar family OIDs (pg_type.dat).
+        DataType::BoolArray => 1000,        // _bool
+        DataType::SmallIntArray => 1005,    // _int2
+        DataType::FloatArray => 1022,       // _float8
+        DataType::NumericArray => 1231,     // _numeric
+        DataType::DateArray => 1182,        // _date
+        DataType::TimestampArray => 1115,   // _timestamp
+        DataType::TimestamptzArray => 1185, // _timestamptz
+        DataType::UuidArray => 2951,        // _uuid
+        DataType::JsonArray => 199,         // _json
+        DataType::JsonbArray => 3807,       // _jsonb
+        DataType::BytesArray => 1001,       // _bytea
+        DataType::VarcharArray => 1015,     // _varchar
+        DataType::CharArray => 1014,        // _bpchar
     }
 }
 

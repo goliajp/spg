@@ -658,6 +658,23 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Interval => out.push(34),
         // v7.37.5 β-P4: tag 35 — INTERVAL[]. Catalog FILE_VERSION 48+.
         DataType::IntervalArray => out.push(35),
+        // v7.37.5 γ — array-of-scalar family. Tags 36..48. Each
+        // body shape follows `IntervalArray`: [u16 count][per
+        // elem: u8 null + (non-null) scalar body in the codec's
+        // LE form].
+        DataType::BoolArray => out.push(36),
+        DataType::SmallIntArray => out.push(37),
+        DataType::FloatArray => out.push(38),
+        DataType::NumericArray => out.push(39),
+        DataType::DateArray => out.push(40),
+        DataType::TimestampArray => out.push(41),
+        DataType::TimestamptzArray => out.push(42),
+        DataType::UuidArray => out.push(43),
+        DataType::JsonArray => out.push(44),
+        DataType::JsonbArray => out.push(45),
+        DataType::BytesArray => out.push(46),
+        DataType::VarcharArray => out.push(47),
+        DataType::CharArray => out.push(48),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -796,6 +813,20 @@ impl Cursor<'_> {
             34 => Ok(DataType::Interval),
             // v7.37.5 β-P4: tag 35 — INTERVAL[]. Catalog FILE_VERSION 48+.
             35 => Ok(DataType::IntervalArray),
+            // v7.37.5 γ: tags 36..48 — array-of-scalar family.
+            36 => Ok(DataType::BoolArray),
+            37 => Ok(DataType::SmallIntArray),
+            38 => Ok(DataType::FloatArray),
+            39 => Ok(DataType::NumericArray),
+            40 => Ok(DataType::DateArray),
+            41 => Ok(DataType::TimestampArray),
+            42 => Ok(DataType::TimestamptzArray),
+            43 => Ok(DataType::UuidArray),
+            44 => Ok(DataType::JsonArray),
+            45 => Ok(DataType::JsonbArray),
+            46 => Ok(DataType::BytesArray),
+            47 => Ok(DataType::VarcharArray),
+            48 => Ok(DataType::CharArray),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -902,6 +933,57 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
                 .iter()
                 .map(|x| if x.is_some() { 17 } else { 1 })
                 .sum::<usize>()
+        }
+        // v7.37.5 γ — fixed-width per-element bodies.
+        Value::BoolArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 2 } else { 1 }).sum::<usize>()
+        }
+        Value::SmallIntArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 3 } else { 1 }).sum::<usize>()
+        }
+        Value::FloatArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+        }
+        Value::TimestampArray(items) | Value::TimestamptzArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+        }
+        Value::DateArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 5 } else { 1 }).sum::<usize>()
+        }
+        Value::NumericArray(items) => {
+            // i128 scaled (16) + u8 scale (1) + 1 null flag.
+            2 + items.iter().map(|x| if x.is_some() { 18 } else { 1 }).sum::<usize>()
+        }
+        Value::UuidArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 17 } else { 1 }).sum::<usize>()
+        }
+        // v7.37.5 γ — variable-width per-element bodies. The codec
+        // uses v47 escape lengths for string/bytes bodies; size
+        // includes the 1-byte null flag + escaped length header +
+        // payload bytes. write_bytes_escaped/write_str_escaped_v47
+        // emit [u16 0xFFFF][u32 real_len] when real_len >= u16::MAX.
+        Value::JsonArray(items)
+        | Value::JsonbArray(items)
+        | Value::VarcharArray(items)
+        | Value::CharArray(items) => {
+            let mut n = 2;
+            for it in items {
+                n += 1; // null flag
+                if let Some(s) = it {
+                    n += if s.len() >= u16::MAX as usize { 2 + 4 } else { 2 } + s.len();
+                }
+            }
+            n
+        }
+        Value::BytesArray(items) => {
+            let mut n = 2;
+            for it in items {
+                n += 1;
+                if let Some(b) = it {
+                    n += if b.len() >= u16::MAX as usize { 2 + 4 } else { 2 } + b.len();
+                }
+            }
+            n
         }
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
         // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
@@ -1216,6 +1298,132 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.37.5 γ — array-of-scalar dense body. Same envelope
+        // as INTERVAL[]: [u16 count][per elem: u8 null + (non-null)
+        // scalar body]. Per-element body matches the scalar's LE
+        // codec form so a future binary array BIND path can splat.
+        (Value::BoolArray(items), DataType::BoolArray) => {
+            let count = u16::try_from(items.len()).expect("BOOL[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(b) => {
+                        out.push(0);
+                        out.push(u8::from(*b));
+                    }
+                }
+            }
+        }
+        (Value::SmallIntArray(items), DataType::SmallIntArray) => {
+            let count = u16::try_from(items.len()).expect("SMALLINT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::FloatArray(items), DataType::FloatArray) => {
+            let count = u16::try_from(items.len()).expect("FLOAT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(x) => {
+                        out.push(0);
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::NumericArray(items), DataType::NumericArray) => {
+            let count = u16::try_from(items.len()).expect("NUMERIC[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some((scaled, scale)) => {
+                        out.push(0);
+                        out.extend_from_slice(&scaled.to_le_bytes());
+                        out.push(*scale);
+                    }
+                }
+            }
+        }
+        (Value::DateArray(items), DataType::DateArray) => {
+            let count = u16::try_from(items.len()).expect("DATE[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(d) => {
+                        out.push(0);
+                        out.extend_from_slice(&d.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::TimestampArray(items), DataType::TimestampArray)
+        | (Value::TimestamptzArray(items), DataType::TimestamptzArray) => {
+            let count = u16::try_from(items.len()).expect("TIMESTAMP[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(t) => {
+                        out.push(0);
+                        out.extend_from_slice(&t.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::UuidArray(items), DataType::UuidArray) => {
+            let count = u16::try_from(items.len()).expect("UUID[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(b) => {
+                        out.push(0);
+                        out.extend_from_slice(&b[..]);
+                    }
+                }
+            }
+        }
+        (Value::JsonArray(items), DataType::JsonArray)
+        | (Value::JsonbArray(items), DataType::JsonbArray)
+        | (Value::VarcharArray(items), DataType::VarcharArray)
+        | (Value::CharArray(items), DataType::CharArray) => {
+            let count = u16::try_from(items.len()).expect("string-array ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(s) => {
+                        out.push(0);
+                        write_bytes_escaped(out, s.as_bytes());
+                    }
+                }
+            }
+        }
+        (Value::BytesArray(items), DataType::BytesArray) => {
+            let count = u16::try_from(items.len()).expect("BYTEA[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(b) => {
+                        out.push(0);
+                        write_bytes_escaped(out, b);
+                    }
+                }
+            }
+        }
         // v7.12.0: tsvector dense body — see `value_body_encoded_len`
         // for layout. Lexemes are written in their already-sorted order.
         (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
@@ -1522,6 +1730,29 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
                 }
             }
         }
+        // v7.37.5 γ — array-of-scalar family. These reach the
+        // schema-less path only through corrupt / synthetic
+        // catalogs (Range elements; never through normal column
+        // storage which is always schema-aware). Until a use
+        // case appears, fence with `unreachable!()` so a future
+        // accidental call surfaces loud instead of writing a
+        // silently-invalid tag.
+        Value::BoolArray(_)
+        | Value::SmallIntArray(_)
+        | Value::FloatArray(_)
+        | Value::NumericArray(_)
+        | Value::DateArray(_)
+        | Value::TimestampArray(_)
+        | Value::TimestamptzArray(_)
+        | Value::UuidArray(_)
+        | Value::JsonArray(_)
+        | Value::JsonbArray(_)
+        | Value::BytesArray(_)
+        | Value::VarcharArray(_)
+        | Value::CharArray(_) => unreachable!(
+            "v7.37.5 γ array-of-scalar lacks a schema-less codec tag — \
+             use schema-aware write_value_body via the column's DataType"
+        ),
         // v7.12.0: tsvector — tag 18. Body shape matches
         // `write_tsvector_body`.
         Value::TsVector(lexs) => {
@@ -2160,6 +2391,155 @@ impl<'a> Cursor<'a> {
                     }
                 }
                 Ok(Value::IntervalArray(items))
+            }
+            // v7.37.5 γ — array-of-scalar dense bodies. Each
+            // reads [u16 count][per elem: u8 null + (non-null)
+            // scalar body LE].
+            DataType::BoolArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<bool>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_u8()? != 0)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("BOOL[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::BoolArray(items))
+            }
+            DataType::SmallIntArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i16>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let s = self.take(2)?;
+                            items.push(Some(i16::from_le_bytes([s[0], s[1]])));
+                        }
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("SMALLINT[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::SmallIntArray(items))
+            }
+            DataType::FloatArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<f64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_f64()?)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("FLOAT[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::FloatArray(items))
+            }
+            DataType::NumericArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<(i128, u8)>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let scale = self.read_u8()?;
+                            items.push(Some((scaled, scale)));
+                        }
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("NUMERIC[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::NumericArray(items))
+            }
+            DataType::DateArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i32>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i32()?)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("DATE[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::DateArray(items))
+            }
+            DataType::TimestampArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("TIMESTAMP[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::TimestampArray(items))
+            }
+            DataType::TimestamptzArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("TIMESTAMPTZ[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::TimestamptzArray(items))
+            }
+            DataType::UuidArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<[u8; 16]>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let s = self.take(16)?;
+                            let mut b = [0u8; 16];
+                            b.copy_from_slice(s);
+                            items.push(Some(b));
+                        }
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("UUID[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::UuidArray(items))
+            }
+            DataType::JsonArray
+            | DataType::JsonbArray
+            | DataType::VarcharArray
+            | DataType::CharArray => {
+                let kind = ty;
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<String>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_str_escaped_v47()?)),
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("string-array null flag: {other}"))),
+                    }
+                }
+                Ok(match kind {
+                    DataType::JsonArray => Value::JsonArray(items),
+                    DataType::JsonbArray => Value::JsonbArray(items),
+                    DataType::VarcharArray => Value::VarcharArray(items),
+                    DataType::CharArray => Value::CharArray(items),
+                    _ => unreachable!(),
+                })
+            }
+            DataType::BytesArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let len = self.read_len_escaped_v47()?;
+                            items.push(Some(self.take(len)?.to_vec()));
+                        }
+                        1 => items.push(None),
+                        other => return Err(StorageError::Corrupt(format!("BYTEA[] null flag: {other}"))),
+                    }
+                }
+                Ok(Value::BytesArray(items))
             }
             // v7.12.0: tsvector dense body — [u16 lex_count]
             // [per lex: u16 word_len + utf-8 word + u16 pos_count
