@@ -3090,17 +3090,42 @@ impl Engine {
         if parent_refs.is_empty() {
             return Ok(None);
         }
+        // Synthesise a CTE name per parent so the existing
+        // "CTE shadows a real table" guard doesn't fire (the parent
+        // IS a real table in the catalog, unlike VIEW expansion's
+        // case). The FROM-clause TableRef walker below rewrites
+        // every parent reference to point at the synthetic CTE.
+        let synth_name = |p: &str| alloc::format!("__spg_partition_{p}");
         let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(parent_refs.len());
+        let mut expanded_parents: Vec<alloc::string::String> = Vec::new();
         for parent_name in &parent_refs {
-            let body = self.build_partition_parent_union_body(parent_name, stmt)?;
+            // No children = no rewrite. The parent itself is a real
+            // (empty-rows) table — the regular FROM-resolution path
+            // will scan it and return 0 rows, matching the
+            // "partition parent with no children" plan. Skipping the
+            // CTE here also avoids `SELECT * FROM parent` re-entering
+            // this rewrite on the synthetic body (infinite recursion).
+            let Some(body) = self.build_partition_parent_union_body(parent_name, stmt)? else {
+                continue;
+            };
             new_ctes.push(spg_sql::ast::Cte {
-                name: parent_name.clone(),
+                name: synth_name(parent_name),
                 body,
                 recursive: false,
                 column_overrides: Vec::new(),
             });
+            expanded_parents.push(parent_name.clone());
+        }
+        if expanded_parents.is_empty() {
+            return Ok(None);
         }
         let mut out = stmt.clone();
+        if let Some(from) = out.from.as_mut() {
+            rewrite_partition_parent_table_ref(&mut from.primary, &expanded_parents, &synth_name);
+            for j in &mut from.joins {
+                rewrite_partition_parent_table_ref(&mut j.table, &expanded_parents, &synth_name);
+            }
+        }
         new_ctes.extend(out.ctes);
         out.ctes = new_ctes;
         Ok(Some(out))
@@ -3108,15 +3133,16 @@ impl Engine {
 
     /// Build the `SELECT * FROM child1 UNION ALL …` body for one parent.
     /// Children include every overlap-hit `Range` plus(always)the
-    /// `Default` child(if any). When no children exist or none survive
-    /// pruning + there is no DEFAULT, return a trivial empty SELECT so
-    /// the parent reference projects an empty result set the way a PG
-    /// "no partitions yet" plan would.
+    /// `Default` child(if any). Returns `Ok(None)` when no children
+    /// would survive — caller skips the CTE injection and lets the
+    /// parent fall through to the regular(empty-rows)scan path,
+    /// avoiding the infinite recursion that an empty-body CTE
+    /// referencing the parent name would trigger.
     fn build_partition_parent_union_body(
         &self,
         parent_name: &str,
         outer: &SelectStatement,
-    ) -> Result<SelectStatement, EngineError> {
+    ) -> Result<Option<SelectStatement>, EngineError> {
         use spg_storage::PartitionRole;
         let cat = self.active_catalog();
         let parent = cat.get(parent_name).ok_or_else(|| {
@@ -3167,12 +3193,12 @@ impl Engine {
         // rewrite expressible in surface SQL so the engine's existing
         // parser path handles the AST shape uniformly.
         if kept.is_empty() {
-            // Synthesise an always-false SELECT shaped like the parent
-            // so the CTE's projection still matches.
-            return parse_select_or_corrupt(&alloc::format!(
-                "SELECT * FROM {} WHERE FALSE",
-                quote_ident_for_sql(parent_name)
-            ));
+            // No children survive — caller falls back to scanning the
+            // (empty) parent table. Returning None here is what
+            // prevents the synthetic CTE from referring back to the
+            // parent name and re-entering this rewrite pass.
+            let _ = parent_name;
+            return Ok(None);
         }
         let mut body = alloc::string::String::new();
         for (i, child_name) in kept.iter().enumerate() {
@@ -3182,8 +3208,30 @@ impl Engine {
             body.push_str("SELECT * FROM ");
             body.push_str(&quote_ident_for_sql(child_name));
         }
-        parse_select_or_corrupt(&body)
+        parse_select_or_corrupt(&body).map(Some)
     }
+}
+
+/// Rewrite a `TableRef` pointing at a partition parent so it
+/// references the synthetic CTE created by the expansion. If the
+/// original ref had no alias, preserve the parent name as an alias
+/// so column references like `events_partitioned.received_at`
+/// keep resolving.
+fn rewrite_partition_parent_table_ref(
+    t: &mut spg_sql::ast::TableRef,
+    parents: &[alloc::string::String],
+    synth_name: &impl Fn(&str) -> alloc::string::String,
+) {
+    if t.lateral_subquery.is_some() || t.unnest_expr.is_some() || t.generate_series_args.is_some() {
+        return;
+    }
+    if !parents.iter().any(|p| p == &t.name) {
+        return;
+    }
+    if t.alias.is_none() {
+        t.alias = Some(t.name.clone());
+    }
+    t.name = synth_name(&t.name);
 }
 
 /// Walk a `TableRef` and push its `name` if it resolves to a partition
