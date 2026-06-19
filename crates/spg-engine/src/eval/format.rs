@@ -302,12 +302,14 @@ fn parse_tz_offset_suffix(suffix: &str, is_positive: bool) -> Option<i64> {
     Some(if is_positive { abs } else { -abs })
 }
 
-/// Render an `Interval { months, micros }` in a PG-ish shape. The output
-/// mirrors `psql`'s text format: years/months from the months part,
-/// days/HH:MM:SS[.frac] from the microsecond part. Empty parts are
-/// omitted; an all-zero interval renders as `0`.
-pub fn format_interval(months: i32, micros: i64) -> String {
-    const MICROS_PER_DAY: i64 = 86_400_000_000;
+/// Render an `Interval { months, days, micros }` in a PG-ish shape.
+/// The output mirrors `psql`'s text format: years/months from the
+/// months part, days from its own dimension (no carry from micros —
+/// this is the PG-canonical separation so `'1 day'` ≠ `'24 hours'`),
+/// HH:MM:SS[.frac] from micros. v7.37.5 β added the `days` parameter
+/// for PG byte-equal; `micros` may still carry hours ≥ 24 (PG keeps
+/// the unnormalised form on the wire).
+pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let years = months / 12;
     let mons = months % 12;
@@ -325,11 +327,13 @@ pub fn format_interval(months: i32, micros: i64) -> String {
     if mons != 0 {
         parts.push(format!("{mons} {}", unit(i64::from(mons), "mon", "mons")));
     }
-    let days = micros / MICROS_PER_DAY;
-    let mut rem = micros % MICROS_PER_DAY;
     if days != 0 {
-        parts.push(format!("{days} {}", unit(days, "day", "days")));
+        parts.push(format!(
+            "{days} {}",
+            unit(i64::from(days), "day", "days")
+        ));
     }
+    let mut rem = micros;
     if rem != 0 {
         let neg = rem < 0;
         if neg {

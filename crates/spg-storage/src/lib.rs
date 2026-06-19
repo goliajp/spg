@@ -436,10 +436,14 @@ pub enum Value {
     Date(i32),
     /// Microseconds since the Unix epoch (1970-01-01T00:00:00Z).
     Timestamp(i64),
-    /// Calendar span: `months` (variable-length) + `micros` (fixed-length).
-    /// Runtime-only — cannot appear in a stored row in v2.11.
+    /// Calendar span: `months` + `days` + `micros`. Three fields are
+    /// required for PG byte-equal: `'1 day'` ≠ `'24 hours'` (DST,
+    /// month-boundary, and the on-wire `pg_type` `interval` are all
+    /// `i64 micros + i32 days + i32 months`). v7.37.5 β widened from
+    /// `{months, micros}`; column storage lands in the same window.
     Interval {
         months: i32,
+        days: i32,
         micros: i64,
     },
     /// v4.9 `JSON` — raw JSON text. No structural validation

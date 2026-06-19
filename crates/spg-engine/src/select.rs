@@ -2862,16 +2862,20 @@ fn generate_series_timestamps(
     step: Value,
     cancel: &CancelToken<'_>,
 ) -> Result<alloc::vec::Vec<Row>, EngineError> {
-    let (months, micros) = match &step {
-        Value::Interval { months, micros } => (*months, *micros),
+    let (months, days, micros) = match &step {
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => (*months, *days, *micros),
         _ => unreachable!("caller guards step.is_interval"),
     };
-    if months == 0 && micros == 0 {
+    if months == 0 && days == 0 && micros == 0 {
         return Err(EngineError::Unsupported(
             "generate_series(): INTERVAL step cannot be zero".into(),
         ));
     }
-    let ascending = months > 0 || micros > 0;
+    let ascending = months > 0 || days > 0 || micros > 0;
     let mut out = alloc::vec::Vec::new();
     let mut cur = Value::Timestamp(start);
     const MAX_ROWS: usize = 10_000_000;
@@ -2897,7 +2901,11 @@ fn generate_series_timestamps(
         let next = eval::apply_binary_interval(
             spg_sql::ast::BinOp::Add,
             &cur,
-            &Value::Interval { months, micros },
+            &Value::Interval {
+                months,
+                days,
+                micros,
+            },
         )
         .map_err(EngineError::Eval)?;
         cur = match next {

@@ -8490,7 +8490,7 @@ impl Parser {
                 "expected string literal after INTERVAL, got {tok:?}"
             )));
         };
-        let (months, micros) = parse_interval_text(&text).ok_or_else(|| ParseError {
+        let (months, days, micros) = parse_interval_text(&text).ok_or_else(|| ParseError {
             message: format!(
                 "cannot parse INTERVAL {text:?}; \
                      expected `<n> <unit> [<n> <unit> ...]` with units \
@@ -8501,6 +8501,7 @@ impl Parser {
         })?;
         Ok(Expr::Literal(Literal::Interval {
             months,
+            days,
             micros,
             text,
         }))
@@ -9241,12 +9242,17 @@ fn extract_numeric_literal(e: &Expr) -> Option<f32> {
 /// Recognised units (case-insensitive, optional trailing `s`):
 /// `microsecond`, `millisecond`, `second`, `minute`, `hour`, `day`, `week`,
 /// `month`, `year`. `week` widens to 7 days; `year` widens to 12 months.
-pub fn parse_interval_text(s: &str) -> Option<(i32, i64)> {
+/// v7.37.5 β — returns `(months, days, micros)`. `days` is preserved
+/// as its own dimension so `INTERVAL '1 day'` ≠ `INTERVAL '24 hours'`
+/// (PG-canonical: DST and month-boundary semantics depend on this).
+/// `week` rolls into `days` (× 7). Sub-day units flow into `micros`.
+pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.is_empty() || !parts.len().is_multiple_of(2) {
         return None;
     }
     let mut months: i32 = 0;
+    let mut days: i32 = 0;
     let mut micros: i64 = 0;
     let mut i = 0;
     while i < parts.len() {
@@ -9259,8 +9265,14 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i64)> {
             "second" => micros = micros.checked_add(n.checked_mul(1_000_000)?)?,
             "minute" => micros = micros.checked_add(n.checked_mul(60_000_000)?)?,
             "hour" => micros = micros.checked_add(n.checked_mul(3_600_000_000)?)?,
-            "day" => micros = micros.checked_add(n.checked_mul(86_400_000_000)?)?,
-            "week" => micros = micros.checked_add(n.checked_mul(604_800_000_000)?)?,
+            "day" => {
+                let n32 = i32::try_from(n).ok()?;
+                days = days.checked_add(n32)?;
+            }
+            "week" => {
+                let n32 = i32::try_from(n).ok()?;
+                days = days.checked_add(n32.checked_mul(7)?)?;
+            }
             "month" => {
                 let n32 = i32::try_from(n).ok()?;
                 months = months.checked_add(n32)?;
@@ -9273,7 +9285,7 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i64)> {
         }
         i += 2;
     }
-    Some((months, micros))
+    Some((months, days, micros))
 }
 
 /// v7.12.4 — map a bare type-name identifier (the form that
@@ -10174,19 +10186,23 @@ mod tests {
 
     #[test]
     fn interval_text_parsing_units() {
+        // v7.37.5 β — three-field shape `(months, days, micros)` so
+        // `'1 day'` and `'24 hours'` no longer collide (PG parity).
         // Single unit.
-        assert_eq!(parse_interval_text("1 day"), Some((0, 86_400_000_000)));
-        assert_eq!(parse_interval_text("1 second"), Some((0, 1_000_000)));
-        assert_eq!(parse_interval_text("1 month"), Some((1, 0)));
-        assert_eq!(parse_interval_text("2 years"), Some((24, 0)));
-        // Compound spans accumulate.
-        assert_eq!(parse_interval_text("1 year 6 months"), Some((18, 0)));
+        assert_eq!(parse_interval_text("1 day"), Some((0, 1, 0)));
+        assert_eq!(parse_interval_text("24 hours"), Some((0, 0, 86_400_000_000)));
+        assert_eq!(parse_interval_text("1 second"), Some((0, 0, 1_000_000)));
+        assert_eq!(parse_interval_text("1 month"), Some((1, 0, 0)));
+        assert_eq!(parse_interval_text("2 years"), Some((24, 0, 0)));
+        assert_eq!(parse_interval_text("1 week"), Some((0, 7, 0)));
+        // Compound spans accumulate per-dimension.
+        assert_eq!(parse_interval_text("1 year 6 months"), Some((18, 0, 0)));
         assert_eq!(
             parse_interval_text("1 day 2 hours"),
-            Some((0, 86_400_000_000 + 7_200_000_000))
+            Some((0, 1, 7_200_000_000))
         );
-        // Negative numbers carry through.
-        assert_eq!(parse_interval_text("-1 day"), Some((0, -86_400_000_000)));
+        // Negative numbers carry through per-dimension.
+        assert_eq!(parse_interval_text("-1 day"), Some((0, -1, 0)));
         // Bad shapes return None.
         assert_eq!(parse_interval_text(""), None);
         assert_eq!(parse_interval_text("garbage"), None);

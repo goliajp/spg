@@ -2679,7 +2679,11 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
         Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
-        Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => spg_engine::eval::format_interval(*months, *days, *micros),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
             escape_copy_cell(&format!("[{}]", parts.join(", ")))
@@ -3463,7 +3467,11 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         }
         Value::Timestamp(micros) => format_timestamp(*micros),
         Value::Date(days) => format_date(*days),
-        Value::Interval { months, micros } => format!("P{months}M{micros}U"),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!("P{months}M{days}D{micros}U"),
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();

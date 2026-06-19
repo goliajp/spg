@@ -224,12 +224,14 @@ pub(crate) fn apply_binary_interval(
     };
     let Value::Interval {
         months: rhs_months,
+        days: rhs_days,
         micros: rhs_us,
     } = rhs
     else {
         unreachable!("rhs guaranteed to be Interval by the match above");
     };
     let signed_months = i64::from(*rhs_months) * sign;
+    let signed_days = i64::from(*rhs_days) * sign;
     let signed_micros = rhs_us.checked_mul(sign).ok_or(EvalError::TypeMismatch {
         detail: "INTERVAL micros overflows on negation".into(),
     })?;
@@ -237,20 +239,18 @@ pub(crate) fn apply_binary_interval(
         Value::Timestamp(t) => Ok(Some(Value::Timestamp(add_interval_to_micros(
             *t,
             signed_months,
+            signed_days,
             signed_micros,
         )?))),
         Value::Date(d) => {
             // Date + interval stays a date when the interval has zero
             // sub-day microseconds; otherwise promote to TIMESTAMP at
-            // midnight of the (months-shifted) date first.
-            let day_aligned = signed_micros.rem_euclid(86_400_000_000) == 0;
-            if day_aligned {
-                let micros_per_day = 86_400_000_000_i64;
-                let days_delta = signed_micros / micros_per_day;
+            // midnight of the (months-shifted, days-shifted) date.
+            if signed_micros == 0 {
                 let shifted = shift_date_by_months(*d, signed_months)?;
                 let new_days =
                     i64::from(shifted)
-                        .checked_add(days_delta)
+                        .checked_add(signed_days)
                         .ok_or(EvalError::TypeMismatch {
                             detail: "DATE ± INTERVAL overflows DATE range".into(),
                         })?;
@@ -268,12 +268,14 @@ pub(crate) fn apply_binary_interval(
                 Ok(Some(Value::Timestamp(add_interval_to_micros(
                     base,
                     signed_months,
+                    signed_days,
                     signed_micros,
                 )?)))
             }
         }
         Value::Interval {
             months: lhs_months,
+            days: lhs_days,
             micros: lhs_us,
         } => {
             let new_months = i64::from(*lhs_months)
@@ -282,6 +284,12 @@ pub(crate) fn apply_binary_interval(
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL months overflows i32".into(),
                 })?;
+            let new_days = i64::from(*lhs_days)
+                .checked_add(signed_days)
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "INTERVAL ± INTERVAL days overflows i32".into(),
+                })?;
             let new_micros = lhs_us
                 .checked_add(signed_micros)
                 .ok_or(EvalError::TypeMismatch {
@@ -289,6 +297,7 @@ pub(crate) fn apply_binary_interval(
                 })?;
             Ok(Some(Value::Interval {
                 months: new_months,
+                days: new_days,
                 micros: new_micros,
             }))
         }
@@ -311,16 +320,24 @@ fn shift_date_by_months(d: i32, months: i64) -> Result<i32, EvalError> {
     Ok(days_from_civil(ny, nm, nd))
 }
 
-/// Add (months, micros) to a `Timestamp` (microseconds since epoch).
-/// Months part is applied through civil calendar with clamp-to-last-day;
-/// micros part is plain i64 addition with overflow guard.
-fn add_interval_to_micros(t: i64, months: i64, micros: i64) -> Result<i64, EvalError> {
+/// Add (months, days, micros) to a `Timestamp` (microseconds since
+/// epoch). Months part is applied through civil calendar with
+/// clamp-to-last-day; days part is a plain 86_400_000_000 micros each
+/// (DST-naïve at the TIMESTAMP level, matching PG); micros part is
+/// plain i64 addition with overflow guard. v7.37.5 β added the
+/// `days` parameter.
+fn add_interval_to_micros(
+    t: i64,
+    months: i64,
+    days: i64,
+    micros: i64,
+) -> Result<i64, EvalError> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
     let mut out = t;
     if months != 0 {
-        const MICROS_PER_DAY: i64 = 86_400_000_000;
-        let days = out.div_euclid(MICROS_PER_DAY);
+        let day_count = out.div_euclid(MICROS_PER_DAY);
         let day_micros = out.rem_euclid(MICROS_PER_DAY);
-        let day_i32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
+        let day_i32 = i32::try_from(day_count).map_err(|_| EvalError::TypeMismatch {
             detail: "TIMESTAMP day component out of i32 range for INTERVAL months math".into(),
         })?;
         let shifted_days = shift_date_by_months(day_i32, months)?;
@@ -330,6 +347,14 @@ fn add_interval_to_micros(t: i64, months: i64, micros: i64) -> Result<i64, EvalE
             .ok_or(EvalError::TypeMismatch {
                 detail: "TIMESTAMP ± INTERVAL months overflows i64 microseconds".into(),
             })?;
+    }
+    if days != 0 {
+        let day_micros = days.checked_mul(MICROS_PER_DAY).ok_or(EvalError::TypeMismatch {
+            detail: "INTERVAL days overflows i64 microseconds".into(),
+        })?;
+        out = out.checked_add(day_micros).ok_or(EvalError::TypeMismatch {
+            detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
+        })?;
     }
     out.checked_add(micros).ok_or(EvalError::TypeMismatch {
         detail: "TIMESTAMP ± INTERVAL micros overflows i64".into(),
@@ -1048,8 +1073,19 @@ mod tests {
     fn interval_add_to_timestamp_micros_part() {
         // 2024-01-01 00:00:00 + INTERVAL '1 hour' = 2024-01-01 01:00:00
         let ts = i64::from(days_from_civil(2024, 1, 1)) * 86_400_000_000;
-        let r = add_interval_to_micros(ts, 0, 3_600_000_000).unwrap();
+        let r = add_interval_to_micros(ts, 0, 0, 3_600_000_000).unwrap();
         let expected = ts + 3_600_000_000;
+        assert_eq!(r, expected);
+    }
+
+    /// v7.37.5 β — days dimension threads cleanly through
+    /// `add_interval_to_micros`. INTERVAL '1 day' adds exactly one
+    /// 86_400_000_000-µs chunk, independent of the months path.
+    #[test]
+    fn interval_add_to_timestamp_days_part() {
+        let ts = i64::from(days_from_civil(2024, 1, 1)) * 86_400_000_000;
+        let r = add_interval_to_micros(ts, 0, 1, 0).unwrap();
+        let expected = i64::from(days_from_civil(2024, 1, 2)) * 86_400_000_000;
         assert_eq!(r, expected);
     }
 
@@ -1079,7 +1115,8 @@ mod tests {
         let lhs = Value::Date(d);
         let rhs = Value::Interval {
             months: 0,
-            micros: 7 * 86_400_000_000,
+            days: 7,
+            micros: 0,
         };
         let v = apply_binary_interval(BinOp::Add, &lhs, &rhs)
             .unwrap()
@@ -1095,6 +1132,7 @@ mod tests {
         let lhs = Value::Date(d);
         let rhs = Value::Interval {
             months: 0,
+            days: 0,
             micros: 3_600_000_000,
         };
         let v = apply_binary_interval(BinOp::Add, &lhs, &rhs)

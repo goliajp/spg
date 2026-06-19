@@ -28,7 +28,12 @@ pub(super) fn extract_field(
     // INTERVAL has its own decomposition — `YEAR` / `MONTH` come from
     // the months part, the rest from the microseconds part. PG matches
     // this convention (months is normalised modulo 12 for MONTH).
-    if let Value::Interval { months, micros } = *v {
+    if let Value::Interval {
+        months,
+        days,
+        micros,
+    } = *v
+    {
         let years = months / 12;
         let mons = months % 12;
         let secs_total = micros / 1_000_000;
@@ -36,14 +41,20 @@ pub(super) fn extract_field(
         let result = match field {
             F::Year => i64::from(years),
             F::Month => i64::from(mons),
-            F::Day => micros / 86_400_000_000,
+            // v7.37.5 β — `days` is its own dimension now. PG semantics:
+            // `extract(day from INTERVAL '24 hours')` = 0 (the micros
+            // dimension never bleeds into the day count).
+            F::Day => i64::from(days),
             F::Hour => (secs_total / 3600) % 24,
             F::Minute => (secs_total / 60) % 60,
             F::Second => secs_total % 60,
             F::Microsecond => (secs_total % 60) * 1_000_000 + frac,
             // total seconds in the interval (months count as 30 days,
-            // PG's justify_interval convention).
-            F::Epoch => i64::from(months) * 30 * 86_400 + secs_total,
+            // days count their own 86_400, PG's justify_interval
+            // convention).
+            F::Epoch => {
+                i64::from(months) * 30 * 86_400 + i64::from(days) * 86_400 + secs_total
+            }
         };
         return Ok(Value::BigInt(result));
     }
@@ -176,6 +187,7 @@ pub(super) fn age(args: &[Value]) -> Result<Value, EvalError> {
     })?;
     Ok(Value::Interval {
         months: 0,
+        days: 0,
         micros: delta,
     })
 }

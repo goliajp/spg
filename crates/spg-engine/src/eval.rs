@@ -876,8 +876,14 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value {
         Literal::BigIntArray(items) => Value::BigIntArray(items.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
-        Literal::Interval { months, micros, .. } => Value::Interval {
+        Literal::Interval {
+            months,
+            days,
+            micros,
+            ..
+        } => Value::Interval {
             months: *months,
+            days: *days,
             micros: *micros,
         },
     }
@@ -928,6 +934,7 @@ mod tests {
             },
             Value::Interval {
                 months: 0,
+                days: 0,
                 micros: 5,
             },
         ];
@@ -1183,15 +1190,27 @@ mod tests {
 
     #[test]
     fn interval_format_basics() {
-        assert_eq!(format_interval(0, 0), "0");
-        assert_eq!(format_interval(0, 86_400_000_000), "1 day");
-        assert_eq!(format_interval(0, -86_400_000_000), "-1 days");
-        assert_eq!(format_interval(0, 3_600_000_000), "01:00:00");
-        assert_eq!(
-            format_interval(0, 86_400_000_000 + 9_000_000),
-            "1 day 00:00:09"
+        // v7.37.5 β — three-arg signature. PG byte-equal:
+        // `'1 day'` ≠ `'24 hours'` now, the format reflects it.
+        assert_eq!(format_interval(0, 0, 0), "0");
+        assert_eq!(format_interval(0, 1, 0), "1 day");
+        assert_eq!(format_interval(0, -1, 0), "-1 days");
+        assert_eq!(format_interval(0, 0, 86_400_000_000), "24:00:00");
+        assert_eq!(format_interval(0, 0, 3_600_000_000), "01:00:00");
+        assert_eq!(format_interval(0, 1, 9_000_000), "1 day 00:00:09");
+        assert_eq!(format_interval(14, 0, 0), "1 year 2 mons");
+        assert_eq!(format_interval(-1, 0, 0), "-1 mons");
+    }
+
+    #[test]
+    fn interval_format_pg_byte_equal_day_vs_24h() {
+        // v7.37.5 β — the PG-canonical distinction `'1 day'` ≠ `'24 hours'`
+        // is preserved in the formatter, not just the parser.
+        assert_eq!(format_interval(0, 1, 0), "1 day");
+        assert_eq!(format_interval(0, 0, 86_400_000_000), "24:00:00");
+        assert_ne!(
+            format_interval(0, 1, 0),
+            format_interval(0, 0, 86_400_000_000),
         );
-        assert_eq!(format_interval(14, 0), "1 year 2 mons");
-        assert_eq!(format_interval(-1, 0), "-1 mons");
     }
 }

@@ -15,14 +15,22 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 
 #[test]
 fn interval_text_cast_via_double_colon() {
+    // v7.37.5 β — `'30 days'` now lands in the dedicated `days`
+    // dimension (PG byte-equal: `'30 days'` ≠ `'720 hours'`).
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT '30 days'::INTERVAL").unwrap());
     assert_eq!(r.len(), 1);
-    let Value::Interval { months, micros } = r[0][0] else {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = r[0][0]
+    else {
         panic!("expected Interval, got {:?}", r[0][0]);
     };
     assert_eq!(months, 0);
-    assert_eq!(micros, 30 * 86_400 * 1_000_000);
+    assert_eq!(days, 30);
+    assert_eq!(micros, 0);
 }
 
 #[test]
@@ -56,11 +64,17 @@ fn interval_with_compound_units() {
         e.execute("SELECT '1 day 2 hours 3 minutes'::INTERVAL")
             .unwrap(),
     );
-    let Value::Interval { months, micros } = r[0][0] else {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = r[0][0]
+    else {
         panic!();
     };
     assert_eq!(months, 0);
-    let expected = (86_400 + 2 * 3600 + 3 * 60) * 1_000_000;
+    assert_eq!(days, 1);
+    let expected = (2 * 3600 + 3 * 60) * 1_000_000;
     assert_eq!(micros, expected);
 }
 
@@ -68,10 +82,16 @@ fn interval_with_compound_units() {
 fn interval_with_months_and_years() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT '1 year 2 months'::INTERVAL").unwrap());
-    let Value::Interval { months, micros } = r[0][0] else {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = r[0][0]
+    else {
         panic!();
     };
     assert_eq!(months, 14);
+    assert_eq!(days, 0);
     assert_eq!(micros, 0);
 }
 
@@ -79,11 +99,17 @@ fn interval_with_months_and_years() {
 fn interval_negative_value() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT '-7 days'::INTERVAL").unwrap());
-    let Value::Interval { months, micros } = r[0][0] else {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = r[0][0]
+    else {
         panic!();
     };
     assert_eq!(months, 0);
-    assert_eq!(micros, -7 * 86_400 * 1_000_000);
+    assert_eq!(days, -7);
+    assert_eq!(micros, 0);
 }
 
 #[test]
