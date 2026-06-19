@@ -328,10 +328,7 @@ pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
         parts.push(format!("{mons} {}", unit(i64::from(mons), "mon", "mons")));
     }
     if days != 0 {
-        parts.push(format!(
-            "{days} {}",
-            unit(i64::from(days), "day", "days")
-        ));
+        parts.push(format!("{days} {}", unit(i64::from(days), "day", "days")));
     }
     let mut rem = micros;
     if rem != 0 {

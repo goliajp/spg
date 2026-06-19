@@ -3864,7 +3864,8 @@ mod tests {
         bytes[0..8].copy_from_slice(&(-86_400_000_000_i64).to_be_bytes());
         bytes[8..12].copy_from_slice(&(-1_i32).to_be_bytes());
         bytes[12..16].copy_from_slice(&(-1_i32).to_be_bytes());
-        let v = decode_binary_param(1186, &bytes).expect("signed INTERVAL binary BIND must succeed");
+        let v =
+            decode_binary_param(1186, &bytes).expect("signed INTERVAL binary BIND must succeed");
         assert_eq!(
             v,
             spg_storage::Value::Interval {

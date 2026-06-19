@@ -281,6 +281,12 @@ pub(crate) fn deserialize_table(
             }
         }
     }
+    // v7.37.6-B — partition role appendix(FILE_VERSION 49+)。
+    // v48 写入者从未到这里;v49+ 读出 Option<PartitionRole>。
+    if version >= 49 {
+        let role = read_partition_role(cur)?;
+        t.schema_mut().partition_role = role;
+    }
     let _ = table_name;
     Ok(())
 }
@@ -988,26 +994,47 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         }
         // v7.37.5 γ — fixed-width per-element bodies.
         Value::BoolArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 2 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 2 } else { 1 })
+                .sum::<usize>()
         }
         Value::SmallIntArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 3 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 3 } else { 1 })
+                .sum::<usize>()
         }
         Value::FloatArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
         }
         Value::TimestampArray(items) | Value::TimestamptzArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
         }
         Value::DateArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 5 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 5 } else { 1 })
+                .sum::<usize>()
         }
         Value::NumericArray(items) => {
             // i128 scaled (16) + u8 scale (1) + 1 null flag.
-            2 + items.iter().map(|x| if x.is_some() { 18 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 18 } else { 1 })
+                .sum::<usize>()
         }
         Value::UuidArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 17 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 17 } else { 1 })
+                .sum::<usize>()
         }
         // v7.37.5 γ — variable-width per-element bodies. The codec
         // uses v47 escape lengths for string/bytes bodies; size
@@ -1022,7 +1049,11 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             for it in items {
                 n += 1; // null flag
                 if let Some(s) = it {
-                    n += if s.len() >= u16::MAX as usize { 2 + 4 } else { 2 } + s.len();
+                    n += if s.len() >= u16::MAX as usize {
+                        2 + 4
+                    } else {
+                        2
+                    } + s.len();
                 }
             }
             n
@@ -1032,7 +1063,11 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             for it in items {
                 n += 1;
                 if let Some(b) = it {
-                    n += if b.len() >= u16::MAX as usize { 2 + 4 } else { 2 } + b.len();
+                    n += if b.len() >= u16::MAX as usize {
+                        2 + 4
+                    } else {
+                        2
+                    } + b.len();
                 }
             }
             n
@@ -1058,10 +1093,10 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             n
         }
         // v7.37.5 ε — geometry fixed-width bodies.
-        Value::Point(_) => 16,                  // 2 × f64
+        Value::Point(_) => 16,                        // 2 × f64
         Value::Lseg(_, _) | Value::PgBox(_, _) => 32, // 2 × Point2D
-        Value::Line { .. } => 24,               // 3 × f64
-        Value::Circle { .. } => 24,             // Point + f64
+        Value::Line { .. } => 24,                     // 3 × f64
+        Value::Circle { .. } => 24,                   // Point + f64
         // v7.37.5 ε — Path: [u8 closed flag][u32 count][Point*n].
         Value::Path { points, .. } => 1 + 4 + 16 * points.len(),
         // v7.37.5 ε — Polygon: [u32 count][Point*n].
@@ -1082,7 +1117,10 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         }
         Value::Char1(_) => 1,
         Value::MoneyArray(items) => {
-            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
         }
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
         // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
@@ -1555,7 +1593,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         }
         // v7.37.5 ε — Path: [u8 closed flag][u32 count][Point*n].
         (Value::Path { points, closed }, DataType::Path) => {
-            out.push(if *closed { 1 } else { 0 });
+            out.push(u8::from(*closed));
             let count = u32::try_from(points.len()).expect("PATH ≤ 4G points");
             out.extend_from_slice(&count.to_le_bytes());
             for p in points {
@@ -2289,6 +2327,136 @@ fn write_bytes_escaped(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
+/// v7.37.6-B — serialize a `TableSchema.partition_role` payload.
+/// `None` writes the single tag byte `0`; presence variants
+/// (Parent / Range / Default) follow the layout pinned in the
+/// `FILE_VERSION 49` docstring. Symmetrical reader:
+/// [`read_partition_role`].
+pub(crate) fn write_partition_role(out: &mut Vec<u8>, role: Option<&crate::PartitionRole>) {
+    use crate::{PartitionKind, PartitionRole};
+    match role {
+        None => out.push(0),
+        Some(PartitionRole::Parent {
+            kind,
+            key_column_positions,
+            index_template_sources,
+        }) => {
+            out.push(1);
+            let kind_tag: u8 = match kind {
+                PartitionKind::Range => 0,
+            };
+            out.push(kind_tag);
+            write_u16(
+                out,
+                u16::try_from(key_column_positions.len()).expect("≤ 65k partition key columns"),
+            );
+            for &pos in key_column_positions {
+                write_u16(out, u16::try_from(pos).expect("≤ 65k columns/table"));
+            }
+            write_u16(
+                out,
+                u16::try_from(index_template_sources.len())
+                    .expect("≤ 65k partition index templates"),
+            );
+            for src in index_template_sources {
+                write_str(out, src.as_str());
+            }
+        }
+        Some(PartitionRole::Range {
+            parent_name,
+            lower,
+            upper,
+        }) => {
+            out.push(2);
+            write_str(out, parent_name.as_str());
+            write_partition_bound(out, lower);
+            write_partition_bound(out, upper);
+        }
+        Some(PartitionRole::Default { parent_name }) => {
+            out.push(3);
+            write_str(out, parent_name.as_str());
+        }
+    }
+}
+
+fn write_partition_bound(out: &mut Vec<u8>, bound: &crate::PartitionBound) {
+    use crate::PartitionBound;
+    match bound {
+        PartitionBound::MinValue => out.push(0),
+        PartitionBound::MaxValue => out.push(1),
+        PartitionBound::TimestampTz(micros) => {
+            out.push(2);
+            out.extend_from_slice(&micros.to_le_bytes());
+        }
+    }
+}
+
+pub(crate) fn read_partition_role(
+    cur: &mut Cursor<'_>,
+) -> Result<Option<crate::PartitionRole>, StorageError> {
+    use crate::{PartitionKind, PartitionRole};
+    let tag = cur.read_u8()?;
+    match tag {
+        0 => Ok(None),
+        1 => {
+            let kind_tag = cur.read_u8()?;
+            let kind = match kind_tag {
+                0 => PartitionKind::Range,
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "partition_role Parent: unknown kind tag {other}"
+                    )));
+                }
+            };
+            let key_count = cur.read_u16()? as usize;
+            let mut key_column_positions = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                key_column_positions.push(cur.read_u16()? as usize);
+            }
+            let tmpl_count = cur.read_u16()? as usize;
+            let mut index_template_sources = Vec::with_capacity(tmpl_count);
+            for _ in 0..tmpl_count {
+                index_template_sources.push(cur.read_str()?);
+            }
+            Ok(Some(PartitionRole::Parent {
+                kind,
+                key_column_positions,
+                index_template_sources,
+            }))
+        }
+        2 => {
+            let parent_name = cur.read_str()?;
+            let lower = read_partition_bound(cur)?;
+            let upper = read_partition_bound(cur)?;
+            Ok(Some(PartitionRole::Range {
+                parent_name,
+                lower,
+                upper,
+            }))
+        }
+        3 => {
+            let parent_name = cur.read_str()?;
+            Ok(Some(PartitionRole::Default { parent_name }))
+        }
+        other => Err(StorageError::Corrupt(format!(
+            "partition_role: unknown role tag {other}"
+        ))),
+    }
+}
+
+fn read_partition_bound(cur: &mut Cursor<'_>) -> Result<crate::PartitionBound, StorageError> {
+    use crate::PartitionBound;
+    let tag = cur.read_u8()?;
+    match tag {
+        0 => Ok(PartitionBound::MinValue),
+        1 => Ok(PartitionBound::MaxValue),
+        2 => Ok(PartitionBound::TimestampTz(cur.read_i64()?)),
+        other => Err(StorageError::Corrupt(format!(
+            "partition_bound: unknown tag {other}"
+        ))),
+    }
+}
+
 pub(crate) fn write_str(out: &mut Vec<u8>, s: &str) {
     if s.len() >= STR_LEN_ESCAPE as usize {
         // Real mail bodies / document text routinely exceed 64 KiB
@@ -2655,7 +2823,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_u8()? != 0)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("BOOL[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "BOOL[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::BoolArray(items))
@@ -2670,7 +2842,11 @@ impl<'a> Cursor<'a> {
                             items.push(Some(i16::from_le_bytes([s[0], s[1]])));
                         }
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("SMALLINT[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "SMALLINT[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::SmallIntArray(items))
@@ -2682,7 +2858,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_f64()?)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("FLOAT[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "FLOAT[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::FloatArray(items))
@@ -2699,7 +2879,11 @@ impl<'a> Cursor<'a> {
                             items.push(Some((scaled, scale)));
                         }
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("NUMERIC[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "NUMERIC[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::NumericArray(items))
@@ -2711,7 +2895,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_i32()?)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("DATE[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "DATE[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::DateArray(items))
@@ -2723,7 +2911,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_i64()?)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("TIMESTAMP[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TIMESTAMP[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::TimestampArray(items))
@@ -2735,7 +2927,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_i64()?)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("TIMESTAMPTZ[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TIMESTAMPTZ[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::TimestamptzArray(items))
@@ -2752,7 +2948,11 @@ impl<'a> Cursor<'a> {
                             items.push(Some(b));
                         }
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("UUID[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "UUID[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::UuidArray(items))
@@ -2768,7 +2968,11 @@ impl<'a> Cursor<'a> {
                     match self.read_u8()? {
                         0 => items.push(Some(self.read_str_escaped_v47()?)),
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("string-array null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "string-array null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(match kind {
@@ -2789,7 +2993,11 @@ impl<'a> Cursor<'a> {
                             items.push(Some(self.take(len)?.to_vec()));
                         }
                         1 => items.push(None),
-                        other => return Err(StorageError::Corrupt(format!("BYTEA[] null flag: {other}"))),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "BYTEA[] null flag: {other}"
+                            )));
+                        }
                     }
                 }
                 Ok(Value::BytesArray(items))

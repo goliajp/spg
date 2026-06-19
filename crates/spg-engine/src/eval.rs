@@ -38,6 +38,7 @@ mod strings;
 mod textsearch;
 mod values;
 
+pub use crate::conversions::format_money_array;
 pub(crate) use binop::{and_3vl, apply_binary_interval};
 use binop::{apply_binary, apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
@@ -48,15 +49,13 @@ use datetime::{
     age, date_format_mysql, date_part, date_trunc, extract_field, from_unixtime, unix_timestamp_of,
 };
 use encoding::{decode_text, encode_text};
-pub use crate::conversions::format_money_array;
 pub use format::{
     days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
     format_date, format_date_array, format_float_array, format_int_array, format_interval,
     format_interval_array, format_money, format_numeric, format_numeric_array,
-    format_smallint_array, format_text_array, format_time, format_timestamp_array,
-    format_uuid_array,
-    format_timestamp, format_timestamptz, format_timetz, parse_date_literal,
-    parse_timestamp_literal,
+    format_smallint_array, format_text_array, format_time, format_timestamp,
+    format_timestamp_array, format_timestamptz, format_timetz, format_uuid_array,
+    parse_date_literal, parse_timestamp_literal,
 };
 use functions::apply_function;
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};

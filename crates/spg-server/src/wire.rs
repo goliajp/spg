@@ -312,9 +312,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::JsonArray(items)
         | Value::JsonbArray(items)
         | Value::VarcharArray(items)
-        | Value::CharArray(items) => {
-            WireValue::Text(spg_engine::eval::format_text_array(items))
-        }
+        | Value::CharArray(items) => WireValue::Text(spg_engine::eval::format_text_array(items)),
         Value::BytesArray(items) => WireValue::Text(spg_engine::eval::format_bytea_array(items)),
         // v7.37.5 δ — Multirange external form.
         Value::Multirange { kind: _, ranges } => {
@@ -328,9 +326,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Circle { center, radius } => {
             WireValue::Text(spg_engine::format_circle(*center, *radius))
         }
-        Value::Path { points, closed } => {
-            WireValue::Text(spg_engine::format_path(points, *closed))
-        }
+        Value::Path { points, closed } => WireValue::Text(spg_engine::format_path(points, *closed)),
         Value::Polygon(points) => WireValue::Text(spg_engine::format_polygon(points)),
         // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
         Value::Inet { family, bits, addr } => {
@@ -350,9 +346,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         // `"char"` is a single byte; render as one-char string
         // (matches PG: `'A'::"char"` renders `A`).
         Value::Char1(b) => WireValue::Text((*b as char).to_string()),
-        Value::MoneyArray(items) => {
-            WireValue::Text(spg_engine::eval::format_money_array(items))
-        }
+        Value::MoneyArray(items) => WireValue::Text(spg_engine::eval::format_money_array(items)),
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

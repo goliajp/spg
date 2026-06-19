@@ -331,12 +331,7 @@ fn shift_date_by_months(d: i32, months: i64) -> Result<i32, EvalError> {
 /// (DST-naïve at the TIMESTAMP level, matching PG); micros part is
 /// plain i64 addition with overflow guard. v7.37.5 β added the
 /// `days` parameter.
-fn add_interval_to_micros(
-    t: i64,
-    months: i64,
-    days: i64,
-    micros: i64,
-) -> Result<i64, EvalError> {
+fn add_interval_to_micros(t: i64, months: i64, days: i64, micros: i64) -> Result<i64, EvalError> {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     let mut out = t;
     if months != 0 {
@@ -354,9 +349,11 @@ fn add_interval_to_micros(
             })?;
     }
     if days != 0 {
-        let day_micros = days.checked_mul(MICROS_PER_DAY).ok_or(EvalError::TypeMismatch {
-            detail: "INTERVAL days overflows i64 microseconds".into(),
-        })?;
+        let day_micros = days
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or(EvalError::TypeMismatch {
+                detail: "INTERVAL days overflows i64 microseconds".into(),
+            })?;
         out = out.checked_add(day_micros).ok_or(EvalError::TypeMismatch {
             detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
         })?;

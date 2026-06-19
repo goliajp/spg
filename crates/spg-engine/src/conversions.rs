@@ -101,48 +101,94 @@ enum UniformArrayKind {
 impl UniformArrayKind {
     fn build(self, items: alloc::vec::Vec<Value>) -> Value {
         match self {
-            Self::Bool => Value::BoolArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Bool(b) => Some(b),
-                _ => unreachable!("uniform Bool"),
-            }).collect()),
-            Self::Float => Value::FloatArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Float(x) => Some(x),
-                _ => unreachable!("uniform Float"),
-            }).collect()),
-            Self::Numeric => Value::NumericArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Numeric { scaled, scale } => Some((scaled, scale)),
-                _ => unreachable!("uniform Numeric"),
-            }).collect()),
-            Self::Date => Value::DateArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Date(d) => Some(d),
-                _ => unreachable!("uniform Date"),
-            }).collect()),
-            Self::Timestamp => Value::TimestampArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Timestamp(t) => Some(t),
-                _ => unreachable!("uniform Timestamp"),
-            }).collect()),
-            Self::Uuid => Value::UuidArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Uuid(b) => Some(b),
-                _ => unreachable!("uniform Uuid"),
-            }).collect()),
-            Self::Bytes => Value::BytesArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Bytes(b) => Some(b),
-                _ => unreachable!("uniform Bytes"),
-            }).collect()),
-            Self::Interval => Value::IntervalArray(items.into_iter().map(|v| match v {
-                Value::Null => None,
-                Value::Interval { months, days, micros } => {
-                    Some(spg_storage::IntervalSpan { months, days, micros })
-                }
-                _ => unreachable!("uniform Interval"),
-            }).collect()),
+            Self::Bool => Value::BoolArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Bool(b) => Some(b),
+                        _ => unreachable!("uniform Bool"),
+                    })
+                    .collect(),
+            ),
+            Self::Float => Value::FloatArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Float(x) => Some(x),
+                        _ => unreachable!("uniform Float"),
+                    })
+                    .collect(),
+            ),
+            Self::Numeric => Value::NumericArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Numeric { scaled, scale } => Some((scaled, scale)),
+                        _ => unreachable!("uniform Numeric"),
+                    })
+                    .collect(),
+            ),
+            Self::Date => Value::DateArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Date(d) => Some(d),
+                        _ => unreachable!("uniform Date"),
+                    })
+                    .collect(),
+            ),
+            Self::Timestamp => Value::TimestampArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Timestamp(t) => Some(t),
+                        _ => unreachable!("uniform Timestamp"),
+                    })
+                    .collect(),
+            ),
+            Self::Uuid => Value::UuidArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Uuid(b) => Some(b),
+                        _ => unreachable!("uniform Uuid"),
+                    })
+                    .collect(),
+            ),
+            Self::Bytes => Value::BytesArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Bytes(b) => Some(b),
+                        _ => unreachable!("uniform Bytes"),
+                    })
+                    .collect(),
+            ),
+            Self::Interval => Value::IntervalArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Interval {
+                            months,
+                            days,
+                            micros,
+                        } => Some(spg_storage::IntervalSpan {
+                            months,
+                            days,
+                            micros,
+                        }),
+                        _ => unreachable!("uniform Interval"),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -797,8 +843,7 @@ pub(crate) fn parse_multirange_str(
     let mut depth: i32 = 0;
     let mut start = 0usize;
     for i in 0..=bytes.len() {
-        let cut = i == bytes.len()
-            || (depth == 0 && bytes[i] == b',');
+        let cut = i == bytes.len() || (depth == 0 && bytes[i] == b',');
         if !cut {
             match bytes.get(i) {
                 Some(b'[') | Some(b'(') => depth += 1,
@@ -963,7 +1008,10 @@ pub fn format_polygon(points: &[spg_storage::Point2D]) -> alloc::string::String 
 /// Surrounding whitespace OK. Returns `None` on malformed input.
 fn parse_point(s: &str) -> Option<spg_storage::Point2D> {
     let s = s.trim();
-    let inner = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(s);
+    let inner = s
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(s);
     let (xs, ys) = inner.split_once(',')?;
     let x: f64 = xs.trim().parse().ok()?;
     let y: f64 = ys.trim().parse().ok()?;
@@ -1019,8 +1067,14 @@ pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Poi
     }
     let (a, b) = (pts[0], pts[1]);
     // Normalise: upper-right has the larger x AND larger y.
-    let ur = spg_storage::Point2D { x: a.x.max(b.x), y: a.y.max(b.y) };
-    let ll = spg_storage::Point2D { x: a.x.min(b.x), y: a.y.min(b.y) };
+    let ur = spg_storage::Point2D {
+        x: a.x.max(b.x),
+        y: a.y.max(b.y),
+    };
+    let ll = spg_storage::Point2D {
+        x: a.x.min(b.x),
+        y: a.y.min(b.y),
+    };
     Some((ur, ll))
 }
 
@@ -1128,7 +1182,12 @@ pub fn format_inet(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::Stri
 pub fn format_macaddr(m: &[u8; 6]) -> alloc::string::String {
     alloc::format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
     )
 }
 
@@ -1136,7 +1195,14 @@ pub fn format_macaddr(m: &[u8; 6]) -> alloc::string::String {
 pub fn format_macaddr8(m: &[u8; 8]) -> alloc::string::String {
     alloc::format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5],
+        m[6],
+        m[7]
     )
 }
 
@@ -1980,33 +2046,53 @@ pub(crate) fn coerce_value(
         // v7.37.5 ζ-A — Text → network / bit / xml / "char" / money[].
         (Value::Text(s), DataType::Inet) => match parse_inet_text(&s) {
             Some((family, bits, addr)) => Some(Value::Inet { family, bits, addr }),
-            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
-                detail: alloc::format!("invalid input syntax for INET: {s:?} (column `{col_name}`)"),
-            })),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for INET: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
         },
         (Value::Text(s), DataType::Cidr) => match parse_inet_text(&s) {
             Some((family, bits, addr)) => Some(Value::Cidr { family, bits, addr }),
-            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
-                detail: alloc::format!("invalid input syntax for CIDR: {s:?} (column `{col_name}`)"),
-            })),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for CIDR: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
         },
         (Value::Text(s), DataType::Macaddr) => match parse_macaddr_text(&s) {
             Some(m) => Some(Value::Macaddr(m)),
-            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
-                detail: alloc::format!("invalid input syntax for MACADDR: {s:?} (column `{col_name}`)"),
-            })),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for MACADDR: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
         },
         (Value::Text(s), DataType::Macaddr8) => match parse_macaddr8_text(&s) {
             Some(m) => Some(Value::Macaddr8(m)),
-            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
-                detail: alloc::format!("invalid input syntax for MACADDR8: {s:?} (column `{col_name}`)"),
-            })),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for MACADDR8: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
         },
         (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
             Some((nbits, bytes)) => Some(Value::BitString { nbits, bytes }),
-            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
-                detail: alloc::format!("invalid input syntax for BIT: {s:?} (column `{col_name}`)"),
-            })),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for BIT: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
         },
         (Value::Text(s), DataType::Xml) => Some(Value::Xml(s)),
         (Value::Text(s), DataType::Char1) => {
@@ -2034,7 +2120,9 @@ pub(crate) fn coerce_value(
             Some(p) => Some(Value::Point(p)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for POINT: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for POINT: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2042,7 +2130,9 @@ pub(crate) fn coerce_value(
             Some((p1, p2)) => Some(Value::Lseg(p1, p2)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for LSEG: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for LSEG: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2050,7 +2140,9 @@ pub(crate) fn coerce_value(
             Some((ur, ll)) => Some(Value::PgBox(ur, ll)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for BOX: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for BOX: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2058,7 +2150,9 @@ pub(crate) fn coerce_value(
             Some((a, b, c)) => Some(Value::Line { a, b, c }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for LINE: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for LINE: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2066,7 +2160,9 @@ pub(crate) fn coerce_value(
             Some((center, radius)) => Some(Value::Circle { center, radius }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for CIRCLE: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for CIRCLE: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2074,7 +2170,9 @@ pub(crate) fn coerce_value(
             Some((points, closed)) => Some(Value::Path { points, closed }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for PATH: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for PATH: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },
@@ -2082,7 +2180,9 @@ pub(crate) fn coerce_value(
             Some(points) => Some(Value::Polygon(points)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("invalid input syntax for POLYGON: {s:?} (column `{col_name}`)"),
+                    detail: alloc::format!(
+                        "invalid input syntax for POLYGON: {s:?} (column `{col_name}`)"
+                    ),
                 }));
             }
         },

@@ -48,10 +48,8 @@ fn inet_ipv6_round_trip() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, a INET NOT NULL)")
         .unwrap();
-    e.execute(
-        "INSERT INTO t VALUES (1, '2001:db8:0:0:0:0:0:1'::inet)",
-    )
-    .unwrap();
+    e.execute("INSERT INTO t VALUES (1, '2001:db8:0:0:0:0:0:1'::inet)")
+        .unwrap();
     let r = rows(e.execute("SELECT a FROM t").unwrap());
     let Value::Inet { family, bits, addr } = &r[0][0] else {
         panic!()
@@ -159,10 +157,7 @@ fn money_array_round_trip() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, xs MONEY[] NOT NULL)")
         .unwrap();
-    assert_eq!(
-        col_type(&mut e, "SELECT xs FROM t"),
-        DataType::MoneyArray
-    );
+    assert_eq!(col_type(&mut e, "SELECT xs FROM t"), DataType::MoneyArray);
     e.execute("INSERT INTO t VALUES (1, ARRAY['$1.00'::money, NULL, '$2.50'::money])")
         .unwrap();
     let r = rows(e.execute("SELECT xs FROM t").unwrap());

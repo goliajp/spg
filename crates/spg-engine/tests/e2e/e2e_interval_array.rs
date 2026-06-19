@@ -126,8 +126,5 @@ fn nullable_column_accepts_null() {
         .unwrap();
     let r = rows(e.execute("SELECT spans FROM t ORDER BY id").unwrap());
     assert_eq!(r[0][0], Value::Null);
-    assert_eq!(
-        r[1][0],
-        Value::IntervalArray(vec![Some(span(0, 1, 0))])
-    );
+    assert_eq!(r[1][0], Value::IntervalArray(vec![Some(span(0, 1, 0))]));
 }

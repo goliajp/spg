@@ -16,7 +16,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::{DataType, Value};
 
 fn first_row(e: &mut Engine, sql: &str) -> Vec<Value> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows for {sql}");
     };
@@ -84,10 +86,7 @@ fn numeric_array_round_trip() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, xs NUMERIC[] NOT NULL)")
         .unwrap();
-    assert_eq!(
-        col_type(&mut e, "SELECT xs FROM t"),
-        DataType::NumericArray
-    );
+    assert_eq!(col_type(&mut e, "SELECT xs FROM t"), DataType::NumericArray);
     e.execute("INSERT INTO t VALUES (1, ARRAY[1.50::numeric(10,2), -3.14::numeric(10,2), NULL])")
         .unwrap();
     let row = first_row(&mut e, "SELECT xs FROM t");
@@ -172,11 +171,7 @@ fn bytes_array_round_trip() {
     let row = first_row(&mut e, "SELECT xs FROM t");
     assert_eq!(
         row[0],
-        Value::BytesArray(vec![
-            Some(vec![0xde, 0xad]),
-            None,
-            Some(vec![0xbe, 0xef]),
-        ])
+        Value::BytesArray(vec![Some(vec![0xde, 0xad]), None, Some(vec![0xbe, 0xef]),])
     );
 }
 
