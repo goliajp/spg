@@ -691,6 +691,17 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Polygon => out.push(54),
         DataType::Line => out.push(55),
         DataType::Circle => out.push(56),
+        // v7.37.5 ζ-A: tags 57..65 — network / bit / xml /
+        // "char" / money[]. Catalog FILE_VERSION 48+.
+        DataType::Inet => out.push(57),
+        DataType::Cidr => out.push(58),
+        DataType::Macaddr => out.push(59),
+        DataType::Macaddr8 => out.push(60),
+        DataType::Bit => out.push(61),
+        DataType::BitVarying => out.push(62),
+        DataType::Xml => out.push(63),
+        DataType::Char1 => out.push(64),
+        DataType::MoneyArray => out.push(65),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -859,6 +870,15 @@ impl Cursor<'_> {
             54 => Ok(DataType::Polygon),
             55 => Ok(DataType::Line),
             56 => Ok(DataType::Circle),
+            57 => Ok(DataType::Inet),
+            58 => Ok(DataType::Cidr),
+            59 => Ok(DataType::Macaddr),
+            60 => Ok(DataType::Macaddr8),
+            61 => Ok(DataType::Bit),
+            62 => Ok(DataType::BitVarying),
+            63 => Ok(DataType::Xml),
+            64 => Ok(DataType::Char1),
+            65 => Ok(DataType::MoneyArray),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1046,6 +1066,24 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Path { points, .. } => 1 + 4 + 16 * points.len(),
         // v7.37.5 ε — Polygon: [u32 count][Point*n].
         Value::Polygon(points) => 4 + 16 * points.len(),
+        // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+        Value::Inet { .. } | Value::Cidr { .. } => 1 + 1 + 16, // family + bits + addr
+        Value::Macaddr(_) => 6,
+        Value::Macaddr8(_) => 8,
+        // BitString: [u32 nbits][packed bytes].
+        Value::BitString { bytes, .. } => 4 + bytes.len(),
+        Value::Xml(s) => {
+            // Same envelope as TEXT (v47 escape lengths).
+            if s.len() >= STR_LEN_ESCAPE as usize {
+                6 + s.len()
+            } else {
+                2 + s.len()
+            }
+        }
+        Value::Char1(_) => 1,
+        Value::MoneyArray(items) => {
+            2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>()
+        }
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
         // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
         // LE * pos_count) + u8 weight].
@@ -1534,6 +1572,44 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 out.extend_from_slice(&p.y.to_le_bytes());
             }
         }
+        // v7.37.5 ζ-A — network. Body: u8 family + u8 bits + 16 B addr.
+        // Cidr shares the Inet body shape (the CIDR invariant is
+        // enforced at parse/coerce, not on disk).
+        (Value::Inet { family, bits, addr }, DataType::Inet)
+        | (Value::Cidr { family, bits, addr }, DataType::Cidr) => {
+            out.push(*family);
+            out.push(*bits);
+            out.extend_from_slice(&addr[..]);
+        }
+        (Value::Macaddr(m), DataType::Macaddr) => out.extend_from_slice(&m[..]),
+        (Value::Macaddr8(m), DataType::Macaddr8) => out.extend_from_slice(&m[..]),
+        // v7.37.5 ζ-A — BitString shared codec for BIT and BIT VARYING.
+        // Body: [u32 LE nbits][ceil(nbits/8) bytes packed BE-in-byte].
+        (Value::BitString { nbits, bytes }, DataType::Bit)
+        | (Value::BitString { nbits, bytes }, DataType::BitVarying) => {
+            out.extend_from_slice(&nbits.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        // v7.37.5 ζ-A — XML stored as length-prefixed text (same
+        // envelope as Text / Json).
+        (Value::Xml(s), DataType::Xml) => write_str(out, s),
+        // v7.37.5 ζ-A — `"char"` is a single raw byte.
+        (Value::Char1(b), DataType::Char1) => out.push(*b),
+        // v7.37.5 ζ-A — MONEY[] dense body. Same shape as
+        // BigIntArray (per-elem i64 LE cents).
+        (Value::MoneyArray(items), DataType::MoneyArray) => {
+            let count = u16::try_from(items.len()).expect("MONEY[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
         // v7.37.5 δ — Multirange dense body: [u16 count][per range:
         // u8 flags + (if lower present) bound body + (if upper
         // present) bound body]. Bound bodies recurse via
@@ -1915,6 +1991,19 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
         | Value::Line { .. }
         | Value::Circle { .. } => unreachable!(
             "v7.37.5 ε geometry scalar lacks a schema-less codec tag — \
+             use schema-aware write_value_body via the column's DataType"
+        ),
+        // v7.37.5 ζ-A — network / bit / xml / "char" / money[]
+        // column-typed only.
+        Value::Inet { .. }
+        | Value::Cidr { .. }
+        | Value::Macaddr(_)
+        | Value::Macaddr8(_)
+        | Value::BitString { .. }
+        | Value::Xml(_)
+        | Value::Char1(_)
+        | Value::MoneyArray(_) => unreachable!(
+            "v7.37.5 ζ-A network/bit/xml/\"char\"/money[] lack a schema-less codec tag — \
              use schema-aware write_value_body via the column's DataType"
         ),
         // v7.12.0: tsvector — tag 18. Body shape matches
@@ -2767,6 +2856,55 @@ impl<'a> Cursor<'a> {
                     points.push(Point2D { x, y });
                 }
                 Ok(Value::Polygon(points))
+            }
+            // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+            DataType::Inet => {
+                let family = self.read_u8()?;
+                let bits = self.read_u8()?;
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(self.take(16)?);
+                Ok(Value::Inet { family, bits, addr })
+            }
+            DataType::Cidr => {
+                let family = self.read_u8()?;
+                let bits = self.read_u8()?;
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(self.take(16)?);
+                Ok(Value::Cidr { family, bits, addr })
+            }
+            DataType::Macaddr => {
+                let mut m = [0u8; 6];
+                m.copy_from_slice(self.take(6)?);
+                Ok(Value::Macaddr(m))
+            }
+            DataType::Macaddr8 => {
+                let mut m = [0u8; 8];
+                m.copy_from_slice(self.take(8)?);
+                Ok(Value::Macaddr8(m))
+            }
+            DataType::Bit | DataType::BitVarying => {
+                let nbits = self.read_u32()?;
+                let nbytes = (nbits as usize).div_ceil(8);
+                let bytes = self.take(nbytes)?.to_vec();
+                Ok(Value::BitString { nbits, bytes })
+            }
+            DataType::Xml => Ok(Value::Xml(self.read_str()?)),
+            DataType::Char1 => Ok(Value::Char1(self.read_u8()?)),
+            DataType::MoneyArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "MONEY[] null flag: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::MoneyArray(items))
             }
             // v7.37.5 δ — Multirange dense body. Symmetric inverse
             // of the schema-aware write arm: read u16 count, per

@@ -1525,6 +1525,16 @@ pub enum ColumnTypeName {
     Polygon,
     Line,
     Circle,
+    /// v7.37.5 ζ-A — PG network / bit / xml / "char" / money[].
+    Inet,
+    Cidr,
+    Macaddr,
+    Macaddr8,
+    Bit,
+    BitVarying,
+    Xml,
+    Char1,
+    MoneyArray,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1618,6 +1628,15 @@ impl fmt::Display for ColumnTypeName {
             Self::Polygon => f.write_str("POLYGON"),
             Self::Line => f.write_str("LINE"),
             Self::Circle => f.write_str("CIRCLE"),
+            Self::Inet => f.write_str("INET"),
+            Self::Cidr => f.write_str("CIDR"),
+            Self::Macaddr => f.write_str("MACADDR"),
+            Self::Macaddr8 => f.write_str("MACADDR8"),
+            Self::Bit => f.write_str("BIT"),
+            Self::BitVarying => f.write_str("VARBIT"),
+            Self::Xml => f.write_str("XML"),
+            Self::Char1 => f.write_str("\"char\""),
+            Self::MoneyArray => f.write_str("MONEY[]"),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),

@@ -148,6 +148,18 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Polygon
         | DataType::Line
         | DataType::Circle
+        // v7.37.5 ζ-A — network / bit / xml / "char" / money[]
+        // collapse to PG external text. RowDescription advertises
+        // 869 / 650 / 829 / 774 / 1560 / 1562 / 142 / 18 / 791.
+        | DataType::Inet
+        | DataType::Cidr
+        | DataType::Macaddr
+        | DataType::Macaddr8
+        | DataType::Bit
+        | DataType::BitVarying
+        | DataType::Xml
+        | DataType::Char1
+        | DataType::MoneyArray
         // v7.37.5 δ — multirange collapses to PG external text
         // form `{[a,b),[c,d)}` on the wire. RowDescription
         // advertises 4451/4537/4536/4533/4534/4535 via
@@ -320,6 +332,27 @@ fn value_to_wire(v: &Value) -> WireValue {
             WireValue::Text(spg_engine::format_path(points, *closed))
         }
         Value::Polygon(points) => WireValue::Text(spg_engine::format_polygon(points)),
+        // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+        Value::Inet { family, bits, addr } => {
+            WireValue::Text(spg_engine::format_inet(*family, *bits, addr))
+        }
+        Value::Cidr { family, bits, addr } => {
+            WireValue::Text(spg_engine::format_inet(*family, *bits, addr))
+        }
+        Value::Macaddr(m) => WireValue::Text(spg_engine::format_macaddr(m)),
+        Value::Macaddr8(m) => WireValue::Text(spg_engine::format_macaddr8(m)),
+        Value::BitString { nbits, bytes } => {
+            WireValue::Text(spg_engine::format_bit_string(*nbits, bytes))
+        }
+        // XML rides the wire as raw text — clients use OID 142 in
+        // RowDescription to decode.
+        Value::Xml(s) => WireValue::Text(s.clone()),
+        // `"char"` is a single byte; render as one-char string
+        // (matches PG: `'A'::"char"` renders `A`).
+        Value::Char1(b) => WireValue::Text((*b as char).to_string()),
+        Value::MoneyArray(items) => {
+            WireValue::Text(spg_engine::eval::format_money_array(items))
+        }
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

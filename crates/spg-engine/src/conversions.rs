@@ -1086,6 +1086,189 @@ pub fn parse_polygon_text(s: &str) -> Option<Vec<spg_storage::Point2D>> {
     parse_point_list(inner)
 }
 
+/// v7.37.5 ζ-A — render an INET/CIDR address as canonical PG text:
+/// IPv4: `a.b.c.d/bits`; IPv6: `xxxx:xxxx:.../bits`. The mask is
+/// elided when it equals the family default (32 for IPv4, 128 for
+/// IPv6), per PG convention.
+pub fn format_inet(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::String {
+    match family {
+        4 => {
+            let s = alloc::format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
+            if bits == 32 {
+                s
+            } else {
+                alloc::format!("{s}/{bits}")
+            }
+        }
+        6 => {
+            // Naive `xxxx:xxxx:...` colon-separated form. PG's
+            // `::` compression is a follow-up; the canonical text
+            // here still round-trips correctly through `parse_inet`.
+            let mut out = alloc::string::String::new();
+            for i in 0..8 {
+                if i > 0 {
+                    out.push(':');
+                }
+                let hi = addr[i * 2];
+                let lo = addr[i * 2 + 1];
+                let word = (u16::from(hi) << 8) | u16::from(lo);
+                out.push_str(&alloc::format!("{word:x}"));
+            }
+            if bits == 128 {
+                out
+            } else {
+                alloc::format!("{out}/{bits}")
+            }
+        }
+        _ => alloc::format!("?invalid-inet-family-{family}"),
+    }
+}
+
+/// v7.37.5 ζ-A — render a MACADDR (6 bytes) as `aa:bb:cc:dd:ee:ff`.
+pub fn format_macaddr(m: &[u8; 6]) -> alloc::string::String {
+    alloc::format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
+}
+
+/// v7.37.5 ζ-A — render a MACADDR8 (8 bytes) as `aa:bb:cc:dd:ee:ff:00:11`.
+pub fn format_macaddr8(m: &[u8; 8]) -> alloc::string::String {
+    alloc::format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]
+    )
+}
+
+/// v7.37.5 ζ-A — render a BIT / BIT VARYING as a binary string of
+/// `'0'` and `'1'` chars (PG canonical text form). Bytes are packed
+/// big-endian within each byte: the most-significant bit of byte 0
+/// is bit 0 of the bit string.
+pub fn format_bit_string(nbits: u32, bytes: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(nbits as usize);
+    for i in 0..nbits as usize {
+        let byte = bytes[i / 8];
+        let bit = (byte >> (7 - (i % 8))) & 1;
+        out.push(if bit == 1 { '1' } else { '0' });
+    }
+    out
+}
+
+/// v7.37.5 ζ-A — render a MONEY[] in PG external form. Each element
+/// is the canonical `format_money` output; the array wrapper is
+/// `{...}` with NULL elements as the literal token `NULL`.
+pub fn format_money_array(items: &[Option<i64>]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(c) => out.push_str(&crate::eval::format_money(*c)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 ζ-A — parse PG INET text. Accepts `a.b.c.d[/bits]`
+/// (IPv4) or `xxxx:xxxx:.../[bits]` (IPv6 colon-separated). The
+/// mask defaults to 32 (IPv4) / 128 (IPv6) when omitted. Returns
+/// `(family, bits, addr16)`. `None` on malformed input.
+pub fn parse_inet_text(s: &str) -> Option<(u8, u8, [u8; 16])> {
+    let s = s.trim();
+    let (addr_s, bits_s) = match s.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    if addr_s.contains(':') {
+        // IPv6 — colon-separated 8 × u16 hex. `::` compression is
+        // a follow-up; we accept full 8-group form for now.
+        let parts: alloc::vec::Vec<&str> = addr_s.split(':').collect();
+        if parts.len() != 8 {
+            return None;
+        }
+        let mut addr = [0u8; 16];
+        for (i, p) in parts.iter().enumerate() {
+            let word = u16::from_str_radix(p, 16).ok()?;
+            addr[i * 2] = (word >> 8) as u8;
+            addr[i * 2 + 1] = (word & 0xff) as u8;
+        }
+        let bits = match bits_s {
+            Some(b) => b.parse::<u8>().ok().filter(|&n| n <= 128)?,
+            None => 128,
+        };
+        Some((6, bits, addr))
+    } else {
+        // IPv4 — `a.b.c.d`.
+        let parts: alloc::vec::Vec<&str> = addr_s.split('.').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let mut addr = [0u8; 16];
+        for (i, p) in parts.iter().enumerate() {
+            addr[i] = p.parse::<u8>().ok()?;
+        }
+        let bits = match bits_s {
+            Some(b) => b.parse::<u8>().ok().filter(|&n| n <= 32)?,
+            None => 32,
+        };
+        Some((4, bits, addr))
+    }
+}
+
+/// v7.37.5 ζ-A — parse PG MACADDR text `aa:bb:cc:dd:ee:ff` (also
+/// accepts `aa-bb-cc-dd-ee-ff` and unseparated `aabbccddeeff`).
+pub fn parse_macaddr_text(s: &str) -> Option<[u8; 6]> {
+    let s = s.trim();
+    let cleaned: alloc::string::String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if cleaned.len() != 12 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for i in 0..6 {
+        out[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// v7.37.5 ζ-A — parse PG MACADDR8 text.
+pub fn parse_macaddr8_text(s: &str) -> Option<[u8; 8]> {
+    let s = s.trim();
+    let cleaned: alloc::string::String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if cleaned.len() != 16 {
+        return None;
+    }
+    let mut out = [0u8; 8];
+    for i in 0..8 {
+        out[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// v7.37.5 ζ-A — parse PG bit string text (a sequence of `'0'` and
+/// `'1'` chars). Returns `(nbits, packed_bytes)` — bytes are
+/// big-endian within each byte (PG canonical).
+pub fn parse_bit_string_text(s: &str) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    let s = s.trim();
+    let nbits = u32::try_from(s.len()).ok()?;
+    let nbytes = (s.len()).div_ceil(8);
+    let mut bytes = alloc::vec![0u8; nbytes];
+    for (i, c) in s.chars().enumerate() {
+        let bit = match c {
+            '0' => 0u8,
+            '1' => 1u8,
+            _ => return None,
+        };
+        if bit == 1 {
+            bytes[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    Some((nbits, bytes))
+}
+
 /// v7.37.5 δ — render a Multirange in PG external form
 /// `{[a,b),[c,d)}`. Empty multirange renders as `{}`. Each range
 /// element is formatted with the same `[/(/]/)` bracket grammar
@@ -1374,6 +1557,15 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Polygon => DataType::Polygon,
         ColumnTypeName::Line => DataType::Line,
         ColumnTypeName::Circle => DataType::Circle,
+        ColumnTypeName::Inet => DataType::Inet,
+        ColumnTypeName::Cidr => DataType::Cidr,
+        ColumnTypeName::Macaddr => DataType::Macaddr,
+        ColumnTypeName::Macaddr8 => DataType::Macaddr8,
+        ColumnTypeName::Bit => DataType::Bit,
+        ColumnTypeName::BitVarying => DataType::BitVarying,
+        ColumnTypeName::Xml => DataType::Xml,
+        ColumnTypeName::Char1 => DataType::Char1,
+        ColumnTypeName::MoneyArray => DataType::MoneyArray,
     }
 }
 
@@ -1785,6 +1977,56 @@ pub(crate) fn coerce_value(
         },
         // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
         (v @ Value::Range { .. }, DataType::Text) => Some(Value::Text(format_range_str(&v))),
+        // v7.37.5 ζ-A — Text → network / bit / xml / "char" / money[].
+        (Value::Text(s), DataType::Inet) => match parse_inet_text(&s) {
+            Some((family, bits, addr)) => Some(Value::Inet { family, bits, addr }),
+            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for INET: {s:?} (column `{col_name}`)"),
+            })),
+        },
+        (Value::Text(s), DataType::Cidr) => match parse_inet_text(&s) {
+            Some((family, bits, addr)) => Some(Value::Cidr { family, bits, addr }),
+            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for CIDR: {s:?} (column `{col_name}`)"),
+            })),
+        },
+        (Value::Text(s), DataType::Macaddr) => match parse_macaddr_text(&s) {
+            Some(m) => Some(Value::Macaddr(m)),
+            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for MACADDR: {s:?} (column `{col_name}`)"),
+            })),
+        },
+        (Value::Text(s), DataType::Macaddr8) => match parse_macaddr8_text(&s) {
+            Some(m) => Some(Value::Macaddr8(m)),
+            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for MACADDR8: {s:?} (column `{col_name}`)"),
+            })),
+        },
+        (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
+            Some((nbits, bytes)) => Some(Value::BitString { nbits, bytes }),
+            None => return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for BIT: {s:?} (column `{col_name}`)"),
+            })),
+        },
+        (Value::Text(s), DataType::Xml) => Some(Value::Xml(s)),
+        (Value::Text(s), DataType::Char1) => {
+            let b = s.bytes().next().unwrap_or(0);
+            Some(Value::Char1(b))
+        }
+        // v7.37.5 ζ-A — inverse coerces.
+        (Value::Inet { family, bits, addr }, DataType::Text) => {
+            Some(Value::Text(format_inet(family, bits, &addr)))
+        }
+        (Value::Cidr { family, bits, addr }, DataType::Text) => {
+            Some(Value::Text(format_inet(family, bits, &addr)))
+        }
+        (Value::Macaddr(m), DataType::Text) => Some(Value::Text(format_macaddr(&m))),
+        (Value::Macaddr8(m), DataType::Text) => Some(Value::Text(format_macaddr8(&m))),
+        (Value::BitString { nbits, bytes }, DataType::Text) => {
+            Some(Value::Text(format_bit_string(nbits, &bytes)))
+        }
+        (Value::Xml(s), DataType::Text) => Some(Value::Text(s)),
+        (Value::Char1(b), DataType::Text) => Some(Value::Text((b as char).to_string())),
         // v7.37.5 ε — Text → geometry coerce. Each parser returns
         // None on malformed input; we surface a TypeMismatch with
         // the column name so the engine error is debuggable.

@@ -48,6 +48,7 @@ use datetime::{
     age, date_format_mysql, date_part, date_trunc, extract_field, from_unixtime, unix_timestamp_of,
 };
 use encoding::{decode_text, encode_text};
+pub use crate::conversions::format_money_array;
 pub use format::{
     days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
     format_date, format_date_array, format_float_array, format_int_array, format_interval,

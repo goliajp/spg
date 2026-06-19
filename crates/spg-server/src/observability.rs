@@ -640,6 +640,17 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::Line | DataType::Circle => 24,
                 DataType::Path => 1 + 4 + 16 * 4,
                 DataType::Polygon => 4 + 16 * 4,
+                // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+                DataType::Inet | DataType::Cidr => 18,
+                DataType::Macaddr => 6,
+                DataType::Macaddr8 => 8,
+                // BIT(n) avg 32 bytes (256 bits); BIT VARYING varlena
+                // wider.
+                DataType::Bit | DataType::BitVarying => 32,
+                DataType::Xml => 128,
+                DataType::Char1 => 1,
+                DataType::MoneyArray => 32, // ~4 elements × 9 B
+
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),
