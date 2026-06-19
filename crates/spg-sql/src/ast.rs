@@ -1095,6 +1095,59 @@ pub struct CreateTableStatement {
     /// path enforces composite uniqueness via row scan on the
     /// leading column index.
     pub table_constraints: Vec<TableConstraint>,
+    /// v7.37.6-B(sentori Epic 2 P0)— `PARTITION BY <strategy>
+    /// (key_col)` declarative partition-parent suffix. `Some` ⇒
+    /// the engine creates a parent table whose own rows stay
+    /// empty and routes INSERT/SELECT through children. Mutually
+    /// exclusive with `partition_of` (parser enforces).
+    pub partition_by: Option<PartitionBySpec>,
+    /// v7.37.6-B — `PARTITION OF <parent> { FOR VALUES FROM (a)
+    /// TO (b) | DEFAULT }` child-table declaration. `Some` ⇒
+    /// the table inherits its column list from `parent` (the
+    /// parser rejects an explicit column list when this is set);
+    /// engine routes child rows back to the parent at INSERT.
+    pub partition_of: Option<PartitionOfSpec>,
+}
+
+/// v7.37.6-B — `PARTITION BY <kind> (key_columns…)` parent suffix.
+/// v7.37.6-B only RANGE is recognised; the enum keeps space for
+/// future LIST / HASH without breaking the public AST shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionBySpec {
+    pub kind: PartitionKindAst,
+    /// One or more ident references into the parent's column list.
+    /// v7.37.6-B contracts a single TIMESTAMPTZ key; multi-key
+    /// RANGE is a phase-2 extension. Parser allows ≥1 to keep the
+    /// shape PG-compatible.
+    pub key_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionKindAst {
+    Range,
+}
+
+/// v7.37.6-B — `PARTITION OF <parent> <bounds>` child suffix.
+/// Bounds is either a half-open range (`FOR VALUES FROM (a) TO (b)`)
+/// or the catch-all `DEFAULT` partition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionOfSpec {
+    pub parent_name: String,
+    pub bounds: PartitionOfBoundsAst,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionOfBoundsAst {
+    /// `FOR VALUES FROM (lower) TO (upper)`. `Expr` is ~144 bytes
+    /// (lits include vector bodies), so we box both bounds to keep
+    /// the variant size in line with `Default` for clippy and to
+    /// minimise per-statement footprint when the partition shape
+    /// isn't in use.
+    Range {
+        lower: Box<Expr>,
+        upper: Box<Expr>,
+    },
+    Default,
 }
 
 /// v7.9.18 — table-level constraint at the end of a CREATE TABLE
@@ -3345,7 +3398,20 @@ impl fmt::Display for CreateTableStatement {
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ")?;
         }
-        write!(f, "{} (", quote_ident(&self.name))?;
+        write!(f, "{}", quote_ident(&self.name))?;
+        // v7.37.6-B — `PARTITION OF parent <bounds>` child form has
+        // no column list and no constraints; the table inherits its
+        // columns from the parent at engine-DDL time.
+        if let Some(spec) = &self.partition_of {
+            write!(f, " PARTITION OF {} ", quote_ident(&spec.parent_name))?;
+            return match &spec.bounds {
+                PartitionOfBoundsAst::Range { lower, upper } => {
+                    write!(f, "FOR VALUES FROM ({}) TO ({})", *lower, *upper)
+                }
+                PartitionOfBoundsAst::Default => f.write_str("DEFAULT"),
+            };
+        }
+        f.write_str(" (")?;
         for (i, col) in self.columns.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
@@ -3368,7 +3434,25 @@ impl fmt::Display for CreateTableStatement {
             f.write_str(", ")?;
             write!(f, "{tc}")?;
         }
-        f.write_str(")")
+        f.write_str(")")?;
+        // v7.37.6-B — partition-parent suffix renders after the
+        // closing column-list paren, before the optional MySQL
+        // table-options tail (which Display doesn't currently emit).
+        if let Some(spec) = &self.partition_by {
+            f.write_str(" PARTITION BY ")?;
+            match spec.kind {
+                PartitionKindAst::Range => f.write_str("RANGE ")?,
+            }
+            f.write_str("(")?;
+            for (i, col) in spec.key_columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(col))?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
     }
 }
 

@@ -208,6 +208,15 @@ pub enum Token {
     /// v6.1.4 — `CONNECTION` keyword (for
     /// `CREATE SUBSCRIPTION … CONNECTION '<conn_str>' …`).
     Connection,
+    /// v7.37.6-B(sentori Epic 2 P0)— `PARTITION` keyword. Drives
+    /// both `CREATE TABLE p (…) PARTITION BY RANGE (key)` (declarative
+    /// parent) and `CREATE TABLE c PARTITION OF p FOR VALUES FROM
+    /// (a) TO (b) | DEFAULT` (child). `OF` / `MINVALUE` / `MAXVALUE`
+    /// stay PG-context-sensitive identifiers — the parser matches them
+    /// as case-insensitive `Token::Ident` strings off the back of this
+    /// reserved keyword, mirroring how `INSERT … RETURNING` handles
+    /// `RETURNING` without burning a global keyword slot.
+    Partition,
 
     Eof,
 }
@@ -963,9 +972,12 @@ fn kw_len8(b: &[u8]) -> Option<Token> {
 
 #[inline]
 fn kw_len9(b: &[u8]) -> Option<Token> {
-    // 1 keyword: savepoint
+    // 2 keywords: savepoint, partition
     if eq_ci(b, b"savepoint") {
         return Some(Token::Savepoint);
+    }
+    if eq_ci(b, b"partition") {
+        return Some(Token::Partition);
     }
     None
 }
