@@ -1032,6 +1032,15 @@ impl Engine {
             // subplan. Runs before the per-row/batch resolver, which then
             // only sees the subqueries the pull-up left behind.
             self.pull_up_unique_correlated_agg_subqueries(&mut stmt_owned);
+            // v7.37.4 (A — correlated LIMIT 1 ORDER BY DESC pull-up) —
+            // the "per-key latest" scalar subquery shape (inbox / feed
+            // / timeline applications) becomes a CTE + LEFT JOIN
+            // against a GROUP BY pre-aggregation that reuses the v7.33
+            // first_ordered argmax executor. Runs AFTER unique-key
+            // pull-up (so the unique-key fast path still wins for
+            // single-PK lookups) and BEFORE the EXISTS sublink rewrite.
+            // Phase 1 (this commit) is skeleton only — no-op pass.
+            self.pull_up_correlated_limit_one_subqueries(&mut stmt_owned);
             // v7.34.2 (mailrs prod NOT EXISTS) — plan-time `[NOT] EXISTS`
             // sublink pull-up to semi/anti-join, before the resolver gets
             // a chance to walk per-row.

@@ -1055,6 +1055,71 @@ impl Engine {
     /// all-inner predicates; and the select list must have no bare wildcard
     /// (a join would widen `*`). Anything else is left for the existing
     /// per-row / batch resolver. Returns true when it rewrote at least one.
+    /// v7.37.4 (A — correlated LIMIT 1 ORDER BY DESC subquery pullup) —
+    /// plan-time rewrite of the "per-key latest" select-list scalar
+    /// subquery pattern:
+    ///
+    /// ```sql
+    /// SELECT outer.k,
+    ///        (SELECT proj_expr FROM inner
+    ///          WHERE inner.k = outer.k AND <non_corr_preds>
+    ///          ORDER BY sort_key DESC LIMIT 1) AS latest_proj
+    ///   FROM outer
+    /// ```
+    ///
+    /// becomes (semantically equivalent, executor-friendly):
+    ///
+    /// ```sql
+    /// WITH __cl1_N AS (
+    ///   SELECT inner.k AS jk,
+    ///          (array_agg(proj_expr ORDER BY sort_key DESC NULLS LAST))[1] AS pj
+    ///     FROM <inner.from>
+    ///    WHERE <non_corr_preds>
+    ///    GROUP BY inner.k
+    /// )
+    /// SELECT outer.k, MAX(__cl1_N.pj) AS latest_proj
+    ///   FROM outer LEFT JOIN __cl1_N ON __cl1_N.jk = outer.k
+    /// ```
+    ///
+    /// The CTE materialises once for the whole outer scan; LEFT JOIN
+    /// on the GROUP-BY-unique `jk` column never multiplies outer rows.
+    /// The `array_agg(... ORDER BY ...)[1]` form reuses the v7.33
+    /// `first_ordered` argmax executor (per-group keep the first row,
+    /// no array build).
+    ///
+    /// Common shape across inbox / feed / timeline applications:
+    /// thread latest message, user latest transaction, device latest
+    /// heartbeat. **Not a mailrs-specific patch** — any client query
+    /// in this shape gets the rewrite.
+    ///
+    /// Acceptance (`try_pull_up_limit_one`):
+    /// - inner: single SELECT, LIMIT 1 + ORDER BY <expr>, no GROUP BY /
+    ///   HAVING / DISTINCT / CTE / UNION / OFFSET, single projection
+    /// - inner FROM: may contain JOINs (INNER) over plain tables; no
+    ///   LATERAL / UNNEST / generate_series / AS OF; no outer reference
+    ///   inside join ON
+    /// - WHERE: exactly one `inner.k = outer.col` (qualified columns)
+    ///   + non-correlated all-inner predicates
+    /// - projection: scalar expression, no aggregates / windows
+    /// - outer: SelectStatement with FROM, no wildcards
+    ///
+    /// Returns true when at least one ScalarSubquery was rewritten.
+    /// Returns false (no-op) when nothing in the statement matches —
+    /// the existing per-row resolver then handles whatever's left.
+    pub(crate) fn pull_up_correlated_limit_one_subqueries(
+        &self,
+        _stmt: &mut SelectStatement,
+    ) -> bool {
+        // Phase 1 skeleton — walker + try-fn signatures are scaffolded
+        // (try_pull_up_limit_one currently returns None for every shape).
+        // No-op pass: identical input/output, identical results, every
+        // gate green. Phase 2+ wire the actual rewrite.
+        //
+        // Env knob (used by differential e2e in Phase 5):
+        //   SPG_PULLUP_LIMIT1_DISABLE=1 short-circuits the pass entirely.
+        false
+    }
+
     pub(crate) fn pull_up_unique_correlated_agg_subqueries(
         &self,
         stmt: &mut SelectStatement,
