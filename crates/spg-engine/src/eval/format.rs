@@ -435,6 +435,176 @@ pub fn format_bigint_array(items: &[Option<i64>]) -> String {
     out
 }
 
+/// v7.37.5 γ — render a BOOL[] in PG external form.
+/// PG uses single-letter `t` / `f` for booleans (matching the
+/// scalar wire convention).
+pub fn format_bool_array(items: &[Option<bool>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 2);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(b) => out.push(if *b { 't' } else { 'f' }),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a SMALLINT[] in PG external form.
+pub fn format_smallint_array(items: &[Option<i16>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 4);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(n) => out.push_str(&n.to_string()),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a FLOAT[] / DOUBLE PRECISION[] in PG
+/// external form. PG renders floats via the engine's existing
+/// f64 → text path so this just calls Rust's default Display.
+pub fn format_float_array(items: &[Option<f64>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 8);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(x) => out.push_str(&x.to_string()),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a NUMERIC[] in PG external form.
+pub fn format_numeric_array(items: &[Option<(i128, u8)>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 6);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some((scaled, scale)) => out.push_str(&format_numeric(*scaled, *scale)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a DATE[] in PG external form. Each
+/// non-NULL element is rendered as `YYYY-MM-DD`.
+pub fn format_date_array(items: &[Option<i32>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 12);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(d) => out.push_str(&format_date(*d)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a TIMESTAMP[] (`with_tz=false`) or
+/// TIMESTAMPTZ[] (`with_tz=true`) in PG external form. Each
+/// non-NULL element is double-quoted because the canonical
+/// timestamp text contains a space (`2024-06-01 12:00:00`)
+/// that would otherwise split on commas wrong.
+pub fn format_timestamp_array(items: &[Option<i64>], with_tz: bool) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 22);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(t) => {
+                out.push('"');
+                if with_tz {
+                    out.push_str(&format_timestamptz(*t));
+                } else {
+                    out.push_str(&format_timestamp(*t));
+                }
+                out.push('"');
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a UUID[] in PG external form. UUID text is
+/// the canonical lowercase 8-4-4-4-12 hyphenated form; no quoting
+/// needed (hex + dashes, no spaces / commas).
+pub fn format_uuid_array(items: &[Option<[u8; 16]>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 38);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(b) => out.push_str(&spg_storage::format_uuid(b)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.37.5 γ — render a BYTEA[] in PG external form. Each
+/// non-NULL element is `\\x<hex>` (the PG hex output form) and
+/// is double-quoted because the leading backslash is a PG array
+/// escape character.
+pub fn format_bytea_array(items: &[Option<Vec<u8>>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 8);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(b) => {
+                out.push('"');
+                let hex = format_bytea_hex(b);
+                // Escape leading backslash (`\` → `\\`) per PG
+                // array-element quoting rules.
+                for c in hex.chars() {
+                    if c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// v7.37.5 β-P4 — render an INTERVAL[] in PG's external array form.
 /// Each non-NULL element is double-quoted because interval text
 /// contains spaces (`1 day`) and colons (`24:00:00`) that would

@@ -616,6 +616,19 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.37.5 β-P4 — INTERVAL[] sized like a small array
                 // (~4 elements × 17B body).
                 DataType::IntervalArray => 68,
+                // v7.37.5 γ — array-of-scalar rough heuristic
+                // (~4 elements × per-element body size).
+                DataType::BoolArray => 8,
+                DataType::SmallIntArray => 12,
+                DataType::FloatArray
+                | DataType::TimestampArray
+                | DataType::TimestamptzArray => 36,
+                DataType::DateArray => 20,
+                DataType::NumericArray => 72,
+                DataType::UuidArray => 68,
+                DataType::JsonArray | DataType::JsonbArray => 256,
+                DataType::BytesArray => 256,
+                DataType::VarcharArray | DataType::CharArray => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

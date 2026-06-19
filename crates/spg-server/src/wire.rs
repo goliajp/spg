@@ -121,6 +121,23 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // as PG external array form: `{"1 day","24:00:00",NULL}`.
         // RowDescription advertises OID 1187 via `pg_type_oid`.
         | DataType::IntervalArray
+        // v7.37.5 γ — array-of-scalar family on the wire as PG
+        // external array text. RowDescription advertises the
+        // family OIDs (1000/1005/1022/1231/1182/1115/1185/2951/
+        // 199/3807/1001/1015/1014) via `pg_type_oid`.
+        | DataType::BoolArray
+        | DataType::SmallIntArray
+        | DataType::FloatArray
+        | DataType::NumericArray
+        | DataType::DateArray
+        | DataType::TimestampArray
+        | DataType::TimestamptzArray
+        | DataType::UuidArray
+        | DataType::JsonArray
+        | DataType::JsonbArray
+        | DataType::BytesArray
+        | DataType::VarcharArray
+        | DataType::CharArray
         // v7.12.0 — tsvector / tsquery collapse to Text on the
         // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
         | DataType::TsVector
@@ -242,6 +259,36 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::IntervalArray(items) => {
             WireValue::Text(spg_engine::eval::format_interval_array(items))
         }
+        // v7.37.5 γ — array-of-scalar external array text. Each
+        // family has its own formatter so element rendering
+        // matches the scalar's `value_to_text` (e.g. UUID lowercase
+        // 8-4-4-4-12; BOOL `t`/`f`).
+        Value::BoolArray(items) => WireValue::Text(spg_engine::eval::format_bool_array(items)),
+        Value::SmallIntArray(items) => {
+            WireValue::Text(spg_engine::eval::format_smallint_array(items))
+        }
+        Value::FloatArray(items) => WireValue::Text(spg_engine::eval::format_float_array(items)),
+        Value::NumericArray(items) => {
+            WireValue::Text(spg_engine::eval::format_numeric_array(items))
+        }
+        Value::DateArray(items) => WireValue::Text(spg_engine::eval::format_date_array(items)),
+        Value::TimestampArray(items) => {
+            WireValue::Text(spg_engine::eval::format_timestamp_array(items, false))
+        }
+        Value::TimestamptzArray(items) => {
+            WireValue::Text(spg_engine::eval::format_timestamp_array(items, true))
+        }
+        Value::UuidArray(items) => WireValue::Text(spg_engine::eval::format_uuid_array(items)),
+        // JSON / JSONB / VARCHAR / CHAR / BYTEA all share the
+        // text-element array shape (per-element formatting is
+        // identical for the wire / PG external array form).
+        Value::JsonArray(items)
+        | Value::JsonbArray(items)
+        | Value::VarcharArray(items)
+        | Value::CharArray(items) => {
+            WireValue::Text(spg_engine::eval::format_text_array(items))
+        }
+        Value::BytesArray(items) => WireValue::Text(spg_engine::eval::format_bytea_array(items)),
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

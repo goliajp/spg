@@ -82,6 +82,114 @@ pub(crate) fn hex_nibble(b: u8) -> Result<u8, &'static str> {
     }
 }
 
+/// v7.37.5 γ — uniform array-of-scalar shape detector. Returns
+/// `Some(kind)` only when every non-NULL element fits the same
+/// new-array element type; `None` falls back to the legacy
+/// `array_literal_widen` Int/BigInt/Text path.
+#[derive(Clone, Copy)]
+enum UniformArrayKind {
+    Bool,
+    Float,
+    Numeric,
+    Date,
+    Timestamp,
+    Uuid,
+    Bytes,
+    Interval,
+}
+
+impl UniformArrayKind {
+    fn build(self, items: alloc::vec::Vec<Value>) -> Value {
+        match self {
+            Self::Bool => Value::BoolArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Bool(b) => Some(b),
+                _ => unreachable!("uniform Bool"),
+            }).collect()),
+            Self::Float => Value::FloatArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Float(x) => Some(x),
+                _ => unreachable!("uniform Float"),
+            }).collect()),
+            Self::Numeric => Value::NumericArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Numeric { scaled, scale } => Some((scaled, scale)),
+                _ => unreachable!("uniform Numeric"),
+            }).collect()),
+            Self::Date => Value::DateArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Date(d) => Some(d),
+                _ => unreachable!("uniform Date"),
+            }).collect()),
+            Self::Timestamp => Value::TimestampArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Timestamp(t) => Some(t),
+                _ => unreachable!("uniform Timestamp"),
+            }).collect()),
+            Self::Uuid => Value::UuidArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Uuid(b) => Some(b),
+                _ => unreachable!("uniform Uuid"),
+            }).collect()),
+            Self::Bytes => Value::BytesArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Bytes(b) => Some(b),
+                _ => unreachable!("uniform Bytes"),
+            }).collect()),
+            Self::Interval => Value::IntervalArray(items.into_iter().map(|v| match v {
+                Value::Null => None,
+                Value::Interval { months, days, micros } => {
+                    Some(spg_storage::IntervalSpan { months, days, micros })
+                }
+                _ => unreachable!("uniform Interval"),
+            }).collect()),
+        }
+    }
+}
+
+fn widen_uniform_typed(items: &[Value]) -> Option<UniformArrayKind> {
+    let mut kind: Option<UniformArrayKind> = None;
+    let mut saw_non_null = false;
+    for v in items {
+        let this = match v {
+            Value::Null => continue,
+            Value::Bool(_) => UniformArrayKind::Bool,
+            Value::Float(_) => UniformArrayKind::Float,
+            Value::Numeric { .. } => UniformArrayKind::Numeric,
+            Value::Date(_) => UniformArrayKind::Date,
+            Value::Timestamp(_) => UniformArrayKind::Timestamp,
+            Value::Uuid(_) => UniformArrayKind::Uuid,
+            Value::Bytes(_) => UniformArrayKind::Bytes,
+            Value::Interval { .. } => UniformArrayKind::Interval,
+            // Int / BigInt / Text / Json — defer to the legacy
+            // Int/Text widen below so the existing IntArray /
+            // BigIntArray / TextArray behaviour is unchanged.
+            _ => return None,
+        };
+        match kind {
+            None => kind = Some(this),
+            Some(prev) if discriminant_eq(prev, this) => {}
+            Some(_) => return None,
+        }
+        saw_non_null = true;
+    }
+    if saw_non_null { kind } else { None }
+}
+
+fn discriminant_eq(a: UniformArrayKind, b: UniformArrayKind) -> bool {
+    matches!(
+        (a, b),
+        (UniformArrayKind::Bool, UniformArrayKind::Bool)
+            | (UniformArrayKind::Float, UniformArrayKind::Float)
+            | (UniformArrayKind::Numeric, UniformArrayKind::Numeric)
+            | (UniformArrayKind::Date, UniformArrayKind::Date)
+            | (UniformArrayKind::Timestamp, UniformArrayKind::Timestamp)
+            | (UniformArrayKind::Uuid, UniformArrayKind::Uuid)
+            | (UniformArrayKind::Bytes, UniformArrayKind::Bytes)
+            | (UniformArrayKind::Interval, UniformArrayKind::Interval)
+    )
+}
+
 /// v7.10.11 — decode a PG TEXT[] external array form
 /// (`{a,b,NULL}` with optional double-quoted elements). The
 /// engine takes a leading/trailing `{`/`}` and splits at commas.
@@ -96,6 +204,15 @@ pub(crate) fn hex_nibble(b: u8) -> Result<u8, &'static str> {
 ///   - any Text → TextArray (fallback; non-string elements
 ///     render as text)
 pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value>) -> Value {
+    // v7.37.5 γ — first, detect a uniform new-array-type. If every
+    // non-NULL element shares one of the array-of-scalar element
+    // shapes (Bool / Float / Numeric / Date / Timestamp / Uuid /
+    // Bytes / Interval), build the matching typed array directly
+    // so INSERT to a typed column doesn't have to go through the
+    // TextArray fallback + coerce chain.
+    if let Some(arr) = widen_uniform_typed(&items) {
+        return arr.build(items);
+    }
     let mut has_text = false;
     let mut has_bigint = false;
     let mut has_int = false;
@@ -951,6 +1068,19 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::TextArray2D => DataType::TextArray2D,
         ColumnTypeName::Interval => DataType::Interval,
         ColumnTypeName::IntervalArray => DataType::IntervalArray,
+        ColumnTypeName::BoolArray => DataType::BoolArray,
+        ColumnTypeName::SmallIntArray => DataType::SmallIntArray,
+        ColumnTypeName::FloatArray => DataType::FloatArray,
+        ColumnTypeName::NumericArray => DataType::NumericArray,
+        ColumnTypeName::DateArray => DataType::DateArray,
+        ColumnTypeName::TimestampArray => DataType::TimestampArray,
+        ColumnTypeName::TimestamptzArray => DataType::TimestamptzArray,
+        ColumnTypeName::UuidArray => DataType::UuidArray,
+        ColumnTypeName::JsonArray => DataType::JsonArray,
+        ColumnTypeName::JsonbArray => DataType::JsonbArray,
+        ColumnTypeName::BytesArray => DataType::BytesArray,
+        ColumnTypeName::VarcharArray => DataType::VarcharArray,
+        ColumnTypeName::CharArray => DataType::CharArray,
     }
 }
 

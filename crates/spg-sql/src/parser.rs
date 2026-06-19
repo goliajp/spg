@@ -6419,9 +6419,29 @@ impl Parser {
                 // v7.37.5 β-P4 — INTERVAL[] via the same postfix
                 // `[]` grammar. Wire OID 1187.
                 ColumnTypeName::Interval => ColumnTypeName::IntervalArray,
+                // v7.37.5 γ — full PG array-of-scalar family.
+                ColumnTypeName::Bool => ColumnTypeName::BoolArray,
+                ColumnTypeName::SmallInt => ColumnTypeName::SmallIntArray,
+                ColumnTypeName::Float => ColumnTypeName::FloatArray,
+                // NUMERIC(p, s) loses its precision params at the
+                // array level (matches PG: `NUMERIC[]` is untyped,
+                // per-element precision flows through values).
+                ColumnTypeName::Numeric(_, _) => ColumnTypeName::NumericArray,
+                ColumnTypeName::Date => ColumnTypeName::DateArray,
+                ColumnTypeName::Timestamp => ColumnTypeName::TimestampArray,
+                ColumnTypeName::Timestamptz => ColumnTypeName::TimestamptzArray,
+                ColumnTypeName::Uuid => ColumnTypeName::UuidArray,
+                ColumnTypeName::Json => ColumnTypeName::JsonArray,
+                ColumnTypeName::Jsonb => ColumnTypeName::JsonbArray,
+                ColumnTypeName::Bytes => ColumnTypeName::BytesArray,
+                // VARCHAR(n)[] / CHAR(n)[] drop the length cap at
+                // the array level (matches PG semantics where the
+                // element precision is per-row, not column-wide).
+                ColumnTypeName::Varchar(_) => ColumnTypeName::VarcharArray,
+                ColumnTypeName::Char(_) => ColumnTypeName::CharArray,
                 other => {
                     return Err(self.err(alloc::format!(
-                        "supported base[]: TEXT / INT / BIGINT / INTERVAL; got {other:?}[]"
+                        "{other:?}[] not yet supported"
                     )));
                 }
             };

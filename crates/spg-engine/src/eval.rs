@@ -49,9 +49,11 @@ use datetime::{
 };
 use encoding::{decode_text, encode_text};
 pub use format::{
-    days_from_civil, format_bigint_array, format_bytea_hex, format_date, format_int_array,
-    format_interval, format_interval_array, format_money, format_numeric, format_text_array,
-    format_time,
+    days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
+    format_date, format_date_array, format_float_array, format_int_array, format_interval,
+    format_interval_array, format_money, format_numeric, format_numeric_array,
+    format_smallint_array, format_text_array, format_time, format_timestamp_array,
+    format_uuid_array,
     format_timestamp, format_timestamptz, format_timetz, parse_date_literal,
     parse_timestamp_literal,
 };

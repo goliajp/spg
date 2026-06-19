@@ -184,6 +184,23 @@ pub enum DataType {
     /// interval body in LE PG-byte-equal field order]`.
     /// FILE_VERSION 48+.
     IntervalArray,
+    /// v7.37.5 γ — full PG array-of-scalar family. Catalog tags
+    /// 36..48; wire OIDs from PG `pg_type.dat`. Per-element body
+    /// uses the scalar's existing `write_value_body` shape.
+    /// FILE_VERSION 48+ (same window as β; no separate bump).
+    BoolArray,        // PG `_bool`        OID 1000, tag 36
+    SmallIntArray,    // PG `_int2`        OID 1005, tag 37
+    FloatArray,       // PG `_float8`      OID 1022, tag 38
+    NumericArray,     // PG `_numeric`     OID 1231, tag 39
+    DateArray,        // PG `_date`        OID 1182, tag 40
+    TimestampArray,   // PG `_timestamp`   OID 1115, tag 41
+    TimestamptzArray, // PG `_timestamptz` OID 1185, tag 42
+    UuidArray,        // PG `_uuid`        OID 2951, tag 43
+    JsonArray,        // PG `_json`        OID 199,  tag 44
+    JsonbArray,       // PG `_jsonb`       OID 3807, tag 45
+    BytesArray,       // PG `_bytea`       OID 1001, tag 46
+    VarcharArray,     // PG `_varchar`     OID 1015, tag 47
+    CharArray,        // PG `_bpchar`      OID 1014, tag 48
     /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
     /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
     /// Catalog FILE_VERSION 20+. Storage shape is row-codec
@@ -355,6 +372,19 @@ impl fmt::Display for DataType {
             Self::IntArray => f.write_str("INT[]"),
             Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::IntervalArray => f.write_str("INTERVAL[]"),
+            Self::BoolArray => f.write_str("BOOL[]"),
+            Self::SmallIntArray => f.write_str("SMALLINT[]"),
+            Self::FloatArray => f.write_str("FLOAT[]"),
+            Self::NumericArray => f.write_str("NUMERIC[]"),
+            Self::DateArray => f.write_str("DATE[]"),
+            Self::TimestampArray => f.write_str("TIMESTAMP[]"),
+            Self::TimestamptzArray => f.write_str("TIMESTAMPTZ[]"),
+            Self::UuidArray => f.write_str("UUID[]"),
+            Self::JsonArray => f.write_str("JSON[]"),
+            Self::JsonbArray => f.write_str("JSONB[]"),
+            Self::BytesArray => f.write_str("BYTEA[]"),
+            Self::VarcharArray => f.write_str("VARCHAR[]"),
+            Self::CharArray => f.write_str("CHAR[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -484,6 +514,26 @@ pub enum Value {
     /// spaces and colons. Storage codec follows the BigIntArray
     /// shape with a 16-byte per-element body.
     IntervalArray(Vec<Option<IntervalSpan>>),
+    /// v7.37.5 γ — single-dimension arrays of the remaining PG
+    /// scalar types. Each carries `Vec<Option<T>>` with the
+    /// scalar's natural Rust shape; element NULLs are first-class
+    /// (per PG: `{1,NULL,3}` is a 3-element array, not a 2-element
+    /// one). Codec follows the IntervalArray shape — `[u16 count]
+    /// [per elem: u8 null + (non-null) scalar body]`.
+    BoolArray(Vec<Option<bool>>),
+    SmallIntArray(Vec<Option<i16>>),
+    FloatArray(Vec<Option<f64>>),
+    /// PG `NUMERIC[]` — `(scaled: i128, scale: u8)` per element.
+    NumericArray(Vec<Option<(i128, u8)>>),
+    DateArray(Vec<Option<i32>>),
+    TimestampArray(Vec<Option<i64>>),
+    TimestamptzArray(Vec<Option<i64>>),
+    UuidArray(Vec<Option<[u8; 16]>>),
+    JsonArray(Vec<Option<String>>),
+    JsonbArray(Vec<Option<String>>),
+    BytesArray(Vec<Option<Vec<u8>>>),
+    VarcharArray(Vec<Option<String>>),
+    CharArray(Vec<Option<String>>),
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
     /// positions + weights. The engine enforces sort/dedup on
     /// construction; consumers can rely on `lexemes.windows(2)`
@@ -606,6 +656,19 @@ impl Value {
             Self::IntArray(_) => Some(DataType::IntArray),
             Self::BigIntArray(_) => Some(DataType::BigIntArray),
             Self::IntervalArray(_) => Some(DataType::IntervalArray),
+            Self::BoolArray(_) => Some(DataType::BoolArray),
+            Self::SmallIntArray(_) => Some(DataType::SmallIntArray),
+            Self::FloatArray(_) => Some(DataType::FloatArray),
+            Self::NumericArray(_) => Some(DataType::NumericArray),
+            Self::DateArray(_) => Some(DataType::DateArray),
+            Self::TimestampArray(_) => Some(DataType::TimestampArray),
+            Self::TimestamptzArray(_) => Some(DataType::TimestamptzArray),
+            Self::UuidArray(_) => Some(DataType::UuidArray),
+            Self::JsonArray(_) => Some(DataType::JsonArray),
+            Self::JsonbArray(_) => Some(DataType::JsonbArray),
+            Self::BytesArray(_) => Some(DataType::BytesArray),
+            Self::VarcharArray(_) => Some(DataType::VarcharArray),
+            Self::CharArray(_) => Some(DataType::CharArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
@@ -966,6 +1029,23 @@ impl IndexKey {
             // GIN/intarray for array-contains queries; SPG plans
             // that as a separate axis under v7.37.8 GIN-on-jsonb).
             Value::IntervalArray(_) => None,
+            // v7.37.5 γ — none of the array-of-scalar family is
+            // B-tree indexable. Same reason as IntervalArray: PG
+            // serves array-contains / array-overlap queries via
+            // GIN, and SPG's GIN axis lands in v7.37.8.
+            Value::BoolArray(_)
+            | Value::SmallIntArray(_)
+            | Value::FloatArray(_)
+            | Value::NumericArray(_)
+            | Value::DateArray(_)
+            | Value::TimestampArray(_)
+            | Value::TimestamptzArray(_)
+            | Value::UuidArray(_)
+            | Value::JsonArray(_)
+            | Value::JsonbArray(_)
+            | Value::BytesArray(_)
+            | Value::VarcharArray(_)
+            | Value::CharArray(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
