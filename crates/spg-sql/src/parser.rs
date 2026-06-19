@@ -4808,6 +4808,26 @@ impl Parser {
         self.advance();
         let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident_like()?;
+        // v7.37.6-B — `CREATE TABLE c PARTITION OF parent <bounds>`
+        // child shape has no column list; the child inherits its
+        // columns from the parent at engine-DDL time. Detect it
+        // before the `(` requirement below.
+        if matches!(self.peek(), Token::Partition)
+            && Self::tokens_match_ident_ci(self.tokens.get(self.pos + 1), "of")
+        {
+            self.advance(); // PARTITION
+            self.advance(); // of
+            let partition_of = self.parse_partition_of_tail()?;
+            return Ok(Statement::CreateTable(CreateTableStatement {
+                name,
+                columns: Vec::new(),
+                if_not_exists,
+                foreign_keys: Vec::new(),
+                table_constraints: Vec::new(),
+                partition_by: None,
+                partition_of: Some(partition_of),
+            }));
+        }
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(
                 "expected '(' after table name, got {:?}",
@@ -4904,13 +4924,184 @@ impl Parser {
         // SPG accepts all forms as no-ops (each option is
         // `<ident> [=] <ident-or-string>` separated by whitespace).
         self.consume_mysql_table_options();
+        // v7.37.6-B — declarative-partition-parent suffix
+        // (`PARTITION BY RANGE (key_col)`) sits after the column
+        // list + MySQL table-options. v7.37.6-B only accepts RANGE
+        // and locks the key column at one ident; the engine then
+        // verifies the column type is TIMESTAMPTZ.
+        let partition_by = if matches!(self.peek(), Token::Partition) {
+            self.advance(); // PARTITION
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!(
+                    "expected BY after PARTITION, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            Some(self.parse_partition_by_tail()?)
+        } else {
+            None
+        };
         Ok(Statement::CreateTable(CreateTableStatement {
             name,
             columns,
             if_not_exists,
             foreign_keys,
             table_constraints,
+            partition_by,
+            partition_of: None,
         }))
+    }
+
+    /// v7.37.6-B — case-insensitive ident match helper for the
+    /// `PARTITION OF` / `MINVALUE` / `MAXVALUE` keywords. They lex
+    /// as `Token::Ident("of"/"minvalue"/"maxvalue")` because we
+    /// didn't burn a global keyword slot for each (see the
+    /// `Token::Partition` doc-comment in `lexer.rs`).
+    fn tokens_match_ident_ci(t: Option<&Token>, want: &str) -> bool {
+        matches!(t, Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case(want))
+    }
+
+    /// v7.37.6-B — after `PARTITION BY`, expect `RANGE (key_col [, ...])`.
+    fn parse_partition_by_tail(&mut self) -> Result<crate::ast::PartitionBySpec, ParseError> {
+        use crate::ast::{PartitionBySpec, PartitionKindAst};
+        let kind = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("range") => {
+                self.advance();
+                PartitionKindAst::Range
+            }
+            other => {
+                return Err(self.err(format!(
+                    "PARTITION BY: only RANGE is supported at v7.37.6-B, got {other:?}"
+                )));
+            }
+        };
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' after PARTITION BY RANGE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut key_columns = Vec::new();
+        loop {
+            key_columns.push(self.expect_ident_like()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected ',' or ')' in PARTITION BY key list, got {other:?}"
+                    )));
+                }
+            }
+        }
+        if key_columns.is_empty() {
+            return Err(self.err("PARTITION BY RANGE requires at least one key column".to_string()));
+        }
+        Ok(PartitionBySpec { kind, key_columns })
+    }
+
+    /// v7.37.6-B — after `PARTITION OF`, expect
+    ///   <parent> FOR VALUES FROM ( <expr> ) TO ( <expr> )
+    /// or
+    ///   <parent> DEFAULT
+    fn parse_partition_of_tail(&mut self) -> Result<crate::ast::PartitionOfSpec, ParseError> {
+        use crate::ast::{PartitionOfBoundsAst, PartitionOfSpec};
+        let parent_name = self.expect_ident_like()?;
+        // v7.37.6-B rejects an explicit column list — the child
+        // inherits from the parent. mailrs round-7 taught us that
+        // CREATE TABLE-side schema reconciliation hides drift, so
+        // we surface this as a parse error rather than silently
+        // ignoring user columns.
+        if matches!(self.peek(), Token::LParen) {
+            return Err(self.err(
+                "CREATE TABLE … PARTITION OF parent: explicit column list not supported \
+                 at v7.37.6-B; the child inherits its columns from the parent"
+                    .to_string(),
+            ));
+        }
+        let bounds = match self.peek() {
+            Token::Default => {
+                self.advance();
+                PartitionOfBoundsAst::Default
+            }
+            Token::For => {
+                self.advance();
+                if !matches!(self.peek(), Token::Values) {
+                    return Err(
+                        self.err(format!("expected VALUES after FOR, got {:?}", self.peek()))
+                    );
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::From) {
+                    return Err(self.err(format!(
+                        "expected FROM after FOR VALUES, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let lower = Box::new(self.parse_partition_bound_expr()?);
+                if !matches!(self.peek(), Token::To) {
+                    return Err(self.err(format!(
+                        "expected TO after FROM (...), got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let upper = Box::new(self.parse_partition_bound_expr()?);
+                PartitionOfBoundsAst::Range { lower, upper }
+            }
+            other => {
+                return Err(self.err(format!(
+                    "expected FOR VALUES or DEFAULT after PARTITION OF parent, got {other:?}"
+                )));
+            }
+        };
+        Ok(PartitionOfSpec {
+            parent_name,
+            bounds,
+        })
+    }
+
+    /// v7.37.6-B — a single `( <expr> )` bound. `MINVALUE` /
+    /// `MAXVALUE` lex as Ident; rewrite them into FunctionCall
+    /// markers (no-arg builtins) so the engine resolves them
+    /// against [`spg_storage::PartitionBound::{MinValue, MaxValue}`].
+    fn parse_partition_bound_expr(&mut self) -> Result<crate::ast::Expr, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' before partition bound, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let expr = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("minvalue") || s.eq_ignore_ascii_case("maxvalue") =>
+            {
+                let name = s.to_ascii_uppercase();
+                self.advance();
+                crate::ast::Expr::FunctionCall {
+                    name,
+                    args: Vec::new(),
+                }
+            }
+            _ => self.parse_expr(0)?,
+        };
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' after partition bound, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(expr)
     }
 
     /// v7.14.0 — true when the next tokens look like an inline
@@ -8738,9 +8929,16 @@ impl Parser {
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
         // PARTITION BY ?
-        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
-            && s.eq_ignore_ascii_case("partition")
-        {
+        // v7.37.6-B promoted PARTITION to a reserved keyword
+        // (Token::Partition); pre-7.37.6-B catalogs lexed it as
+        // `Token::Ident("partition")`. Accept both so older sources
+        // and the new lexer surface land on the same path.
+        let is_partition_kw = match self.peek() {
+            Token::Partition => true,
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("partition"),
+            _ => false,
+        };
+        if is_partition_kw {
             self.advance();
             if !matches!(self.peek(), Token::By) {
                 return Err(self.err(format!(
@@ -9963,15 +10161,116 @@ mod tests {
         let Statement::CreateTable(t) = stmt else {
             panic!("expected CreateTable");
         };
-        assert_eq!(
-            t.columns[0].user_type_ref.as_deref(),
-            Some("my_user_type")
-        );
+        assert_eq!(t.columns[0].user_type_ref.as_deref(), Some("my_user_type"));
     }
 
     #[test]
     fn create_table_missing_table_keyword_errors() {
         assert!(parse_statement("CREATE x (a INT)").is_err());
+    }
+
+    // v7.37.6-B(sentori Epic 2 P0)— `PARTITION BY RANGE` parent +
+    // `PARTITION OF parent <bounds>` child parse + Display round-trip.
+
+    #[test]
+    fn parse_create_table_partition_by_range() {
+        use crate::ast::{PartitionBySpec, PartitionKindAst};
+        let stmt = parse_statement(
+            "CREATE TABLE events_partitioned (id BIGINT NOT NULL, ts TIMESTAMPTZ NOT NULL, \
+             payload JSONB) PARTITION BY RANGE (ts)",
+        )
+        .unwrap();
+        let Statement::CreateTable(t) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(t.partition_of.is_none(), "parent has no partition_of");
+        assert_eq!(t.columns.len(), 3);
+        let by = t.partition_by.as_ref().expect("expected PARTITION BY");
+        assert_eq!(
+            by,
+            &PartitionBySpec {
+                kind: PartitionKindAst::Range,
+                key_columns: alloc::vec!["ts".to_string()],
+            }
+        );
+        // Display round-trip preserves the suffix. `quote_ident`
+        // only adds double quotes when the ident needs escaping, so
+        // a plain `ts` survives bare here.
+        assert!(
+            t.to_string().contains("PARTITION BY RANGE (ts)"),
+            "Display lost PARTITION BY suffix: {t}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_partition_of_range() {
+        use crate::ast::{PartitionOfBoundsAst, PartitionOfSpec};
+        let stmt = parse_statement(
+            "CREATE TABLE events_2026_06 PARTITION OF events_partitioned \
+             FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00')",
+        )
+        .unwrap();
+        let Statement::CreateTable(t) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(t.columns.is_empty(), "child inherits columns from parent");
+        assert!(t.partition_by.is_none());
+        let of = t.partition_of.as_ref().expect("expected PARTITION OF");
+        assert_eq!(of.parent_name, "events_partitioned");
+        let PartitionOfSpec { bounds, .. } = of.clone();
+        match bounds {
+            PartitionOfBoundsAst::Range { lower, upper } => {
+                assert!(lower.to_string().contains("2026-06-01"));
+                assert!(upper.to_string().contains("2026-07-01"));
+            }
+            PartitionOfBoundsAst::Default => panic!("expected Range, got Default"),
+        }
+        // Display round-trip emits the FOR VALUES tail. `quote_ident`
+        // skips quotes when not required, so the parent name appears
+        // bare here.
+        let s = t.to_string();
+        assert!(
+            s.contains("PARTITION OF events_partitioned"),
+            "Display lost PARTITION OF: {s}"
+        );
+        assert!(s.contains("FOR VALUES FROM"), "Display lost FROM: {s}");
+        assert!(s.contains(") TO ("), "Display lost TO: {s}");
+    }
+
+    #[test]
+    fn parse_create_table_partition_of_default() {
+        use crate::ast::PartitionOfBoundsAst;
+        let stmt =
+            parse_statement("CREATE TABLE events_default PARTITION OF events_partitioned DEFAULT")
+                .unwrap();
+        let Statement::CreateTable(t) = stmt else {
+            panic!("expected CreateTable");
+        };
+        let of = t.partition_of.as_ref().expect("expected PARTITION OF");
+        assert_eq!(of.parent_name, "events_partitioned");
+        assert!(matches!(of.bounds, PartitionOfBoundsAst::Default));
+        assert!(
+            t.to_string()
+                .contains("PARTITION OF events_partitioned DEFAULT"),
+            "Display lost DEFAULT: {t}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_partition_of_rejects_columns() {
+        // v7.37.6-B contract: PARTITION OF children inherit columns
+        // from the parent; an explicit list MUST surface as a parse
+        // error rather than getting silently ignored.
+        let err = parse_statement(
+            "CREATE TABLE events_2026_06 PARTITION OF events_partitioned (id BIGINT) \
+             FOR VALUES FROM ('a') TO ('b')",
+        );
+        assert!(err.is_err(), "expected parse error for explicit columns");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("PARTITION OF") && msg.contains("column"),
+            "error should mention PARTITION OF + columns: {msg}"
+        );
     }
 
     #[test]
