@@ -2114,31 +2114,58 @@ impl Engine {
                 _ => None,
             };
             if let Some((subquery, neg)) = parsed {
-                // Try the `[NOT] IN (SELECT k FROM t)` rewrite FIRST.
-                // The InSet path already gives the executor an O(outer)
-                // per-row membership probe over an O(inner) build, ride
-                // the existing `subquery_replacement` materialise +
-                // 7.34.3 `filter_table_indices` seed-dedup; the prod
-                // `mailrs_prod_not_exists` 250 k probe drops 178 ms
-                // (LEFT JOIN + IS NULL form) → 74 ms (NOT IN form).
-                // Fall back to the LEFT JOIN + IS NULL injection only
-                // when NOT IN would be unsafe (negated case + nullable
-                // inner.k — NOT IN's three-valued logic treats a NULL
-                // probe element as "unknown for every outer row").
-                if let Some(rewritten) =
-                    self.try_pull_up_exists_as_in(subquery, neg, &outer_aliases)
+                // v7.34.2 first chose `[NOT] IN (SELECT k FROM t)` first
+                // because the `mailrs_prod_not_exists` 250 k probe
+                // dropped 178 ms (LEFT JOIN + IS NULL form) → 74 ms
+                // (NOT IN form). But that win was from the OUTER ORDER
+                // BY id DESC LIMIT N walker fast path
+                // (`try_pk_walk_top_n`), which only the InList shape
+                // exposes (early-stop on first N survivors). For
+                // shapes WITHOUT an outer LIMIT (e.g. `SELECT
+                // COUNT(*) FROM messages WHERE NOT EXISTS …`) the IN
+                // form has to materialise the entire 12.5 k inner
+                // value set as `Vec<Expr::Literal>` before HashSet
+                // build — pure overhead that the LEFT ANTI JOIN
+                // executor skips by hashing the inner table directly.
+                // v7.37.x (docker-fair NOTEX) — branch on outer
+                // LIMIT presence: with LIMIT, prefer InList (walker
+                // benefit); without LIMIT, prefer LEFT ANTI JOIN
+                // (streaming build, no Expr::Literal Vec roundtrip).
+                let outer_has_limit = stmt.limit.is_some();
+                let try_in_first = outer_has_limit;
+                let mut consumed = false;
+                if try_in_first
+                    && let Some(rewritten) =
+                        self.try_pull_up_exists_as_in(subquery, neg, &outer_aliases)
                 {
                     survivors.push(rewritten);
-                    rewrote_any = true;
-                    continue;
+                    consumed = true;
                 }
-                if let Some((join, residual)) =
-                    self.try_pull_up_exists_sublink(subquery, neg, &outer_aliases, new_joins.len())
+                if !consumed
+                    && let Some((join, residual)) = self.try_pull_up_exists_sublink(
+                        subquery,
+                        neg,
+                        &outer_aliases,
+                        new_joins.len(),
+                    )
                 {
                     new_joins.push(join);
                     if let Some(r) = residual {
                         survivors.push(r);
                     }
+                    consumed = true;
+                }
+                if !consumed
+                    && !try_in_first
+                    && let Some(rewritten) =
+                        self.try_pull_up_exists_as_in(subquery, neg, &outer_aliases)
+                {
+                    // Fallback when LEFT ANTI JOIN refused (e.g. inner
+                    // shape too complex) — IN form is the next best.
+                    survivors.push(rewritten);
+                    consumed = true;
+                }
+                if consumed {
                     rewrote_any = true;
                     continue;
                 }
