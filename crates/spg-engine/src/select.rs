@@ -1649,9 +1649,15 @@ impl Engine {
         // row + partial-sort tail entirely. Walker output is already
         // in ORDER BY order so `materialise_in_order` (no extra sort)
         // is the natural sink.
-        if let Some(walked) =
-            try_pk_walk_top_n(stmt, self.active_catalog(), table, schema_cols, alias)
-        {
+        if let Some(walked) = try_pk_walk_top_n(
+            stmt,
+            self.active_catalog(),
+            table,
+            schema_cols,
+            alias,
+            self,
+            cancel,
+        ) {
             return materialise_in_order(stmt, schema_cols, alias, &walked);
         }
 
