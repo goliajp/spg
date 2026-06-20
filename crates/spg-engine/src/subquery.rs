@@ -3321,8 +3321,8 @@ fn expr_may_use_in_set(e: &Expr) -> bool {
 /// all of one family (integer or string, NULLs tracked separately).
 pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
     let mut has_null = false;
-    let mut ints: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
-    let mut texts: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    let mut ints: hashbrown::HashSet<i64> = hashbrown::HashSet::with_capacity(list.len());
+    let mut texts: hashbrown::HashSet<String> = hashbrown::HashSet::with_capacity(list.len());
     for item in list {
         let Expr::Literal(lit) = item else {
             return None;
