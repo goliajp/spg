@@ -3995,6 +3995,23 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
 /// targets do the same.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
+    // v7.37.10 — `/proc/<pid>` directory existence is the
+    // most reliable liveness signal on Linux, and crucially
+    // doesn't depend on `procps` being installed in the
+    // container image. Minimal images(rust:slim, distroless,
+    // mailrs-mmalloc's stripped runtime)don't ship `ps`, and
+    // a failed `Command::spawn` previously fell back to
+    // "treat as alive" — which inverted the meaning of every
+    // stale-lock probe in those environments. Probe /proc
+    // first on Linux; fall back to `ps -p` on other unix
+    // (macOS / BSD), where procps-equivalent tools ship by
+    // default.
+    #[cfg(target_os = "linux")]
+    {
+        if std::path::Path::new("/proc").is_dir() {
+            return std::path::Path::new(&format!("/proc/{pid}")).exists();
+        }
+    }
     match std::process::Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
