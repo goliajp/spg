@@ -227,6 +227,104 @@ fn handle_pg_simple_query(
     // from the session `statement_timeout` GUC (default
     // `0` → `CancelToken::none()`, hot path unchanged).
     let cancel = statement_cancel(settings);
+    // v7.37.x (SPGS PROJ wire encode tax) — streaming simple-query
+    // SELECT. When the SQL is a pure read (first word == SELECT, no
+    // sequence-mutating function), bypass the materialising
+    // `execute_with_role → QueryResult::Rows { rows: Vec<Row> }` path
+    // and stream rows from the engine straight into `wbuf`. Saves the
+    // engine-side `Vec<Row>` allocation (25 k Row alloc + 125 k cell
+    // clone on the wire-probe PROJ shape) + the read-then-iterate
+    // tax in the response loop below. Non-streamable shapes
+    // (aggregate, ORDER BY, DISTINCT, subqueries, …) bail out of the
+    // streaming engine pass and the caller's `Vec<Row>` path still
+    // runs them.
+    let streaming_select_attempt = {
+        let trimmed_start = sql.trim_start();
+        let first = trimmed_start.split_ascii_whitespace().next().unwrap_or("");
+        // SELECT only; CTE / SHOW / EXPLAIN keep the materialising
+        // path. setval / nextval / currval mutate sequence state and
+        // must hit the write lock, not the read-streaming path.
+        if first.eq_ignore_ascii_case("select") {
+            let b = sql.as_bytes();
+            if !(ci_contains(b, b"setval(")
+                || ci_contains(b, b"nextval(")
+                || ci_contains(b, b"currval("))
+            {
+                Some(())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if streaming_select_attempt.is_some() {
+        let engine_lock = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        let pre_len = wbuf.len();
+        let mut cols_storage: Vec<ColumnSchema> = Vec::new();
+        let mut wrote_header = false;
+        let mut first_row_size: Option<usize> = None;
+        let stream_result =
+            engine_lock.execute_readonly_select_streaming(sql, cancel, |item| match item {
+                spg_engine::StreamItem::Header(cols) => {
+                    cols_storage.extend_from_slice(cols);
+                    let r = send_row_description(wbuf, cols);
+                    if r.is_ok() {
+                        wrote_header = true;
+                    }
+                    r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                }
+                spg_engine::StreamItem::Row(values) => {
+                    if first_row_size.is_none() {
+                        let before = wbuf.len();
+                        let r = encode_data_row_from_refs(wbuf, &cols_storage, values);
+                        first_row_size = Some(wbuf.len() - before);
+                        return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
+                    }
+                    encode_data_row_from_refs(wbuf, &cols_storage, values)
+                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                }
+            });
+        drop(engine_lock);
+        conn_state
+            .wait_event
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        match stream_result {
+            Ok(n) => {
+                send_command_complete(wbuf, &format!("SELECT {n}"))?;
+                send_ready_for_query(wbuf, *tx_state)?;
+                stream.write_all(wbuf)?;
+                wbuf.clear();
+                return Ok(());
+            }
+            Err(_e) if !wrote_header => {
+                // Streaming refused this SELECT (non-streamable shape
+                // or pre-exec parse error). Rewind wbuf and fall
+                // through to the materialising path so the error
+                // surfaces from the canonical handler.
+                wbuf.truncate(pre_len);
+            }
+            Err(e) => {
+                // Error mid-stream after partial output — too late to
+                // recover; truncate the partial frames and surface as
+                // a wire error so the client doesn't see a torn row.
+                wbuf.truncate(pre_len);
+                let (sqlstate, msg) = engine_error_to_wire(&e);
+                send_error(wbuf, sqlstate, &msg)?;
+                send_ready_for_query(wbuf, *tx_state)?;
+                stream.write_all(wbuf)?;
+                wbuf.clear();
+                return Ok(());
+            }
+        }
+        // Restart the wait_event flag for the fall-back path below.
+        conn_state
+            .wait_event
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let result = execute_with_role(state, sql, role, cancel);
     conn_state
         .wait_event
@@ -244,12 +342,25 @@ fn handle_pg_simple_query(
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(wbuf, &columns)?;
             let n = rows.len();
-            // Pre-reserve roughly one DataRow frame's worth per row so
-            // the inner `out.push`/`extend_from_slice` calls don't keep
-            // re-growing the response buffer for a 25 k-row PROJ.
-            wbuf.reserve(n.saturating_mul(64));
-            for row in &rows {
-                encode_data_row(wbuf, &columns, row)?;
+            // v7.37.x (SPGS PROJ wire encode tax) — calibrate the
+            // per-row reservation against the first encoded row so a
+            // 25 k-row PROJ doesn't trigger a mid-write `Vec::reserve`
+            // (each grow re-memcpys the accumulated buffer — at 25 k
+            // rows × ~100 B/row = 2.5 MB the doubling sequence from
+            // 1.6 MB reserved costs ~1.6 MB extra memcpy). Encode one
+            // row first to learn its byte size, then `reserve` enough
+            // headroom for the remaining (n - 1) rows + the
+            // CommandComplete tail.
+            if let Some((first, rest)) = rows.split_first() {
+                let before = wbuf.len();
+                encode_data_row(wbuf, &columns, first)?;
+                let first_size = wbuf.len() - before;
+                if rest.len() > 0 {
+                    wbuf.reserve(first_size.saturating_mul(rest.len()).saturating_add(32));
+                }
+                for row in rest {
+                    encode_data_row(wbuf, &columns, row)?;
+                }
             }
             send_command_complete(wbuf, &format!("SELECT {n}"))?;
         }
