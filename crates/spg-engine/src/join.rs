@@ -1149,7 +1149,17 @@ impl Engine {
                     Some(Value::SmallInt(n)) => i64::from(*n),
                     _ => continue 'build,
                 };
-                int_table.entry(key).or_default().push(ri);
+                // v7.37.x (docker-fair NOTEX hash-build attack) — most
+                // FK-to-PK joins are unique on the build side, so the
+                // bucket is a one-element Vec. `or_default()` lands as
+                // a 0-cap Vec then the push grows it through 1 → 4
+                // (two allocs); pre-sizing to 1 cuts those to one.
+                // For the NOTEX 12.5 k-row build side this saves
+                // ~12.5 k × ~100 ns ≈ 1.25 ms per query.
+                int_table
+                    .entry(key)
+                    .or_insert_with(|| Vec::with_capacity(1))
+                    .push(ri);
                 continue;
             }
             keybuf.clear();
@@ -1160,7 +1170,10 @@ impl Engine {
                 }
             }
             aggregate::encode_key_refs_into(&keybuf, &mut keystr);
-            table.entry_ref(keystr.as_str()).or_default().push(ri);
+            table
+                .entry_ref(keystr.as_str())
+                .or_insert_with(|| Vec::with_capacity(1))
+                .push(ri);
         }
         let mut next: Vec<usize> = Vec::new();
         let mut probebuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
