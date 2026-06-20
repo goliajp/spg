@@ -255,31 +255,43 @@ impl Engine {
                 // grouped scan; per-row resolution becomes a map
                 // lookup. 23.5k per-group executions (~900 ms) became
                 // one scan + lookups.
+                // v7.37.x (docker-fair SCALARSQ attack) — pointer-keyed
+                // fast cache. The inner SelectStatement is stable for
+                // the duration of the query, so its address makes a
+                // unique key that costs nothing to compute (vs
+                // `alloc::format!("{}", inner)` ~ 500 ns × N outer
+                // rows of pure repr churn).
                 if memo.is_some() {
-                    let repr = alloc::format!("{}", **inner);
+                    let ptr_key = core::ptr::from_ref::<SelectStatement>(&**inner) as usize;
                     let entry_known = memo
                         .as_ref()
-                        .is_some_and(|m| m.group_maps.contains_key(&repr));
+                        .is_some_and(|m| m.group_maps_by_ptr.contains_key(&ptr_key));
                     if !entry_known {
                         let built = self
                             .try_batch_correlated_scalar(inner, None, cancel)?
                             .map(alloc::rc::Rc::new);
                         if let Some(m) = memo.as_deref_mut() {
-                            m.group_maps.insert(repr.clone(), built);
+                            m.group_maps_by_ptr.insert(ptr_key, built);
                         }
                     }
                     if let Some(m) = memo.as_deref_mut()
-                        && let Some(Some(gm)) = m.group_maps.get(&repr)
+                        && let Some(Some(gm)) = m.group_maps_by_ptr.get(&ptr_key)
                     {
-                        let (outer_col, map) = gm.as_ref();
+                        let (outer_col, map, empty_default) = gm.as_ref();
                         let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                             .map_err(EngineError::Eval)?;
+                        // v7.37.x — scalar subquery empty-set semantics:
+                        // `COUNT(*)` / `COUNT(col)` over no rows = 0,
+                        // every other aggregate = NULL. The batched
+                        // GroupMap omits keys whose inner-table partition
+                        // was empty; treat such misses as the per-
+                        // aggregate empty-default.
                         let v = if matches!(key_v, Value::Null) {
                             Value::Null
                         } else {
                             map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
                                 .cloned()
-                                .unwrap_or(Value::Null)
+                                .unwrap_or_else(|| empty_default.clone())
                         };
                         *e = value_to_literal_expr(v)?;
                         return Ok(());
@@ -752,6 +764,20 @@ impl Engine {
             alias: None,
         });
         batch.items = items;
+        // v7.37.x (docker-fair SCALARSQ-aggregate path) — when the
+        // inner output expression is an aggregate (e.g. `COUNT(*)`
+        // for the `(SELECT COUNT(*) FROM inner WHERE inner.k =
+        // outer.k)` scalar subquery shape), the batch query
+        // `SELECT inner.k, COUNT(*) FROM inner` is invalid SQL
+        // without `GROUP BY inner.k`. Inject the GROUP BY so the
+        // aggregate executor produces (key → count) pairs, matching
+        // the per-key scalar-subquery semantics. Pre-7.37.x this
+        // case mis-executed as a single anonymous group and either
+        // returned a wrong total or surfaced an `UnknownQualifier`
+        // (when the rewriter couldn't bind the bare column ref).
+        if aggregate::contains_aggregate(out_expr) {
+            batch.group_by = Some(alloc::vec![Expr::Column(inner_col.clone())]);
+        }
         // v7.32 (architecture v2 P3) — keyed index-probe. When the
         // caller hands a restriction set (the ≤LIMIT surviving outer
         // rows of a post-LIMIT deferred subquery) AND the correlation
@@ -939,7 +965,12 @@ impl Engine {
             }
         }
         let map = best.into_iter().map(|(k, (_, v))| (k, v)).collect();
-        Ok(Some((outer_col, map)))
+        // v7.37.x (docker-fair SCALARSQ attack) — empty-default per
+        // PG scalar-subquery aggregate semantics. Captured here so the
+        // splice path doesn't have to re-introspect a possibly-hollowed
+        // inner template.
+        let empty_default = scalar_subquery_empty_default(inner);
+        Ok(Some((outer_col, map, empty_default)))
     }
 }
 
@@ -2842,6 +2873,37 @@ fn is_correlation_error(e: &EngineError) -> bool {
 /// would fail to resolve. Everything it can't reason about cleanly
 /// (lateral / derived FROM entries) returns false and falls through to
 /// the existing execute-and-catch path, so behaviour is unchanged.
+/// v7.37.x (docker-fair SCALARSQ attack) — return the SQL empty-set
+/// default for a scalar subquery's output expression. PG semantics
+/// distinguish `COUNT(*)` (0 over an empty set) from other aggregates
+/// (NULL). Called by the batched ScalarSubquery resolver when a
+/// per-outer-row probe finds no matching inner partition.
+fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value {
+    use spg_sql::ast::SelectItem;
+    if inner.items.len() != 1 {
+        return Value::Null;
+    }
+    let SelectItem::Expr { expr, .. } = &inner.items[0] else {
+        return Value::Null;
+    };
+    fn is_count(e: &Expr) -> bool {
+        match e {
+            // COUNT(*) parses as `count_star`; COUNT(col) as `count`.
+            // Both have BIGINT-shaped empty-set default of 0.
+            Expr::FunctionCall { name, .. } => {
+                name.eq_ignore_ascii_case("count") || name.eq_ignore_ascii_case("count_star")
+            }
+            Expr::AggregateOrdered { call, .. } => is_count(call),
+            _ => false,
+        }
+    }
+    if is_count(expr) {
+        Value::Int(0)
+    } else {
+        Value::Null
+    }
+}
+
 fn select_is_correlated(s: &SelectStatement) -> bool {
     use spg_sql::ast::SelectItem;
     let Some(from) = &s.from else {
@@ -3071,7 +3133,13 @@ fn splice_planned_subqueries(
                 return Ok(false);
             };
             *idx += 1;
-            let (outer_col, map) = gm.as_ref();
+            // v7.37.x (docker-fair SCALARSQ attack) — empty_default is
+            // carried on the GroupMap (PG empty-set semantics: COUNT = 0,
+            // others = NULL). The inner here may be HOLLOWED by the
+            // template-rewrite step, so re-introspecting it for the
+            // aggregate kind doesn't work — the construction-time
+            // value on the GroupMap is the source of truth.
+            let (outer_col, map, empty_default) = gm.as_ref();
             let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                 .map_err(EngineError::Eval)?;
             let v = if matches!(key_v, Value::Null) {
@@ -3079,7 +3147,7 @@ fn splice_planned_subqueries(
             } else {
                 map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
                     .cloned()
-                    .unwrap_or(Value::Null)
+                    .unwrap_or_else(|| empty_default.clone())
             };
             *e = value_to_literal_expr(v)?;
             Ok(true)
