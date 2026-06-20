@@ -1385,18 +1385,36 @@ fn accumulate_groups(
                             entry.1[i].count += 1;
                         }
                     }
-                    AggKind::BoolOr => {
-                        if let Value::Bool(b) = arg_ref {
+                    AggKind::BoolOr => match arg_ref {
+                        Value::Bool(b) => {
                             let st = &mut entry.1[i];
                             st.bool_acc = Some(st.bool_acc.unwrap_or(false) || *b);
                         }
-                    }
-                    AggKind::BoolAnd => {
-                        if let Value::Bool(b) = arg_ref {
+                        Value::Null => {}
+                        _ => update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?,
+                    },
+                    AggKind::BoolAnd => match arg_ref {
+                        Value::Bool(b) => {
                             let st = &mut entry.1[i];
                             st.bool_acc = Some(st.bool_acc.unwrap_or(true) && *b);
                         }
-                    }
+                        Value::Null => {}
+                        _ => update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?,
+                    },
                     _ => {
                         update_state(
                             &mut entry.1[i],
@@ -1645,18 +1663,36 @@ fn accumulate_groups(
                             entry.1[i].count += 1;
                         }
                     }
-                    AggKind::BoolOr => {
-                        if let Value::Bool(b) = arg_ref {
+                    AggKind::BoolOr => match arg_ref {
+                        Value::Bool(b) => {
                             let st = &mut entry.1[i];
                             st.bool_acc = Some(st.bool_acc.unwrap_or(false) || *b);
                         }
-                    }
-                    AggKind::BoolAnd => {
-                        if let Value::Bool(b) = arg_ref {
+                        Value::Null => {}
+                        _ => update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?,
+                    },
+                    AggKind::BoolAnd => match arg_ref {
+                        Value::Bool(b) => {
                             let st = &mut entry.1[i];
                             st.bool_acc = Some(st.bool_acc.unwrap_or(true) && *b);
                         }
-                    }
+                        Value::Null => {}
+                        _ => update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?,
+                    },
                     _ => {
                         update_state(
                             &mut entry.1[i],
