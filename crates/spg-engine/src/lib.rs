@@ -44,7 +44,7 @@ mod session;
 mod show;
 mod spg_admin;
 pub mod statistics;
-mod subquery;
+pub mod subquery;
 pub mod subscriptions;
 mod substitute;
 mod system_catalog;

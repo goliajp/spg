@@ -664,6 +664,37 @@ impl Engine {
         budget: &mut ByteBudget,
     ) -> Result<DeferredJoin<'_>, EngineError> {
         let (swapped_from, primary_preds, peer_preds) = analyze_join_pushdown(from, where_);
+        // v7.37.x (mailrs Track A perf — SPGE ≫ PG18) — pushed conjuncts
+        // are enforced AT the primary `filter_table_indices` (or eager
+        // peer `materialise_table_ref_filtered`) AND/OR as a join-stage
+        // residual via `where_preds`. Re-applying them per joined tuple
+        // inside `filter_join_survivors` is pure waste — 30 k tuples ×
+        // compiled-WHERE eval cost ~1 ms on the mailrs minimal probe.
+        // Build a residual WHERE = `where_ \ pushed_conjuncts` and pass
+        // only that to the survivor filter. Identity is by `Expr` pointer
+        // (analyze_join_pushdown gave us borrows into `where_`'s conjunct
+        // set, so the pointers match exactly).
+        let pushed_set: alloc::collections::BTreeSet<usize> = primary_preds
+            .iter()
+            .chain(peer_preds.iter().flat_map(|v| v.iter()))
+            .map(|e| core::ptr::from_ref::<Expr>(*e) as usize)
+            .collect();
+        let residual_where_owned: Option<Expr> = where_.and_then(|w| {
+            let kept: Vec<Expr> = reorder::split_and_conjunctions(w)
+                .into_iter()
+                .filter(|c| !pushed_set.contains(&(core::ptr::from_ref::<Expr>(c) as usize)))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                None
+            } else {
+                kept.into_iter().reduce(|a, b| Expr::Binary {
+                    lhs: alloc::boxed::Box::new(a),
+                    op: spg_sql::ast::BinOp::And,
+                    rhs: alloc::boxed::Box::new(b),
+                })
+            }
+        });
         let from = swapped_from.as_ref().unwrap_or(from);
         let primary_alias = from
             .primary
@@ -837,7 +868,8 @@ impl Engine {
                 budget,
             )?;
         }
-        let survivors = self.filter_join_survivors(&pipe, where_, &ctx, cancel, budget)?;
+        let survivors =
+            self.filter_join_survivors(&pipe, residual_where_owned.as_ref(), &ctx, cancel, budget)?;
         Ok(DeferredJoin {
             sources: pipe.sources,
             offsets: pipe.offsets,
