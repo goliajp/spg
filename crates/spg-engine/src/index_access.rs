@@ -12,7 +12,10 @@ use spg_sql::ast::{BinOp, Expr, Literal, SelectStatement};
 use spg_storage::{Catalog, ColumnSchema, IndexKey, Row, Table, Value};
 
 use crate::eval::{self, EvalContext};
-use crate::{EngineError, QueryResult, apply_offset_and_limit, build_projection};
+use crate::{
+    CancelToken, Engine, EngineError, QueryResult, apply_offset_and_limit, build_projection,
+    memoize,
+};
 
 /// Try to plan a WHERE clause as an equality lookup against an existing
 /// index. Returns the candidate row indices on success; `None` means the
@@ -134,6 +137,8 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     table: &'a Table,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
+    engine: &Engine,
+    cancel: CancelToken<'_>,
 ) -> Option<Vec<Cow<'a, Row>>> {
     if stmt.distinct || stmt.limit_with_ties {
         return None;
@@ -181,6 +186,14 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
     let table_name = table.schema().name.as_str();
     let mut kept: Vec<Cow<'a, Row>> = Vec::with_capacity(want);
+    // v7.37.x (mailrs prod content_worker NOT EXISTS) — share one
+    // MemoizeCache across the walk so a materialised InList (from
+    // `subquery_replacement` of an uncorrelated InSubquery / the
+    // NOT EXISTS pullup) hits the in-set fast path instead of an
+    // O(N×M) linear scan per row. Without the memo, 25 k outer ×
+    // 25 k InList on the prod messages × attachment_content shape
+    // cost ~6 s.
+    let mut memo = memoize::MemoizeCache::new();
     // The walker yields `(IndexKey, &Vec<RowLocator>)` ordered by key
     // in the requested direction; per-key locator order within the
     // map preserves insertion order, which matches the legacy stable-
@@ -213,7 +226,9 @@ pub(crate) fn try_pk_walk_top_n<'a>(
                 }
             };
             if let Some(w) = where_expr {
-                let cond = eval::eval_expr(w, row_cow.as_ref(), &ctx).ok()?;
+                let cond = engine
+                    .eval_expr_with_correlated(w, row_cow.as_ref(), &ctx, cancel, Some(&mut memo))
+                    .ok()?;
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
                 }

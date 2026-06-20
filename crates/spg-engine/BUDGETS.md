@@ -7,6 +7,7 @@ only.
 | Gate                                              | Budget   | Bench (criterion median) | Headroom |
 |---------------------------------------------------|---------:|-------------------------:|---------:|
 | `execute_select_where_n100` (≤)                   | 500 µs   | **2.57 µs** (v3.0.0)     | ~190×    |
+| `content_worker_not_exists_top_n` (≤)             | 100 ms   | **~3 ms** (v7.37.x)      | ~30×     |
 
 Run: `cargo test -p spg-engine --test perf_gate`.
 
