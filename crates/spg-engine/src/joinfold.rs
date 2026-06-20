@@ -223,6 +223,100 @@ struct FoldPlan {
     pk_values: Vec<Value>,
 }
 
+impl Engine {
+    /// v7.37.x (docker-fair LEFTJOIN 71 % attack) — eliminate LEFT
+    /// JOINs whose right side is unreferenced everywhere except the
+    /// ON equality, and whose ON equality is on a UNIQUE/PK column of
+    /// the right table. Such a join preserves outer cardinality
+    /// exactly and contributes no value used downstream, so it can
+    /// be dropped wholesale. PG's planner applies the same rewrite
+    /// for canonical shapes like
+    ///     SELECT COUNT(*) FROM A LEFT JOIN B ON B.pk = A.fk
+    /// — A's row count is the result; B never has to be touched.
+    ///
+    /// Conservative: requires no aliases to be duplicated, no
+    /// LATERAL/UNNEST/AS-OF-SEGMENT special FROM shapes, and the
+    /// right side's join key resolved against the live catalog.
+    /// Returns `Some(rewritten)` if at least one join was eliminated;
+    /// `None` otherwise.
+    pub(crate) fn try_eliminate_redundant_left_joins(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        let from = stmt.from.as_ref()?;
+        if from.joins.is_empty() {
+            return None;
+        }
+        // Quick gate: at least one LEFT JOIN must exist.
+        if !from.joins.iter().any(|j| matches!(j.kind, JoinKind::Left)) {
+            return None;
+        }
+        // Reject special-shape FROM primaries / joined tables — the
+        // alias/column resolution below doesn't model these.
+        if from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return None;
+        }
+        for j in &from.joins {
+            if j.table.lateral_subquery.is_some()
+                || j.table.unnest_expr.is_some()
+                || j.table.generate_series_args.is_some()
+                || j.table.as_of_segment.is_some()
+            {
+                return None;
+            }
+        }
+        let primary_alias = table_alias(&from.primary).to_string();
+        let mut alias_to_idx: BTreeMap<String, usize> = BTreeMap::new();
+        alias_to_idx.insert(primary_alias.clone(), 0);
+        for (i, j) in from.joins.iter().enumerate() {
+            let a = table_alias(&j.table).to_string();
+            if alias_to_idx.insert(a, i + 1).is_some() {
+                return None;
+            }
+        }
+        // Identify eligible LEFT joins to eliminate.
+        let mut drop_indices: Vec<usize> = Vec::new();
+        for (i, j) in from.joins.iter().enumerate() {
+            if !matches!(j.kind, JoinKind::Left) {
+                continue;
+            }
+            let on = j.on.as_ref()?;
+            let inner_alias = table_alias(&j.table);
+            // Reuse the INNER-fold's ON-equality analyser. It rejects
+            // anything but a single equality with one column qualified
+            // by the inner alias.
+            let (_outer_expr, inner_col_name) = analyse_on_eq(on, inner_alias, &alias_to_idx)?;
+            // The inner join key must be UNIQUE/PK on the inner table;
+            // otherwise LEFT JOIN can multiply outer rows.
+            if !self.column_is_single_unique_public(&j.table.name, &inner_col_name) {
+                continue;
+            }
+            // The inner alias must be referenced nowhere except this
+            // join's ON clause. Stricter than the INNER-fold variant:
+            // inner-only WHERE conjuncts CAN'T be re-applied after a
+            // LEFT JOIN elimination (no IN-list seed sub-SELECT exists
+            // here), and any IS-NULL anti-join pattern
+            // (`__exsj_0.message_id IS NULL` from v7.37.27 NOT EXISTS
+            // pull-up) MUST veto elimination.
+            if alias_referenced_strictly_elsewhere(stmt, &from.joins, i, inner_alias) {
+                continue;
+            }
+            drop_indices.push(i);
+        }
+        if drop_indices.is_empty() {
+            return None;
+        }
+        let new_from = build_folded_from(from, &drop_indices);
+        let mut new_stmt = stmt.clone();
+        new_stmt.from = Some(new_from);
+        Some(new_stmt)
+    }
+}
+
 /// True when any expression anywhere in the statement still carries
 /// an unresolved subquery node. We bail in this case because the fold
 /// recurses into `exec_bare_select_cancel`, which does NOT re-run
@@ -467,6 +561,31 @@ fn alias_referenced_elsewhere(
             }
             // Touches alias — must touch ONLY alias.
             if expr_references_any_other_alias(p, alias) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Stricter variant of `alias_referenced_elsewhere` for LEFT-JOIN
+/// elimination: WHERE conjuncts that touch the inner alias AT ALL
+/// veto elimination (e.g. anti-join `inner.k IS NULL` patterns), not
+/// just mixed-alias ones. Inner-only WHERE conjuncts can be re-applied
+/// after INNER-fold via the IN-list seed sub-SELECT; LEFT-JOIN
+/// elimination has no equivalent place to put them.
+pub(crate) fn alias_referenced_strictly_elsewhere(
+    stmt: &SelectStatement,
+    joins: &[FromJoin],
+    skip_idx: usize,
+    alias: &str,
+) -> bool {
+    if alias_referenced_elsewhere(stmt, joins, skip_idx, alias) {
+        return true;
+    }
+    if let Some(w) = &stmt.where_ {
+        for p in split_and_conjunctions(w) {
+            if expr_references_alias(p, alias) {
                 return true;
             }
         }
