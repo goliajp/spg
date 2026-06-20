@@ -299,6 +299,16 @@ struct AggState {
     /// small. Sticking with `BTreeSet`; the dispatch-side enum
     /// fix in `update_state` is the R34 win.
     seen: BTreeSet<String>,
+    /// v7.37.x (docker-fair DISTA attack) — fast-path BigInt seen
+    /// set. The hot DISTINCT path used `encode_key_refs_into` to
+    /// turn `Value::BigInt(n)` into a string key like `"I<n>|"` then
+    /// inserted that into the String BTreeSet — ~100 ns of pure alloc
+    /// + format churn per row × 25 k rows × 1 BigInt DISTINCT spec
+    /// (the DISTA `COUNT(DISTINCT m.id)` shape) ≈ 2.5 ms of waste.
+    /// Direct `BTreeSet<i64>` skips encode entirely; lookups stay
+    /// O(log small) on the per-group set. Lazy-allocated — only the
+    /// BigInt-DISTINCT path constructs it.
+    seen_int: Option<BTreeSet<i64>>,
     /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
     /// to `items` (pushed under the same skip/keep conditions).
     /// Empty when the aggregate carries no internal ordering.
@@ -1330,11 +1340,28 @@ fn accumulate_groups(
                     // `seen` set. Skips encode_one + 2-walk
                     // contains+insert; only Text arms apply, others
                     // ride the encoded path unchanged.
+                    //
+                    // v7.37.x (docker-fair DISTA attack) — extend the
+                    // single-family fast path to BigInt via a parallel
+                    // `seen_int: Option<BTreeSet<i64>>`. The DISTA
+                    // `COUNT(DISTINCT m.id)` shape pumps 25 k BigInt
+                    // probes; skipping `encode_key_refs_into` saves
+                    // ~100 ns of alloc + format churn per row.
                     if let Value::Text(s) = arg_ref {
                         if entry.1[i].seen.contains(s.as_str()) {
                             continue;
                         }
                         entry.1[i].seen.insert(s.clone());
+                    } else if let Value::BigInt(n) = arg_ref {
+                        let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
+                        if !set.insert(*n) {
+                            continue;
+                        }
+                    } else if let Value::Int(n) = arg_ref {
+                        let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
+                        if !set.insert(i64::from(*n)) {
+                            continue;
+                        }
                     } else {
                         encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
@@ -1608,11 +1635,23 @@ fn accumulate_groups(
                     // bound fast path counterpart above). Per-spec
                     // type invariance lets us use the column text as
                     // the `seen` key directly, no `S<text>|` prefix.
+                    // v7.37.x (docker-fair DISTA) — BigInt parallel
+                    // path skips encode_key_refs_into entirely.
                     if let Value::Text(s) = arg_ref {
                         if entry.1[i].seen.contains(s.as_str()) {
                             continue;
                         }
                         entry.1[i].seen.insert(s.clone());
+                    } else if let Value::BigInt(n) = arg_ref {
+                        let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
+                        if !set.insert(*n) {
+                            continue;
+                        }
+                    } else if let Value::Int(n) = arg_ref {
+                        let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
+                        if !set.insert(i64::from(*n)) {
+                            continue;
+                        }
                     } else {
                         encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
@@ -1800,8 +1839,18 @@ fn accumulate_groups(
             // v7.37.x — single-Text fast path same shape as the
             // bound/slow paths above.
             if spec.distinct {
+                // v7.37.x (docker-fair DISTA) — single-family fast
+                // paths skip encode_key for Text/BigInt/Int.
                 let inserted = match &arg_val {
                     Value::Text(s) => entry.1[i].seen.insert(s.clone()),
+                    Value::BigInt(n) => entry.1[i]
+                        .seen_int
+                        .get_or_insert_with(BTreeSet::new)
+                        .insert(*n),
+                    Value::Int(n) => entry.1[i]
+                        .seen_int
+                        .get_or_insert_with(BTreeSet::new)
+                        .insert(i64::from(*n)),
                     _ => {
                         let key = encode_key(core::slice::from_ref(&arg_val));
                         entry.1[i].seen.insert(key)
