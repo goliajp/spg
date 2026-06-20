@@ -94,6 +94,35 @@ fn handle_pg_simple_query(
 ) -> std::io::Result<()> {
     // Null-terminated SQL string (typically — psql appends \0).
     let sql_bytes = body.strip_suffix(b"\0").unwrap_or(body);
+    // v7.37.x (SPGS PLUCK 红线) — ultra-hot early-out for pure-int
+    // `SELECT <int>` BEFORE the per-query activity-registry update
+    // (RWLock::write + String alloc per query). Liveness probes /
+    // pool keepalives don't need to show up in `spg_stat_activity` —
+    // an integer ping has no diagnostic value to surface there.
+    // Saves ~2-3 µs / query at the floor.
+    {
+        let trimmed_bytes = trim_ascii(sql_bytes);
+        let trimmed_bytes = if trimmed_bytes.last() == Some(&b';') {
+            trim_ascii(&trimmed_bytes[..trimmed_bytes.len() - 1])
+        } else {
+            trimmed_bytes
+        };
+        if let Some(rest) = ci_strip_prefix(trimmed_bytes, b"select ") {
+            let rest_trim = trim_ascii(rest);
+            if !rest_trim.is_empty()
+                && rest_trim
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+')
+                && let Ok(s) = core::str::from_utf8(rest_trim)
+                && let Ok(n) = s.parse::<i64>()
+            {
+                encode_select_int_response(wbuf, n, *tx_state)?;
+                stream.write_all(wbuf)?;
+                wbuf.clear();
+                return Ok(());
+            }
+        }
+    }
     // v6.5.2 — update activity registry.
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -120,36 +149,6 @@ fn handle_pg_simple_query(
     // `execute_with_role`, `persist_wire_write`) all take `&str`,
     // so the slice form is drop-in.
     let sql: &str = sql_str.trim_end_matches(';').trim();
-    // v7.37.x (SPGS PLUCK 红线) — pure-integer-literal SELECT fast
-    // path at the very top of the dispatcher. ORM connection pools,
-    // pgbouncer keepalives, and BI client canary probes spam these,
-    // and PG 18's wire processes them in ~53 µs; SPGS was paying ~100
-    // µs because the SQL traversed parse_set / parse_show /
-    // parse_copy / canned_response / wait_event_set /
-    // streaming_select_attempt before hitting the (much shorter)
-    // canned arm at line ~940. Detect `SELECT <int>` (no whitespace
-    // before the int beyond a single space, nothing after the int)
-    // up front and emit `RowDescription + DataRow + CommandComplete +
-    // ReadyForQuery` straight into wbuf, no parse layers traversed.
-    if let Some(rest) = ci_strip_prefix(sql.as_bytes(), b"select ") {
-        let rest_trim = trim_ascii(rest);
-        if !rest_trim.is_empty()
-            && rest_trim
-                .iter()
-                .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+')
-            && let Ok(s) = core::str::from_utf8(rest_trim)
-            && let Ok(n) = s.parse::<i64>()
-        {
-            // Hand-rolled hot path: build the full response (RowDesc +
-            // DataRow + CommandComplete + ReadyForQuery) directly into
-            // wbuf with zero `ColumnSchema` / `Row` / `format!` /
-            // intermediate Vec allocations, then single `write_all`.
-            encode_select_int_response(wbuf, n, *tx_state)?;
-            stream.write_all(wbuf)?;
-            wbuf.clear();
-            return Ok(());
-        }
-    }
     // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
     // multi-frame protocol; intercept before the regular
     // execute path tries to parse them.
