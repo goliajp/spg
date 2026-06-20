@@ -1060,6 +1060,16 @@ impl Engine {
             if !stmt_owned.ctes.is_empty() {
                 return self.exec_with_ctes(&stmt_owned, cancel);
             }
+            // v7.37.x (docker-fair INSUBQ attack) — short-circuit
+            //   SELECT COUNT(*) FROM A WHERE A.pk IN (<uncorrelated subquery>)
+            // BEFORE `resolve_select_subqueries` materialises the inner
+            // result as `Vec<Expr::Literal>` (~150 µs for the 6 k-row
+            // INSUBQ benchmark). Run the inner once, collect the result
+            // values into a `HashSet<i64>` directly, then probe A.pk per
+            // value and tally. Returns `Some` when the shape matches.
+            if let Some(out) = self.try_count_star_pk_in_subquery_fast(&stmt_owned, cancel)? {
+                return Ok(out);
+            }
             self.resolve_select_subqueries(&mut stmt_owned, cancel)?;
             &stmt_owned
         } else {
@@ -1755,6 +1765,161 @@ impl Engine {
             columns,
             rows: alloc::vec![Row::new(values)],
         })
+    }
+
+    /// v7.37.x (docker-fair INSUBQ attack) — pre-replacement short-
+    /// circuit. Catches
+    ///   SELECT COUNT(*) FROM A WHERE A.pk IN (<uncorrelated subquery>)
+    /// BEFORE `resolve_select_subqueries` materialises the inner result
+    /// as `Vec<Expr::Literal>`. Runs the inner once, collects the
+    /// values into a `HashSet<i64>` directly, then probes A.pk per
+    /// HashSet entry and tallies. Saves the Expr-literal roundtrip
+    /// (~150 µs / query at INSUBQ benchmark scale).
+    pub(crate) fn try_count_star_pk_in_subquery_fast(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        use spg_sql::ast::SelectItem;
+        if stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || !stmt.unions.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.items.len() != 1
+        {
+            return Ok(None);
+        }
+        let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+            return Ok(None);
+        };
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("count_star") && args.is_empty());
+        if !is_count_star {
+            return Ok(None);
+        }
+        let Some(from) = stmt.from.as_ref() else {
+            return Ok(None);
+        };
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(where_expr) = stmt.where_.as_ref() else {
+            return Ok(None);
+        };
+        // The WHERE conjunct must be a bare `<col> IN (subquery)` with
+        // negated=false; no other predicates.
+        let Expr::InSubquery {
+            expr: col_expr,
+            subquery,
+            negated: false,
+        } = where_expr
+        else {
+            return Ok(None);
+        };
+        let Expr::Column(c) = col_expr.as_ref() else {
+            return Ok(None);
+        };
+        let outer_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        if let Some(q) = c.qualifier.as_deref()
+            && !q.eq_ignore_ascii_case(outer_alias)
+        {
+            return Ok(None);
+        }
+        // Outer column must be a single-column PK on integer family.
+        let catalog = self.active_catalog();
+        let Some(outer_table) = catalog.get(from.primary.name.as_str()) else {
+            return Ok(None);
+        };
+        let outer_schema = outer_table.schema();
+        let Some(outer_pos) = outer_schema
+            .columns
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&c.name))
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            outer_schema.columns[outer_pos].ty,
+            spg_storage::DataType::BigInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::SmallInt
+        ) {
+            return Ok(None);
+        }
+        if !outer_schema
+            .uniqueness_constraints
+            .iter()
+            .any(|u| u.is_primary_key && u.columns.as_slice() == [outer_pos])
+        {
+            return Ok(None);
+        }
+        let Some(idx) = outer_table.index_on(outer_pos) else {
+            return Ok(None);
+        };
+        // Inner must be uncorrelated. The cheap-correlation pre-check
+        // exists upstream; here we just attempt the bare exec.
+        if crate::subquery::select_is_correlated(subquery) {
+            return Ok(None);
+        }
+        let mut inner = (**subquery).clone();
+        self.resolve_select_subqueries(&mut inner, cancel)?;
+        let r = match self.exec_bare_select_cancel(&inner, cancel) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let QueryResult::Rows { columns, rows, .. } = r else {
+            return Ok(None);
+        };
+        if columns.len() != 1 {
+            return Ok(None);
+        }
+        // Collect inner i64 values directly into a HashSet, then probe.
+        let mut count: i64 = 0;
+        let mut probed = hashbrown::HashSet::<i64>::with_capacity(rows.len());
+        for row in &rows {
+            let v = row.values.first().cloned().unwrap_or(Value::Null);
+            let n = match v {
+                Value::BigInt(n) => n,
+                Value::Int(n) => i64::from(n),
+                Value::SmallInt(n) => i64::from(n),
+                Value::Null => continue,
+                _ => return Ok(None),
+            };
+            // De-duplicate inner key set so a duplicate inner value
+            // doesn't double-count the same outer row.
+            if !probed.insert(n) {
+                continue;
+            }
+            let Some(key) = spg_storage::IndexKey::from_value(&Value::BigInt(n)) else {
+                return Ok(None);
+            };
+            if !idx.lookup_eq(&key).is_empty() {
+                count += 1;
+            }
+        }
+        let columns_out = alloc::vec![ColumnSchema::new(
+            "count".to_string(),
+            spg_storage::DataType::BigInt,
+            false,
+        )];
+        let rows_out = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
+        Ok(Some(QueryResult::Rows {
+            columns: columns_out,
+            rows: rows_out,
+        }))
     }
 
     /// v7.37.x (docker-fair INSUBQ attack) — short-circuit
