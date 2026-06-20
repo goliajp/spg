@@ -1905,6 +1905,24 @@ impl Engine {
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, &ctx));
         let mut eval_stack: Vec<Value> = Vec::new();
+        // v7.37.x (docker-fair SCALARSQ attack) — early-limit gate for
+        // the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
+        // Hoisted above the closure so the projection-eval path can
+        // gate `memo` passing on it: the SELECT-item correlated-scalar
+        // batch path scans the FULL inner table once (~5 ms for 12.5 k
+        // rows) and is only a win when N outer rows is large; for small
+        // LIMITed shapes a per-row PK seek (~5 µs × 100 = 500 µs) wins.
+        let early_cap: Option<usize> = if stmt.order_by.is_empty()
+            && !stmt.distinct
+            && !stmt.limit_with_ties
+            && srf_position.is_none()
+            && stmt.where_.is_none()
+        {
+            stmt.limit_literal()
+                .map(|n| n.saturating_add(stmt.offset_literal().unwrap_or(0)) as usize)
+        } else {
+            None
+        };
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row, loop_idx: usize| -> Result<(), EngineError> {
@@ -1951,44 +1969,29 @@ impl Engine {
                 let mut values = Vec::with_capacity(projection.len());
                 for p in &projection {
                     // v7.24 (round-16 B) — correlated-aware.
-                    values.push(self.eval_expr_with_correlated(&p.expr, row, &ctx, cancel, None)?);
+                    // v7.37.x (docker-fair SCALARSQ attack) — share the
+                    // per-row memo with projection. Required for the
+                    // batch-evaluated correlated-scalar path to fire on
+                    // SELECT-item scalar subqueries; otherwise each row
+                    // re-executes the inner.
+                    //
+                    // Skip the memo when the outer row count is small
+                    // (early-limited): the batch path scans the FULL
+                    // inner table to build a GroupMap (~5 ms for a
+                    // 12.5 k-row inner), while per-row execution with a
+                    // PK index seek is ~5 µs per call — much cheaper for
+                    // N ≤ ~1000 outer rows.
+                    let pass_memo = early_cap.is_none_or(|cap| cap > 1000);
+                    let memo_arg = if pass_memo { Some(&mut memo) } else { None };
+                    values.push(
+                        self.eval_expr_with_correlated(&p.expr, row, &ctx, cancel, memo_arg)?,
+                    );
                 }
                 let out = Row::new(values);
                 budget.charge(approx_row_bytes(&out))?;
                 tagged.push((order_keys, out));
             }
             Ok(())
-        };
-        // v7.37.x (docker-fair SCALARSQ 214× attack) — early-limit gate
-        // for the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
-        // SQL output order is implementation-defined when ORDER BY is
-        // absent, so the surviving top-N picked AFTER projection is
-        // identical to the top-N picked DURING scan. Skipping projection
-        // work for the dropped rows is load-bearing for shapes like
-        // `SELECT m.id, (SELECT COUNT(*) FROM e WHERE …) FROM messages m
-        // LIMIT 100` — without this gate the correlated scalar runs for
-        // each of the 25 k outer rows even though only 100 results
-        // survive. PG enforces the same semantics via `Limit`.
-        //
-        // Gates:
-        // - SRF (unnest) ⇒ one input row may emit many output rows; a
-        //   `+= 1`-per-scan counter under-counts and stops too early.
-        // - WHERE present ⇒ rows may be rejected; `+= 1` over-counts and
-        //   stops too early (with v7.37.27 pull-up the conjuncts a
-        //   correlated subquery rewrote into may still be ON the WHERE).
-        // The strict gate keeps the test e2e_memoize and
-        // mailrs_round15_16 correlated NOT-EXISTS shapes
-        // unaffected — they both carry an outer WHERE or ORDER BY.
-        let early_cap: Option<usize> = if stmt.order_by.is_empty()
-            && !stmt.distinct
-            && !stmt.limit_with_ties
-            && srf_position.is_none()
-            && stmt.where_.is_none()
-        {
-            stmt.limit_literal()
-                .map(|n| n.saturating_add(stmt.offset_literal().unwrap_or(0)) as usize)
-        } else {
-            None
         };
         let mut emitted: usize = 0;
         if let Some(rows) = &indexed_rows {

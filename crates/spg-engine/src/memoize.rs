@@ -56,9 +56,20 @@ pub struct CacheKey {
 
 /// v7.29 - one batch-evaluated correlated subquery: the outer key
 /// column and the key -> value map.
+///
+/// v7.37.x (docker-fair SCALARSQ attack) — extended with an
+/// `empty_default` Value. PG scalar-subquery empty-set semantics
+/// distinguish `COUNT(*)` / `COUNT(col)` (= 0 over no rows) from
+/// every other aggregate (= NULL). The hollow_scalar_subqueries
+/// template-rewrite step empties the inner SelectStatement before
+/// the per-row splice, so the splicer cannot inspect the original
+/// aggregate kind at probe time. Storing the empty-default on the
+/// GroupMap captures that information at try_batch_correlated_scalar
+/// construction time, where the original inner is still in hand.
 pub type GroupMap = (
     spg_sql::ast::ColumnName,
     alloc::collections::BTreeMap<String, Value>,
+    Value,
 );
 
 /// v7.29 (3c) - per-expression resolution plan: for the i-th scalar
@@ -126,6 +137,13 @@ pub struct MemoizeCache {
     /// (so we don't re-analyse it per row). Turns 23.5k per-group
     /// executions into one grouped scan + 23.5k lookups.
     pub group_maps: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<GroupMap>>>,
+    /// v7.37.x (docker-fair SCALARSQ attack) — fast-path cache keyed
+    /// by `SelectStatement` pointer address. The repr-stringified
+    /// `group_maps` key cost ~500 ns of `alloc::format!` per outer
+    /// row; for hundreds-of-row LIMIT shapes that's still tens of µs
+    /// of pure repr churn. Per-row hit is a HashMap probe on a usize
+    /// key (the inner AST is stable for the SELECT's lifetime).
+    pub group_maps_by_ptr: hashbrown::HashMap<usize, Option<alloc::rc::Rc<GroupMap>>>,
     /// v7.34 (mailrs conn-pool P0) - decorrelated `[NOT] EXISTS`: subquery
     /// repr -> Some(semi/anti-join key-set) or None when the shape can't
     /// decorrelate (don't re-analyse per row). Parallel to `group_maps`.
@@ -177,6 +195,7 @@ impl MemoizeCache {
             hit_count: 0,
             miss_count: 0,
             group_maps: alloc::collections::BTreeMap::new(),
+            group_maps_by_ptr: hashbrown::HashMap::new(),
             exists_sets: alloc::collections::BTreeMap::new(),
             exists_plans: alloc::collections::BTreeMap::new(),
             expr_plans: alloc::collections::BTreeMap::new(),
