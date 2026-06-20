@@ -2163,6 +2163,41 @@ impl Engine {
                     labels,
                 }
             }
+            // v7.37.x (ζ-B Phase 1 composite accept) — `CREATE TYPE
+            // name AS (field …)` is accepted and stored in the
+            // catalog so PG dumps emitting composite type definitions
+            // don't fail. Phase 1 doesn't yet support USING the
+            // composite type as a column type or constructing
+            // composite Value literals — that lands in Phase 2 with
+            // Value::Composite + ROW() cast + field-access syntax.
+            // Storing in the existing `enum_types` slot is wrong;
+            // we register a synthetic enum with the field names as
+            // labels so the catalog has a record. A real CompositeDef
+            // slot ships with Phase 2.
+            spg_sql::ast::TypeKind::Composite { fields } => {
+                if fields.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "CREATE TYPE … AS (…) must declare at least one field".into(),
+                    ));
+                }
+                // Synthetic enum-shaped record: labels = field names.
+                // Reject duplicate field names per PG.
+                for i in 0..fields.len() {
+                    for j in (i + 1)..fields.len() {
+                        if fields[i].0.eq_ignore_ascii_case(&fields[j].0) {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "CREATE TYPE {:?}: duplicate composite field {:?}",
+                                s.name,
+                                fields[i].0
+                            )));
+                        }
+                    }
+                }
+                spg_storage::EnumDef {
+                    name: s.name.clone(),
+                    labels: fields.into_iter().map(|(n, _)| n).collect(),
+                }
+            }
         };
         self.active_catalog_mut()
             .create_enum_type(def)

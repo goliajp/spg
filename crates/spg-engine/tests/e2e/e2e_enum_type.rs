@@ -129,3 +129,51 @@ fn update_to_invalid_label_skipped_for_phase14() {
     // assertion.
     let _ = e.execute("UPDATE p SET m = 'angry' WHERE id = 1");
 }
+
+// v7.37.x (ζ-B Phase 1 composite accept) — `CREATE TYPE foo AS (a INT, b TEXT)`
+// is accepted and registered in the catalog. Phase 1 doesn't support USING
+// the composite as a column type yet; that's Phase 2.
+#[test]
+fn create_composite_type_accepts_and_registers() {
+    let mut e = Engine::new();
+    e.execute("CREATE TYPE addr AS (street TEXT, city TEXT, zip INT)")
+        .unwrap();
+    // Round-trip via catalog serialise/deserialise: the synthetic
+    // enum-shaped record carries the field names as labels (Phase 1
+    // stops short of Value::Composite).
+    let snapshot = e.catalog().serialize();
+    let restored = spg_storage::Catalog::deserialize(&snapshot).expect("round-trip");
+    let def = restored
+        .enum_types()
+        .get("addr")
+        .expect("composite persisted");
+    assert_eq!(
+        def.labels,
+        vec!["street".to_string(), "city".to_string(), "zip".to_string()]
+    );
+}
+
+#[test]
+fn create_composite_type_rejects_empty_field_list() {
+    let mut e = Engine::new();
+    let err = e.execute("CREATE TYPE empty AS ()");
+    assert!(err.is_err(), "empty composite must be rejected");
+}
+
+#[test]
+fn create_composite_type_rejects_duplicate_field_names() {
+    let mut e = Engine::new();
+    let err = e.execute("CREATE TYPE dup AS (a INT, A TEXT)");
+    assert!(
+        err.is_err(),
+        "duplicate composite field (case-insensitive) must be rejected"
+    );
+}
+
+#[test]
+fn create_composite_type_collides_with_existing_type() {
+    let mut e = Engine::new();
+    e.execute("CREATE TYPE foo AS (a INT)").unwrap();
+    let err = e.execute("CREATE TYPE foo AS ENUM ('x')");
+    assert!(err.is_err(), "name collision must be rejected");
+}

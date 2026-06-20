@@ -379,11 +379,23 @@ pub struct CreateTypeStatement {
 /// implemented; the variant set is open so Phase 1.5 (DOMAIN)
 /// and later (COMPOSITE, RANGE) can land without an AST shape
 /// migration.
+///
+/// v7.37.x (ζ-B Phase 1 composite accept) — added Composite for
+/// `CREATE TYPE name AS (field_name field_type, …)`. Phase 1
+/// stores the field list in the catalog so PG dumps that emit
+/// `CREATE TYPE … AS (…)` don't error out; using a composite type
+/// as a column type lands in Phase 2 (Value::Composite encoding +
+/// ROW() literal + field-access syntax).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     /// `AS ENUM ('a', 'b', …)`. Order is preserved (PG enum
     /// labels are ordered).
     Enum { labels: Vec<String> },
+    /// `AS (field_name field_type, …)`. Order matters; PG
+    /// composite literals are positional.
+    Composite {
+        fields: Vec<(String, ColumnTypeName)>,
+    },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -3026,6 +3038,16 @@ impl fmt::Display for CreateTypeStatement {
                         f.write_str(", ")?;
                     }
                     write!(f, "'{}'", l.replace('\'', "''"))?;
+                }
+                f.write_str(")")
+            }
+            TypeKind::Composite { fields } => {
+                f.write_str("(")?;
+                for (i, (n, t)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} {}", quote_ident(n), t)?;
                 }
                 f.write_str(")")
             }

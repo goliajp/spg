@@ -1750,18 +1750,49 @@ impl Parser {
             )));
         }
         self.advance();
+        // v7.37.x (ζ-B composite Phase 1) — `AS (` is the composite-
+        // type shape: `CREATE TYPE foo AS (a INT, b TEXT)`. Branch
+        // on the next token: `(` = composite, ident `ENUM` = enum.
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut fields: Vec<(String, ColumnTypeName)> = Vec::new();
+            loop {
+                let field_name = self.expect_ident_like()?;
+                let field_type = self.parse_column_type_name()?;
+                fields.push((field_name, field_type));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                return Err(self.err(alloc::format!(
+                    "expected , or ) in composite field list, got {:?}",
+                    self.peek()
+                )));
+            }
+            if fields.is_empty() {
+                return Err(self.err("CREATE TYPE … AS (…) must declare at least one field".into()));
+            }
+            return Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
+                name,
+                kind: crate::ast::TypeKind::Composite { fields },
+            }));
+        }
         // Required `ENUM` ident.
         let kind_ident = match self.peek().clone() {
             Token::Ident(s) | Token::QuotedIdent(s) => s,
             other => {
                 return Err(self.err(alloc::format!(
-                    "expected ENUM after CREATE TYPE {name:?} AS, got {other:?}"
+                    "expected ENUM or '(' after CREATE TYPE {name:?} AS, got {other:?}"
                 )));
             }
         };
         if !kind_ident.eq_ignore_ascii_case("enum") {
             return Err(self.err(alloc::format!(
-                "Phase 1.4 only supports ENUM; got {kind_ident:?}"
+                "Phase 1.4 only supports ENUM or composite '(…)'; got {kind_ident:?}"
             )));
         }
         self.advance();
