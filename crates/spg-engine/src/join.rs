@@ -1570,6 +1570,189 @@ impl Engine {
     /// eligibility gates plus the `try_streamed_inner_join_topn`
     /// join-shape gates. Returns `None` on any miss → the legacy
     /// heap streamer + general path handle it.
+    /// v7.37.x (docker-fair NOTEX attack) — short-circuit
+    ///   SELECT COUNT(*) FROM A LEFT JOIN B ON B.k = A.fk WHERE B.k IS NULL
+    /// (the v7.37.27 NOT-EXISTS pull-up output shape). Materialising
+    /// every (outer, NULL-padded right) tuple just to count survivors
+    /// is wasted work — build a `HashSet<i64>` of B's unique join
+    /// values (B.k must be UNIQUE / PK on a single integer column), scan
+    /// A's storage, and increment the counter on each miss. PG's Merge
+    /// Anti-Join does the same shape over both PK indexes. Returns
+    /// `None` on any eligibility miss; the general join + aggregate
+    /// path handles non-matching shapes.
+    pub(crate) fn try_count_star_left_anti_join_fast(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        use spg_sql::ast::{JoinKind, SelectItem};
+        ANTI_JOIN_FAST_PATH_TRIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || !stmt.unions.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+        {
+            return Ok(None);
+        }
+        if from.joins.len() != 1 {
+            return Ok(None);
+        }
+        let join = &from.joins[0];
+        if !matches!(join.kind, JoinKind::Left) {
+            return Ok(None);
+        }
+        // Gate: outer + inner must be plain catalog tables.
+        let plain = |t: &spg_sql::ast::TableRef| {
+            t.unnest_expr.is_none()
+                && t.lateral_subquery.is_none()
+                && t.as_of_segment.is_none()
+                && t.generate_series_args.is_none()
+        };
+        if !plain(&from.primary) || !plain(&join.table) {
+            return Ok(None);
+        }
+        let outer_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let inner_alias = join
+            .table
+            .alias
+            .as_deref()
+            .unwrap_or(join.table.name.as_str());
+        // Items must be a single `COUNT(*)`.
+        if stmt.items.len() != 1 {
+            return Ok(None);
+        }
+        let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+            return Ok(None);
+        };
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("count_star") && args.is_empty());
+        if !is_count_star {
+            return Ok(None);
+        }
+        // ON clause: single equality on outer.col = inner.col (or
+        // commuted). Capture (outer_col, inner_col).
+        let Some(on) = join.on.as_ref() else {
+            return Ok(None);
+        };
+        let Some((outer_col, inner_col)) = analyse_join_eq(on, outer_alias, inner_alias)? else {
+            return Ok(None);
+        };
+        // WHERE clause: single `inner_alias.inner_col IS NULL` predicate
+        // (canonical anti-join filter).
+        let Some(where_expr) = stmt.where_.as_ref() else {
+            return Ok(None);
+        };
+        if !is_inner_is_null(where_expr, inner_alias, &inner_col) {
+            return Ok(None);
+        }
+        // Inner column must be UNIQUE / PK on a single integer column,
+        // so the antiset built from B's rows is collision-free under
+        // `HashSet<i64>`. Look the table up in the catalog.
+        let catalog = self.active_catalog();
+        let Some(inner_table) = catalog.get(join.table.name.as_str()) else {
+            return Ok(None);
+        };
+        let inner_schema = inner_table.schema();
+        let Some(inner_pos) = inner_schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&inner_col))
+        else {
+            return Ok(None);
+        };
+        let inner_ty = inner_schema.columns[inner_pos].ty;
+        if !matches!(
+            inner_ty,
+            spg_storage::DataType::BigInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::SmallInt
+        ) {
+            return Ok(None);
+        }
+        // The inner column must be a single-column PK so the antiset is
+        // collision-free. (Single-column UNIQUE follows the same rule;
+        // restricting Phase 1 to PK keeps the gate trivial.)
+        if !inner_schema
+            .uniqueness_constraints
+            .iter()
+            .any(|u| u.is_primary_key && u.columns.as_slice() == [inner_pos])
+        {
+            return Ok(None);
+        }
+        let Some(outer_table) = catalog.get(from.primary.name.as_str()) else {
+            return Ok(None);
+        };
+        let outer_schema = outer_table.schema();
+        let Some(outer_pos) = outer_schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&outer_col))
+        else {
+            return Ok(None);
+        };
+        let outer_ty = outer_schema.columns[outer_pos].ty;
+        if !matches!(
+            outer_ty,
+            spg_storage::DataType::BigInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::SmallInt
+        ) {
+            return Ok(None);
+        }
+        // Build the antiset.
+        let read_int = |v: &Value| -> Option<i64> {
+            match v {
+                Value::BigInt(n) => Some(*n),
+                Value::Int(n) => Some(i64::from(*n)),
+                Value::SmallInt(n) => Some(i64::from(*n)),
+                _ => None,
+            }
+        };
+        let mut antiset: hashbrown::HashSet<i64> =
+            hashbrown::HashSet::with_capacity(inner_table.row_count());
+        for row in inner_table.rows() {
+            if let Some(v) = row.values.get(inner_pos)
+                && let Some(k) = read_int(v)
+            {
+                antiset.insert(k);
+            }
+        }
+        // Walk outer; count rows whose key isn't in the set OR whose key
+        // is NULL (a NULL outer key has no join match either way).
+        let mut count: i64 = 0;
+        for row in outer_table.rows() {
+            match row.values.get(outer_pos) {
+                Some(v) => match read_int(v) {
+                    Some(k) => {
+                        if !antiset.contains(&k) {
+                            count += 1;
+                        }
+                    }
+                    None => count += 1,
+                },
+                None => count += 1,
+            }
+        }
+        let columns = alloc::vec![ColumnSchema::new(
+            "count".to_string(),
+            spg_storage::DataType::BigInt,
+            false,
+        )];
+        let rows = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
+        let _ = outer_alias;
+        let _ = (outer_col, inner_col);
+        ANTI_JOIN_FAST_PATH_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
     pub(crate) fn try_streamed_inner_join_walk_topn(
         &self,
         stmt: &SelectStatement,
@@ -2392,3 +2575,61 @@ fn build_combined_schema(
     }
     combined_schema
 }
+
+/// v7.37.x — helper for `try_count_star_left_anti_join_fast`. Recognises
+/// `outer.X = inner.Y` (commuted accepted) and returns the column names.
+fn analyse_join_eq(
+    on: &Expr,
+    outer_alias: &str,
+    inner_alias: &str,
+) -> Result<Option<(String, String)>, EngineError> {
+    use spg_sql::ast::BinOp;
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = on
+    else {
+        return Ok(None);
+    };
+    let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref()) else {
+        return Ok(None);
+    };
+    fn col_alias(c: &spg_sql::ast::ColumnName) -> Option<&str> {
+        c.qualifier.as_deref()
+    }
+    let pair_o_then_i = (col_alias(a), col_alias(b));
+    if matches!(pair_o_then_i, (Some(aq), Some(bq))
+        if aq.eq_ignore_ascii_case(outer_alias) && bq.eq_ignore_ascii_case(inner_alias))
+    {
+        return Ok(Some((a.name.clone(), b.name.clone())));
+    }
+    if matches!(pair_o_then_i, (Some(aq), Some(bq))
+        if aq.eq_ignore_ascii_case(inner_alias) && bq.eq_ignore_ascii_case(outer_alias))
+    {
+        return Ok(Some((b.name.clone(), a.name.clone())));
+    }
+    Ok(None)
+}
+
+/// v7.37.x — recognise `<inner_alias>.<inner_col> IS NULL`.
+fn is_inner_is_null(e: &Expr, inner_alias: &str, inner_col: &str) -> bool {
+    let Expr::IsNull { expr, negated } = e else {
+        return false;
+    };
+    if *negated {
+        return false;
+    }
+    let Expr::Column(c) = expr.as_ref() else {
+        return false;
+    };
+    c.qualifier
+        .as_deref()
+        .is_some_and(|q| q.eq_ignore_ascii_case(inner_alias))
+        && c.name.eq_ignore_ascii_case(inner_col)
+}
+
+pub static ANTI_JOIN_FAST_PATH_TRIED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static ANTI_JOIN_FAST_PATH_FIRED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);

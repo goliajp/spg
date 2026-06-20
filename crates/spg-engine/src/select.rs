@@ -2301,6 +2301,22 @@ impl Engine {
         from: &FromClause,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.37.x (docker-fair NOTEX attack) — short-circuit COUNT(*)
+        // over a LEFT ANTI JOIN. The v7.37.27 NOT EXISTS pullup
+        // rewrites `SELECT COUNT(*) FROM A WHERE NOT EXISTS (SELECT 1
+        // FROM B WHERE B.k = A.k)` into
+        //   SELECT COUNT(*) FROM A LEFT JOIN B ON B.k = A.k
+        //   WHERE B.k IS NULL
+        // The general join executor builds a hash, probes every outer
+        // tuple, materialises (left_padded_with_null) for every miss,
+        // then runs the aggregate over the result set. For COUNT(*) we
+        // only need the count — skip the tuple materialisation. Build
+        // a HashSet of B's unique join values, scan A's PK index, and
+        // increment the counter on each miss. PG's Merge Anti-Join
+        // does roughly this; ours becomes a simple HashSet probe.
+        if let Some(out) = self.try_count_star_left_anti_join_fast(stmt, from)? {
+            return Ok(out);
+        }
         // v7.34.5 (mailrs prod #5) — walker-driven join + early stop.
         // When ORDER BY is on an indexed primary column, walking the
         // btree in the requested direction lets the streamer break
