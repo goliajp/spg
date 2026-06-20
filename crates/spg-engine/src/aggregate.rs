@@ -427,6 +427,16 @@ struct Projection {
     kept_synth: Vec<Row>,
     deferred: Vec<(usize, Expr)>,
     order_rewritten: Vec<Expr>,
+    /// v7.37.x — when `defer_projection` is requested, `out_rows`
+    /// carries empty placeholders and the caller runs the per-item
+    /// eval pass after sort+truncate over the surviving ≤ keep_n
+    /// rows. `None` when projection was performed inline.
+    deferred_project: Option<DeferredProject>,
+}
+
+struct DeferredProject {
+    items_rewritten: Vec<Option<Expr>>,
+    items_compiled: Vec<Option<eval::CompiledExpr>>,
 }
 
 /// v7.35.0 — detect the `SELECT COUNT(*) FROM … [WHERE …]` shape
@@ -573,6 +583,24 @@ pub(crate) fn run(
         table_alias,
     )?;
 
+    // v7.37.x (mailrs Track A 100k attack) — defer the bound
+    // per-item SELECT projection on the synth rows until AFTER
+    // sort + LIMIT truncation. On a `GROUP BY t ORDER BY agg DESC
+    // LIMIT 50` with 20 000 groups (the mailrs minimal 100k shape)
+    // pre-defer ran 20 000 × N_items compiled-VM evals + Row
+    // allocations before discarding 99.75 % at the sort truncation
+    // step. HAVING still runs inline on every group because it
+    // filters BEFORE the LIMIT; we only skip the SELECT-list eval.
+    let defer_projection = !stmt.order_by.is_empty()
+        && !stmt.distinct
+        && !stmt.limit_with_ties
+        && stmt.having.is_none()
+        && stmt.limit_literal().is_some_and(|l| {
+            let off = stmt.offset_literal().unwrap_or(0) as usize;
+            let k = (l as usize).saturating_add(off);
+            k > 0 && k < synth_rows.len()
+        });
+
     // (3) Rewrite the user's expressions, filter groups by HAVING and project.
     let Projection {
         columns,
@@ -580,6 +608,7 @@ pub(crate) fn run(
         mut kept_synth,
         deferred,
         order_rewritten,
+        deferred_project,
     } = project_groups(
         synth_rows,
         stmt,
@@ -587,6 +616,7 @@ pub(crate) fn run(
         &agg_specs,
         &synth_schema,
         correlated_eval,
+        defer_projection,
     )?;
 
     // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
@@ -629,6 +659,41 @@ pub(crate) fn run(
         )?;
         kept_synth = sorted_synth;
         out_rows = sorted_out;
+    }
+
+    // v7.37.x — run deferred SELECT-list projection on the truncated
+    // top-K survivors. For `GROUP BY thread_id ORDER BY MAX(date) DESC
+    // LIMIT 50` against 20 000 groups, this turns ~40 000 compiled-VM
+    // evals + Row allocations into 100, saving ~2-3 ms on the mailrs
+    // minimal 100k shape.
+    if let Some(DeferredProject {
+        items_rewritten,
+        items_compiled,
+    }) = deferred_project
+    {
+        let synth_ctx = EvalContext::new(&synth_schema, None);
+        let mut stack: Vec<Value> = Vec::new();
+        for (idx, srow) in kept_synth.iter().enumerate() {
+            let mut values: Vec<Value> = Vec::with_capacity(columns.len());
+            for (i, rewritten) in items_rewritten.iter().enumerate() {
+                let Some(rewritten) = rewritten else { continue };
+                if deferred.iter().any(|(c, _)| *c == i) {
+                    values.push(Value::Null);
+                    continue;
+                }
+                values.push(if let Some(cc) = &items_compiled[i] {
+                    eval::eval_compiled(cc, srow, &synth_ctx, &mut stack)?
+                } else {
+                    match correlated_eval {
+                        Some(f) if crate::expr_has_subquery(rewritten) => {
+                            f(rewritten, srow, &synth_ctx)?
+                        }
+                        _ => eval::eval_expr(rewritten, srow, &synth_ctx)?,
+                    }
+                });
+            }
+            out_rows[idx] = Row::new(values);
+        }
     }
 
     let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
@@ -1643,6 +1708,7 @@ fn project_groups(
     agg_specs: &[AggSpec],
     synth_schema: &[ColumnSchema],
     correlated_eval: Option<CorrelatedEval<'_>>,
+    defer_projection: bool,
 ) -> Result<Projection, EvalError> {
     // Rewrite the user's SELECT items + ORDER BY to reference synthetic
     // columns. After rewriting, every remaining `Expr::Column` must
@@ -1753,6 +1819,14 @@ fn project_groups(
                 continue;
             }
         }
+        // v7.37.x — when caller pre-truncates via ORDER BY+LIMIT, skip
+        // per-item projection here; the caller fills the placeholder
+        // out_rows from the top-K survivors below.
+        if defer_projection {
+            kept_synth.push(srow);
+            out_rows.push(Row::new(Vec::new()));
+            continue;
+        }
         let mut values: Vec<Value> = Vec::with_capacity(columns.len());
         for (i, rewritten) in items_rewritten.iter().enumerate() {
             let Some(rewritten) = rewritten else { continue };
@@ -1774,12 +1848,21 @@ fn project_groups(
         kept_synth.push(srow);
         out_rows.push(Row::new(values));
     }
+    let deferred_project_state = if defer_projection {
+        Some(DeferredProject {
+            items_rewritten,
+            items_compiled,
+        })
+    } else {
+        None
+    };
     Ok(Projection {
         columns,
         out_rows,
         kept_synth,
         deferred,
         order_rewritten,
+        deferred_project: deferred_project_state,
     })
 }
 
