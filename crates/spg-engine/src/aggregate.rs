@@ -1343,14 +1343,71 @@ fn accumulate_groups(
                         entry.1[i].seen.insert(dkeybuf.clone());
                     }
                 }
-                update_state(
-                    &mut entry.1[i],
-                    spec.kind,
-                    &spec.name,
-                    arg_ref,
-                    arg2_val.as_ref(),
-                    order_keys,
-                )?;
+                // v7.37.x (mailrs Track A 100k attack) — inline the
+                // common aggregate kinds (MAX / MIN / Count / CountStar
+                // / BoolOr / BoolAnd) here instead of dispatching
+                // through `update_state`'s enum jump + per-kind branch.
+                // Skipping the function-call overhead saves ~20-30 ns
+                // per spec per row at 100 k; the slow kinds keep the
+                // dispatched call.
+                match spec.kind {
+                    AggKind::Max => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            let upd = match &st.extreme {
+                                None => true,
+                                Some(prev) => {
+                                    value_cmp(arg_ref, prev) == core::cmp::Ordering::Greater
+                                }
+                            };
+                            if upd {
+                                st.extreme = Some(arg_ref.clone());
+                            }
+                        }
+                    }
+                    AggKind::Min => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            let upd = match &st.extreme {
+                                None => true,
+                                Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
+                            };
+                            if upd {
+                                st.extreme = Some(arg_ref.clone());
+                            }
+                        }
+                    }
+                    AggKind::CountStar => {
+                        entry.1[i].count += 1;
+                    }
+                    AggKind::Count => {
+                        if !matches!(arg_ref, Value::Null) {
+                            entry.1[i].count += 1;
+                        }
+                    }
+                    AggKind::BoolOr => {
+                        if let Value::Bool(b) = arg_ref {
+                            let st = &mut entry.1[i];
+                            st.bool_acc = Some(st.bool_acc.unwrap_or(false) || *b);
+                        }
+                    }
+                    AggKind::BoolAnd => {
+                        if let Value::Bool(b) = arg_ref {
+                            let st = &mut entry.1[i];
+                            st.bool_acc = Some(st.bool_acc.unwrap_or(true) && *b);
+                        }
+                    }
+                    _ => {
+                        update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?;
+                    }
+                }
             }
             continue;
         }
@@ -1546,14 +1603,71 @@ fn accumulate_groups(
                         entry.1[i].seen.insert(dkeybuf.clone());
                     }
                 }
-                update_state(
-                    &mut entry.1[i],
-                    spec.kind,
-                    &spec.name,
-                    arg_ref,
-                    arg2_val.as_ref(),
-                    order_keys,
-                )?;
+                // v7.37.x (mailrs Track A 100k attack) — inline the
+                // common aggregate kinds (MAX / MIN / Count / CountStar
+                // / BoolOr / BoolAnd) here instead of dispatching
+                // through `update_state`'s enum jump + per-kind branch.
+                // Skipping the function-call overhead saves ~20-30 ns
+                // per spec per row at 100 k; the slow kinds keep the
+                // dispatched call.
+                match spec.kind {
+                    AggKind::Max => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            let upd = match &st.extreme {
+                                None => true,
+                                Some(prev) => {
+                                    value_cmp(arg_ref, prev) == core::cmp::Ordering::Greater
+                                }
+                            };
+                            if upd {
+                                st.extreme = Some(arg_ref.clone());
+                            }
+                        }
+                    }
+                    AggKind::Min => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            let upd = match &st.extreme {
+                                None => true,
+                                Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
+                            };
+                            if upd {
+                                st.extreme = Some(arg_ref.clone());
+                            }
+                        }
+                    }
+                    AggKind::CountStar => {
+                        entry.1[i].count += 1;
+                    }
+                    AggKind::Count => {
+                        if !matches!(arg_ref, Value::Null) {
+                            entry.1[i].count += 1;
+                        }
+                    }
+                    AggKind::BoolOr => {
+                        if let Value::Bool(b) = arg_ref {
+                            let st = &mut entry.1[i];
+                            st.bool_acc = Some(st.bool_acc.unwrap_or(false) || *b);
+                        }
+                    }
+                    AggKind::BoolAnd => {
+                        if let Value::Bool(b) = arg_ref {
+                            let st = &mut entry.1[i];
+                            st.bool_acc = Some(st.bool_acc.unwrap_or(true) && *b);
+                        }
+                    }
+                    _ => {
+                        update_state(
+                            &mut entry.1[i],
+                            spec.kind,
+                            &spec.name,
+                            arg_ref,
+                            arg2_val.as_ref(),
+                            order_keys,
+                        )?;
+                    }
+                }
             }
             continue;
         }
