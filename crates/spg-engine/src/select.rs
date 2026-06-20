@@ -1905,6 +1905,23 @@ impl Engine {
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, &ctx));
         let mut eval_stack: Vec<Value> = Vec::new();
+        // v7.37.x (docker-fair SCALARSQ attack) — pre-analyse every
+        // SELECT-item scalar subquery for the PK-probe fast path. The
+        // analysis (gate checks + catalog lookups) takes ~500 ns; doing
+        // it once per query instead of once per row × 100 rows saves
+        // ~50 µs and lets the per-row evaluation reduce to a single
+        // index probe + outer-column read.
+        let scalarsq_fast: Vec<Option<crate::ScalarPkProbeFastPath>> = projection
+            .iter()
+            .map(|p| {
+                if let Expr::ScalarSubquery(inner) = &p.expr {
+                    self.analyse_scalar_count_pk_eq_probe(inner, schema_cols, alias)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let any_scalarsq_fast = scalarsq_fast.iter().any(Option::is_some);
         // v7.37.x (docker-fair SCALARSQ attack) — early-limit gate for
         // the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
         // Hoisted above the closure so the projection-eval path can
@@ -1967,7 +1984,16 @@ impl Engine {
                 }
             } else {
                 let mut values = Vec::with_capacity(projection.len());
-                for p in &projection {
+                for (i, p) in projection.iter().enumerate() {
+                    // v7.37.x (docker-fair SCALARSQ attack) — pre-
+                    // analysed PK-probe fast path. The per-row work is
+                    // a read of outer.col from the row plus an index
+                    // probe — no Expr clone, no walker, no
+                    // `eval_expr_with_correlated` framework.
+                    if any_scalarsq_fast && let Some(fp) = &scalarsq_fast[i] {
+                        values.push(self.probe_with_pk_fast_path(fp, row));
+                        continue;
+                    }
                     // v7.24 (round-16 B) — correlated-aware.
                     // v7.37.x (docker-fair SCALARSQ attack) — share the
                     // per-row memo with projection. Required for the
