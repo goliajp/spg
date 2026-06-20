@@ -1947,13 +1947,57 @@ impl Engine {
             }
             Ok(())
         };
+        // v7.37.x (docker-fair SCALARSQ 214× attack) — early-limit gate
+        // for the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
+        // SQL output order is implementation-defined when ORDER BY is
+        // absent, so the surviving top-N picked AFTER projection is
+        // identical to the top-N picked DURING scan. Skipping projection
+        // work for the dropped rows is load-bearing for shapes like
+        // `SELECT m.id, (SELECT COUNT(*) FROM e WHERE …) FROM messages m
+        // LIMIT 100` — without this gate the correlated scalar runs for
+        // each of the 25 k outer rows even though only 100 results
+        // survive. PG enforces the same semantics via `Limit`.
+        //
+        // Gates:
+        // - SRF (unnest) ⇒ one input row may emit many output rows; a
+        //   `+= 1`-per-scan counter under-counts and stops too early.
+        // - WHERE present ⇒ rows may be rejected; `+= 1` over-counts and
+        //   stops too early (with v7.37.27 pull-up the conjuncts a
+        //   correlated subquery rewrote into may still be ON the WHERE).
+        // The strict gate keeps the test e2e_memoize and
+        // mailrs_round15_16 correlated NOT-EXISTS shapes
+        // unaffected — they both carry an outer WHERE or ORDER BY.
+        let early_cap: Option<usize> = if stmt.order_by.is_empty()
+            && !stmt.distinct
+            && !stmt.limit_with_ties
+            && srf_position.is_none()
+            && stmt.where_.is_none()
+        {
+            stmt.limit_literal()
+                .map(|n| n.saturating_add(stmt.offset_literal().unwrap_or(0)) as usize)
+        } else {
+            None
+        };
+        let mut emitted: usize = 0;
         if let Some(rows) = &indexed_rows {
             for (loop_idx, cow) in rows.iter().enumerate() {
+                if let Some(cap) = early_cap
+                    && emitted >= cap
+                {
+                    break;
+                }
                 process_row(cow.as_ref(), loop_idx)?;
+                emitted = emitted.saturating_add(1);
             }
         } else {
             for i in 0..table.row_count() {
+                if let Some(cap) = early_cap
+                    && emitted >= cap
+                {
+                    break;
+                }
                 process_row(&table.rows()[i], i)?;
+                emitted = emitted.saturating_add(1);
             }
             // v7.35.1 (mailrs prod #6 follow-up) — fold cold-tier
             // rows into the same loop. The full-scan path here is the
@@ -1963,7 +2007,13 @@ impl Engine {
             // silently returned a subset.
             let cold_rows = self.iter_cold_rows_of_table(table);
             for (offset, row) in cold_rows.iter().enumerate() {
+                if let Some(cap) = early_cap
+                    && emitted >= cap
+                {
+                    break;
+                }
                 process_row(row, table.row_count() + offset)?;
+                emitted = emitted.saturating_add(1);
             }
         }
 
