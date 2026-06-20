@@ -1591,6 +1591,18 @@ impl Engine {
         // nested-loop join executor. Single-table FROM stays on the
         // existing scan + index-seek path.
         if !from.joins.is_empty() {
+            // v7.37.x (docker-fair LEFTJOIN 71 % attack) — LEFT JOIN
+            // elimination: when a LEFT JOIN's right side is referenced
+            // ONLY in the ON equality and the right-side join key is
+            // UNIQUE/PK, the join preserves outer cardinality exactly
+            // and contributes no values used downstream. Drop the
+            // entire join. PG does this on the
+            // `SELECT COUNT(*) FROM A LEFT JOIN B ON B.pk = A.fk` shape
+            // — A's row count is what survives, B never has to be
+            // touched.
+            if let Some(eliminated) = self.try_eliminate_redundant_left_joins(stmt) {
+                return self.exec_bare_select_cancel(&eliminated, cancel);
+            }
             if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
                 return self.exec_bare_select_cancel(&folded, cancel);
             }
