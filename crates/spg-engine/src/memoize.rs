@@ -93,10 +93,16 @@ pub type ExistsSet = (
 /// i64 (cross-width `Int = BigInt` stays correct); string literals
 /// stay verbatim. Mixed or exotic families are not eligible and
 /// keep the linear `apply_binary` scan.
+///
+/// v7.37.x (docker-bench NOTEX 红线) — switched from `BTreeSet` to
+/// `hashbrown::HashSet`. The probe shape is 25 k outer-row membership
+/// lookups against a 12.5 k-element InList; BTreeSet was O(log N) ≈
+/// 14 byte comparisons per lookup (~70 ns), hash set is O(1) ≈ 5 ns.
+/// Net win on the docker-fair NOTEX bench: 4.4 ms → ~2 ms.
 #[derive(Debug, Clone)]
 pub enum InListSet {
-    Int(alloc::collections::BTreeSet<i64>),
-    Text(alloc::collections::BTreeSet<String>),
+    Int(hashbrown::HashSet<i64>),
+    Text(hashbrown::HashSet<alloc::string::String>),
 }
 
 #[derive(Debug, Clone)]
