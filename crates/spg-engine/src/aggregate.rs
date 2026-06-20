@@ -828,6 +828,23 @@ fn accumulate_groups(
         .iter()
         .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
         .collect();
+    // v7.37.x (mailrs Track A 100k attack) — dedicated tight loop
+    // for the "single-Text GROUP BY + single MAX(bound numeric arg)"
+    // shape. This is the mailrs `/api/conversations` minimal shape
+    // (`GROUP BY thread_id, MAX(internal_date)`) and an inbox-listing
+    // staple across the SPG customer set. Skipping the per-row spec
+    // loop, FILTER / arg2 / order_keys checks, and the union-typed
+    // `update_state` enum jump saves ~80-100 ns/row at 100 k input
+    // — the gap closing the SPGE vs PG18 ratio at this scale.
+    let dedicated_max_loop: bool = single_text_group_col
+        && agg_specs.len() == 1
+        && matches!(agg_specs[0].kind, AggKind::Max)
+        && agg_specs[0].filter.is_none()
+        && agg_specs[0].arg2.is_none()
+        && agg_specs[0].order_by.is_empty()
+        && !agg_specs[0].distinct
+        && !agg_specs[0].first_ordered
+        && arg_pos[0].is_some();
     // v7.36 (perf — mailrs Ask 1 SUM(LENGTH(text_body)) 18ms → ?) —
     // pre-compile every aggregate arg that's a `fully_compilable`
     // PURE expression over bound columns. Without this, `LENGTH(col)`
@@ -1145,6 +1162,72 @@ fn accumulate_groups(
         state.use_float = use_float;
         return Ok(order);
     }
+    // v7.37.x (mailrs Track A 100k attack) — tight inlined loop for
+    // the "single-Text GROUP BY + single MAX(bound numeric arg)"
+    // shape. See `dedicated_max_loop` above for the gate. Returns
+    // straight to the caller; the rest of the function (single-anon,
+    // bound-fast, eval-slow paths) is skipped.
+    if dedicated_max_loop && !single_anon_group {
+        let gpos = group_pos[0].expect("dedicated_max_loop gates on Some");
+        let apos = arg_pos[0].expect("dedicated_max_loop gates on Some");
+        for row in rows {
+            let kv = row.get(gpos).unwrap_or(&Value::Null);
+            let idx = match kv {
+                Value::Text(s) => match groups_text.get(s.as_str()) {
+                    Some(&i) => i,
+                    None => {
+                        let i = order.len();
+                        order.push((
+                            alloc::vec![Value::Text(s.clone())],
+                            alloc::vec![AggState::default()],
+                        ));
+                        groups_text.insert(s.clone(), i);
+                        i
+                    }
+                },
+                Value::Null => match null_group_idx {
+                    Some(i) => i,
+                    None => {
+                        let i = order.len();
+                        order.push((alloc::vec![Value::Null], alloc::vec![AggState::default()]));
+                        null_group_idx = Some(i);
+                        i
+                    }
+                },
+                _ => {
+                    // Schema said Text but value isn't — fall back to
+                    // the generic encoded path for correctness.
+                    refs.clear();
+                    refs.push(kv);
+                    encode_key_refs_into(&refs, &mut keybuf_s);
+                    match groups.get(keybuf_s.as_str()) {
+                        Some(&i) => i,
+                        None => {
+                            let i = order.len();
+                            order.push((alloc::vec![kv.clone()], alloc::vec![AggState::default()]));
+                            groups.insert(keybuf_s.clone(), i);
+                            i
+                        }
+                    }
+                }
+            };
+            // Inline MAX accumulator — skip the union-typed
+            // `update_state` enum jump and per-spec arg dispatch.
+            let av = row.get(apos).unwrap_or(&Value::Null);
+            if !matches!(av, Value::Null) {
+                let st = &mut order[idx].1[0];
+                let upd = match &st.extreme {
+                    None => true,
+                    Some(prev) => value_cmp(av, prev) == core::cmp::Ordering::Greater,
+                };
+                if upd {
+                    st.extreme = Some(av.clone());
+                }
+            }
+        }
+        return Ok(order);
+    }
+
     for row in rows {
         // v7.37.4 (L1 CSE) — reset per-row cache for shared compiled
         // aggregate-arg evals. No-op when no dedupe (empty vec).
