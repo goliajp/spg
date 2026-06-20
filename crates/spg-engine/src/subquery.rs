@@ -3245,7 +3245,7 @@ fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value {
     }
 }
 
-fn select_is_correlated(s: &SelectStatement) -> bool {
+pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
     use spg_sql::ast::SelectItem;
     let Some(from) = &s.from else {
         // No FROM: correlated iff some projected column is qualified
