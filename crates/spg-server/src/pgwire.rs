@@ -580,21 +580,62 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // resizing the buffer in place for each message. Same `&[u8]`
     // borrow shape downstream — handlers don't notice.
     let mut rbuf: Vec<u8> = Vec::with_capacity(8192);
+    // v7.37.x (SPGS PLUCK 红线 — speculative read) — try to fetch
+    // header + body in one syscall for small messages. PG protocol
+    // header (5 bytes) plus a short body (e.g. `SELECT 1\0` = 9 B)
+    // fits in a small read; psql normally TCP-packs the whole query
+    // into one segment. The first `read()` call here pulls up to 256
+    // bytes and parses the header from the front — when the body
+    // fits in the same chunk the second `read_exact(&mut rbuf)`
+    // syscall is skipped, halving the per-query I/O system-call
+    // count (~15-20 µs / syscall on macOS).
+    let mut peek_buf = [0u8; 256];
+    let mut peek_have: usize = 0;
     loop {
-        let mut header = [0u8; 5];
-        if let Err(e) = stream.read_exact(&mut header) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        // Ensure we have at least 5 bytes for the header. The
+        // speculative read pulls up to peek_buf.len() bytes; refills
+        // from the socket only when the buffer doesn't already hold
+        // a full header.
+        while peek_have < 5 {
+            let n = match stream.read(&mut peek_buf[peek_have..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+            if n == 0 {
                 return Ok(());
             }
-            return Err(e);
+            peek_have += n;
         }
-        let msg_type = header[0];
-        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let msg_type = peek_buf[0];
+        let len = u32::from_be_bytes([peek_buf[1], peek_buf[2], peek_buf[3], peek_buf[4]]) as usize;
         // PG length includes the 4 bytes of the length itself.
         let body_len = len.saturating_sub(4);
-        rbuf.resize(body_len, 0);
-        if body_len > 0 {
-            stream.read_exact(&mut rbuf)?;
+        let in_peek = peek_have - 5;
+        if body_len <= in_peek {
+            // Body fully present in the speculative read. Copy out
+            // for downstream borrow (rbuf needs stable lifetime
+            // across the dispatch arms below) and shift any
+            // remaining bytes to the front of peek_buf for the next
+            // iteration.
+            rbuf.resize(body_len, 0);
+            rbuf[..body_len].copy_from_slice(&peek_buf[5..5 + body_len]);
+            let leftover = peek_have - 5 - body_len;
+            if leftover > 0 {
+                peek_buf.copy_within(5 + body_len..peek_have, 0);
+            }
+            peek_have = leftover;
+        } else {
+            // Body extends past the peek chunk. Move what we have
+            // into rbuf and read the remainder via the legacy path.
+            rbuf.resize(body_len, 0);
+            rbuf[..in_peek].copy_from_slice(&peek_buf[5..peek_have]);
+            stream.read_exact(&mut rbuf[in_peek..])?;
+            peek_have = 0;
         }
         let body: &[u8] = &rbuf;
 
