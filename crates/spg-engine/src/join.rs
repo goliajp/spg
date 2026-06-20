@@ -1384,6 +1384,34 @@ impl Engine {
         cancel: CancelToken<'_>,
         budget: &mut ByteBudget,
     ) -> Result<Vec<usize>, EngineError> {
+        // v7.37.x (mailrs Track A perf — paired with v7.37.15
+        // pushdown-strip) — when every conjunct was pushed onto its
+        // source (eager peer filter / primary index seek / join-stage
+        // residual), `residual_where` is None and every joined tuple
+        // is already a survivor. Skip the per-tuple eval-or-true loop:
+        // budget-charge a single rectangular approximation of the
+        // whole working set, then bulk-copy the tuple indices via
+        // `to_vec()`. On the mailrs minimal 100k shape this turns a
+        // 100 k-iter per-tuple loop into a single allocation +
+        // memcpy.
+        if where_.is_none() {
+            // Approximate total bytes by per-row cost × row count
+            // (mirrors what the per-tuple charge would sum). Empty
+            // working set short-circuits to a no-op.
+            let n_rows = if pipe.stride == 0 {
+                0
+            } else {
+                pipe.working.len() / pipe.stride
+            };
+            if n_rows > 0 {
+                let sample_tuple = &pipe.working[..pipe.stride];
+                let per_tuple =
+                    approx_tuple_bytes(&pipe.sources, &pipe.offsets, &pipe.masks, sample_tuple);
+                budget.charge(per_tuple.saturating_mul(n_rows))?;
+            }
+            cancel.check()?;
+            return Ok(pipe.working.clone());
+        }
         let mut memo = memoize::MemoizeCache::default();
         let compiled_where: Option<eval::CompiledExpr> = where_
             .filter(|w| eval::fully_compilable(w))
