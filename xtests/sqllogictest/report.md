@@ -6,8 +6,19 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 141 | 0 | 0 | 100.0% |
-| `pg_regress` | 1258 | 0 | 0 | 100.0% |
+| `pg_regress` | 1252 | 6 | 0 | 99.5% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
+
+## Top fail patterns
+
+| count | pattern |
+|---|---|
+| 1 | `record 10: row mismatch | expected:` |
+| 1 | `record 12: row mismatch | expected:` |
+| 1 | `record 18: row mismatch | expected:` |
+| 1 | `record 2: row mismatch | expected:` |
+| 1 | `record 5: row mismatch | expected:` |
+| 1 | `record 8: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -70,8 +81,8 @@ Per-corpus pass / fail / skip:
 | `07_date_functions.test` | 13 | 0 | 0 |
 | `08_now_and_date_arith.test` | 10 | 0 | 0 |
 | `09_bare_current.test` | 4 | 0 | 0 |
-| `10_interval.test` | 23 | 0 | 0 |
-| `11_date_functions_part2.test` | 25 | 0 | 0 |
+| `10_interval.test` | 22 | 1 | 0 |
+| `11_date_functions_part2.test` | 23 | 2 | 0 |
 | `12_pg_trgm.test` | 16 | 0 | 0 |
 | `13_timestamptz_offset.test` | 11 | 0 | 0 |
 | `14_disable_trigger_tsvector.test` | 23 | 0 | 0 |
@@ -95,7 +106,7 @@ Per-corpus pass / fail / skip:
 | `32_format.test` | 10 | 0 | 0 |
 | `33_regexp_family.test` | 13 | 0 | 0 |
 | `34_jsonb_path_query.test` | 12 | 0 | 0 |
-| `35_inet_types.test` | 15 | 0 | 0 |
+| `35_inet_types.test` | 12 | 3 | 0 |
 | `36_concat.test` | 25 | 0 | 0 |
 | `37_concat_ws.test` | 24 | 0 | 0 |
 | `38_now_bare_call.test` | 16 | 0 | 0 |
@@ -148,6 +159,24 @@ Per-corpus pass / fail / skip:
 | `85_pg_database_roles_view.test` | 3 | 0 | 0 |
 | `86_pg_views_view.test` | 4 | 0 | 0 |
 | `87_pg_settings_view.test` | 6 | 0 | 0 |
+
+<details><summary>`10_interval.test` fail snippets</summary>
+
+- record 18: row mismatch |   expected: ["12:00:00"] |   actual:   ["1 day -12:00:00"]
+</details>
+
+<details><summary>`11_date_functions_part2.test` fail snippets</summary>
+
+- record 10: row mismatch |   expected: ["60 days"] |   actual:   ["1440:00:00"]
+- record 12: row mismatch |   expected: ["-60 days"] |   actual:   ["-1440:00:00"]
+</details>
+
+<details><summary>`35_inet_types.test` fail snippets</summary>
+
+- record 2: row mismatch |   expected: ["10.0.0.5", "192.168.1.1"] |   actual:   ["Inet { family: 4, bits: 32, addr: [10, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }", "…
+- record 5: row mismatch |   expected: ["10.0.0.0/8", "192.168.0.0/16"] |   actual:   ["Cidr { family: 4, bits: 16, addr: [192, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, …
+- record 8: row mismatch |   expected: ["00:50:56:c0:00:01"] |   actual:   ["Macaddr([0, 80, 86, 192, 0, 1])"]
+</details>
 
 ### `pgvector/`
 

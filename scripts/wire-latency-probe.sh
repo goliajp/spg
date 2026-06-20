@@ -87,6 +87,31 @@ INBOX="SELECT m.thread_id, MAX(m.subject), COUNT(DISTINCT m.id), MAX(m.internal_
 # Non-aggregate, all-rows join projection — the materialise() exerciser.
 PROJ="SELECT m.id, m.subject, m.sender, m.internal_date, mb.user_address FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE mb.user_address = 'u@x'"
 
+# v7.37.x — theory-coverage shapes added to break the cherry-picking
+# trap. Don't only test INBOX/PROJ; the SPGS >= PG18 wire red line
+# applies to every shape, and a shape SPGS loses on is a HARD ship
+# blocker no matter how niche.
+
+# Pluck: tiny single-cell SELECT. Pure SPGS-side parse + dispatch +
+# wire RT. If SPGS loses here it's pgwire layer overhead, not engine.
+PLUCK="SELECT 1"
+
+# Full scan + single scalar. No GROUP BY, no JOIN. Engine should be
+# near-instant; cost is the per-row count loop. SPGS adds wire RT.
+COUNTALL="SELECT COUNT(*) FROM messages"
+
+# Anti-semi-join with IN-LIST: customer NOT EXISTS shape over 25k.
+# Stresses subquery decorrelation + filter path. mailrs prod-shape.
+NOTEXISTS="SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM email_analysis e WHERE e.message_id = m.id)"
+
+# Top-N + ORDER BY DESC + LIMIT 50 on a high-cardinality
+# GROUP BY (~5k groups, output 50). Aggregate engine + sort exerciser.
+TOPN="SELECT m.thread_id, MAX(m.internal_date) FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE mb.user_address = 'u@x' GROUP BY m.thread_id ORDER BY MAX(m.internal_date) DESC LIMIT 50"
+
+# Aggregate over JOIN with DISTINCT — the inbox-listing kernel without
+# the heavy correlated subqueries that pad INBOX.
+DISTAGG="SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), COUNT(DISTINCT m.id), MAX(m.internal_date) FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE mb.user_address = 'u@x' GROUP BY m.thread_id ORDER BY MAX(m.internal_date) DESC LIMIT 50"
+
 # psql client via docker, --network host, against localhost:PORT.
 # 4th arg = password (empty for SPG's open-mode auth).
 psql_run() { # port user db [password]  -> reads SQL on stdin
@@ -128,6 +153,11 @@ echo "  seed: $(wc -l < "$SEED_FILE") statements, $(du -h "$SEED_FILE" | cut -f1
 # ── PG 18 target ──────────────────────────────────────────────────
 echo "== PG 18 (spg-bench-postgres :$PG_PORT) =="
 psql_run "$PG_PORT" "$PG_USER" "$PG_DB" "$PG_USER" < "$SEED_FILE" | grep -iE 'error' && echo "  (pg seed errors above)" || true
+measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "PLUCK" "$PLUCK"
+measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "COUNT" "$COUNTALL"
+measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "NOTEX" "$NOTEXISTS"
+measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "TOPN " "$TOPN"
+measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "DISTA" "$DISTAGG"
 measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "INBOX" "$INBOX"
 measure "$PG_PORT" "$PG_USER" "$PG_DB" "bench" "PROJ"  "$PROJ"
 
@@ -141,6 +171,11 @@ trap 'kill -9 "$SPG_PID" 2>/dev/null; rm -rf "$SPG_DB_DIR" "$SEED_FILE"' EXIT
 for _ in $(seq 1 50); do grep -q "pg-wire listening" /tmp/spg-probe.log && break; sleep 0.1; done
 grep -q "pg-wire listening" /tmp/spg-probe.log || { echo "spg pgwire did not start:"; cat /tmp/spg-probe.log; exit 1; }
 psql_run "$SPG_PORT" spg spg "" < "$SEED_FILE" | grep -iE 'error' && echo "  (spg seed errors above)" || true
+measure "$SPG_PORT" spg spg "" "PLUCK" "$PLUCK"
+measure "$SPG_PORT" spg spg "" "COUNT" "$COUNTALL"
+measure "$SPG_PORT" spg spg "" "NOTEX" "$NOTEXISTS"
+measure "$SPG_PORT" spg spg "" "TOPN " "$TOPN"
+measure "$SPG_PORT" spg spg "" "DISTA" "$DISTAGG"
 measure "$SPG_PORT" spg spg "" "INBOX" "$INBOX"
 measure "$SPG_PORT" spg spg "" "PROJ"  "$PROJ"
 

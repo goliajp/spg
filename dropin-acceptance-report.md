@@ -1,0 +1,74 @@
+# SPG drop-in acceptance report
+
+- image: `goliakk/spg:7.17.0`
+- panel cases: 57  (pass 36  / fail 21)
+
+**Verdict: FAIL — 21 case(s) below show real SPG dialect gaps. See the table.**
+
+## Cases
+
+| Case | Status | First error (if FAIL) |
+|---|:-:|---|
+| `D-pre.1.to_tsvector` | ✅ | |
+| `D-pre.1.match_plainto` | ✅ | |
+| `D-pre.1.match_to_tsquery` | ✅ | |
+| `D-pre.1.ts_rank` | ✅ | |
+| `D-pre.1.phraseto_tsquery` | ✅ | |
+| `D-pre.2.literal` | ✅ | |
+| `D-pre.2.any` | ✅ | |
+| `D-pre.2.array_length` | ✅ | |
+| `D-pre.2.subscript` | ✅ | |
+| `D-pre.2.array_agg` | ✅ | |
+| `D-pre.2.unnest_projection` | ❌ |  eval: type mismatch: unknown function `unnest` |
+| `D-pre.3.hex_literal_pg_escape` | ❌ |  parse: parse error at token #8: expected ',' or ')' in VALUES tuple, got String("\\\\xdeadbeef") |
+| `D-pre.3.hex_literal_double_backslash` | ✅ | |
+| `D-pre.3.cast_round_trip` | ❌ |  parse: parse error at token #9: unsupported cast target `::bytea` |
+| `D-pre.3.octet_length_with_cast` | ❌ |  parse: parse error at token #9: unsupported cast target `::bytea` |
+| `D-pre.4.reserved_col_key_unquoted` | ✅ | |
+| `D-pre.4.reserved_col_key_quoted` | ✅ | |
+| `D-pre.4.ivfflat_index` | ✅ | |
+| `D-pre.4.hnsw_vector_cosine` | ✅ | |
+| `D-pre.4.bigserial_inline_pk` | ✅ | |
+| `D-pre.4.multi_col_index_create` | ✅ | |
+| `D-pre.4.multi_col_index_seek` | ✅ | |
+| `D-pre.5.table_name_contacts` | ✅ | |
+| `type.bigint` | ✅ | |
+| `type.timestamptz` | ✅ | |
+| `type.json_jsonb` | ✅ | |
+| `type.uuid_gen` | ✅ | |
+| `type.numeric` | ✅ | |
+| `type.bytea_pg_escape` | ❌ |  parse: parse error at token #6: expected ',' or ')' in VALUES tuple, got String("\\\\xcafe") |
+| `stock.on_conflict_do_nothing` | ✅ | |
+| `stock.on_conflict_do_update` | ✅ | |
+| `stock.returning` | ✅ | |
+| `stock.cte` | ✅ | |
+| `stock.fk_cascade` | ✅ | |
+| `stock.transaction_commit` | ✅ | |
+| `stock.transaction_rollback` | ✅ | |
+| `round12.upsert_via_unique_index` | ❌ |  unsupported: UNIQUE INDEX "r12_a_email" violation on "r12_a": row #0 duplicates an existing key |
+| `round12.bitwise_flag_math` | ❌ |  parse: parse error at token #0: lex: unknown char ' |
+| `round12.extract_epoch` | ❌ |  parse: parse error at token #4: unknown EXTRACT field "epoch"; supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND |
+| `round12.update_where_in_subquery` | ❌ |  eval: type mismatch: subquery reached row eval — engine resolver bug |
+| `round13.serial_continuity_multirow` | ❌ | expected [3] got [2] |
+| `round13.inline_pk_enforces` | ❌ | expected [1] got [2] |
+| `round21.bytea_above_64k` | ✅ | |
+| `round21.text_array_elem_above_64k` | ✅ | |
+| `round14.text_above_64k` | ✅ | |
+| `round15.string_to_array` | ❌ | ERROR: eval: type mismatch: unknown function `string_to_array` |
+| `round16.order_by_nulls_first` | ❌ | ERROR: parse: parse error at token #8: expected end of input, got Ident("nulls") |
+| `round16.array_agg_internal_order` | ❌ | ERROR: parse: parse error at token #5: expected ',' or ')' in function args, got Order |
+| `round16.setweight_trigger_fires` | ❌ | ERROR: storage: corrupt on-disk format: trigger function "r16_f": expression eval failed: type mismatch: unknown function `setweight` |
+| `round16.correlated_not_exists_join` | ❌ | ERROR: eval: type mismatch: subquery reached row eval — engine resolver bug |
+| `round17.ilike` | ❌ | ERROR: parse: parse error at token #9: expected end of input, got Ident("ilike") |
+| `round17.distinct_agg_case_cast` | ❌ | ERROR: parse: parse error at token #3: unexpected token Distinct in expression |
+| `round17.cte_chain` | ❌ | ERROR: parse: parse error at token #10: expected ')' after CTE body, got Ident("ilike") |
+| `round19.correlated_scalar_in_group_by` | ❌ | ERROR: eval: type mismatch: subquery reached row eval — engine resolver bug |
+| `round20.aggregate_group_composite` | ❌ | ERROR: parse: parse error at token #3: unexpected token Distinct in expression |
+| `round26.backfill_keyset_offset_skips_orphan` | ✅ | |
+| `round26.backfill_desc_limit_top_end` | ✅ | |
+
+## Reproducer
+
+```bash
+scripts/dropin-acceptance.sh --image goliakk/spg:7.17.0 --port 25433
+```
