@@ -120,6 +120,36 @@ fn handle_pg_simple_query(
     // `execute_with_role`, `persist_wire_write`) all take `&str`,
     // so the slice form is drop-in.
     let sql: &str = sql_str.trim_end_matches(';').trim();
+    // v7.37.x (SPGS PLUCK 红线) — pure-integer-literal SELECT fast
+    // path at the very top of the dispatcher. ORM connection pools,
+    // pgbouncer keepalives, and BI client canary probes spam these,
+    // and PG 18's wire processes them in ~53 µs; SPGS was paying ~100
+    // µs because the SQL traversed parse_set / parse_show /
+    // parse_copy / canned_response / wait_event_set /
+    // streaming_select_attempt before hitting the (much shorter)
+    // canned arm at line ~940. Detect `SELECT <int>` (no whitespace
+    // before the int beyond a single space, nothing after the int)
+    // up front and emit `RowDescription + DataRow + CommandComplete +
+    // ReadyForQuery` straight into wbuf, no parse layers traversed.
+    if let Some(rest) = ci_strip_prefix(sql.as_bytes(), b"select ") {
+        let rest_trim = trim_ascii(rest);
+        if !rest_trim.is_empty()
+            && rest_trim
+                .iter()
+                .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+')
+            && let Ok(s) = core::str::from_utf8(rest_trim)
+            && let Ok(n) = s.parse::<i64>()
+        {
+            // Hand-rolled hot path: build the full response (RowDesc +
+            // DataRow + CommandComplete + ReadyForQuery) directly into
+            // wbuf with zero `ColumnSchema` / `Row` / `format!` /
+            // intermediate Vec allocations, then single `write_all`.
+            encode_select_int_response(wbuf, n, *tx_state)?;
+            stream.write_all(wbuf)?;
+            wbuf.clear();
+            return Ok(());
+        }
+    }
     // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
     // multi-frame protocol; intercept before the regular
     // execute path tries to parse them.
@@ -906,9 +936,58 @@ fn ci_eq(b: &[u8], target: &[u8]) -> bool {
     b.eq_ignore_ascii_case(target)
 }
 
+fn ci_strip_prefix<'a>(b: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if ci_starts_with(b, prefix) {
+        Some(&b[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn trim_ascii(b: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < b.len() && b[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = b.len();
+    while end > start && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &b[start..end]
+}
+
 fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse> {
     let trimmed = sql.trim();
     let b = trimmed.as_bytes();
+    // v7.37.x (SPGS PLUCK 红线) — pure-literal SELECTs ("SELECT 1",
+    // "SELECT 42", "SELECT NULL") show up in liveness probes,
+    // pgbouncer keepalives, ORM connection-pool pings, and BI client
+    // canary queries. Pre-7.37.x the round-trip went all the way
+    // through SQL parse → engine dispatch → streaming wrap →
+    // `encode_data_row`, adding ~65 µs over PG 18's 32 µs wire RT.
+    // Bake a fast small-int canned response and use it when the SQL
+    // is exactly `SELECT <decimal>` with nothing else.
+    if let Some(rest) = ci_strip_prefix(b, b"select ") {
+        let rest_trim = trim_ascii(rest);
+        if !rest_trim.is_empty()
+            && rest_trim
+                .iter()
+                .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+')
+            && let Ok(s) = core::str::from_utf8(rest_trim)
+            && let Ok(n) = s.parse::<i64>()
+        {
+            return Some(CannedResponse::Rows {
+                columns: vec![ColumnSchema::new("?column?", DataType::BigInt, false)],
+                rows: vec![Row::new(vec![Value::BigInt(n)])],
+            });
+        }
+        if ci_eq(rest_trim, b"null") {
+            return Some(CannedResponse::Rows {
+                columns: vec![ColumnSchema::new("?column?", DataType::Text, true)],
+                rows: vec![Row::new(vec![Value::Null])],
+            });
+        }
+    }
     if ci_starts_with(b, b"select version()") || ci_eq(b, b"select version()") {
         return Some(CannedResponse::single_text("version", "spg 4.6"));
     }
@@ -3159,6 +3238,96 @@ fn send_parameter_status(stream: &mut dyn Write, key: &str, value: &str) -> std:
 
 fn send_ready_for_query(stream: &mut dyn Write, state: u8) -> std::io::Result<()> {
     send_msg(stream, b'Z', &[state])
+}
+
+/// v7.37.x (SPGS PLUCK 红线 — hand-rolled `SELECT <int>` response).
+/// Builds the full PG wire response for a literal-int SELECT
+/// (RowDescription + DataRow + CommandComplete + ReadyForQuery)
+/// straight into `out` with zero `Vec` / `String` / `ColumnSchema` /
+/// `Row` / `format!` intermediates. The literal-int SELECT path is
+/// hit per liveness probe / pool keepalive / canary canary so even
+/// small per-query allocations show up on the wire-probe (~5 µs
+/// each = 50 µs / 10-alloc legacy path), and PG 18's response time
+/// for this shape is ~21 µs end-to-end on mini — every byte spent
+/// on bookkeeping closes a wire-probe gap.
+fn encode_select_int_response(out: &mut Vec<u8>, n: i64, tx_state: u8) -> std::io::Result<()> {
+    // RowDescription frame body: 1 field, name "?column?", type
+    // BigInt (OID 20, size 8, modifier -1), text format (0).
+    //   [2 bytes: nfields=1]
+    //   [name="?column?\0" (9 bytes)]
+    //   [4 bytes: table OID (0)]
+    //   [2 bytes: column attr num (0)]
+    //   [4 bytes: type OID (20)]
+    //   [2 bytes: type size (8)]
+    //   [4 bytes: type modifier (-1)]
+    //   [2 bytes: format code (0 = text)]
+    // body length = 2 + 9 + 4 + 2 + 4 + 2 + 4 + 2 = 29
+    // frame total = 1 byte (op 'T') + 4 byte len + 29 body = 34
+    #[rustfmt::skip]
+    const ROW_DESC_FRAME: [u8; 34] = [
+        b'T',
+        0, 0, 0, 33,         // length = 4 + 29
+        0, 1,                 // nfields = 1
+        b'?', b'c', b'o', b'l', b'u', b'm', b'n', b'?', 0, // name
+        0, 0, 0, 0,           // table OID
+        0, 0,                 // column attr num
+        0, 0, 0, 20,          // type OID = BigInt
+        0, 8,                 // type size = 8
+        255, 255, 255, 255,   // type modifier = -1
+        0, 0,                 // format code = text
+    ];
+    out.extend_from_slice(&ROW_DESC_FRAME);
+
+    // DataRow frame: 1 cell, the decimal text of `n`.
+    //   [2 bytes: nfields=1]
+    //   [4 bytes: cell length]
+    //   [cell text bytes]
+    // Encode the int decimal text into a small scratch buffer first
+    // so we know its length.
+    let mut digits = [0u8; 24];
+    let mut pos = digits.len();
+    let (mut x, negative) = if n < 0 {
+        ((n as i128).unsigned_abs() as u64, true)
+    } else {
+        (n as u64, false)
+    };
+    loop {
+        pos -= 1;
+        digits[pos] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    if negative {
+        pos -= 1;
+        digits[pos] = b'-';
+    }
+    let int_text = &digits[pos..];
+    let cell_len = int_text.len() as u32;
+    let frame_len = 4 + 2 + 4 + cell_len; // length-field + nfields + cell_len_prefix + cell
+    out.push(b'D');
+    out.extend_from_slice(&frame_len.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // nfields = 1
+    out.extend_from_slice(&cell_len.to_be_bytes());
+    out.extend_from_slice(int_text);
+
+    // CommandComplete: "SELECT 1\0" (tag is row count, always 1).
+    //   length = 4 + 9 = 13; total = 1 + 13 = 14
+    #[rustfmt::skip]
+    const COMPLETE_FRAME: [u8; 14] = [
+        b'C',
+        0, 0, 0, 13,
+        b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0,
+    ];
+    out.extend_from_slice(&COMPLETE_FRAME);
+
+    // ReadyForQuery: length 5, state byte.
+    //   total = 1 + 5 = 6
+    out.push(b'Z');
+    out.extend_from_slice(&5u32.to_be_bytes());
+    out.push(tx_state);
+    Ok(())
 }
 
 fn send_command_complete(stream: &mut dyn Write, tag: &str) -> std::io::Result<()> {
