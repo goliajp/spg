@@ -705,6 +705,19 @@ fn accumulate_groups(
     // the inbox shape). The map owns its key once on vacant insert.
     let mut order: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
     let mut groups: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    // v7.37.x (mailrs Track A perf — SPGE ≫ PG18) — single-Text GROUP
+    // BY column fast path. The canonical-string encode (`S<text>|`)
+    // + `encode_key_refs_into` reuse-buffer churn dominated the 30 k-
+    // row mailrs minimal probe (~3-4 ms / 30 k). For `GROUP BY t` on
+    // a TEXT column (the inbox-listing / conversation-grouping shape)
+    // the column text IS the canonical key — no encoder, no prefix
+    // byte, no `refs` Vec rebuild per row. The fallback `groups` map
+    // above is retained for multi-col / non-Text / collation paths;
+    // this map only fires when the schema and value structurally
+    // permit it. `null_group_idx` collects NULL group rows (SQL groups
+    // all NULLs into one bucket).
+    let mut groups_text: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    let mut null_group_idx: Option<usize> = None;
     // When there are no GROUP BY exprs *and* there is at least one aggregate,
     // every row collapses into a single anonymous group keyed by "".
     if rows.is_empty() && group_exprs.is_empty() {
@@ -737,6 +750,15 @@ fn accumulate_groups(
     };
     let group_pos: Vec<Option<usize>> = group_exprs.iter().map(col_pos).collect();
     let all_groups_bound = group_pos.iter().all(Option::is_some);
+    // v7.37.x — single-col GROUP BY on a TEXT-typed column lets the
+    // hot loop key the hash map by the column text directly. Resolved
+    // once from the bound position against `schema_cols`.
+    let single_text_group_col: bool = group_pos.len() == 1
+        && group_pos[0].is_some_and(|p| {
+            schema_cols
+                .get(p)
+                .is_some_and(|c| matches!(c.ty, spg_storage::DataType::Text))
+        });
     let arg_pos: Vec<Option<usize>> = agg_specs
         .iter()
         .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
@@ -1172,23 +1194,75 @@ fn accumulate_groups(
         // straight from borrowed cells; group_vals materialise
         // only when the group is NEW.
         if all_groups_bound && ci_positions.is_empty() {
-            refs.clear();
-            refs.extend(
-                group_pos
-                    .iter()
-                    .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
-            );
-            encode_key_refs_into(&refs, &mut keybuf_s);
-            let idx = match groups.get(keybuf_s.as_str()) {
-                Some(&i) => i,
-                None => {
-                    let i = order.len();
-                    let init: Vec<AggState> =
-                        (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                    let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
-                    order.push((owned, init));
-                    groups.insert(keybuf_s.clone(), i);
-                    i
+            // v7.37.x — single-Text fast path uses the raw text as the
+            // map key (no encode_one's `S<text>|` prefix/suffix push,
+            // no refs Vec rebuild). NULL values land in a dedicated
+            // slot so SQL's "all NULLs share one group" semantics hold.
+            let idx = if single_text_group_col {
+                let v = row.get(group_pos[0].unwrap()).unwrap_or(&Value::Null);
+                match v {
+                    Value::Text(s) => match groups_text.get(s.as_str()) {
+                        Some(&i) => i,
+                        None => {
+                            let i = order.len();
+                            let init: Vec<AggState> =
+                                (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                            order.push((alloc::vec![Value::Text(s.clone())], init));
+                            groups_text.insert(s.clone(), i);
+                            i
+                        }
+                    },
+                    Value::Null => match null_group_idx {
+                        Some(i) => i,
+                        None => {
+                            let i = order.len();
+                            let init: Vec<AggState> =
+                                (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                            order.push((alloc::vec![Value::Null], init));
+                            null_group_idx = Some(i);
+                            i
+                        }
+                    },
+                    _ => {
+                        // Schema says Text but value is something else
+                        // (coercion edge case). Fall back to the encoded
+                        // path for correctness — same logic as the
+                        // non-single-Text branch below.
+                        refs.clear();
+                        refs.push(v);
+                        encode_key_refs_into(&refs, &mut keybuf_s);
+                        match groups.get(keybuf_s.as_str()) {
+                            Some(&i) => i,
+                            None => {
+                                let i = order.len();
+                                let init: Vec<AggState> =
+                                    (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                                order.push((alloc::vec![v.clone()], init));
+                                groups.insert(keybuf_s.clone(), i);
+                                i
+                            }
+                        }
+                    }
+                }
+            } else {
+                refs.clear();
+                refs.extend(
+                    group_pos
+                        .iter()
+                        .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
+                );
+                encode_key_refs_into(&refs, &mut keybuf_s);
+                match groups.get(keybuf_s.as_str()) {
+                    Some(&i) => i,
+                    None => {
+                        let i = order.len();
+                        let init: Vec<AggState> =
+                            (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                        let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
+                        order.push((owned, init));
+                        groups.insert(keybuf_s.clone(), i);
+                        i
+                    }
                 }
             };
             let entry = &mut order[idx];
