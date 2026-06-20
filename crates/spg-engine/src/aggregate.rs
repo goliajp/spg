@@ -1321,11 +1321,27 @@ fn accumulate_groups(
                     continue;
                 }
                 if spec.distinct {
-                    encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
-                    if entry.1[i].seen.contains(dkeybuf.as_str()) {
-                        continue;
+                    // v7.37.x (mailrs Track A 100k distinct_aggs attack)
+                    // — single-Text DISTINCT fast path. Within a single
+                    // distinct spec all input values come from one
+                    // expression and share one type, so the encode-
+                    // prefix (`S<text>|`) is redundant: the column
+                    // text alone is collision-free within this spec's
+                    // `seen` set. Skips encode_one + 2-walk
+                    // contains+insert; only Text arms apply, others
+                    // ride the encoded path unchanged.
+                    if let Value::Text(s) = arg_ref {
+                        if entry.1[i].seen.contains(s.as_str()) {
+                            continue;
+                        }
+                        entry.1[i].seen.insert(s.clone());
+                    } else {
+                        encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                        if entry.1[i].seen.contains(dkeybuf.as_str()) {
+                            continue;
+                        }
+                        entry.1[i].seen.insert(dkeybuf.clone());
                     }
-                    entry.1[i].seen.insert(dkeybuf.clone());
                 }
                 update_state(
                     &mut entry.1[i],
@@ -1513,19 +1529,22 @@ fn accumulate_groups(
                     continue;
                 }
                 if spec.distinct {
-                    // v7.37.4 (R34 follow-on) — single `insert` call
-                    // covers the "is new?" check and the insertion in
-                    // one hash probe. Clone only when truly inserting
-                    // (`get` first, allocate on miss). The dominant
-                    // mailrs DISTINCT-on-text case sees a hit
-                    // ~ 80 % of the time at this catalog size, so
-                    // skipping the clone on the hit path is real
-                    // savings.
-                    encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
-                    if entry.1[i].seen.contains(dkeybuf.as_str()) {
-                        continue;
+                    // v7.37.x — single-Text DISTINCT fast path (see
+                    // bound fast path counterpart above). Per-spec
+                    // type invariance lets us use the column text as
+                    // the `seen` key directly, no `S<text>|` prefix.
+                    if let Value::Text(s) = arg_ref {
+                        if entry.1[i].seen.contains(s.as_str()) {
+                            continue;
+                        }
+                        entry.1[i].seen.insert(s.clone());
+                    } else {
+                        encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                        if entry.1[i].seen.contains(dkeybuf.as_str()) {
+                            continue;
+                        }
+                        entry.1[i].seen.insert(dkeybuf.clone());
                     }
-                    entry.1[i].seen.insert(dkeybuf.clone());
                 }
                 update_state(
                     &mut entry.1[i],
@@ -1628,9 +1647,17 @@ fn accumulate_groups(
             // before they reach the accumulator. NULLs flow through
             // (each aggregate's own NULL rule applies; PG also
             // treats NULL as a single distinct value for array_agg).
+            // v7.37.x — single-Text fast path same shape as the
+            // bound/slow paths above.
             if spec.distinct {
-                let key = encode_key(core::slice::from_ref(&arg_val));
-                if !entry.1[i].seen.insert(key) {
+                let inserted = match &arg_val {
+                    Value::Text(s) => entry.1[i].seen.insert(s.clone()),
+                    _ => {
+                        let key = encode_key(core::slice::from_ref(&arg_val));
+                        entry.1[i].seen.insert(key)
+                    }
+                };
+                if !inserted {
                     continue;
                 }
             }
