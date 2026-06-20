@@ -1677,6 +1677,16 @@ impl Engine {
         // referenced column has an index, dispatch each locator through
         // the catalog (hot tier → borrow, cold tier → page-read +
         // decode) and iterate just those rows. Otherwise fall back to a
+        // v7.37.x (docker-fair INSUBQ attack) — short-circuit COUNT(*)
+        // FROM A WHERE A.pk IN (large literal list). The post-subquery-
+        // replacement shape of INSUBQ. Runs BEFORE `indexed_rows` so
+        // we don't pay the row materialisation cost twice. Returns
+        // a bare `Rows{count}` if the shape matches.
+        if aggregate::uses_aggregate(stmt)
+            && let Some(out) = self.try_count_star_pk_in_list_fast(stmt, table, schema_cols, alias)
+        {
+            return Ok(out);
+        }
         // full scan over the hot tier (cold-tier rows are only reached
         // via index seek in v5.1 — full table scans against cold-tier
         // data ship in v5.2 with the freezer's per-segment scan API).
@@ -1745,6 +1755,114 @@ impl Engine {
             columns,
             rows: alloc::vec![Row::new(values)],
         })
+    }
+
+    /// v7.37.x (docker-fair INSUBQ attack) — short-circuit
+    ///   SELECT COUNT(*) FROM A WHERE A.pk IN (literal list)
+    /// (the post-subquery-replacement shape of the INSUBQ probe
+    /// `SELECT COUNT(*) FROM A WHERE A.pk IN (SELECT k FROM B WHERE …)`).
+    /// The general aggregate path materialises every seeked row into
+    /// a `Vec<Cow<Row>>`, then runs the aggregate executor over it.
+    /// For COUNT(*) we only care how many keys hit; iterate the list
+    /// and tally `idx.lookup_eq(key)` non-empty results, skipping the
+    /// row materialisation, the aggregate state machine, and the per-
+    /// row WHERE re-eval (the seek already filtered by the same list).
+    /// Returns `None` when the shape doesn't match.
+    fn try_count_star_pk_in_list_fast(
+        &self,
+        stmt: &SelectStatement,
+        table: &spg_storage::Table,
+        schema_cols: &[ColumnSchema],
+        alias: &str,
+    ) -> Option<QueryResult> {
+        use spg_sql::ast::{ColumnName, SelectItem};
+        // Gates on the SELECT shape.
+        if stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || !stmt.unions.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.items.len() != 1
+        {
+            return None;
+        }
+        let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+            return None;
+        };
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("count_star") && args.is_empty());
+        if !is_count_star {
+            return None;
+        }
+        // WHERE must be `<col> IN (literal list)` with no other
+        // conjuncts (the seek result is a true subset of the row
+        // population for this predicate).
+        let where_expr = stmt.where_.as_ref()?;
+        let Expr::InList {
+            expr: col_expr,
+            list,
+            negated: false,
+        } = where_expr
+        else {
+            return None;
+        };
+        let Expr::Column(c) = col_expr.as_ref() else {
+            return None;
+        };
+        if let Some(q) = c.qualifier.as_deref()
+            && !q.eq_ignore_ascii_case(alias)
+        {
+            return None;
+        }
+        let col_pos = schema_cols
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+        // The column must be a single-column PK on an integer family
+        // — the same gate the SCALARSQ + LEFT-ANTI-JOIN fast paths use,
+        // so the antiset stays collision-free under `HashSet<i64>`.
+        let schema = table.schema();
+        if !matches!(
+            schema.columns[col_pos].ty,
+            spg_storage::DataType::BigInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::SmallInt
+        ) {
+            return None;
+        }
+        if !schema
+            .uniqueness_constraints
+            .iter()
+            .any(|u| u.is_primary_key && u.columns.as_slice() == [col_pos])
+        {
+            return None;
+        }
+        let idx = table.index_on(col_pos)?;
+        // Tally non-empty seek results across all literal values.
+        let mut count: i64 = 0;
+        for lit in list {
+            let Expr::Literal(l) = lit else {
+                return None;
+            };
+            let v = eval::literal_to_value(l);
+            let key = spg_storage::IndexKey::from_value(&v)?;
+            if !idx.lookup_eq(&key).is_empty() {
+                count += 1;
+            }
+        }
+        let columns = alloc::vec![ColumnSchema::new(
+            "count".to_string(),
+            spg_storage::DataType::BigInt,
+            false,
+        )];
+        let rows = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
+        let _ = ColumnName {
+            qualifier: None,
+            name: String::new(),
+        };
+        Some(QueryResult::Rows { columns, rows })
     }
 
     /// Single-table aggregate path: filter the (optionally index-seeked)
