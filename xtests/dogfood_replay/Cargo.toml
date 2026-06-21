@@ -1,0 +1,33 @@
+[package]
+name         = "spg-dogfood-replay"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "SPG dogfood-replay testbed — every customer prod incident encoded as a SPG-internal regression gate."
+publish      = false
+
+[[bin]]
+name = "spg-dogfood-replay"
+path = "src/main.rs"
+
+[dependencies]
+# v7.37.5 — dogfood-replay framework. Bin-only crate; the framework
+# is intentionally tight on deps so it stays buildable under
+# `--locked` without bumping the workspace lockfile. JSON is used
+# for the fixture descriptor format (serde already in the lock); tar
+# extraction goes through `tar -xzf` on the host (no native dep);
+# SHA-256 lives in `sha2` which the workspace already locks.
+spg-engine   = { path = "../../crates/spg-engine",   version = "7.9" }
+spg-embedded = { path = "../../crates/spg-embedded", version = "7.9" }
+spg-storage  = { path = "../../crates/spg-storage",  version = "7.9" }
+sha2         = "0.10"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+anyhow       = "1"
+clap         = { version = "4", features = ["derive"] }
+tempfile     = "3"
+
+[lints]
+workspace = true

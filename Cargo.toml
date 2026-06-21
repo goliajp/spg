@@ -15,6 +15,7 @@ members = [
     "crates/spgctl",
     "xtests/sqllogictest",
     "xtests/sqlx-pgwire",
+    "xtests/dogfood_replay",
     "xbench/competitor",
 ]
 
