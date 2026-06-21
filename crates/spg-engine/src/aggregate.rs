@@ -927,14 +927,33 @@ fn accumulate_groups(
         .iter()
         .map(|spec| spec.order_by.iter().map(|o| col_pos(&o.expr)).collect())
         .collect();
+    // v7.37.43 (DISTA A-3) — precompute the per-spec arg2 when it is a
+    // bare literal. `string_agg(DISTINCT col, ',')` and every other
+    // call with a constant separator goes through this path; PG evaluates
+    // arg2 as a Const once at plan time. SPG was paying a Cow row
+    // materialisation per input row purely so `eval_arg(literal, &row)`
+    // could run — but a literal doesn't read the row at all. Hoist the
+    // literal value into a per-query table; per-row arg2 just clones it.
+    //
+    // Sentinel: when arg2 is present but NOT a literal, the entry stays
+    // `None` and the per-row path still falls into the eval branch
+    // (which forces `needs_mat`).
+    let arg2_literal_val: Vec<Option<Value<'static>>> = agg_specs
+        .iter()
+        .map(|s| match &s.arg2 {
+            Some(Expr::Literal(l)) => Some(eval::literal_to_value(l)),
+            _ => None,
+        })
+        .collect();
     // Does any spec need the fully-materialised row in the bound fast
-    // path — a FILTER, a non-bound value arg, a second arg, or a non-bound
-    // ORDER key? When false (every aggregate arg/key is a bound column —
-    // the inbox shape) the bound fast path never materialises a row.
+    // path — a FILTER, a non-bound value arg, a NON-LITERAL second arg,
+    // or a non-bound ORDER key? When false (every aggregate arg/key is a
+    // bound column — the inbox shape, and the DISTA shape after A-3)
+    // the bound fast path never materialises a row.
     let needs_mat = agg_specs.iter().enumerate().any(|(i, s)| {
         s.filter.is_some()
             || (s.arg.is_some() && arg_pos[i].is_none() && arg_compiled[i].is_none())
-            || s.arg2.is_some()
+            || (s.arg2.is_some() && arg2_literal_val[i].is_none())
             || order_pos[i].iter().any(Option::is_none)
     });
     let ci_positions: Vec<usize> = group_exprs
@@ -1287,9 +1306,12 @@ fn accumulate_groups(
                         &arg_owned
                     }
                 };
-                let arg2_val = match &spec.arg2 {
-                    None => None,
-                    Some(e) => Some(eval_arg(
+                let arg2_val = match (&spec.arg2, &arg2_literal_val[i]) {
+                    (None, _) => None,
+                    // v7.37.43 (DISTA A-3) — literal arg2: clone the
+                    // precomputed value, skip per-row eval & row mat.
+                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
                         &ctx,
@@ -1593,9 +1615,12 @@ fn accumulate_groups(
                         &arg_owned
                     }
                 };
-                let arg2_val = match &spec.arg2 {
-                    None => None,
-                    Some(e) => Some(eval_arg(
+                let arg2_val = match (&spec.arg2, &arg2_literal_val[i]) {
+                    (None, _) => None,
+                    // v7.37.43 (DISTA A-3) — literal arg2: clone the
+                    // precomputed value, skip per-row eval & row mat.
+                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
                         &ctx,
