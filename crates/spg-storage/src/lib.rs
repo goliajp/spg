@@ -1025,6 +1025,50 @@ impl<'arena> Value<'arena> {
             Value::Null => Value::Null,
         }
     }
+
+    /// v7.37.42-arena Phase 4 — copy heap payloads into the supplied
+    /// bump arena, yielding a `Value<'a>` whose Cow-variant payloads
+    /// are arena-borrowed (or stay as small owned scalars for the
+    /// `Copy`-able variants).
+    ///
+    /// Used at the catalog ↔ ephemeral boundary: a `ColumnSchema.default`
+    /// is `Value<'static>` but INSERT-time eval may want it stamped into
+    /// the per-statement arena alongside other arena-built scalars.
+    ///
+    /// Allocates only into the supplied arena; the input `&self` keeps
+    /// its own storage. For `Copy`-able / nested-owned variants the
+    /// implementation falls back to `clone()` (the nested heap blocks
+    /// stay on the global allocator, which is fine — the boundary
+    /// requirement is just "no aliasing of caller-owned strings").
+    pub fn clone_into<'a>(&self, arena: &'a bumpalo::Bump) -> Value<'a> {
+        match self {
+            Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(s))),
+            Value::Json(s) => Value::Json(Cow::Borrowed(arena.alloc_str(s))),
+            Value::Xml(s) => Value::Xml(Cow::Borrowed(arena.alloc_str(s))),
+            Value::Bytes(b) => {
+                let slot = arena.alloc_slice_copy::<u8>(b);
+                Value::Bytes(Cow::Borrowed(slot))
+            }
+            Value::Vector(v) => {
+                let slot = arena.alloc_slice_copy::<f32>(v);
+                Value::Vector(Cow::Borrowed(slot))
+            }
+            Value::BitString { nbits, bytes } => {
+                let slot = arena.alloc_slice_copy::<u8>(bytes);
+                Value::BitString {
+                    nbits: *nbits,
+                    bytes: Cow::Borrowed(slot),
+                }
+            }
+            // Copy-able scalars + variants whose nested heap blocks are
+            // `'static` regardless of `'arena` (TextArray, JsonArray,
+            // Hstore, TsVector, Range bounds, …). Clone the heap block
+            // via the standard `into_owned()` path then lift the
+            // resulting `Value<'static>` to `Value<'a>` via the Cow
+            // variance — `'static` covers any lifetime.
+            other => other.clone().into_owned(),
+        }
+    }
 }
 
 impl Value<'static> {
@@ -1092,6 +1136,28 @@ impl<'arena> Row<'arena> {
 
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+impl<'arena> Row<'arena> {
+    /// v7.37.42-arena Phase 4 — copy every cell into the supplied bump
+    /// arena, yielding a `Row<'a>` whose Cow-payloads are arena-borrowed.
+    /// Boundary helper for catalog defaults → DML eval handoff and
+    /// arena-local row scratch.
+    pub fn clone_into<'a>(&self, arena: &'a bumpalo::Bump) -> Row<'a> {
+        Row {
+            values: self.values.iter().map(|v| v.clone_into(arena)).collect(),
+        }
+    }
+
+    /// v7.37.42-arena Phase 4 — lift this `Row<'arena>` to a fully-owned
+    /// `Row<'static>` for catalog write / WAL serialisation. Equivalent
+    /// to `Row::from_arena(self)` but consumes by value at any lifetime
+    /// (callers can write `row.into_owned()` mirroring `Value::into_owned`).
+    pub fn into_owned(self) -> Row<'static> {
+        Row {
+            values: self.values.into_iter().map(Value::into_owned).collect(),
+        }
     }
 }
 
