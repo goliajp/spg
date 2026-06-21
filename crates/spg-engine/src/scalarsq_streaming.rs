@@ -306,6 +306,46 @@ impl Engine {
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let ctx = self.ev_ctx(schema_cols, Some(alias));
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
+        // v7.37.42 (docker-fair SCALARSQ attack 2) — pre-resolve every
+        // projection item that's a bare `Expr::Column` to a direct
+        // position into `row.values`. The hot loop then short-circuits
+        // `eval_expr_with_correlated` (which walks the column-resolution
+        // logic against the `EvalContext` per call) with a single
+        // `row.values[pos].clone()` for these items. Bytes identical —
+        // the eval interpreter's Column arm performs the same lookup.
+        //
+        // `None` entries here mean the projection item is NOT a bare
+        // column (function call, arithmetic, scalar subquery, etc.) and
+        // must go through the interpreter as before.
+        let projection_direct_col: Vec<Option<usize>> = projection
+            .iter()
+            .map(|p| match &p.expr {
+                Expr::Column(c) => {
+                    // Match the eval interpreter's column-resolution
+                    // semantics exactly (`resolve_column` in
+                    // `eval/resolve.rs`) so the cached position points
+                    // to the same cell the per-call path would have
+                    // picked. Single-table scope: try composite
+                    // `qualifier.name` first when a qualifier is
+                    // present, then fall back to the bare column name.
+                    // Case-sensitive `==` matches `resolve_column`'s
+                    // `s.name == c.name` exactly. Bare-name suffix
+                    // fallback (".name") is only meaningful for joined
+                    // schemas which the streaming shape rejects, so we
+                    // skip it here — any miss returns `None` and falls
+                    // back to the interpreter path.
+                    if let Some(q) = c.qualifier.as_deref() {
+                        let composite = alloc::format!("{q}.{name}", name = c.name);
+                        if let Some(p) = schema_cols.iter().position(|s| s.name == composite) {
+                            return Some(p);
+                        }
+                    }
+                    schema_cols.iter().position(|s| s.name == c.name)
+                }
+                _ => None,
+            })
+            .collect();
+        let any_direct_col = projection_direct_col.iter().any(Option::is_some);
         // Index seek for WHERE — mirrors run_single_table_scan's
         // four-way fallback (BTree equality / GIN tsvector / trigram
         // LIKE / GIN JSONB containment). When none fires, the full
@@ -382,6 +422,8 @@ impl Engine {
             projection: &[crate::select::ProjectedItem],
             scalarsq_fast: &[Option<crate::ScalarPkProbeFastPath>],
             any_scalarsq_fast: bool,
+            projection_direct_col: &[Option<usize>],
+            any_direct_col: bool,
             pass_memo: bool,
             off: usize,
             row_buf: &mut bumpalo::collections::Vec<'a, Value<'a>>,
@@ -418,6 +460,15 @@ impl Engine {
             for (i, p) in projection.iter().enumerate() {
                 if any_scalarsq_fast && let Some(fp) = &scalarsq_fast[i] {
                     row_buf.push(engine.probe_with_pk_fast_path(fp, row));
+                    continue;
+                }
+                // v7.37.42 attack 2 — bare `Expr::Column` projection
+                // items short-circuit the eval interpreter. The
+                // resolved position was computed once at prepare time
+                // against the same schema_cols the row layout follows.
+                if any_direct_col && let Some(pos) = projection_direct_col[i] {
+                    let v = row.values.get(pos).cloned().unwrap_or(Value::Null);
+                    row_buf.push(v);
                     continue;
                 }
                 let memo_arg = if pass_memo { Some(&mut *memo) } else { None };
@@ -459,6 +510,8 @@ impl Engine {
                     &projection,
                     &scalarsq_fast,
                     any_scalarsq_fast,
+                    &projection_direct_col,
+                    any_direct_col,
                     pass_memo,
                     off,
                     &mut row_buf,
@@ -489,6 +542,8 @@ impl Engine {
                     &projection,
                     &scalarsq_fast,
                     any_scalarsq_fast,
+                    &projection_direct_col,
+                    any_direct_col,
                     pass_memo,
                     off,
                     &mut row_buf,
@@ -503,35 +558,45 @@ impl Engine {
                 )?;
             }
             // Cold tier — mirrors run_single_table_scan's final loop.
-            let cold_rows = self.iter_cold_rows_of_table(table);
-            for (offset, row) in cold_rows.iter().enumerate() {
-                if let Some(cap) = target
-                    && emitted >= cap.saturating_sub(off)
-                {
-                    break;
+            // v7.37.42 attack 3 — skip the cold-tier PK-index walk when
+            // the catalog has no cold segments loaded. On a hot-only
+            // database (typical bench/docker-fair shape) this saves
+            // the per-query walk of the entire PK BTree (every entry
+            // checked for `RowLocator::Cold`) that produced ~10-20 µs
+            // of overhead on small tables.
+            if self.active_catalog().has_any_cold_segments() {
+                let cold_rows = self.iter_cold_rows_of_table(table);
+                for (offset, row) in cold_rows.iter().enumerate() {
+                    if let Some(cap) = target
+                        && emitted >= cap.saturating_sub(off)
+                    {
+                        break;
+                    }
+                    run_one(
+                        self,
+                        row,
+                        table.row_count() + offset,
+                        stmt,
+                        &ctx,
+                        &compiled_where,
+                        &projection,
+                        &scalarsq_fast,
+                        any_scalarsq_fast,
+                        &projection_direct_col,
+                        any_direct_col,
+                        pass_memo,
+                        off,
+                        &mut row_buf,
+                        &mut memo,
+                        &mut eval_stack,
+                        &mut survived,
+                        &mut emitted,
+                        &mut budget,
+                        &columns,
+                        cancel,
+                        &mut emit,
+                    )?;
                 }
-                run_one(
-                    self,
-                    row,
-                    table.row_count() + offset,
-                    stmt,
-                    &ctx,
-                    &compiled_where,
-                    &projection,
-                    &scalarsq_fast,
-                    any_scalarsq_fast,
-                    pass_memo,
-                    off,
-                    &mut row_buf,
-                    &mut memo,
-                    &mut eval_stack,
-                    &mut survived,
-                    &mut emitted,
-                    &mut budget,
-                    &columns,
-                    cancel,
-                    &mut emit,
-                )?;
             }
         }
         Ok((columns, emitted))

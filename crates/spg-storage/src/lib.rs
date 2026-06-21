@@ -3359,6 +3359,23 @@ impl Catalog {
         self.tables.get_mut(idx)
     }
 
+    /// v7.37.42 (docker-fair SCALARSQ attack) — resolve a table name to
+    /// its insertion-order index ONCE, so callers that need to fetch the
+    /// same table many times (per-row PK probes in correlated scalar
+    /// subqueries) can avoid the per-call `BTreeMap<String, usize>` string
+    /// descent. The returned index is stable for the lifetime of the
+    /// catalog snapshot the caller holds (same engine read guard).
+    pub fn tables_position_of(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+
+    /// Direct positional fetch counterpart to [`tables_position_of`].
+    /// `idx` must come from `tables_position_of` against the same catalog
+    /// snapshot — out-of-range returns `None`.
+    pub fn tables_at(&self, idx: usize) -> Option<&Table> {
+        self.tables.get(idx)
+    }
+
     /// v7.34 (crash-recovery P0 #2) — replay a row-level redo log onto
     /// this catalog (the [`RowChange`] physical-redo apply primitive that
     /// row-level WAL recovery will use in place of statement re-execution).
@@ -3608,6 +3625,17 @@ impl Catalog {
     #[must_use]
     pub fn cold_segment_count(&self) -> usize {
         self.cold_segments.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// v7.37.42 (docker-fair SCALARSQ attack 3) — short-circuit guard
+    /// for scan loops that conditionally walk the cold tier. Returns
+    /// `false` when the catalog has never loaded a cold segment (or all
+    /// segments are tombstoned), so callers can skip the per-table cold
+    /// PK-index walk entirely on hot-only databases. O(N segments);
+    /// typical N is small (single-digit) so the check is sub-µs.
+    #[must_use]
+    pub fn has_any_cold_segments(&self) -> bool {
+        self.cold_segments.iter().any(Option::is_some)
     }
 
     /// Slot count including tombstones (= the next id the
