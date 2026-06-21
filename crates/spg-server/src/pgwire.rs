@@ -629,10 +629,18 @@ fn handle_pg_simple_query(
         let take_scalarsq_streaming = prepared_stmt.as_ref().is_some_and(|s| {
             spg_engine::scalarsq_streaming::is_scalarsq_streaming_shape(s.as_ref())
         });
+        // v7.37.43 (DISTA A-1) — the streaming wrapper's emit closure
+        // + per-row `cell_refs` Vec rebuild add ~25 µs of pure overhead
+        // for aggregate-bearing shapes whose engine path
+        // (`try_exec_joined_streaming`) rejects on aggregate and falls
+        // back to a materialised `Vec<Row>` anyway. Take the
+        // materialised path directly for aggregates too — same wire
+        // bytes, no closure indirection.
         let take_materialised_path = !take_scalarsq_streaming
-            && prepared_stmt
-                .as_ref()
-                .is_some_and(|s| spg_engine::expr_tree_has_subquery(s.as_ref()));
+            && prepared_stmt.as_ref().is_some_and(|s| {
+                spg_engine::expr_tree_has_subquery(s.as_ref())
+                    || spg_engine::aggregate::uses_aggregate(s.as_ref())
+            });
         let stream_result: Result<usize, spg_engine::EngineError> = if take_scalarsq_streaming {
             let s = prepared_stmt
                 .as_ref()

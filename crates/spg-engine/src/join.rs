@@ -123,6 +123,10 @@ impl JoinSrc<'_> {
 /// (`offsets.len() == tuple.len() + 1`). `None` means SQL NULL: a
 /// LEFT-extended slot (`usize::MAX`), or a position past the row's
 /// width.
+///
+/// v7.37.43 (DISTA A-2) — slow-path fallback used only when the caller
+/// has no `pos_to_src` table. Most RowRef::Tuple uses now go through
+/// `tuple_value_indexed` (direct index lookup, no partition_point).
 pub(crate) fn tuple_value<'s>(
     sources: &'s [JoinSrc<'_>],
     offsets: &[usize],
@@ -137,6 +141,48 @@ pub(crate) fn tuple_value<'s>(
     sources.get(k)?.get(ri)?.values.get(pos - offsets[k])
 }
 
+/// v7.37.43 (DISTA A-2) — direct-index variant: `pos_to_src[pos]` =
+/// source index `k` for combined position `pos`. Built once per
+/// JoinPipeline / DeferredJoin (linear in combined width); per-row
+/// `RowRef::get` becomes a single array read instead of a binary
+/// search over `offsets` per call.
+///
+/// For DISTA (~100k joined rows × ~5 cell reads/row in the aggregate
+/// loop) this strips ~50 ns × 500k = ~25 ms of partition_point ops down
+/// to direct indexing.
+#[inline]
+pub(crate) fn tuple_value_indexed<'s>(
+    sources: &'s [JoinSrc<'_>],
+    offsets: &[usize],
+    pos_to_src: &[u16],
+    tuple: &[usize],
+    pos: usize,
+) -> Option<&'s Value<'static>> {
+    let k = *pos_to_src.get(pos)? as usize;
+    let ri = *tuple.get(k)?;
+    if ri == usize::MAX {
+        return None;
+    }
+    sources.get(k)?.get(ri)?.values.get(pos - offsets[k])
+}
+
+/// v7.37.43 (DISTA A-2) — build the position → source-index table for
+/// a combined schema. `offsets.len() == sources + 1`, last entry is
+/// the total combined width.
+pub(crate) fn build_pos_to_src(offsets: &[usize]) -> Vec<u16> {
+    let width = offsets.last().copied().unwrap_or(0);
+    let mut tab: Vec<u16> = Vec::with_capacity(width);
+    for k in 0..offsets.len().saturating_sub(1) {
+        let span = offsets[k + 1] - offsets[k];
+        for _ in 0..span {
+            // 2^16 sources is comfortably beyond the planner cap;
+            // `as u16` truncation here is a non-issue in practice.
+            tab.push(k as u16);
+        }
+    }
+    tab
+}
+
 /// v7.32 (P4 borrow channel, increment 2) — a row handed to the
 /// aggregate engine. Either a borrowed materialised `Row` (single-table
 /// and legacy paths) or a deferred row-index tuple over join sources
@@ -148,6 +194,11 @@ pub(crate) enum RowRef<'a> {
     Tuple {
         sources: &'a [JoinSrc<'a>],
         offsets: &'a [usize],
+        /// v7.37.43 (DISTA A-2) — precomputed combined-position →
+        /// source-index map (built once per JoinPipeline / DeferredJoin
+        /// in `build_pos_to_src`). `RowRef::get` uses this for direct
+        /// indexing instead of binary search over `offsets` per call.
+        pos_to_src: &'a [u16],
         tuple: &'a [usize],
     },
 }
@@ -162,8 +213,9 @@ impl RowRef<'_> {
             RowRef::Tuple {
                 sources,
                 offsets,
+                pos_to_src,
                 tuple,
-            } => tuple_value(sources, offsets, tuple, pos),
+            } => tuple_value_indexed(sources, offsets, pos_to_src, tuple, pos),
         }
     }
 
@@ -179,13 +231,14 @@ impl RowRef<'_> {
             RowRef::Tuple {
                 sources,
                 offsets,
+                pos_to_src,
                 tuple,
             } => {
                 let width = offsets.last().copied().unwrap_or(0);
                 let mut vals: Vec<Value<'static>> = Vec::with_capacity(width);
                 for pos in 0..width {
                     vals.push(
-                        tuple_value(sources, offsets, tuple, pos)
+                        tuple_value_indexed(sources, offsets, pos_to_src, tuple, pos)
                             .cloned()
                             .unwrap_or(Value::Null),
                     );
@@ -258,6 +311,11 @@ pub(crate) fn materialise_tuple_vals(
 pub(crate) struct DeferredJoin<'a> {
     pub(crate) sources: Vec<JoinSrc<'a>>,
     pub(crate) offsets: Vec<usize>,
+    /// v7.37.43 (DISTA A-2) — combined-position → source-index map; built
+    /// once via `build_pos_to_src(&offsets)` at construction time, so
+    /// per-row `RowRef::get` is a direct index instead of a partition_point
+    /// over `offsets`.
+    pub(crate) pos_to_src: Vec<u16>,
     pub(crate) widths: Vec<usize>,
     pub(crate) masks: Vec<Option<Vec<bool>>>,
     /// Flat row-index tuples — one stride-long group per surviving row.
@@ -286,6 +344,7 @@ impl DeferredJoin<'_> {
             .map(|tuple| RowRef::Tuple {
                 sources: &self.sources,
                 offsets: &self.offsets,
+                pos_to_src: &self.pos_to_src,
                 tuple,
             })
             .collect()
@@ -406,6 +465,9 @@ struct JoinPipeline<'a> {
     masks: Vec<Option<Vec<bool>>>,
     widths: Vec<usize>,
     offsets: Vec<usize>,
+    /// v7.37.43 (DISTA A-2) — combined-position → source-index map; kept
+    /// in sync with `offsets` by `new` / `advance`.
+    pos_to_src: Vec<u16>,
     working: Vec<usize>,
     stride: usize,
     consumed_cols: usize,
@@ -419,11 +481,14 @@ impl<'a> JoinPipeline<'a> {
         width: usize,
         working: Vec<usize>,
     ) -> Self {
+        let offsets = alloc::vec![0, width];
+        let pos_to_src = build_pos_to_src(&offsets);
         Self {
             sources: alloc::vec![primary],
             masks: alloc::vec![mask],
             widths: alloc::vec![width],
-            offsets: alloc::vec![0, width],
+            offsets,
+            pos_to_src,
             working,
             stride: 1,
             consumed_cols: width,
@@ -451,6 +516,13 @@ impl<'a> JoinPipeline<'a> {
         self.consumed_cols += right_arity;
         self.offsets.push(self.consumed_cols);
         self.widths.push(right_arity);
+        // v7.37.43 (DISTA A-2) — extend the pos_to_src table for the
+        // new peer's column span. `as u16` truncation is safe: source
+        // counts in practice are O(small).
+        let k = (self.sources.len() - 1) as u16;
+        for _ in 0..right_arity {
+            self.pos_to_src.push(k);
+        }
     }
 }
 
@@ -778,9 +850,12 @@ impl Engine {
             // tuples so the deferred output type stays uniform.
             let width = combined_schema.len();
             let n = filtered.len();
+            let offsets = alloc::vec![0, width];
+            let pos_to_src = build_pos_to_src(&offsets);
             return Ok(DeferredJoin {
                 sources: alloc::vec![JoinSrc::Owned(filtered)],
-                offsets: alloc::vec![0, width],
+                offsets,
+                pos_to_src,
                 widths: alloc::vec![width],
                 masks: alloc::vec![None],
                 survivors: (0..n).collect(),
@@ -877,6 +952,7 @@ impl Engine {
         Ok(DeferredJoin {
             sources: pipe.sources,
             offsets: pipe.offsets,
+            pos_to_src: pipe.pos_to_src,
             widths: pipe.widths,
             masks: pipe.masks,
             survivors,
@@ -1442,6 +1518,7 @@ impl Engine {
             let rr = RowRef::Tuple {
                 sources: &pipe.sources,
                 offsets: &pipe.offsets,
+                pos_to_src: &pipe.pos_to_src,
                 tuple,
             };
             let pass = if let Some(cw) = &compiled_where {
