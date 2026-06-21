@@ -1,0 +1,28 @@
+{
+  "name": "mailrs-2026-06-22-track-a",
+  "filed": "2026-06-22",
+  "source": "mailrs",
+  "report": "stables/mailrs/.claude/notes/spg-7.37.3-prod-conversations-real-sql-2026-06-18.md",
+  "production": true,
+  "kind": {
+    "type": "query",
+    "snapshot": {
+      "path": "snapshot.tar.gz",
+      "url": "https://snapshots.example.com/mailrs-2026-06-22-track-a.tar.gz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 0
+    },
+    "queries": [
+      {
+        "file": "queries.sql",
+        "warmup_iters": 20,
+        "measure_iters": 100
+      }
+    ],
+    "expected": {
+      "cold_ms_max": 100,
+      "warm_ms_max": 5,
+      "p95_ms_max": 10
+    }
+  }
+}

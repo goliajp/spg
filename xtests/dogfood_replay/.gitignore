@@ -1,0 +1,4 @@
+# Snapshot tarballs are large prod-shape catalogs; devs fetch
+# out-of-band via the URL recorded in each fixture's fixture.json.
+fixtures/**/snapshot.tar.gz
+fixtures/**/*.snapshot

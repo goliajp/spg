@@ -1,0 +1,21 @@
+{
+  "name": "mailrs-2026-06-22-wal-replay-bounded",
+  "filed": "2026-06-22",
+  "source": "mailrs",
+  "report": "stables/mailrs/.claude/notes/spg-7.37.4-prod-deploy-2026-06-22.md",
+  "production": true,
+  "kind": {
+    "type": "wal-replay-bounded",
+    "description": "Synthetic WAL: 5000 DELETE records on a multi-indexed table; replay must stay bounded.",
+    "synthesise": {
+      "table_rows": 100000,
+      "indices_count": 13,
+      "wal_records": [
+        { "kind": "delete", "count": 5000 }
+      ]
+    },
+    "expected": {
+      "replay_ms_max": 10000
+    }
+  }
+}
