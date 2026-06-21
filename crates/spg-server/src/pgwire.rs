@@ -334,6 +334,16 @@ fn handle_pg_simple_query(
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
         let mut wrote_header = false;
         let mut first_row_size: Option<usize> = None;
+        // v7.37.42-arena Phase 3 — per-SELECT bumpalo arena hosts the
+        // wire-encode fallback-cell text payloads. The Phase 2 arena
+        // for SCALARSQ-shape engine-side row scratch lives inside the
+        // `take_scalarsq_streaming` branch (it's tied to the engine
+        // executor's lifetime — different scope than the wire arena).
+        // This outer arena drops at end of the streaming branch in
+        // O(1), releasing all per-cell text strings from the
+        // value-to-text fallback path (Float / Numeric / Vector /
+        // Uuid / range / hstore / array etc.) in a single bulk reset.
+        let wire_arena = bumpalo::Bump::new();
         // v7.37.x (docker-fair SCALARSQ wire-overhead attack) — try
         // the per-connection parse cache. On hit we skip the SQL-
         // string entry point's parse / clock / reorder work and call
@@ -380,11 +390,11 @@ fn handle_pg_simple_query(
                 spg_engine::StreamItem::Row(values) => {
                     if first_row_size.is_none() {
                         let before = wbuf.len();
-                        let r = encode_data_row_from_refs(wbuf, &cols_storage, values);
+                        let r = encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena);
                         first_row_size = Some(wbuf.len() - before);
                         return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
                     }
-                    encode_data_row_from_refs(wbuf, &cols_storage, values)
+                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             }
@@ -456,7 +466,7 @@ fn handle_pg_simple_query(
                         header_written = true;
                     }
                     let before = wbuf.len();
-                    encode_data_row_from_values(wbuf, &cols_storage, values)
+                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                     if first_row_size.is_none() {
                         first_row_size = Some(wbuf.len() - before);
@@ -490,7 +500,7 @@ fn handle_pg_simple_query(
                         wrote_header = true;
                         for row in &rows {
                             let before = wbuf.len();
-                            encode_data_row(wbuf, &cols_storage, row)
+                            encode_data_row(wbuf, &cols_storage, row, &wire_arena)
                                 .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                             if first_row_size.is_none() {
                                 first_row_size = Some(wbuf.len() - before);
@@ -572,15 +582,19 @@ fn handle_pg_simple_query(
             // row first to learn its byte size, then `reserve` enough
             // headroom for the remaining (n - 1) rows + the
             // CommandComplete tail.
+            // v7.37.42-arena Phase 3 — fallback materialised path
+            // also gets a per-SELECT arena for the cell text-format
+            // fallback payloads. Dropped at end of branch.
+            let mat_arena = bumpalo::Bump::new();
             if let Some((first, rest)) = rows.split_first() {
                 let before = wbuf.len();
-                encode_data_row(wbuf, &columns, first)?;
+                encode_data_row(wbuf, &columns, first, &mat_arena)?;
                 let first_size = wbuf.len() - before;
                 if rest.len() > 0 {
                     wbuf.reserve(first_size.saturating_mul(rest.len()).saturating_add(32));
                 }
                 for row in rest {
-                    encode_data_row(wbuf, &columns, row)?;
+                    encode_data_row(wbuf, &columns, row, &mat_arena)?;
                 }
             }
             send_command_complete(wbuf, &format!("SELECT {n}"))?;
@@ -2183,6 +2197,10 @@ fn handle_execute(
             let _ = needs_write;
         }
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
+        // v7.37.42-arena Phase 3 — per-Execute arena for cell
+        // text-format fallback payloads in the extended-protocol
+        // streaming path.
+        let ext_arena = bumpalo::Bump::new();
         let stream_emit_result =
             eng.execute_prepared_select_streaming(s, cancel, |item| match item {
                 spg_engine::StreamItem::Header(cols) => {
@@ -2195,7 +2213,7 @@ fn handle_execute(
                     io_res.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
                 spg_engine::StreamItem::Row(values) => {
-                    encode_data_row_from_refs(stream, &cols_storage, values)
+                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             });
@@ -2249,8 +2267,13 @@ fn handle_execute(
                 send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
             }
             let n = rows.len();
+            // v7.37.42-arena Phase 3 — per-Execute arena for the cell
+            // text-format fallback payloads in the materialised
+            // extended-protocol path.
+            let row_arena = bumpalo::Bump::new();
             for row in &rows {
-                encode_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
+                encode_data_row(stream, &columns, row, &row_arena)
+                    .map_err(|e| proto(e.to_string()))?;
             }
             send_command_complete(stream, &format!("SELECT {n}"))
                 .map_err(|e| proto(e.to_string()))?;
@@ -3619,12 +3642,18 @@ fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
 }
 
 fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
+    // v7.37.42-arena Phase 3 — per-call arena for the cell text-format
+    // fallback path. `send_data_row` covers canned/catalog responses
+    // and a handful of extended-protocol slow-path rows (line 1408 +
+    // legacy fallbacks), all very low row volume — arena lifetime
+    // scoped to this single row is fine.
+    let arena = bumpalo::Bump::new();
     let n = u16::try_from(row.values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
     let mut body = Vec::with_capacity(2 + row.values.len() * 8);
     body.extend_from_slice(&n.to_be_bytes());
     for (i, v) in row.values.iter().enumerate() {
-        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty))?;
+        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty), &arena)?;
     }
     send_msg(stream, b'D', &body)
 }
@@ -3637,7 +3666,8 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
 fn encode_data_row_from_refs(
     out: &mut Vec<u8>,
     cols: &[ColumnSchema],
-    values: &[&spg_storage::Value],
+    values: &[&spg_storage::Value<'_>],
+    arena: &bumpalo::Bump,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -3646,7 +3676,7 @@ fn encode_data_row_from_refs(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty))?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -3666,8 +3696,13 @@ fn encode_data_row_from_refs(
 /// `send_data_row` is kept around for canned responses and the
 /// extended-protocol path (line 1625), which see at most a handful of
 /// rows per call and don't justify the same buffer-handle threading.
-fn encode_data_row(out: &mut Vec<u8>, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
-    encode_data_row_from_values(out, cols, &row.values)
+fn encode_data_row(
+    out: &mut Vec<u8>,
+    cols: &[ColumnSchema],
+    row: &Row,
+    arena: &bumpalo::Bump,
+) -> std::io::Result<()> {
+    encode_data_row_from_values(out, cols, &row.values, arena)
 }
 
 /// v7.37.42-arena Phase 2 — `&[Value]` variant of `encode_data_row`.
@@ -3681,6 +3716,7 @@ fn encode_data_row_from_values(
     out: &mut Vec<u8>,
     cols: &[ColumnSchema],
     values: &[Value<'_>],
+    arena: &bumpalo::Bump,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -3689,7 +3725,7 @@ fn encode_data_row_from_values(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty))?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -3710,7 +3746,12 @@ fn encode_data_row_from_values(
 /// Less common types (Float / Numeric / Timestamp / Vector / Uuid /
 /// arrays / hstore / range) fall back to `value_to_pg_text`; they're
 /// rare on row-projection-heavy workloads.
-fn encode_pg_text_cell(out: &mut Vec<u8>, v: &Value, ty: Option<DataType>) -> std::io::Result<()> {
+fn encode_pg_text_cell(
+    out: &mut Vec<u8>,
+    v: &Value<'_>,
+    ty: Option<DataType>,
+    arena: &bumpalo::Bump,
+) -> std::io::Result<()> {
     match v {
         Value::Null => {
             out.extend_from_slice(&(-1i32).to_be_bytes());
@@ -3739,7 +3780,7 @@ fn encode_pg_text_cell(out: &mut Vec<u8>, v: &Value, ty: Option<DataType>) -> st
         Value::Date(days) => return write_cell_date(out, *days),
         _ => {}
     }
-    match value_to_pg_text(v, ty) {
+    match value_to_pg_text(v, ty, arena) {
         None => out.extend_from_slice(&(-1i32).to_be_bytes()),
         Some(s) => write_cell_bytes(out, s.as_bytes())?,
     }
@@ -4044,82 +4085,171 @@ const fn pg_type_len(ty: DataType) -> i16 {
     }
 }
 
-fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
+/// v7.37.42-arena Phase 3 — fallback text renderer for the rare
+/// cell types (Float / Numeric / Interval / Vector / Uuid / arrays /
+/// hstore / range / etc.) the type-dispatched fast path in
+/// `encode_pg_text_cell` doesn't handle directly. Pre-Phase 3 this
+/// returned an owned `String` per cell, burning a heap alloc + drop
+/// for every fallback-type cell on the wire. Now it allocates the
+/// formatted text into the per-query `bumpalo::Bump` and yields a
+/// `&'a str` whose lifetime is tied to the arena; the caller writes
+/// the slice straight into the DataRow body and the arena bulk-drops
+/// all per-cell payloads in O(1) at query-close. For inline-format
+/// branches (Float / Numeric / Interval / Year / Vector / array
+/// shapes) `bumpalo::format!` writes the formatted bytes directly
+/// into the arena with no transient heap `String`. For
+/// helper-returning-`String` branches (Uuid / Time / Money / Range /
+/// Hstore / 2D arrays) we still allocate the helper's owned `String`,
+/// then copy its bytes into the arena and drop the heap copy — these
+/// types are sub-1% of fallback traffic so the helper churn doesn't
+/// move the bench needle; the arena gives us a single uniform return
+/// shape across all variants.
+fn value_to_pg_text<'a>(
+    v: &Value<'_>,
+    ty: Option<DataType>,
+    arena: &'a bumpalo::Bump,
+) -> Option<&'a str> {
+    use bumpalo::collections::String as BumpString;
+    use core::fmt::Write;
+
+    let into_arena = |s: &str| -> &'a str { BumpString::from_str_in(s, arena).into_bump_str() };
+
+    // Single-arg format helper — `bumpalo::format!` requires at least
+    // one explicit `,arg` after the format string, so we use a manual
+    // `BumpString::new_in + write!` for the single-capture-only sites
+    // that just want `Display::fmt` into the arena.
+    let display_into_arena = |d: &dyn core::fmt::Display| -> &'a str {
+        let mut buf = BumpString::new_in(arena);
+        let _ = write!(&mut buf, "{d}");
+        buf.into_bump_str()
+    };
+
     Some(match v {
         Value::Null => return None,
-        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-        Value::SmallInt(n) => n.to_string(),
-        Value::Int(n) => n.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Float(f) => format!("{f}"),
-        Value::Text(s) | Value::Json(s) => s.to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "t"
+            } else {
+                "f"
+            }
+        }
+        Value::SmallInt(n) => display_into_arena(n),
+        Value::Int(n) => display_into_arena(n),
+        Value::BigInt(n) => display_into_arena(n),
+        Value::Float(f) => display_into_arena(f),
+        Value::Text(s) | Value::Json(s) => into_arena(s.as_ref()),
         // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
         // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
         // must round-trip to a literal pg_dump would emit (i.e.
         // include the `+00` UTC offset).
         Value::Timestamp(micros) if matches!(ty, Some(DataType::Timestamptz)) => {
-            spg_engine::eval::format_timestamptz(*micros)
+            into_arena(&spg_engine::eval::format_timestamptz(*micros))
         }
-        Value::Timestamp(micros) => format_timestamp(*micros),
-        Value::Date(days) => format_date(*days),
+        Value::Timestamp(micros) => into_arena(&format_timestamp(*micros)),
+        Value::Date(days) => into_arena(&format_date(*days)),
         Value::Interval {
             months,
             days,
             micros,
-        } => format!("P{months}M{days}D{micros}U"),
-        Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
-        Value::Vector(v) => {
-            let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
-            format!("[{}]", parts.join(", "))
+        } => {
+            let mut buf = BumpString::new_in(arena);
+            let _ = write!(&mut buf, "P{months}M{days}D{micros}U");
+            buf.into_bump_str()
+        }
+        Value::Numeric { scaled, scale } => into_arena(&format_numeric(*scaled, *scale)),
+        Value::Vector(vec) => {
+            // Inline join into the arena buffer — avoids
+            // intermediate `Vec<String> + parts.join(", ")` heap
+            // allocs (one per element + one for the join).
+            let mut buf = BumpString::new_in(arena);
+            buf.push('[');
+            let mut first = true;
+            for x in vec.iter() {
+                if !first {
+                    buf.push_str(", ");
+                }
+                first = false;
+                use core::fmt::Write;
+                let _ = write!(&mut buf, "{x}");
+            }
+            buf.push(']');
+            buf.into_bump_str()
         }
         // v6.0.1: pgwire text-format render for SQ8 cells —
         // dequantise so clients see the pgvector-style
         // `[x, y, z]` payload.
         Value::Sq8Vector(q) => {
-            let parts: Vec<String> = spg_storage::quantize::dequantize(q)
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            format!("[{}]", parts.join(", "))
+            let dequant = spg_storage::quantize::dequantize(q);
+            let mut buf = BumpString::new_in(arena);
+            buf.push('[');
+            let mut first = true;
+            for x in dequant.iter() {
+                if !first {
+                    buf.push_str(", ");
+                }
+                first = false;
+                use core::fmt::Write;
+                let _ = write!(&mut buf, "{x}");
+            }
+            buf.push(']');
+            buf.into_bump_str()
         }
         // v6.0.3: pgwire text-format render for HALF cells.
         Value::HalfVector(h) => {
-            let parts: Vec<String> = h
-                .to_f32_vec()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            format!("[{}]", parts.join(", "))
+            let halfs = h.to_f32_vec();
+            let mut buf = BumpString::new_in(arena);
+            buf.push('[');
+            let mut first = true;
+            for x in halfs.iter() {
+                if !first {
+                    buf.push_str(", ");
+                }
+                first = false;
+                use core::fmt::Write;
+                let _ = write!(&mut buf, "{x}");
+            }
+            buf.push(']');
+            buf.into_bump_str()
         }
         // v7.17.0 — UUID renders canonical 8-4-4-4-12 lowercase
         // hyphenated. Matches PG `uuid_out` so libpq clients,
         // psql `\d`, and sqlx text-mode decoders all read the
         // standard form.
-        Value::Uuid(b) => spg_storage::format_uuid(b),
+        Value::Uuid(b) => into_arena(&spg_storage::format_uuid(b)),
         // v7.17.0 Phase 3.P0-32 — TIME renders via the shared
         // engine helper so the trim-trailing-zeros shape matches
         // PG `time_out` across pgwire, sqllogictest, and engine.
-        Value::Time(us) => spg_engine::eval::format_time(*us),
+        Value::Time(us) => into_arena(&spg_engine::eval::format_time(*us)),
         // v7.17.0 Phase 3.P0-33 — YEAR renders 4-digit zero-padded.
-        Value::Year(y) => format!("{y:04}"),
+        Value::Year(y) => {
+            let mut buf = BumpString::new_in(arena);
+            let _ = write!(&mut buf, "{y:04}");
+            buf.into_bump_str()
+        }
         // v7.17.0 Phase 3.P0-34 — TIMETZ via the shared engine
         // helper so the canonical `HH:MM:SS[.ffffff]±HH[:MM]`
         // shape matches PG `timetz_out` across all renderers.
-        Value::TimeTz { us, offset_secs } => spg_engine::eval::format_timetz(*us, *offset_secs),
+        Value::TimeTz { us, offset_secs } => {
+            into_arena(&spg_engine::eval::format_timetz(*us, *offset_secs))
+        }
         // v7.17.0 Phase 3.P0-35 — MONEY via the shared engine
         // helper so the canonical en_US text form matches PG
         // `cash_out` across all renderers.
-        Value::Money(c) => spg_engine::eval::format_money(*c),
+        Value::Money(c) => into_arena(&spg_engine::eval::format_money(*c)),
         // v7.17.0 Phase 3.P0-38 — Range via shared engine helper.
-        Value::Range { .. } => spg_engine::format_range_text(v),
+        Value::Range { .. } => into_arena(&spg_engine::format_range_text(v)),
         // v7.17.0 Phase 3.P0-39 — Hstore via shared engine helper.
-        Value::Hstore(pairs) => spg_engine::format_hstore_text(pairs),
+        Value::Hstore(pairs) => into_arena(&spg_engine::format_hstore_text(pairs)),
         // v7.17.0 Phase 3.P0-40 — 2D arrays via shared helpers.
-        Value::IntArray2D(rows) => spg_engine::format_int_2d_text_pub(rows),
-        Value::BigIntArray2D(rows) => spg_engine::format_bigint_2d_text_pub(rows),
-        Value::TextArray2D(rows) => spg_engine::format_text_2d_text_pub(rows),
+        Value::IntArray2D(rows) => into_arena(&spg_engine::format_int_2d_text_pub(rows)),
+        Value::BigIntArray2D(rows) => into_arena(&spg_engine::format_bigint_2d_text_pub(rows)),
+        Value::TextArray2D(rows) => into_arena(&spg_engine::format_text_2d_text_pub(rows)),
         // v7.5.0 — Value is #[non_exhaustive].
-        _ => format!("{v:?}"),
+        _ => {
+            let mut buf = BumpString::new_in(arena);
+            let _ = write!(&mut buf, "{v:?}");
+            buf.into_bump_str()
+        }
     })
 }
 
