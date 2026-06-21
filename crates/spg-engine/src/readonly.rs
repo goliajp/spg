@@ -248,6 +248,60 @@ impl Engine {
         self.exec_select_cancel(s, cancel)
     }
 
+    /// v7.37.42-arena Phase 2 — arena-aware streaming SELECT API.
+    /// On SCALARSQ streaming-shape detection (`is_scalarsq_streaming_
+    /// shape`), routes to `exec_scalarsq_streaming` and emits each
+    /// projected row straight out of an arena-backed `bumpalo::Vec`
+    /// scratch — no `Vec<Row<'static>>` ever materialises in the
+    /// engine for this shape.
+    ///
+    /// Non-streaming shapes fall through to the generic
+    /// `exec_select_cancel` materialised path and emit row-by-row
+    /// off the returned `Vec<Row>`; callers stay shape-blind.
+    ///
+    /// Caller passes a `&'a Bump`; per-row projection scratch lives
+    /// in that arena and drops in O(1) at the caller's
+    /// `Bump::reset()` / scope end. This is the SPG equivalent of
+    /// PG's per-query MessageContext / printtup pattern.
+    ///
+    /// The shape check is fast (~10 boolean field reads + items
+    /// walk); calling on every prepared SELECT is fine.
+    pub fn execute_readonly_select_with_arena<'a, F>(
+        &self,
+        s: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        arena: &'a bumpalo::Bump,
+        mut emit: F,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, usize), EngineError>
+    where
+        F: FnMut(
+            &[spg_storage::ColumnSchema],
+            &[spg_storage::Value<'a>],
+        ) -> Result<(), EngineError>,
+    {
+        cancel.check()?;
+        if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
+            return self.exec_scalarsq_streaming(s, cancel, arena, emit);
+        }
+        // Generic fallback — same as `execute_readonly_select_prepared`
+        // but adapted to the streaming-shape API's columns+row
+        // callback signature. The arena isn't used here (cells are
+        // owned `Value<'static>`); the win for the fallback shape
+        // lands in later phases.
+        let QueryResult::Rows { columns, rows } = self.exec_select_cancel(s, cancel)? else {
+            return Err(EngineError::Unsupported(
+                "execute_readonly_select_with_arena fallback got a non-Rows result".into(),
+            ));
+        };
+        for row in &rows {
+            // `&[Value<'static>]` satisfies `&[Value<'a>]` via
+            // covariance of `Cow<'a, str>` in `'a`.
+            emit(&columns, &row.values)?;
+        }
+        let n = rows.len();
+        Ok((columns, n))
+    }
+
     pub fn execute_readonly_select_streaming_prepared<F>(
         &self,
         s: &spg_sql::ast::SelectStatement,

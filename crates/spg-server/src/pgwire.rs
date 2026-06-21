@@ -410,10 +410,74 @@ fn handle_pg_simple_query(
         // closure + cell_refs Vec management. The streaming wrapper
         // still runs for prepared SELECTs without subqueries (joined
         // non-aggregate projection — the original PROJ consumer).
-        let take_materialised_path = prepared_stmt
-            .as_ref()
-            .is_some_and(|s| spg_engine::expr_tree_has_subquery(s.as_ref()));
-        let stream_result: Result<usize, spg_engine::EngineError> = if take_materialised_path {
+        // v7.37.42-arena Phase 2 — SCALARSQ streaming-shape dispatch.
+        // For the narrow SCALARSQ shape (single-table SELECT with at
+        // least one scalar subquery in projection + no ORDER BY /
+        // GROUP BY / DISTINCT / window / UNION / CTE — see
+        // `spg_engine::scalarsq_streaming::is_scalarsq_streaming_shape`),
+        // call the slim arena-aware streaming executor that emits
+        // each projected row straight into `wbuf` via the encode
+        // closure below. Skips the engine-side `Vec<Row>`
+        // materialise the `execute_readonly_select_prepared` path
+        // pays for shape-forced materialisation; the per-row
+        // projection scratch lives in a bumpalo arena that bulk-
+        // resets at end of `Bump::new` scope. The wire-side encoded
+        // bytes accumulate in `wbuf` so the final write_all is still
+        // a single TCP syscall.
+        let take_scalarsq_streaming = prepared_stmt.as_ref().is_some_and(|s| {
+            spg_engine::scalarsq_streaming::is_scalarsq_streaming_shape(s.as_ref())
+        });
+        let take_materialised_path = !take_scalarsq_streaming
+            && prepared_stmt
+                .as_ref()
+                .is_some_and(|s| spg_engine::expr_tree_has_subquery(s.as_ref()));
+        let stream_result: Result<usize, spg_engine::EngineError> = if take_scalarsq_streaming {
+            let s = prepared_stmt
+                .as_ref()
+                .expect("guarded by is_some_and above");
+            // Per-query bumpalo arena — drops in O(1) at scope end,
+            // releasing the per-row projection scratch + (Phase 3)
+            // arena-allocated wire-cell payloads in one bulk reset.
+            // Models PG's per-query MessageContext + printtup.
+            let arena = bumpalo::Bump::new();
+            (|| -> Result<usize, spg_engine::EngineError> {
+                // RowDescription is deferred until first row callback
+                // (executor returns columns alongside the emit) so we
+                // emit it on the first row callback. An empty result
+                // still owes the RowDescription, sent below the loop.
+                let mut header_written = false;
+                let emit_row = |columns: &[spg_storage::ColumnSchema],
+                                values: &[spg_storage::Value<'_>]|
+                 -> Result<(), spg_engine::EngineError> {
+                    if !header_written {
+                        cols_storage.extend_from_slice(columns);
+                        send_row_description(wbuf, columns)
+                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                        header_written = true;
+                    }
+                    let before = wbuf.len();
+                    encode_data_row_from_values(wbuf, &cols_storage, values)
+                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                    if first_row_size.is_none() {
+                        first_row_size = Some(wbuf.len() - before);
+                    }
+                    Ok(())
+                };
+                let (columns, n) = engine_lock.execute_readonly_select_with_arena(
+                    s.as_ref(),
+                    cancel,
+                    &arena,
+                    emit_row,
+                )?;
+                if !header_written {
+                    cols_storage.extend_from_slice(&columns);
+                    send_row_description(wbuf, &columns)
+                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                }
+                wrote_header = true;
+                Ok(n)
+            })()
+        } else if take_materialised_path {
             let s = prepared_stmt
                 .as_ref()
                 .expect("guarded by is_some_and above");
@@ -3603,13 +3667,28 @@ fn encode_data_row_from_refs(
 /// extended-protocol path (line 1625), which see at most a handful of
 /// rows per call and don't justify the same buffer-handle threading.
 fn encode_data_row(out: &mut Vec<u8>, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
-    let n = u16::try_from(row.values.len())
+    encode_data_row_from_values(out, cols, &row.values)
+}
+
+/// v7.37.42-arena Phase 2 — `&[Value]` variant of `encode_data_row`.
+/// The SCALARSQ streaming executor keeps an arena-backed per-row
+/// `bumpalo::Vec<Value>` scratch and hands a borrowed slice to the
+/// wire encoder without wrapping in a fresh `Row` (and the
+/// `Vec<Value>` alloc it would force on the 100-row-per-query hot
+/// path). The cells themselves are encoded identically to
+/// `encode_data_row`.
+fn encode_data_row_from_values(
+    out: &mut Vec<u8>,
+    cols: &[ColumnSchema],
+    values: &[Value<'_>],
+) -> std::io::Result<()> {
+    let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
     let frame_start = out.len();
     out.push(b'D');
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
-    for (i, v) in row.values.iter().enumerate() {
+    for (i, v) in values.iter().enumerate() {
         encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty))?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;

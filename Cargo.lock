@@ -1530,6 +1530,7 @@ dependencies = [
 name = "spg-engine"
 version = "7.37.3"
 dependencies = [
+ "bumpalo",
  "criterion",
  "hashbrown 0.15.5",
  "sha1",
@@ -1550,6 +1551,7 @@ dependencies = [
 name = "spg-server"
 version = "7.37.3"
 dependencies = [
+ "bumpalo",
  "libc",
  "rcgen",
  "rustls",

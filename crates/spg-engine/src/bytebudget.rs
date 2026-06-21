@@ -34,8 +34,16 @@ pub(crate) fn approx_value_bytes(v: &Value) -> usize {
 /// Approximate heap bytes held by one materialised `Row`: per-cell
 /// enum slots plus fat payloads.
 pub(crate) fn approx_row_bytes(row: &Row<'static>) -> usize {
-    row.values.len() * core::mem::size_of::<Value>()
-        + row.values.iter().map(approx_value_bytes).sum::<usize>()
+    approx_values_bytes(&row.values)
+}
+
+/// v7.37.42-arena Phase 2 — same accounting as `approx_row_bytes` but
+/// takes a borrowed `&[Value]` slice. The SCALARSQ streaming executor
+/// keeps a reusable per-query `Vec<Value>` scratch (in a bumpalo
+/// arena) and charges the budget per row without ever wrapping it in
+/// a `Row` — this lets it skip the per-row Row alloc on the hot path.
+pub(crate) fn approx_values_bytes(values: &[Value<'_>]) -> usize {
+    core::mem::size_of_val(values) + values.iter().map(approx_value_bytes).sum::<usize>()
 }
 
 /// v7.30.3 (mailrs round-26) — per-query byte budget for join/filter

@@ -29,7 +29,21 @@
 // See `.claude/notes/v7.37.42-scalarsq-specialized-executor-design.md`
 // for the full (A3) attack design.
 
+use alloc::borrow::Cow;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
+use bumpalo::Bump;
 use spg_sql::ast::{Expr, SelectItem, SelectStatement};
+use spg_storage::{ColumnSchema, Row, StorageError, Value};
+
+use crate::bytebudget::{ByteBudget, approx_values_bytes};
+use crate::cancel::CancelToken;
+use crate::eval;
+use crate::index_access::{try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_trgm_seek};
+use crate::memoize::MemoizeCache;
+use crate::select::build_projection;
+use crate::{Engine, EngineError};
 
 /// `true` iff `stmt` matches the SCALARSQ streaming shape — see the
 /// module-level docs for the precise rules.
@@ -227,6 +241,300 @@ fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
                     .as_deref()
                     .is_some_and(expr_has_streaming_disqualifier)
         }
+    }
+}
+
+impl Engine {
+    /// v7.37.42-arena Phase 2 — slim arena-aware streaming executor
+    /// for the SCALARSQ shape (`SELECT col, scalar_subq FROM
+    /// single_table [WHERE …] [LIMIT N]`). Mirrors
+    /// `run_single_table_scan`'s hot path but without the
+    /// `tagged: Vec<(order_keys, Row)>` intermediate, without the
+    /// `Vec<Row<'static>>` post-loop QueryResult materialise, and
+    /// with the per-row projection scratch `Vec<Value>` allocated in
+    /// the caller-supplied bumpalo `Bump` arena — when the query
+    /// ends, the arena drops in O(1) instead of paying N row Vec
+    /// `Drop`s.
+    ///
+    /// The detector (`is_scalarsq_streaming_shape`) guarantees:
+    ///   * single-table FROM (no joins / UNNEST / lateral / AS OF)
+    ///   * no ORDER BY / GROUP BY / HAVING / DISTINCT / WITH TIES
+    ///   * no UNION / EXCEPT / CTE
+    ///   * no wildcard projection
+    ///   * no top-level UNNEST SRF in projection
+    /// so the post-loop sort/dedup/limit pipeline is unnecessary;
+    /// each output row depends only on its outer row + the per-row
+    /// scalar subquery evaluation.
+    ///
+    /// `emit` takes `&[Value<'a>]` (not `&Row`) so the per-row
+    /// projection buffer can be reused via `clear()` + `push()`
+    /// without a per-row outer `Vec` alloc. The arena lifetime `'a`
+    /// is anchored by the caller's `&'a Bump`; the buffer + any
+    /// future `&'a str` cell payloads (Phase 3) inherit it.
+    ///
+    /// Returns the column schema + total emitted row count
+    /// (post-OFFSET, post-LIMIT).
+    pub(crate) fn exec_scalarsq_streaming<'a, F>(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+        arena: &'a Bump,
+        mut emit: F,
+    ) -> Result<(Vec<ColumnSchema>, usize), EngineError>
+    where
+        F: FnMut(&[ColumnSchema], &[Value<'a>]) -> Result<(), EngineError>,
+    {
+        if !is_scalarsq_streaming_shape(stmt) {
+            return Err(EngineError::Unsupported(
+                "exec_scalarsq_streaming: not a streaming-shape SELECT".to_string(),
+            ));
+        }
+        // Shape-check guarantees `stmt.from` is `Some(_)` with a
+        // plain single-table primary.
+        let from = stmt
+            .from
+            .as_ref()
+            .expect("streaming shape requires FROM (detector enforces)");
+        let primary = &from.primary;
+        let catalog = self.active_catalog();
+        let table = catalog.get(&primary.name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: primary.name.clone(),
+            })
+        })?;
+        let schema_cols = &table.schema().columns;
+        let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
+        let projection = build_projection(&stmt.items, schema_cols, alias)?;
+        // Index seek for WHERE — mirrors run_single_table_scan's
+        // four-way fallback (BTree equality / GIN tsvector / trigram
+        // LIKE / GIN JSONB containment). When none fires, the full
+        // hot+cold scan covers the rest.
+        let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
+            try_index_seek(w, schema_cols, catalog, table, alias)
+                .or_else(|| try_gin_seek(w, schema_cols, catalog, table, alias, &ctx))
+                .or_else(|| try_trgm_seek(w, schema_cols, table, alias))
+                .or_else(|| try_gin_jsonb_seek(w, schema_cols, table, alias))
+        });
+        // Compile the WHERE once. For subquery-free predicates the
+        // compiled path runs a flat step program; correlated /
+        // subquery-bearing WHEREs fall through to the interpreter.
+        let compiled_where: Option<eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| eval::fully_compilable(w))
+            .map(|w| eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
+        // Pre-analyse every projection-item scalar subquery for the
+        // PK-probe fast path. Per-row eval becomes one outer-column
+        // read + one PK index seek — no Expr clone, no walker.
+        let scalarsq_fast: Vec<Option<crate::ScalarPkProbeFastPath>> = projection
+            .iter()
+            .map(|p| {
+                if let Expr::ScalarSubquery(inner) = &p.expr {
+                    self.analyse_scalar_count_pk_eq_probe(inner, schema_cols, alias)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let any_scalarsq_fast = scalarsq_fast.iter().any(Option::is_some);
+        // OFFSET/LIMIT — `target = OFFSET + LIMIT` short-circuits the
+        // scan once enough rows are emitted.
+        let lim = stmt.limit_literal().map(|n| n as usize);
+        let off = stmt.offset_literal().map(|n| n as usize).unwrap_or(0);
+        let target = lim.map(|n| n.saturating_add(off));
+        // Skip the batch-correlated-scalar memo for tiny outer
+        // counts (LIMIT 100-ish): the batch path scans the FULL inner
+        // table; per-row PK seek (~5 µs × 100 = 500 µs) wins.
+        let pass_memo = target.is_none_or(|cap| cap > 1000);
+        let mut memo = MemoizeCache::new();
+        let mut budget = ByteBudget::new(self.max_query_bytes);
+        // Output columns built once; the caller (wire encoder)
+        // borrows this slice for every row.
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // v7.37.42-arena Phase 2 — row projection buffer lives in
+        // the bumpalo arena. The buffer is reused via `clear()` +
+        // `push()` per row, but the Vec storage itself (and any
+        // future `&'a str` cell payloads from Phase 3) is arena-
+        // allocated, so the arena's bulk-reset on query end is what
+        // replaces per-row Drop.
+        let mut row_buf: bumpalo::collections::Vec<'a, Value<'a>> =
+            bumpalo::collections::Vec::with_capacity_in(projection.len(), arena);
+        let mut survived: usize = 0; // pre-LIMIT/OFFSET count
+        let mut emitted: usize = 0; // post-LIMIT/OFFSET count
+        // Per-row work: WHERE-filter + project + apply offset/limit
+        // + emit. Captures `&mut emit`, `&mut row_buf`, `&mut
+        // survived`, `&mut emitted`, plus the per-row tooling. Hot
+        // path identical to run_single_table_scan's process_row but
+        // writes to `emit` directly instead of `tagged.push`.
+        #[allow(clippy::too_many_arguments)]
+        fn run_one<'a, F>(
+            engine: &Engine,
+            row: &Row<'static>,
+            loop_idx: usize,
+            stmt: &SelectStatement,
+            ctx: &crate::eval::EvalContext<'_>,
+            compiled_where: &Option<eval::CompiledExpr>,
+            projection: &[crate::select::ProjectedItem],
+            scalarsq_fast: &[Option<crate::ScalarPkProbeFastPath>],
+            any_scalarsq_fast: bool,
+            pass_memo: bool,
+            off: usize,
+            row_buf: &mut bumpalo::collections::Vec<'a, Value<'a>>,
+            memo: &mut MemoizeCache,
+            eval_stack: &mut Vec<Value<'static>>,
+            survived: &mut usize,
+            emitted: &mut usize,
+            budget: &mut ByteBudget,
+            columns: &[ColumnSchema],
+            cancel: CancelToken<'_>,
+            emit: &mut F,
+        ) -> Result<(), EngineError>
+        where
+            F: FnMut(&[ColumnSchema], &[Value<'a>]) -> Result<(), EngineError>,
+        {
+            if loop_idx.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if let Some(cw) = compiled_where {
+                let cond =
+                    eval::eval_compiled(cw, row, ctx, eval_stack).map_err(EngineError::Eval)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    return Ok(());
+                }
+            } else if let Some(where_expr) = &stmt.where_ {
+                let cond =
+                    engine.eval_expr_with_correlated(where_expr, row, ctx, cancel, Some(memo))?;
+                if !matches!(cond, Value::Bool(true)) {
+                    return Ok(());
+                }
+            }
+            // Build projection row in arena-backed buffer.
+            row_buf.clear();
+            for (i, p) in projection.iter().enumerate() {
+                if any_scalarsq_fast && let Some(fp) = &scalarsq_fast[i] {
+                    row_buf.push(engine.probe_with_pk_fast_path(fp, row));
+                    continue;
+                }
+                let memo_arg = if pass_memo { Some(&mut *memo) } else { None };
+                row_buf
+                    .push(engine.eval_expr_with_correlated(&p.expr, row, ctx, cancel, memo_arg)?);
+            }
+            // OFFSET: drop the first `off` survived rows.
+            *survived = survived.saturating_add(1);
+            if *survived <= off {
+                return Ok(());
+            }
+            // Budget enforcement matches run_single_table_scan: charge
+            // each row before emit so a fat scan trips
+            // QueryBytesExceeded at the ceiling instead of past it.
+            budget.charge(approx_values_bytes(row_buf))?;
+            emit(columns, row_buf)?;
+            *emitted = emitted.saturating_add(1);
+            Ok(())
+        }
+        // Hot tier first, then cold tier — matches
+        // run_single_table_scan's order so result ordering is the
+        // same. Streaming shape has no ORDER BY so the order isn't
+        // semantically observable, but matching the generic path
+        // makes the differential test byte-exact for single-tier.
+        if let Some(rows) = &indexed_rows {
+            for (loop_idx, cow) in rows.iter().enumerate() {
+                if let Some(cap) = target
+                    && emitted >= cap.saturating_sub(off)
+                {
+                    break;
+                }
+                run_one(
+                    self,
+                    cow.as_ref(),
+                    loop_idx,
+                    stmt,
+                    &ctx,
+                    &compiled_where,
+                    &projection,
+                    &scalarsq_fast,
+                    any_scalarsq_fast,
+                    pass_memo,
+                    off,
+                    &mut row_buf,
+                    &mut memo,
+                    &mut eval_stack,
+                    &mut survived,
+                    &mut emitted,
+                    &mut budget,
+                    &columns,
+                    cancel,
+                    &mut emit,
+                )?;
+            }
+        } else {
+            for i in 0..table.row_count() {
+                if let Some(cap) = target
+                    && emitted >= cap.saturating_sub(off)
+                {
+                    break;
+                }
+                run_one(
+                    self,
+                    &table.rows()[i],
+                    i,
+                    stmt,
+                    &ctx,
+                    &compiled_where,
+                    &projection,
+                    &scalarsq_fast,
+                    any_scalarsq_fast,
+                    pass_memo,
+                    off,
+                    &mut row_buf,
+                    &mut memo,
+                    &mut eval_stack,
+                    &mut survived,
+                    &mut emitted,
+                    &mut budget,
+                    &columns,
+                    cancel,
+                    &mut emit,
+                )?;
+            }
+            // Cold tier — mirrors run_single_table_scan's final loop.
+            let cold_rows = self.iter_cold_rows_of_table(table);
+            for (offset, row) in cold_rows.iter().enumerate() {
+                if let Some(cap) = target
+                    && emitted >= cap.saturating_sub(off)
+                {
+                    break;
+                }
+                run_one(
+                    self,
+                    row,
+                    table.row_count() + offset,
+                    stmt,
+                    &ctx,
+                    &compiled_where,
+                    &projection,
+                    &scalarsq_fast,
+                    any_scalarsq_fast,
+                    pass_memo,
+                    off,
+                    &mut row_buf,
+                    &mut memo,
+                    &mut eval_stack,
+                    &mut survived,
+                    &mut emitted,
+                    &mut budget,
+                    &columns,
+                    cancel,
+                    &mut emit,
+                )?;
+            }
+        }
+        Ok((columns, emitted))
     }
 }
 

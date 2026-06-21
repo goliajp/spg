@@ -14,6 +14,10 @@ hashbrown    = { workspace = true }
 spg-crypto  = { workspace = true }
 spg-sql     = { workspace = true }
 spg-storage = { workspace = true }
+# v7.37.42-arena Phase 2 — per-query Bump arena for the SCALARSQ
+# streaming executor's row scratch + projection buffer. Keeps the
+# Vec<Value> outer alloc off the heap and bulk-resets at query end.
+bumpalo     = { workspace = true }
 # v7.17.0 Phase 3.P0-71 — `mysql_native_password` auth verifier
 # stores SHA1(SHA1(password)) per user. RustCrypto's `sha1` is
 # the smallest dep that lands a no_std-friendly SHA-1 in the
