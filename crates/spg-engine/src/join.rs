@@ -247,6 +247,46 @@ impl RowRef<'_> {
             }
         }
     }
+
+    /// v7.37.5-A2b (profile-guided Track A) — same as `as_row` but
+    /// writes into a caller-owned buffer that survives the row loop.
+    /// Profile showed `as_row` allocating + freeing a fresh
+    /// `Vec<Value>` of full combined width per outer row in
+    /// `accumulate_groups`'s `needs_mat` path (~15 % self time in
+    /// `to_vec`/`Value::clone`/`drop` combined, ~10-20 MB per-query
+    /// allocator churn at 24 k × 30-cell width). Reusing the buffer
+    /// keeps the Vec backing across iterations — Value clones still
+    /// fire (they're semantically owned) but the Vec allocation +
+    /// free goes away. `Owned` rows clone into the buffer too so the
+    /// caller can pass a single buffer through both branches; the
+    /// Vec stays warm in the allocator across all calls.
+    pub(crate) fn as_row_into(&self, buf: &mut Vec<Value<'static>>) {
+        buf.clear();
+        match self {
+            RowRef::Owned(r) => {
+                buf.reserve(r.values.len());
+                for v in &r.values {
+                    buf.push(v.clone());
+                }
+            }
+            RowRef::Tuple {
+                sources,
+                offsets,
+                pos_to_src,
+                tuple,
+            } => {
+                let width = offsets.last().copied().unwrap_or(0);
+                buf.reserve(width);
+                for pos in 0..width {
+                    buf.push(
+                        tuple_value_indexed(sources, offsets, pos_to_src, tuple, pos)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Clone a source row's values into a combined-row buffer. A mask
