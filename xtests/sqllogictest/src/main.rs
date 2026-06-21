@@ -61,7 +61,42 @@ fn main() -> ExitCode {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        groups.push(run_group(&group_name, &path));
+        // If a top-level group dir has no `.test` files of its own but
+        // does contain subdirectories, treat each subdirectory as its
+        // own group named `<parent>/<sub>`. Lets `spg_baseline/` hold
+        // a 14-directory taxonomy without flattening all files into one
+        // big group.
+        let has_own_tests = fs::read_dir(&path)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("test"))
+            })
+            .unwrap_or(false);
+        let subdirs: Vec<PathBuf> = fs::read_dir(&path)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !has_own_tests && !subdirs.is_empty() {
+            let mut sd = subdirs;
+            sd.sort();
+            for sub in sd {
+                let sub_name = sub
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let composite = format!("{group_name}/{sub_name}");
+                groups.push(run_group(&composite, &sub));
+            }
+        } else {
+            groups.push(run_group(&group_name, &path));
+        }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
 
