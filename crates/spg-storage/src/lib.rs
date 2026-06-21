@@ -2539,6 +2539,14 @@ pub struct Catalog {
     /// Persisted in catalog FILE_VERSION 30+; older catalogs
     /// deserialise with an empty map.
     domain_types: BTreeMap<String, DomainDef>,
+    /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
+    /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
+    /// reference these by name via
+    /// `ColumnSchema.user_composite_type` (parallel to
+    /// `user_enum_type` / `user_domain_type`). Persisted in catalog
+    /// FILE_VERSION 52+; older catalogs deserialise with an empty
+    /// map.
+    composite_types: BTreeMap<String, CompositeDef>,
     /// v7.17.0 — schema-namespace registry (Phase 1.6). Tracks
     /// which schemas exist. `public`, `pg_catalog`, and
     /// `information_schema` are built-in and always present.
@@ -2763,6 +2771,30 @@ pub struct EnumDef {
     pub labels: Vec<String>,
 }
 
+/// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE type
+/// (`CREATE TYPE name AS (field_name field_type, ...)`). Order
+/// matters: PG composite literals are positional, and SPG mirrors
+/// that. Stored as ordered `(name, DataType)` pairs to keep the
+/// codec straightforward and to allow eventual `Value::Composite`
+/// bodies to encode positionally. Persisted in catalog FILE_VERSION
+/// 52+; older catalogs deserialise with an empty composite_types
+/// map. Composite types can be used as a column type by spelling
+/// the composite's name; the resolution from
+/// `ColumnSchema.user_composite_type = Some(name)` happens at the
+/// engine boundary (parallel to `user_enum_type` /
+/// `user_domain_type`). The dense storage shape — JSON-text body
+/// keyed by the composite's field list — keeps the codec free of
+/// recursive `Value` bodies until the full Value::Composite arena
+/// migration in a later phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeDef {
+    pub name: String,
+    /// Ordered `(field_name, field_type)` pairs. PG composite
+    /// literals are positional, so order is part of the type's
+    /// identity.
+    pub fields: Vec<(String, DataType)>,
+}
+
 /// v7.17.0 Phase 1.2 — catalogued VIEW. The body is stored as the
 /// raw source text the parser saw between `AS` and the statement
 /// terminator; the engine re-parses on each invocation. Same
@@ -2823,6 +2855,7 @@ impl Catalog {
             materialized_views: BTreeMap::new(),
             enum_types: BTreeMap::new(),
             domain_types: BTreeMap::new(),
+            composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
     }
@@ -3100,6 +3133,35 @@ impl Catalog {
     /// v7.17.0 Phase 1.5 — drop a DOMAIN by name.
     pub fn drop_domain_type(&mut self, name: &str) -> bool {
         self.domain_types.remove(name).is_some()
+    }
+
+    /// v7.37.42-T2 ζ-B — read-only handle to user-defined COMPOSITE
+    /// catalog. Used by the engine to resolve
+    /// `ColumnSchema.user_composite_type` lookups + by
+    /// information_schema-style introspection.
+    pub const fn composite_types(&self) -> &BTreeMap<String, CompositeDef> {
+        &self.composite_types
+    }
+
+    /// v7.37.42-T2 ζ-B — install a new COMPOSITE type. Errors if
+    /// `name` already exists in the composite registry (PG forbids
+    /// IF NOT EXISTS on CREATE TYPE composite; the engine surfaces
+    /// the collision with the existing name).
+    pub fn create_composite_type(&mut self, def: CompositeDef) -> Result<(), StorageError> {
+        if self.composite_types.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "type {:?} already exists",
+                def.name
+            )));
+        }
+        self.composite_types.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.37.42-T2 ζ-B — drop a COMPOSITE type by name. Returns
+    /// true if a type was removed.
+    pub fn drop_composite_type(&mut self, name: &str) -> bool {
+        self.composite_types.remove(name).is_some()
     }
 
     /// v7.17.0 Phase 1.6 — read-only handle to the user-created
@@ -4886,7 +4948,21 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v50 catalogs never wrote tag 6(the same DDL loaded as a
 ///     BTree fallback); v51 readers see tag 6 explicitly and dispatch
 ///     into `IndexKind::GinJsonb`.
-const FILE_VERSION: u8 = 51;
+/// v52 introduces (v7.37.42-T2 ζ-B composite + domain metasystem):
+///   * Trailing COMPOSITE-types catalog block after the
+///     user-schemas block. Encoded as `u32 count` followed by
+///     per-entry: `name`, `u16 field_count`, then `field_count`
+///     `[str field_name][data_type]` pairs (`write_data_type` is
+///     reused). v51-and-below catalogs deserialise with an empty
+///     composite_types map; v52 readers tolerate v51 catalogs by
+///     stopping at the schema block (no composite block present
+///     ⇒ empty map). Composite types are referenced by columns
+///     via `ColumnSchema.user_composite_type`, mirroring the
+///     `user_enum_type` / `user_domain_type` pattern. The block
+///     lands here (not as a per-table appendix) so dropping the
+///     composite type registers globally and DROP TYPE can find it
+///     without a table scan.
+const FILE_VERSION: u8 = 52;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5580,6 +5656,24 @@ impl Catalog {
         for name in &self.schemas {
             write_str(&mut out, name);
         }
+        // v7.37.42-T2 ζ-B — COMPOSITE types catalog block
+        // (FILE_VERSION 52+). Each entry: name, u16 field_count,
+        // then field_count `[str field_name][data_type]` pairs.
+        write_u32(
+            &mut out,
+            u32::try_from(self.composite_types.len()).expect("≤ 4G composite types"),
+        );
+        for c in self.composite_types.values() {
+            write_str(&mut out, &c.name);
+            write_u16(
+                &mut out,
+                u16::try_from(c.fields.len()).expect("≤ 65k fields / composite"),
+            );
+            for (fname, fty) in &c.fields {
+                write_str(&mut out, fname);
+                write_data_type(&mut out, *fty);
+            }
+        }
         out
     }
 
@@ -5817,6 +5911,25 @@ impl Catalog {
             for _ in 0..sch_count {
                 let name = cur.read_str()?;
                 cat.schemas.insert(name);
+            }
+        }
+        // v7.37.42-T2 ζ-B — COMPOSITE types catalog block
+        // (FILE_VERSION 52+). v51-and-below readers stop at the
+        // user-schemas block; v52 readers fed a v51 catalog see no
+        // composite block and default to an empty map.
+        if version >= 52 {
+            let ctype_count = cur.read_u32()? as usize;
+            for _ in 0..ctype_count {
+                let name = cur.read_str()?;
+                let field_count = cur.read_u16()? as usize;
+                let mut fields = Vec::with_capacity(field_count);
+                for _ in 0..field_count {
+                    let fname = cur.read_str()?;
+                    let fty = cur.read_data_type()?;
+                    fields.push((fname, fty));
+                }
+                cat.composite_types
+                    .insert(name.clone(), CompositeDef { name, fields });
             }
         }
         if cur.pos < buf.len() {
