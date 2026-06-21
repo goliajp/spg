@@ -1533,6 +1533,33 @@ fn apply_function_dispatch(
         "current_database" | "database" => Ok(Value::text("spg")),
         "current_schema" => Ok(Value::text::<String>("public".into())),
         "current_user" | "session_user" | "user" => Ok(Value::text::<String>("admin".into())),
+        // v7.37.43-T4 — PG advisory locks. SPG is single-writer +
+        // single-process; the engine holds its own exclusive RwLock
+        // on the write path, so there's no concurrent-writer race
+        // for advisory locks to mediate. `sqlx::migrate!()` issues
+        // `pg_advisory_lock($1)` / `pg_advisory_unlock($1)` around
+        // its migration set so two parallel migrators don't double-
+        // apply; under SPG semantics those calls become no-ops that
+        // return `void` / `bool true` per PG's signatures, so the
+        // sqlx migration pipeline runs end-to-end. Same applies to
+        // every drop-in customer (mailrs, sentori, any sqlx-shaped
+        // app) — they get advisory-lock acceptance for free without
+        // a customer-side code change. Reservation-level functions
+        // (`pg_try_advisory_lock` / `_unlock_all`) match the same
+        // contract — true on lock attempt, true on unlock, void on
+        // unlock_all — because under single-writer there's nothing
+        // a real lock would block.
+        "pg_advisory_lock"
+        | "pg_advisory_xact_lock"
+        | "pg_advisory_lock_shared"
+        | "pg_advisory_xact_lock_shared" => Ok(Value::Null),
+        "pg_try_advisory_lock"
+        | "pg_try_advisory_xact_lock"
+        | "pg_try_advisory_lock_shared"
+        | "pg_try_advisory_xact_lock_shared"
+        | "pg_advisory_unlock"
+        | "pg_advisory_unlock_shared" => Ok(Value::Bool(true)),
+        "pg_advisory_unlock_all" => Ok(Value::Null),
         // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
         // canonical PG lowercase type name. sqlx / SQLAlchemy /
         // Diesel emit this during describe; generic ORMs may

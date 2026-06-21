@@ -66,6 +66,28 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         }
         Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),
         Value::Numeric { scaled, scale } => Literal::String(format_numeric(scaled, scale)),
+        // v7.37.43-T4 — UUID round-trips through its canonical
+        // 8-4-4-4-12 hex text form. `coerce_value` against a UUID
+        // target column re-parses the literal back to `Value::Uuid`.
+        // Sentori migration 0009_quotas.sql backfills `org_quotas`
+        // from `orgs.id` (UUID PK), which exercises this materialise
+        // shape on every sqlx-migrate user porting a UUID-keyed
+        // schema. Pre-T4 this failed with "INSERT … SELECT cannot
+        // materialise value of type Some(Uuid)" and broke the
+        // backfill in 0009 plus every analogous DDL+backfill pair.
+        Value::Uuid(bytes) => Literal::String(spg_storage::format_uuid(&bytes)),
+        // BYTEA: hex-encode through `\x…` literal so re-parse
+        // recognises bytea. PG's text form for bytea is `\\xHEX`
+        // (single backslash on the wire, escaped here for Rust).
+        Value::Bytes(bs) => {
+            let mut s = alloc::string::String::with_capacity(2 + bs.len() * 2);
+            s.push_str("\\x");
+            for b in bs.iter() {
+                use core::fmt::Write;
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            Literal::String(s)
+        }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "INSERT … SELECT cannot materialise value of type {:?}; \
