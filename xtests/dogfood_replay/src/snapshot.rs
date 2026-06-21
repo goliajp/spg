@@ -127,38 +127,46 @@ pub fn extract_snapshot(tarball: &Path) -> Result<ExtractedSnapshot> {
 fn locate_catalog(root: &Path) -> Result<PathBuf> {
     // Heuristic: walk one level deep looking for a `*.spg`
     // directory (the standard SPG on-disk layout). If nothing
-    // matches, fall back to the root itself.
+    // matches, fall back to the root itself. NOTE: SPG's open_path
+    // takes the catalog DIR — for older catalogs the on-disk shape was
+    // `mailrs.spg` as a regular file (with sibling `mailrs.spg.wal/`
+    // directory). In that case open_path takes the parent dir, not
+    // the file. So we accept *either* a `*.spg` directory or a `*.spg`
+    // regular file's parent as the open-path target.
     for entry in std::fs::read_dir(root)
         .with_context(|| format!("scan extracted snapshot {}", root.display()))?
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".spg"))
-            {
-                return Ok(path);
-            }
-            // Recurse one level — some tarballs nest under a top dir.
-            if let Ok(inner) = std::fs::read_dir(&path) {
-                for sub in inner.flatten() {
-                    let sub_path = sub.path();
-                    if sub_path.is_dir()
-                        && sub_path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .is_some_and(|s| s.ends_with(".spg"))
-                    {
-                        return Ok(sub_path);
-                    }
+        let name_ok = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(".spg"));
+        if name_ok {
+            // open_path takes the catalog db path itself (regardless
+            // of whether it's a directory or file). It derives the WAL
+            // dir by appending `.wal` to the file_name. So we return
+            // the actual *.spg path in both cases.
+            return Ok(path);
+        }
+        // Recurse one level — some tarballs nest under a top dir.
+        if path.is_dir()
+            && let Ok(inner) = std::fs::read_dir(&path)
+        {
+            for sub in inner.flatten() {
+                let sub_path = sub.path();
+                let sub_name_ok = sub_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.ends_with(".spg"));
+                if sub_name_ok {
+                    return Ok(sub_path);
                 }
             }
         }
     }
     Err(anyhow!(
-        "no *.spg catalog directory found under extracted snapshot at {}",
+        "no *.spg catalog directory or file found under extracted snapshot at {}",
         root.display()
     ))
 }
