@@ -3226,3 +3226,109 @@ fn partition_bound_minvalue_maxvalue_round_trip() {
     }
     assert_eq!(bytes, back.serialize());
 }
+
+// v7.37.42-arena Phase 4 — `Value::clone_into(arena)` lifts an owned
+// `Value<'static>` into the bump arena. The result must compare equal
+// to the source (Cow value semantics) regardless of the underlying
+// `Cow::Borrowed` / `Cow::Owned` split, and must lift cleanly back to
+// `Value<'static>` via `into_owned()`.
+#[test]
+fn arena_clone_into_round_trip_heap_variants() {
+    let arena = bumpalo::Bump::new();
+
+    let owned_text = Value::text("hello world");
+    let arena_text = owned_text.clone_into(&arena);
+    assert_eq!(arena_text, owned_text);
+    assert_eq!(arena_text.clone().into_owned(), owned_text);
+
+    let owned_json = Value::json(r#"{"k":1}"#);
+    let arena_json = owned_json.clone_into(&arena);
+    assert_eq!(arena_json, owned_json);
+
+    let owned_xml = Value::xml("<a/>");
+    let arena_xml = owned_xml.clone_into(&arena);
+    assert_eq!(arena_xml, owned_xml);
+
+    let owned_bytes = Value::bytes(alloc::vec![1u8, 2, 3, 4]);
+    let arena_bytes = owned_bytes.clone_into(&arena);
+    assert_eq!(arena_bytes, owned_bytes);
+
+    let owned_vec = Value::vector(alloc::vec![1.0f32, 2.0, 3.0]);
+    let arena_vec = owned_vec.clone_into(&arena);
+    assert_eq!(arena_vec, owned_vec);
+
+    let owned_bits = Value::bit_string(12, alloc::vec![0xAB, 0xC0]);
+    let arena_bits = owned_bits.clone_into(&arena);
+    assert_eq!(arena_bits, owned_bits);
+}
+
+// v7.37.42-arena Phase 4 — `Value::clone_into` on Copy-able / nested-owned
+// variants (scalars, arrays, ranges, …) must produce an equal Value. The
+// implementation falls back to `clone().into_owned()` (heap blocks stay on
+// the global allocator), which is correctness-equivalent to the Cow path.
+#[test]
+fn arena_clone_into_round_trip_copy_and_nested_variants() {
+    let arena = bumpalo::Bump::new();
+    for v in [
+        Value::SmallInt(7),
+        Value::Int(-3),
+        Value::BigInt(42),
+        Value::Float(core::f64::consts::PI),
+        Value::Bool(true),
+        Value::Date(20_000),
+        Value::Timestamp(1_700_000_000_000_000),
+        Value::Uuid([1u8; 16]),
+        Value::Null,
+        Value::TextArray(alloc::vec![
+            Some("a".to_string()),
+            None,
+            Some("b".to_string()),
+        ]),
+        Value::IntArray(alloc::vec![Some(1), None, Some(3)]),
+    ] {
+        let lifted = v.clone_into(&arena);
+        assert_eq!(lifted, v, "clone_into changed scalar/array Value: {v:?}");
+    }
+}
+
+// v7.37.42-arena Phase 4 — `Row::clone_into` + `Row::into_owned` are
+// the row-level analogues of the Value boundary helpers. The bump arena
+// hosts the per-cell payloads; converting back must yield byte-identical
+// catalog rows (storage round-trip is the production gate).
+#[test]
+fn arena_row_clone_into_then_into_owned_round_trip() {
+    let arena = bumpalo::Bump::new();
+    let row = Row::new(alloc::vec![
+        Value::BigInt(1),
+        Value::text("ham"),
+        Value::Null,
+        Value::bytes(alloc::vec![0xDE, 0xAD]),
+    ]);
+
+    let arena_row = row.clone_into(&arena);
+    assert_eq!(arena_row, row);
+
+    let lifted: Row<'static> = arena_row.into_owned();
+    assert_eq!(lifted, row);
+
+    // Catalog round-trip — serialise via the storage codec, deserialise,
+    // and check the recovered Row is byte-identical to the original.
+    // This is the WAL/persistence boundary Phase 4 must preserve.
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("v", DataType::Text, true),
+            ColumnSchema::new("opt", DataType::SmallInt, true),
+            ColumnSchema::new("blob", DataType::Bytes, true),
+        ],
+    ))
+    .unwrap();
+    c.get_mut("t").unwrap().insert(lifted.clone()).unwrap();
+    let bytes = c.serialize();
+    let back = Catalog::deserialize(&bytes).unwrap();
+    let stored = back.get("t").unwrap().rows().get(0).cloned().unwrap();
+    assert_eq!(stored, lifted, "catalog round-trip diverged");
+    assert_eq!(bytes, back.serialize(), "catalog bytes round-trip diverged");
+}
