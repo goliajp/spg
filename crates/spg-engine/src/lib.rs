@@ -37,6 +37,7 @@ pub mod publications;
 pub mod query_stats;
 mod readonly;
 pub mod reorder;
+pub mod scalarsq_streaming;
 mod select;
 pub mod selectivity;
 mod sequence;
