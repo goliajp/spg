@@ -99,6 +99,21 @@ pub(crate) enum Step {
     Cast {
         target: spg_sql::ast::CastTarget,
     },
+    /// v7.37.5-A2b — `CASE [operand] WHEN x THEN y … ELSE z END`.
+    /// Each `(when, then)` branch and the optional `else` is a
+    /// pre-compiled sub-program; the executor short-circuits on the
+    /// first matching WHEN. Compiles only when **every** sub-program
+    /// is itself `fully_compilable` (so the Case never falls back to
+    /// a Subtree that would force a row materialise — profile-guided
+    /// fix for Track A `COUNT(DISTINCT CASE WHEN ...)` aggregates).
+    /// Searched form has `operand=None` and treats each WHEN as a
+    /// Bool predicate; simple form has `operand=Some(prog)` and
+    /// compares the operand value with each WHEN via `BinOp::Eq`.
+    Case {
+        operand: Option<CompiledExpr>,
+        branches: alloc::vec::Vec<(CompiledExpr, CompiledExpr)>,
+        else_branch: Option<CompiledExpr>,
+    },
     /// Fallback: interpret this subtree with eval_expr.
     Subtree(Expr),
 }
@@ -304,6 +319,39 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 target: target.clone(),
             });
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            // Gate by `fully_compilable` at the leaf: if any sub-expr
+            // can't compile natively, the whole Case stays Subtree so
+            // a single Case never escapes to a row-materialise eval.
+            let all_ok = operand.as_deref().is_none_or(fully_compilable)
+                && branches
+                    .iter()
+                    .all(|(w, t)| fully_compilable(w) && fully_compilable(t))
+                && else_branch.as_deref().is_none_or(fully_compilable);
+            if !all_ok {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            let op_c = operand
+                .as_deref()
+                .map(|o| compile_expr(o, ctx));
+            let branches_c: alloc::vec::Vec<(CompiledExpr, CompiledExpr)> = branches
+                .iter()
+                .map(|(w, t)| (compile_expr(w, ctx), compile_expr(t, ctx)))
+                .collect();
+            let else_c = else_branch
+                .as_deref()
+                .map(|el| compile_expr(el, ctx));
+            steps.push(Step::Case {
+                operand: op_c,
+                branches: branches_c,
+                else_branch: else_c,
+            });
+        }
         other => steps.push(Step::Subtree(other.clone())),
     }
 }
@@ -351,6 +399,26 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // is pure / context-free for the scalar targets we care
         // about (text, ints, floats, bool, dates).
         Expr::Cast { expr, .. } => fully_compilable(expr),
+        // v7.37.5-A2b — `CASE [operand] WHEN x THEN y … ELSE z END`
+        // when every sub-expression is itself fully-compilable. Hot
+        // shape: Track A's 14 aggregates over
+        // `COUNT(DISTINCT CASE WHEN m.message_id != '' THEN
+        //                          m.message_id
+        //                     ELSE CAST(m.id AS TEXT) END)` — without
+        // this, every Case fell to `arg_compiled = None`, forced
+        // `needs_mat = true` per-row, and triggered a full combined-
+        // row `Vec<Value>` clone for the eval path.
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_none_or(fully_compilable)
+                && branches
+                    .iter()
+                    .all(|(w, t)| fully_compilable(w) && fully_compilable(t))
+                && else_branch.as_deref().is_none_or(fully_compilable)
+        }
         _ => false,
     }
 }
@@ -616,6 +684,51 @@ pub(crate) fn eval_compiled_ref(
             Step::Cast { target } => {
                 let v = stack.pop().unwrap_or(Value::Null);
                 stack.push(super::cast::cast_value(v, target.clone())?);
+            }
+            Step::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                // v7.37.5-A2b — short-circuit Case executor. Mirrors
+                // `Expr::Case` interpreter semantics bit-for-bit (each
+                // WHEN evaluates with its own scratch stack; first
+                // match wins; ELSE = NULL when absent). Reuses the
+                // outer `stack` storage between branches.
+                let operand_value = if let Some(op) = operand {
+                    let mut sub = alloc::vec::Vec::new();
+                    Some(eval_compiled_ref(op, row, ctx, &mut sub)?)
+                } else {
+                    None
+                };
+                let mut matched_value: Option<Value<'static>> = None;
+                for (when_c, then_c) in branches {
+                    let mut sub = alloc::vec::Vec::new();
+                    let when_v = eval_compiled_ref(when_c, row, ctx, &mut sub)?;
+                    let matched = match &operand_value {
+                        None => matches!(when_v, Value::Bool(true)),
+                        Some(op_v) => matches!(
+                            apply_binary(BinOp::Eq, op_v.clone(), when_v)?,
+                            Value::Bool(true)
+                        ),
+                    };
+                    if matched {
+                        let mut sub2 = alloc::vec::Vec::new();
+                        matched_value = Some(eval_compiled_ref(then_c, row, ctx, &mut sub2)?);
+                        break;
+                    }
+                }
+                let v = match matched_value {
+                    Some(v) => v,
+                    None => match else_branch {
+                        Some(el) => {
+                            let mut sub = alloc::vec::Vec::new();
+                            eval_compiled_ref(el, row, ctx, &mut sub)?
+                        }
+                        None => Value::Null,
+                    },
+                };
+                stack.push(v);
             }
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }
