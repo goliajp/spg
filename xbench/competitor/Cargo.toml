@@ -107,6 +107,16 @@ name = "profile_breakdown"
 path = "src/bin/profile_breakdown.rs"
 test = false
 
+[[bin]]
+name = "profile_content_worker"
+path = "src/bin/profile_content_worker.rs"
+test = false
+
+[[bin]]
+name = "profile_track_a"
+path = "src/bin/profile_track_a.rs"
+test = false
+
 [lints.rust]
 unsafe_code     = "deny"
 unused_must_use = "deny"

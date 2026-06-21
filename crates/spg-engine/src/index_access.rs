@@ -194,6 +194,19 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     // 25 k InList on the prod messages × attachment_content shape
     // cost ~6 s.
     let mut memo = memoize::MemoizeCache::new();
+    // v7.37.5-A2b (profile-guided) — content_worker prod profile
+    // showed 24% self-time in `resolve_column` (linear scan of
+    // ctx.columns per cell access) because the per-row WHERE eval
+    // path went through `eval_with_in_sets` → `eval_expr(lhs, ...)`
+    // → `Expr::Column` → `resolve_column`. The same WHERE expression
+    // is fully-compilable (an `m.id NOT IN (literal_list)` after
+    // `subquery_replacement`) — pre-compile it once and run
+    // `eval_compiled` per row, pre-resolving the column position.
+    // Falls back to the eval path for non-compilable WHEREs.
+    let compiled_where: Option<eval::CompiledExpr> = where_expr
+        .filter(|w| eval::fully_compilable(w))
+        .map(|w| eval::compile_expr(w, &ctx));
+    let mut eval_stack: Vec<spg_storage::Value<'static>> = Vec::new();
     // The walker yields `(IndexKey, &Vec<RowLocator>)` ordered by key
     // in the requested direction; per-key locator order within the
     // map preserves insertion order, which matches the legacy stable-
@@ -225,7 +238,15 @@ pub(crate) fn try_pk_walk_top_n<'a>(
                     }
                 }
             };
-            if let Some(w) = where_expr {
+            if let Some(cw) = &compiled_where {
+                // v7.37.5-A2b — compiled path: column positions resolved
+                // at compile time; `eval_compiled` is allocator-free per
+                // row (stack reused).
+                let cond = eval::eval_compiled(cw, row_cow.as_ref(), &ctx, &mut eval_stack).ok()?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            } else if let Some(w) = where_expr {
                 let cond = engine
                     .eval_expr_with_correlated(w, row_cow.as_ref(), &ctx, cancel, Some(&mut memo))
                     .ok()?;
