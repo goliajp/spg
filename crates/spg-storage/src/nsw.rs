@@ -60,8 +60,8 @@ pub(crate) fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usiz
             .get_mut(new_row_idx)
             .expect("levels slot padded by ensure_node_slot") = level;
     }
-    let query = match &table.rows[new_row_idx].values[col_pos] {
-        Value::Vector(v) => v.clone(),
+    let query: Vec<f32> = match &table.rows[new_row_idx].values[col_pos] {
+        Value::Vector(v) => v.to_vec(),
         // v6.0.1: dequantise the inserted SQ8 cell into an f32 query
         // surface so the existing greedy / beam machinery can route
         // distances through `cell_to_query_metric_distance`. The

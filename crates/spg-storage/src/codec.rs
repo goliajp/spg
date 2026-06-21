@@ -927,7 +927,7 @@ impl Cursor<'_> {
 /// encoder's per-column body sizing so the v5.2.1 `Table::hot_bytes`
 /// incremental counter doesn't pay an alloc-per-insert tax. Returns
 /// the exact same `usize` as `encode_row_body_dense(row, schema).len()`.
-pub fn row_body_encoded_len(row: &Row, schema: &TableSchema) -> usize {
+pub fn row_body_encoded_len(row: &Row<'_>, schema: &TableSchema) -> usize {
     debug_assert_eq!(
         row.values.len(),
         schema.columns.len(),
@@ -949,7 +949,7 @@ pub fn row_body_encoded_len(row: &Row, schema: &TableSchema) -> usize {
 /// lock-step with the encoder. The `_ty` slot is reserved for future
 /// type-dependent encodings — every variant currently writes a fixed
 /// body shape regardless of the declared column type.
-fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
+fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
     match v {
         Value::SmallInt(_) => 2,
         // 4-byte body: i32 / Date.
@@ -1243,7 +1243,7 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
 /// `row.values.len()` must equal `schema.columns.len()` — the row
 /// is expected to have been validated by `Table::insert` (the
 /// engine's INSERT path) before reaching this function.
-pub fn encode_row_body_dense(row: &Row, schema: &TableSchema) -> Vec<u8> {
+pub fn encode_row_body_dense(row: &Row<'_>, schema: &TableSchema) -> Vec<u8> {
     debug_assert_eq!(
         row.values.len(),
         schema.columns.len(),
@@ -1278,7 +1278,7 @@ pub fn decode_row_body_dense(
     bytes: &[u8],
     schema: &TableSchema,
     codec_version: u8,
-) -> Result<(Row, usize), StorageError> {
+) -> Result<(Row<'static>, usize), StorageError> {
     let mut cur = Cursor::new(bytes).with_codec_version(codec_version);
     let bitmap_bytes = schema.columns.len().div_ceil(8);
     let mut bitmap_buf = [0u8; 32];
@@ -1308,7 +1308,7 @@ pub fn decode_row_body_dense(
 /// schema-default path still goes through the legacy `write_value` so
 /// DEFAULT values keep their self-describing tag and remain decodable
 /// without consulting a column type.
-fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
+fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
     match (v, ty) {
         (Value::SmallInt(n), DataType::SmallInt) => out.extend_from_slice(&n.to_le_bytes()),
         (Value::Int(n), DataType::Int) => out.extend_from_slice(&n.to_le_bytes()),
@@ -1327,7 +1327,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         ) => {
             let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
             out.extend_from_slice(&dim.to_le_bytes());
-            for x in v {
+            for x in v.iter() {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
@@ -1797,7 +1797,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
 /// `write_value` would emit for `v`. Used by the range codec to
 /// pre-size cells. We mirror the tag-byte + body shape from
 /// `write_value` rather than serialising to a temp Vec.
-fn write_value_encoded_len(v: &Value) -> usize {
+fn write_value_encoded_len(v: &Value<'_>) -> usize {
     match v {
         Value::Null => 1,
         Value::SmallInt(_) => 1 + 2,
@@ -1852,7 +1852,7 @@ fn write_value_encoded_len(v: &Value) -> usize {
     }
 }
 
-pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
+pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
     match v {
         Value::Null => out.push(0),
         Value::SmallInt(n) => {
@@ -1887,7 +1887,7 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(6);
             let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
             out.extend_from_slice(&dim.to_le_bytes());
-            for x in v {
+            for x in v.iter() {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
@@ -2688,7 +2688,7 @@ impl<'a> Cursor<'a> {
     /// fixed-width body for the given column type. Used inside the row
     /// hot loop; column defaults still go through `read_value` (which
     /// reads its own type tag) so DEFAULT round-trips without a schema.
-    pub(crate) fn read_value_body(&mut self, ty: DataType) -> Result<Value, StorageError> {
+    pub(crate) fn read_value_body(&mut self, ty: DataType) -> Result<Value<'static>, StorageError> {
         match ty {
             DataType::SmallInt => {
                 let s = self.take(2)?;
@@ -2699,7 +2699,7 @@ impl<'a> Cursor<'a> {
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
-                Ok(Value::Text(self.read_str()?))
+                Ok(Value::Text(Cow::Owned(self.read_str()?)))
             }
             DataType::Vector {
                 encoding: VecEncoding::F32,
@@ -2711,7 +2711,7 @@ impl<'a> Cursor<'a> {
                     let bytes: [u8; 4] = self.take(4)?.try_into().expect("checked");
                     v.push(f32::from_le_bytes(bytes));
                 }
-                Ok(Value::Vector(v))
+                Ok(Value::Vector(Cow::Owned(v)))
             }
             DataType::Vector {
                 encoding: VecEncoding::Sq8,
@@ -2741,7 +2741,7 @@ impl<'a> Cursor<'a> {
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
             DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
             DataType::Timestamptz => Ok(Value::Timestamp(self.read_i64()?)),
-            DataType::Jsonb => Ok(Value::Json(self.read_str()?)),
+            DataType::Jsonb => Ok(Value::Json(Cow::Owned(self.read_str()?))),
             DataType::Interval => {
                 // v7.37.5 β-P2 — INTERVAL column read: 16-byte body
                 // i64 micros + i32 days + i32 months (PG-byte-equal
@@ -2755,14 +2755,14 @@ impl<'a> Cursor<'a> {
                     micros,
                 })
             }
-            DataType::Json => Ok(Value::Json(self.read_str()?)),
+            DataType::Json => Ok(Value::Json(Cow::Owned(self.read_str()?))),
             // v7.10.4: BYTEA on-disk is [u16 len][bytes]. Same wire
             // shape as Text, but read as raw Vec<u8>.
             DataType::Bytes => {
                 // v7.27 (round-21) — escaped length at >= 47.
                 let len = self.read_len_escaped_v47()?;
                 let bytes = self.take(len)?.to_vec();
-                Ok(Value::Bytes(bytes))
+                Ok(Value::Bytes(Cow::Owned(bytes)))
             }
             // v7.10.9: TEXT[] dense body.
             DataType::TextArray => {
@@ -3124,9 +3124,12 @@ impl<'a> Cursor<'a> {
                 let nbits = self.read_u32()?;
                 let nbytes = (nbits as usize).div_ceil(8);
                 let bytes = self.take(nbytes)?.to_vec();
-                Ok(Value::BitString { nbits, bytes })
+                Ok(Value::BitString {
+                    nbits,
+                    bytes: Cow::Owned(bytes),
+                })
             }
-            DataType::Xml => Ok(Value::Xml(self.read_str()?)),
+            DataType::Xml => Ok(Value::Xml(Cow::Owned(self.read_str()?))),
             DataType::Char1 => Ok(Value::Char1(self.read_u8()?)),
             DataType::MoneyArray => {
                 let count = self.read_u16()? as usize;
@@ -3396,14 +3399,14 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    pub(crate) fn read_value(&mut self) -> Result<Value, StorageError> {
+    pub(crate) fn read_value(&mut self) -> Result<Value<'static>, StorageError> {
         let tag = self.read_u8()?;
         match tag {
             0 => Ok(Value::Null),
             1 => Ok(Value::Int(self.read_i32()?)),
             2 => Ok(Value::BigInt(self.read_i64()?)),
             3 => Ok(Value::Float(self.read_f64()?)),
-            4 => Ok(Value::Text(self.read_str()?)),
+            4 => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             5 => Ok(Value::Bool(self.read_u8()? != 0)),
             6 => {
                 let dim = self.read_u32()? as usize;
@@ -3412,7 +3415,7 @@ impl<'a> Cursor<'a> {
                     let bytes: [u8; 4] = self.take(4)?.try_into().expect("checked");
                     v.push(f32::from_le_bytes(bytes));
                 }
-                Ok(Value::Vector(v))
+                Ok(Value::Vector(Cow::Owned(v)))
             }
             7 => {
                 let s = self.take(2)?;
@@ -3450,7 +3453,7 @@ impl<'a> Cursor<'a> {
                 // v7.27 (round-21) — escaped length at >= 47.
                 let len = self.read_len_escaped_v47()?;
                 let bytes = self.take(len)?.to_vec();
-                Ok(Value::Bytes(bytes))
+                Ok(Value::Bytes(Cow::Owned(bytes)))
             }
             // v7.10.9: tag 15 — TEXT[]. [u16 count][per elem: u8
             // null + (when non-null) u16 len + utf-8 bytes].

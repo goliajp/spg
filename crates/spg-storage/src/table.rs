@@ -219,7 +219,7 @@ impl Table {
     /// Insert one row after validating it matches the schema (length + type).
     /// Returns `StorageError` on mismatch — the table is left unchanged.
     /// Updates every defined index with the new row's key.
-    pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
+    pub fn insert(&mut self, row: Row<'static>) -> Result<(), StorageError> {
         if row.len() != self.schema.columns.len() {
             return Err(StorageError::ArityMismatch {
                 expected: self.schema.columns.len(),
@@ -332,7 +332,7 @@ impl Table {
                     // rule as `to_tsvector('simple', text)`) and
                     // extend each lexeme's posting list.
                     let text_cell = match &row.values[idx.column_position] {
-                        Value::Text(s) => Some(s.as_str()),
+                        Value::Text(s) => Some(s.as_ref()),
                         // mysqldump-style mediumtext / longtext
                         // land as Value::Text on insert; varchar
                         // cells likewise. Anything else (NULL,
@@ -355,7 +355,7 @@ impl Table {
                     // tokens(`labels @> '...'` against a NULL row
                     // is always false so absence here is correct).
                     let json_cell = match &row.values[idx.column_position] {
-                        Value::Json(s) => Some(s.as_str()),
+                        Value::Json(s) => Some(s.as_ref()),
                         _ => None,
                     };
                     if let Some(s) = json_cell {
@@ -1031,9 +1031,9 @@ impl Table {
     /// Indices on existing columns keep working — column positions
     /// don't shift since the new column lands at the end — so no
     /// index rebuild is needed.
-    pub fn add_column(&mut self, col: ColumnSchema, fill_value: Value) {
+    pub fn add_column(&mut self, col: ColumnSchema, fill_value: Value<'static>) {
         self.schema.columns.push(col);
-        let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        let mut new_rows: PersistentVec<Row<'static>> = PersistentVec::new();
         for row in self.rows.iter() {
             let mut values = row.values.clone();
             values.push(fill_value.clone());
@@ -1203,7 +1203,7 @@ impl Table {
     pub fn update_row(
         &mut self,
         position: usize,
-        new_values: Vec<Value>,
+        new_values: Vec<Value<'static>>,
     ) -> Result<(), StorageError> {
         if position >= self.rows.len() {
             return Err(StorageError::Corrupt(alloc::format!(
@@ -1675,13 +1675,16 @@ impl Table {
 /// goes through f32: `current → Vec<f32> → target`, leaving NULL
 /// cells untouched. Returns `Unsupported` on a non-vector cell —
 /// the caller should have rejected the schema before reaching this.
-fn recode_vector_cell(cell: Value, target: VecEncoding) -> Result<Value, StorageError> {
+fn recode_vector_cell(
+    cell: Value<'static>,
+    target: VecEncoding,
+) -> Result<Value<'static>, StorageError> {
     if matches!(cell, Value::Null) {
         return Ok(cell);
     }
     // Step 1 — extract the f32 representation of the source cell.
     let as_f32: Vec<f32> = match &cell {
-        Value::Vector(v) => v.clone(),
+        Value::Vector(v) => v.to_vec(),
         Value::Sq8Vector(q) => quantize::dequantize(q),
         Value::HalfVector(h) => h.to_f32_vec(),
         other => {
@@ -1696,7 +1699,7 @@ fn recode_vector_cell(cell: Value, target: VecEncoding) -> Result<Value, Storage
     // F32 — but `Value::Vector(as_f32)` is the right answer
     // regardless).
     Ok(match target {
-        VecEncoding::F32 => Value::Vector(as_f32),
+        VecEncoding::F32 => Value::Vector(Cow::Owned(as_f32)),
         VecEncoding::Sq8 => Value::Sq8Vector(quantize::quantize(&as_f32)),
         VecEncoding::F16 => Value::HalfVector(halfvec::HalfVector::from_f32_slice(&as_f32)),
     })

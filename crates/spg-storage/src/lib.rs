@@ -46,6 +46,7 @@ pub use self::segment::{
     wrap_v2_envelope_with_brin,
 };
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -531,16 +532,26 @@ pub enum TsQueryAst {
 /// A row-cell value, including SQL `NULL`. `Float` uses `f64`; NaN compares
 /// non-equal to itself (PG behaviour) — `PartialEq` is derived so callers
 /// must opt into NaN-aware comparison if they need stronger guarantees.
+///
+/// v7.37.42-arena Phase 1: parameterised on `'arena` so heap-bearing
+/// variants (Text/Json/Xml/Bytes/Vector/BitString.bytes) can borrow from
+/// a per-query bump arena (`Cow::Borrowed(&'arena ...)`). Persistent /
+/// catalog Values use `Value<'static>` (alias `ValueOwned`) with
+/// `Cow::Owned(...)`. Phase 1 keeps Range/Multirange recursive `Box<Value>`
+/// at `'static` (owned) — arena migration deferred to a later phase.
+/// Array-of-Option<String> variants (TextArray etc.) also stay owned in
+/// Phase 1; their nested shape is awkward for the simple Cow lift and the
+/// SCALARSQ hot path doesn't touch them.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub enum Value {
+pub enum Value<'arena> {
     SmallInt(i16),
     Int(i32),
     BigInt(i64),
     Float(f64),
-    Text(String),
+    Text(Cow<'arena, str>),
     Bool(bool),
-    Vector(Vec<f32>),
+    Vector(Cow<'arena, [f32]>),
     /// v6.0.1: 8-bit scalar-quantised vector cell. Lives in
     /// columns declared `VECTOR(N) USING SQ8`. Layout per cell:
     /// `Sq8Vector { min: f32, max: f32, bytes: Vec<u8> }` —
@@ -578,13 +589,13 @@ pub enum Value {
     /// v4.9 `JSON` — raw JSON text. No structural validation
     /// happens at the storage layer; whatever the parser hands us
     /// round-trips verbatim. Equality is byte-wise.
-    Json(String),
+    Json(Cow<'arena, str>),
     /// v7.10.4 `BYTEA` — raw binary blob. Equality is byte-wise.
     /// Layout matches `Text`'s length-prefixed shape (`[u32 LE
     /// len][bytes]`) under tag 18; the engine accepts PG hex
     /// literals (`'\xDEADBEEF'`) and escape literals at the
     /// coercion boundary.
-    Bytes(Vec<u8>),
+    Bytes(Cow<'arena, [u8]>),
     /// v7.10.9 `TEXT[]` — single-dimension TEXT array with
     /// optional NULL elements. Equality is element-wise. PG's
     /// NULL-element comparison semantics: NULL ≠ NULL inside
@@ -695,11 +706,11 @@ pub enum Value {
     /// with 0s if `nbits % 8 != 0`).
     BitString {
         nbits: u32,
-        bytes: Vec<u8>,
+        bytes: Cow<'arena, [u8]>,
     },
     /// v7.37.5 ζ-A — PG `xml`. Stored verbatim as a string; no
     /// parse-time validation (matches the SPG JSON convention).
-    Xml(String),
+    Xml(Cow<'arena, str>),
     /// v7.37.5 ζ-A — PG `"char"` (internal single-byte type,
     /// distinct from CHAR(n)).
     Char1(u8),
@@ -763,14 +774,22 @@ pub enum Value {
     /// bounds).
     Range {
         kind: RangeKind,
-        lower: Option<alloc::boxed::Box<Value>>,
-        upper: Option<alloc::boxed::Box<Value>>,
+        // v7.37.42-arena Phase 1: Range bounds stay owned ('static).
+        // Recursive arena lifetimes are awkward to migrate at this
+        // phase and the SCALARSQ hot path doesn't construct ranges.
+        lower: Option<alloc::boxed::Box<Value<'static>>>,
+        upper: Option<alloc::boxed::Box<Value<'static>>>,
         lower_inc: bool,
         upper_inc: bool,
         empty: bool,
     },
     Null,
 }
+
+/// Owned `Value` — heap-bearing variants are `Cow::Owned`. Used everywhere
+/// a Value must outlive a query-scoped arena (catalog defaults, persistent
+/// storage, public APIs).
+pub type ValueOwned = Value<'static>;
 
 /// v7.37.5 ε — PG `point` building block. Shared by every other
 /// geometric type (lseg / path / box / polygon / circle all
@@ -791,8 +810,10 @@ pub struct Point2D {
 /// other fields mirror `Value::Range` exactly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangeSpan {
-    pub lower: Option<alloc::boxed::Box<Value>>,
-    pub upper: Option<alloc::boxed::Box<Value>>,
+    // v7.37.42-arena Phase 1: stays owned ('static) — same rationale as
+    // Range bounds above.
+    pub lower: Option<alloc::boxed::Box<Value<'static>>>,
+    pub upper: Option<alloc::boxed::Box<Value<'static>>>,
     pub lower_inc: bool,
     pub upper_inc: bool,
     pub empty: bool,
@@ -812,7 +833,7 @@ pub struct IntervalSpan {
     pub micros: i64,
 }
 
-impl Value {
+impl<'arena> Value<'arena> {
     /// Type tag, or `None` for `NULL` (unknown at value level).
     pub fn data_type(&self) -> Option<DataType> {
         match self {
@@ -905,17 +926,163 @@ impl Value {
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
+
+    /// v7.37.42-arena Phase 1: lift any `Value<'arena>` (possibly
+    /// borrowing from a bump arena) into a fully-owned `Value<'static>`.
+    /// Used at boundaries that must outlive the per-query arena
+    /// (catalog write, public QueryResult emit, sqlx materialise).
+    ///
+    /// For the recursive Range/Multirange variants — bounds are already
+    /// `Box<Value<'static>>` per Phase 1 design, so we just rebuild the
+    /// outer enum at `'static`.
+    pub fn into_owned(self) -> Value<'static> {
+        match self {
+            Value::SmallInt(n) => Value::SmallInt(n),
+            Value::Int(n) => Value::Int(n),
+            Value::BigInt(n) => Value::BigInt(n),
+            Value::Float(f) => Value::Float(f),
+            Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
+            Value::Bool(b) => Value::Bool(b),
+            Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
+            Value::Sq8Vector(q) => Value::Sq8Vector(q),
+            Value::HalfVector(h) => Value::HalfVector(h),
+            Value::Numeric { scaled, scale } => Value::Numeric { scaled, scale },
+            Value::Date(d) => Value::Date(d),
+            Value::Timestamp(t) => Value::Timestamp(t),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            Value::Json(s) => Value::Json(Cow::Owned(s.into_owned())),
+            Value::Bytes(b) => Value::Bytes(Cow::Owned(b.into_owned())),
+            Value::TextArray(v) => Value::TextArray(v),
+            Value::IntArray(v) => Value::IntArray(v),
+            Value::BigIntArray(v) => Value::BigIntArray(v),
+            Value::IntervalArray(v) => Value::IntervalArray(v),
+            Value::BoolArray(v) => Value::BoolArray(v),
+            Value::SmallIntArray(v) => Value::SmallIntArray(v),
+            Value::FloatArray(v) => Value::FloatArray(v),
+            Value::NumericArray(v) => Value::NumericArray(v),
+            Value::DateArray(v) => Value::DateArray(v),
+            Value::TimestampArray(v) => Value::TimestampArray(v),
+            Value::TimestamptzArray(v) => Value::TimestamptzArray(v),
+            Value::UuidArray(v) => Value::UuidArray(v),
+            Value::JsonArray(v) => Value::JsonArray(v),
+            Value::JsonbArray(v) => Value::JsonbArray(v),
+            Value::BytesArray(v) => Value::BytesArray(v),
+            Value::VarcharArray(v) => Value::VarcharArray(v),
+            Value::CharArray(v) => Value::CharArray(v),
+            Value::Multirange { kind, ranges } => Value::Multirange { kind, ranges },
+            Value::Point(p) => Value::Point(p),
+            Value::Lseg(a, b) => Value::Lseg(a, b),
+            Value::Path { points, closed } => Value::Path { points, closed },
+            Value::PgBox(a, b) => Value::PgBox(a, b),
+            Value::Polygon(p) => Value::Polygon(p),
+            Value::Line { a, b, c } => Value::Line { a, b, c },
+            Value::Circle { center, radius } => Value::Circle { center, radius },
+            Value::Inet { family, bits, addr } => Value::Inet { family, bits, addr },
+            Value::Cidr { family, bits, addr } => Value::Cidr { family, bits, addr },
+            Value::Macaddr(m) => Value::Macaddr(m),
+            Value::Macaddr8(m) => Value::Macaddr8(m),
+            Value::BitString { nbits, bytes } => Value::BitString {
+                nbits,
+                bytes: Cow::Owned(bytes.into_owned()),
+            },
+            Value::Xml(s) => Value::Xml(Cow::Owned(s.into_owned())),
+            Value::Char1(c) => Value::Char1(c),
+            Value::MoneyArray(v) => Value::MoneyArray(v),
+            Value::TsVector(v) => Value::TsVector(v),
+            Value::TsQuery(q) => Value::TsQuery(q),
+            Value::Uuid(u) => Value::Uuid(u),
+            Value::Time(t) => Value::Time(t),
+            Value::Year(y) => Value::Year(y),
+            Value::TimeTz { us, offset_secs } => Value::TimeTz { us, offset_secs },
+            Value::Money(m) => Value::Money(m),
+            Value::Range {
+                kind,
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+            } => Value::Range {
+                kind,
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+            },
+            Value::Hstore(h) => Value::Hstore(h),
+            Value::IntArray2D(a) => Value::IntArray2D(a),
+            Value::BigIntArray2D(a) => Value::BigIntArray2D(a),
+            Value::TextArray2D(a) => Value::TextArray2D(a),
+            Value::Null => Value::Null,
+        }
+    }
+}
+
+impl Value<'static> {
+    /// v7.37.42-arena Phase 1 — owned-Text constructor. The variant now
+    /// holds `Cow<'arena, str>`, so the previous `Value::Text(String)`
+    /// shape no longer compiles directly. This helper preserves the
+    /// historical ergonomics: `Value::text("foo")` or
+    /// `Value::text(String::from("foo"))`.
+    pub fn text<S: Into<String>>(s: S) -> Self {
+        Value::Text(Cow::Owned(s.into()))
+    }
+
+    /// v7.37.42-arena Phase 1 — owned-Json constructor (mirrors `text`).
+    pub fn json<S: Into<String>>(s: S) -> Self {
+        Value::Json(Cow::Owned(s.into()))
+    }
+
+    /// v7.37.42-arena Phase 1 — owned-Xml constructor.
+    pub fn xml<S: Into<String>>(s: S) -> Self {
+        Value::Xml(Cow::Owned(s.into()))
+    }
+
+    /// v7.37.42-arena Phase 1 — owned-Bytes constructor.
+    pub fn bytes<B: Into<Vec<u8>>>(b: B) -> Self {
+        Value::Bytes(Cow::Owned(b.into()))
+    }
+
+    /// v7.37.42-arena Phase 1 — owned-Vector constructor.
+    pub fn vector<V: Into<Vec<f32>>>(v: V) -> Self {
+        Value::Vector(Cow::Owned(v.into()))
+    }
+
+    /// v7.37.42-arena Phase 1 — owned-BitString constructor.
+    pub fn bit_string<B: Into<Vec<u8>>>(nbits: u32, bytes: B) -> Self {
+        Value::BitString {
+            nbits,
+            bytes: Cow::Owned(bytes.into()),
+        }
+    }
 }
 
 /// One table row — values are positional and must match
 /// `TableSchema.columns` in length and (modulo NULL) in `DataType`.
+///
+/// v7.37.42-arena Phase 1: parameterised on `'arena` so per-query rows
+/// can borrow from a bump arena. The owned shape (`Row<'static>`, alias
+/// `RowOwned`) is what catalog storage, public APIs, and tests use.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    pub values: Vec<Value>,
+pub struct Row<'arena> {
+    pub values: Vec<Value<'arena>>,
 }
 
-impl Row {
-    pub const fn new(values: Vec<Value>) -> Self {
+/// Owned `Row` — values are `Value<'static>`. Used everywhere a row must
+/// outlive a query-scoped arena.
+pub type RowOwned = Row<'static>;
+
+impl<'arena> Row<'arena> {
+    pub const fn new(values: Vec<Value<'arena>>) -> Self {
         Self { values }
     }
 
@@ -928,6 +1095,17 @@ impl Row {
     }
 }
 
+impl Row<'static> {
+    /// v7.37.42-arena Phase 1 — lift any `Row<'arena>` (possibly arena-
+    /// borrowed) into a fully-owned `Row<'static>`. Mirrors
+    /// `Value::into_owned`.
+    pub fn from_arena(row: Row<'_>) -> Self {
+        Self {
+            values: row.values.into_iter().map(Value::into_owned).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSchema {
     pub name: String,
@@ -937,7 +1115,10 @@ pub struct ColumnSchema {
     /// means "no default" (so omitted columns become NULL, or error
     /// out when the column is NOT NULL). Literal defaults take this
     /// path.
-    pub default: Option<Value>,
+    ///
+    /// v7.37.42-arena Phase 1: explicitly `Value<'static>` — catalog
+    /// defaults must outlive any per-query arena.
+    pub default: Option<Value<'static>>,
     /// v7.9.21 — for DEFAULT expressions that need INSERT-time
     /// evaluation (e.g. `DEFAULT now()`, `DEFAULT CURRENT_TIMESTAMP`),
     /// the Display form of the expression. The engine re-parses
@@ -1260,12 +1441,12 @@ pub enum IndexKey {
 }
 
 impl IndexKey {
-    pub fn from_value(v: &Value) -> Option<Self> {
+    pub fn from_value(v: &Value<'_>) -> Option<Self> {
         match v {
             Value::SmallInt(n) => Some(Self::Int(i64::from(*n))),
             Value::Int(n) => Some(Self::Int(i64::from(*n))),
             Value::BigInt(n) => Some(Self::Int(*n)),
-            Value::Text(s) => Some(Self::Text(s.clone())),
+            Value::Text(s) => Some(Self::Text(s.clone().into_owned())),
             Value::Bool(b) => Some(Self::Bool(*b)),
             // Date/Timestamp use their integer storage repr as the
             // index key — same order semantics, same comparison.
@@ -2057,12 +2238,12 @@ impl Index {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowChange {
     /// Append `row` to `table`.
-    Insert { table: String, row: Row },
+    Insert { table: String, row: Row<'static> },
     /// Replace the row at physical `pos` in `table` with `new_row`.
     Update {
         table: String,
         pos: usize,
-        new_row: Vec<Value>,
+        new_row: Vec<Value<'static>>,
     },
     /// Remove the rows at the given physical `positions` from `table`.
     Delete {
@@ -2082,7 +2263,7 @@ pub fn encode_redo_log(changes: &[RowChange]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(FILE_VERSION);
     codec::write_u32(&mut out, changes.len() as u32);
-    let write_values = |out: &mut Vec<u8>, vals: &[Value]| {
+    let write_values = |out: &mut Vec<u8>, vals: &[Value<'static>]| {
         codec::write_u32(out, vals.len() as u32);
         for v in vals {
             codec::write_value(out, v);
@@ -2129,7 +2310,7 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
     let mut cur = codec::Cursor::new(bytes).with_codec_version(version);
     let _version = cur.read_u8()?;
     let count = cur.read_u32()? as usize;
-    let mut read_values = |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value>, StorageError> {
+    let mut read_values = |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value<'static>>, StorageError> {
         let n = cur.read_u32()? as usize;
         let mut vals = Vec::with_capacity(n);
         for _ in 0..n {
@@ -2176,7 +2357,7 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
-    rows: PersistentVec<Row>,
+    rows: PersistentVec<Row<'static>>,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the
@@ -4355,7 +4536,7 @@ impl ColumnSchema {
     /// plain column schema. Used by the engine when CREATE TABLE
     /// specifies `column TYPE DEFAULT <expr>`.
     #[must_use]
-    pub fn with_default(mut self, default: Value) -> Self {
+    pub fn with_default(mut self, default: Value<'static>) -> Self {
         self.default = Some(default);
         self
     }
