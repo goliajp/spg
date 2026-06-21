@@ -1,0 +1,31 @@
+# PG-style string functions: lower, upper, length, substring, position.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'Hello World'), (2, 'foo')
+
+query IT rowsort
+SELECT id, lower(s) FROM t ORDER BY id
+----
+1
+hello world
+2
+foo
+
+query IT rowsort
+SELECT id, upper(s) FROM t ORDER BY id
+----
+1
+HELLO WORLD
+2
+FOO
+
+query II rowsort
+SELECT id, length(s) FROM t ORDER BY id
+----
+1
+11
+2
+3

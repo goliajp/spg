@@ -1,0 +1,20 @@
+# PG JSONB operators: ->, ->>, @>. v7.37.6-A epic surface.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, doc JSONB NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a": 1, "tags": ["x", "y"]}'), (2, '{"a": 2, "tags": ["y"]}')
+
+query IT rowsort
+SELECT id, doc->>'a' FROM t ORDER BY id
+----
+1
+1
+2
+2
+
+query I rowsort
+SELECT id FROM t WHERE doc @> '{"a": 1}'
+----
+1

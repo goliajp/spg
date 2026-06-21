@@ -1,0 +1,19 @@
+# CREATE SEQUENCE + nextval (v7.17.0 Phase 1.1).
+
+statement ok
+CREATE SEQUENCE s
+
+query I
+SELECT nextval('s')
+----
+1
+
+query I
+SELECT nextval('s')
+----
+2
+
+query I
+SELECT currval('s')
+----
+2

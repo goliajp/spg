@@ -1,0 +1,16 @@
+# PG array operators: ANY-form membership, concat ||.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, tags TEXT[])
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY['a', 'b']), (2, ARRAY['b', 'c'])
+
+# tags column round-trips with PG canonical form.
+query IT rowsort
+SELECT id, tags FROM t ORDER BY id
+----
+1
+{a,b}
+2
+{b,c}

@@ -1,0 +1,23 @@
+# PG :: cast syntax + CAST(... AS ...) syntax.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, '42'), (2, '99')
+
+query II rowsort
+SELECT id, s::int FROM t ORDER BY id
+----
+1
+42
+2
+99
+
+query II rowsort
+SELECT id, CAST(s AS INT) FROM t ORDER BY id
+----
+1
+42
+2
+99

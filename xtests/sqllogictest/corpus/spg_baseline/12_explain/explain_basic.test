@@ -1,0 +1,13 @@
+# EXPLAIN SELECT — returns a plan text without errors.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+# We don't assert the plan text shape (it's free-form) — just that the
+# statement runs to completion via the statement-ok pathway, which
+# proves EXPLAIN parses and dispatches.
+statement ok
+EXPLAIN SELECT * FROM t WHERE id = 1

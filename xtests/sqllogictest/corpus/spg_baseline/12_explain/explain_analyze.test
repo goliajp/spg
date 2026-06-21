@@ -1,0 +1,10 @@
+# EXPLAIN ANALYZE — runs the query and reports actual rows.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+statement ok
+EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1

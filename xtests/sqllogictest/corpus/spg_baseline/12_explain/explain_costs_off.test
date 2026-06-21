@@ -1,0 +1,12 @@
+# Re-EXPLAIN with no options. SPG's EXPLAIN options surface is
+# minimal; COSTS OFF is a future parser feature. The base form is
+# stable.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement ok
+EXPLAIN SELECT * FROM t WHERE id = 1

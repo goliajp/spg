@@ -1,0 +1,30 @@
+# PG LIKE / ILIKE / NOT LIKE.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'Apple'), (2, 'banana'), (3, 'cherry'), (4, 'APRICOT')
+
+query I rowsort
+SELECT id FROM t WHERE s LIKE 'A%'
+----
+1
+4
+
+query I rowsort
+SELECT id FROM t WHERE s ILIKE 'a%'
+----
+1
+4
+
+query I rowsort
+SELECT id FROM t WHERE s NOT LIKE 'A%'
+----
+2
+3
+
+query I rowsort
+SELECT id FROM t WHERE s LIKE '%erry'
+----
+3

@@ -1,0 +1,22 @@
+# BEGIN / ROLLBACK undoes the writes inside the transaction.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'a')
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (2, 'b')
+
+statement ok
+ROLLBACK
+
+query IT rowsort
+SELECT id, name FROM t
+----
+1
+a
