@@ -12,10 +12,12 @@
 # Usage: scripts/test-on-mini.sh <gate.sh args...>
 #   scripts/test-on-mini.sh e2e
 #   scripts/test-on-mini.sh gates --full
+#   scripts/test-on-mini.sh biz       # now supported (was previously local-only)
 #
-# Caveat: the biz category needs Docker (its harnesses run psql from
-# the postgres:18 image) and a .git dir for rev-parse — neither exists
-# on the testbed mirror, so run biz locally.
+# Mini.local has OrbStack docker (per `feedback-offload-heavy-to-mini`
+# memory + verified during v7.37 ship cycle running docker-fair bench).
+# We export the OrbStack PATH so the remote shell finds `docker`, and
+# we sync .git so `git rev-parse` etc work in biz harness paths.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,6 +27,10 @@ RDIR="${SPG_MINI_DIR:-workspace/goliajp/spg-ci}"
 [[ $# -ge 1 ]] || { echo "usage: $0 <gate.sh args...>" >&2; exit 2; }
 
 ssh "$HOST" "mkdir -p '$RDIR'"
-rsync -az --delete --filter=':- .gitignore' --exclude /.git \
+# Sync .git so biz / sqllogictest harnesses that call `git rev-parse`
+# don't fail with "not a git repository". target/ stays via gitignore
+# (rsync's --filter ignores .gitignore'd paths).
+rsync -az --delete --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
-exec ssh "$HOST" "cd '$RDIR' && exec scripts/gate.sh $*"
+# OrbStack PATH so `docker` resolves on the non-interactive ssh shell.
+exec ssh "$HOST" "PATH=/Applications/OrbStack.app/Contents/MacOS/xbin:\$PATH cd '$RDIR' && exec scripts/gate.sh $*"
