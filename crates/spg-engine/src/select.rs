@@ -519,12 +519,11 @@ impl Engine {
                     cte.name
                 )));
             }
-            let body_select = cte
-                .body
-                .as_select()
-                .ok_or_else(|| EngineError::Unsupported(alloc::format!(
+            let body_select = cte.body.as_select().ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
                     "data-modifying CTE not supported on this SELECT entry"
-                )))?;
+                ))
+            })?;
             let (columns, rows) = if cte.recursive {
                 let synthetic = spg_sql::ast::Cte {
                     name: cte.name.clone(),
@@ -694,7 +693,13 @@ impl Engine {
         cte_name: &str,
         body: &spg_sql::ast::InsertStatement,
         _cancel: CancelToken<'_>,
-    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+    ) -> Result<
+        (
+            Vec<spg_storage::ColumnSchema>,
+            Vec<spg_storage::Row<'static>>,
+        ),
+        EngineError,
+    > {
         // v7.37.43-T4.4 — strip any nested CTEs from the body
         // (already materialised in the outer pass) before
         // dispatch to avoid infinite recursion.
@@ -723,7 +728,13 @@ impl Engine {
         cte_name: &str,
         body: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
-    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+    ) -> Result<
+        (
+            Vec<spg_storage::ColumnSchema>,
+            Vec<spg_storage::Row<'static>>,
+        ),
+        EngineError,
+    > {
         let mut body = body.clone();
         body.ctes = Vec::new();
         let result = self.exec_update_cancel(&body, cancel)?;
@@ -746,7 +757,13 @@ impl Engine {
         cte_name: &str,
         body: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
-    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+    ) -> Result<
+        (
+            Vec<spg_storage::ColumnSchema>,
+            Vec<spg_storage::Row<'static>>,
+        ),
+        EngineError,
+    > {
         let mut body = body.clone();
         body.ctes = Vec::new();
         let result = self.exec_delete_cancel(&body, cancel)?;
@@ -1994,8 +2011,7 @@ impl Engine {
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
         let ctx = EvalContext::new(&empty_schema, None);
         let dummy_row = Row::new(alloc::vec::Vec::new());
-        let arg_value =
-            eval::eval_expr(arg_expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+        let arg_value = eval::eval_expr(arg_expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
         let pairs = crate::json::jsonb_each_text_rows(&arg_value).map_err(EngineError::Eval)?;
         let rows: alloc::vec::Vec<Row<'static>> = pairs
             .into_iter()
@@ -2060,8 +2076,7 @@ impl Engine {
         for row in &filtered {
             let mut vals = alloc::vec::Vec::with_capacity(projection.len());
             for p in &projection {
-                let v =
-                    eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?;
+                let v = eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?;
                 vals.push(v);
             }
             projected_rows.push(Row::new(vals));

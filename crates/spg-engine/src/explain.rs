@@ -235,13 +235,25 @@ pub(crate) fn explain_select(
         match &cte.body {
             spg_sql::ast::CteBody::Select(s) => explain_select(s, engine, depth + 2, out),
             spg_sql::ast::CteBody::Insert(s) => {
-                out.push(alloc::format!("{}ModifyingCTE (INSERT {})", "  ".repeat(depth + 2), s.table));
+                out.push(alloc::format!(
+                    "{}ModifyingCTE (INSERT {})",
+                    "  ".repeat(depth + 2),
+                    s.table
+                ));
             }
             spg_sql::ast::CteBody::Update(s) => {
-                out.push(alloc::format!("{}ModifyingCTE (UPDATE {})", "  ".repeat(depth + 2), s.table));
+                out.push(alloc::format!(
+                    "{}ModifyingCTE (UPDATE {})",
+                    "  ".repeat(depth + 2),
+                    s.table
+                ));
             }
             spg_sql::ast::CteBody::Delete(s) => {
-                out.push(alloc::format!("{}ModifyingCTE (DELETE {})", "  ".repeat(depth + 2), s.table));
+                out.push(alloc::format!(
+                    "{}ModifyingCTE (DELETE {})",
+                    "  ".repeat(depth + 2),
+                    s.table
+                ));
             }
         }
     }

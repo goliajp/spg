@@ -42,8 +42,14 @@ fn execute_rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
 #[test]
 fn writable_cte_insert_returning_feeds_outer_insert() {
     let mut e = Engine::new();
-    execute(&mut e, "CREATE TABLE source_t (id INT PRIMARY KEY, name TEXT)");
-    execute(&mut e, "CREATE TABLE target_a (id INT PRIMARY KEY, name TEXT)");
+    execute(
+        &mut e,
+        "CREATE TABLE source_t (id INT PRIMARY KEY, name TEXT)",
+    );
+    execute(
+        &mut e,
+        "CREATE TABLE target_a (id INT PRIMARY KEY, name TEXT)",
+    );
     execute(&mut e, "CREATE TABLE target_b (a_id INT, name TEXT)");
     execute(
         &mut e,
@@ -107,9 +113,15 @@ fn writable_cte_returning_carries_multiple_columns() {
 #[test]
 fn writable_cte_update_returning_feeds_outer_insert() {
     let mut e = Engine::new();
-    execute(&mut e, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)");
+    execute(
+        &mut e,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)",
+    );
     execute(&mut e, "CREATE TABLE audit (id INT, new_balance INT)");
-    execute(&mut e, "INSERT INTO accounts VALUES (1,100),(2,200),(3,300)");
+    execute(
+        &mut e,
+        "INSERT INTO accounts VALUES (1,100),(2,200),(3,300)",
+    );
 
     execute(
         &mut e,
@@ -166,16 +178,17 @@ fn writable_cte_sentori_0065_identity_scopes_shape() {
            FROM orgs o \
            JOIN new_scopes s ON s.name = o.slug",
     );
-    let scopes = execute_rows(
-        &mut e,
-        "SELECT id, name FROM identity_scopes ORDER BY id",
-    );
+    let scopes = execute_rows(&mut e, "SELECT id, name FROM identity_scopes ORDER BY id");
     assert_eq!(scopes.len(), 2, "two scopes created via CTE");
     let mappings = execute_rows(
         &mut e,
         "SELECT org_id, scope_id FROM org_identity_scopes ORDER BY org_id",
     );
-    assert_eq!(mappings.len(), 2, "two org->scope mappings via outer INSERT");
+    assert_eq!(
+        mappings.len(),
+        2,
+        "two org->scope mappings via outer INSERT"
+    );
     assert_eq!(mappings[0][0], mappings[0][1]);
     assert_eq!(mappings[1][0], mappings[1][1]);
 }
@@ -193,10 +206,7 @@ fn writable_cte_delete_returning_feeds_outer_insert() {
         &mut e,
         "CREATE TABLE archive (id INT PRIMARY KEY, payload TEXT)",
     );
-    execute(
-        &mut e,
-        "INSERT INTO staging VALUES (1,'a'),(2,'b'),(3,'c')",
-    );
+    execute(&mut e, "INSERT INTO staging VALUES (1,'a'),(2,'b'),(3,'c')");
 
     execute(
         &mut e,

@@ -113,7 +113,11 @@ fn sentori_0067_style_lateral_jsonb_each_text_filter_pattern() {
         "SELECT event_id, key_type, value FROM fingerprints \
             ORDER BY event_id, key_type",
     );
-    assert_eq!(fp.len(), 2, "only event 1 contributed pairs (email + phone)");
+    assert_eq!(
+        fp.len(),
+        2,
+        "only event 1 contributed pairs (email + phone)"
+    );
     assert_eq!(fp[0][0], Value::Int(1));
     assert_eq!(fp[0][1], Value::text("email".to_string()));
     assert_eq!(fp[0][2], Value::text("abc123".to_string()));
@@ -127,7 +131,10 @@ fn sentori_0067_style_lateral_jsonb_each_text_filter_pattern() {
 #[test]
 fn cross_join_lateral_jsonb_each_text_correlates_with_parent_row() {
     let mut e = Engine::new();
-    execute(&mut e, "CREATE TABLE docs (id INT PRIMARY KEY, payload JSONB)");
+    execute(
+        &mut e,
+        "CREATE TABLE docs (id INT PRIMARY KEY, payload JSONB)",
+    );
     execute(
         &mut e,
         "INSERT INTO docs VALUES \
@@ -143,7 +150,11 @@ fn cross_join_lateral_jsonb_each_text_correlates_with_parent_row() {
            CROSS JOIN LATERAL jsonb_each_text(d.payload) AS kv(key, value) \
            ORDER BY d.id, kv.key",
     );
-    assert_eq!(rows.len(), 3, "row 1 contributes 2 pairs, row 2 contributes 1, row 3 contributes 0");
+    assert_eq!(
+        rows.len(),
+        3,
+        "row 1 contributes 2 pairs, row 2 contributes 1, row 3 contributes 0"
+    );
     // row 1: (1, a, one), (1, b, two)
     assert_eq!(rows[0][0], Value::Int(1));
     assert_eq!(rows[0][1], Value::text("a".to_string()));

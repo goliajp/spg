@@ -8782,18 +8782,18 @@ impl Parser {
                 _ if is_update_kw => {
                     let inner = self.parse_one_statement()?;
                     let Statement::Update(s) = inner else {
-                        return Err(self.err(format!(
-                            "expected UPDATE inside WITH (…), got {inner:?}"
-                        )));
+                        return Err(
+                            self.err(format!("expected UPDATE inside WITH (…), got {inner:?}"))
+                        );
                     };
                     crate::ast::CteBody::Update(alloc::boxed::Box::new(s))
                 }
                 _ if is_delete_kw => {
                     let inner = self.parse_one_statement()?;
                     let Statement::Delete(s) = inner else {
-                        return Err(self.err(format!(
-                            "expected DELETE inside WITH (…), got {inner:?}"
-                        )));
+                        return Err(
+                            self.err(format!("expected DELETE inside WITH (…), got {inner:?}"))
+                        );
                     };
                     crate::ast::CteBody::Delete(alloc::boxed::Box::new(s))
                 }

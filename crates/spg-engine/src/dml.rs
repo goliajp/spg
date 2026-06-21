@@ -1725,8 +1725,13 @@ impl Engine {
     fn materialise_one_cte_to_temp(
         &mut self,
         cte: &spg_sql::ast::Cte,
-    ) -> Result<(alloc::vec::Vec<spg_storage::ColumnSchema>, alloc::vec::Vec<Row<'static>>), EngineError>
-    {
+    ) -> Result<
+        (
+            alloc::vec::Vec<spg_storage::ColumnSchema>,
+            alloc::vec::Vec<Row<'static>>,
+        ),
+        EngineError,
+    > {
         use spg_sql::ast::CteBody;
         let cancel = CancelToken::none();
         match &cte.body {
@@ -1779,8 +1784,13 @@ impl Engine {
         &self,
         cte_name: &str,
         result: QueryResult,
-    ) -> Result<(alloc::vec::Vec<spg_storage::ColumnSchema>, alloc::vec::Vec<Row<'static>>), EngineError>
-    {
+    ) -> Result<
+        (
+            alloc::vec::Vec<spg_storage::ColumnSchema>,
+            alloc::vec::Vec<Row<'static>>,
+        ),
+        EngineError,
+    > {
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),
             QueryResult::CommandOk { .. } => {

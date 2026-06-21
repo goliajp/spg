@@ -438,7 +438,10 @@ pub(crate) fn walk_insert_exprs_mut(
         walk_select_exprs_mut(sel, f)?;
     }
     if let Some(oc) = &mut ins.on_conflict
-        && let spg_sql::ast::OnConflictAction::Update { assignments, where_ } = &mut oc.action
+        && let spg_sql::ast::OnConflictAction::Update {
+            assignments,
+            where_,
+        } = &mut oc.action
     {
         for (_, e) in assignments.iter_mut() {
             f(e)?;
