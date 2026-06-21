@@ -204,7 +204,8 @@ fn build_inner(run_analyze: bool) -> Engine {
 /// (`try_streamed_inner_join_walk_topn` for the joined shape, or
 /// `try_pk_walk_top_n` after JOIN reduction) walks `messages` DESC,
 /// probes the NOT EXISTS via the index, and stops at 64 survivors.
-const SQL_CONTENT_WORKER: &str = "SELECT m.id, m.sender, m.maildir_id, mb.user_address \
+const SQL_CONTENT_WORKER: &str =
+    "SELECT m.id, m.sender, m.maildir_id, mb.user_address \
        FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
       WHERE m.size > 0 \
         AND NOT EXISTS (SELECT 1 FROM attachment_content ac \
@@ -392,10 +393,7 @@ fn mailrs_conversations_100k_no_analyze_under_budget() {
 #[ignore]
 fn mailrs_100k_cascade_p50_p95_p99_sweep() {
     let _lock = crate::perf_lock();
-    for (label, mut eng) in [
-        ("with-analyze", build()),
-        ("no-analyze", build_no_analyze()),
-    ] {
+    for (label, mut eng) in [("with-analyze", build()), ("no-analyze", build_no_analyze())] {
         eprintln!("== {label} ==");
         for (name, sql, budget_ms) in [
             ("content_worker", SQL_CONTENT_WORKER, 100.0_f64),

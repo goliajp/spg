@@ -997,9 +997,10 @@ mod tests {
             .unwrap();
         }
         // Source order: messages drives mailboxes.
-        let stmt = e
-            .prepare("SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id")
-            .unwrap();
+        let stmt = e.prepare(
+            "SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id",
+        )
+        .unwrap();
         let spg_sql::ast::Statement::Select(sel) = stmt else {
             panic!()
         };
@@ -1032,7 +1033,9 @@ mod tests {
             .unwrap();
         }
         let stmt = e
-            .prepare("SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id")
+            .prepare(
+                "SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id",
+            )
             .unwrap();
         let spg_sql::ast::Statement::Select(sel) = stmt else {
             panic!()
@@ -1060,7 +1063,9 @@ mod tests {
                 .unwrap();
         }
         let stmt = e
-            .prepare("SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id")
+            .prepare(
+                "SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id",
+            )
             .unwrap();
         let spg_sql::ast::Statement::Select(sel) = stmt else {
             panic!()
@@ -1097,7 +1102,9 @@ mod tests {
         }
         e.execute("ANALYZE").unwrap();
         let stmt = e
-            .prepare("SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id")
+            .prepare(
+                "SELECT m.id FROM messages m INNER JOIN mailboxes mb ON mb.id = m.mailbox_id",
+            )
             .unwrap();
         let spg_sql::ast::Statement::Select(sel) = stmt else {
             panic!()
