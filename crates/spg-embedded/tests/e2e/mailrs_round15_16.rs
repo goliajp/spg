@@ -4,7 +4,7 @@
 
 use spg_embedded::{Database, QueryResult, Value};
 
-fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value<'static>>> {
     match db.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected rows for {sql}, got {other:?}"),
@@ -19,7 +19,7 @@ fn order_by_nulls_first_last() {
         .unwrap();
     db.execute("INSERT INTO feeds VALUES (1, 200), (2, NULL), (3, 100)")
         .unwrap();
-    let ids = |rows: Vec<Vec<Value>>| -> Vec<i64> {
+    let ids = |rows: Vec<Vec<Value<'static>>>| -> Vec<i64> {
         rows.iter()
             .map(|r| match r[0] {
                 Value::BigInt(n) => n,
@@ -244,15 +244,15 @@ fn pg_trigger_reports_registration_and_enabled_state() {
         "SELECT tgname, relname, tgenabled, events, function FROM pg_trigger",
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("tr".into()));
-    assert_eq!(r[0][2], Value::Text("O".into()));
-    assert_eq!(r[0][3], Value::Text("INSERT OR UPDATE".into()));
+    assert_eq!(r[0][0], Value::text("tr"));
+    assert_eq!(r[0][2], Value::text("O"));
+    assert_eq!(r[0][3], Value::text("INSERT OR UPDATE"));
     db.execute("ALTER TABLE m DISABLE TRIGGER tr").unwrap();
     let r = rows_of(
         &mut db,
         "SELECT tgenabled FROM pg_trigger WHERE tgname = 'tr'",
     );
-    assert_eq!(r[0][0], Value::Text("D".into()));
+    assert_eq!(r[0][0], Value::text("D"));
 }
 
 /// v7.24.1 follow-up — the two scope-cut items from round-16 A/B:

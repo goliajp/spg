@@ -10,7 +10,7 @@ fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
         .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
-fn read_rows(snap: &CatalogSnapshot, sql: &str) -> Vec<Vec<Value>> {
+fn read_rows(snap: &CatalogSnapshot, sql: &str) -> Vec<Vec<Value<'static>>> {
     match Engine::execute_readonly_on_snapshot(snap, sql)
         .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
     {

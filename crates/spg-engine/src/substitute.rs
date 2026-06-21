@@ -272,7 +272,10 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
 /// WAL path (which needs the bind-final AST so replay sees a
 /// simple-query-shaped statement, not a `$1`-shaped one). Errors
 /// when a placeholder references an index past the params slice.
-pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value<'static>]) -> Result<(), EngineError> {
+pub fn substitute_placeholders(
+    stmt: &mut Statement,
+    params: &[Value<'static>],
+) -> Result<(), EngineError> {
     match stmt {
         Statement::Select(s) => substitute_select(s, params)?,
         Statement::Insert(ins) => {

@@ -206,7 +206,11 @@ impl core::fmt::Display for EvalError {
     }
 }
 
-pub fn eval_expr(expr: &Expr, row: &Row<'static>, ctx: &EvalContext<'_>) -> Result<Value<'static>, EvalError> {
+pub fn eval_expr(
+    expr: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
     match expr {
         Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
             detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
@@ -1019,10 +1023,7 @@ mod tests {
         let r = Row::new(vec![Value::Int(7), Value::text("hi")]);
         let c = ctx(&cs, None);
         assert_eq!(eval_expr(&col_ref("a"), &r, &c).unwrap(), Value::Int(7));
-        assert_eq!(
-            eval_expr(&col_ref("b"), &r, &c).unwrap(),
-            Value::text("hi")
-        );
+        assert_eq!(eval_expr(&col_ref("b"), &r, &c).unwrap(), Value::text("hi"));
     }
 
     #[test]

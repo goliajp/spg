@@ -9,7 +9,7 @@ use spg_engine::{Engine, PULLUP_LIMIT1_FIRE_COUNT, QueryResult};
 use spg_storage::Value;
 use std::sync::atomic::Ordering;
 
-fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows from {sql:?}, got {other:?}"),

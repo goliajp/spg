@@ -5,7 +5,7 @@
 
 use spg_engine::{Engine, QueryResult};
 
-fn rows(r: QueryResult) -> Vec<Vec<spg_storage::Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<spg_storage::Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -26,7 +26,7 @@ fn create_view_and_select_returns_rows() {
     let names: Vec<&str> = r
         .iter()
         .map(|row| match &row[1] {
-            spg_storage::Value::Text(s) => s.as_str(),
+            spg_storage::Value::Text(s) => s.as_ref(),
             other => panic!("not text: {other:?}"),
         })
         .collect();
@@ -51,7 +51,7 @@ fn create_view_with_column_rename_list() {
     );
     assert_eq!(
         r[0][1],
-        spg_storage::Value::Text("alice".into()),
+        spg_storage::Value::text("alice"),
         "label column should select name"
     );
 }
@@ -148,7 +148,7 @@ fn view_joined_with_table() {
         .unwrap(),
     );
     assert_eq!(r.len(), 2);
-    assert_eq!(r[0][0], spg_storage::Value::Text("alice".into()));
+    assert_eq!(r[0][0], spg_storage::Value::text("alice"));
 }
 
 #[test]

@@ -75,7 +75,7 @@ fn build_populated_catalog() -> Catalog {
     let t = cat.get_mut("users").unwrap();
     let payload: String = "x".repeat(PAYLOAD_LEN);
     for id in 0..POPULATE_ROWS as i64 {
-        let row = Row::new(vec![Value::BigInt(id), Value::Text(payload.clone())]);
+        let row = Row::new(vec![Value::BigInt(id), Value::text(payload.clone())]);
         t.insert(row).unwrap();
     }
     t.add_index("by_id".to_string(), "id").unwrap();

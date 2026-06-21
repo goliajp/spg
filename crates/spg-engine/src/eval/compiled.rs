@@ -456,7 +456,12 @@ pub(crate) fn eval_compiled_ref(
     for step in &c.steps {
         match step {
             Step::Column(pos) => {
-                stack.push(row.get(*pos).cloned().map(Value::into_owned).unwrap_or(Value::Null));
+                stack.push(
+                    row.get(*pos)
+                        .cloned()
+                        .map(Value::into_owned)
+                        .unwrap_or(Value::Null),
+                );
             }
             Step::Lit(v) => stack.push(v.clone()),
             Step::Binary(op) => {

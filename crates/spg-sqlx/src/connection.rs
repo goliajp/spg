@@ -495,7 +495,7 @@ fn affected_from(qr: &EngineQueryResult) -> u64 {
 
 fn build_rows(
     cols: &[spg_embedded::ColumnSchema],
-    rows: Vec<Vec<spg_embedded::Value>>,
+    rows: Vec<Vec<spg_embedded::Value<'static>>>,
 ) -> Vec<SpgRow> {
     let columns: Arc<Vec<SpgColumn>> = Arc::new(
         cols.iter()

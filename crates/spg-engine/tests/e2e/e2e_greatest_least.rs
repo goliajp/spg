@@ -16,7 +16,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -79,7 +79,7 @@ fn greatest_strings_lexicographic() {
         e.execute("SELECT greatest('apple', 'banana', 'cherry')")
             .unwrap(),
     );
-    assert_eq!(row[0], Value::Text("cherry".into()));
+    assert_eq!(row[0], Value::text("cherry"));
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn least_strings_lexicographic() {
         e.execute("SELECT least('banana', 'apple', 'cherry')")
             .unwrap(),
     );
-    assert_eq!(row[0], Value::Text("apple".into()));
+    assert_eq!(row[0], Value::text("apple"));
 }
 
 // ── NULL ARGS SKIPPED ────────────────────────────────────────────

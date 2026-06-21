@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -35,7 +35,7 @@ fn pg_settings_has_standard_conforming_strings_on() {
         .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("on".into()));
+    assert_eq!(r[0][0], Value::text("on"));
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn pg_settings_lists_client_encoding() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("UTF8".into()));
+    assert_eq!(r[0][0], Value::text("UTF8"));
 }
 
 #[test]
@@ -58,5 +58,5 @@ fn pg_settings_session_set_value_overrides_default() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("custom_schema".into()));
+    assert_eq!(r[0][0], Value::text("custom_schema"));
 }

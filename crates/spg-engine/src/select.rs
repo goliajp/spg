@@ -1392,7 +1392,8 @@ impl Engine {
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
         let ctx = EvalContext::new(&empty_schema, None);
         let dummy_row = Row::new(alloc::vec::Vec::new());
-        let mut arg_values: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::with_capacity(args.len());
+        let mut arg_values: alloc::vec::Vec<Value<'static>> =
+            alloc::vec::Vec::with_capacity(args.len());
         for a in args {
             arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
         }
@@ -2767,7 +2768,12 @@ impl Engine {
                 } else if let Some(pos) = proj_pos[i] {
                     // Bound but couldn't decompose (shouldn't normally
                     // happen — keep as a safe path).
-                    values.push(row.get(pos).cloned().map(Value::into_owned).unwrap_or(Value::Null));
+                    values.push(
+                        row.get(pos)
+                            .cloned()
+                            .map(Value::into_owned)
+                            .unwrap_or(Value::Null),
+                    );
                 } else {
                     // Eval path — `materialised` is Some whenever any
                     // projection item is non-bound (need_eval_row true).
@@ -2917,7 +2923,7 @@ impl Engine {
         expr: &Expr,
         row: &Row<'static>,
         ctx: &EvalContext,
-    ) -> Result<Value, EngineError> {
+    ) -> Result<Value<'static>, EngineError> {
         let cancel = CancelToken::none();
         self.eval_expr_with_correlated(expr, row, ctx, cancel, None)
     }
@@ -3167,7 +3173,10 @@ pub(crate) fn build_projection(
 /// non-column expressions). Lets `WITH t(n) AS (SELECT 1 ...)`
 /// land an Int column in the CTE storage table rather than failing
 /// the insert with "expected TEXT, got INT".
-pub(crate) fn infer_column_types(columns: &[ColumnSchema], rows: &[Row<'static>]) -> Vec<ColumnSchema> {
+pub(crate) fn infer_column_types(
+    columns: &[ColumnSchema],
+    rows: &[Row<'static>],
+) -> Vec<ColumnSchema> {
     let mut out = columns.to_vec();
     for (col_idx, col) in out.iter_mut().enumerate() {
         if col.ty != DataType::Text {

@@ -123,7 +123,7 @@ fn run_stage_bench(with_hnsw: bool, label: &str, rows: usize) {
         let q = queries[i].clone();
         let t0 = Instant::now();
         let r = eng
-            .execute_prepared(stmt.clone(), &[Value::Vector(q)])
+            .execute_prepared(stmt.clone(), &[Value::vector(q)])
             .unwrap();
         let dt = t0.elapsed().as_nanos();
         std::hint::black_box(r);

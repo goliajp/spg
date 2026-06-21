@@ -16,7 +16,7 @@ fn engine_with(sqls: &[&str]) -> Engine {
     eng
 }
 
-fn rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),

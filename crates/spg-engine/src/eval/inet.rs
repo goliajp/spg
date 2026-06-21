@@ -238,7 +238,11 @@ fn inet_networks_equal(a: &InetNet, b: &InetNet) -> bool {
     network_prefix_eq(a, b, a.prefix_bits)
 }
 
-pub(super) fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Value<'static>, EvalError> {
+pub(super) fn inet_op_bool_result(
+    op: BinOp,
+    l: &Value,
+    r: &Value,
+) -> Result<Value<'static>, EvalError> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }

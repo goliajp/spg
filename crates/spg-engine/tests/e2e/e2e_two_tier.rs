@@ -97,7 +97,7 @@ fn select_name_by_id(engine: &mut Engine, id: i64) -> Option<String> {
     assert_eq!(rows.len(), 1, "PK lookup must return at most one row");
     let v = &rows[0].values[0];
     match v {
-        Value::Text(s) => Some(s.clone()),
+        Value::Text(s) => Some(s.to_string()),
         other => panic!("expected Text, got {other:?}"),
     }
 }

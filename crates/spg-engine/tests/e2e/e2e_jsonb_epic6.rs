@@ -18,7 +18,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_value(e: &mut Engine, sql: &str) -> Value {
+fn one_value(e: &mut Engine, sql: &str) -> Value<'static> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -34,7 +34,7 @@ fn one_value(e: &mut Engine, sql: &str) -> Value {
         .expect("col")
 }
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -116,7 +116,7 @@ fn arrow_text_member_returns_text() {
     let mut e = Engine::new();
     let v = one_value(&mut e, r#"SELECT '{"name":"alice"}'::jsonb ->> 'name'"#);
     // PG: `->>` strips jsonb wrapping quotes — returns plain text.
-    assert_eq!(v, Value::Text("alice".into()));
+    assert_eq!(v, Value::text("alice"));
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn arrow_text_array_index_returns_text() {
     let mut e = Engine::new();
     let v = one_value(&mut e, r#"SELECT '[10,20,30]'::jsonb ->> 0"#);
     // Numbers as text.
-    assert_eq!(v, Value::Text("10".into()));
+    assert_eq!(v, Value::text("10"));
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn path_get_jsonb() {
 fn path_get_text() {
     let mut e = Engine::new();
     let v = one_value(&mut e, r#"SELECT '{"a":{"b":"deep"}}'::jsonb #>> '{a,b}'"#);
-    assert_eq!(v, Value::Text("deep".into()));
+    assert_eq!(v, Value::text("deep"));
 }
 
 // ─── v7.37.6-A new operators ─────────────────────────────────────

@@ -4,7 +4,7 @@
 
 use spg_engine::{Engine, QueryResult};
 
-fn rows(r: QueryResult) -> Vec<Vec<spg_storage::Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<spg_storage::Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -112,7 +112,7 @@ fn create_materialized_view_with_column_rename() {
     let r = rows(e.execute("SELECT pk, label FROM mv").unwrap());
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], spg_storage::Value::Int(1));
-    assert_eq!(r[0][1], spg_storage::Value::Text("alice".into()));
+    assert_eq!(r[0][1], spg_storage::Value::text("alice"));
 }
 
 #[test]

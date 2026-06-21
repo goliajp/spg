@@ -4,7 +4,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -30,9 +30,9 @@ fn key_column_usage_lists_fk_columns() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("parent_id".into()));
-    assert_eq!(r[0][1], Value::Text("parents".into()));
-    assert_eq!(r[0][2], Value::Text("id".into()));
+    assert_eq!(r[0][0], Value::text("parent_id"));
+    assert_eq!(r[0][1], Value::text("parents"));
+    assert_eq!(r[0][2], Value::text("id"));
 }
 
 #[test]
@@ -53,8 +53,8 @@ fn referential_constraints_lists_fk() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("children".into()));
-    assert_eq!(r[0][1], Value::Text("parents".into()));
+    assert_eq!(r[0][0], Value::text("children"));
+    assert_eq!(r[0][1], Value::text("parents"));
 }
 
 #[test]
@@ -71,9 +71,9 @@ fn statistics_lists_per_index_column() {
         .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("t".into()));
-    assert_eq!(r[0][1], Value::Text("idx_t_name".into()));
-    assert_eq!(r[0][2], Value::Text("name".into()));
+    assert_eq!(r[0][0], Value::text("t"));
+    assert_eq!(r[0][1], Value::text("idx_t_name"));
+    assert_eq!(r[0][2], Value::text("name"));
 }
 
 #[test]

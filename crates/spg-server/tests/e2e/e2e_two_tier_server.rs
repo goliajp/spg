@@ -101,7 +101,7 @@ fn bake_users_segment(rows: &[(i64, &str)]) -> Vec<u8> {
     let seg_rows: Vec<(u64, Vec<u8>)> = rows
         .iter()
         .map(|(id, name)| {
-            let row = Row::new(vec![Value::BigInt(*id), Value::Text((*name).into())]);
+            let row = Row::new(vec![Value::BigInt(*id), Value::text(*name)]);
             ((*id).cast_unsigned(), encode_row_body_dense(&row, &schema))
         })
         .collect();

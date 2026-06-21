@@ -15,7 +15,7 @@ fn engine_with(sqls: &[&str]) -> Engine {
     eng
 }
 
-fn rows_of(eng: &mut Engine, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+fn rows_of(eng: &mut Engine, sql: &str) -> (Vec<String>, Vec<Vec<Value<'static>>>) {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { columns, rows } => (
             columns.iter().map(|c| c.name.clone()).collect(),
@@ -42,7 +42,7 @@ fn insert_returning_star() {
     let mut eng = engine_with(&["CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)"]);
     let (cols, vals) = rows_of(&mut eng, "INSERT INTO u VALUES (10, 'alice') RETURNING *");
     assert_eq!(vals.len(), 1);
-    assert_eq!(vals[0], vec![Value::Int(10), Value::Text("alice".into())]);
+    assert_eq!(vals[0], vec![Value::Int(10), Value::text("alice")]);
     assert_eq!(cols.len(), 2);
 }
 
@@ -96,7 +96,7 @@ fn delete_returning_pre_delete_state() {
     ]);
     let (_cols, vals) = rows_of(&mut eng, "DELETE FROM t WHERE id = 1 RETURNING id, payload");
     assert_eq!(vals.len(), 1);
-    assert_eq!(vals[0], vec![Value::Int(1), Value::Text("a".into())]);
+    assert_eq!(vals[0], vec![Value::Int(1), Value::text("a")]);
     // Sanity: actually gone.
     let after = match eng.execute("SELECT id FROM t").unwrap() {
         QueryResult::Rows { rows, .. } => rows.len(),

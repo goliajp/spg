@@ -10,7 +10,7 @@
 //!     surface, so mailrs and other sqlx apps can drop in
 //!     without code change.
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 #[cfg(feature = "uuid")]
 use sqlx_core::decode::Decode;
@@ -75,7 +75,7 @@ mod u {
                 // Generous decode from canonical text — covers
                 // the case where a `SELECT id::text FROM t` path
                 // landed at a UUID column site.
-                EngineValue::Text(s) => spg_storage::parse_uuid_str(s)
+                EngineValue::Text(s) => spg_storage::parse_uuid_str(s.as_ref())
                     .map(Uuid::from_bytes)
                     .ok_or_else(|| format!("cannot parse text {s:?} as uuid::Uuid").into()),
                 other => Err(format!("cannot decode {other:?} as uuid::Uuid / UUID").into()),

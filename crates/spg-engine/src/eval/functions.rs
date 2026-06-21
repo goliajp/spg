@@ -433,7 +433,9 @@ fn apply_function_dispatch(
                         Some(n) => (n as usize).min(chars.len() - skip),
                         None => chars.len() - skip,
                     };
-                    Ok(Value::text(chars[skip..skip + take].iter().collect::<String>()))
+                    Ok(Value::text(
+                        chars[skip..skip + take].iter().collect::<String>(),
+                    ))
                 }
                 Value::Bytes(b) => {
                     let skip = (effective_start - 1) as usize;

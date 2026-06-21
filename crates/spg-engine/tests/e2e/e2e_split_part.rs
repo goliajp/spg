@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
@@ -35,7 +35,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
     });
     let row = one_row(r);
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -303,7 +303,7 @@ fn split_part_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (split_part('John Doe', ' ', 1))")
         .unwrap();
     let row = one_row(e.execute("SELECT first FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("John".into()));
+    assert_eq!(row[0], Value::text("John"));
 }
 
 // ── TYPE / METADATA ──────────────────────────────────────────────

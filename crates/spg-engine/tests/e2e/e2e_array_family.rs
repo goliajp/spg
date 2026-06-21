@@ -15,7 +15,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::{DataType, Value};
 
-fn first_row(e: &mut Engine, sql: &str) -> Vec<Value> {
+fn first_row(e: &mut Engine, sql: &str) -> Vec<Value<'static>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));

@@ -27,7 +27,7 @@ fn ok(e: &mut Engine, sql: &str) {
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
-fn first_value(e: &mut Engine, sql: &str) -> Value {
+fn first_value(e: &mut Engine, sql: &str) -> Value<'static> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -51,7 +51,7 @@ fn explain_text(e: &mut Engine, sql: &str) -> String {
             .iter()
             .flat_map(|r| r.values.iter())
             .map(|v| match v {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 other => format!("{other:?}"),
             })
             .collect::<Vec<_>>()

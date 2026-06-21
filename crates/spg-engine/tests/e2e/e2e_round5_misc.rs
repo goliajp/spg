@@ -84,7 +84,7 @@ fn case_when_in_select_searched_form() {
     };
     assert_eq!(rows.len(), 3);
     let to_text = |v: &spg_storage::Value| match v {
-        spg_storage::Value::Text(s) => s.clone(),
+        spg_storage::Value::Text(s) => s.to_string(),
         other => panic!("expected text, got {other:?}"),
     };
     assert_eq!(to_text(&rows[0].values[0]), "small");

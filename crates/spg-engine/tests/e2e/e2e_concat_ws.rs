@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
@@ -29,7 +29,7 @@ fn one_row(r: QueryResult) -> Vec<Value> {
     }
 }
 
-fn first_text(e: &mut Engine, sql: &str) -> Value {
+fn first_text(e: &mut Engine, sql: &str) -> Value<'static> {
     let r = e.execute(sql).unwrap_or_else(|err| {
         panic!("execute({sql:?}) failed: {err:?}");
     });
@@ -44,7 +44,7 @@ fn separator_only_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',')"),
-        Value::Text(String::new())
+        Value::text(String::new())
     );
 }
 
@@ -53,7 +53,7 @@ fn one_data_arg_no_separator_emitted() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', 'only')"),
-        Value::Text("only".into())
+        Value::text("only")
     );
 }
 
@@ -62,7 +62,7 @@ fn two_data_args_separator_between() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', 'a', 'b')"),
-        Value::Text("a,b".into())
+        Value::text("a,b")
     );
 }
 
@@ -71,7 +71,7 @@ fn five_data_args() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws('-', 'a', 'b', 'c', 'd', 'e')"),
-        Value::Text("a-b-c-d-e".into())
+        Value::text("a-b-c-d-e")
     );
 }
 
@@ -121,7 +121,7 @@ fn null_data_arg_skipped_separator_not_doubled() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', 'a', NULL, 'b')"),
-        Value::Text("a,b".into())
+        Value::text("a,b")
     );
 }
 
@@ -132,7 +132,7 @@ fn all_data_args_null_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', NULL, NULL)"),
-        Value::Text(String::new())
+        Value::text(String::new())
     );
 }
 
@@ -142,7 +142,7 @@ fn one_null_data_arg_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', NULL)"),
-        Value::Text(String::new())
+        Value::text(String::new())
     );
 }
 
@@ -151,7 +151,7 @@ fn leading_nulls_followed_by_value() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', NULL, NULL, 'first')"),
-        Value::Text("first".into())
+        Value::text("first")
     );
 }
 
@@ -160,7 +160,7 @@ fn trailing_nulls_after_value() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', 'last', NULL, NULL)"),
-        Value::Text("last".into())
+        Value::text("last")
     );
 }
 
@@ -172,7 +172,7 @@ fn alternating_nulls_and_values() {
             &mut e,
             "SELECT concat_ws('-', NULL, 'a', NULL, 'b', NULL, 'c')"
         ),
-        Value::Text("a-b-c".into())
+        Value::text("a-b-c")
     );
 }
 
@@ -183,7 +183,7 @@ fn empty_string_separator_joins_with_no_glue() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws('', 'a', 'b', 'c')"),
-        Value::Text("abc".into())
+        Value::text("abc")
     );
 }
 
@@ -192,7 +192,7 @@ fn multichar_separator() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(', ', 'a', 'b', 'c')"),
-        Value::Text("a, b, c".into())
+        Value::text("a, b, c")
     );
 }
 
@@ -201,7 +201,7 @@ fn multibyte_utf8_separator() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws('・', 'あ', 'い', 'う')"),
-        Value::Text("あ・い・う".into())
+        Value::text("あ・い・う")
     );
 }
 
@@ -215,7 +215,7 @@ fn empty_string_data_arg_kept_separator_around_it() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', 'a', '', 'b')"),
-        Value::Text("a,,b".into())
+        Value::text("a,,b")
     );
 }
 
@@ -226,7 +226,7 @@ fn integer_data_args_coerced() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws('-', 1, 2, 3)"),
-        Value::Text("1-2-3".into())
+        Value::text("1-2-3")
     );
 }
 
@@ -235,7 +235,7 @@ fn mixed_types_coerced() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws('|', 'a', 1, true, NULL, 2.5)"),
-        Value::Text("a|1|t|2.5".into())
+        Value::text("a|1|t|2.5")
     );
 }
 
@@ -246,7 +246,7 @@ fn integer_separator_coerced_to_text() {
     // — apps rarely emit this but the engine should not panic.
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(0, 'a', 'b')"),
-        Value::Text("a0b".into())
+        Value::text("a0b")
     );
 }
 
@@ -263,7 +263,7 @@ fn concat_ws_over_nullable_columns() {
         e.execute("SELECT concat_ws(' ', first, middle, last) FROM p")
             .unwrap(),
     );
-    assert_eq!(row[0], Value::Text("John Doe".into()));
+    assert_eq!(row[0], Value::text("John Doe"));
 }
 
 #[test]
@@ -275,7 +275,7 @@ fn concat_ws_full_name_with_all_null_returns_empty() {
         e.execute("SELECT concat_ws(' ', first, last) FROM p")
             .unwrap(),
     );
-    assert_eq!(row[0], Value::Text(String::new()));
+    assert_eq!(row[0], Value::text(String::new()));
 }
 
 // ── INSERT + COMPOSITION ──────────────────────────────────────────
@@ -287,7 +287,7 @@ fn concat_ws_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (concat_ws('-', 'X', 42, 'Y'))")
         .unwrap();
     let row = one_row(e.execute("SELECT label FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("X-42-Y".into()));
+    assert_eq!(row[0], Value::text("X-42-Y"));
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn concat_ws_inside_where() {
         panic!()
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[0], Value::Text("foo".into()));
+    assert_eq!(rows[0].values[0], Value::text("foo"));
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn concat_ws_nested() {
             &mut e,
             "SELECT concat_ws('->', concat_ws(':', 'a', 'b'), concat_ws(':', 'c', 'd'))"
         ),
-        Value::Text("a:b->c:d".into())
+        Value::text("a:b->c:d")
     );
 }
 
@@ -328,7 +328,7 @@ fn concat_ws_null_sep_differs_from_concat() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat(NULL, 'a', 'b')"),
-        Value::Text("ab".into())
+        Value::text("ab")
     );
     // concat_ws's NULL-sep poison is in null_separator_returns_null.
 }

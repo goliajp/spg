@@ -10,7 +10,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -50,8 +50,8 @@ fn commit_persists_table_and_rows_atomically() {
     assert_eq!(
         res,
         vec![
-            vec![Value::Int(1), Value::Text("a".to_string())],
-            vec![Value::Int(2), Value::Text("b".to_string())],
+            vec![Value::Int(1), Value::text("a")],
+            vec![Value::Int(2), Value::text("b")],
         ]
     );
 }

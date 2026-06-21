@@ -13,7 +13,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -70,7 +70,7 @@ fn create_table_parent_and_children_round_trip() {
     let names: Vec<String> = rows(&mut e, "SHOW TABLES")
         .into_iter()
         .filter_map(|r| match r.into_iter().next()? {
-            Value::Text(s) => Some(s),
+            Value::Text(s) => Some(s.into_owned()),
             _ => None,
         })
         .collect();

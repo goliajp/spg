@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -17,7 +17,7 @@ fn show_databases_returns_canonical_mysql_set() {
     let names: Vec<String> = r
         .into_iter()
         .map(|row| match row[0].clone() {
-            Value::Text(s) => s,
+            Value::Text(s) => s.into_owned(),
             _ => panic!(),
         })
         .collect();

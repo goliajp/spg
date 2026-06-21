@@ -23,7 +23,7 @@ fn setup() -> Engine {
     e
 }
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -48,7 +48,7 @@ fn inner_join_peer_predicate_filters_matched_pairs() {
                 ref o => panic!("{o:?}"),
             };
             let cat = match &row.values[1] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 o => panic!("{o:?}"),
             };
             (id, cat)

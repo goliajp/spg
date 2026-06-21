@@ -2310,14 +2310,15 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
     let mut cur = codec::Cursor::new(bytes).with_codec_version(version);
     let _version = cur.read_u8()?;
     let count = cur.read_u32()? as usize;
-    let mut read_values = |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value<'static>>, StorageError> {
-        let n = cur.read_u32()? as usize;
-        let mut vals = Vec::with_capacity(n);
-        for _ in 0..n {
-            vals.push(cur.read_value()?);
-        }
-        Ok(vals)
-    };
+    let mut read_values =
+        |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value<'static>>, StorageError> {
+            let n = cur.read_u32()? as usize;
+            let mut vals = Vec::with_capacity(n);
+            for _ in 0..n {
+                vals.push(cur.read_value()?);
+            }
+            Ok(vals)
+        };
     let mut changes = Vec::with_capacity(count);
     for _ in 0..count {
         let op = cur.read_u8()?;
@@ -3739,7 +3740,7 @@ impl Catalog {
     /// segment-decode errors — those would indicate corrupted
     /// cold-tier files and should be caught at
     /// [`Catalog::load_segment_bytes`] time.
-    pub fn lookup_by_pk(&self, table: &str, index_name: &str, key: &IndexKey) -> Option<Row> {
+    pub fn lookup_by_pk(&self, table: &str, index_name: &str, key: &IndexKey) -> Option<Row<'_>> {
         let t = self.get(table)?;
         let idx = t.indices.iter().find(|i| i.name == index_name)?;
         let locators = idx.lookup_eq(key);

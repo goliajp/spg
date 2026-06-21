@@ -604,7 +604,8 @@ impl Engine {
                     vals.extend(src_row.values.iter().cloned());
                     Row::new(vals)
                 } else {
-                    let mut vals: Vec<Value<'static>> = (0..target_arity).map(|_| Value::Null).collect();
+                    let mut vals: Vec<Value<'static>> =
+                        (0..target_arity).map(|_| Value::Null).collect();
                     vals.extend(src_row.values.iter().cloned());
                     Row::new(vals)
                 };
@@ -667,7 +668,8 @@ impl Engine {
                 }
                 spg_sql::ast::MergeAction::Insert { columns, values } => {
                     // For INSERT NOT MATCHED, target side is NULL-padded.
-                    let mut vals: Vec<Value<'static>> = (0..target_arity).map(|_| Value::Null).collect();
+                    let mut vals: Vec<Value<'static>> =
+                        (0..target_arity).map(|_| Value::Null).collect();
                     vals.extend(src_row.values.iter().cloned());
                     let synth_row = Row::new(vals);
                     let mut new_row_values: Vec<Value<'static>> =
@@ -883,7 +885,8 @@ impl Engine {
         let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
         if !before_delete_triggers.is_empty() {
             let mut filtered_positions: Vec<usize> = Vec::with_capacity(positions.len());
-            let mut filtered_old_rows: Vec<Vec<Value<'static>>> = Vec::with_capacity(to_delete_rows.len());
+            let mut filtered_old_rows: Vec<Vec<Value<'static>>> =
+                Vec::with_capacity(to_delete_rows.len());
             for (pos, old_vals) in positions.iter().zip(to_delete_rows.iter()) {
                 let old_row = Row::new(old_vals.clone());
                 let mut cancel_this = false;
@@ -1300,7 +1303,14 @@ impl Engine {
         table_name: &str,
         clause: &spg_sql::ast::OnConflictClause,
         all_values: Vec<Vec<Value<'static>>>,
-    ) -> Result<(Vec<Vec<Value<'static>>>, Vec<(usize, Vec<Value<'static>>)>, usize), EngineError> {
+    ) -> Result<
+        (
+            Vec<Vec<Value<'static>>>,
+            Vec<(usize, Vec<Value<'static>>)>,
+            usize,
+        ),
+        EngineError,
+    > {
         let mut pending_updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let mut skipped_count = 0usize;
         let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
@@ -1325,7 +1335,8 @@ impl Engine {
                     &conflict_cols,
                     &key_tuple,
                 );
-            let key_tuple_owned: Vec<Value<'static>> = key_tuple.iter().map(|v| (*v).clone()).collect();
+            let key_tuple_owned: Vec<Value<'static>> =
+                key_tuple.iter().map(|v| (*v).clone()).collect();
             let collides_with_batch =
                 !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
             let collides = collides_with_table || collides_with_batch;
@@ -1843,7 +1854,14 @@ fn insert_parsed_rows(
     table_name: &str,
     trigger_session_cfg: Option<&str>,
     returning_enabled: bool,
-) -> Result<(Vec<Vec<Value<'static>>>, Vec<triggers::DeferredEmbeddedStmt>, usize), EngineError> {
+) -> Result<
+    (
+        Vec<Vec<Value<'static>>>,
+        Vec<triggers::DeferredEmbeddedStmt>,
+        usize,
+    ),
+    EngineError,
+> {
     let mut affected = 0usize;
     // v7.9.4 — keep RETURNING projection rows separate per
     // INSERT and per UPDATE branch so DO UPDATE pushes the new

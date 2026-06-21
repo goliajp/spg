@@ -39,7 +39,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -49,15 +49,15 @@ fn one_row(r: QueryResult) -> Vec<Value> {
     }
 }
 
-fn one_cell(eng: &mut Engine, sql: &str) -> Value {
+fn one_cell(eng: &mut Engine, sql: &str) -> Value<'static> {
     let row = one_row(eng.execute(sql).unwrap());
     assert_eq!(row.len(), 1, "{sql}");
     row.into_iter().next().unwrap()
 }
 
-fn json_text(v: Value) -> String {
+fn json_text(v: Value<'_>) -> String {
     match v {
-        Value::Json(s) => s,
+        Value::Json(s) => s.into_owned(),
         other => panic!("expected Value::Json, got {other:?}"),
     }
 }

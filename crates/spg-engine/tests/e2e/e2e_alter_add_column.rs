@@ -93,7 +93,7 @@ fn add_column_then_insert_uses_default_for_new_rows() {
     assert_eq!(table.rows().len(), 1);
     let v = &table.rows().get(0).unwrap().values[1];
     let s = match v {
-        spg_storage::Value::Text(s) => s.clone(),
+        spg_storage::Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     };
     assert_eq!(s, "pending");

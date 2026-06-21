@@ -8,7 +8,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -106,7 +106,7 @@ fn spg_stat_segment_resolves_table_name() {
     for row in &rows {
         assert_eq!(
             row[1],
-            Value::Text("t".to_string()),
+            Value::text("t"),
             "expected table_name='t' for segment owned by t"
         );
     }
@@ -315,7 +315,7 @@ fn peer_table_cold_tier_rows_visible_to_join() {
         .unwrap(),
     );
     assert_eq!(by_id.len(), 1);
-    assert_eq!(by_id[0][0], Value::Text("mb-5".to_string()));
+    assert_eq!(by_id[0][0], Value::text("mb-5"));
 }
 
 /// v7.36 — primary-table cold-tier coverage for the legacy

@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -14,14 +14,14 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 fn percent_s_text_substitution() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('Hello %s', 'world')").unwrap());
-    assert_eq!(r[0][0], Value::Text("Hello world".into()));
+    assert_eq!(r[0][0], Value::text("Hello world"));
 }
 
 #[test]
 fn percent_s_multiple_args() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('%s + %s = %s', 1, 2, 3)").unwrap());
-    assert_eq!(r[0][0], Value::Text("1 + 2 = 3".into()));
+    assert_eq!(r[0][0], Value::text("1 + 2 = 3"));
 }
 
 #[test]
@@ -31,21 +31,21 @@ fn percent_l_quoted_literal() {
         e.execute("SELECT format('WHERE name = %L', 'alice')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("WHERE name = 'alice'".into()));
+    assert_eq!(r[0][0], Value::text("WHERE name = 'alice'"));
 }
 
 #[test]
 fn percent_l_escapes_single_quote() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('= %L', 'O''Brien')").unwrap());
-    assert_eq!(r[0][0], Value::Text("= 'O''Brien'".into()));
+    assert_eq!(r[0][0], Value::text("= 'O''Brien'"));
 }
 
 #[test]
 fn percent_l_null_renders_as_NULL_literal() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('= %L', NULL)").unwrap());
-    assert_eq!(r[0][0], Value::Text("= NULL".into()));
+    assert_eq!(r[0][0], Value::text("= NULL"));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn percent_capital_i_escapes_double_quote() {
 fn percent_percent_literal() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('100%%')").unwrap());
-    assert_eq!(r[0][0], Value::Text("100%".into()));
+    assert_eq!(r[0][0], Value::text("100%"));
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn positional_argument_n_dollar() {
         e.execute("SELECT format('%2$s %1$s', 'last', 'first')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("first last".into()));
+    assert_eq!(r[0][0], Value::text("first last"));
 }
 
 #[test]
@@ -119,5 +119,5 @@ fn null_format_string_propagates() {
 fn percent_s_null_arg_renders_empty() {
     let mut e = Engine::new();
     let r = rows(e.execute("SELECT format('[%s]', NULL)").unwrap());
-    assert_eq!(r[0][0], Value::Text("[]".into()));
+    assert_eq!(r[0][0], Value::text("[]"));
 }

@@ -6,7 +6,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -32,8 +32,8 @@ fn sums_with_group_by_all() {
     assert_eq!(
         got,
         vec![
-            vec![Value::Text("east".to_string()), Value::BigInt(15)],
-            vec![Value::Text("west".to_string()), Value::BigInt(50)],
+            vec![Value::text("east"), Value::BigInt(15)],
+            vec![Value::text("west"), Value::BigInt(50)],
         ]
     );
 }
@@ -59,21 +59,9 @@ fn group_by_all_with_two_non_aggregate_keys() {
     assert_eq!(
         got,
         vec![
-            vec![
-                Value::Text("x".to_string()),
-                Value::Text("1".to_string()),
-                Value::BigInt(150),
-            ],
-            vec![
-                Value::Text("x".to_string()),
-                Value::Text("2".to_string()),
-                Value::BigInt(30),
-            ],
-            vec![
-                Value::Text("y".to_string()),
-                Value::Text("1".to_string()),
-                Value::BigInt(7),
-            ],
+            vec![Value::text("x"), Value::text("1"), Value::BigInt(150),],
+            vec![Value::text("x"), Value::text("2"), Value::BigInt(30),],
+            vec![Value::text("y"), Value::text("1"), Value::BigInt(7),],
         ]
     );
 }

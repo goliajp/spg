@@ -156,7 +156,7 @@ impl RowRef<'_> {
     /// Borrow the cell at a combined-schema position. The bound-column
     /// fast path in `aggregate::run` reads cells this way — zero clone.
     #[inline]
-    pub(crate) fn get(&self, pos: usize) -> Option<&Value> {
+    pub(crate) fn get(&self, pos: usize) -> Option<&Value<'_>> {
         match self {
             RowRef::Owned(r) => r.values.get(pos),
             RowRef::Tuple {
@@ -201,7 +201,11 @@ impl RowRef<'_> {
 /// unreferenced columns instead of cloning them — the in-place
 /// equivalent of `null_out_unreferenced` for sources that were never
 /// pre-cloned.
-pub(crate) fn extend_masked(vals: &mut Vec<Value<'static>>, row: &Row<'static>, mask: Option<&[bool]>) {
+pub(crate) fn extend_masked(
+    vals: &mut Vec<Value<'static>>,
+    row: &Row<'static>,
+    mask: Option<&[bool]>,
+) {
     match mask {
         Some(keep) => {
             for (i, v) in row.values.iter().enumerate() {
@@ -934,11 +938,12 @@ impl Engine {
         if has_cold && !join_col_is_pk {
             return Ok(false);
         }
-        let (cold_rows, cold_pk_map): (Vec<Row<'static>>, hashbrown::HashMap<i64, usize>) = if has_cold {
-            crate::constraints::iter_cold_rows_with_locator_map(self.active_catalog(), table)
-        } else {
-            (Vec::new(), hashbrown::HashMap::new())
-        };
+        let (cold_rows, cold_pk_map): (Vec<Row<'static>>, hashbrown::HashMap<i64, usize>) =
+            if has_cold {
+                crate::constraints::iter_cold_rows_with_locator_map(self.active_catalog(), table)
+            } else {
+                (Vec::new(), hashbrown::HashMap::new())
+            };
         let stored = table.rows();
         let hot_len = stored.len();
         let (lpos0, _) = eq_pairs[0];
@@ -1273,37 +1278,39 @@ impl Engine {
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
         budget: &mut ByteBudget,
     ) -> Result<(), EngineError> {
-        let lazy_rows: Option<Vec<Row<'static>>> = if peer.eager_rows.is_none() && peer.lateral.is_none() {
-            let tname = peer.join_table.as_deref().unwrap_or("");
-            let mut rows: Vec<Row<'static>> = self
-                .active_catalog()
-                .get(tname)
-                .map(|t| t.rows().iter().cloned().collect())
-                .unwrap_or_default();
-            // v7.36 — nested-loop fallback materialises the peer
-            // into `lazy_rows`. Append cold-tier rows so the fall-
-            // back stays correct after the force-eager-when-cold
-            // guard was lifted in `build_join_peers`.
-            if let Some(t) = self.active_catalog().get(tname)
-                && t.has_cold_rows_fast()
-            {
-                rows.extend(crate::constraints::iter_cold_rows_of_parent(
-                    self.active_catalog(),
-                    t,
-                ));
-            }
-            if let Some(needed) = needed {
-                Self::null_out_unreferenced(&mut rows, &peer.cols, &peer.alias, needed);
-            }
-            budget.charge(approx_rows_bytes(&rows))?;
-            Some(rows)
-        } else {
-            None
-        };
+        let lazy_rows: Option<Vec<Row<'static>>> =
+            if peer.eager_rows.is_none() && peer.lateral.is_none() {
+                let tname = peer.join_table.as_deref().unwrap_or("");
+                let mut rows: Vec<Row<'static>> = self
+                    .active_catalog()
+                    .get(tname)
+                    .map(|t| t.rows().iter().cloned().collect())
+                    .unwrap_or_default();
+                // v7.36 — nested-loop fallback materialises the peer
+                // into `lazy_rows`. Append cold-tier rows so the fall-
+                // back stays correct after the force-eager-when-cold
+                // guard was lifted in `build_join_peers`.
+                if let Some(t) = self.active_catalog().get(tname)
+                    && t.has_cold_rows_fast()
+                {
+                    rows.extend(crate::constraints::iter_cold_rows_of_parent(
+                        self.active_catalog(),
+                        t,
+                    ));
+                }
+                if let Some(needed) = needed {
+                    Self::null_out_unreferenced(&mut rows, &peer.cols, &peer.alias, needed);
+                }
+                budget.charge(approx_rows_bytes(&rows))?;
+                Some(rows)
+            } else {
+                None
+            };
         // Lateral results are per-outer-row, so matched right rows persist
         // in a stage arena the tuples can index.
         let mut arena: Vec<Row<'static>> = Vec::new();
-        let rights_eager: Option<&[Row<'static>]> = peer.eager_rows.as_deref().or(lazy_rows.as_deref());
+        let rights_eager: Option<&[Row<'static>]> =
+            peer.eager_rows.as_deref().or(lazy_rows.as_deref());
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;

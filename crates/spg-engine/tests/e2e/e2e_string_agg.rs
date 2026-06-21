@@ -21,7 +21,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -55,7 +55,7 @@ fn string_agg_two_arg_concat_with_separator() {
         .unwrap();
     let row = one_row(r);
     // Order is INSERTion order in absence of ORDER BY inside the agg.
-    assert_eq!(row[0], Value::Text("red,green,blue".into()));
+    assert_eq!(row[0], Value::text("red,green,blue"));
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn string_agg_skips_null_inputs() {
     let row = one_row(r);
     // id=3 has (NULL, 'cyan'); NULL skipped, separator only between
     // surviving values → just "cyan".
-    assert_eq!(row[0], Value::Text("cyan".into()));
+    assert_eq!(row[0], Value::text("cyan"));
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn string_agg_single_value_no_separator() {
     e.execute("INSERT INTO n VALUES ('only')").unwrap();
     let r = e.execute("SELECT string_agg(v, '|') FROM n").unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text("only".into()));
+    assert_eq!(row[0], Value::text("only"));
 }
 
 #[test]
@@ -112,11 +112,11 @@ fn string_agg_with_group_by() {
     };
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].values[0], Value::Int(1));
-    assert_eq!(rows[0].values[1], Value::Text("red,green,blue".into()));
+    assert_eq!(rows[0].values[1], Value::text("red,green,blue"));
     assert_eq!(rows[1].values[0], Value::Int(2));
-    assert_eq!(rows[1].values[1], Value::Text("orange,yellow".into()));
+    assert_eq!(rows[1].values[1], Value::text("orange,yellow"));
     assert_eq!(rows[2].values[0], Value::Int(3));
-    assert_eq!(rows[2].values[1], Value::Text("cyan".into()));
+    assert_eq!(rows[2].values[1], Value::text("cyan"));
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn string_agg_int_input_coerced_to_text() {
     // form `string_agg(v::text, ',')` as the canonical workaround.
     let r = e.execute("SELECT string_agg(v::text, ',') FROM n").unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text("1,2".into()));
+    assert_eq!(row[0], Value::text("1,2"));
 }
 
 // ── array_agg ────────────────────────────────────────────────────

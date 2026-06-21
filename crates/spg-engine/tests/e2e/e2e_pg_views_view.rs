@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -25,8 +25,8 @@ fn pg_views_lists_declared_view() {
         .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("v".into()));
-    assert_eq!(r[0][1], Value::Text("public".into()));
+    assert_eq!(r[0][0], Value::text("v"));
+    assert_eq!(r[0][1], Value::text("public"));
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn pg_views_definition_carries_body() {
     );
     assert_eq!(r.len(), 1);
     let def = match &r[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         _ => panic!(),
     };
     assert!(def.to_uppercase().contains("SELECT"), "got: {def}");

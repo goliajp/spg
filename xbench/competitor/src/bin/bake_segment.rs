@@ -50,10 +50,10 @@ fn sweep_schema() -> TableSchema {
 /// `sec = (id * 2654435761 % 1_000_000_000) as i32` (Fibonacci-
 /// hash spread); `name = "u-{id}"`. Keeps cold-tier rows
 /// byte-identical to hot-tier rows so SELECTs don't care.
-fn make_sweep_row(id: i32) -> Row {
+fn make_sweep_row(id: i32) -> Row<'static> {
     let sec = ((id as u64).wrapping_mul(2_654_435_761) % 1_000_000_000) as i32;
     let name = format!("u-{id}");
-    Row::new(vec![Value::Int(id), Value::Int(sec), Value::Text(name)])
+    Row::new(vec![Value::Int(id), Value::Int(sec), Value::text(name)])
 }
 
 fn parse_args() -> (u64, PathBuf) {

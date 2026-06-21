@@ -105,7 +105,10 @@ pub(super) fn ts_match(l: Value, r: Value) -> Result<Value<'static>, EvalError> 
 /// session-resolved `default_text_search_config` is used (defaults
 /// to `simple` when unset); with two args the first picks the
 /// config. NULL text → NULL.
-pub(super) fn fts_to_tsvector(args: &[Value<'static>], ctx: &EvalContext<'_>) -> Result<Value<'static>, EvalError> {
+pub(super) fn fts_to_tsvector(
+    args: &[Value<'static>],
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("to_tsvector", args, ctx)?;
     match text {
         None => Ok(Value::Null),
@@ -191,7 +194,10 @@ pub(super) fn fts_websearch_to_tsquery(
     }
 }
 
-pub(super) fn fts_to_tsquery(args: &[Value<'static>], ctx: &EvalContext<'_>) -> Result<Value<'static>, EvalError> {
+pub(super) fn fts_to_tsquery(
+    args: &[Value<'static>],
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("to_tsquery", args, ctx)?;
     match text {
         None => Ok(Value::Null),
@@ -698,7 +704,10 @@ impl<'a> TsQueryParser<'a> {
     }
 }
 
-pub(super) fn tsvector_concat(l: &[spg_storage::TsLexeme], r: &[spg_storage::TsLexeme]) -> Value<'static> {
+pub(super) fn tsvector_concat(
+    l: &[spg_storage::TsLexeme],
+    r: &[spg_storage::TsLexeme],
+) -> Value<'static> {
     let shift = l
         .iter()
         .flat_map(|x| x.positions.iter().copied())

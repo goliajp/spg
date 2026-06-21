@@ -17,7 +17,7 @@ fn ok(e: &mut Engine, sql: &str) {
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -27,7 +27,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
     }
 }
 
-fn first_value(e: &mut Engine, sql: &str) -> Value {
+fn first_value(e: &mut Engine, sql: &str) -> Value<'static> {
     rows(e, sql)
         .into_iter()
         .next()
@@ -633,15 +633,9 @@ $$",
     ok(&mut e, "UPDATE users SET name = 'ALICE' WHERE id = 1");
     // Both alice posts got rewritten.
     let r = rows(&mut e, "SELECT id, author_name FROM posts ORDER BY id");
-    assert_eq!(
-        r[0].values,
-        vec![Value::Int(10), Value::Text("ALICE".into())]
-    );
-    assert_eq!(r[1].values, vec![Value::Int(11), Value::Text("bob".into())]);
-    assert_eq!(
-        r[2].values,
-        vec![Value::Int(12), Value::Text("ALICE".into())]
-    );
+    assert_eq!(r[0].values, vec![Value::Int(10), Value::text("ALICE")]);
+    assert_eq!(r[1].values, vec![Value::Int(11), Value::text("bob")]);
+    assert_eq!(r[2].values, vec![Value::Int(12), Value::text("ALICE")]);
 }
 
 #[test]
@@ -682,7 +676,7 @@ $$",
         "SELECT parent_id, payload FROM child ORDER BY payload",
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0].values, vec![Value::Int(2), Value::Text("c2a".into())]);
+    assert_eq!(r[0].values, vec![Value::Int(2), Value::text("c2a")]);
 }
 
 #[test]

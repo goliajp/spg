@@ -13,7 +13,7 @@ use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 use sqlx_core::types::Type;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::arguments::SpgArgumentValue;
 use crate::database::Spg;
@@ -38,7 +38,7 @@ impl<'q> Encode<'q, Spg> for DateTime<Utc> {
         // this shape and stores as i64 µs UTC.
         let s = self.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
+            value: EngineValue::text(s),
             type_info: Some(<DateTime<Utc> as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -76,7 +76,7 @@ impl<'q> Encode<'q, Spg> for NaiveDateTime {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = self.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
+            value: EngineValue::text(s),
             type_info: Some(<NaiveDateTime as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -114,7 +114,7 @@ impl<'q> Encode<'q, Spg> for NaiveDate {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = format!("{:04}-{:02}-{:02}", self.year(), self.month(), self.day());
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
+            value: EngineValue::text(s),
             type_info: Some(<NaiveDate as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });

@@ -388,7 +388,11 @@ pub(crate) fn build_order_keys(
 /// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`
 /// agree: OFFSET applies *after* ORDER BY but *before* LIMIT (so
 /// `LIMIT 10 OFFSET 5` keeps rows 6..=15).
-pub(crate) fn apply_offset_and_limit(rows: &mut Vec<Row<'static>>, offset: Option<u32>, limit: Option<u32>) {
+pub(crate) fn apply_offset_and_limit(
+    rows: &mut Vec<Row<'static>>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) {
     if let Some(off) = offset {
         let off = off as usize;
         if off >= rows.len() {

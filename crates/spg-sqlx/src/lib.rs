@@ -194,4 +194,4 @@ pub use crate::value::{SpgValue, SpgValueRef};
 // Re-export the embedded engine's owned-value type so consumers
 // don't have to depend on spg-embedded directly to construct or
 // pattern-match values returned from the adapter.
-pub use spg_embedded::Value as EngineValue;
+pub use spg_embedded::ValueOwned as EngineValue;

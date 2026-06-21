@@ -37,7 +37,7 @@ fn build_catalog(n_rows: usize) -> Catalog {
     for i in 0..n_rows {
         t.insert(Row::new(vec![
             Value::Int(i32::try_from(i).unwrap()),
-            Value::Text(format!("user-{i}")),
+            Value::text(format!("user-{i}")),
             Value::Float(f64::from(i as i32) * 0.1),
         ]))
         .unwrap();
@@ -77,7 +77,7 @@ fn build_vector_catalog(n_rows: usize) -> Catalog {
         ];
         t.insert(Row::new(vec![
             Value::Int(i32::try_from(i).unwrap()),
-            Value::Vector(v),
+            Value::vector(v),
         ]))
         .unwrap();
     }
@@ -155,7 +155,7 @@ fn bench_hnsw_build(c: &mut Criterion) {
                     let f = i as f32;
                     t.insert(Row::new(vec![
                         Value::Int(i32::try_from(i).unwrap()),
-                        Value::Vector(vec![
+                        Value::vector(vec![
                             f * 0.01,
                             f * 0.02,
                             f * 0.03,

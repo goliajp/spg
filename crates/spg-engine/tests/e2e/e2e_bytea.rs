@@ -8,7 +8,7 @@ fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
         .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
-fn select_value(eng: &mut Engine, sql: &str) -> Value {
+fn select_value(eng: &mut Engine, sql: &str) -> Value<'static> {
     match ok(eng, sql) {
         QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -28,7 +28,7 @@ fn bytea_round_trip_hex_literal() {
     let Value::Bytes(bytes) = v else {
         panic!("expected Bytes");
     };
-    assert_eq!(bytes, b"Hello");
+    assert_eq!(bytes.as_ref(), b"Hello");
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn bytea_escape_form() {
     let Value::Bytes(bytes) = v else {
         panic!("expected Bytes");
     };
-    assert_eq!(bytes, b"hi\0there");
+    assert_eq!(bytes.as_ref(), b"hi\0there");
 }
 
 #[test]

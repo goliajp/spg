@@ -21,7 +21,7 @@ use spg_engine::Engine;
 use spg_engine::QueryResult;
 use spg_storage::IndexKind;
 
-fn rows(r: QueryResult) -> Vec<spg_storage::Row> {
+fn rows(r: QueryResult) -> Vec<spg_storage::Row<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => rows,
         _ => panic!("expected rows"),

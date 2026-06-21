@@ -10,14 +10,14 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected Rows, got {other:?}"),
     }
 }
 
-fn join_lines(rows: Vec<Vec<Value>>) -> String {
+fn join_lines(rows: Vec<Vec<Value<'static>>>) -> String {
     let mut s = String::new();
     for r in rows {
         if let Some(Value::Text(t)) = r.into_iter().next() {

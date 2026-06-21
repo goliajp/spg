@@ -12,7 +12,7 @@
 
 use spg_embedded::{Database, QueryResult, Value};
 
-fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value<'static>>> {
     match db.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected rows for {sql}, got {other:?}"),
@@ -39,8 +39,8 @@ fn count_star_filter_in_select_list() {
         "SELECT thread_id, COUNT(*) FILTER (WHERE (flags & 1) = 0) AS seen \
          FROM m GROUP BY thread_id ORDER BY thread_id",
     );
-    assert_eq!(r[0], vec![Value::Text("t1".into()), Value::BigInt(1)]);
-    assert_eq!(r[1], vec![Value::Text("t2".into()), Value::BigInt(2)]);
+    assert_eq!(r[0], vec![Value::text("t1"), Value::BigInt(1)]);
+    assert_eq!(r[1], vec![Value::text("t2"), Value::BigInt(2)]);
 }
 
 /// Several aggregates with independent filters in one grouped pass,
@@ -60,7 +60,7 @@ fn multiple_independent_filters_one_pass() {
     assert_eq!(
         r[0],
         vec![
-            Value::Text("t1".into()),
+            Value::text("t1"),
             Value::BigInt(2),
             Value::BigInt(1),
             Value::BigInt(2),
@@ -70,7 +70,7 @@ fn multiple_independent_filters_one_pass() {
     assert_eq!(
         r[1],
         vec![
-            Value::Text("t2".into()),
+            Value::text("t2"),
             Value::BigInt(3),
             Value::BigInt(2),
             Value::BigInt(4),
@@ -89,7 +89,7 @@ fn filter_in_having() {
          HAVING COUNT(*) FILTER (WHERE (flags & 1) = 0) > 1 ORDER BY thread_id",
     );
     // t1 has 1 seen, t2 has 2 — only t2 passes.
-    assert_eq!(r, vec![vec![Value::Text("t2".into())]]);
+    assert_eq!(r, vec![vec![Value::text("t2")]]);
 }
 
 /// Ungrouped (whole-table) filtered aggregate.
@@ -394,7 +394,7 @@ fn json_aggregates() {
     db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7)")
         .unwrap();
     let r = rows_of(&mut db, "SELECT json_agg(x) FROM p");
-    assert_eq!(r[0][0], Value::Json("[1, 2, 3]".into()));
+    assert_eq!(r[0][0], Value::json("[1, 2, 3]"));
     let r = rows_of(&mut db, "SELECT json_object_agg(x, y) FROM p");
     assert_eq!(
         r[0][0],

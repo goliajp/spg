@@ -46,14 +46,14 @@ fn prepare_then_bind_query() {
     let stmt = db.prepare("SELECT name FROM users WHERE id = $1").unwrap();
     let rows = db.query_prepared(&stmt, &[Value::Int(2)]).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Text("bob".into()));
+    assert_eq!(rows[0][0], Value::text("bob"));
 
     // Same plan, different bind — exercises plan reuse.
     let rows = db.query_prepared(&stmt, &[Value::Int(1)]).unwrap();
-    assert_eq!(rows[0][0], Value::Text("alice".into()));
+    assert_eq!(rows[0][0], Value::text("alice"));
 
     let rows = db.query_prepared(&stmt, &[Value::Int(3)]).unwrap();
-    assert_eq!(rows[0][0], Value::Text("carol".into()));
+    assert_eq!(rows[0][0], Value::text("carol"));
 }
 
 #[test]
@@ -92,11 +92,11 @@ fn prepare_multi_param_mixed_types() {
         &insert,
         &[
             Value::Int(1),
-            Value::Text("signin".into()),
+            Value::text("signin"),
             Value::Bool(true),
             // v7.15.0 TIMESTAMPTZ accepts offset literal —
             // converted to i64 µs UTC at coerce time.
-            Value::Text("2026-06-06 12:00:00+00".into()),
+            Value::text("2026-06-06 12:00:00+00"),
         ],
     )
     .unwrap();
@@ -107,7 +107,7 @@ fn prepare_multi_param_mixed_types() {
     let rows = db.query_prepared(&select, &[Value::Bool(true)]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Int(1));
-    assert_eq!(rows[0][1], Value::Text("signin".into()));
+    assert_eq!(rows[0][1], Value::text("signin"));
     assert_eq!(rows[0][2], Value::Bool(true));
 }
 
@@ -150,17 +150,17 @@ fn prepared_dml_persists_via_wal() {
         db.execute("CREATE TABLE kv (k INT NOT NULL, v TEXT NOT NULL)")
             .unwrap();
         let stmt = db.prepare("INSERT INTO kv VALUES ($1, $2)").unwrap();
-        db.execute_prepared(&stmt, &[Value::Int(1), Value::Text("one".into())])
+        db.execute_prepared(&stmt, &[Value::Int(1), Value::text("one")])
             .unwrap();
-        db.execute_prepared(&stmt, &[Value::Int(2), Value::Text("two".into())])
+        db.execute_prepared(&stmt, &[Value::Int(2), Value::text("two")])
             .unwrap();
     }
 
     let mut db = Database::open_path(&path).unwrap();
     let rows = db.query("SELECT k, v FROM kv ORDER BY k").unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![Value::Int(1), Value::Text("one".into())]);
-    assert_eq!(rows[1], vec![Value::Int(2), Value::Text("two".into())]);
+    assert_eq!(rows[0], vec![Value::Int(1), Value::text("one")]);
+    assert_eq!(rows[1], vec![Value::Int(2), Value::text("two")]);
 }
 
 #[test]

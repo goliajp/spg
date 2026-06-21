@@ -17,7 +17,7 @@ fn build_engine() -> Engine {
     Engine::new().with_clock(clock)
 }
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -36,7 +36,7 @@ fn counter_increments_on_each_execute() {
     let got = rows_of(res);
     let insert_row = got
         .iter()
-        .find(|r| r[0] == Value::Text("INSERT INTO t VALUES (1)".to_string()))
+        .find(|r| r[0] == Value::text("INSERT INTO t VALUES (1)"))
         .expect("INSERT row");
     assert_eq!(insert_row[1], Value::BigInt(3), "exec_count is 3");
 }

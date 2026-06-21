@@ -14,7 +14,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -28,7 +28,7 @@ fn one_text(e: &mut Engine, sql: &str) -> String {
     let mut rs = rows(e, sql);
     let row = rs.pop().expect("one row");
     match row.into_iter().next().expect("one col") {
-        Value::Text(s) => s,
+        Value::Text(s) => s.into_owned(),
         other => panic!("expected text, got {other:?}"),
     }
 }

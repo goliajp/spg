@@ -4,7 +4,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -41,12 +41,9 @@ fn replication_lists_subscriptions() {
     );
     let got = rows_of(res);
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0][0], Value::Text("s".to_string()));
-    assert_eq!(
-        got[0][1],
-        Value::Text("host=localhost port=5432".to_string())
-    );
-    assert_eq!(got[0][2], Value::Text("p".to_string()));
+    assert_eq!(got[0][0], Value::text("s"));
+    assert_eq!(got[0][1], Value::text("host=localhost port=5432"));
+    assert_eq!(got[0][2], Value::text("p"));
     assert_eq!(got[0][3], Value::BigInt(0));
     assert_eq!(got[0][4], Value::Bool(true));
 }

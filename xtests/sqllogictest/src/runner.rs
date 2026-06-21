@@ -188,7 +188,7 @@ fn render_cell(v: &Value, ty: char) -> String {
             if s.is_empty() {
                 "(empty)".into()
             } else {
-                s.clone()
+                s.to_string()
             }
         }
         Value::Bool(b) => (if *b { "1" } else { "0" }).into(),
@@ -239,7 +239,7 @@ fn render_cell(v: &Value, ty: char) -> String {
             days,
             micros,
         } => spg_engine::eval::format_interval(*months, *days, *micros),
-        Value::Json(s) => s.clone(),
+        Value::Json(s) => s.to_string(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
         // canonical text form so fixtures can assert on
         // array-returning functions (`show_trgm`, `string_to_array`,

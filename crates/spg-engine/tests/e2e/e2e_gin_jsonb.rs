@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));

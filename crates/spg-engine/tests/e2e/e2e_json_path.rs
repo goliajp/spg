@@ -6,7 +6,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_value(eng: &mut Engine, sql: &str) -> Value {
+fn one_value(eng: &mut Engine, sql: &str) -> Value<'static> {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().next().unwrap().values[0].clone(),
         _ => panic!("expected Rows"),
@@ -17,21 +17,21 @@ fn one_value(eng: &mut Engine, sql: &str) -> Value {
 fn hash_arrow_walks_into_object() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, r#"SELECT '{"a":{"b":42}}' #> '{a,b}'"#);
-    assert_eq!(v, Value::Json("42".to_string()));
+    assert_eq!(v, Value::json("42"));
 }
 
 #[test]
 fn hash_arrow_text_returns_unquoted_string() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, r#"SELECT '{"a":{"b":"hi"}}' #>> '{a,b}'"#);
-    assert_eq!(v, Value::Text("hi".to_string()));
+    assert_eq!(v, Value::text("hi"));
 }
 
 #[test]
 fn hash_arrow_walks_into_array_index() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, r#"SELECT '{"items":[10,20,30]}' #> '{items,1}'"#);
-    assert_eq!(v, Value::Json("20".to_string()));
+    assert_eq!(v, Value::json("20"));
 }
 
 #[test]

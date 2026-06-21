@@ -145,14 +145,8 @@ fn t2_copy_blocks_and_serial_spellings_import() {
         .query("SELECT subject FROM messages ORDER BY id")
         .unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0][0],
-        spg_storage::Value::Text("re: hello; world".into())
-    );
-    assert_eq!(
-        rows[1][0],
-        spg_storage::Value::Text("it's a tab\there".into())
-    );
+    assert_eq!(rows[0][0], spg_storage::Value::text("re: hello; world"));
+    assert_eq!(rows[1][0], spg_storage::Value::text("it's a tab\there"));
     let null_score = db
         .query("SELECT id FROM messages WHERE score IS NULL")
         .unwrap();

@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -35,7 +35,7 @@ fn pg_indexes_lists_user_index_by_table() {
     let names: Vec<_> = r
         .iter()
         .map(|row| match &row[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             _ => panic!(),
         })
         .collect();
@@ -56,7 +56,7 @@ fn pg_indexes_indexdef_contains_create_index() {
     );
     assert_eq!(r.len(), 1);
     let def = match &r[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         _ => panic!(),
     };
     assert!(def.contains("CREATE"));

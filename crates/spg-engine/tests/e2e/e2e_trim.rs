@@ -17,7 +17,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
@@ -33,7 +33,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
     });
     let row = one_row(r);
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Null => panic!("got NULL, expected Text"),
         other => panic!("expected Text, got {other:?}"),
     }
@@ -245,8 +245,8 @@ fn trim_over_column() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text(String::new()));
-    assert_eq!(rows[1].values[0], Value::Text("john".into()));
+    assert_eq!(rows[0].values[0], Value::text(String::new()));
+    assert_eq!(rows[1].values[0], Value::text("john"));
 }
 
 // ── ARITY ERRORS ─────────────────────────────────────────────────
@@ -304,7 +304,7 @@ fn trim_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (trim('   hello   '))")
         .unwrap();
     let row = one_row(e.execute("SELECT n FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("hello".into()));
+    assert_eq!(row[0], Value::text("hello"));
 }
 
 // ── NESTED ───────────────────────────────────────────────────────

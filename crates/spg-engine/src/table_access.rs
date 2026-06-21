@@ -176,16 +176,17 @@ impl Engine {
         }
         let ctx = EvalContext::new(&cols, Some(alias));
         let mut out: Vec<Row<'static>> = Vec::new();
-        let push_if = |row: &Row<'static>, out: &mut Vec<Row<'static>>| -> Result<(), EngineError> {
-            for p in preds {
-                let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
-                if !matches!(v, Value::Bool(true)) {
-                    return Ok(());
+        let push_if =
+            |row: &Row<'static>, out: &mut Vec<Row<'static>>| -> Result<(), EngineError> {
+                for p in preds {
+                    let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
+                    if !matches!(v, Value::Bool(true)) {
+                        return Ok(());
+                    }
                 }
-            }
-            out.push(row.clone());
-            Ok(())
-        };
+                out.push(row.clone());
+                Ok(())
+            };
         match seeded {
             Some(ids) => {
                 for i in ids {

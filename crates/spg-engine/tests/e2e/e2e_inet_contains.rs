@@ -14,7 +14,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn bool_of(r: QueryResult) -> Value {
+fn bool_of(r: QueryResult) -> Value<'static> {
     match r {
         QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
         _ => panic!("expected rows"),

@@ -93,7 +93,7 @@ fn regclass_cast_strips_schema_prefix() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("t".into()));
+    assert_eq!(rows[0].values[0], Value::text("t"));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn regtype_text_in_text_out() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("int4".into()));
+    assert_eq!(rows[0].values[0], Value::text("int4"));
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn regclass_passes_unqualified_name_through() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("t".into()));
+    assert_eq!(rows[0].values[0], Value::text("t"));
 }
 
 #[test]
@@ -135,5 +135,5 @@ fn regclass_integer_oid_renders_as_text() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("16384".into()));
+    assert_eq!(rows[0].values[0], Value::text("16384"));
 }

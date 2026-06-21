@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -17,10 +17,7 @@ fn show_indexes_lists_table_indexes() {
         .unwrap();
     e.execute("CREATE INDEX idx_t_name ON t (name)").unwrap();
     let r = rows(e.execute("SHOW INDEXES FROM t").unwrap());
-    assert!(
-        r.iter()
-            .any(|row| row[2] == Value::Text("idx_t_name".into()))
-    );
+    assert!(r.iter().any(|row| row[2] == Value::text("idx_t_name")));
 }
 
 #[test]
@@ -50,7 +47,7 @@ fn show_status_returns_canonical_pairs() {
     let names: Vec<String> = r
         .iter()
         .map(|row| match &row[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             _ => panic!(),
         })
         .collect();
@@ -65,7 +62,7 @@ fn show_variables_returns_canonical_pairs() {
     let names: Vec<String> = r
         .iter()
         .map(|row| match &row[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             _ => panic!(),
         })
         .collect();
@@ -78,5 +75,5 @@ fn show_processlist_returns_self_row() {
     let mut e = Engine::new();
     let r = rows(e.execute("SHOW PROCESSLIST").unwrap());
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][1], Value::Text("postgres".into()));
+    assert_eq!(r[0][1], Value::text("postgres"));
 }

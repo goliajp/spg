@@ -12,7 +12,7 @@
 //! `types/text.rs` and uses [`numeric_to_text`] below — every
 //! sqlx user gets it for free.
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 #[cfg(feature = "bigdecimal")]
 use sqlx_core::decode::Decode;

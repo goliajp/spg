@@ -48,7 +48,9 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
 /// the v7.16.2 view returns the columns mailrs probes; broader
 /// PG-spec parity (ordinal_position, is_nullable, character_
 /// maximum_length, udt_name, …) lands as needed.
-pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_information_schema_columns(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
@@ -70,11 +72,7 @@ pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSche
                 Value::text(tname.clone()),
                 Value::text(col.name.clone()),
                 Value::Int(ordinal),
-                Value::text::<&str>(if col.nullable {
-                    "YES"
-                } else {
-                    "NO"
-                }),
+                Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
                 Value::text(pg_data_type_text(col.ty)),
             ]));
         }
@@ -83,7 +81,9 @@ pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSche
 }
 
 /// v7.16.2 — synthesise `information_schema.tables`.
-pub(crate) fn synth_information_schema_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_information_schema_tables(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
@@ -562,7 +562,9 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
 
 /// v7.17.0 Phase 3.P0-64 — synthesise
 /// `information_schema.REFERENTIAL_CONSTRAINTS`. One row per FK.
-pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_info_referential_constraints(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("constraint_name", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),

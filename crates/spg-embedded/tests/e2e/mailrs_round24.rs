@@ -78,7 +78,7 @@ fn round24_prepared_on_conflict_no_op_survives_crash_replay() {
         let stmt = db
             .prepare("INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .unwrap();
-        db.execute_prepared(&stmt, &[Value::Text("x".into()), Value::Text("y".into())])
+        db.execute_prepared(&stmt, &[Value::text("x"), Value::text("y")])
             .unwrap();
         // Step 2 — any successful write after it.
         db.execute("INSERT INTO t (a, b) VALUES ('p', 'q')")
@@ -97,8 +97,8 @@ fn round24_prepared_on_conflict_no_op_survives_crash_replay() {
         2,
         "seed row + post-conflict insert expected, got {got:?}"
     );
-    assert_eq!(got[0][0], Value::Text("p".into()));
-    assert_eq!(got[1][0], Value::Text("x".into()));
+    assert_eq!(got[0][0], Value::text("p"));
+    assert_eq!(got[1][0], Value::text("x"));
     // The replay must be CLEAN — if only the ask-2 quarantine were
     // in place (Display still stripping ON CONFLICT), the row count
     // would coincidentally match while the rejected record landed in
@@ -135,7 +135,7 @@ fn round24_prepared_on_conflict_do_update_survives_crash_replay() {
                 "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) DO UPDATE SET b = excluded.b",
             )
             .unwrap();
-        db.execute_prepared(&stmt, &[Value::Text("x".into()), Value::Text("new".into())])
+        db.execute_prepared(&stmt, &[Value::text("x"), Value::text("new")])
             .unwrap();
         std::mem::forget(db);
     }
@@ -145,7 +145,7 @@ fn round24_prepared_on_conflict_do_update_survives_crash_replay() {
     assert_eq!(got.len(), 1, "upsert must not duplicate: {got:?}");
     assert_eq!(
         got[0][0],
-        Value::Text("new".into()),
+        Value::text("new"),
         "replay must reconstruct the DO UPDATE effect"
     );
 }
@@ -200,7 +200,7 @@ fn round24_unappliable_wal_record_quarantines_instead_of_bricking() {
         2,
         "duplicate quarantined + later record applied expected, got {got:?}"
     );
-    assert_eq!(got[0][0], Value::Text("p".into()));
+    assert_eq!(got[0][0], Value::text("p"));
     let quarantine_files: Vec<PathBuf> = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|e| e.ok())

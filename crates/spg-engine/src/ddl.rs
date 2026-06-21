@@ -1143,7 +1143,8 @@ impl Engine {
             let nullable = col_def.nullable;
             let has_default = col_def.default.is_some() || col_def.auto_increment;
             let col_schema = column_def_to_schema(col_def)?;
-            let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some() {
+            let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some()
+            {
                 resolve_column_default_free(&col_schema, clock)?
             } else if nullable || row_count == 0 {
                 Value::Null
