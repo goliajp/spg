@@ -229,7 +229,21 @@ pub(crate) fn explain_select(
             alloc::format!("{child}CTE: {}", cte.name)
         };
         out.push(head);
-        explain_select(&cte.body, engine, depth + 2, out);
+        // v7.37.43-T4.4 — modifying CTE bodies appear as a stub
+        // node; the dispatch logic in the engine routes them
+        // through dml.rs paths, not the recursive select planner.
+        match &cte.body {
+            spg_sql::ast::CteBody::Select(s) => explain_select(s, engine, depth + 2, out),
+            spg_sql::ast::CteBody::Insert(s) => {
+                out.push(alloc::format!("{}ModifyingCTE (INSERT {})", "  ".repeat(depth + 2), s.table));
+            }
+            spg_sql::ast::CteBody::Update(s) => {
+                out.push(alloc::format!("{}ModifyingCTE (UPDATE {})", "  ".repeat(depth + 2), s.table));
+            }
+            spg_sql::ast::CteBody::Delete(s) => {
+                out.push(alloc::format!("{}ModifyingCTE (DELETE {})", "  ".repeat(depth + 2), s.table));
+            }
+        }
     }
     // 3) FROM details — primary table + joins, index hits.
     if let Some(from) = &stmt.from {

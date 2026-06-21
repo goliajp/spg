@@ -1716,7 +1716,7 @@ impl Engine {
         };
         let cte = Cte {
             name: cte_name.clone(),
-            body,
+            body: spg_sql::ast::CteBody::Select(body),
             recursive: false,
             column_overrides: Vec::new(),
         };
@@ -1731,6 +1731,7 @@ impl Engine {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: None,
                 lateral_subquery: None,
+                jsonb_each_text_arg: None,
             },
             on: Some(Expr::Binary {
                 lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
@@ -2001,6 +2002,7 @@ impl Engine {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: None,
                 lateral_subquery: None,
+                jsonb_each_text_arg: None,
             },
             on: Some(on),
         };
@@ -2514,6 +2516,7 @@ impl Engine {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: None,
                 lateral_subquery: None,
+                jsonb_each_text_arg: None,
             },
             on: Some(on),
         };

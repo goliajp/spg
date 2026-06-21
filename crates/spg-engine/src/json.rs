@@ -122,6 +122,55 @@ fn write_json(v: &JsonValue, out: &mut String) {
 /// right-hand side is a PG text-array literal `'{a,0,b}'` whose
 /// elements are walked left-to-right; each element is either an
 /// object key or (when it parses as a non-negative integer) an
+/// v7.37.43-T4.5 — set-returning function `jsonb_each_text(jsonb)`.
+/// PG semantics: for each (key, value) pair in the object, emit one
+/// row whose `key` column is the literal key and `value` column is
+/// the JSON value rendered as text (`null` → SQL NULL, primitives →
+/// their lexeme, nested objects/arrays → JSON text).
+///
+/// Returns the (key, value) tuples as a Vec ready for FROM-clause
+/// materialisation. Non-object inputs raise an error (PG's actual
+/// behaviour); `NULL` and empty object both produce 0 rows.
+pub fn jsonb_each_text_rows(arg: &Value) -> Result<Vec<(String, Option<String>)>, EvalError> {
+    let src = match arg {
+        Value::Null => return Ok(Vec::new()),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "jsonb_each_text: argument must be JSON / JSONB, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let parsed = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_each_text: invalid JSON: {e}"),
+    })?;
+    match parsed {
+        JsonValue::Object(entries) => {
+            let mut out: Vec<(String, Option<String>)> = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                let text = match &v {
+                    JsonValue::Null => None,
+                    JsonValue::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
+                    JsonValue::Number(_) | JsonValue::NumberText(_) | JsonValue::String(_) => {
+                        Some(v.as_text())
+                    }
+                    JsonValue::Array(_) | JsonValue::Object(_) => Some(v.to_json_text()),
+                };
+                out.push((k, text));
+            }
+            Ok(out)
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "jsonb_each_text: argument must be a JSON object, got {other:?}"
+            ),
+        }),
+    }
+}
+
 /// array index. Missing or non-existent steps return `Value::Null`.
 pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static>, EvalError> {
     let src = match lhs {

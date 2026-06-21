@@ -475,22 +475,65 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.37.43-T4.4 — `&self` SELECT path: only read-only CTE
+        // bodies are supported here. Writable CTEs on a SELECT
+        // outer require `&mut self` and route through the
+        // top-level `exec_select_cancel_mut` entry; sentori
+        // 0065's WITH-INSERT-INSERT shape comes in as a top-level
+        // INSERT, not a SELECT, so this restriction is harmless
+        // in practice.
+        if stmt.ctes.iter().any(|c| c.body.is_modifying()) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "SELECT with a data-modifying CTE body must run via the top-level mutable entry"
+            )));
+        }
+        let catalog = self.materialise_ctes_readonly(&stmt.ctes, cancel)?;
+        // Strip CTEs from the body before running on the temp engine
+        // so we don't recurse forever.
+        let mut body = stmt.clone();
+        body.ctes = Vec::new();
+        let mut temp = Engine::restore(catalog);
+        if let Some(c) = self.clock {
+            temp = temp.with_clock(c);
+        }
+        if let Some(f) = self.salt_fn {
+            temp = temp.with_salt_fn(f);
+        }
+        temp.exec_select_cancel(&body, cancel)
+    }
+
+    /// v7.37.43-T4.4 — read-only CTE materialiser used by the
+    /// `&self` SELECT path. Caller guarantees no modifying CTE
+    /// bodies are present.
+    pub(crate) fn materialise_ctes_readonly(
+        &self,
+        ctes: &[spg_sql::ast::Cte],
+        cancel: CancelToken<'_>,
+    ) -> Result<crate::Catalog, EngineError> {
+        cancel.check()?;
         let mut catalog = self.active_catalog().clone();
-        for cte in &stmt.ctes {
+        for cte in ctes {
             if catalog.get(&cte.name).is_some() {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "CTE name {:?} shadows an existing table; rename the CTE",
                     cte.name
                 )));
             }
+            let body_select = cte
+                .body
+                .as_select()
+                .ok_or_else(|| EngineError::Unsupported(alloc::format!(
+                    "data-modifying CTE not supported on this SELECT entry"
+                )))?;
             let (columns, rows) = if cte.recursive {
-                self.materialise_recursive_cte(cte, &catalog, cancel)?
+                let synthetic = spg_sql::ast::Cte {
+                    name: cte.name.clone(),
+                    body: spg_sql::ast::CteBody::Select(body_select.clone()),
+                    recursive: true,
+                    column_overrides: cte.column_overrides.clone(),
+                };
+                self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
             } else {
-                // v7.25 (round-17) — run the body against the
-                // ACCUMULATED catalog so a CTE can reference every
-                // CTE declared before it (`WITH a AS (…), b AS
-                // (SELECT … FROM a)`). Executing on `self` lost the
-                // already-materialised CTE tables.
                 let mut cte_engine = Engine::restore(catalog.clone());
                 if let Some(c) = self.clock {
                     cte_engine = cte_engine.with_clock(c);
@@ -498,7 +541,7 @@ impl Engine {
                 if let Some(f) = self.salt_fn {
                     cte_engine = cte_engine.with_salt_fn(f);
                 }
-                let body_result = cte_engine.exec_select_cancel(&cte.body, cancel)?;
+                let body_result = cte_engine.exec_select_cancel(body_select, cancel)?;
                 let QueryResult::Rows { columns, rows } = body_result else {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "CTE {:?} body did not return rows",
@@ -507,13 +550,8 @@ impl Engine {
                 };
                 (columns, rows)
             };
-            // v4.22: the projection builder labels any non-column
-            // expression as Text — including literal SELECT 1.
-            // Promote each column's type to whatever the rows
-            // actually carry so the CTE storage table accepts them.
             let inferred = infer_column_types(&columns, &rows);
             let mut columns = inferred;
-            // v4.22: apply optional `WITH name(a, b, c)` overrides.
             if !cte.column_overrides.is_empty() {
                 if cte.column_overrides.len() != columns.len() {
                     return Err(EngineError::Unsupported(alloc::format!(
@@ -536,18 +574,193 @@ impl Engine {
                 table.insert(row).map_err(EngineError::Storage)?;
             }
         }
-        // Strip CTEs from the body before running on the temp engine
-        // so we don't recurse forever.
-        let mut body = stmt.clone();
+        Ok(catalog)
+    }
+
+    /// v7.37.43-T4.4 — shared CTE materialiser (mutable variant).
+    /// Retained for non-DML callers; the DML path (writable CTE on
+    /// INSERT/UPDATE/DELETE outer) uses `run_with_cte_temps` in
+    /// `dml.rs` which installs the CTE temps directly on the
+    /// active catalog so the outer statement's writes hit real
+    /// tables.
+    #[allow(dead_code)]
+    pub(crate) fn materialise_ctes(
+        &mut self,
+        ctes: &[spg_sql::ast::Cte],
+        cancel: CancelToken<'_>,
+    ) -> Result<crate::Catalog, EngineError> {
+        cancel.check()?;
+        // v7.37.43-T4.4 — modifying CTEs need to write through the
+        // SAME catalog as the outer statement, not a clone (PG's
+        // writable CTE puts all modifications in one transaction).
+        // For the read-only case the original logic cloned, but
+        // since the outer statement also goes through the cloned
+        // engine and ALL writes must converge, we now drive the
+        // accumulator off `self.active_catalog().clone()` and
+        // commit the modifying writes directly to `self`'s active
+        // catalog so the surface is consistent.
+        let mut catalog = self.active_catalog().clone();
+        for cte in ctes {
+            if catalog.get(&cte.name).is_some() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CTE name {:?} shadows an existing table; rename the CTE",
+                    cte.name
+                )));
+            }
+            let (columns, rows) = match &cte.body {
+                spg_sql::ast::CteBody::Select(body) if cte.recursive => {
+                    // Recursive CTE — the existing helper takes a
+                    // SELECT body and the snapshot catalog.
+                    let synthetic = spg_sql::ast::Cte {
+                        name: cte.name.clone(),
+                        body: spg_sql::ast::CteBody::Select(body.clone()),
+                        recursive: true,
+                        column_overrides: cte.column_overrides.clone(),
+                    };
+                    self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
+                }
+                spg_sql::ast::CteBody::Select(body) => {
+                    // v7.25 (round-17) — run against the accumulated
+                    // catalog so later CTEs can reference earlier
+                    // ones in the same WITH clause.
+                    let mut cte_engine = Engine::restore(catalog.clone());
+                    if let Some(c) = self.clock {
+                        cte_engine = cte_engine.with_clock(c);
+                    }
+                    if let Some(f) = self.salt_fn {
+                        cte_engine = cte_engine.with_salt_fn(f);
+                    }
+                    let body_result = cte_engine.exec_select_cancel(body, cancel)?;
+                    let QueryResult::Rows { columns, rows } = body_result else {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "CTE {:?} body did not return rows",
+                            cte.name
+                        )));
+                    };
+                    (columns, rows)
+                }
+                spg_sql::ast::CteBody::Insert(body) => {
+                    self.exec_modifying_cte_insert(&cte.name, body, cancel)?
+                }
+                spg_sql::ast::CteBody::Update(body) => {
+                    self.exec_modifying_cte_update(&cte.name, body, cancel)?
+                }
+                spg_sql::ast::CteBody::Delete(body) => {
+                    self.exec_modifying_cte_delete(&cte.name, body, cancel)?
+                }
+            };
+            // v4.22: the projection builder labels any non-column
+            // expression as Text — including literal SELECT 1.
+            // Promote each column's type to whatever the rows
+            // actually carry so the CTE storage table accepts them.
+            let inferred = infer_column_types(&columns, &rows);
+            let mut columns = inferred;
+            if !cte.column_overrides.is_empty() {
+                if cte.column_overrides.len() != columns.len() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "CTE {:?} column list has {} names but body returns {} columns",
+                        cte.name,
+                        cte.column_overrides.len(),
+                        columns.len()
+                    )));
+                }
+                for (col, name) in columns.iter_mut().zip(cte.column_overrides.iter()) {
+                    col.name.clone_from(name);
+                }
+            }
+            let schema = TableSchema::new(cte.name.clone(), columns);
+            catalog.create_table(schema).map_err(EngineError::Storage)?;
+            let table = catalog
+                .get_mut(&cte.name)
+                .expect("just-created CTE table must exist");
+            for row in rows {
+                table.insert(row).map_err(EngineError::Storage)?;
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// v7.37.43-T4.4 — execute an INSERT CTE body. Runs the INSERT
+    /// against `self` (so the mutation lands in the active catalog
+    /// inside the current transaction) and captures the RETURNING
+    /// projection — column schema + rows — to materialise as the
+    /// CTE alias's table. An INSERT without RETURNING produces a
+    /// 0-row table with a synthetic single-column placeholder
+    /// (matches PG: the CTE alias is still defined, but referencing
+    /// it from the outer query without RETURNING raises a
+    /// column-resolution error at scan time).
+    fn exec_modifying_cte_insert(
+        &mut self,
+        cte_name: &str,
+        body: &spg_sql::ast::InsertStatement,
+        _cancel: CancelToken<'_>,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+        // v7.37.43-T4.4 — strip any nested CTEs from the body
+        // (already materialised in the outer pass) before
+        // dispatch to avoid infinite recursion.
+        let mut body = body.clone();
         body.ctes = Vec::new();
-        let mut temp = Engine::restore(catalog);
-        if let Some(c) = self.clock {
-            temp = temp.with_clock(c);
+        let result = self.exec_insert(body)?;
+        match result {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            QueryResult::CommandOk { .. } => {
+                // No RETURNING — emit a sentinel single-column
+                // schema with zero rows so the alias is defined.
+                let placeholder = spg_storage::ColumnSchema::new(
+                    alloc::format!("{cte_name}_returning_absent"),
+                    spg_storage::DataType::Text,
+                    true,
+                );
+                Ok((alloc::vec![placeholder], Vec::new()))
+            }
         }
-        if let Some(f) = self.salt_fn {
-            temp = temp.with_salt_fn(f);
+    }
+
+    /// v7.37.43-T4.4 — execute an UPDATE CTE body, same semantics
+    /// as INSERT above.
+    fn exec_modifying_cte_update(
+        &mut self,
+        cte_name: &str,
+        body: &spg_sql::ast::UpdateStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+        let mut body = body.clone();
+        body.ctes = Vec::new();
+        let result = self.exec_update_cancel(&body, cancel)?;
+        match result {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            QueryResult::CommandOk { .. } => {
+                let placeholder = spg_storage::ColumnSchema::new(
+                    alloc::format!("{cte_name}_returning_absent"),
+                    spg_storage::DataType::Text,
+                    true,
+                );
+                Ok((alloc::vec![placeholder], Vec::new()))
+            }
         }
-        temp.exec_select_cancel(&body, cancel)
+    }
+
+    /// v7.37.43-T4.4 — execute a DELETE CTE body.
+    fn exec_modifying_cte_delete(
+        &mut self,
+        cte_name: &str,
+        body: &spg_sql::ast::DeleteStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<spg_storage::Row<'static>>), EngineError> {
+        let mut body = body.clone();
+        body.ctes = Vec::new();
+        let result = self.exec_delete_cancel(&body, cancel)?;
+        match result {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            QueryResult::CommandOk { .. } => {
+                let placeholder = spg_storage::ColumnSchema::new(
+                    alloc::format!("{cte_name}_returning_absent"),
+                    spg_storage::DataType::Text,
+                    true,
+                );
+                Ok((alloc::vec![placeholder], Vec::new()))
+            }
+        }
     }
 
     /// v4.22: materialise a WITH RECURSIVE CTE. The body must be a
@@ -560,7 +773,7 @@ impl Engine {
     /// deduplicates against the accumulated result, UNION ALL does
     /// not. A hard cap on total rows prevents runaway queries.
     #[allow(clippy::too_many_lines)]
-    fn materialise_recursive_cte(
+    pub(crate) fn materialise_recursive_cte(
         &self,
         cte: &spg_sql::ast::Cte,
         base_catalog: &Catalog,
@@ -569,14 +782,23 @@ impl Engine {
         const MAX_TOTAL_ROWS: usize = 1_000_000;
         const MAX_ITERATIONS: usize = 100_000;
         cancel.check()?;
-        if cte.body.unions.is_empty() {
+        // v7.37.43-T4.4 — RECURSIVE only supports SELECT bodies;
+        // a modifying recursive CTE is parser-rejectable but we
+        // guard here defensively.
+        let body_select = cte.body.as_select().ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "WITH RECURSIVE {:?} body must be a SELECT, not a data-modifying statement",
+                cte.name
+            ))
+        })?;
+        if body_select.unions.is_empty() {
             return Err(EngineError::Unsupported(alloc::format!(
                 "WITH RECURSIVE {:?} body must be a UNION of an anchor and a recursive term",
                 cte.name
             )));
         }
         // Anchor: the body's leading SELECT, with unions stripped.
-        let mut anchor = cte.body.clone();
+        let mut anchor = body_select.clone();
         let union_terms = core::mem::take(&mut anchor.unions);
         anchor.ctes = Vec::new();
         // Anchor must not reference the CTE name.
@@ -1628,6 +1850,12 @@ impl Engine {
         if from.primary.unnest_expr.is_some() {
             return self.exec_select_unnest(stmt, &from.primary, cancel);
         }
+        // v7.37.43-T4.5 — `FROM jsonb_each_text(<expr>)` set-
+        // returning function. Same dispatch shape as unnest but
+        // emits a two-column (key TEXT, value TEXT) row stream.
+        if from.primary.jsonb_each_text_arg.is_some() {
+            return self.exec_select_jsonb_each_text(stmt, &from.primary, cancel);
+        }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
         // [, step])` set-returning source. Dispatch mirrors UNNEST:
         // materialise the row stream from a single eval pass, then
@@ -1745,6 +1973,145 @@ impl Engine {
             );
         }
         self.run_single_table_scan(stmt, table, schema_cols, alias, indexed_rows, cancel)
+    }
+
+    /// v7.37.43-T4.5 — execute `SELECT … FROM jsonb_each_text(<expr>)`.
+    /// Sentori migration 0067 uses this with `CROSS JOIN LATERAL`; the
+    /// uncorrelated FROM-primary case is the simpler shape, used by
+    /// e2e pins. Materialises the (key, value) pair stream into a
+    /// synthetic two-column TEXT table, then routes through the
+    /// regular projection / WHERE / ORDER BY pipeline.
+    fn exec_select_jsonb_each_text(
+        &self,
+        stmt: &SelectStatement,
+        primary: &TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let arg_expr = primary
+            .jsonb_each_text_arg
+            .as_deref()
+            .expect("caller guards jsonb_each_text_arg.is_some()");
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy_row = Row::new(alloc::vec::Vec::new());
+        let arg_value =
+            eval::eval_expr(arg_expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+        let pairs = crate::json::jsonb_each_text_rows(&arg_value).map_err(EngineError::Eval)?;
+        let rows: alloc::vec::Vec<Row<'static>> = pairs
+            .into_iter()
+            .map(|(k, v)| {
+                let key_val = Value::text(k);
+                let value_val = match v {
+                    Some(s) => Value::text(s),
+                    None => Value::Null,
+                };
+                Row::new(alloc::vec![key_val, value_val])
+            })
+            .collect();
+        let alias = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| "jsonb_each_text".to_string());
+        let key_col = ColumnSchema::new("key".to_string(), spg_storage::DataType::Text, false);
+        let value_col = ColumnSchema::new("value".to_string(), spg_storage::DataType::Text, true);
+        let schema_cols = alloc::vec![key_col, value_col];
+        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // WHERE.
+        let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
+            let mut out = alloc::vec::Vec::with_capacity(rows.len());
+            for row in rows {
+                cancel.check()?;
+                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Bool(true)) {
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            rows
+        };
+        // Aggregate dispatch (e.g. SELECT COUNT(*) FROM jsonb_each_text…).
+        if aggregate::uses_aggregate(stmt) {
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
+            let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
+            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(RowRef::Owned).collect();
+            let agg = aggregate::run(
+                stmt,
+                &filtered_refs,
+                &schema_cols,
+                Some(&alias),
+                Some(&agg_correlated),
+            )?;
+            return self.finish_agg_result(agg, stmt, cancel);
+        }
+        // Projection.
+        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let mut projected_rows: alloc::vec::Vec<Row<'static>> =
+            alloc::vec::Vec::with_capacity(filtered.len());
+        for row in &filtered {
+            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+            for p in &projection {
+                let v =
+                    eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?;
+                vals.push(v);
+            }
+            projected_rows.push(Row::new(vals));
+        }
+        let columns: alloc::vec::Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // ORDER BY.
+        if !stmt.order_by.is_empty() {
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, r)| -> Result<_, EngineError> {
+                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        })
+                        .collect();
+                    Ok((i, keys?))
+                })
+                .collect::<Result<_, _>>()?;
+            indexed.sort_by(|a, b| {
+                for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
+                    let o = &stmt.order_by[idx];
+                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    if cmp != core::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            projected_rows = indexed
+                .into_iter()
+                .map(|(i, _)| projected_rows[i].clone())
+                .collect();
+        }
+        if let Some(offset) = stmt.offset_literal() {
+            let off = (offset as usize).min(projected_rows.len());
+            projected_rows.drain(..off);
+        }
+        if let Some(limit) = stmt.limit_literal() {
+            projected_rows.truncate(limit as usize);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: projected_rows,
+        })
     }
 
     /// Constant `SELECT` with no FROM: evaluate each projection item
@@ -3460,7 +3827,7 @@ impl Engine {
             };
             new_ctes.push(spg_sql::ast::Cte {
                 name: name.clone(),
-                body,
+                body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: view.columns.clone(),
             });
@@ -3525,7 +3892,7 @@ impl Engine {
             };
             new_ctes.push(spg_sql::ast::Cte {
                 name: synth_name(parent_name),
-                body,
+                body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: Vec::new(),
             });

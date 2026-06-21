@@ -755,6 +755,7 @@ impl Engine {
             unnest_column_aliases: Vec::new(),
             generate_series_args: None,
             lateral_subquery: None,
+            jsonb_each_text_arg: None,
         };
         let where_ = combine_with_and_owned(inner_preds);
         let pk_col_name = ColumnName {

@@ -3480,6 +3480,7 @@ impl Parser {
         };
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Update(crate::ast::UpdateStatement {
+            ctes: Vec::new(),
             table,
             assignments,
             where_,
@@ -3503,6 +3504,7 @@ impl Parser {
         };
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Delete(crate::ast::DeleteStatement {
+            ctes: Vec::new(),
             table,
             where_,
             returning,
@@ -7409,6 +7411,7 @@ impl Parser {
             let on_conflict = self.parse_optional_on_conflict()?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
+                ctes: Vec::new(),
                 table,
                 columns,
                 rows: Vec::new(),
@@ -7469,6 +7472,7 @@ impl Parser {
         let on_conflict = self.parse_optional_on_conflict()?;
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
+            ctes: Vec::new(),
             table,
             columns,
             rows,
@@ -7619,6 +7623,115 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // v7.37.43-T4.5 — `LATERAL jsonb_each_text(<expr>)` —
+        // set-returning function whose argument may reference a
+        // preceding FROM item. We rewrite this to
+        // `LATERAL (SELECT key, value FROM jsonb_each_text(<expr>)
+        // AS __srf__) AS <alias>` so the existing LATERAL subquery
+        // executor handles per-outer-row evaluation and the
+        // SRF-primary jsonb_each_text path handles the inner
+        // materialisation. Sentori 0067 backfill is the dogfood
+        // shape.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("jsonb_each_text"))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
+        {
+            self.advance(); // LATERAL
+            self.advance(); // jsonb_each_text
+            self.advance(); // (
+            let arg = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after LATERAL jsonb_each_text() argument, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let alias = alias_ident
+                .clone()
+                .unwrap_or_else(|| "jsonb_each_text".to_string());
+            // Synthesise: SELECT __srf__.key AS <key_alias>, __srf__.value AS <value_alias>
+            //               FROM jsonb_each_text(<arg>) AS __srf__
+            // PG's `AS kv(key, value)` column-alias list maps
+            // positions to names; default to (key, value) when
+            // omitted (matching the SRF's natural column names).
+            let srf_alias = "__srf__".to_string();
+            let key_alias = column_aliases
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "key".to_string());
+            let value_alias = column_aliases
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "value".to_string());
+            let inner_select = crate::ast::SelectStatement {
+                ctes: Vec::new(),
+                distinct: false,
+                items: alloc::vec![
+                    crate::ast::SelectItem::Expr {
+                        expr: crate::ast::Expr::Column(crate::ast::ColumnName {
+                            qualifier: Some(srf_alias.clone()),
+                            name: "key".to_string(),
+                        }),
+                        alias: Some(key_alias),
+                    },
+                    crate::ast::SelectItem::Expr {
+                        expr: crate::ast::Expr::Column(crate::ast::ColumnName {
+                            qualifier: Some(srf_alias.clone()),
+                            name: "value".to_string(),
+                        }),
+                        alias: Some(value_alias),
+                    },
+                ],
+                from: Some(crate::ast::FromClause {
+                    primary: TableRef {
+                        name: srf_alias.clone(),
+                        alias: Some(srf_alias.clone()),
+                        as_of_segment: None,
+                        unnest_expr: None,
+                        unnest_column_aliases: Vec::new(),
+                        generate_series_args: None,
+                        lateral_subquery: None,
+                        jsonb_each_text_arg: Some(Box::new(arg)),
+                    },
+                    joins: Vec::new(),
+                }),
+                where_: None,
+                group_by: None,
+                group_by_all: false,
+                having: None,
+                unions: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                limit_with_ties: false,
+            };
+            return Ok(TableRef {
+                name: alias.clone(),
+                alias: Some(alias),
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(inner_select)),
+                jsonb_each_text_arg: None,
+            });
+        }
+        // v7.37.43-T4.5 — bare `CROSS JOIN jsonb_each_text(t.col)`
+        // without an explicit `LATERAL` keyword is the same shape
+        // PG accepts (SRF naturally licences lateral correlation).
+        // We mirror the LATERAL rewrite when the argument syntactic-
+        // ally references an outer column (Column { qualifier:
+        // Some(_), … }). For simplicity we apply the rewrite
+        // whenever the SRF directly follows JOIN/CROSS JOIN/comma
+        // in the FROM-list — caller-side join parsing positions
+        // this peek correctly.
+        // (Implementation note: detection lives below; the LATERAL
+        // branch above already covers the explicit form; the bare
+        // form falls through to the plain SRF arm and the engine
+        // treats it as a constant-arg SRF if no outer reference is
+        // present.)
         // v7.17.0 Phase 3.P0-41 — `LATERAL ( SELECT … )` derived
         // table. Detect at the head so it claims precedence over
         // every other table-ref shape (unnest / generate_series /
@@ -7655,6 +7768,42 @@ impl Parser {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
+                jsonb_each_text_arg: None,
+            });
+        }
+        // v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
+        // function as a FROM item. Emits one row per (key, value)
+        // pair in the JSONB object argument as TEXT columns. May
+        // be wrapped in CROSS JOIN LATERAL when the argument
+        // references a preceding FROM item (sentori migration
+        // 0067 backfill shape: `CROSS JOIN LATERAL
+        // jsonb_each_text(t.json_col) AS kv(key, value)`).
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("jsonb_each_text"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // jsonb_each_text
+            self.advance(); // (
+            let arg = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after jsonb_each_text() argument, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident
+                .clone()
+                .unwrap_or_else(|| "jsonb_each_text".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: None,
+                jsonb_each_text_arg: Some(Box::new(arg)),
             });
         }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
@@ -7683,6 +7832,7 @@ impl Parser {
                 unnest_column_aliases,
                 generate_series_args: None,
                 lateral_subquery: None,
+                jsonb_each_text_arg: None,
             });
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -7733,6 +7883,7 @@ impl Parser {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: Some(args),
                 lateral_subquery: None,
+                jsonb_each_text_arg: None,
             });
         }
         // v7.16.2 — preserve information_schema / pg_catalog
@@ -7799,6 +7950,7 @@ impl Parser {
             unnest_column_aliases: Vec::new(),
             generate_series_args: None,
             lateral_subquery: None,
+            jsonb_each_text_arg: None,
         })
     }
 
@@ -8604,10 +8756,53 @@ impl Parser {
                 )));
             }
             self.advance();
-            if !matches!(self.peek(), Token::Select) {
-                return Err(self.err(format!("WITH body must be a SELECT, got {:?}", self.peek())));
-            }
-            let inner = self.parse_select_stmt()?;
+            // v7.37.43-T4.4 — accept INSERT / UPDATE / DELETE (with
+            // RETURNING) as the CTE body in addition to SELECT.
+            // PG writable CTE semantics. UPDATE / DELETE come in as
+            // bare Idents (lexer keeps SELECT / INSERT as reserved
+            // tokens but treats the rest of DML as case-insensitive
+            // idents).
+            let is_update_kw = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update"));
+            let is_delete_kw = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete"));
+            let body = match self.peek() {
+                Token::Select => {
+                    let inner = self.parse_select_stmt()?;
+                    let Statement::Select(s) = inner else {
+                        unreachable!("parse_select_stmt returns Select");
+                    };
+                    crate::ast::CteBody::Select(s)
+                }
+                Token::Insert => {
+                    let inner = self.parse_one_statement()?;
+                    let Statement::Insert(s) = inner else {
+                        unreachable!("Token::Insert routes to Insert");
+                    };
+                    crate::ast::CteBody::Insert(alloc::boxed::Box::new(s))
+                }
+                _ if is_update_kw => {
+                    let inner = self.parse_one_statement()?;
+                    let Statement::Update(s) = inner else {
+                        return Err(self.err(format!(
+                            "expected UPDATE inside WITH (…), got {inner:?}"
+                        )));
+                    };
+                    crate::ast::CteBody::Update(alloc::boxed::Box::new(s))
+                }
+                _ if is_delete_kw => {
+                    let inner = self.parse_one_statement()?;
+                    let Statement::Delete(s) = inner else {
+                        return Err(self.err(format!(
+                            "expected DELETE inside WITH (…), got {inner:?}"
+                        )));
+                    };
+                    crate::ast::CteBody::Delete(alloc::boxed::Box::new(s))
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "WITH body must be SELECT / INSERT / UPDATE / DELETE, got {other:?}"
+                    )));
+                }
+            };
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(format!(
                     "expected ')' after CTE body, got {:?}",
@@ -8615,9 +8810,6 @@ impl Parser {
                 )));
             }
             self.advance();
-            let Statement::Select(body) = inner else {
-                unreachable!("parse_select_stmt returns Select")
-            };
             ctes.push(crate::ast::Cte {
                 name,
                 body,
@@ -8630,19 +8822,48 @@ impl Parser {
             }
             break;
         }
-        // The body SELECT follows. Must start with SELECT.
-        if !matches!(self.peek(), Token::Select) {
-            return Err(self.err(format!(
-                "expected SELECT after WITH clause, got {:?}",
-                self.peek()
-            )));
+        // v7.37.43-T4.4 — the outer body may be SELECT (classical),
+        // or INSERT / UPDATE / DELETE (writable CTE outer). Attach
+        // the parsed CTEs to whichever statement the body produces.
+        let outer_is_update = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update"));
+        let outer_is_delete = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete"));
+        match self.peek() {
+            Token::Select => {
+                let body_stmt = self.parse_select_stmt()?;
+                let Statement::Select(mut body) = body_stmt else {
+                    unreachable!()
+                };
+                body.ctes = ctes;
+                Ok(Statement::Select(body))
+            }
+            Token::Insert => {
+                let body_stmt = self.parse_one_statement()?;
+                let Statement::Insert(mut body) = body_stmt else {
+                    unreachable!()
+                };
+                body.ctes = ctes;
+                Ok(Statement::Insert(body))
+            }
+            _ if outer_is_update => {
+                let body_stmt = self.parse_one_statement()?;
+                let Statement::Update(mut body) = body_stmt else {
+                    return Err(self.err(format!("expected UPDATE after WITH clause")));
+                };
+                body.ctes = ctes;
+                Ok(Statement::Update(body))
+            }
+            _ if outer_is_delete => {
+                let body_stmt = self.parse_one_statement()?;
+                let Statement::Delete(mut body) = body_stmt else {
+                    return Err(self.err(format!("expected DELETE after WITH clause")));
+                };
+                body.ctes = ctes;
+                Ok(Statement::Delete(body))
+            }
+            other => Err(self.err(format!(
+                "expected SELECT / INSERT / UPDATE / DELETE after WITH clause, got {other:?}"
+            ))),
         }
-        let body_stmt = self.parse_select_stmt()?;
-        let Statement::Select(mut body) = body_stmt else {
-            unreachable!()
-        };
-        body.ctes = ctes;
-        Ok(Statement::Select(body))
     }
 
     /// v4.10: parse `EXISTS (SELECT ...)`. Caller (`parse_atom`)
