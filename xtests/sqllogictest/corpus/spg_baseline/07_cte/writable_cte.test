@@ -1,0 +1,17 @@
+# Writable-CTE wiring is the v7.37.43-T4 closure surface; the parser
+# path for WITH-INSERT and WITH-DELETE-INSERT is not on develop yet.
+# As a placeholder for that train, document the read-CTE behaviour
+# that does work today (CTE feeding SELECT).
+
+statement ok
+CREATE TABLE src (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO src VALUES (1, 10), (2, 20)
+
+# WITH … SELECT — supported.
+query II rowsort
+WITH bare AS (SELECT id, v FROM src WHERE id = 1) SELECT id, v FROM bare
+----
+1
+10

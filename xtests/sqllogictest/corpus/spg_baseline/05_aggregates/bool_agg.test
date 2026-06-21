@@ -1,0 +1,23 @@
+# bool_or / bool_and aggregates.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, v BOOL NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('a', true), ('a', false), ('b', true), ('b', true)
+
+query TB rowsort
+SELECT g, bool_or(v) FROM t GROUP BY g
+----
+a
+1
+b
+1
+
+query TB rowsort
+SELECT g, bool_and(v) FROM t GROUP BY g
+----
+a
+0
+b
+1

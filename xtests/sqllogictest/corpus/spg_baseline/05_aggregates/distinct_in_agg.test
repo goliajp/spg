@@ -1,0 +1,22 @@
+# COUNT(DISTINCT col), SUM(DISTINCT col).
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (1, 10), (2, 20), (3, 20)
+
+query I rowsort
+SELECT COUNT(DISTINCT a) FROM t
+----
+3
+
+query I rowsort
+SELECT COUNT(DISTINCT b) FROM t
+----
+2
+
+query I rowsort
+SELECT SUM(DISTINCT b) FROM t
+----
+30

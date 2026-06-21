@@ -1,0 +1,17 @@
+# Window frame: SUM() OVER (ORDER BY x).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+query II nosort
+SELECT id, SUM(v) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+10
+2
+30
+3
+60

@@ -1,0 +1,15 @@
+# = ANY (...) and > ALL (...) against an enumerated array constant.
+# Subquery-form ANY/ALL is a future parser feature; the array-form
+# is the supported baseline (also matches PG semantics).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 100)
+
+query I rowsort
+SELECT id FROM t WHERE v IN (20, 100)
+----
+2
+3

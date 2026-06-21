@@ -1,0 +1,19 @@
+# Aggregate against empty table — COUNT(*) = 0, SUM/AVG = NULL.
+
+statement ok
+CREATE TABLE t (v INT NOT NULL)
+
+query I rowsort
+SELECT COUNT(*) FROM t
+----
+0
+
+query I rowsort
+SELECT SUM(v) FROM t
+----
+NULL
+
+query I rowsort
+SELECT MIN(v) FROM t
+----
+NULL

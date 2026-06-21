@@ -1,0 +1,17 @@
+# Conditional aggregation via CASE inside the aggregate.
+# Parser-level FILTER (WHERE x) sugar is not yet shipped; the
+# CASE-WHEN-THEN-NULL idiom is the supported baseline.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('a', 10), ('a', 20), ('a', 100), ('b', 5)
+
+query TI rowsort
+SELECT g, COUNT(CASE WHEN v > 15 THEN 1 END) FROM t GROUP BY g
+----
+a
+2
+b
+0

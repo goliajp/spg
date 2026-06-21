@@ -1,0 +1,15 @@
+# HAVING.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('x', 10), ('x', 20), ('y', 5), ('z', 100)
+
+query TI rowsort
+SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 10
+----
+x
+30
+z
+100

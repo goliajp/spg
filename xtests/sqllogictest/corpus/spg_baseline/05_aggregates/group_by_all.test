@@ -1,0 +1,20 @@
+# GROUP BY ALL (v6.4.1).
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, h TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('a', '1', 10), ('a', '2', 20), ('b', '1', 5)
+
+query TTI rowsort
+SELECT g, h, SUM(v) FROM t GROUP BY ALL
+----
+a
+1
+10
+a
+2
+20
+b
+1
+5

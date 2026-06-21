@@ -1,0 +1,27 @@
+# COUNT(*), COUNT(col), SUM, AVG.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)
+
+query I rowsort
+SELECT COUNT(*) FROM t
+----
+4
+
+query I rowsort
+SELECT COUNT(v) FROM t
+----
+3
+
+query I rowsort
+SELECT SUM(v) FROM t
+----
+60
+
+query R rowsort
+SELECT AVG(v) FROM t
+----
+20.000

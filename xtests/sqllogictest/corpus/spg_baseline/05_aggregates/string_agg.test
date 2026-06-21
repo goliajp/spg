@@ -1,0 +1,15 @@
+# string_agg with separator + ORDER BY.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('a', 'bob'), ('a', 'alice'), ('a', 'charlie'), ('b', 'dave')
+
+query TT rowsort
+SELECT g, string_agg(name, ',' ORDER BY name) FROM t GROUP BY g
+----
+a
+alice,bob,charlie
+b
+dave
