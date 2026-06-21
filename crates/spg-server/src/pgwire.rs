@@ -371,11 +371,9 @@ fn handle_pg_simple_query(
             match item {
                 spg_engine::StreamItem::Header(cols) => {
                     cols_storage.extend_from_slice(cols);
-                    let r = send_row_description(wbuf, cols);
-                    if r.is_ok() {
-                        wrote_header = true;
-                    }
-                    r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                    send_row_description_direct(wbuf, cols);
+                    wrote_header = true;
+                    Ok(())
                 }
                 spg_engine::StreamItem::Row(values) => {
                     if first_row_size.is_none() {
@@ -421,8 +419,7 @@ fn handle_pg_simple_query(
                 match engine_lock.execute_readonly_select_prepared(s.as_ref(), cancel)? {
                     spg_engine::QueryResult::Rows { columns, rows } => {
                         cols_storage.extend_from_slice(&columns);
-                        send_row_description(wbuf, &columns)
-                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                        send_row_description_direct(wbuf, &columns);
                         wrote_header = true;
                         for row in &rows {
                             let before = wbuf.len();
@@ -451,7 +448,7 @@ fn handle_pg_simple_query(
             .store(0, std::sync::atomic::Ordering::Relaxed);
         match stream_result {
             Ok(n) => {
-                send_command_complete(wbuf, &format!("SELECT {n}"))?;
+                send_select_command_complete(wbuf, n as u64);
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
                 wbuf.clear();
@@ -497,7 +494,7 @@ fn handle_pg_simple_query(
     };
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
-            send_row_description(wbuf, &columns)?;
+            send_row_description_direct(wbuf, &columns);
             let n = rows.len();
             // v7.37.x (SPGS PROJ wire encode tax) — calibrate the
             // per-row reservation against the first encoded row so a
@@ -519,7 +516,7 @@ fn handle_pg_simple_query(
                     encode_data_row(wbuf, &columns, row)?;
                 }
             }
-            send_command_complete(wbuf, &format!("SELECT {n}"))?;
+            send_select_command_complete(wbuf, n as u64);
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             let tag = command_tag(sql, affected);
@@ -2142,8 +2139,7 @@ fn handle_execute(
                 return Err((sqlstate, msg));
             }
         };
-        send_command_complete(stream, &format!("SELECT {row_count}"))
-            .map_err(|e| proto(e.to_string()))?;
+        send_select_command_complete(stream, row_count as u64);
         return Ok(());
     }
     let result = {
@@ -2187,8 +2183,7 @@ fn handle_execute(
             for row in &rows {
                 encode_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
             }
-            send_command_complete(stream, &format!("SELECT {n}"))
-                .map_err(|e| proto(e.to_string()))?;
+            send_select_command_complete(stream, n as u64);
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             // Synthesise a command tag from the statement kind so
@@ -3505,6 +3500,51 @@ fn send_command_complete(stream: &mut dyn Write, tag: &str) -> std::io::Result<(
     send_msg(stream, b'C', &body)
 }
 
+/// v7.37.42 (docker-fair SCALARSQ wire-overhead attack) — write a
+/// complete Pg message frame straight into `out`:
+///   [ty][len BE u32][body...]
+/// `body_writer` writes the body bytes; we backpatch len after.
+/// Skips the per-call `send_msg` intermediate `Vec` + the wrappers'
+/// (`send_command_complete`, `send_row_description`, …) per-call
+/// body `Vec` allocs. Used by the hot SELECT close path so a 100-row
+/// SCALARSQ response doesn't pay 3 heap allocs (format! tag + body
+/// Vec + send_msg out Vec) at the tail.
+#[inline]
+fn write_pg_frame(out: &mut Vec<u8>, ty: u8, body_writer: impl FnOnce(&mut Vec<u8>)) {
+    let frame_start = out.len();
+    out.push(ty);
+    out.extend_from_slice(&[0u8; 4]);
+    body_writer(out);
+    let body_plus_len = (out.len() - frame_start - 1) as u32;
+    out[frame_start + 1..frame_start + 5].copy_from_slice(&body_plus_len.to_be_bytes());
+}
+
+/// v7.37.42 — direct-to-`wbuf` writer for the `SELECT N` CommandComplete
+/// tag. Skips the per-query `format!()` heap alloc + `send_msg`'s
+/// intermediate `Vec` + `send_command_complete`'s body `Vec`. Three
+/// heap allocs eliminated per SELECT. The inline u64→decimal loop
+/// mirrors `write_cell_int`'s rationale: `std::fmt::Write`'s
+/// formatter state machine costs measurably more per call than the
+/// tight loop here, and SELECT close runs on every hot SELECT.
+fn send_select_command_complete(out: &mut Vec<u8>, n: u64) {
+    write_pg_frame(out, b'C', |b| {
+        b.extend_from_slice(b"SELECT ");
+        let mut buf = [0u8; 20];
+        let mut pos = buf.len();
+        let mut x = n;
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (x % 10) as u8;
+            x /= 10;
+            if x == 0 {
+                break;
+            }
+        }
+        b.extend_from_slice(&buf[pos..]);
+        b.push(0);
+    });
+}
+
 fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
     // ErrorResponse: each field is `[fieldcode byte][value][\0]`,
     // terminated by a single `\0`. Minimum useful set: S (severity),
@@ -3534,6 +3574,28 @@ fn send_row_description(stream: &mut dyn Write, cols: &[ColumnSchema]) -> std::i
 /// `encode_row_description_body` round.
 fn send_row_description_cached(out: &mut Vec<u8>, body: &[u8]) -> std::io::Result<()> {
     send_msg(out, b'T', body)
+}
+
+/// v7.37.42 (docker-fair SCALARSQ wire-overhead attack) — direct
+/// RowDescription writer that emits straight into `out` without the
+/// intermediate `body: Vec<u8>` the `send_row_description` →
+/// `send_msg` pair allocates per call. Two heap allocs eliminated
+/// per SELECT response.
+fn send_row_description_direct(out: &mut Vec<u8>, cols: &[ColumnSchema]) {
+    write_pg_frame(out, b'T', |b| {
+        let n = u16::try_from(cols.len()).unwrap_or(u16::MAX);
+        b.extend_from_slice(&n.to_be_bytes());
+        for c in cols {
+            b.extend_from_slice(c.name.as_bytes());
+            b.push(0);
+            b.extend_from_slice(&0u32.to_be_bytes());
+            b.extend_from_slice(&0u16.to_be_bytes());
+            b.extend_from_slice(&pg_type_oid(c.ty).to_be_bytes());
+            b.extend_from_slice(&pg_type_len(c.ty).to_be_bytes());
+            b.extend_from_slice(&(-1i32).to_be_bytes());
+            b.extend_from_slice(&0u16.to_be_bytes());
+        }
+    });
 }
 
 fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
