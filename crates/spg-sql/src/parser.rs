@@ -70,6 +70,66 @@ fn is_dump_noise_statement(lc: &str) -> bool {
     )
 }
 
+/// v7.37.43-T4 — PG-unreserved keywords that are legal identifiers
+/// per `pg_get_keywords()`. SPG tokenizes these as named variants
+/// so the parser can dispatch on them in their owning contexts
+/// (`RELEASE SAVEPOINT`, `SHOW name`, `BEGIN`/`COMMIT`/`ROLLBACK`,
+/// `CREATE INDEX`, etc.), but they MUST stay usable as table /
+/// column / alias names — that's the PG contract for unreserved
+/// keywords (see PG docs Appendix C.1).
+///
+/// Before this generalisation, sentori migration 0001_init.sql
+/// `release TEXT NOT NULL` blew up the parser with "expected
+/// identifier, got Release", and the same gap stalked every
+/// SPG drop-in user whose schema had a column / alias named
+/// `release` / `index` / `tables` / `show` / `savepoint` /
+/// `begin` / `commit` / `rollback` / `drop` / `insert` / `values`
+/// / `limit` / `partition`. PG accepts all of them as identifiers
+/// when unquoted, so SPG must too.
+///
+/// Returns the canonical lowercase identifier text when the token
+/// belongs to PG's unreserved class, `None` otherwise. Used by
+/// `expect_ident_like` (column / table / alias names) so the
+/// generalisation applies everywhere an identifier may appear,
+/// not just in the contexts these tokens were introduced for.
+fn unreserved_keyword_text(tok: &Token) -> Option<String> {
+    let s = match tok {
+        // PG keyword class: unreserved or col_name.
+        Token::Release => "release",
+        Token::Savepoint => "savepoint",
+        Token::Show => "show",
+        Token::Index => "index",
+        Token::Begin => "begin",
+        Token::Commit => "commit",
+        Token::Rollback => "rollback",
+        Token::Drop => "drop",
+        Token::Insert => "insert",
+        Token::Values => "values",
+        Token::Limit => "limit",
+        Token::Partition => "partition",
+        Token::Tables => "tables",
+        Token::Connection => "connection",
+        Token::Publication => "publication",
+        Token::Subscription => "subscription",
+        Token::Interval => "interval",
+        // `extract` is non-reserved in PG too (it's a function the
+        // parser dispatches via context — outside that context it's
+        // a plain identifier).
+        Token::Extract => "extract",
+        Token::Offset => "offset",
+        // `to` is reserved in PG (used in many "AS … TO …" forms), so
+        // it is NOT relaxed here. Same for `from`, `where`, `as`,
+        // `select`, `not`, `and`, `or`, `null`, `true`, `false`,
+        // `create`, `table`, `into`, `on`, `order`, `by`, `having`,
+        // `group`, `distinct`, `union`, `all`, `join`, `inner`,
+        // `left`, `cross`, `outer`, `default`, `is`, `between`,
+        // `in`, `like`, `for`, `except`, `desc`, `asc`, `partition`
+        // (partial — keep partition as unreserved per modern PG).
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
 /// v7.9.22 — recognise pgvector / SPG vector-index opclass names
 /// in CREATE INDEX. SPG's HNSW already routes by query operator;
 /// the opclass is accepted for `pg_dump` compatibility (mailrs
@@ -326,6 +386,20 @@ impl Parser {
     fn expect_ident_like(&mut self) -> Result<String, ParseError> {
         let first = match self.advance() {
             Token::Ident(s) | Token::QuotedIdent(s) => s,
+            // v7.37.43-T4 — PG-unreserved keywords are legal identifiers
+            // per PG's `pg_get_keywords()` classification. SPG tokenizes
+            // these as named variants for parsing leverage in the
+            // contexts that own them (`RELEASE SAVEPOINT`, `SHOW name`,
+            // `BEGIN`, etc.), but they MUST still be usable as table /
+            // column / alias names in DDL+DML. Sentori migrations like
+            // 0001_init.sql ship `release TEXT NOT NULL` in the events
+            // table — the `events.release` column carries the release
+            // identifier string. Pre-T4 this triggered "expected
+            // identifier, got Release" and blocked every drop-in user
+            // whose schema had a column / alias with one of these names.
+            other if unreserved_keyword_text(&other).is_some() => {
+                unreserved_keyword_text(&other).unwrap()
+            }
             other => {
                 return Err(ParseError {
                     message: format!("expected identifier, got {other:?}"),
@@ -343,6 +417,9 @@ impl Parser {
             self.advance();
             match self.advance() {
                 Token::Ident(s) | Token::QuotedIdent(s) => return Ok(s),
+                other if unreserved_keyword_text(&other).is_some() => {
+                    return Ok(unreserved_keyword_text(&other).unwrap());
+                }
                 other => {
                     return Err(ParseError {
                         message: format!("expected identifier after '{first}.', got {other:?}"),
@@ -4185,6 +4262,15 @@ impl Parser {
                         self.consume_until_statement_boundary();
                         return Ok(Vec::new());
                     }
+                    Token::Drop => {
+                        // v7.37.43-T4 — same path as the Ident("drop")
+                        // arm above. `DROP` is unreserved per PG; the
+                        // lexer emits `Token::Drop` so the publication-
+                        // DROP path can dispatch on it, but ALTER COLUMN
+                        // DROP DEFAULT / DROP NOT NULL must also work.
+                        self.consume_until_statement_boundary();
+                        return Ok(Vec::new());
+                    }
                     Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                         // v7.22 (round-13 T2) — `ALTER COLUMN c ADD
                         // GENERATED { ALWAYS | BY DEFAULT } AS
@@ -6016,6 +6102,20 @@ impl Parser {
                 (s, None)
             }
             Token::Ident(_) | Token::QuotedIdent(_) => {
+                let key_expr = self.parse_expr(0)?;
+                let primary = extract_first_column(&key_expr).ok_or_else(|| {
+                    self.err("expression index key must reference at least one column".into())
+                })?;
+                (primary, Some(key_expr))
+            }
+            // v7.37.43-T4 — parenthesised expression index key
+            // `CREATE INDEX … ON t ((payload->'bundle'->>'id'))`.
+            // PG's CREATE INDEX requires the expression to be in
+            // its own parens to disambiguate function calls from
+            // column lists, so this `LParen` is the inner open-paren
+            // of an expression key. parse_expr handles the recursive
+            // descent and consumes the matching `RParen`.
+            Token::LParen => {
                 let key_expr = self.parse_expr(0)?;
                 let primary = extract_first_column(&key_expr).ok_or_else(|| {
                     self.err("expression index key must reference at least one column".into())
@@ -8086,6 +8186,16 @@ impl Parser {
                 self.parse_match_against_atom()
             }
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
+            // v7.37.43-T4 — PG-unreserved keywords are legal column /
+            // alias names in expression context too. `release` appears
+            // in sentori `0003_partition_events.sql` as both a column
+            // reference (SELECT … release …) and an INSERT column list
+            // entry. Mirrors `expect_ident_like`'s expansion of the
+            // identifier set.
+            other if unreserved_keyword_text(&other).is_some() => {
+                let s = unreserved_keyword_text(&other).unwrap();
+                self.finish_ident_atom(s)
+            }
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
                 token_pos: tok_pos,
@@ -9784,6 +9894,64 @@ mod tests {
 
     fn parse(s: &str) -> Statement {
         parse_statement(s).expect("parse ok")
+    }
+
+    // v7.37.43-T4 sentori cutover acceptance — `release`, `index`,
+    // `tables`, `partition`, etc. are unreserved keywords per PG's
+    // `pg_get_keywords()` and MUST be usable as column / table /
+    // alias names. Pre-T4 every drop-in user whose schema had one
+    // of these as a column name (sentori events.release, mailrs
+    // messages.index in some forks) blew the parser up at CREATE
+    // TABLE time with "expected identifier, got Release". The
+    // generalisation lives in `unreserved_keyword_text` + the
+    // `expect_ident_like` and `parse_atom` arms that consult it.
+    #[test]
+    fn release_usable_as_column_name_in_create_table() {
+        let stmt =
+            parse("CREATE TABLE events (id INT PRIMARY KEY, release TEXT NOT NULL, payload TEXT)");
+        if let Statement::CreateTable(t) = stmt {
+            let names: alloc::vec::Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, alloc::vec!["id", "release", "payload"]);
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn release_usable_as_column_ref_in_select_projection() {
+        // The sentori `0003_partition_events.sql` INSERT-SELECT
+        // walk references `release` in both column lists; the
+        // projection-side use exercises `parse_atom`'s relaxed
+        // identifier set.
+        parse("SELECT id, release, payload FROM events WHERE id = 1");
+    }
+
+    #[test]
+    fn release_usable_as_column_ref_in_insert_column_list() {
+        // INSERT INTO t (id, release, payload) VALUES (…)
+        parse("INSERT INTO events (id, release, payload) VALUES (1, '1.0.0', 'data')");
+    }
+
+    #[test]
+    fn alter_column_drop_not_null_uses_keyword_drop_token() {
+        // Sentori `0013_audit_tombstone.sql` issues
+        // `ALTER TABLE … ALTER COLUMN x DROP NOT NULL`. The lexer
+        // emits Token::Drop (not Ident("drop")); the parser must
+        // accept both in the ALTER COLUMN sub-dispatch.
+        parse("ALTER TABLE audit_logs ALTER COLUMN org_id DROP NOT NULL");
+    }
+
+    #[test]
+    fn create_index_accepts_parenthesised_expression_key() {
+        // sentori `0040_events_bundle_idx.sql` shape — JSONB
+        // expression index. Pre-T4 the parser bailed at the
+        // inner `(` with "expected column ident or expression,
+        // got LParen". The Token::LParen arm in CREATE INDEX
+        // routes through the expression parser instead.
+        parse(
+            "CREATE INDEX IF NOT EXISTS events_bundle_id_idx \
+             ON events ((payload->'bundle'->>'id'))",
+        );
     }
 
     // v7.30.2 (mailrs round-25 ask 2) — nesting / chain budgets must
