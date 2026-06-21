@@ -3419,24 +3419,241 @@ impl Catalog {
     /// is a corrupt/misaligned log and surfaces as an error rather than a
     /// silent skip.
     pub fn apply_redo(&mut self, changes: &[RowChange]) -> Result<(), StorageError> {
+        // v7.37.5 (mailrs crash-recovery Ask 3) — true batched replay.
+        // Pre-v7.37.5 each `RowChange::Delete` record ran a fresh
+        // O(N) PersistentVec rebuild + O(N × indices × log N)
+        // `rebuild_indices()` — 5000 records × 100k rows × 13 indices
+        // ≈ 27 min on the mailrs prod-shape WAL.
+        //
+        // The strategy: group consecutive changes by table, and for
+        // each run, compose all the row-level mutations through a
+        // single "live" tracking vector + a per-table operation log,
+        // then apply rows + indices ONCE at the end. The result:
+        //  - DELETE blow-up: O(records × rows × indices × log rows)
+        //    → O(rows × indices × log rows) — one rebuild per run.
+        //  - Row-position semantics preserved: positions in a later
+        //    `Delete` / `Update` record reference the layout produced
+        //    by every earlier change; we walk the live-vector
+        //    forward as each change is processed so positions
+        //    translate correctly to the ORIGINAL row index space.
+        //
+        // For correctness, even with this batching `apply_redo`
+        // remains in-order: a single per-table run only batches
+        // a contiguous slice of changes targeting that table; a
+        // mid-run change targeting a DIFFERENT table forces a
+        // flush of the current run.
+        let mut runs: alloc::vec::Vec<(String, alloc::vec::Vec<&RowChange>)> = alloc::vec::Vec::new();
         for change in changes {
-            match change {
-                RowChange::Insert { table, row } => {
-                    self.table_for_redo(table)?.insert(row.clone())?;
+            let table = match change {
+                RowChange::Insert { table, .. }
+                | RowChange::Update { table, .. }
+                | RowChange::Delete { table, .. } => table.clone(),
+            };
+            if runs.last().map(|(t, _)| t.as_str()) != Some(table.as_str()) {
+                runs.push((table, alloc::vec::Vec::new()));
+            }
+            runs.last_mut().unwrap().1.push(change);
+        }
+        for (table_name, run) in runs {
+            self.apply_redo_run_on_table(&table_name, &run)?;
+        }
+        Ok(())
+    }
+
+    /// v7.37.5 — apply a contiguous slice of `RowChange`s all
+    /// targeting the same `table_name`. Composes row mutations
+    /// through a single live-tracking vector + a single tail
+    /// for appended `Insert`s + a single in-place edit set for
+    /// `Update`s, then writes the final row layout to
+    /// `self.rows` and rebuilds indices ONCE.
+    fn apply_redo_run_on_table(
+        &mut self,
+        table_name: &str,
+        run: &[&RowChange],
+    ) -> Result<(), StorageError> {
+        // Look up the table once; the unchecked unwrap is safe
+        // because the caller just resolved `table_name` for each
+        // change.
+        let table = self.get_mut(table_name).ok_or_else(|| {
+            StorageError::Corrupt(alloc::format!("redo: unknown table {table_name:?}"))
+        })?;
+        // Live-tracking over both pre-existing rows and tail-
+        // appended Insert rows. `live[i] = true` initially for
+        // every existing row. Appended Inserts extend with `true`.
+        // A `Delete` flips entries to `false` (using the position
+        // mapping that walks live indices in order). An `Update`
+        // edits in place — collected into an overlay map keyed by
+        // ORIGINAL row position so later Updates win.
+        let original_rows: alloc::vec::Vec<Row<'static>> =
+            table.rows().iter().cloned().collect();
+        let mut live: alloc::vec::Vec<bool> = alloc::vec![true; original_rows.len()];
+        let mut tail: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+        // Overlay: index into ORIGINAL row space (existing rows
+        // 0..original_rows.len()) or into tail (offset
+        // original_rows.len()). Map -> new values.
+        let mut overlay: alloc::collections::BTreeMap<usize, alloc::vec::Vec<Value<'static>>> =
+            alloc::collections::BTreeMap::new();
+        // Helper: given a "current" position (i.e. position in
+        // the post-prior-deletes layout), translate to the
+        // ABSOLUTE position in the unified live + tail space
+        // by walking the live vector + tail. Returns None when
+        // the position is out of range.
+        fn translate(
+            live: &[bool],
+            tail_len: usize,
+            current_pos: usize,
+        ) -> Option<usize> {
+            // Walk live[..] counting live entries until we hit
+            // current_pos. Then if not yet matched, dip into tail.
+            let mut seen = 0usize;
+            for (i, &alive) in live.iter().enumerate() {
+                if alive {
+                    if seen == current_pos {
+                        return Some(i);
+                    }
+                    seen += 1;
                 }
-                RowChange::Update {
-                    table,
-                    pos,
-                    new_row,
-                } => {
-                    self.table_for_redo(table)?
-                        .update_row(*pos, new_row.clone())?;
+            }
+            // Position lives in tail. tail_len rows in the tail
+            // are all live (we haven't deleted any tail rows in
+            // this simplification; if we did, we'd extend `live`).
+            let off = current_pos - seen;
+            if off < tail_len {
+                Some(live.len() + off)
+            } else {
+                None
+            }
+        }
+        for change in run {
+            match *change {
+                RowChange::Insert { row, .. } => {
+                    // Validate against schema before recording the
+                    // change so a corrupt log surfaces as an error
+                    // rather than silently mis-applying.
+                    if row.len() != table.schema().columns.len() {
+                        return Err(StorageError::ArityMismatch {
+                            expected: table.schema().columns.len(),
+                            actual: row.len(),
+                        });
+                    }
+                    tail.push(row.clone());
                 }
-                RowChange::Delete { table, positions } => {
-                    self.table_for_redo(table)?.delete_rows(positions);
+                RowChange::Update { pos, new_row, .. } => {
+                    if new_row.len() != table.schema().columns.len() {
+                        return Err(StorageError::ArityMismatch {
+                            expected: table.schema().columns.len(),
+                            actual: new_row.len(),
+                        });
+                    }
+                    let abs = translate(&live, tail.len(), *pos).ok_or_else(|| {
+                        StorageError::Corrupt(alloc::format!(
+                            "redo: update_row position {pos} out of bounds in table {table_name:?}",
+                        ))
+                    })?;
+                    // Tail edits are applied directly to `tail`
+                    // (we own it); existing-row edits land in
+                    // the overlay map keyed by original index.
+                    if abs < live.len() {
+                        overlay.insert(abs, new_row.clone());
+                    } else {
+                        tail[abs - live.len()] = Row::new(new_row.clone());
+                    }
+                }
+                RowChange::Delete { positions, .. } => {
+                    // De-dup + sort so the translate walk stays
+                    // monotone (the second translate doesn't have
+                    // to redo work the first one did, in principle;
+                    // we keep it simple here and re-walk per
+                    // position). Bounds-filter silently mirrors
+                    // `Table::delete_rows`.
+                    let mut sorted: alloc::vec::Vec<usize> = positions.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    // Walk live[] once per Delete record to
+                    // translate all positions in this record's
+                    // post-prior-deletes layout to absolute
+                    // indices. We MUST defer the live[] flip
+                    // until after all positions are translated
+                    // so two positions in the same record
+                    // (e.g. [3, 7]) reference the same layout.
+                    let mut to_flip_live: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                    let mut to_flip_tail: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                    // Two-pointer walk: live[i] scanned monotonically,
+                    // sorted positions consumed in order.
+                    let mut seen = 0usize;
+                    let mut sp = sorted.iter().peekable();
+                    for (i, &alive) in live.iter().enumerate() {
+                        if !alive {
+                            continue;
+                        }
+                        while let Some(&&p) = sp.peek() {
+                            if seen == p {
+                                to_flip_live.push(i);
+                                sp.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if sp.peek().is_none() {
+                            break;
+                        }
+                        seen += 1;
+                    }
+                    // Remaining positions fall into the tail.
+                    for &p in sp {
+                        // p >= seen and refers to the (p - seen)-th
+                        // entry in tail. Filter out-of-bounds.
+                        let off = p - seen;
+                        if off < tail.len() {
+                            to_flip_tail.push(off);
+                        }
+                    }
+                    for i in to_flip_live {
+                        live[i] = false;
+                        // Any pending overlay edit for this
+                        // index is moot — the row is gone.
+                        overlay.remove(&i);
+                    }
+                    // Tail deletes: remove in REVERSE order so
+                    // shifting indices stay valid.
+                    to_flip_tail.sort_unstable();
+                    to_flip_tail.dedup();
+                    for off in to_flip_tail.into_iter().rev() {
+                        tail.remove(off);
+                        // Re-key tail-relative overlay entries that
+                        // were past `off` — in practice tail edits
+                        // are applied directly so the overlay map
+                        // only holds existing-row keys; nothing to
+                        // do here.
+                    }
                 }
             }
         }
+        // Compose the final row layout: keep existing rows where
+        // live[i] = true, applying overlay edits in place; then
+        // append the surviving tail.
+        let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        let mut new_hot_bytes: u64 = 0;
+        let schema_snapshot = table.schema().clone();
+        for (i, row) in original_rows.into_iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            let final_row = if let Some(new_values) = overlay.remove(&i) {
+                Row::new(new_values)
+            } else {
+                row
+            };
+            new_hot_bytes = new_hot_bytes
+                .saturating_add(row_body_encoded_len(&final_row, &schema_snapshot) as u64);
+            new_rows.push_mut(final_row);
+        }
+        for row in tail {
+            new_hot_bytes = new_hot_bytes
+                .saturating_add(row_body_encoded_len(&row, &schema_snapshot) as u64);
+            new_rows.push_mut(row);
+        }
+        table.set_rows_and_rebuild_indices(new_rows, new_hot_bytes);
         Ok(())
     }
 
