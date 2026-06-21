@@ -2269,9 +2269,77 @@ impl Engine {
         if columns.len() != 1 {
             return Ok(None);
         }
+        // v7.37.43 (INSUBQ B-1) — inner-uniqueness check. If the inner
+        // subquery projects a column known to be UNIQUE/PK on its table
+        // (statically: `SELECT <col> FROM <tbl> WHERE …` where <col> is
+        // in `tbl.uniqueness_constraints`), survivor values are
+        // guaranteed distinct and the per-survivor `HashSet::insert`
+        // dedup check is redundant. ~25 ns × N_inner-survivors saved.
+        //
+        // Inlined check — gated on: no DISTINCT/GROUP/UNION/JOIN, single
+        // projection that is a bare Column ref, table-column lookup in
+        // catalog confirms the column appears as a unique constraint's
+        // sole member. UNIQUE NOT NULL is required — a nullable unique
+        // column may have multiple NULLs, but NULLs are already skipped
+        // above (`Value::Null => continue`), so a UNIQUE-only column is
+        // still safe to dedup-skip.
+        let inner_unique = (|| -> bool {
+            if inner.distinct
+                || inner.group_by.is_some()
+                || !inner.unions.is_empty()
+                || inner.having.is_some()
+                || inner.items.len() != 1
+            {
+                return false;
+            }
+            let Some(inner_from) = inner.from.as_ref() else {
+                return false;
+            };
+            if !inner_from.joins.is_empty()
+                || inner_from.primary.lateral_subquery.is_some()
+                || inner_from.primary.unnest_expr.is_some()
+                || inner_from.primary.generate_series_args.is_some()
+            {
+                return false;
+            }
+            let SelectItem::Expr { expr: proj, .. } = &inner.items[0] else {
+                return false;
+            };
+            let Expr::Column(pc) = proj else {
+                return false;
+            };
+            let inner_alias = inner_from
+                .primary
+                .alias
+                .as_deref()
+                .unwrap_or(inner_from.primary.name.as_str());
+            if let Some(q) = pc.qualifier.as_deref()
+                && !q.eq_ignore_ascii_case(inner_alias)
+            {
+                return false;
+            }
+            let Some(inner_table) = catalog.get(inner_from.primary.name.as_str()) else {
+                return false;
+            };
+            let isch = inner_table.schema();
+            let Some(ipos) = isch
+                .columns
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(&pc.name))
+            else {
+                return false;
+            };
+            isch.uniqueness_constraints
+                .iter()
+                .any(|u| u.columns.as_slice() == [ipos])
+        })();
         // Collect inner i64 values directly into a HashSet, then probe.
         let mut count: i64 = 0;
-        let mut probed = hashbrown::HashSet::<i64>::with_capacity(rows.len());
+        let mut probed = if inner_unique {
+            hashbrown::HashSet::<i64>::new()
+        } else {
+            hashbrown::HashSet::<i64>::with_capacity(rows.len())
+        };
         for row in &rows {
             let v = row.values.first().cloned().unwrap_or(Value::Null);
             let n = match v {
@@ -2282,14 +2350,17 @@ impl Engine {
                 _ => return Ok(None),
             };
             // De-duplicate inner key set so a duplicate inner value
-            // doesn't double-count the same outer row.
-            if !probed.insert(n) {
+            // doesn't double-count the same outer row. Skipped when
+            // the inner projection is statically unique.
+            if !inner_unique && !probed.insert(n) {
                 continue;
             }
-            let Some(key) = spg_storage::IndexKey::from_value(&Value::BigInt(n)) else {
-                return Ok(None);
-            };
-            if !idx.lookup_eq(&key).is_empty() {
+            // v7.37.43 (INSUBQ B-2 + B-4) — direct i64 PK probe, skipping
+            // the `IndexKey::from_value` enum-dispatch and the per-call
+            // `IndexKey` wrapper construction. The outer column is
+            // already gated to integer-family above, so an i64 key
+            // always corresponds to a valid PK lookup.
+            if !idx.lookup_eq_i64(n).is_empty() {
                 count += 1;
             }
         }
