@@ -244,7 +244,7 @@ impl Engine {
             ColumnSchema::new("scope", DataType::Text, false),
             ColumnSchema::new("table_count", DataType::Int, true),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .publications
             .iter()
             .map(|(name, scope)| {
@@ -262,8 +262,8 @@ impl Engine {
                     ),
                 };
                 Row::new(alloc::vec![
-                    Value::Text(name.clone()),
-                    Value::Text(scope_str),
+                    Value::text(name.clone()),
+                    Value::text(scope_str),
                     count_val,
                 ])
             })

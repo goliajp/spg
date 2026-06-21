@@ -138,7 +138,7 @@ pub(super) fn value_to_text(v: &Value) -> String {
         Value::BigInt(n) => format!("{n}"),
         Value::Float(x) => format!("{x}"),
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
@@ -231,7 +231,7 @@ pub(super) fn value_to_text(v: &Value) -> String {
         Value::Macaddr(b) => crate::conversions::format_macaddr(b),
         Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),
         Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
-        Value::Xml(s) => s.clone(),
+        Value::Xml(s) => s.to_string(),
         Value::Char1(b) => format!("{}", *b as char),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),

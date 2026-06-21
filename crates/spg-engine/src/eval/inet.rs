@@ -16,7 +16,7 @@ use spg_storage::Value;
 
 use super::EvalError;
 
-pub(super) fn inet_host(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn inet_host(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),
@@ -27,10 +27,10 @@ pub(super) fn inet_host(args: &[Value]) -> Result<Value, EvalError> {
         }
     };
     let host = s.split('/').next().unwrap_or("").to_string();
-    Ok(Value::Text(host))
+    Ok(Value::text(host))
 }
 
-pub(super) fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn inet_network(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),
@@ -48,11 +48,11 @@ pub(super) fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
     let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
     if !host.contains('.') {
         // IPv6 / MACADDR — return the input unmasked.
-        return Ok(Value::Text(s));
+        return Ok(Value::text(s));
     }
     let octets: Vec<&str> = host.split('.').collect();
     if octets.len() != 4 {
-        return Ok(Value::Text(s));
+        return Ok(Value::text(s));
     }
     let keep_bytes = ((mask + 7) / 8) as usize;
     let mut out = alloc::string::String::new();
@@ -68,10 +68,10 @@ pub(super) fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
     }
     out.push('/');
     out.push_str(&mask.to_string());
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }
 
-pub(super) fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn inet_masklen(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),
@@ -238,7 +238,7 @@ fn inet_networks_equal(a: &InetNet, b: &InetNet) -> bool {
     network_prefix_eq(a, b, a.prefix_bits)
 }
 
-pub(super) fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
+pub(super) fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Value<'static>, EvalError> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }

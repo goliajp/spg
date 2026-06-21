@@ -20,7 +20,7 @@ use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days, days_from_civil}
 pub(super) fn extract_field(
     field: spg_sql::ast::ExtractField,
     v: &Value,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
@@ -103,7 +103,7 @@ fn civil_components(days: i32) -> (i32, u32, u32) {
 /// source)`. Same component dispatch (DATE / TIMESTAMP / INTERVAL) and
 /// same `BigInt` return shape; PG returns double precision but we keep the
 /// integer convention so the runner's `query I` shape works unchanged.
-pub(super) fn date_part(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn date_part(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -151,7 +151,7 @@ pub(super) fn date_part(args: &[Value]) -> Result<Value, EvalError> {
 /// the dispatcher errors instead of guessing a clock source. Callers
 /// who want PG's `age(t)` semantics should write `age(CURRENT_DATE, t)`
 /// explicitly so the clock reference is visible at the SQL layer.
-pub(super) fn age(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn age(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() || args.len() > 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("age() takes 1 or 2 args, got {}", args.len()),
@@ -208,7 +208,7 @@ pub(super) fn age(args: &[Value]) -> Result<Value, EvalError> {
 ///
 /// Unknown `%X` tokens pass through verbatim (MySQL emits the `%`
 /// then the unknown letter).
-pub(super) fn date_format_mysql(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn date_format_mysql(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -331,7 +331,7 @@ pub(super) fn date_format_mysql(args: &[Value]) -> Result<Value, EvalError> {
         }
         i += 2;
     }
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }
 
 /// v7.17.0 Phase 3.P0-29 — `UNIX_TIMESTAMP(t)` returns epoch
@@ -340,7 +340,7 @@ pub(super) fn date_format_mysql(args: &[Value]) -> Result<Value, EvalError> {
 /// Bare `UNIX_TIMESTAMP()` (no args) is folded to a BigInt literal
 /// by clock_replacement_for at the rewrite layer — never reaches
 /// this arm.
-pub(super) fn unix_timestamp_of(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn unix_timestamp_of(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!("unix_timestamp() takes 0 or 1 arg, got {}", args.len()),
@@ -362,7 +362,7 @@ pub(super) fn unix_timestamp_of(args: &[Value]) -> Result<Value, EvalError> {
 /// v7.17.0 Phase 3.P0-29 — `FROM_UNIXTIME(n)` returns a TIMESTAMP
 /// at `n` seconds past the Unix epoch. `FROM_UNIXTIME(n, fmt)`
 /// applies MySQL date_format on top, returning TEXT.
-pub(super) fn from_unixtime(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn from_unixtime(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if !(1..=2).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: format!("from_unixtime() takes 1 or 2 args, got {}", args.len()),
@@ -401,7 +401,7 @@ pub(super) fn from_unixtime(args: &[Value]) -> Result<Value, EvalError> {
 /// requested calendar boundary (year / month / day / hour / minute /
 /// second). Returns the truncated `TIMESTAMP`. NULL on either side
 /// propagates to NULL.
-pub(super) fn date_trunc(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn date_trunc(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("date_trunc() takes 2 args, got {}", args.len()),

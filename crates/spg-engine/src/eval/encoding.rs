@@ -16,7 +16,7 @@ use super::EvalError;
 /// (raw UTF-8 bytes). Supported formats: base64 (PG default),
 /// base64url (RFC 4648 §5), base32hex (RFC 4648 §7 extended-hex),
 /// hex.
-pub(super) fn encode_text(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn encode_text(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("encode() takes 2 args, got {}", args.len()),
@@ -52,13 +52,13 @@ pub(super) fn encode_text(args: &[Value]) -> Result<Value, EvalError> {
             });
         }
     };
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }
 
 /// v6.4.3 — `decode(text, format)`. Inverse of `encode`; returns
 /// Text containing the raw decoded bytes (caller may CAST to bytea
 /// equivalent if SPG adds bytea later).
-pub(super) fn decode_text(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn decode_text(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("decode() takes 2 args, got {}", args.len()),
@@ -68,7 +68,7 @@ pub(super) fn decode_text(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::Null);
     }
     let text = match &args[0] {
-        Value::Text(s) => s.as_str(),
+        Value::Text(s) => s.as_ref(),
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!("decode() expects text, got {:?}", other.data_type()),
@@ -97,7 +97,7 @@ pub(super) fn decode_text(args: &[Value]) -> Result<Value, EvalError> {
     let s = String::from_utf8(bytes).map_err(|_| EvalError::TypeMismatch {
         detail: "decode(): result bytes are not valid UTF-8 (SPG stores raw bytes as Text)".into(),
     })?;
-    Ok(Value::Text(s))
+    Ok(Value::text(s))
 }
 
 // ── byte-level encoders ───────────────────────────────────────────

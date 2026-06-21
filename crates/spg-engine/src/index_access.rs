@@ -139,7 +139,7 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     table_alias: &str,
     engine: &Engine,
     cancel: CancelToken<'_>,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if stmt.distinct || stmt.limit_with_ties {
         return None;
     }
@@ -259,11 +259,11 @@ pub(crate) fn materialise_in_order(
     stmt: &SelectStatement,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
-    ordered_rows: &[Cow<'_, Row>],
+    ordered_rows: &[Cow<'_, Row<'static>>],
 ) -> Result<QueryResult, EngineError> {
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
     let projection = build_projection(&stmt.items, schema_cols, table_alias)?;
-    let mut output_rows: Vec<Row> = Vec::with_capacity(ordered_rows.len());
+    let mut output_rows: Vec<Row<'static>> = Vec::with_capacity(ordered_rows.len());
     for row_cow in ordered_rows {
         let row = row_cow.as_ref();
         let mut values = Vec::with_capacity(projection.len());
@@ -345,7 +345,7 @@ pub(crate) fn try_index_seek<'a>(
     catalog: &'a Catalog,
     table: &'a Table,
     table_alias: &str,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     // v7.11.3 — recurse through top-level `AND` so a PG-style
     // composite predicate like `WHERE id = 1 AND created_at > $1`
     // still hits the index on `id`. The caller re-applies the
@@ -389,7 +389,7 @@ pub(crate) fn try_index_seek<'a>(
     // v5.1: each locator dispatches to either the hot tier (zero-
     // copy borrow of `table.rows()[i]`) or a cold-tier segment
     // (one page read + dense row decode, ~µs scale). Cold rows are
-    // returned as `Cow::Owned` so the caller's `&Row` iteration
+    // returned as `Cow::Owned` so the caller's `&Row<'static>` iteration
     // doesn't see a tier distinction; pre-freezer (no cold
     // segments loaded) every locator is `Hot` and every entry is
     // `Cow::Borrowed` — identical cost to the pre-v5.1 path.
@@ -425,7 +425,7 @@ fn try_inlist_seek<'a>(
     catalog: &'a Catalog,
     table: &'a Table,
     table_alias: &str,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     let Expr::InList {
         expr,
         list,
@@ -500,7 +500,7 @@ pub(crate) fn try_gin_seek<'a>(
     table: &'a Table,
     table_alias: &str,
     ctx: &eval::EvalContext<'_>,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
         op: BinOp::And,
@@ -591,7 +591,7 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
     schema_cols: &[ColumnSchema],
     table: &'a Table,
     table_alias: &str,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
         op: BinOp::And,
@@ -733,7 +733,7 @@ pub(crate) fn try_trgm_seek<'a>(
     schema_cols: &[ColumnSchema],
     table: &'a Table,
     table_alias: &str,
-) -> Option<Vec<Cow<'a, Row>>> {
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
         op: BinOp::And,
@@ -982,7 +982,7 @@ pub(crate) fn resolve_col_literal_pair(
     lit_side: &Expr,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
-) -> Option<(usize, Value)> {
+) -> Option<(usize, Value<'static>)> {
     let Expr::Column(c) = col_side else {
         return None;
     };
@@ -1004,7 +1004,7 @@ pub(crate) fn resolve_col_literal_pair(
             }
         }
         Literal::Float(x) => Value::Float(*x),
-        Literal::String(s) => Value::Text(s.clone()),
+        Literal::String(s) => Value::text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
         // Vector, array and Interval literals can't be used as B-tree

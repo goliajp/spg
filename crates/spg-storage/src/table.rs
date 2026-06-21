@@ -146,7 +146,7 @@ impl Table {
     /// v4.39: returns the persistent row vector by reference. Callers that
     /// used to take `&[Row]` should switch to `.iter()` (via
     /// `IntoIterator for &PersistentVec`) or `.get(i)` for indexing.
-    pub const fn rows(&self) -> &PersistentVec<Row> {
+    pub const fn rows(&self) -> &PersistentVec<Row<'static>> {
         &self.rows
     }
 

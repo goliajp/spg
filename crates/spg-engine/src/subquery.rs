@@ -80,11 +80,11 @@ impl Engine {
     pub(crate) fn eval_expr_with_correlated(
         &self,
         expr: &Expr,
-        row: &Row,
+        row: &Row<'static>,
         ctx: &EvalContext<'_>,
         cancel: CancelToken<'_>,
         mut memo: Option<&mut memoize::MemoizeCache>,
-    ) -> Result<Value, EngineError> {
+    ) -> Result<Value<'static>, EngineError> {
         // v7.30.2 (mailrs round-25) — the has-subquery walk is
         // O(tree) and a materialised `IN (…)` list makes the tree
         // huge; cache the answer per expression address so the
@@ -230,7 +230,7 @@ impl Engine {
     fn resolve_correlated_in_expr(
         &self,
         e: &mut Expr,
-        row: &Row,
+        row: &Row<'static>,
         ctx: &EvalContext<'_>,
         cancel: CancelToken<'_>,
         mut memo: Option<&mut memoize::MemoizeCache>,
@@ -303,7 +303,7 @@ impl Engine {
                 // values hit the same entry.
                 let cache_key = memo.as_ref().map(|_| memoize::CacheKey {
                     subquery_repr: alloc::format!("{}", **inner),
-                    outer_values: row.values.clone(),
+                    outer_values: row.values.iter().cloned().map(Value::into_owned).collect(),
                 });
                 if let (Some(cache), Some(k)) = (memo.as_deref_mut(), cache_key.as_ref())
                     && let Some(cached) = cache.get(k)
@@ -373,7 +373,7 @@ impl Engine {
                         && let Some(Some(es)) = m.exists_sets.get(&repr)
                     {
                         let (outer_cols, set) = es.as_ref();
-                        let mut key_vals: Vec<Value> = Vec::with_capacity(outer_cols.len());
+                        let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
                         let mut any_null = false;
                         for oc in outer_cols {
                             let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
@@ -631,7 +631,7 @@ impl Engine {
     pub(crate) fn try_batch_correlated_scalar(
         &self,
         inner: &SelectStatement,
-        restrict: Option<(&[Row], &EvalContext<'_>)>,
+        restrict: Option<(&[Row<'static>], &EvalContext<'_>)>,
         cancel: CancelToken<'_>,
     ) -> Result<Option<memoize::GroupMap>, EngineError> {
         use spg_sql::ast::{BinOp, SelectItem as SI};
@@ -815,7 +815,7 @@ impl Engine {
         // join the promotion can't safely reorder, returns None and
         // the caller falls back to the lazy all-keys batch (no
         // regression).
-        let keyed: Option<(&[Row], &EvalContext<'_>)> = restrict.and_then(|(rows, rctx)| {
+        let keyed: Option<(&[Row<'static>], &EvalContext<'_>)> = restrict.and_then(|(rows, rctx)| {
             // Resolve the table that owns the correlation column.
             let driver_name: &str = if from.joins.is_empty() {
                 from.primary.name.as_str()
@@ -2908,7 +2908,7 @@ impl ScalarPkProbeFastPath {
     /// Per-row probe. Reads `row.values[self.outer_pos]`, looks up the
     /// inner table and PK index, and returns `Int(1)` on a hit or
     /// `Int(0)` on a miss / NULL outer key.
-    pub fn probe(&self, row: &Row) -> Value {
+    pub fn probe(&self, row: &Row<'static>) -> Value {
         // The engine handle is needed to access the live catalog. The
         // probe is called from the run-loop with the engine in scope,
         // so we look up the catalog via a thread_local-cached
@@ -2952,7 +2952,7 @@ impl Engine {
     /// Run a pre-analysed PK probe against the live catalog. Used by
     /// the per-row projection fast path to avoid going through
     /// `eval_expr_with_correlated`.
-    pub(crate) fn probe_with_pk_fast_path(&self, plan: &ScalarPkProbeFastPath, row: &Row) -> Value {
+    pub(crate) fn probe_with_pk_fast_path(&self, plan: &ScalarPkProbeFastPath, row: &Row<'static>) -> Value<'static> {
         let outer_int = match row.values.get(plan.outer_pos) {
             Some(Value::BigInt(n)) => *n,
             Some(Value::Int(n)) => i64::from(*n),
@@ -3092,7 +3092,7 @@ impl Engine {
     pub(crate) fn try_scalar_count_pk_eq_probe(
         &self,
         inner: &SelectStatement,
-        row: &Row,
+        row: &Row<'static>,
         ctx: &EvalContext<'_>,
     ) -> Result<Option<Value>, EngineError> {
         use spg_sql::ast::{BinOp, ColumnName, SelectItem};
@@ -3219,7 +3219,7 @@ pub static SCALARSQ_PK_PROBE_FIRED: core::sync::atomic::AtomicU64 =
 /// distinguish `COUNT(*)` (0 over an empty set) from other aggregates
 /// (NULL). Called by the batched ScalarSubquery resolver when a
 /// per-outer-row probe finds no matching inner partition.
-fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value {
+fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value<'static> {
     use spg_sql::ast::SelectItem;
     if inner.items.len() != 1 {
         return Value::Null;
@@ -3465,7 +3465,7 @@ fn splice_planned_subqueries(
     e: &mut Expr,
     plan: &[Option<alloc::rc::Rc<memoize::GroupMap>>],
     idx: &mut usize,
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<bool, EngineError> {
     match e {
@@ -3638,7 +3638,7 @@ fn splice_planned_exists(
     e: &mut Expr,
     plan: &[Option<alloc::rc::Rc<memoize::ExistsSet>>],
     idx: &mut usize,
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<bool, EngineError> {
     match e {
@@ -3648,7 +3648,7 @@ fn splice_planned_exists(
             };
             *idx += 1;
             let (outer_cols, set) = es.as_ref();
-            let mut key_vals: Vec<Value> = Vec::with_capacity(outer_cols.len());
+            let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
             let mut any_null = false;
             for oc in outer_cols {
                 let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
@@ -3794,10 +3794,10 @@ pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry
 /// `eval_expr`, so coercion and error semantics stay identical.
 fn eval_with_in_sets(
     e: &Expr,
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext<'_>,
     m: &mut memoize::MemoizeCache,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     match e {
         Expr::Binary {
             lhs,
@@ -3831,7 +3831,7 @@ fn eval_with_in_sets(
                 (Value::SmallInt(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
                 (Value::Int(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
                 (Value::BigInt(n), memoize::InListSet::Int(s)) => s.contains(n),
-                (Value::Text(t), memoize::InListSet::Text(s)) => s.contains(t.as_str()),
+                (Value::Text(t), memoize::InListSet::Text(s)) => s.contains(t.as_ref()),
                 // Cross-family needle (e.g. Float vs integer list):
                 // keep apply_binary's coercion / error behaviour.
                 _ => return eval::eval_expr(e, row, ctx).map_err(EngineError::Eval),
@@ -3852,7 +3852,7 @@ fn eval_with_in_sets(
     }
 }
 
-fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalContext<'_>) {
+fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row<'static>, ctx: &EvalContext<'_>) {
     // v7.24 (round-16 B) — joined outer contexts carry no single
     // table alias; their schemas use composite "alias.column" names
     // instead. Pass an unmatchable alias and let the composite
@@ -3865,7 +3865,7 @@ fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalCon
 
 fn substitute_in_select(
     stmt: &mut SelectStatement,
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext<'_>,
     outer_alias: &str,
 ) {
@@ -3893,7 +3893,7 @@ fn substitute_in_select(
     }
 }
 
-fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alias: &str) {
+fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, outer_alias: &str) {
     // v7.25.2 (round-19 A) — bare synthetic columns. The aggregate
     // rewriter replaces group-key references INSIDE subquery bodies
     // with `__grp_N` so a correlated subquery in a GROUP BY select

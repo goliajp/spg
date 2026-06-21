@@ -21,13 +21,13 @@ use super::{
 };
 
 /// PG-style `expr::TYPE` coercion. NULL always casts as NULL.
-pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
+pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static>, EvalError> {
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
     match target {
         CastTarget::Vector => cast_to_vector(v),
-        CastTarget::Text => Ok(Value::Text(value_to_text(&v))),
+        CastTarget::Text => Ok(Value::text(value_to_text(&v))),
         CastTarget::Int => cast_numeric_to_int(v),
         CastTarget::BigInt => cast_numeric_to_bigint(v),
         CastTarget::Float => cast_numeric_to_float(v),
@@ -44,8 +44,8 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         // (validation is the producer's responsibility, same as
         // the column-INSERT path).
         CastTarget::Json | CastTarget::Jsonb => match v {
-            Value::Json(s) => Ok(Value::Json(s)),
-            Value::Text(s) => Ok(Value::Json(s)),
+            Value::Json(s) => Ok(Value::json(s)),
+            Value::Text(s) => Ok(Value::json(s)),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "::json / ::jsonb only accepts TEXT-shape inputs, got {:?}",
@@ -77,10 +77,10 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 // the search_path; SPG is single-schema so
                 // dropping is always safe.
                 let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
-                Ok(Value::Text(bare))
+                Ok(Value::text(bare))
             }
-            Value::Int(n) => Ok(Value::Text(alloc::format!("{n}"))),
-            Value::BigInt(n) => Ok(Value::Text(alloc::format!("{n}"))),
+            Value::Int(n) => Ok(Value::text(alloc::format!("{n}"))),
+            Value::BigInt(n) => Ok(Value::text(alloc::format!("{n}"))),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {:?}",
@@ -157,9 +157,9 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         // mismatch — same shape as PG's contract. Closes the
         // mailrs D-pre #3 reverse-acceptance gap.
         CastTarget::Bytea => match v {
-            Value::Bytes(b) => Ok(Value::Bytes(b)),
+            Value::Bytes(b) => Ok(Value::bytes(b)),
             Value::Text(s) => match crate::conversions::decode_bytea_literal(&s) {
-                Ok(b) => Ok(Value::Bytes(b)),
+                Ok(b) => Ok(Value::bytes(b)),
                 Err(msg) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("invalid input syntax for type bytea: {msg}"),
                 }),
@@ -567,14 +567,14 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
     }
 }
 
-/// Parse a `Value::Text("[1.0, 2.0, 3.0]")` into a `Value::Vector(..)`. Mirrors
+/// Parse a `Value::text("[1.0, 2.0, 3.0]")` into a `Value::vector(..)`. Mirrors
 /// pgvector's `'[..]'::vector` cast. NULL casts as NULL.
-pub fn cast_to_vector(v: Value) -> Result<Value, EvalError> {
+pub fn cast_to_vector(v: Value) -> Result<Value<'static>, EvalError> {
     match v {
         Value::Null => Ok(Value::Null),
-        Value::Vector(v) => Ok(Value::Vector(v)),
+        Value::Vector(v) => Ok(Value::vector(v.into_owned())),
         Value::Text(s) => parse_vector_text(&s)
-            .map(Value::Vector)
+            .map(Value::vector)
             .ok_or(EvalError::TypeMismatch {
                 detail: format!("cannot parse {s:?} as a vector literal"),
             }),

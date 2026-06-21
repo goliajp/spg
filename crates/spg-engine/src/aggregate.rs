@@ -281,7 +281,7 @@ struct AggState {
     count: i64,
     sum_int: i64,
     sum_float: f64,
-    extreme: Option<Value>,
+    extreme: Option<Value<'static>>,
     use_float: bool,
     /// v7.17.0 — running collection for string_agg / array_agg.
     /// Each entry is one row's contribution (NULL preserved as
@@ -289,7 +289,7 @@ struct AggState {
     /// array_agg keeps them). Pushing in insertion order matches
     /// PG behaviour when no `ORDER BY` is given inside the
     /// aggregate call.
-    items: Vec<Value>,
+    items: Vec<Value<'static>>,
     /// v7.25 (round-17) — per-group dedupe set for DISTINCT
     /// aggregates (encoded values; NULLs never reach it because
     /// the caller's skip runs after the per-aggregate NULL rules).
@@ -312,7 +312,7 @@ struct AggState {
     /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
     /// to `items` (pushed under the same skip/keep conditions).
     /// Empty when the aggregate carries no internal ordering.
-    item_keys: Vec<Vec<Value>>,
+    item_keys: Vec<Vec<Value<'static>>>,
     /// v7.17.0 — captured separator for string_agg. PG accepts a
     /// non-constant separator expression but in practice every
     /// caller passes a literal; the engine snapshots the last
@@ -341,13 +341,13 @@ struct AggState {
     reg_sxy: f64,
     /// v7.32 (round-29) — second value stream for `json_object_agg`
     /// (`items` holds the keys, `aux_items` the values).
-    aux_items: Vec<Value>,
+    aux_items: Vec<Value<'static>>,
     /// v7.33 (array_agg argmax) — for a `first_ordered` spec
     /// (`(array_agg(x ORDER BY y))[1]`), the running first-by-order
     /// (sort-key tuple, value). Replaced only when a new row's key sorts
     /// strictly before the current best (ties keep the earliest row, =
     /// the stable-sort `[1]`). No items/item_keys array is built.
-    first_best: Option<(Vec<Value>, Value)>,
+    first_best: Option<(Vec<Value<'static>>, Value<'static>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,7 +400,7 @@ struct AggSpec {
 #[derive(Debug)]
 pub struct AggResult {
     pub columns: Vec<ColumnSchema>,
-    pub rows: Vec<Row>,
+    pub rows: Vec<Row<'static>>,
     /// v7.31 (perf — PG lesson #1, post-LIMIT subquery projection):
     /// select-list items whose rewritten expr carries a subquery and
     /// is referenced by neither ORDER BY nor HAVING. Their output
@@ -411,7 +411,7 @@ pub struct AggResult {
     pub deferred: Vec<(usize, Expr)>,
     /// Synthetic group rows aligned 1:1 with `rows`; populated only
     /// when `deferred` is non-empty.
-    pub synth_rows: Vec<Row>,
+    pub synth_rows: Vec<Row<'static>>,
     /// Schema the deferred exprs evaluate against.
     pub synth_schema: Vec<ColumnSchema>,
 }
@@ -425,7 +425,7 @@ pub struct AggResult {
 /// ORDER BY of a GROUP BY query). The engine passes its
 /// correlated-aware evaluator; pure-library callers pass None and
 /// surviving subqueries keep erroring loudly.
-pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>;
+pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row<'static>, &EvalContext<'_>) -> Result<Value<'static>, EvalError>;
 
 /// Output of the per-group projection stage (`project_groups`): the
 /// output schema, the projected rows, the synth rows kept alongside
@@ -433,8 +433,8 @@ pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Resul
 /// items, and the rewritten ORDER BY exprs (shared with the sort).
 struct Projection {
     columns: Vec<ColumnSchema>,
-    out_rows: Vec<Row>,
-    kept_synth: Vec<Row>,
+    out_rows: Vec<Row<'static>>,
+    kept_synth: Vec<Row<'static>>,
     deferred: Vec<(usize, Expr)>,
     order_rewritten: Vec<Expr>,
     /// v7.37.x — when `defer_projection` is requested, `out_rows`
@@ -682,9 +682,9 @@ pub(crate) fn run(
     }) = deferred_project
     {
         let synth_ctx = EvalContext::new(&synth_schema, None);
-        let mut stack: Vec<Value> = Vec::new();
+        let mut stack: Vec<Value<'static>> = Vec::new();
         for (idx, srow) in kept_synth.iter().enumerate() {
-            let mut values: Vec<Value> = Vec::with_capacity(columns.len());
+            let mut values: Vec<Value<'static>> = Vec::with_capacity(columns.len());
             for (i, rewritten) in items_rewritten.iter().enumerate() {
                 let Some(rewritten) = rewritten else { continue };
                 if deferred.iter().any(|(c, _)| *c == i) {
@@ -770,7 +770,7 @@ fn accumulate_groups(
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
-) -> Result<Vec<(Vec<Value>, Vec<AggState>)>, EvalError> {
+) -> Result<Vec<(Vec<Value<'static>>, Vec<AggState>)>, EvalError> {
     let ctx = EvalContext::new(schema_cols, table_alias);
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // v7.32 (architecture v2, P2b) — insertion-ordered group state in
@@ -778,7 +778,7 @@ fn accumulate_groups(
     // `key_order: Vec<String>` (a second per-group key clone) and the
     // per-group re-probe `groups[k]` at finalize (24k hash lookups for
     // the inbox shape). The map owns its key once on vacant insert.
-    let mut order: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
+    let mut order: Vec<(Vec<Value<'static>>, Vec<AggState>)> = Vec::new();
     let mut groups: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
     // v7.37.x (mailrs Track A perf — SPGE ≫ PG18) — single-Text GROUP
     // BY column fast path. The canonical-string encode (`S<text>|`)
@@ -953,7 +953,7 @@ fn accumulate_groups(
     // touch the allocator zero times.
     let mut keybuf_s = String::new();
     // v7.36 — reused Step VM eval stack for compiled aggregate args.
-    let mut eval_stack: Vec<Value> = Vec::new();
+    let mut eval_stack: Vec<Value<'static>> = Vec::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
     // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /
@@ -978,7 +978,7 @@ fn accumulate_groups(
                 || s.arg2.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
                 || s.order_by.iter().any(|o| crate::expr_has_subquery(&o.expr))
         });
-    let eval_arg = |e: &Expr, r: &Row, c: &EvalContext<'_>| -> Result<Value, EvalError> {
+    let eval_arg = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| -> Result<Value<'static>, EvalError> {
         match correlated_eval {
             Some(f) if any_agg_subquery && crate::expr_has_subquery(e) => f(e, r, c),
             _ => eval::eval_expr(e, r, c),
@@ -1183,15 +1183,15 @@ fn accumulate_groups(
         for row in rows {
             let kv = row.get(gpos).unwrap_or(&Value::Null);
             let idx = match kv {
-                Value::Text(s) => match groups_text.get(s.as_str()) {
+                Value::Text(s) => match groups_text.get(s.as_ref()) {
                     Some(&i) => i,
                     None => {
                         let i = order.len();
                         order.push((
-                            alloc::vec![Value::Text(s.clone())],
+                            alloc::vec![Value::text(s.clone())],
                             alloc::vec![AggState::default()],
                         ));
-                        groups_text.insert(s.clone(), i);
+                        groups_text.insert(s.to_string(), i);
                         i
                     }
                 },
@@ -1214,7 +1214,7 @@ fn accumulate_groups(
                         Some(&i) => i,
                         None => {
                             let i = order.len();
-                            order.push((alloc::vec![kv.clone()], alloc::vec![AggState::default()]));
+                            order.push((alloc::vec![kv.clone().into_owned()], alloc::vec![AggState::default()]));
                             groups.insert(keybuf_s.clone(), i);
                             i
                         }
@@ -1231,7 +1231,7 @@ fn accumulate_groups(
                     Some(prev) => value_cmp(av, prev) == core::cmp::Ordering::Greater,
                 };
                 if upd {
-                    st.extreme = Some(av.clone());
+                    st.extreme = Some(av.clone().into_owned());
                 }
             }
         }
@@ -1290,13 +1290,13 @@ fn accumulate_groups(
                         &ctx,
                     )?),
                 };
-                let order_keys = if spec.order_by.is_empty() {
+                let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
-                    let mut keys = Vec::with_capacity(spec.order_by.len());
+                    let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
-                        let v = if let Some(p) = order_pos[i][k] {
-                            row.get(p).cloned().unwrap_or(Value::Null)
+                        let v: Value<'static> = if let Some(p) = order_pos[i][k] {
+                            row.get(p).cloned().map(Value::into_owned).unwrap_or(Value::Null)
                         } else {
                             eval_arg(
                                 &o.expr,
@@ -1325,7 +1325,7 @@ fn accumulate_groups(
                             }
                         };
                         if better {
-                            st.first_best = Some((keys, arg_ref.clone()));
+                            st.first_best = Some((keys, arg_ref.clone().into_owned()));
                         }
                     }
                     continue;
@@ -1348,10 +1348,10 @@ fn accumulate_groups(
                     // probes; skipping `encode_key_refs_into` saves
                     // ~100 ns of alloc + format churn per row.
                     if let Value::Text(s) = arg_ref {
-                        if entry.1[i].seen.contains(s.as_str()) {
+                        if entry.1[i].seen.contains(s.as_ref()) {
                             continue;
                         }
-                        entry.1[i].seen.insert(s.clone());
+                        entry.1[i].seen.insert(s.to_string());
                     } else if let Value::BigInt(n) = arg_ref {
                         let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
                         if !set.insert(*n) {
@@ -1388,7 +1388,7 @@ fn accumulate_groups(
                                 }
                             };
                             if upd {
-                                st.extreme = Some(arg_ref.clone());
+                                st.extreme = Some(arg_ref.clone().into_owned());
                             }
                         }
                     }
@@ -1400,7 +1400,7 @@ fn accumulate_groups(
                                 Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
                             };
                             if upd {
-                                st.extreme = Some(arg_ref.clone());
+                                st.extreme = Some(arg_ref.clone().into_owned());
                             }
                         }
                     }
@@ -1467,14 +1467,14 @@ fn accumulate_groups(
             let idx = if single_text_group_col {
                 let v = row.get(group_pos[0].unwrap()).unwrap_or(&Value::Null);
                 match v {
-                    Value::Text(s) => match groups_text.get(s.as_str()) {
+                    Value::Text(s) => match groups_text.get(s.as_ref()) {
                         Some(&i) => i,
                         None => {
                             let i = order.len();
                             let init: Vec<AggState> =
                                 (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                            order.push((alloc::vec![Value::Text(s.clone())], init));
-                            groups_text.insert(s.clone(), i);
+                            order.push((alloc::vec![Value::text(s.clone())], init));
+                            groups_text.insert(s.to_string(), i);
                             i
                         }
                     },
@@ -1503,7 +1503,7 @@ fn accumulate_groups(
                                 let i = order.len();
                                 let init: Vec<AggState> =
                                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                                order.push((alloc::vec![v.clone()], init));
+                                order.push((alloc::vec![v.clone().into_owned()], init));
                                 groups.insert(keybuf_s.clone(), i);
                                 i
                             }
@@ -1524,7 +1524,7 @@ fn accumulate_groups(
                         let i = order.len();
                         let init: Vec<AggState> =
                             (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                        let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
+                        let owned: Vec<Value<'static>> = refs.iter().map(|v| (*v).clone().into_owned()).collect();
                         order.push((owned, init));
                         groups.insert(keybuf_s.clone(), i);
                         i
@@ -1592,15 +1592,15 @@ fn accumulate_groups(
                         &ctx,
                     )?),
                 };
-                let order_keys = if spec.order_by.is_empty() {
+                let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
-                    let mut keys = Vec::with_capacity(spec.order_by.len());
+                    let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         // Bound ORDER key → read the cell by reference; only
                         // a non-bound key falls to the materialised eval path.
                         keys.push(match order_pos[i][k] {
-                            Some(p) => row.get(p).cloned().unwrap_or(Value::Null),
+                            Some(p) => row.get(p).cloned().map(Value::into_owned).unwrap_or(Value::Null),
                             None => eval_arg(
                                 &o.expr,
                                 mat.as_deref().expect("needs_mat for non-bound ORDER key"),
@@ -1625,7 +1625,7 @@ fn accumulate_groups(
                             }
                         };
                         if better {
-                            st.first_best = Some((keys, arg_ref.clone()));
+                            st.first_best = Some((keys, arg_ref.clone().into_owned()));
                         }
                     }
                     continue;
@@ -1638,10 +1638,10 @@ fn accumulate_groups(
                     // v7.37.x (docker-fair DISTA) — BigInt parallel
                     // path skips encode_key_refs_into entirely.
                     if let Value::Text(s) = arg_ref {
-                        if entry.1[i].seen.contains(s.as_str()) {
+                        if entry.1[i].seen.contains(s.as_ref()) {
                             continue;
                         }
-                        entry.1[i].seen.insert(s.clone());
+                        entry.1[i].seen.insert(s.to_string());
                     } else if let Value::BigInt(n) = arg_ref {
                         let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
                         if !set.insert(*n) {
@@ -1678,7 +1678,7 @@ fn accumulate_groups(
                                 }
                             };
                             if upd {
-                                st.extreme = Some(arg_ref.clone());
+                                st.extreme = Some(arg_ref.clone().into_owned());
                             }
                         }
                     }
@@ -1690,7 +1690,7 @@ fn accumulate_groups(
                                 Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
                             };
                             if upd {
-                                st.extreme = Some(arg_ref.clone());
+                                st.extreme = Some(arg_ref.clone().into_owned());
                             }
                         }
                     }
@@ -1751,8 +1751,8 @@ fn accumulate_groups(
         // tuple materialises here exactly once, never on the bound fast
         // path above), then the original eval loop runs unchanged.
         let row_materialised = row.as_row();
-        let row: &Row = &row_materialised;
-        let group_vals: Vec<Value> = group_exprs
+        let row: &Row<'static> = &row_materialised;
+        let group_vals: Vec<Value<'static>> = group_exprs
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
             .collect::<Result<_, _>>()?;
@@ -1765,7 +1765,7 @@ fn accumulate_groups(
             let mut key_vals = group_vals.clone();
             for &i in &ci_positions {
                 if let Value::Text(s) = &key_vals[i] {
-                    key_vals[i] = Value::Text(s.to_ascii_lowercase());
+                    key_vals[i] = Value::text(s.to_ascii_lowercase());
                 }
             }
             encode_key(&key_vals)
@@ -1806,10 +1806,10 @@ fn accumulate_groups(
             };
             // v7.24 (round-16 A) — aggregate-internal ORDER BY:
             // evaluate the key tuple against the source row.
-            let order_keys = if spec.order_by.is_empty() {
+            let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                 None
             } else {
-                let mut keys = Vec::with_capacity(spec.order_by.len());
+                let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                 for o in &spec.order_by {
                     keys.push(eval_arg(&o.expr, row, &ctx)?);
                 }
@@ -1827,7 +1827,7 @@ fn accumulate_groups(
                         }
                     };
                     if better {
-                        st.first_best = Some((keys, arg_val.clone()));
+                        st.first_best = Some((keys, arg_val.clone().into_owned()));
                     }
                 }
                 continue;
@@ -1842,7 +1842,7 @@ fn accumulate_groups(
                 // v7.37.x (docker-fair DISTA) — single-family fast
                 // paths skip encode_key for Text/BigInt/Int.
                 let inserted = match &arg_val {
-                    Value::Text(s) => entry.1[i].seen.insert(s.clone()),
+                    Value::Text(s) => entry.1[i].seen.insert(s.to_string()),
                     Value::BigInt(n) => entry.1[i]
                         .seen_int
                         .get_or_insert_with(BTreeSet::new)
@@ -1891,7 +1891,7 @@ fn build_synth_schema(
         group_exprs.iter().map(|_| DataType::Text).collect()
     } else {
         let probe_row = rows[0].as_row();
-        let probe: &Row = &probe_row;
+        let probe: &Row<'static> = &probe_row;
         group_exprs
             .iter()
             .map(|g| {
@@ -1923,8 +1923,8 @@ fn build_synth_schema(
 /// element `[1]` of the fully-sorted array.
 fn cmp_order_keys(
     order_by: &[spg_sql::ast::OrderBy],
-    a: &[Value],
-    b: &[Value],
+    a: &[Value<'static>],
+    b: &[Value<'static>],
 ) -> core::cmp::Ordering {
     for (k, o) in order_by.iter().enumerate() {
         let cmp = crate::order_by_value_cmp(o.desc, o.nulls_first, &a[k], &b[k]);
@@ -1936,13 +1936,13 @@ fn cmp_order_keys(
 }
 
 fn finalize_synth_rows(
-    order: &[(Vec<Value>, Vec<AggState>)],
+    order: &[(Vec<Value<'static>>, Vec<AggState>)],
     agg_specs: &[AggSpec],
     synth_schema: &[ColumnSchema],
     rows: &[RowRef<'_>],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
-) -> Result<Vec<Row>, EvalError> {
+) -> Result<Vec<Row<'static>>, EvalError> {
     let ctx = EvalContext::new(schema_cols, table_alias);
     // v7.32 (round-29) — ordered-set direct arguments (the percentile
     // fraction) are constant per PG, so evaluate each once up front.
@@ -1955,9 +1955,9 @@ fn finalize_synth_rows(
         .collect::<Result<_, _>>()?;
 
     // Materialise synthetic rows (insertion order = `order`).
-    let mut synth_rows: Vec<Row> = Vec::new();
+    let mut synth_rows: Vec<Row<'static>> = Vec::new();
     for (gvals, states) in order {
-        let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
+        let mut values: Vec<Value<'static>> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
             // v7.33 (array_agg argmax) — first_ordered: the running
@@ -2011,7 +2011,7 @@ fn finalize_synth_rows(
 /// (`kept_synth`) so post-LIMIT deferred subqueries can evaluate later.
 #[allow(clippy::too_many_lines)]
 fn project_groups(
-    synth_rows: Vec<Row>,
+    synth_rows: Vec<Row<'static>>,
     stmt: &SelectStatement,
     group_exprs: &[Expr],
     agg_specs: &[AggSpec],
@@ -2110,9 +2110,9 @@ fn project_groups(
                 .map(|e| eval::compile_expr(e, &synth_ctx))
         })
         .collect();
-    let mut kept_synth: Vec<Row> = Vec::new();
-    let mut out_rows: Vec<Row> = Vec::new();
-    let mut stack: Vec<Value> = Vec::new();
+    let mut kept_synth: Vec<Row<'static>> = Vec::new();
+    let mut out_rows: Vec<Row<'static>> = Vec::new();
+    let mut stack: Vec<Value<'static>> = Vec::new();
     for srow in synth_rows {
         if let Some(hc) = &having_compiled {
             let cond = eval::eval_compiled(hc, &srow, &synth_ctx, &mut stack)?;
@@ -2136,7 +2136,7 @@ fn project_groups(
             out_rows.push(Row::new(Vec::new()));
             continue;
         }
-        let mut values: Vec<Value> = Vec::with_capacity(columns.len());
+        let mut values: Vec<Value<'static>> = Vec::with_capacity(columns.len());
         for (i, rewritten) in items_rewritten.iter().enumerate() {
             let Some(rewritten) = rewritten else { continue };
             if deferred.iter().any(|(c, _)| *c == i) {
@@ -2182,11 +2182,11 @@ fn sort_synth_by_order_by(
     synth_schema: &[ColumnSchema],
     order_by: &[spg_sql::ast::OrderBy],
     order_rewritten: &[Expr],
-    mut kept_synth: Vec<Row>,
-    mut out_rows: Vec<Row>,
+    mut kept_synth: Vec<Row<'static>>,
+    mut out_rows: Vec<Row<'static>>,
     correlated_eval: Option<CorrelatedEval<'_>>,
     keep_n: Option<usize>,
-) -> Result<(Vec<Row>, Vec<Row>), EvalError> {
+) -> Result<(Vec<Row<'static>>, Vec<Row<'static>>), EvalError> {
     let synth_ctx = EvalContext::new(synth_schema, None);
     // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
     // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
@@ -2207,8 +2207,8 @@ fn sort_synth_by_order_by(
     // The synth row rides through the sort so deferred exprs can
     // evaluate against the surviving groups after the caller's
     // LIMIT truncation.
-    let mut keystack: Vec<Value> = Vec::new();
-    let mut tagged: Vec<(Vec<Value>, Row, Row)> = Vec::with_capacity(kept_synth.len());
+    let mut keystack: Vec<Value<'static>> = Vec::new();
+    let mut tagged: Vec<(Vec<Value<'static>>, Row, Row)> = Vec::with_capacity(kept_synth.len());
     for (s, o) in kept_synth.into_iter().zip(out_rows) {
         let mut keys = Vec::with_capacity(order_rewritten.len());
         for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
@@ -2223,7 +2223,7 @@ fn sort_synth_by_order_by(
         }
         tagged.push((keys, s, o));
     }
-    let cmp = |a: &(Vec<Value>, Row, Row), b: &(Vec<Value>, Row, Row)| {
+    let cmp = |a: &(Vec<Value<'static>>, Row, Row), b: &(Vec<Value<'static>>, Row, Row)| {
         use core::cmp::Ordering;
         for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
             let (desc, nf) = keys_meta[i];
@@ -2578,9 +2578,9 @@ fn update_state(
     st: &mut AggState,
     kind: AggKind,
     name: &str,
-    v: &Value,
-    arg2: Option<&Value>,
-    order_keys: Option<Vec<Value>>,
+    v: &Value<'_>,
+    arg2: Option<&Value<'_>>,
+    order_keys: Option<Vec<Value<'static>>>,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
     // v7.37.4 (R34) — dispatch by pre-classified `kind` (`Copy`
@@ -2621,10 +2621,10 @@ fn update_state(
                 return Ok(());
             }
             match &st.extreme {
-                None => st.extreme = Some(v.clone()),
+                None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
                     if value_cmp(v, cur) == core::cmp::Ordering::Less {
-                        st.extreme = Some(v.clone());
+                        st.extreme = Some(v.clone().into_owned());
                     }
                 }
             }
@@ -2634,10 +2634,10 @@ fn update_state(
                 return Ok(());
             }
             match &st.extreme {
-                None => st.extreme = Some(v.clone()),
+                None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
                     if value_cmp(v, cur) == core::cmp::Ordering::Greater {
-                        st.extreme = Some(v.clone());
+                        st.extreme = Some(v.clone().into_owned());
                     }
                 }
             }
@@ -2653,13 +2653,13 @@ fn update_state(
             if let Some(sep) = arg2
                 && let Value::Text(s) = sep
             {
-                st.separator = Some(s.clone());
+                st.separator = Some(s.to_string());
             }
             if is_null {
                 return Ok(());
             }
             if let Value::Text(s) = v {
-                st.items.push(Value::Text(s.clone()));
+                st.items.push(Value::text(s.clone()));
                 if let Some(k) = order_keys {
                     st.item_keys.push(k);
                 }
@@ -2676,7 +2676,7 @@ fn update_state(
         // is locked from the first row's value type; subsequent
         // rows must match (PG also rejects mixed-type array_agg).
         AggKind::ArrayAgg => {
-            st.items.push(v.clone());
+            st.items.push(v.clone().into_owned());
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
             }
@@ -2767,7 +2767,7 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
-            st.items.push(v.clone());
+            st.items.push(v.clone().into_owned());
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
             }
@@ -2790,7 +2790,7 @@ fn update_state(
         // v7.32 (round-29) — json_agg / jsonb_agg collect every input
         // (NULL becomes JSON null, per PG) in row order.
         AggKind::JsonAgg => {
-            st.items.push(v.clone());
+            st.items.push(v.clone().into_owned());
             st.count += 1;
         }
         // v7.32 (round-29) — json_object_agg(key, value): keys in
@@ -2800,8 +2800,8 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
-            st.items.push(v.clone());
-            st.aux_items.push(arg2.cloned().unwrap_or(Value::Null));
+            st.items.push(v.clone().into_owned());
+            st.aux_items.push(arg2.cloned().map(Value::into_owned).unwrap_or(Value::Null));
             st.count += 1;
         }
     }
@@ -2809,7 +2809,7 @@ fn update_state(
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn finalize(name: &str, st: &AggState) -> Value {
+fn finalize(name: &str, st: &AggState) -> Value<'static> {
     match name {
         "count" | "count_star" => Value::BigInt(st.count),
         "sum" => {
@@ -2851,7 +2851,7 @@ fn finalize(name: &str, st: &AggState) -> Value {
                     out.push_str(s);
                 }
             }
-            Value::Text(out)
+            Value::text(out)
         }
         // v7.17.0 — array_agg: collect into a typed array. NULL
         // elements are preserved per PG. Result type is decided
@@ -2893,7 +2893,7 @@ fn finalize(name: &str, st: &AggState) -> Value {
                         .items
                         .iter()
                         .map(|v| match v {
-                            Value::Text(s) => Some(s.clone()),
+                            Value::Text(s) => Some(s.to_string()),
                             Value::Null => None,
                             other => Some(format!("{other:?}")),
                         })
@@ -2991,7 +2991,7 @@ fn finalize(name: &str, st: &AggState) -> Value {
                 out.push_str(&crate::json::value_to_json_text(item));
             }
             out.push(']');
-            Value::Json(out)
+            Value::json(out)
         }
         // v7.32 (round-29) — json_object_agg: a JSON object built from
         // the parallel key (`items`) / value (`aux_items`) streams.
@@ -3006,16 +3006,16 @@ fn finalize(name: &str, st: &AggState) -> Value {
                 }
                 // Object keys are always JSON strings (PG coerces).
                 let key_text = match key {
-                    Value::Text(s) | Value::Json(s) => s.clone(),
+                    Value::Text(s) | Value::Json(s) => s.to_string(),
                     other => crate::json::value_to_json_text(other),
                 };
-                out.push_str(&crate::json::value_to_json_text(&Value::Text(key_text)));
+                out.push_str(&crate::json::value_to_json_text(&Value::text(key_text)));
                 out.push_str(": ");
                 let val = st.aux_items.get(i).unwrap_or(&Value::Null);
                 out.push_str(&crate::json::value_to_json_text(val));
             }
             out.push('}');
-            Value::Json(out)
+            Value::json(out)
         }
         // Ordered-set aggregates are finalized in `run` (they need the
         // sorted items + the direct fraction argument), never here.
@@ -3050,7 +3050,7 @@ fn finalize_ordered_set(
     st: &AggState,
     direct: Option<&Value>,
     order: Option<&spg_sql::ast::OrderBy>,
-) -> Value {
+) -> Value<'static> {
     let fraction = direct;
     let items = &st.items;
     if items.is_empty() {
@@ -3546,7 +3546,7 @@ fn encode_one(out: &mut String, v: &Value) {
         }
         Value::Vector(v) => {
             out.push('V');
-            for x in v {
+            for x in v.iter() {
                 out.push_str(&x.to_string());
                 out.push(',');
             }
@@ -3628,7 +3628,7 @@ fn encode_one(out: &mut String, v: &Value) {
 }
 
 /// v7.30 (perf campaign) - encode from borrowed cells without
-/// materialising an owned Vec<Value> first.
+/// materialising an owned Vec<Value<'static>> first.
 pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
     let mut out = String::new();
     for v in vals {
@@ -3649,7 +3649,7 @@ pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
     }
 }
 
-pub(crate) fn encode_key(vals: &[Value]) -> String {
+pub(crate) fn encode_key(vals: &[Value<'static>]) -> String {
     let mut out = String::new();
     for v in vals {
         encode_one(&mut out, v);

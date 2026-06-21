@@ -26,7 +26,7 @@ use crate::{
 /// materialised (every regular table / unnest / generate_series) or
 /// lateral (subquery re-evaluated per outer row).
 pub(crate) struct JoinedPeer<'a> {
-    pub(crate) eager_rows: Option<Vec<Row>>,
+    pub(crate) eager_rows: Option<Vec<Row<'static>>>,
     pub(crate) cols: Vec<ColumnSchema>,
     pub(crate) alias: String,
     pub(crate) kind: JoinKind,
@@ -52,11 +52,11 @@ pub(crate) struct JoinedPeer<'a> {
 pub(crate) enum JoinSrc<'a> {
     /// Owned by the join: the primary scan, a lazily-materialised
     /// peer, or the arena of per-outer-row LATERAL results.
-    Owned(Vec<Row>),
+    Owned(Vec<Row<'static>>),
     /// Peer rows materialised up front and still owned by `JoinedPeer`.
-    Eager(&'a [Row]),
+    Eager(&'a [Row<'static>]),
     /// Index-nested-loop peer reading the stored table in place.
-    Stored(&'a spg_storage::persistent::PersistentVec<Row>),
+    Stored(&'a spg_storage::persistent::PersistentVec<Row<'static>>),
     /// v7.36 — hot tier borrowed in place + cold tier owned. INL
     /// probe consults `cold_locator_map` to translate a Cold
     /// `RowLocator` (which only carries `(segment_id, page_offset)`
@@ -68,14 +68,14 @@ pub(crate) enum JoinSrc<'a> {
     /// uses internally. Indices `0..hot.len()` map to hot rows;
     /// `hot.len()..` map to `cold[i - hot.len()]`.
     Mixed {
-        hot: &'a spg_storage::persistent::PersistentVec<Row>,
-        cold: Vec<Row>,
+        hot: &'a spg_storage::persistent::PersistentVec<Row<'static>>,
+        cold: Vec<Row<'static>>,
         cold_locator_map: hashbrown::HashMap<i64, usize>,
     },
 }
 
 impl JoinSrc<'_> {
-    pub(crate) fn get(&self, i: usize) -> Option<&Row> {
+    pub(crate) fn get(&self, i: usize) -> Option<&Row<'static>> {
         match self {
             Self::Owned(v) => v.get(i),
             Self::Eager(s) => s.get(i),
@@ -128,7 +128,7 @@ pub(crate) fn tuple_value<'s>(
     offsets: &[usize],
     tuple: &[usize],
     pos: usize,
-) -> Option<&'s Value> {
+) -> Option<&'s Value<'static>> {
     let k = offsets.partition_point(|&o| o <= pos).checked_sub(1)?;
     let ri = *tuple.get(k)?;
     if ri == usize::MAX {
@@ -144,7 +144,7 @@ pub(crate) fn tuple_value<'s>(
 /// `tuple_value`, so the join+aggregate path never materialises a
 /// combined `Row` for the bound-column fast path.
 pub(crate) enum RowRef<'a> {
-    Owned(&'a Row),
+    Owned(&'a Row<'static>),
     Tuple {
         sources: &'a [JoinSrc<'a>],
         offsets: &'a [usize],
@@ -167,13 +167,13 @@ impl RowRef<'_> {
         }
     }
 
-    /// Present the row as a `&Row` for the eval path. `Owned` borrows
+    /// Present the row as a `&Row<'static>` for the eval path. `Owned` borrows
     /// directly (zero cost); `Tuple` materialises once into owned values
     /// — the only allocation, paid solely on the eval (non-bound) path,
     /// never for the bound fast path. The materialised width is the full
     /// combined schema (`offsets.last()`); a LEFT-NULL slot or an out-of-
     /// range position becomes `Value::Null` (same as `tuple_value`).
-    pub(crate) fn as_row(&self) -> Cow<'_, Row> {
+    pub(crate) fn as_row(&self) -> Cow<'_, Row<'static>> {
         match self {
             RowRef::Owned(r) => Cow::Borrowed(r),
             RowRef::Tuple {
@@ -182,7 +182,7 @@ impl RowRef<'_> {
                 tuple,
             } => {
                 let width = offsets.last().copied().unwrap_or(0);
-                let mut vals: Vec<Value> = Vec::with_capacity(width);
+                let mut vals: Vec<Value<'static>> = Vec::with_capacity(width);
                 for pos in 0..width {
                     vals.push(
                         tuple_value(sources, offsets, tuple, pos)
@@ -201,7 +201,7 @@ impl RowRef<'_> {
 /// unreferenced columns instead of cloning them — the in-place
 /// equivalent of `null_out_unreferenced` for sources that were never
 /// pre-cloned.
-pub(crate) fn extend_masked(vals: &mut Vec<Value>, row: &Row, mask: Option<&[bool]>) {
+pub(crate) fn extend_masked(vals: &mut Vec<Value<'static>>, row: &Row<'static>, mask: Option<&[bool]>) {
     match mask {
         Some(keep) => {
             for (i, v) in row.values.iter().enumerate() {
@@ -224,8 +224,8 @@ pub(crate) fn materialise_tuple_vals(
     masks: &[Option<Vec<bool>>],
     tuple: &[usize],
     cap: usize,
-) -> Vec<Value> {
-    let mut vals: Vec<Value> = Vec::with_capacity(cap);
+) -> Vec<Value<'static>> {
+    let mut vals: Vec<Value<'static>> = Vec::with_capacity(cap);
     for (k, &ri) in tuple.iter().enumerate() {
         let row = if ri == usize::MAX {
             None
@@ -250,7 +250,7 @@ pub(crate) fn materialise_tuple_vals(
 /// The aggregate path borrows each survivor as a `RowRef::Tuple` (the
 /// bound fast path reads source cells by reference — zero clone); the
 /// projection / window paths call `materialise()` for an owned
-/// `Vec<Row>` identical to the pre-increment-2 output.
+/// `Vec<Row<'static>>` identical to the pre-increment-2 output.
 pub(crate) struct DeferredJoin<'a> {
     pub(crate) sources: Vec<JoinSrc<'a>>,
     pub(crate) offsets: Vec<usize>,
@@ -289,7 +289,7 @@ impl DeferredJoin<'_> {
 
     /// Materialise the survivors into owned combined Rows (projection /
     /// window paths). Byte-identical to the pre-deferral output.
-    pub(crate) fn materialise(&self) -> Vec<Row> {
+    pub(crate) fn materialise(&self) -> Vec<Row<'static>> {
         if self.stride == 0 {
             return Vec::new();
         }
@@ -352,7 +352,7 @@ pub(crate) fn approx_tuple_bytes(
 struct TopNEntry {
     keys: Vec<f64>,
     seq: u64,
-    row: Row,
+    row: Row<'static>,
 }
 
 impl TopNEntry {
@@ -752,7 +752,7 @@ impl Engine {
         if joined.is_empty() {
             // Joinless FROM: the primary rows ARE the combined rows —
             // filter and hand them back without any re-clone.
-            let mut filtered: Vec<Row> = Vec::new();
+            let mut filtered: Vec<Row<'static>> = Vec::new();
             let mut memo = memoize::MemoizeCache::default();
             for row in primary_rows {
                 if let Some(where_expr) = where_ {
@@ -934,7 +934,7 @@ impl Engine {
         if has_cold && !join_col_is_pk {
             return Ok(false);
         }
-        let (cold_rows, cold_pk_map): (Vec<Row>, hashbrown::HashMap<i64, usize>) = if has_cold {
+        let (cold_rows, cold_pk_map): (Vec<Row<'static>>, hashbrown::HashMap<i64, usize>) = if has_cold {
             crate::constraints::iter_cold_rows_with_locator_map(self.active_catalog(), table)
         } else {
             (Vec::new(), hashbrown::HashMap::new())
@@ -967,7 +967,7 @@ impl Engine {
                             }
                         }
                     };
-                    let right_opt: Option<&Row> = if ri < hot_len {
+                    let right_opt: Option<&Row<'static>> = if ri < hot_len {
                         stored.get(ri)
                     } else {
                         cold_rows.get(ri - hot_len)
@@ -1273,9 +1273,9 @@ impl Engine {
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
         budget: &mut ByteBudget,
     ) -> Result<(), EngineError> {
-        let lazy_rows: Option<Vec<Row>> = if peer.eager_rows.is_none() && peer.lateral.is_none() {
+        let lazy_rows: Option<Vec<Row<'static>>> = if peer.eager_rows.is_none() && peer.lateral.is_none() {
             let tname = peer.join_table.as_deref().unwrap_or("");
-            let mut rows: Vec<Row> = self
+            let mut rows: Vec<Row<'static>> = self
                 .active_catalog()
                 .get(tname)
                 .map(|t| t.rows().iter().cloned().collect())
@@ -1302,8 +1302,8 @@ impl Engine {
         };
         // Lateral results are per-outer-row, so matched right rows persist
         // in a stage arena the tuples can index.
-        let mut arena: Vec<Row> = Vec::new();
-        let rights_eager: Option<&[Row]> = peer.eager_rows.as_deref().or(lazy_rows.as_deref());
+        let mut arena: Vec<Row<'static>> = Vec::new();
+        let rights_eager: Option<&[Row<'static>]> = peer.eager_rows.as_deref().or(lazy_rows.as_deref());
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
@@ -1429,7 +1429,7 @@ impl Engine {
         let compiled_where: Option<eval::CompiledExpr> = where_
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, ctx));
-        let mut eval_stack: Vec<Value> = Vec::new();
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             let rr = RowRef::Tuple {
@@ -1531,8 +1531,8 @@ impl Engine {
         &self,
         inner: &SelectStatement,
         outer_schema: &[ColumnSchema],
-        outer_row: &Row,
-    ) -> Result<Vec<Row>, EngineError> {
+        outer_row: &Row<'static>,
+    ) -> Result<Vec<Row<'static>>, EngineError> {
         let mut substituted = inner.clone();
         substitute_outer_columns_multi(&mut substituted, outer_row, outer_schema);
         let result = self.exec_bare_select_cancel(&substituted, CancelToken::none())?;
@@ -1895,7 +1895,7 @@ impl Engine {
         // Hash the peer on the equality key (same as the heap streamer).
         let mut htable: hashbrown::HashMap<String, Vec<usize>> =
             hashbrown::HashMap::with_capacity(peer_rows.len());
-        let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
+        let mut keybuf: Vec<Value<'static>> = Vec::with_capacity(eq_pairs.len());
         'build: for (ri, right) in peer_rows.iter().enumerate() {
             keybuf.clear();
             for (_, rpos) in &eq_pairs {
@@ -1916,7 +1916,7 @@ impl Engine {
             .collect();
         let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
         let mut where_memo = memoize::MemoizeCache::default();
-        let mut plain_sink: Vec<Row> = Vec::with_capacity(keep.min(1024));
+        let mut plain_sink: Vec<Row<'static>> = Vec::with_capacity(keep.min(1024));
         // Walker drive: walk primary via btree index in ORDER BY
         // direction. Rows arrive already sorted; plain_sink + early
         // stop replaces the heap.
@@ -1958,7 +1958,7 @@ impl Engine {
                         }
                     }
                 };
-                let left: &Row = left_cow.as_ref();
+                let left: &Row<'static> = left_cow.as_ref();
                 keybuf.clear();
                 let mut left_has_null = false;
                 for (lpos, _) in &eq_pairs {
@@ -1977,7 +1977,7 @@ impl Engine {
                 };
                 for &ri in cands {
                     let right = &peer_rows[ri];
-                    let mut combined_vals: Vec<Value> =
+                    let mut combined_vals: Vec<Value<'static>> =
                         Vec::with_capacity(left_arity + peer_cols.len());
                     for (i, v) in left.values.iter().enumerate() {
                         combined_vals.push(if keep_mask.get(i).copied().unwrap_or(true) {
@@ -2025,7 +2025,7 @@ impl Engine {
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
         let projection = build_projection(&stmt.items, &combined_schema, "")?;
         let mut proj_memo = memoize::MemoizeCache::default();
-        let mut rows: Vec<Row> = Vec::with_capacity(output.len());
+        let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {
             let mut values = Vec::with_capacity(projection.len());
             for p in &projection {
@@ -2167,7 +2167,7 @@ impl Engine {
         // Hash the peer on the equality key (NULL keys never match).
         let mut htable: hashbrown::HashMap<String, Vec<usize>> =
             hashbrown::HashMap::with_capacity(peer_rows.len());
-        let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
+        let mut keybuf: Vec<Value<'static>> = Vec::with_capacity(eq_pairs.len());
         'build: for (ri, right) in peer_rows.iter().enumerate() {
             keybuf.clear();
             for (_, rpos) in &eq_pairs {
@@ -2193,7 +2193,7 @@ impl Engine {
         let mut where_memo = memoize::MemoizeCache::default();
         let mut heap: alloc::collections::BinaryHeap<TopNEntry> =
             alloc::collections::BinaryHeap::new();
-        let mut plain_sink: Vec<Row> = Vec::new();
+        let mut plain_sink: Vec<Row<'static>> = Vec::new();
         let mut seq: u64 = 0;
         // v7.36 (cold-tier coverage) — extend the primary scan with
         // the cold-tier rows so `ORDER BY <non-indexed> LIMIT N`
@@ -2224,7 +2224,7 @@ impl Engine {
             };
             for &ri in cands {
                 let right = &peer_rows[ri];
-                let mut combined_vals: Vec<Value> =
+                let mut combined_vals: Vec<Value<'static>> =
                     Vec::with_capacity(left_arity + peer_cols.len());
                 for (i, v) in left.values.iter().enumerate() {
                     combined_vals.push(if keep_mask.get(i).copied().unwrap_or(true) {
@@ -2298,7 +2298,7 @@ impl Engine {
                 }
             }
         }
-        let mut output: Vec<Row> = if stmt.order_by.is_empty() {
+        let mut output: Vec<Row<'static>> = if stmt.order_by.is_empty() {
             plain_sink
         } else {
             heap.into_sorted_vec().into_iter().map(|e| e.row).collect()
@@ -2306,7 +2306,7 @@ impl Engine {
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
         let projection = build_projection(&stmt.items, &combined_schema, "")?;
         let mut proj_memo = memoize::MemoizeCache::default();
-        let mut rows: Vec<Row> = Vec::with_capacity(output.len());
+        let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {
             let mut values = Vec::with_capacity(projection.len());
             for p in &projection {
@@ -2356,7 +2356,7 @@ pub(crate) fn synth_lateral_col_name(expr: &Expr, idx: usize) -> String {
 /// LATERAL subquery resolves before execution.
 pub(crate) fn substitute_outer_columns_multi(
     stmt: &mut SelectStatement,
-    outer_row: &Row,
+    outer_row: &Row<'static>,
     outer_schema: &[ColumnSchema],
 ) {
     substitute_outer_in_select(stmt, outer_row, outer_schema);
@@ -2371,7 +2371,7 @@ pub(crate) fn substitute_outer_columns_multi(
 /// avoids accidentally rebinding inner columns of the same name.
 fn substitute_outer_in_select(
     stmt: &mut SelectStatement,
-    outer_row: &Row,
+    outer_row: &Row<'static>,
     outer_schema: &[ColumnSchema],
 ) {
     for item in &mut stmt.items {
@@ -2398,7 +2398,7 @@ fn substitute_outer_in_select(
     }
 }
 
-fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row, outer_schema: &[ColumnSchema]) {
+fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row<'static>, outer_schema: &[ColumnSchema]) {
     if let Expr::Column(c) = e
         && let Some(qual) = &c.qualifier
     {

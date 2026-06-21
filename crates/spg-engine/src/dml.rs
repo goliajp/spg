@@ -206,7 +206,7 @@ impl Engine {
             .where_
             .as_ref()
             .and_then(|w| try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str()));
-        let mut planned: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let candidate_positions: Vec<usize> = match &seek_positions {
             Some(list) => list.clone(),
             None => (0..table.row_count()).collect(),
@@ -269,7 +269,7 @@ impl Engine {
         // FK / CHECK / trigger passes so guards reason about the
         // computed value the same way they would for a literal cell.
         {
-            let mut staged: Vec<Vec<Value>> = planned
+            let mut staged: Vec<Vec<Value<'static>>> = planned
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
@@ -281,7 +281,7 @@ impl Engine {
         // v7.6.6 — capture pre-update row values for the FK
         // enforcement passes below. `planned` carries new values
         // only; pair them with the old row.
-        let plan_with_old: Vec<(usize, Vec<Value>, Vec<Value>)> = planned
+        let plan_with_old: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)> = planned
             .iter()
             .map(|(pos, new_vals)| (*pos, table.rows()[*pos].values.clone(), new_vals.clone()))
             .collect();
@@ -295,7 +295,7 @@ impl Engine {
         // local FK columns changed, the new value must exist in the
         // parent.
         if !self_fks.is_empty() {
-            let new_rows: Vec<Vec<Value>> = planned
+            let new_rows: Vec<Vec<Value<'static>>> = planned
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
@@ -305,7 +305,7 @@ impl Engine {
         // (mailrs round-5 G3). Predicates evaluated against the
         // candidate post-UPDATE row; false rejects the UPDATE.
         {
-            let new_rows: Vec<Vec<Value>> = planned
+            let new_rows: Vec<Vec<Value<'static>>> = planned
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
@@ -381,7 +381,7 @@ impl Engine {
         }
         // v7.9.4 — snapshot post-update values for RETURNING (post-
         // BEFORE-trigger because triggers can rewrite cells).
-        let updated_for_returning: Vec<Vec<Value>> = if stmt.returning.is_some() {
+        let updated_for_returning: Vec<Vec<Value<'static>>> = if stmt.returning.is_some() {
             applied_after_before
                 .iter()
                 .map(|(_pos, new_row, _old)| new_row.values.clone())
@@ -500,7 +500,7 @@ impl Engine {
             })?;
             (
                 t.schema().columns.clone(),
-                t.rows().iter().cloned().collect::<Vec<Row>>(),
+                t.rows().iter().cloned().collect::<Vec<Row<'static>>>(),
             )
         };
         let (source_cols, source_rows) = {
@@ -513,7 +513,7 @@ impl Engine {
             // input. Source rows are read-only inputs (we never
             // mutate the source) so this is the same shape as
             // `materialise_table_ref`'s v7.35.1 cold-aware lift.
-            let mut rows: Vec<Row> = s.rows().iter().cloned().collect();
+            let mut rows: Vec<Row<'static>> = s.rows().iter().cloned().collect();
             rows.extend(crate::constraints::iter_cold_rows_of_parent(
                 self.active_catalog(),
                 s,
@@ -562,8 +562,8 @@ impl Engine {
         // Resolve INSERT column positions once (validate names).
         // For each clause that's an INSERT, map column names → target positions.
         let mut delete_indices: Vec<usize> = Vec::new();
-        let mut updates: Vec<(usize, Vec<Value>)> = Vec::new();
-        let mut inserts: Vec<Vec<Value>> = Vec::new();
+        let mut updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
+        let mut inserts: Vec<Vec<Value<'static>>> = Vec::new();
         let mut affected: usize = 0;
 
         for (src_idx, src_row) in source_rows.iter().enumerate() {
@@ -604,7 +604,7 @@ impl Engine {
                     vals.extend(src_row.values.iter().cloned());
                     Row::new(vals)
                 } else {
-                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    let mut vals: Vec<Value<'static>> = (0..target_arity).map(|_| Value::Null).collect();
                     vals.extend(src_row.values.iter().cloned());
                     Row::new(vals)
                 };
@@ -667,10 +667,10 @@ impl Engine {
                 }
                 spg_sql::ast::MergeAction::Insert { columns, values } => {
                     // For INSERT NOT MATCHED, target side is NULL-padded.
-                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    let mut vals: Vec<Value<'static>> = (0..target_arity).map(|_| Value::Null).collect();
                     vals.extend(src_row.values.iter().cloned());
                     let synth_row = Row::new(vals);
-                    let mut new_row_values: Vec<Value> =
+                    let mut new_row_values: Vec<Value<'static>> =
                         (0..target_arity).map(|_| Value::Null).collect();
                     for (col, expr) in columns.iter().zip(values.iter()) {
                         let pos =
@@ -831,7 +831,7 @@ impl Engine {
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can
         // run after the mut borrow drops.
-        let mut to_delete_rows: Vec<Vec<Value>> = Vec::new();
+        let mut to_delete_rows: Vec<Vec<Value<'static>>> = Vec::new();
         // v7.20 P4 — index seek (same shape as exec_update_cancel):
         // an equality WHERE on an indexed column narrows the walk
         // to the matching hot positions; the full WHERE still
@@ -883,7 +883,7 @@ impl Engine {
         let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
         if !before_delete_triggers.is_empty() {
             let mut filtered_positions: Vec<usize> = Vec::with_capacity(positions.len());
-            let mut filtered_old_rows: Vec<Vec<Value>> = Vec::with_capacity(to_delete_rows.len());
+            let mut filtered_old_rows: Vec<Vec<Value<'static>>> = Vec::with_capacity(to_delete_rows.len());
             for (pos, old_vals) in positions.iter().zip(to_delete_rows.iter()) {
                 let old_row = Row::new(old_vals.clone());
                 let mut cancel_this = false;
@@ -1299,17 +1299,17 @@ impl Engine {
         &self,
         table_name: &str,
         clause: &spg_sql::ast::OnConflictClause,
-        all_values: Vec<Vec<Value>>,
-    ) -> Result<(Vec<Vec<Value>>, Vec<(usize, Vec<Value>)>, usize), EngineError> {
-        let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
+        all_values: Vec<Vec<Value<'static>>>,
+    ) -> Result<(Vec<Vec<Value<'static>>>, Vec<(usize, Vec<Value<'static>>)>, usize), EngineError> {
+        let mut pending_updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let mut skipped_count = 0usize;
         let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
             self.active_catalog(),
             table_name,
             clause.target_columns.as_slice(),
         )?;
-        let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
-        let mut seen_keys: Vec<Vec<Value>> = Vec::new();
+        let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
+        let mut seen_keys: Vec<Vec<Value<'static>>> = Vec::new();
         for values in all_values {
             let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
             // SQL spec: NULL in any conflict column means "no
@@ -1325,7 +1325,7 @@ impl Engine {
                     &conflict_cols,
                     &key_tuple,
                 );
-            let key_tuple_owned: Vec<Value> = key_tuple.iter().map(|v| (*v).clone()).collect();
+            let key_tuple_owned: Vec<Value<'static>> = key_tuple.iter().map(|v| (*v).clone()).collect();
             let collides_with_batch =
                 !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
             let collides = collides_with_table || collides_with_batch;
@@ -1575,7 +1575,7 @@ impl Engine {
         &self,
         table_name: &str,
         items: &[SelectItem],
-        mutated_rows: Vec<Vec<Value>>,
+        mutated_rows: Vec<Vec<Value<'static>>>,
     ) -> Result<QueryResult, EngineError> {
         let table = self.active_catalog().get(table_name).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound {
@@ -1584,7 +1584,7 @@ impl Engine {
         })?;
         let schema_cols = table.schema().columns.clone();
         let columns = self.derive_output_columns(items, &schema_cols, table_name);
-        let mut out_rows: Vec<Row> = Vec::with_capacity(mutated_rows.len());
+        let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(mutated_rows.len());
         for values in mutated_rows {
             let row = Row::new(values);
             let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
@@ -1661,7 +1661,7 @@ fn build_tuple_pos(
 /// fully-typed sibling cells.
 pub(crate) fn apply_generated_stored_columns(
     column_meta: &[ColumnSchema],
-    rows: &mut [Vec<Value>],
+    rows: &mut [Vec<Value<'static>>],
 ) -> Result<(), EngineError> {
     use spg_engine_no_alias::ParsedExpr;
     let mut parsed: Vec<Option<ParsedExpr>> = Vec::with_capacity(column_meta.len());
@@ -1736,9 +1736,9 @@ fn parse_insert_rows(
     seq_floors: &alloc::collections::BTreeMap<usize, i64>,
     enum_label_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
-) -> Result<Vec<Vec<Value>>, EngineError> {
+) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     let schema_cols_len = column_meta.len();
-    let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    let mut all_values: Vec<Vec<Value<'static>>> = Vec::with_capacity(rows.len());
     // v7.24 (round-16 collateral) — statement-scoped serial
     // cursors. next_auto_value() is a max+1 scan over COMMITTED
     // rows; multi-row `INSERT … VALUES (…),(…)` computed it per
@@ -1758,9 +1758,9 @@ fn parse_insert_rows(
         // Fast path: no column-list permutation → tuple slot j
         // maps to schema column j. We can zip schema with tuple
         // and skip the `raw_tuple` staging allocation entirely.
-        let values: Vec<Value> = if let Some(map) = &tuple_pos {
+        let values: Vec<Value<'static>> = if let Some(map) = &tuple_pos {
             // Permuted path: still need raw_tuple to index by `map[i]`.
-            let raw_tuple: Vec<Value> = tuple
+            let raw_tuple: Vec<Value<'static>> = tuple
                 .into_iter()
                 .map(literal_expr_to_value)
                 .collect::<Result<_, _>>()?;
@@ -1786,7 +1786,7 @@ fn parse_insert_rows(
                     auto_cursors.insert(i, next + 1);
                     raw = Value::BigInt(next);
                 }
-                let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                let coerced = coerce_value(raw.into_owned(), col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 check_unsigned_range(&coerced, col, i)?;
@@ -1835,20 +1835,20 @@ fn parse_insert_rows(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
-    all_values: Vec<Vec<Value>>,
-    pending_updates: Vec<(usize, Vec<Value>)>,
+    all_values: Vec<Vec<Value<'static>>>,
+    pending_updates: Vec<(usize, Vec<Value<'static>>)>,
     before_insert_triggers: &[spg_storage::FunctionDef],
     after_insert_triggers: &[spg_storage::FunctionDef],
     column_meta: &[ColumnSchema],
     table_name: &str,
     trigger_session_cfg: Option<&str>,
     returning_enabled: bool,
-) -> Result<(Vec<Vec<Value>>, Vec<triggers::DeferredEmbeddedStmt>, usize), EngineError> {
+) -> Result<(Vec<Vec<Value<'static>>>, Vec<triggers::DeferredEmbeddedStmt>, usize), EngineError> {
     let mut affected = 0usize;
     // v7.9.4 — keep RETURNING projection rows separate per
     // INSERT and per UPDATE branch so DO UPDATE pushes the new
     // post-update state, not the incoming-only values.
-    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    let mut returning_rows: Vec<Vec<Value<'static>>> = Vec::new();
     // v7.12.7 — collect embedded SQL emitted by any trigger
     // fire across the row loop; engine drains the queue after
     // the table mut borrow drops.

@@ -112,7 +112,7 @@ impl Engine {
         let storage_fk = resolve_foreign_key(tbl, &cols_snapshot, fk, self.active_catalog())?;
         // Verify existing rows. Treat them as a virtual
         // INSERT batch — reusing the v7.6.2 enforce helper.
-        let existing_rows: Vec<Vec<Value>> = self
+        let existing_rows: Vec<Vec<Value<'static>>> = self
             .active_catalog()
             .get(tbl)
             .expect("checked above")
@@ -208,7 +208,7 @@ impl Engine {
         // the column is nullable and has no DEFAULT. NOT NULL
         // without DEFAULT errors when the table has existing
         // rows — same as PG.
-        let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
+        let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some() {
             resolve_column_default_free(&col_schema, clock)?
         } else if nullable || row_count == 0 {
             Value::Null
@@ -265,7 +265,7 @@ impl Engine {
         }
         let schema_cols = table.schema().columns.clone();
         let ctx = eval::EvalContext::new(&schema_cols, None);
-        let mut new_values: alloc::vec::Vec<Value> =
+        let mut new_values: alloc::vec::Vec<Value<'static>> =
             alloc::vec::Vec::with_capacity(table.row_count());
         for row in table.rows().iter() {
             let raw = match &using {
@@ -1143,7 +1143,7 @@ impl Engine {
             let nullable = col_def.nullable;
             let has_default = col_def.default.is_some() || col_def.auto_increment;
             let col_schema = column_def_to_schema(col_def)?;
-            let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
+            let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some() {
                 resolve_column_default_free(&col_schema, clock)?
             } else if nullable || row_count == 0 {
                 Value::Null
@@ -2589,7 +2589,7 @@ impl Engine {
 pub(crate) fn resolve_column_default_free(
     col: &ColumnSchema,
     clock_fn: Option<ClockFn>,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     if let Some(rt) = &col.runtime_default {
         return eval_runtime_default_free(rt, col.ty, clock_fn);
     }
@@ -2600,7 +2600,7 @@ pub(crate) fn eval_runtime_default_free(
     rt: &str,
     ty: DataType,
     clock_fn: Option<ClockFn>,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     let s = rt.trim().to_ascii_lowercase();
     // v7.17.0 Phase 2.1 — also strip `(N)` precision suffix
     // so MySQL `CURRENT_TIMESTAMP(6)` resolves the same as
@@ -2673,8 +2673,8 @@ pub(crate) fn canonicalize_set_value(
     lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     col_idx: usize,
     col_name: &str,
-    value: Value,
-) -> Result<Value, EngineError> {
+    value: Value<'static>,
+) -> Result<Value<'static>, EngineError> {
     let Some(variants) = lookup.get(&col_idx) else {
         return Ok(value);
     };
@@ -2682,7 +2682,7 @@ pub(crate) fn canonicalize_set_value(
         Value::Null => Ok(Value::Null),
         Value::Text(s) => {
             if s.is_empty() {
-                return Ok(Value::Text(alloc::string::String::new()));
+                return Ok(Value::text(alloc::string::String::new()));
             }
             // Collect a presence-set of variant indices to keep
             // definition order + handle de-dup in one pass.
@@ -2713,7 +2713,7 @@ pub(crate) fn canonicalize_set_value(
                 first = false;
                 out.push_str(&variants[i]);
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         other => Err(EngineError::Unsupported(alloc::format!(
             "column {col_name:?}: SET-typed column expects TEXT, got {:?}",

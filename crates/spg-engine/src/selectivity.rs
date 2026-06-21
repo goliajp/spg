@@ -121,7 +121,7 @@ pub fn between(stats: Option<&ColumnStats>, low: &Value, high: &Value) -> f64 {
 /// `col IN (v1, v2, …)`. Sums per-value equality selectivities,
 /// clamped at 1.0. Without stats, returns `DEFAULT_EQ × len(values)`
 /// (also clamped) — the same shape PG would produce.
-pub fn in_list(stats: Option<&ColumnStats>, values: &[Value]) -> f64 {
+pub fn in_list(stats: Option<&ColumnStats>, values: &[Value<'static>]) -> f64 {
     if values.is_empty() {
         // Empty IN list — selectivity 0 (matches no rows). Still
         // floored at MIN_SELECTIVITY so the planner doesn't see
@@ -251,7 +251,7 @@ fn value_cmp_str(value: &Value, bound: &str) -> core::cmp::Ordering {
             .ok()
             .and_then(|b| x.partial_cmp(&b))
             .unwrap_or(Ordering::Equal),
-        Value::Text(s) | Value::Json(s) => s.as_str().cmp(bound),
+        Value::Text(s) | Value::Json(s) => s.as_ref().cmp(bound),
         Value::Bool(b) => {
             let bs = if *b { "t" } else { "f" };
             bs.cmp(bound)
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn in_list_caps_at_one() {
         let s = mk_int_stats(0, 5, 5, 0.0);
-        let many: Vec<Value> = (0..50).map(Value::Int).collect();
+        let many: Vec<Value<'static>> = (0..50).map(Value::Int).collect();
         let est = in_list(Some(&s), &many);
         assert!(est <= 1.0);
     }

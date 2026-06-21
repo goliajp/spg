@@ -32,7 +32,7 @@ impl Engine {
     fn materialise_table_ref(
         &self,
         tref: &TableRef,
-    ) -> Result<(Vec<Row>, Vec<ColumnSchema>), EngineError> {
+    ) -> Result<(Vec<Row<'static>>, Vec<ColumnSchema>), EngineError> {
         if let Some(expr) = tref.unnest_expr.as_deref() {
             let empty_schema: Vec<ColumnSchema> = Vec::new();
             let ctx = EvalContext::new(&empty_schema, None);
@@ -46,7 +46,7 @@ impl Engine {
                             .into_iter()
                             .map(|item| {
                                 Row::new(alloc::vec![match item {
-                                    Some(s) => Value::Text(s),
+                                    Some(s) => Value::text(s),
                                     None => Value::Null,
                                 }])
                             })
@@ -96,7 +96,7 @@ impl Engine {
                 .ok_or_else(|| StorageError::TableNotFound {
                     name: tref.name.clone(),
                 })?;
-        let mut rows: Vec<Row> = table.rows().iter().cloned().collect();
+        let mut rows: Vec<Row<'static>> = table.rows().iter().cloned().collect();
         // v7.35.1 (mailrs prod #6 follow-up) — same fix as the
         // filtered variant: append every cold-tier row (one pass over
         // a unique BTree picks each row exactly once) so non-indexed
@@ -119,7 +119,7 @@ impl Engine {
         &self,
         tref: &TableRef,
         preds: &[&Expr],
-    ) -> Result<(Vec<Row>, Vec<ColumnSchema>), EngineError> {
+    ) -> Result<(Vec<Row<'static>>, Vec<ColumnSchema>), EngineError> {
         if preds.is_empty()
             || tref.unnest_expr.is_some()
             || tref.lateral_subquery.is_some()
@@ -175,8 +175,8 @@ impl Engine {
             }
         }
         let ctx = EvalContext::new(&cols, Some(alias));
-        let mut out: Vec<Row> = Vec::new();
-        let push_if = |row: &Row, out: &mut Vec<Row>| -> Result<(), EngineError> {
+        let mut out: Vec<Row<'static>> = Vec::new();
+        let push_if = |row: &Row<'static>, out: &mut Vec<Row<'static>>| -> Result<(), EngineError> {
             for p in preds {
                 let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
                 if !matches!(v, Value::Bool(true)) {
@@ -220,7 +220,7 @@ impl Engine {
     /// a separate visited-set. Returns an empty Vec when the table
     /// has no PK-backed BTree (pre-PK tables / ad-hoc heaps stay
     /// hot-tier-only, so this is harmless on those shapes).
-    pub(crate) fn iter_cold_rows_of_table(&self, table: &Table) -> Vec<Row> {
+    pub(crate) fn iter_cold_rows_of_table(&self, table: &Table) -> Vec<Row<'static>> {
         let schema = table.schema();
         // PK column position(s) — single-column PK only for now;
         // composite PKs would require composite-key resolution
@@ -367,7 +367,7 @@ impl Engine {
             }
         }
         let ctx = EvalContext::new(cols, Some(alias));
-        let keep = |row: &Row| -> Result<bool, EngineError> {
+        let keep = |row: &Row<'static>| -> Result<bool, EngineError> {
             for (i, p) in preds.iter().enumerate() {
                 // The pred that seeded the index seek is already proven
                 // true for every row in the seeded set; skip the

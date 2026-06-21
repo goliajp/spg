@@ -95,7 +95,7 @@ pub struct EvalContext<'a> {
     /// expression tree. Empty for simple queries; populated by the
     /// prepared-statement Execute path with Bind values converted
     /// to `Value`. Index N (1-based per PG) hits `params[N-1]`.
-    pub params: &'a [Value],
+    pub params: &'a [Value<'static>],
     /// v7.12.1 — session text-search config (from `SET
     /// default_text_search_config = '<name>'`). Resolved when the
     /// engine builds an `EvalContext` and consumed by the FTS
@@ -153,7 +153,7 @@ impl<'a> EvalContext<'a> {
     /// resolution. The slice must outlive the context; callers
     /// construct it from the prepared statement's Bind values.
     #[must_use]
-    pub const fn with_params(mut self, params: &'a [Value]) -> Self {
+    pub const fn with_params(mut self, params: &'a [Value<'static>]) -> Self {
         self.params = params;
         self
     }
@@ -206,7 +206,7 @@ impl core::fmt::Display for EvalError {
     }
 }
 
-pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+pub fn eval_expr(expr: &Expr, row: &Row<'static>, ctx: &EvalContext<'_>) -> Result<Value<'static>, EvalError> {
     match expr {
         Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
             detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
@@ -309,14 +309,14 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                                     Value::BigInt(x) => x,
                                     _ => 0,
                                 };
-                                return Ok(Value::Text(text_prefix_chars(t, n)));
+                                return Ok(Value::text(text_prefix_chars(t, n)));
                             }
                         }
                         _ => {}
                     }
                 }
             }
-            let evaluated: Result<Vec<Value>, _> =
+            let evaluated: Result<Vec<Value<'static>>, _> =
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
             apply_function(name, &evaluated?, ctx)
         }
@@ -424,7 +424,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         // TextArray. Non-TEXT non-integer elements (Bool, Float)
         // stringify into TextArray as the safe default.
         Expr::Array(items) => {
-            let mut materialised: Vec<Value> = Vec::with_capacity(items.len());
+            let mut materialised: Vec<Value<'static>> = Vec::with_capacity(items.len());
             for elem in items {
                 materialised.push(eval_expr(elem, row, ctx)?);
             }
@@ -445,7 +445,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                     .into_iter()
                     .map(|v| match v {
                         Value::Null => None,
-                        Value::Text(s) | Value::Json(s) => Some(s),
+                        Value::Text(s) | Value::Json(s) => Some(s.into_owned()),
                         other => Some(value_to_text_for_array(&other)),
                     })
                     .collect();
@@ -502,7 +502,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let pos = (i - 1) as usize;
             match target_v {
                 Value::TextArray(items) => match items.get(pos) {
-                    Some(Some(s)) => Ok(Value::Text(s.clone())),
+                    Some(Some(s)) => Ok(Value::text(s.clone())),
                     Some(None) | None => Ok(Value::Null),
                 },
                 Value::IntArray(items) => match items.get(pos) {
@@ -538,7 +538,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 return Ok(Value::Null);
             }
             let elems: Vec<Option<Value>> = match arr {
-                Value::TextArray(items) => items.into_iter().map(|o| o.map(Value::Text)).collect(),
+                Value::TextArray(items) => items.into_iter().map(|o| o.map(Value::text)).collect(),
                 Value::IntArray(items) => items.into_iter().map(|o| o.map(Value::Int)).collect(),
                 Value::BigIntArray(items) => {
                     items.into_iter().map(|o| o.map(Value::BigInt)).collect()
@@ -642,7 +642,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
 /// `format_numeric` / `format_date` etc.
 fn value_to_text_for_array(v: &Value) -> String {
     match v {
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::SmallInt(n) => n.to_string(),
@@ -717,7 +717,7 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 }
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
-fn fn_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
+fn fn_string_to_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let [text_arg, delim_arg] = args else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("string_to_array expects 2 arguments, got {}", args.len()),
@@ -739,9 +739,9 @@ fn fn_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
     let parts: Vec<Option<String>> = match delim_arg {
         // NULL delimiter → one element per character.
         Value::Null => text.chars().map(|c| Some(c.to_string())).collect(),
-        Value::Text(d) if d.is_empty() => alloc::vec![Some(text.clone())],
+        Value::Text(d) if d.is_empty() => alloc::vec![Some(text.to_string())],
         Value::Text(d) => text
-            .split(d.as_str())
+            .split(d.as_ref())
             .map(|p| Some(p.to_string()))
             .collect(),
         other => {
@@ -759,7 +759,7 @@ fn fn_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
 /// v6.4.3 — `error_on_null(v)`. Returns `v` unchanged if non-NULL;
 /// errors otherwise. Convenience to assert NOT NULL inside an
 /// expression without wrapping it in COALESCE + raise hacks.
-fn error_on_null(args: &[Value]) -> Result<Value, EvalError> {
+fn error_on_null(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!("error_on_null() takes 1 arg, got {}", args.len()),
@@ -777,7 +777,7 @@ fn error_on_null(args: &[Value]) -> Result<Value, EvalError> {
 /// propagates as None (caller short-circuits to Value::Null).
 fn text_arg(v: &Value) -> Result<Option<String>, EvalError> {
     match v {
-        Value::Text(s) => Ok(Some(s.clone())),
+        Value::Text(s) => Ok(Some(s.to_string())),
         Value::Null => Ok(None),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
@@ -862,7 +862,7 @@ const fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
-pub(crate) fn literal_to_value(l: &Literal) -> Value {
+pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
     match l {
         Literal::Integer(n) => {
             if let Ok(small) = i32::try_from(*n) {
@@ -872,8 +872,8 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value {
             }
         }
         Literal::Float(x) => Value::Float(*x),
-        Literal::String(s) => Value::Text(s.clone()),
-        Literal::Vector(v) => Value::Vector(v.clone()),
+        Literal::String(s) => Value::text(s.clone()),
+        Literal::Vector(v) => Value::vector(v.clone()),
         Literal::TextArray(items) => Value::TextArray(items.clone()),
         Literal::IntArray(items) => Value::IntArray(items.clone()),
         Literal::BigIntArray(items) => Value::BigIntArray(items.clone()),
@@ -926,9 +926,9 @@ mod tests {
             Value::BigInt(100),
             Value::Float(3.0),
             Value::Float(2.5),
-            Value::Text(String::new()),
-            Value::Text("a".into()),
-            Value::Text("b".into()),
+            Value::text(String::new()),
+            Value::text("a"),
+            Value::text("b"),
             Value::Date(10),
             Value::Timestamp(1000),
             Value::Numeric {
@@ -1016,12 +1016,12 @@ mod tests {
     #[test]
     fn column_lookup_unqualified() {
         let cs = vec![col("a", DataType::Int), col("b", DataType::Text)];
-        let r = Row::new(vec![Value::Int(7), Value::Text("hi".into())]);
+        let r = Row::new(vec![Value::Int(7), Value::text("hi")]);
         let c = ctx(&cs, None);
         assert_eq!(eval_expr(&col_ref("a"), &r, &c).unwrap(), Value::Int(7));
         assert_eq!(
             eval_expr(&col_ref("b"), &r, &c).unwrap(),
-            Value::Text("hi".into())
+            Value::text("hi")
         );
     }
 

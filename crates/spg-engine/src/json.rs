@@ -123,9 +123,9 @@ fn write_json(v: &JsonValue, out: &mut String) {
 /// elements are walked left-to-right; each element is either an
 /// object key or (when it parses as a non-negative integer) an
 /// array index. Missing or non-existent steps return `Value::Null`.
-pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalError> {
+pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static>, EvalError> {
     let src = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -137,7 +137,7 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalE
         }
     };
     let path_text = match rhs {
-        Value::Text(s) | Value::Json(s) => s.as_str(),
+        Value::Text(s) | Value::Json(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -184,9 +184,9 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalE
         return Ok(Value::Null);
     }
     if as_text {
-        Ok(Value::Text(cur.as_text()))
+        Ok(Value::text(cur.as_text()))
     } else {
-        Ok(Value::Json(cur.to_json_text()))
+        Ok(Value::json(cur.to_json_text()))
     }
 }
 
@@ -204,9 +204,9 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalE
 ///   - Scalar string: true iff the scalar equals `key`.
 ///   - Other scalars / null: false.
 /// NULL on either side → NULL (SQL 3VL).
-pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -218,7 +218,7 @@ pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
         }
     };
     let key = match rhs {
-        Value::Text(s) => s.as_str(),
+        Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -252,7 +252,7 @@ fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
     match v {
         Value::Null => Ok(None),
         Value::TextArray(items) => Ok(Some(items.iter().filter_map(|x| x.clone()).collect())),
-        Value::Text(s) => Ok(Some(alloc::vec![s.clone()])),
+        Value::Text(s) => Ok(Some(alloc::vec![s.to_string()])),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
                 "JSON ?|/?&: right side must be TEXT[] or TEXT, got {:?}",
@@ -264,9 +264,9 @@ fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
 
 /// v7.37.6-A — PG `jsonb ?| text[]`. Returns BOOL: true iff any one
 /// of the listed keys exists at the top level.
-pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -288,9 +288,9 @@ pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
 
 /// v7.37.6-A — PG `jsonb ?& text[]`. Returns BOOL: true iff every
 /// one of the listed keys exists at the top level.
-pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -310,9 +310,9 @@ pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
     Ok(Value::Bool(keys.iter().all(|k| node_has_key(&doc, k))))
 }
 
-pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -324,7 +324,7 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
         }
     };
     let rhs_text = match rhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -424,9 +424,9 @@ fn parse_text_array(s: &str) -> Result<Vec<String>, EvalError> {
 /// containing JSON. `rhs` is either a TEXT key (object access) or
 /// an INT index (array access). `as_text=true` for `->>` (returns
 /// `Value::Text`); `false` for `->` (returns `Value::Json`).
-pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalError> {
+pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static>, EvalError> {
     let src = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -478,9 +478,9 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalEr
         None | Some(JsonValue::Null) => Ok(Value::Null),
         Some(v) => {
             if as_text {
-                Ok(Value::Text(v.as_text()))
+                Ok(Value::text(v.as_text()))
             } else {
-                Ok(Value::Json(v.to_json_text()))
+                Ok(Value::json(v.to_json_text()))
             }
         }
     }
@@ -907,7 +907,7 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
 /// v7.17.0 Phase 3.9 — `jsonb_path_query(doc, path)` — returns the
 /// matched JSON values as a TextArray (each element is the JSON
 /// encoding of one match).
-pub fn path_query(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+pub fn path_query(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
     let (src, path_text) = match (doc, path) {
         (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
         (Value::Json(s) | Value::Text(s), Value::Text(p) | Value::Json(p)) => (s, p),
@@ -931,12 +931,12 @@ pub fn path_query(doc: &Value, path: &Value) -> Result<Value, EvalError> {
 
 /// v7.17.0 Phase 3.9 — `jsonb_path_query_first(doc, path)` returns
 /// the first matched JSON value as a Json, or NULL on no match.
-pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
     let q = path_query(doc, path)?;
     match q {
         Value::TextArray(items) => {
             if let Some(Some(first)) = items.into_iter().next() {
-                Ok(Value::Json(first))
+                Ok(Value::json(first))
             } else {
                 Ok(Value::Null)
             }
@@ -947,7 +947,7 @@ pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value, EvalError> {
 
 /// v7.17.0 Phase 3.9 — `jsonb_path_query_array(doc, path)` returns
 /// the matched values wrapped as a single JSON array.
-pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
     let q = path_query(doc, path)?;
     match q {
         Value::TextArray(items) => {
@@ -961,7 +961,7 @@ pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value, EvalError> {
                 first = false;
             }
             buf.push(']');
-            Ok(Value::Json(buf))
+            Ok(Value::json(buf))
         }
         other => Ok(other),
     }
@@ -1006,7 +1006,7 @@ fn encode_value_into(v: &Value, out: &mut String) {
             // Render the exact decimal text — same shape display uses.
             out.push_str(&render_numeric(*scaled, *scale));
         }
-        Value::Text(s) => write_json(&JsonValue::String(s.clone()), out),
+        Value::Text(s) => write_json(&JsonValue::String(s.to_string()), out),
         Value::Json(s) => {
             // Pass through verbatim; re-parsing would re-format and
             // drift `1.0` → `1` etc. PG's to_json on a json input is
@@ -1081,7 +1081,7 @@ fn render_numeric(scaled: i128, scale: u8) -> String {
 /// `json_build_object(k, v, k, v, …)` — variadic, even-length.
 /// NULL key → error (PG: "argument cannot be null"). Values encoded
 /// via `value_to_json_text`. Returns Value::Json.
-pub fn build_object(args: &[Value]) -> Result<Value, EvalError> {
+pub fn build_object(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if !args.len().is_multiple_of(2) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
@@ -1103,7 +1103,7 @@ pub fn build_object(args: &[Value]) -> Result<Value, EvalError> {
                     detail: "json_build_object() key cannot be NULL".into(),
                 });
             }
-            Value::Text(s) | Value::Json(s) => s.clone(),
+            Value::Text(s) | Value::Json(s) => s.to_string(),
             other => format_value_as_text(other),
         };
         write_json(&JsonValue::String(key), &mut out);
@@ -1111,12 +1111,12 @@ pub fn build_object(args: &[Value]) -> Result<Value, EvalError> {
         encode_value_into(&pair[1], &mut out);
     }
     out.push('}');
-    Ok(Value::Json(out))
+    Ok(Value::json(out))
 }
 
 /// `json_build_array(...)` — variadic; empty → "[]". Each arg
 /// encoded via `value_to_json_text`.
-pub fn build_array(args: &[Value]) -> Result<Value, EvalError> {
+pub fn build_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let mut out = String::from("[");
     for (i, v) in args.iter().enumerate() {
         if i > 0 {
@@ -1125,7 +1125,7 @@ pub fn build_array(args: &[Value]) -> Result<Value, EvalError> {
         encode_value_into(v, &mut out);
     }
     out.push(']');
-    Ok(Value::Json(out))
+    Ok(Value::json(out))
 }
 
 fn format_value_as_text(v: &Value) -> String {
@@ -1147,7 +1147,7 @@ fn format_value_as_text(v: &Value) -> String {
 ///   * Path step on array: integer index, negative counts from end.
 ///     Out-of-range with create_missing → append; without → no-op.
 ///   * Type mismatch (e.g. step on a scalar) → no-op (PG semantics).
-pub fn set(args: &[Value]) -> Result<Value, EvalError> {
+pub fn set(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("jsonb_set() takes 3 or 4 args, got {}", args.len()),
@@ -1178,7 +1178,7 @@ pub fn set(args: &[Value]) -> Result<Value, EvalError> {
         detail: alloc::format!("jsonb_set(): invalid JSON new_value — {e}"),
     })?;
     set_at_path(&mut root, &path, new_val, create_missing);
-    Ok(Value::Json(root.to_json_text()))
+    Ok(Value::json(root.to_json_text()))
 }
 
 fn set_at_path(node: &mut JsonValue, path: &[String], new_val: JsonValue, create_missing: bool) {
@@ -1250,7 +1250,7 @@ fn resolve_array_index(step: &str, len: usize) -> Option<usize> {
 ///     positive index → append; out-of-range negative → prepend.
 ///   * Object parent: key must NOT exist (PG raises). insert_after
 ///     has no effect for objects.
-pub fn insert(args: &[Value]) -> Result<Value, EvalError> {
+pub fn insert(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("jsonb_insert() takes 3 or 4 args, got {}", args.len()),
@@ -1286,7 +1286,7 @@ pub fn insert(args: &[Value]) -> Result<Value, EvalError> {
         detail: alloc::format!("jsonb_insert(): invalid JSON new_value — {e}"),
     })?;
     insert_at_path(&mut root, &path, new_val, insert_after)?;
-    Ok(Value::Json(root.to_json_text()))
+    Ok(Value::json(root.to_json_text()))
 }
 
 fn insert_at_path(
@@ -1365,7 +1365,7 @@ fn insert_at_path(
 
 fn json_text_arg<'a>(v: &'a Value, fname: &str, role: &str) -> Result<&'a str, EvalError> {
     match v {
-        Value::Json(s) | Value::Text(s) => Ok(s.as_str()),
+        Value::Json(s) | Value::Text(s) => Ok(s.as_ref()),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
                 "{fname}() {role} must be JSON or TEXT, got {:?}",
@@ -1377,7 +1377,7 @@ fn json_text_arg<'a>(v: &'a Value, fname: &str, role: &str) -> Result<&'a str, E
 
 fn path_text_arg(v: &Value, fname: &str) -> Result<Vec<String>, EvalError> {
     match v {
-        Value::Text(s) | Value::Json(s) => parse_text_array(s.as_str()),
+        Value::Text(s) | Value::Json(s) => parse_text_array(s.as_ref()),
         Value::TextArray(items) => Ok(items
             .iter()
             .map(|o| o.clone().unwrap_or_default())
@@ -1434,34 +1434,34 @@ mod tests {
 
     #[test]
     fn path_object_key_returns_value() {
-        let doc = Value::Json(r#"{"name":"alice","age":30}"#.into());
-        let key = Value::Text("name".into());
+        let doc = Value::json::<String>(r#"{"name":"alice","age":30}"#.into());
+        let key = Value::text("name");
         let v = path_get(&doc, &key, true).unwrap();
-        assert_eq!(v, Value::Text("alice".into()));
+        assert_eq!(v, Value::text("alice"));
         let v = path_get(&doc, &key, false).unwrap();
-        assert_eq!(v, Value::Json("\"alice\"".into()));
+        assert_eq!(v, Value::json("\"alice\""));
     }
 
     #[test]
     fn path_array_index_supports_negative() {
-        let doc = Value::Json("[10,20,30]".into());
+        let doc = Value::json("[10,20,30]");
         let v = path_get(&doc, &Value::Int(1), true).unwrap();
-        assert_eq!(v, Value::Text("20".into()));
+        assert_eq!(v, Value::text("20"));
         let v = path_get(&doc, &Value::Int(-1), true).unwrap();
-        assert_eq!(v, Value::Text("30".into()));
+        assert_eq!(v, Value::text("30"));
     }
 
     #[test]
     fn path_missing_key_returns_null() {
-        let doc = Value::Json(r#"{"a":1}"#.into());
-        let v = path_get(&doc, &Value::Text("missing".into()), true).unwrap();
+        let doc = Value::json::<String>(r#"{"a":1}"#.into());
+        let v = path_get(&doc, &Value::text("missing"), true).unwrap();
         assert_eq!(v, Value::Null);
     }
 
     #[test]
     fn path_get_nested_subtree_renders_back() {
-        let doc = Value::Json(r#"{"k":{"x":[1,2]}}"#.into());
-        let v = path_get(&doc, &Value::Text("k".into()), false).unwrap();
-        assert_eq!(v, Value::Json("{\"x\":[1,2]}".into()));
+        let doc = Value::json::<String>(r#"{"k":{"x":[1,2]}}"#.into());
+        let v = path_get(&doc, &Value::text("k"), false).unwrap();
+        assert_eq!(v, Value::json::<String>("{\"x\":[1,2]}".into()));
     }
 }

@@ -33,7 +33,7 @@ pub(crate) fn approx_value_bytes(v: &Value) -> usize {
 
 /// Approximate heap bytes held by one materialised `Row`: per-cell
 /// enum slots plus fat payloads.
-pub(crate) fn approx_row_bytes(row: &Row) -> usize {
+pub(crate) fn approx_row_bytes(row: &Row<'static>) -> usize {
     row.values.len() * core::mem::size_of::<Value>()
         + row.values.iter().map(approx_value_bytes).sum::<usize>()
 }
@@ -74,6 +74,6 @@ impl ByteBudget {
 }
 
 /// Sum `approx_row_bytes` over a freshly materialised row set.
-pub(crate) fn approx_rows_bytes(rows: &[Row]) -> usize {
+pub(crate) fn approx_rows_bytes(rows: &[Row<'static>]) -> usize {
     rows.iter().map(approx_row_bytes).sum()
 }

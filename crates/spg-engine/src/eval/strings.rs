@@ -27,10 +27,10 @@ pub(super) enum TrimSide {
 /// support negative n which means "all but |n| chars from the
 /// opposite side". n=0 → ''. Codepoint-counted. NULL → NULL.
 pub(super) fn string_left_right(
-    args: &[Value],
+    args: &[Value<'static>],
     is_left: bool,
     fn_name: &str,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("{fn_name}() takes 2 args, got {}", args.len()),
@@ -56,7 +56,7 @@ pub(super) fn string_left_right(
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
     if n == 0 {
-        return Ok(Value::Text(String::new()));
+        return Ok(Value::text(String::new()));
     }
     let (start, end) = if is_left {
         if n > 0 {
@@ -76,9 +76,9 @@ pub(super) fn string_left_right(
         (drop as usize, len as usize)
     };
     if start >= end {
-        return Ok(Value::Text(String::new()));
+        return Ok(Value::text(String::new()));
     }
-    Ok(Value::Text(chars[start..end].iter().collect()))
+    Ok(Value::text(chars[start..end].iter().collect::<String>()))
 }
 
 /// PG `lpad` / `rpad` shared implementation. Length is the
@@ -88,7 +88,7 @@ pub(super) fn string_left_right(
 /// for multi-char fills, on the appropriate side. Empty fill +
 /// needs padding → returns input verbatim (potentially
 /// truncated). NULL on any arg → NULL.
-pub(super) fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
+pub(super) fn string_pad(args: &[Value<'static>], is_left: bool, fn_name: &str) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 && args.len() != 3 {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("{fn_name}() takes 2 or 3 args, got {}", args.len()),
@@ -117,17 +117,17 @@ pub(super) fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result
         String::from(" ")
     };
     if target <= 0 {
-        return Ok(Value::Text(String::new()));
+        return Ok(Value::text(String::new()));
     }
     let target = target as usize;
     let s_chars: Vec<char> = s.chars().collect();
     if s_chars.len() >= target {
         // Truncate from the right (PG keeps LEFT side for both
         // lpad and rpad).
-        return Ok(Value::Text(s_chars[..target].iter().collect()));
+        return Ok(Value::text(s_chars[..target].iter().collect::<String>()));
     }
     if fill.is_empty() {
-        return Ok(Value::Text(s));
+        return Ok(Value::text(s));
     }
     let pad_needed = target - s_chars.len();
     let fill_chars: Vec<char> = fill.chars().collect();
@@ -136,9 +136,9 @@ pub(super) fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result
         padding.push(fill_chars[i % fill_chars.len()]);
     }
     if is_left {
-        Ok(Value::Text(padding + &s))
+        Ok(Value::text(padding + &s))
     } else {
-        Ok(Value::Text(s + &padding))
+        Ok(Value::text(s + &padding))
     }
 }
 
@@ -148,10 +148,10 @@ pub(super) fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result
 /// of UTF-8 codepoints (not a substring). NULL on either arg
 /// poisons the result.
 pub(super) fn string_trim(
-    args: &[Value],
+    args: &[Value<'static>],
     side: TrimSide,
     fn_name: &str,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     let (input, chars_str) = match args {
         [v] => (v.clone(), String::from(" ")),
         [v, c] => (v.clone(), {
@@ -185,7 +185,7 @@ pub(super) fn string_trim(
             end -= 1;
         }
     }
-    Ok(Value::Text(chars[start..end].iter().collect()))
+    Ok(Value::text(chars[start..end].iter().collect::<String>()))
 }
 
 /// v7.17.0 Phase 3.8 — PG `format(fmtstr, args…)` with
@@ -198,7 +198,7 @@ pub(super) fn string_trim(
 ///   * `%%` — literal `%`
 ///   * `%n$X` — argument position (1-based) before the specifier
 ///     character (e.g. `%2$s` picks the 2nd arg)
-pub(super) fn format_string(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn format_string(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() {
         return Err(EvalError::TypeMismatch {
             detail: "format() takes at least 1 arg (format string)".into(),
@@ -332,7 +332,7 @@ pub(super) fn format_string(args: &[Value]) -> Result<Value, EvalError> {
             }
         }
     }
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }
 
 /// Helper: render a Value as text for format()'s %s / %I / %L
@@ -382,7 +382,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
 
 pub(super) fn value_to_format_text(v: &Value) -> String {
     match v {
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
@@ -399,7 +399,7 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
     }
 }
 
-pub(super) fn to_char(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn to_char(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -506,5 +506,5 @@ pub(super) fn to_char(args: &[Value]) -> Result<Value, EvalError> {
             i += 1;
         }
     }
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }

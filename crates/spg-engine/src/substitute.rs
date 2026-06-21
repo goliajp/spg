@@ -30,7 +30,7 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         Value::Int(n) => Literal::Integer(i64::from(n)),
         Value::BigInt(n) => Literal::Integer(n),
         Value::Float(x) => Literal::Float(x),
-        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
@@ -54,9 +54,9 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         Value::Int(n) => Literal::Integer(i64::from(n)),
         Value::BigInt(n) => Literal::Integer(n),
         Value::Float(x) => Literal::Float(x),
-        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
-        Value::Vector(xs) => Literal::Vector(xs),
+        Value::Vector(xs) => Literal::Vector(xs.into_owned()),
         // Date / Timestamp / Timestamptz / Numeric round-trip
         // through a TEXT literal that `coerce_value` re-parses
         // against the target column type.
@@ -272,7 +272,7 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
 /// WAL path (which needs the bind-final AST so replay sees a
 /// simple-query-shaped statement, not a `$1`-shaped one). Errors
 /// when a placeholder references an index past the params slice.
-pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(), EngineError> {
+pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value<'static>]) -> Result<(), EngineError> {
     match stmt {
         Statement::Select(s) => substitute_select(s, params)?,
         Statement::Insert(ins) => {
@@ -383,7 +383,7 @@ pub(crate) fn walk_select_exprs_mut(
 
 pub(crate) fn substitute_select(
     s: &mut SelectStatement,
-    params: &[Value],
+    params: &[Value<'static>],
 ) -> Result<(), EngineError> {
     walk_select_exprs_mut(s, &mut |e| substitute_expr(e, params))?;
     // v7.25.1 — LIMIT/OFFSET placeholders inside CTE bodies and
@@ -413,7 +413,7 @@ pub(crate) fn substitute_select(
 /// nested statements (CTE bodies / UNION peers).
 fn resolve_limit_offset_placeholders(
     s: &mut SelectStatement,
-    params: &[Value],
+    params: &[Value<'static>],
 ) -> Result<(), EngineError> {
     if let Some(le) = s.limit {
         s.limit = Some(resolve_limit_placeholder(le, params)?);
@@ -432,7 +432,7 @@ fn resolve_limit_offset_placeholders(
 
 fn resolve_limit_placeholder(
     le: spg_sql::ast::LimitExpr,
-    params: &[Value],
+    params: &[Value<'static>],
 ) -> Result<spg_sql::ast::LimitExpr, EngineError> {
     use spg_sql::ast::LimitExpr;
     match le {
@@ -471,7 +471,7 @@ fn resolve_limit_placeholder(
     }
 }
 
-fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
+fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), EngineError> {
     if let Expr::Placeholder(n) = e {
         let idx = usize::from(*n).saturating_sub(1);
         let v = params.get(idx).ok_or_else(|| {

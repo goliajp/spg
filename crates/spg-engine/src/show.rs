@@ -17,11 +17,11 @@ impl Engine {
     /// `SELECT name FROM ...` style logic if needed.
     pub(crate) fn exec_show_tables(&self) -> QueryResult {
         let columns = alloc::vec![ColumnSchema::new("name", DataType::Text, false)];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .active_catalog()
             .table_names()
             .into_iter()
-            .map(|n| Row::new(alloc::vec![Value::Text(n)]))
+            .map(|n| Row::new(alloc::vec![Value::text(n)]))
             .collect();
         QueryResult::Rows { columns, rows }
     }
@@ -112,8 +112,8 @@ impl Engine {
             ColumnSchema::new("Create Table", DataType::Text, false),
         ];
         let rows = alloc::vec![Row::new(alloc::vec![
-            Value::Text(name.into()),
-            Value::Text(ddl),
+            Value::text::<String>(name.into()),
+            Value::text(ddl),
         ])];
         Ok(QueryResult::Rows { columns, rows })
     }
@@ -136,7 +136,7 @@ impl Engine {
             ColumnSchema::new("Null", DataType::Text, false),
             ColumnSchema::new("Index_type", DataType::Text, false),
         ];
-        let mut rows: Vec<Row> = Vec::new();
+        let mut rows: Vec<Row<'static>> = Vec::new();
         for idx in t.indices() {
             let col = t
                 .schema()
@@ -149,17 +149,17 @@ impl Engine {
                 .get(idx.column_position)
                 .map_or(true, |c| c.nullable);
             rows.push(Row::new(alloc::vec![
-                Value::Text(name.into()),
+                Value::text::<String>(name.into()),
                 Value::Int(i32::from(!idx.is_unique)),
-                Value::Text(idx.name.clone()),
+                Value::text(idx.name.clone()),
                 Value::Int(1),
-                Value::Text(col),
-                Value::Text(if nullable {
+                Value::text(col),
+                Value::text(if nullable {
                     "YES".into()
                 } else {
                     String::new()
                 }),
-                Value::Text("BTREE".into()),
+                Value::text("BTREE"),
             ]));
         }
         Ok(QueryResult::Rows { columns, rows })
@@ -182,12 +182,12 @@ impl Engine {
             ("Opened_tables", "0"),
             ("Innodb_buffer_pool_pages_total", "0"),
         ];
-        let rows: Vec<Row> = pairs
+        let rows: Vec<Row<'static>> = pairs
             .iter()
             .map(|(k, v)| {
                 Row::new(alloc::vec![
-                    Value::Text((*k).into()),
-                    Value::Text((*v).into())
+                    Value::text::<String>((*k).into()),
+                    Value::text::<String>((*v).into())
                 ])
             })
             .collect();
@@ -201,7 +201,7 @@ impl Engine {
             ColumnSchema::new("Variable_name", DataType::Text, false),
             ColumnSchema::new("Value", DataType::Text, false),
         ];
-        let mut rows: Vec<Row> = Vec::new();
+        let mut rows: Vec<Row<'static>> = Vec::new();
         let canonical: &[(&str, &str)] = &[
             ("version", "8.0.35-spg"),
             ("version_comment", "SPG dual-stack engine"),
@@ -215,16 +215,16 @@ impl Engine {
         ];
         for &(k, v) in canonical {
             rows.push(Row::new(alloc::vec![
-                Value::Text(k.into()),
-                Value::Text(v.into()),
+                Value::text::<String>(k.into()),
+                Value::text::<String>(v.into()),
             ]));
         }
         // Session-set parameters surface here too.
         for (k, v) in &self.session_params {
             if !canonical.iter().any(|(n, _)| (*n).eq_ignore_ascii_case(k)) {
                 rows.push(Row::new(alloc::vec![
-                    Value::Text(k.clone()),
-                    Value::Text(v.clone()),
+                    Value::text(k.clone()),
+                    Value::text(v.clone()),
                 ]));
             }
         }
@@ -248,13 +248,13 @@ impl Engine {
         ];
         let rows = alloc::vec![Row::new(alloc::vec![
             Value::Int(1),
-            Value::Text("postgres".into()),
-            Value::Text("localhost".into()),
-            Value::Text("postgres".into()),
-            Value::Text("Query".into()),
+            Value::text("postgres"),
+            Value::text("localhost"),
+            Value::text("postgres"),
+            Value::text::<String>("Query".into()),
             Value::Int(0),
-            Value::Text("executing".into()),
-            Value::Text("SHOW PROCESSLIST".into()),
+            Value::text::<String>("executing".into()),
+            Value::text::<String>("SHOW PROCESSLIST".into()),
         ])];
         QueryResult::Rows { columns, rows }
     }
@@ -274,9 +274,9 @@ impl Engine {
             "sys",
             "postgres",
         ];
-        let rows: Vec<Row> = names
+        let rows: Vec<Row<'static>> = names
             .iter()
-            .map(|n| Row::new(alloc::vec![Value::Text((*n).into())]))
+            .map(|n| Row::new(alloc::vec![Value::text::<String>((*n).into())]))
             .collect();
         QueryResult::Rows { columns, rows }
     }
@@ -295,14 +295,14 @@ impl Engine {
             ColumnSchema::new("type", DataType::Text, false),
             ColumnSchema::new("nullable", DataType::Bool, false),
         ];
-        let rows: Vec<Row> = table
+        let rows: Vec<Row<'static>> = table
             .schema()
             .columns
             .iter()
             .map(|c| {
                 Row::new(alloc::vec![
-                    Value::Text(c.name.clone()),
-                    Value::Text(alloc::format!("{}", c.ty)),
+                    Value::text(c.name.clone()),
+                    Value::text(alloc::format!("{}", c.ty)),
                     Value::Bool(c.nullable),
                 ])
             })

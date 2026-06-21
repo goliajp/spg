@@ -222,7 +222,7 @@ impl Engine {
     pub fn execute_prepared(
         &mut self,
         stmt: Statement,
-        params: &[Value],
+        params: &[Value<'static>],
     ) -> Result<QueryResult, EngineError> {
         self.execute_prepared_with_cancel(stmt, params, CancelToken::none())
     }
@@ -253,10 +253,10 @@ impl Engine {
     ///
     /// For shapes where the engine can stream directly (non-aggregate
     /// join projection of bound columns, no ORDER BY / DISTINCT / etc.)
-    /// no `Vec<Row>` is materialised — cell references come straight
+    /// no `Vec<Row<'static>>` is materialised — cell references come straight
     /// out of the source tables. For non-streamable shapes the engine
     /// runs the full `exec_select_cancel`, then walks the materialised
-    /// `Vec<Row>` driving the same emit callback (no engine-side win,
+    /// `Vec<Row<'static>>` driving the same emit callback (no engine-side win,
     /// but pgwire dispatches every Execute through one path).
     pub fn execute_prepared_select_streaming<F>(
         &mut self,
@@ -276,7 +276,7 @@ impl Engine {
 
     /// v7.37 — internal streaming dispatcher. Phase 1: fall-back path
     /// only — runs the materialising `exec_select_cancel`, then drives
-    /// the emit callback from the resulting `Vec<Row>`. Phase 2 will
+    /// the emit callback from the resulting `Vec<Row<'static>>`. Phase 2 will
     /// add a true streaming path for the joined-projection shape.
     fn exec_select_streaming<F>(
         &mut self,
@@ -288,7 +288,7 @@ impl Engine {
         F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
     {
         // v7.37 — true-streaming fast path for joined-non-aggregate
-        // projection of bound columns. Skips `Vec<Row>` + per-cell
+        // projection of bound columns. Skips `Vec<Row<'static>>` + per-cell
         // `.cloned()` (about 4 ms saved on the 25 k-row PROJ shape).
         // Unresolved subqueries / pull-up shapes / non-streamable
         // structure (ORDER BY, DISTINCT, …) fall through to the
@@ -324,7 +324,7 @@ impl Engine {
 #[derive(Debug)]
 pub enum StreamItem<'a> {
     Header(&'a [ColumnSchema]),
-    Row(&'a [&'a Value]),
+    Row(&'a [&'a Value<'static>]),
 }
 
 impl Engine {
@@ -335,7 +335,7 @@ impl Engine {
     pub fn execute_prepared_with_cancel(
         &mut self,
         mut stmt: Statement,
-        params: &[Value],
+        params: &[Value<'static>],
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         substitute_placeholders(&mut stmt, params)?;

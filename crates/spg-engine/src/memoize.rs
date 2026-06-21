@@ -51,7 +51,7 @@ pub const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheKey {
     pub subquery_repr: String,
-    pub outer_values: Vec<Value>,
+    pub outer_values: Vec<Value<'static>>,
 }
 
 /// v7.29 - one batch-evaluated correlated subquery: the outer key
@@ -68,8 +68,8 @@ pub struct CacheKey {
 /// construction time, where the original inner is still in hand.
 pub type GroupMap = (
     spg_sql::ast::ColumnName,
-    alloc::collections::BTreeMap<String, Value>,
-    Value,
+    alloc::collections::BTreeMap<String, Value<'static>>,
+    Value<'static>,
 );
 
 /// v7.29 (3c) - per-expression resolution plan: for the i-th scalar
@@ -130,7 +130,7 @@ pub struct MemoizeCache {
     /// re-promoting a hit is `O(n)` worst-case but `O(1)`
     /// amortised for the common front-half-hit pattern of nested-
     /// loop correlated subqueries.
-    entries: VecDeque<(CacheKey, Value)>,
+    entries: VecDeque<(CacheKey, Value<'static>)>,
     /// v7.29 (round-22 phase 3) - batch-evaluated correlated scalar
     /// subqueries: subquery repr -> Some((outer column, key -> value
     /// map built in ONE pass)) or None when the shape can't batch
@@ -241,7 +241,7 @@ impl MemoizeCache {
     /// Insert a freshly-computed scalar value. Caller must have
     /// `get`-missed first (the cache doesn't dedupe inserts).
     /// Evicts LRU entries until both caps are satisfied.
-    pub fn insert(&mut self, key: CacheKey, value: Value) {
+    pub fn insert(&mut self, key: CacheKey, value: Value<'static>) {
         let entry_bytes = approx_bytes(&key) + approx_value_bytes(&value);
         while !self.entries.is_empty()
             && (self.entries.len() >= self.max_entries
@@ -290,7 +290,7 @@ fn approx_value_bytes(v: &Value) -> usize {
 mod tests {
     use super::*;
 
-    fn key(repr: &str, outer: &[Value]) -> CacheKey {
+    fn key(repr: &str, outer: &[Value<'static>]) -> CacheKey {
         CacheKey {
             subquery_repr: repr.into(),
             outer_values: outer.to_vec(),
@@ -353,7 +353,7 @@ mod tests {
         // Big strings exceed 128 bytes fast.
         for i in 0..10 {
             let big_str = alloc::string::String::from_iter(core::iter::repeat_n('x', 64));
-            c.insert(key("q", &[Value::Int(i)]), Value::Text(big_str));
+            c.insert(key("q", &[Value::Int(i)]), Value::text(big_str));
         }
         assert!(c.len() < 10, "len={}", c.len());
     }

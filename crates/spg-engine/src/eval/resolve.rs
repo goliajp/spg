@@ -71,10 +71,10 @@ pub(super) fn collation_fold_for_compare(
     op: BinOp,
     lhs: &Expr,
     rhs: &Expr,
-    l: Value,
-    r: Value,
+    l: Value<'static>,
+    r: Value<'static>,
     ctx: &EvalContext<'_>,
-) -> (Value, Value) {
+) -> (Value<'static>, Value<'static>) {
     if !matches!(
         op,
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
@@ -88,8 +88,8 @@ pub(super) fn collation_fold_for_compare(
     if !ci {
         return (l, r);
     }
-    let fold = |v: Value| match v {
-        Value::Text(s) => Value::Text(s.to_ascii_lowercase()),
+    let fold = |v: Value<'static>| match v {
+        Value::Text(s) => Value::text(s.to_ascii_lowercase()),
         other => other,
     };
     (fold(l), fold(r))
@@ -105,9 +105,9 @@ pub(super) fn collation_fold_for_compare(
 /// detailed not-found / unknown-qualifier errors.
 pub(super) fn eval_expr_cow<'r>(
     expr: &Expr,
-    row: &'r Row,
+    row: &'r Row<'static>,
     ctx: &EvalContext<'_>,
-) -> Result<Cow<'r, Value>, EvalError> {
+) -> Result<Cow<'r, Value<'static>>, EvalError> {
     match expr {
         Expr::Column(c) => match resolve_column_borrowed(c, row, ctx)? {
             Some(v) => Ok(Cow::Borrowed(v)),
@@ -175,11 +175,11 @@ pub(crate) fn find_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<u
     ctx.columns.iter().position(|s| s.name == c.name)
 }
 
-pub(super) fn resolve_column_borrowed<'r>(
+pub(super) fn resolve_column_borrowed<'r, 'a>(
     c: &ColumnName,
-    row: &'r Row,
+    row: &'r Row<'a>,
     ctx: &EvalContext<'_>,
-) -> Result<Option<&'r Value>, EvalError> {
+) -> Result<Option<&'r Value<'a>>, EvalError> {
     if let Some(q) = &c.qualifier {
         if let Some(pos) = ctx
             .columns
@@ -217,9 +217,9 @@ pub(super) fn text_prefix_chars(t: &str, n: i64) -> String {
 
 pub(super) fn resolve_column(
     c: &ColumnName,
-    row: &Row,
+    row: &Row<'_>,
     ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     if let Some(q) = &c.qualifier {
         // Multi-table evaluation (joins): the synthesised schema uses
         // composite column names "alias.column" so we look that up
@@ -232,7 +232,7 @@ pub(super) fn resolve_column(
             .iter()
             .position(|s| composite_eq(&s.name, q, &c.name))
         {
-            return Ok(row.values[pos].clone());
+            return Ok(row.values[pos].clone().into_owned());
         }
         // v7.26 (round-20 B) — when the qualifier IS a known table
         // alias in a joined schema (composite "alias.x" columns
@@ -256,7 +256,7 @@ pub(super) fn resolve_column(
         }
     }
     if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
-        return Ok(row.values[pos].clone());
+        return Ok(row.values[pos].clone().into_owned());
     }
     // Bare-name fallback for joined schemas: match any single composite
     // column ending in ".<name>"; ambiguity is an error.
@@ -269,7 +269,7 @@ pub(super) fn resolve_column(
     let first = matches.next();
     let extra = matches.next();
     match (first, extra) {
-        (Some((pos, _)), None) => Ok(row.values[pos].clone()),
+        (Some((pos, _)), None) => Ok(row.values[pos].clone().into_owned()),
         (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
             detail: alloc::format!("ambiguous column reference: {}", c.name),
         }),

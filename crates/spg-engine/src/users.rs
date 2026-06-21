@@ -657,13 +657,13 @@ impl Engine {
             ColumnSchema::new("name", DataType::Text, false),
             ColumnSchema::new("role", DataType::Text, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .users
             .iter()
             .map(|(name, rec)| {
                 Row::new(alloc::vec![
-                    Value::Text(name.to_string()),
-                    Value::Text(rec.role.as_str().to_string()),
+                    Value::text(name.to_string()),
+                    Value::text(rec.role.as_str().to_string()),
                 ])
             })
             .collect();
