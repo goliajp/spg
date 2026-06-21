@@ -130,27 +130,31 @@ fn update_to_invalid_label_skipped_for_phase14() {
     let _ = e.execute("UPDATE p SET m = 'angry' WHERE id = 1");
 }
 
-// v7.37.x (ζ-B Phase 1 composite accept) — `CREATE TYPE foo AS (a INT, b TEXT)`
-// is accepted and registered in the catalog. Phase 1 doesn't support USING
-// the composite as a column type yet; that's Phase 2.
+// v7.37.42-T2 ζ-B — `CREATE TYPE foo AS (a INT, b TEXT)` lands in
+// the dedicated composite_types registry (no longer synthesized
+// into enum_types). See e2e_composite_type.rs for the full surface;
+// this test just pins that the registry lookup works after
+// catalog round-trip.
 #[test]
 fn create_composite_type_accepts_and_registers() {
     let mut e = Engine::new();
     e.execute("CREATE TYPE addr AS (street TEXT, city TEXT, zip INT)")
         .unwrap();
-    // Round-trip via catalog serialise/deserialise: the synthetic
-    // enum-shaped record carries the field names as labels (Phase 1
-    // stops short of Value::Composite).
     let snapshot = e.catalog().serialize();
     let restored = spg_storage::Catalog::deserialize(&snapshot).expect("round-trip");
-    let def = restored
-        .enum_types()
+    let comp = restored
+        .composite_types()
         .get("addr")
         .expect("composite persisted");
     assert_eq!(
-        def.labels,
+        comp.fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>(),
         vec!["street".to_string(), "city".to_string(), "zip".to_string()]
     );
+    // No longer overloaded onto enum_types.
+    assert!(restored.enum_types().get("addr").is_none());
 }
 
 #[test]

@@ -1572,8 +1572,19 @@ impl Engine {
                 }
                 continue;
             }
+            // v7.37.42-T2 ζ-B — composite type bound to a column.
+            // Stored as JSONB at the storage tier (positional + named
+            // field access via JSONB path operators is the canonical
+            // PG-compatible surface until Value::Composite lands).
+            // The composite identity stays in `catalog.composite_types`
+            // for introspection / DROP TYPE / column-type-DDL
+            // round-trip.
+            if cat.composite_types().contains_key(&name) {
+                col.ty = spg_storage::DataType::Jsonb;
+                continue;
+            }
             return Err(EngineError::Unsupported(alloc::format!(
-                "column {:?}: unknown column type {:?} (not a built-in, ENUM, or DOMAIN)",
+                "column {:?}: unknown column type {:?} (not a built-in, ENUM, DOMAIN, or composite)",
                 col.name,
                 name
             )));
@@ -2140,7 +2151,29 @@ impl Engine {
                 alloc::format!("type {:?} would shadow an existing view", s.name),
             )));
         }
-        let def = match s.kind {
+        // v7.37.42-T2 ζ-B — pre-check collision with the
+        // composite registry too, so creating ENUM with a name
+        // already used by a composite (or vice versa) fails
+        // uniformly regardless of which kind comes first.
+        if cat.composite_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} already exists", s.name),
+            )));
+        }
+        if cat.enum_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} already exists", s.name),
+            )));
+        }
+        if cat.domain_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} already exists", s.name),
+            )));
+        }
+        // v7.37.42-T2 ζ-B — composite types now live in their own
+        // catalog registry (composite_types), parallel to enum_types
+        // / domain_types. ENUM stays in enum_types as before.
+        match s.kind {
             spg_sql::ast::TypeKind::Enum { labels } => {
                 if labels.is_empty() {
                     return Err(EngineError::Unsupported(
@@ -2159,29 +2192,20 @@ impl Engine {
                         }
                     }
                 }
-                spg_storage::EnumDef {
+                let def = spg_storage::EnumDef {
                     name: s.name.clone(),
                     labels,
-                }
+                };
+                self.active_catalog_mut()
+                    .create_enum_type(def)
+                    .map_err(EngineError::Storage)?;
             }
-            // v7.37.x (ζ-B Phase 1 composite accept) — `CREATE TYPE
-            // name AS (field …)` is accepted and stored in the
-            // catalog so PG dumps emitting composite type definitions
-            // don't fail. Phase 1 doesn't yet support USING the
-            // composite type as a column type or constructing
-            // composite Value literals — that lands in Phase 2 with
-            // Value::Composite + ROW() cast + field-access syntax.
-            // Storing in the existing `enum_types` slot is wrong;
-            // we register a synthetic enum with the field names as
-            // labels so the catalog has a record. A real CompositeDef
-            // slot ships with Phase 2.
             spg_sql::ast::TypeKind::Composite { fields } => {
                 if fields.is_empty() {
                     return Err(EngineError::Unsupported(
                         "CREATE TYPE … AS (…) must declare at least one field".into(),
                     ));
                 }
-                // Synthetic enum-shaped record: labels = field names.
                 // Reject duplicate field names per PG.
                 for i in 0..fields.len() {
                     for j in (i + 1)..fields.len() {
@@ -2194,15 +2218,20 @@ impl Engine {
                         }
                     }
                 }
-                spg_storage::EnumDef {
+                // Resolve each field's ColumnTypeName → DataType.
+                let resolved_fields = fields
+                    .into_iter()
+                    .map(|(fname, fty)| (fname, column_type_to_data_type(fty)))
+                    .collect::<alloc::vec::Vec<_>>();
+                let def = spg_storage::CompositeDef {
                     name: s.name.clone(),
-                    labels: fields.into_iter().map(|(n, _)| n).collect(),
-                }
+                    fields: resolved_fields,
+                };
+                self.active_catalog_mut()
+                    .create_composite_type(def)
+                    .map_err(EngineError::Storage)?;
             }
-        };
-        self.active_catalog_mut()
-            .create_enum_type(def)
-            .map_err(EngineError::Storage)?;
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -2336,8 +2365,14 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let mut removed = 0usize;
         for name in names {
-            let was_present = self.active_catalog_mut().drop_enum_type(name);
-            if was_present {
+            // v7.37.42-T2 ζ-B — DROP TYPE searches ENUM + COMPOSITE
+            // registries (PG groups CREATE TYPE … AS ENUM and
+            // CREATE TYPE … AS (…) under the same DROP TYPE
+            // command).
+            let cat = self.active_catalog_mut();
+            let was_enum = cat.drop_enum_type(name);
+            let was_composite = cat.drop_composite_type(name);
+            if was_enum || was_composite {
                 removed += 1;
             } else if !if_exists {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
