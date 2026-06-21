@@ -27,12 +27,12 @@ fn redo_apply_matches_direct_position_ops() {
         c
     }
     let rows = [
-        Row::new(alloc::vec![Value::BigInt(1), Value::Text("a".to_string())]),
-        Row::new(alloc::vec![Value::BigInt(2), Value::Text("b".to_string())]),
-        Row::new(alloc::vec![Value::BigInt(3), Value::Text("c".to_string())]),
-        Row::new(alloc::vec![Value::BigInt(4), Value::Text("d".to_string())]),
+        Row::new(alloc::vec![Value::BigInt(1), Value::text("a")]),
+        Row::new(alloc::vec![Value::BigInt(2), Value::text("b")]),
+        Row::new(alloc::vec![Value::BigInt(3), Value::text("c")]),
+        Row::new(alloc::vec![Value::BigInt(4), Value::text("d")]),
     ];
-    let upd = alloc::vec![Value::BigInt(2), Value::Text("B".to_string())];
+    let upd = alloc::vec![Value::BigInt(2), Value::text("B")];
 
     // C1 — direct storage ops.
     let mut c1 = fresh();
@@ -103,7 +103,7 @@ fn redo_capture_replays_to_identical_state() {
         c
     }
     let mk =
-        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::Text(v.to_string())]);
+        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
 
     let mut c1 = fresh();
     {
@@ -114,7 +114,7 @@ fn redo_capture_replays_to_identical_state() {
         t.insert(mk(3, "c")).unwrap();
         t.update_row(
             1,
-            alloc::vec![Value::BigInt(2), Value::Text("B".to_string())],
+            alloc::vec![Value::BigInt(2), Value::text("B")],
         )
         .unwrap();
         t.delete_rows(&[0]); // drop id=1
@@ -157,7 +157,7 @@ fn catalog_drain_redo_replays_multi_table() {
         c
     }
     let mk =
-        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::Text(v.to_string())]);
+        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
 
     let mut c1 = fresh();
     c1.enable_redo_all();
@@ -168,7 +168,7 @@ fn catalog_drain_redo_replays_multi_table() {
         .unwrap()
         .update_row(
             0,
-            alloc::vec![Value::BigInt(1), Value::Text("A1".to_string())],
+            alloc::vec![Value::BigInt(1), Value::text("A1")],
         )
         .unwrap();
     c1.get_mut("b").unwrap().delete_rows(&[0]);
@@ -192,7 +192,7 @@ fn redo_log_codec_round_trips() {
             table: "t".to_string(),
             row: Row::new(alloc::vec![
                 Value::BigInt(1),
-                Value::Text("a".to_string()),
+                Value::text("a"),
                 Value::Null,
                 Value::Bool(true),
             ]),
@@ -200,7 +200,7 @@ fn redo_log_codec_round_trips() {
         RowChange::Update {
             table: "users".to_string(),
             pos: 42,
-            new_row: alloc::vec![Value::Int(7), Value::Bytes(alloc::vec![1, 2, 3])],
+            new_row: alloc::vec![Value::Int(7), Value::bytes(alloc::vec![1, 2, 3])],
         },
         RowChange::Delete {
             table: "t".to_string(),
@@ -245,7 +245,7 @@ fn snapshot_round_trips_large_bytea_and_text_array_element() {
         .unwrap()
         .insert(Row::new(alloc::vec![
             Value::BigInt(1),
-            Value::Bytes(big_blob.clone()),
+            Value::bytes(big_blob.clone()),
             Value::TextArray(alloc::vec![Some(big_elem.clone()), None, Some("s".into())]),
         ]))
         .unwrap();
@@ -325,7 +325,7 @@ fn snapshot_round_trips_megabyte_text_row() {
     let body = "m".repeat(1_048_576);
     cat.get_mut("mail")
         .unwrap()
-        .insert(Row::new(vec![Value::BigInt(1), Value::Text(body.clone())]))
+        .insert(Row::new(vec![Value::BigInt(1), Value::text(body.clone())]))
         .unwrap();
     let bytes = cat.serialize();
     let re = Catalog::deserialize(&bytes).unwrap();
@@ -353,7 +353,7 @@ fn segment_v3_round_trips_large_text_rows() {
         .map(|i| {
             let row = Row::new(vec![
                 Value::BigInt(i.cast_signed()),
-                Value::Text(big.clone()),
+                Value::text(big.clone()),
             ]);
             (i, encode_row_body_dense(&row, &schema))
         })
@@ -516,7 +516,7 @@ fn value_type_tag_matches_variant() {
     assert_eq!(Value::Int(1).data_type(), Some(DataType::Int));
     assert_eq!(Value::BigInt(1).data_type(), Some(DataType::BigInt));
     assert_eq!(Value::Float(1.0).data_type(), Some(DataType::Float));
-    assert_eq!(Value::Text("x".into()).data_type(), Some(DataType::Text));
+    assert_eq!(Value::text("x").data_type(), Some(DataType::Text));
     assert_eq!(Value::Bool(true).data_type(), Some(DataType::Bool));
     assert_eq!(Value::Null.data_type(), None);
     assert!(Value::Null.is_null());
@@ -589,12 +589,12 @@ fn table_insert_happy_path_appends_row() {
     let t = cat.get_mut("users").unwrap();
     t.insert(Row::new(vec![
         Value::Int(1),
-        Value::Text("alice".into()),
+        Value::text("alice"),
         Value::Float(99.5),
     ]))
     .unwrap();
     assert_eq!(t.row_count(), 1);
-    assert_eq!(t.rows()[0].values[1], Value::Text("alice".into()));
+    assert_eq!(t.rows()[0].values[1], Value::text("alice"));
 }
 
 #[test]
@@ -664,7 +664,7 @@ fn table_insert_null_into_nullable_ok() {
     let t = cat.get_mut("users").unwrap();
     t.insert(Row::new(vec![
         Value::Int(1),
-        Value::Text("bob".into()),
+        Value::text("bob"),
         Value::Null,
     ]))
     .unwrap();
@@ -750,7 +750,7 @@ fn nsw_clone_is_o1() {
         let base = (i as f32) * 0.01;
         t.insert(Row::new(alloc::vec![
             Value::Int(i),
-            Value::Vector(alloc::vec![base, base + 0.05, base + 0.1]),
+            Value::vector(alloc::vec![base, base + 0.05, base + 0.1]),
         ]))
         .unwrap();
     }
@@ -1117,7 +1117,7 @@ fn nsw_index_topology_persists_through_round_trip() {
         let base = (i as f32) * 0.1;
         let row = Row::new(alloc::vec![
             Value::Int(i),
-            Value::Vector(alloc::vec![base, base + 0.05, base + 0.1]),
+            Value::vector(alloc::vec![base, base + 0.05, base + 0.1]),
         ]);
         t.insert(row).unwrap();
     }
@@ -1211,7 +1211,7 @@ fn hnsw_search_matches_brute_force_for_l2_top1() {
     for &(id, v) in &dataset {
         t.insert(Row::new(alloc::vec![
             Value::Int(id),
-            Value::Vector(alloc::vec![v[0], v[1], v[2]]),
+            Value::vector(alloc::vec![v[0], v[1], v[2]]),
         ]))
         .unwrap();
     }
@@ -1250,13 +1250,13 @@ fn serialize_table_with_rows_round_trips() {
     let t = cat.get_mut("users").unwrap();
     t.insert(Row::new(vec![
         Value::Int(1),
-        Value::Text("alice".into()),
+        Value::text("alice"),
         Value::Float(95.5),
     ]))
     .unwrap();
     t.insert(Row::new(vec![
         Value::Int(2),
-        Value::Text("bob".into()),
+        Value::text("bob"),
         Value::Null,
     ]))
     .unwrap();
@@ -1337,7 +1337,7 @@ fn populated_users() -> Catalog {
     ] {
         t.insert(Row::new(vec![
             Value::Int(id),
-            Value::Text(name.into()),
+            Value::text(name),
             score.map_or(Value::Null, Value::Float),
         ]))
         .unwrap();
@@ -1385,7 +1385,7 @@ fn insert_after_create_index_updates_it() {
     t.add_index("by_name".into(), "name").unwrap();
     t.insert(Row::new(vec![
         Value::Int(4),
-        Value::Text("dave".into()),
+        Value::text("dave"),
         Value::Null,
     ]))
     .unwrap();
@@ -1418,7 +1418,7 @@ fn null_or_float_values_are_not_indexed() {
 
 #[test]
 fn vector_value_data_type_carries_dim() {
-    let v = Value::Vector(vec![1.0, 2.0, 3.0]);
+    let v = Value::vector(vec![1.0, 2.0, 3.0]);
     assert_eq!(
         v.data_type(),
         Some(DataType::Vector {
@@ -1445,7 +1445,7 @@ fn vector_column_insert_matching_dim_ok() {
     .unwrap();
     cat.get_mut("emb")
         .unwrap()
-        .insert(Row::new(vec![Value::Vector(vec![1.0, 2.0, 3.0])]))
+        .insert(Row::new(vec![Value::vector(vec![1.0, 2.0, 3.0])]))
         .unwrap();
 }
 
@@ -1467,7 +1467,7 @@ fn vector_column_insert_dim_mismatch_rejected() {
     let err = cat
         .get_mut("emb")
         .unwrap()
-        .insert(Row::new(vec![Value::Vector(vec![1.0, 2.0])]))
+        .insert(Row::new(vec![Value::vector(vec![1.0, 2.0])]))
         .unwrap_err();
     assert!(matches!(err, StorageError::TypeMismatch { .. }));
 }
@@ -1494,7 +1494,7 @@ fn vector_value_survives_catalog_round_trip() {
         .unwrap()
         .insert(Row::new(vec![
             Value::Int(1),
-            Value::Vector(vec![0.5, -1.25, 3.0, 7.0]),
+            Value::vector(vec![0.5, -1.25, 3.0, 7.0]),
         ]))
         .unwrap();
     let restored = Catalog::deserialize(&cat.serialize()).expect("round-trip");
@@ -1508,7 +1508,7 @@ fn vector_value_survives_catalog_round_trip() {
     );
     assert_eq!(
         table.rows()[0].values[1],
-        Value::Vector(vec![0.5, -1.25, 3.0, 7.0])
+        Value::vector(vec![0.5, -1.25, 3.0, 7.0])
     );
 }
 
@@ -1547,8 +1547,8 @@ fn bigint_pk_users_schema() -> TableSchema {
     )
 }
 
-fn make_user_row(id: i64, name: &str) -> Row {
-    Row::new(vec![Value::BigInt(id), Value::Text(name.into())])
+fn make_user_row(id: i64, name: &str) -> Row<'static> {
+    Row::new(vec![Value::BigInt(id), Value::text(name.to_string())])
 }
 
 // v7.20 P4 — update_row incremental index maintenance.
@@ -1564,7 +1564,7 @@ fn update_row_non_indexed_column_keeps_index_intact() {
     t.add_index("by_id".into(), "id").unwrap();
     // Change only the non-indexed `name` column — the by_id
     // entry for key 2 must still resolve position 1.
-    t.update_row(1, vec![Value::BigInt(2), Value::Text("bobby".into())])
+    t.update_row(1, vec![Value::BigInt(2), Value::text("bobby")])
         .unwrap();
     let idx = t.index_on(0).unwrap();
     assert_eq!(
@@ -1572,7 +1572,7 @@ fn update_row_non_indexed_column_keeps_index_intact() {
         &[RowLocator::Hot(1)],
         "old key still resolves the in-place position"
     );
-    assert_eq!(t.rows()[1].values[1], Value::Text("bobby".into()));
+    assert_eq!(t.rows()[1].values[1], Value::text("bobby"));
 }
 
 #[test]
@@ -1585,7 +1585,7 @@ fn update_row_indexed_column_moves_entry() {
     }
     t.add_index("by_id".into(), "id").unwrap();
     // Change the indexed key 2 → 20.
-    t.update_row(1, vec![Value::BigInt(20), Value::Text("bob".into())])
+    t.update_row(1, vec![Value::BigInt(20), Value::text("bob")])
         .unwrap();
     let idx = t.index_on(0).unwrap();
     assert!(
@@ -1613,7 +1613,7 @@ fn update_row_duplicate_key_moves_only_target_position() {
     }
     t.add_index("by_id".into(), "id").unwrap();
     // Move position 1's key 7 → 8; position 0 must keep its 7.
-    t.update_row(1, vec![Value::BigInt(8), Value::Text("b".into())])
+    t.update_row(1, vec![Value::BigInt(8), Value::text("b")])
         .unwrap();
     let idx = t.index_on(0).unwrap();
     assert_eq!(idx.lookup_eq(&IndexKey::Int(7)), &[RowLocator::Hot(0)]);
@@ -1835,7 +1835,7 @@ fn register_cold_locators_rejects_nsw_index() {
     let t = cat.get_mut("vecs").unwrap();
     t.insert(Row::new(vec![
         Value::Int(1),
-        Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+        Value::vector(vec![1.0, 0.0, 0.0, 0.0]),
     ]))
     .unwrap();
     t.add_nsw_index("by_v".into(), "v", NSW_DEFAULT_M).unwrap();
@@ -2133,8 +2133,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::BigInt(1_000_000),
             Value::Float(1.5),
             Value::Bool(true),
-            Value::Text("hello".into()),
-            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::text("hello"),
+            Value::vector(vec![1.0, 2.0, 3.0]),
             Value::Numeric {
                 scaled: 12345,
                 scale: 2,
@@ -2149,8 +2149,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::BigInt(0),
             Value::Float(0.0),
             Value::Bool(false),
-            Value::Text(String::new()),
-            Value::Vector(vec![]),
+            Value::text(""),
+            Value::vector(vec![]),
             Value::Numeric {
                 scaled: 0,
                 scale: 2,
@@ -2164,8 +2164,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::BigInt(-1),
             Value::Float(-0.5),
             Value::Bool(true),
-            Value::Text("a much longer payload here".into()),
-            Value::Vector(vec![0.1, 0.2, 0.3]),
+            Value::text("a much longer payload here"),
+            Value::vector(vec![0.1, 0.2, 0.3]),
             Value::Numeric {
                 scaled: -999_999_999,
                 scale: 2,
@@ -2376,7 +2376,7 @@ fn freeze_oldest_to_cold_rejects_non_integer_pk() {
     ))
     .unwrap();
     let t = cat.get_mut("by_name").unwrap();
-    t.insert(Row::new(vec![Value::Text("a".into()), Value::BigInt(1)]))
+    t.insert(Row::new(vec![Value::text("a"), Value::BigInt(1)]))
         .unwrap();
     t.add_index("by_n".into(), "name").unwrap();
     let err = cat
