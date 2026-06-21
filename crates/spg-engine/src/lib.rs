@@ -105,7 +105,7 @@ use core::fmt;
 // v7.16.0 — re-export the parsed-statement AST so downstream
 // crates (spg-embedded → spg-sqlx) don't need a direct dep on
 // spg-sql for the prepare/bind handle.
-pub use spg_sql::ast::Statement as ParsedStatement;
+pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
 use spg_sql::parser::ParseError;
 use spg_storage::{Catalog, ColumnSchema, Row, RowChange, StorageError};
 

@@ -37,6 +37,8 @@
 //! docker-compose intra-network deployments (matches our
 //! out-of-scope decision to never ship TLS).
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -46,6 +48,42 @@ use spg_engine::{CancelToken, EngineError, MonotonicNowFn, QueryResult, Role};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::ServerState;
+
+// v7.37.x (docker-fair SCALARSQ wire-overhead attack) — per-thread
+// parse cache for the simple-query streaming path. The wire-probe
+// session sends 100 + identical SQLs sequentially; caching the post-
+// `prepare_select_streaming` AST saves ~50-80 µs / query on hit
+// (parse + clock + ORDER-BY-position + reorder). Bounded LRU.
+const PGWIRE_PARSE_CACHE_CAP: usize = 64;
+
+thread_local! {
+    static PGWIRE_PARSE_CACHE: RefCell<
+        VecDeque<(String, Arc<spg_engine::SelectStatement>)>,
+    > = const { RefCell::new(VecDeque::new()) };
+}
+
+fn pgwire_parse_cache_get(sql: &str) -> Option<Arc<spg_engine::SelectStatement>> {
+    PGWIRE_PARSE_CACHE.with(|c| {
+        let c = c.borrow();
+        for (k, s) in c.iter() {
+            if k == sql {
+                return Some(Arc::clone(s));
+            }
+        }
+        None
+    })
+}
+
+fn pgwire_parse_cache_put(sql: &str, stmt: Arc<spg_engine::SelectStatement>) {
+    PGWIRE_PARSE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(k, _)| k != sql);
+        if c.len() >= PGWIRE_PARSE_CACHE_CAP {
+            c.pop_back();
+        }
+        c.push_front((sql.to_string(), stmt));
+    });
+}
 
 const PROTOCOL_V3: u32 = 196608; // 3 << 16
 
@@ -296,8 +334,41 @@ fn handle_pg_simple_query(
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
         let mut wrote_header = false;
         let mut first_row_size: Option<usize> = None;
-        let stream_result =
-            engine_lock.execute_readonly_select_streaming(sql, cancel, |item| match item {
+        // v7.37.x (docker-fair SCALARSQ wire-overhead attack) — try
+        // the per-connection parse cache. On hit we skip the SQL-
+        // string entry point's parse / clock / reorder work and call
+        // the prepared variant via an Arc-shared AST (no clone). For
+        // SQLs containing clock-rewrite-eligible nodes
+        // (`current_timestamp` / `now` / `clock_timestamp`) we
+        // bypass the cache so the clock value can't go stale —
+        // wire-probe SCALARSQ SQLs don't hit this gate.
+        let sql_b = sql.as_bytes();
+        let cache_eligible = !(ci_contains(sql_b, b"current_timestamp")
+            || ci_contains(sql_b, b"current_time")
+            || ci_contains(sql_b, b"current_date")
+            || ci_contains(sql_b, b"clock_timestamp")
+            || ci_contains(sql_b, b"transaction_timestamp")
+            || ci_contains(sql_b, b"now("));
+        let cached_stmt = if cache_eligible {
+            pgwire_parse_cache_get(sql)
+        } else {
+            None
+        };
+        let prepared_stmt = if let Some(s) = cached_stmt {
+            Some(s)
+        } else if let Ok(s) = engine_lock.prepare_select_streaming(sql) {
+            let arc = Arc::new(s);
+            if cache_eligible {
+                pgwire_parse_cache_put(sql, Arc::clone(&arc));
+            }
+            Some(arc)
+        } else {
+            None
+        };
+        // Factor the emit closure body once so cache-hit and miss
+        // paths share the encode logic without duplication.
+        let mut emit = |item: spg_engine::StreamItem<'_>| -> Result<(), spg_engine::EngineError> {
+            match item {
                 spg_engine::StreamItem::Header(cols) => {
                     cols_storage.extend_from_slice(cols);
                     let r = send_row_description(wbuf, cols);
@@ -316,7 +387,14 @@ fn handle_pg_simple_query(
                     encode_data_row_from_refs(wbuf, &cols_storage, values)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
-            });
+            }
+        };
+        let stream_result = if let Some(s) = prepared_stmt.as_ref() {
+            engine_lock.execute_readonly_select_streaming_prepared(s.as_ref(), cancel, &mut emit)
+        } else {
+            engine_lock.execute_readonly_select_streaming(sql, cancel, &mut emit)
+        };
+        drop(prepared_stmt);
         drop(engine_lock);
         conn_state
             .wait_event
