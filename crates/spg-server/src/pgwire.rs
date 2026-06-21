@@ -112,6 +112,159 @@ pub fn spawn_listener(
     Ok(local)
 }
 
+/// v7.37.43-T4 — split a PG simple-query SQL body into top-level
+/// statements at unquoted, unparenthesized `;` separators.
+///
+/// PG's simple-query protocol explicitly accepts a script with
+/// multiple statements separated by `;` (see PG docs §53.2.2 — "Simple
+/// Query"). `sqlx::migrate!()` relies on this: every migration file
+/// is submitted as one Query message and the server executes each
+/// statement in order. Before this change SPG's parser bailed on
+/// the second statement with "expected end of input, got Create",
+/// which broke every sqlx-migrate user (sentori, mailrs, and every
+/// drop-in port via sqlx 0.8).
+///
+/// The splitter respects PG lexer boundaries — `;` inside any of
+/// the constructs below is NOT a separator:
+///   * single-quoted strings `'…'` (incl. `''` escape)
+///   * double-quoted identifiers `"…"` (incl. `""` escape)
+///   * `--` line comments through end-of-line
+///   * `/* … */` block comments (PG nests these — we track depth)
+///   * dollar-quoted strings `$tag$ … $tag$` (incl. `$$` empty tag,
+///     used by `DO $$ … $$` blocks in sentori migrations 0009 / 0021)
+///
+/// Returns the slice range for each non-empty statement (no trailing
+/// `;`, leading/trailing whitespace preserved — the downstream
+/// dispatch trims). Whitespace-only segments between adjacent `;;`
+/// are dropped so the caller can rely on every returned slice being
+/// dispatchable.
+pub(crate) fn split_top_level_statements(body: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let n = body.len();
+    while i < n {
+        let b = body[i];
+        match b {
+            b'\'' => {
+                // Single-quoted string. `''` inside = escaped quote.
+                i += 1;
+                while i < n {
+                    if body[i] == b'\'' {
+                        if i + 1 < n && body[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                // Double-quoted identifier. `""` inside = escaped.
+                i += 1;
+                while i < n {
+                    if body[i] == b'"' {
+                        if i + 1 < n && body[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < n && body[i + 1] == b'-' => {
+                // Line comment through end of line.
+                i += 2;
+                while i < n && body[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && body[i + 1] == b'*' => {
+                // Block comment — PG nests these.
+                i += 2;
+                let mut depth = 1u32;
+                while i < n && depth > 0 {
+                    if i + 1 < n && body[i] == b'/' && body[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < n && body[i] == b'*' && body[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                // Dollar-quoted string: `$tag$…$tag$`. Tag is empty
+                // or [A-Za-z_][A-Za-z0-9_]*. If not a valid tag,
+                // treat `$` as literal byte.
+                let tag_start = i + 1;
+                let mut j = tag_start;
+                let mut valid_tag = true;
+                while j < n && body[j] != b'$' {
+                    let c = body[j];
+                    let ok = if j == tag_start {
+                        c.is_ascii_alphabetic() || c == b'_'
+                    } else {
+                        c.is_ascii_alphanumeric() || c == b'_'
+                    };
+                    if !ok {
+                        valid_tag = false;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !valid_tag || j >= n {
+                    // Not a valid open tag — treat `$` as literal.
+                    i += 1;
+                    continue;
+                }
+                // body[tag_start..j] is the tag (possibly empty),
+                // body[i..=j] is `$tag$`.
+                let close_len = j - i + 1;
+                let close_start = i;
+                let close_end = j + 1;
+                i = j + 1;
+                while i + close_len <= n {
+                    if body[i..i + close_len] == body[close_start..close_end] {
+                        i += close_len;
+                        break;
+                    }
+                    i += 1;
+                }
+                if i + close_len > n {
+                    // unterminated — consume rest.
+                    i = n;
+                }
+            }
+            b';' => {
+                let slice = &body[start..i];
+                if !slice.iter().all(|c| c.is_ascii_whitespace()) {
+                    out.push(slice);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    // Trailing piece (no closing `;`).
+    if start < n {
+        let slice = &body[start..n];
+        if !slice.iter().all(|c| c.is_ascii_whitespace()) {
+            out.push(slice);
+        }
+    }
+    out
+}
+
 /// v7.33 (D, autorun) — the PG-wire simple-query ('Q') handler, split
 /// out of `handle_conn` (~195 of its ~528 lines). SET / SHOW / COPY
 /// intercepts, the canned-probe answers, then execute + WAL/snapshot
@@ -119,6 +272,18 @@ pub fn spawn_listener(
 /// state (tx_state, settings) — never the extended-protocol prepared/
 /// portal maps. Each former `continue` is a normal `Ok(())` return;
 /// the caller loops to the next message. Pure extraction.
+///
+/// v7.37.43-T4 — multi-statement dispatch. When the SQL body contains
+/// N > 1 top-level statements (the canonical `sqlx::migrate!()`
+/// input shape — every sentori migration file ships as a multi-stmt
+/// script), each statement is dispatched in order through the inner
+/// handler with exactly one ReadyForQuery + one TCP flush at the end
+/// (PG protocol §53.2.2). Mid-script COPY (which would need a
+/// multi-frame interaction the captured wbuf can't proxy) is
+/// rejected with SQLSTATE `0A000`. The single-stmt path is
+/// unchanged — perf-critical PG-wire workloads (probes, pool
+/// keepalives, sqlx extended-protocol prepared queries) never enter
+/// the multi-stmt branch.
 #[allow(clippy::too_many_arguments)]
 fn handle_pg_simple_query(
     stream: &mut TcpStream,
@@ -132,6 +297,23 @@ fn handle_pg_simple_query(
 ) -> std::io::Result<()> {
     // Null-terminated SQL string (typically — psql appends \0).
     let sql_bytes = body.strip_suffix(b"\0").unwrap_or(body);
+    // v7.37.43-T4 — multi-statement Q dispatch. `sqlx::migrate!()`
+    // and `psql -f script.sql` submit migration files as one Q
+    // frame with N statements separated by top-level `;`. The
+    // single-stmt path below can only handle one statement, so we
+    // detect N > 1 here and route through a capture-and-strip-RFQ
+    // loop. Statements that the splitter sees only one of (every
+    // probe / pool keepalive / SQL string from sqlx extended
+    // protocol Parse, plus simple-query psql REPL lines) fall
+    // through unchanged.
+    {
+        let stmts = split_top_level_statements(sql_bytes);
+        if stmts.len() > 1 {
+            return dispatch_pg_simple_query_multi(
+                stream, &stmts, state, conn_state, role, tx_state, settings, wbuf,
+            );
+        }
+    }
     // v7.37.x (SPGS PLUCK 红线) — ultra-hot early-out for pure-int
     // `SELECT <int>` BEFORE the per-query activity-registry update
     // (RWLock::write + String alloc per query). Liveness probes /
@@ -639,6 +821,209 @@ fn handle_pg_simple_query(
         // v7.5.0 — QueryResult is #[non_exhaustive].
         Ok(_) => {
             send_error(wbuf, "XX000", "unexpected QueryResult variant")?;
+        }
+    }
+    send_ready_for_query(wbuf, *tx_state)?;
+    stream.write_all(wbuf)?;
+    wbuf.clear();
+    Ok(())
+}
+
+/// v7.37.43-T4 — dispatch a single statement from a multi-statement
+/// `sqlx::migrate!()` script. Writes CC / error / RowDescription /
+/// DataRow frames into `wbuf`, NO ReadyForQuery, NO TCP flush. The
+/// caller (`dispatch_pg_simple_query_multi`) accumulates all sub-
+/// statements into one wbuf and emits one final RFQ + flush per
+/// PG protocol §53.2.2.
+///
+/// Covers the subset that `sqlx::migrate!()` scripts use:
+///   * SET / SHOW (with the same engine-affecting / multi-assignment
+///     fallthrough as the single-stmt path)
+///   * canned-probe answers (psql startup queries)
+///   * `execute_with_role` for DDL / DML / SELECT (Rows or CommandOk
+///     emitted into `wbuf`)
+///
+/// COPY in the middle of a multi-stmt script gets an SQLSTATE
+/// `0A000` error frame — the COPY sub-protocol needs interactive
+/// reads/writes against the real TCP stream the captured wbuf
+/// can't proxy. (`psql -f` rewrites file-mode COPY as a metacommand,
+/// so practical scripts don't hit this.)
+///
+/// The streaming-SELECT fast path is intentionally not used here
+/// — multi-statement migration scripts are not the hot path; the
+/// materialised path keeps the helper short and the per-statement
+/// state-tracking correct (each sub-stmt's Rows must land before
+/// the next sub-stmt's RowDescription).
+#[allow(clippy::too_many_arguments)]
+fn handle_pg_simple_query_one_into_wbuf(
+    sql_bytes: &[u8],
+    state: &Arc<ServerState>,
+    conn_state: &Arc<crate::ConnState>,
+    role: Role,
+    tx_state: &mut u8,
+    settings: &mut std::collections::HashMap<String, String>,
+    wbuf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    // Mirror the activity registry update from the single-stmt path
+    // so spg_stat_activity surfaces the current substatement.
+    let now_us = wallclock_unix_micros();
+    conn_state
+        .last_query_start_us
+        .store(now_us, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut s) = conn_state.current_sql.write() {
+        s.clear();
+        match std::str::from_utf8(sql_bytes) {
+            Ok(valid) => s.push_str(valid),
+            Err(_) => s.push_str(&String::from_utf8_lossy(sql_bytes)),
+        }
+    }
+    let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
+        send_error(wbuf, "22021", "invalid UTF-8 in query")?;
+        return Ok(());
+    };
+    let sql: &str = sql_str.trim_end_matches(';').trim();
+    if sql.is_empty() {
+        // Empty statement after splitter trim — emit the PG
+        // canonical EmptyQueryResponse marker via CommandComplete
+        // with no tag (PG uses 'I' message for empty; CC with empty
+        // tag is the closest portable equivalent SPG handles).
+        send_command_complete(wbuf, "")?;
+        return Ok(());
+    }
+    // SET name=value — same dispatch as the single-stmt path.
+    if let Some((name, value)) = parse_set_statement(sql) {
+        let name_lc = name.to_ascii_lowercase();
+        settings.insert(name_lc.clone(), value.clone());
+        if name_lc == "application_name" {
+            if let Ok(mut g) = conn_state.application_name.write() {
+                *g = value.clone();
+            }
+        }
+        let engine_affecting = matches!(
+            name_lc.as_str(),
+            "foreign_key_checks" | "session_replication_role" | "default_text_search_config"
+        );
+        let is_multi = name_lc.contains('@')
+            || value.contains(',')
+            || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
+            || sql.to_ascii_lowercase().contains("foreign_key_checks =")
+            || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
+        if !engine_affecting && !is_multi {
+            send_command_complete(wbuf, "SET")?;
+            return Ok(());
+        }
+        // engine-affecting or multi-assignment: fall through.
+    }
+    if let Some(name) = parse_show_statement(sql) {
+        let resp = render_show(&name, settings);
+        send_canned(wbuf, &resp)?;
+        return Ok(());
+    }
+    if parse_copy_intent(sql).is_some() {
+        send_error(
+            wbuf,
+            "0A000",
+            "COPY is not supported within a multi-statement simple-query script; \
+             send COPY as its own Query message",
+        )?;
+        return Ok(());
+    }
+    if let Some(canned) = canned_response(sql, state) {
+        send_canned(wbuf, &canned)?;
+        return Ok(());
+    }
+    let cancel = statement_cancel(settings);
+    conn_state
+        .wait_event
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let result = execute_with_role(state, sql, role, cancel);
+    conn_state
+        .wait_event
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let result = match persist_wire_write(state, sql, &result) {
+        Ok(()) => result,
+        Err(e) => Err(EngineError::Unsupported(format!(
+            "durability append failed: {e}"
+        ))),
+    };
+    match result {
+        Ok(QueryResult::Rows { columns, rows }) => {
+            send_row_description(wbuf, &columns)?;
+            let mat_arena = bumpalo::Bump::new();
+            for row in &rows {
+                encode_data_row(wbuf, &columns, row, &mat_arena)?;
+            }
+            send_command_complete_select_count(wbuf, rows.len())?;
+        }
+        Ok(QueryResult::CommandOk { affected, .. }) => {
+            let tag = command_tag(sql, affected);
+            send_command_complete(wbuf, &tag)?;
+            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+                b'T'
+            } else {
+                b'I'
+            };
+        }
+        Err(e) => {
+            let (sqlstate, msg) = engine_error_to_wire(&e);
+            send_error(wbuf, sqlstate, &msg)?;
+            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+                b'E'
+            } else {
+                b'I'
+            };
+        }
+        Ok(_) => {
+            send_error(wbuf, "XX000", "unexpected QueryResult variant")?;
+        }
+    }
+    Ok(())
+}
+
+/// v7.37.43-T4 — drive a multi-statement `sqlx::migrate!()` script
+/// through `handle_pg_simple_query_one_into_wbuf` per statement,
+/// then emit exactly one ReadyForQuery + one TCP flush per PG
+/// protocol §53.2.2.
+///
+/// PG's behavior on error in a mid-script statement (when the
+/// client did NOT wrap the script in BEGIN…COMMIT itself) is to
+/// stop processing further statements and let the client see the
+/// error frame followed by RFQ in error state. We mirror that: if
+/// any sub-stmt's wbuf encoding ended in an Error frame (tx_state
+/// went to 'E'), stop dispatching the remainder.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_pg_simple_query_multi(
+    stream: &mut TcpStream,
+    stmts: &[&[u8]],
+    state: &Arc<ServerState>,
+    conn_state: &Arc<crate::ConnState>,
+    role: Role,
+    tx_state: &mut u8,
+    settings: &mut std::collections::HashMap<String, String>,
+    wbuf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    for stmt in stmts {
+        let pre_len = wbuf.len();
+        handle_pg_simple_query_one_into_wbuf(
+            stmt, state, conn_state, role, tx_state, settings, wbuf,
+        )?;
+        // PG halts a multi-stmt script after the first error frame
+        // (the client sees Error + RFQ, no further frames). We
+        // detect by checking whether tx_state was bumped to 'E' OR
+        // the most recently emitted message starts with 'E' (Error
+        // response). The tx_state path covers errors inside a TX
+        // started by an earlier statement in the script; the wbuf
+        // probe covers errors outside any TX (tx_state stays 'I').
+        if *tx_state == b'E' {
+            break;
+        }
+        if let Some(&first_byte_of_last_msg) = wbuf.get(pre_len) {
+            // Conservative — only break on Error responses, not on
+            // NoticeResponse ('N'); we don't emit NoticeResponses
+            // from this path so 'E' uniquely identifies errors.
+            if first_byte_of_last_msg == b'E' {
+                break;
+            }
         }
     }
     send_ready_for_query(wbuf, *tx_state)?;
@@ -4469,6 +4854,98 @@ mod tests {
         assert!(len >= 0, "negative cell length");
         let len = len as usize;
         &buf[4..4 + len]
+    }
+
+    // v7.37.43-T4 — `split_top_level_statements` is the splitter that
+    // turns sqlx::migrate!()'s multi-statement Q-message into the
+    // per-statement dispatch loop. The acceptance cases here lock
+    // every PG lexer boundary the splitter must respect — the
+    // sentori migrations exercise all of them.
+    fn split_owned(body: &str) -> Vec<String> {
+        split_top_level_statements(body.as_bytes())
+            .into_iter()
+            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn splitter_single_statement_no_semicolon() {
+        assert_eq!(split_owned("SELECT 1"), vec!["SELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn splitter_two_statements_semicolon_separated() {
+        let r = split_owned("CREATE TABLE a (); CREATE TABLE b ();");
+        assert_eq!(r, vec!["CREATE TABLE a ()", "CREATE TABLE b ()"]);
+    }
+
+    #[test]
+    fn splitter_ignores_semicolon_inside_single_quotes() {
+        // CHECK (kind IN ('public', 'admin')) — sentori 0001_init.sql
+        // ships exactly this shape; a naive splitter would split on
+        // the `;` inside the literal of an earlier statement.
+        let r = split_owned("INSERT INTO t VALUES ('a;b'); SELECT 1");
+        assert_eq!(r, vec!["INSERT INTO t VALUES ('a;b')", "SELECT 1"]);
+    }
+
+    #[test]
+    fn splitter_ignores_semicolon_inside_double_quoted_ident() {
+        let r = split_owned(r#"SELECT "a;b"; SELECT 1"#);
+        assert_eq!(r, vec![r#"SELECT "a;b""#, "SELECT 1"]);
+    }
+
+    #[test]
+    fn splitter_ignores_semicolon_inside_line_comment() {
+        let r = split_owned("SELECT 1 -- comment ; nope\n; SELECT 2");
+        assert_eq!(r, vec!["SELECT 1 -- comment ; nope", "SELECT 2"]);
+    }
+
+    #[test]
+    fn splitter_ignores_semicolon_inside_block_comment() {
+        let r = split_owned("SELECT 1 /* ; not a split */; SELECT 2");
+        assert_eq!(r, vec!["SELECT 1 /* ; not a split */", "SELECT 2"]);
+    }
+
+    #[test]
+    fn splitter_handles_dollar_quoted_do_block() {
+        // sentori `0009_quotas.sql` shape — a DO $$ … $$ block carrying
+        // an inner statement that ends in `;`. The splitter must NOT
+        // break the script at the inner `;` because it's inside the
+        // dollar-quoted body; only the closing `$$;` ends the DO.
+        let script = "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT 1) THEN \
+                       CREATE TYPE foo AS ENUM ('a'); \
+                     END IF; \
+                     END $$; \
+                     CREATE TABLE t ()";
+        let r = split_owned(script);
+        assert_eq!(r.len(), 2, "want 2 stmts, got: {r:?}");
+        assert!(r[0].starts_with("DO $$"));
+        assert_eq!(r[1], "CREATE TABLE t ()");
+    }
+
+    #[test]
+    fn splitter_handles_tagged_dollar_quotes() {
+        let script = "SELECT $tag$body; with ; semicolons$tag$; SELECT 1";
+        let r = split_owned(script);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1], "SELECT 1");
+    }
+
+    #[test]
+    fn splitter_drops_empty_statements_between_semicolons() {
+        let r = split_owned("SELECT 1;;; SELECT 2;");
+        assert_eq!(r, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn splitter_handles_escaped_single_quote_in_string() {
+        // PG escapes `'` inside a string by doubling: `'it''s ok'`.
+        // The splitter must not break out of the literal early.
+        let r = split_owned("SELECT 'it''s; ok'; SELECT 1");
+        assert_eq!(r, vec!["SELECT 'it''s; ok'", "SELECT 1"]);
     }
 
     /// v7.34.6 — `write_cell_timestamp` must match
