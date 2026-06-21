@@ -521,7 +521,33 @@ pub(crate) fn eval_compiled_ref(
     stack: &mut Vec<Value<'static>>,
 ) -> Result<Value<'static>, EvalError> {
     stack.clear();
-    for step in &c.steps {
+    run_compiled_steps(&c.steps, row, ctx, stack)?;
+    Ok(stack.pop().unwrap_or(Value::Null))
+}
+
+/// v7.37.5-A2b — append-mode entry point for nested sub-programs (the
+/// `Step::Case` executor's per-branch evaluations). Does NOT clear the
+/// stack; pushes the program's result on top of whatever was already
+/// there. Caller uses the `mark` to know where to truncate / pop. Kept
+/// out of public surface — only the Case opcode reaches for it.
+fn eval_compiled_ref_into(
+    c: &CompiledExpr,
+    row: &crate::join::RowRef<'_>,
+    ctx: &EvalContext<'_>,
+    stack: &mut Vec<Value<'static>>,
+    _mark: usize,
+) -> Result<(), EvalError> {
+    run_compiled_steps(&c.steps, row, ctx, stack)
+}
+
+#[inline]
+fn run_compiled_steps(
+    steps: &[Step],
+    row: &crate::join::RowRef<'_>,
+    ctx: &EvalContext<'_>,
+    stack: &mut Vec<Value<'static>>,
+) -> Result<(), EvalError> {
+    for step in steps {
         match step {
             Step::Column(pos) => {
                 stack.push(
@@ -693,18 +719,29 @@ pub(crate) fn eval_compiled_ref(
                 // v7.37.5-A2b — short-circuit Case executor. Mirrors
                 // `Expr::Case` interpreter semantics bit-for-bit (each
                 // WHEN evaluates with its own scratch stack; first
-                // match wins; ELSE = NULL when absent). Reuses the
-                // outer `stack` storage between branches.
+                // match wins; ELSE = NULL when absent). The outer
+                // `stack` is reused (truncated back to its pre-Case
+                // mark after each sub-program); allocator-free per
+                // branch — the prior version allocated a fresh
+                // `Vec<Value>` per sub-program which showed up as
+                // ~3 % `drop_in_place<Vec<Value>>` self time.
+                let mark = stack.len();
                 let operand_value = if let Some(op) = operand {
-                    let mut sub = alloc::vec::Vec::new();
-                    Some(eval_compiled_ref(op, row, ctx, &mut sub)?)
+                    // Recursive call reuses the same stack: it
+                    // `stack.clear()`s at entry so we hand it a fresh
+                    // logical view; pop the sub-program's result
+                    // afterwards and restore our prefix manually.
+                    eval_compiled_ref_into(op, row, ctx, stack, mark)?;
+                    Some(stack.pop().unwrap_or(Value::Null))
                 } else {
                     None
                 };
+                stack.truncate(mark);
                 let mut matched_value: Option<Value<'static>> = None;
                 for (when_c, then_c) in branches {
-                    let mut sub = alloc::vec::Vec::new();
-                    let when_v = eval_compiled_ref(when_c, row, ctx, &mut sub)?;
+                    eval_compiled_ref_into(when_c, row, ctx, stack, mark)?;
+                    let when_v = stack.pop().unwrap_or(Value::Null);
+                    stack.truncate(mark);
                     let matched = match &operand_value {
                         None => matches!(when_v, Value::Bool(true)),
                         Some(op_v) => matches!(
@@ -713,8 +750,9 @@ pub(crate) fn eval_compiled_ref(
                         ),
                     };
                     if matched {
-                        let mut sub2 = alloc::vec::Vec::new();
-                        matched_value = Some(eval_compiled_ref(then_c, row, ctx, &mut sub2)?);
+                        eval_compiled_ref_into(then_c, row, ctx, stack, mark)?;
+                        matched_value = Some(stack.pop().unwrap_or(Value::Null));
+                        stack.truncate(mark);
                         break;
                     }
                 }
@@ -722,8 +760,10 @@ pub(crate) fn eval_compiled_ref(
                     Some(v) => v,
                     None => match else_branch {
                         Some(el) => {
-                            let mut sub = alloc::vec::Vec::new();
-                            eval_compiled_ref(el, row, ctx, &mut sub)?
+                            eval_compiled_ref_into(el, row, ctx, stack, mark)?;
+                            let v = stack.pop().unwrap_or(Value::Null);
+                            stack.truncate(mark);
+                            v
                         }
                         None => Value::Null,
                     },
@@ -733,5 +773,5 @@ pub(crate) fn eval_compiled_ref(
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }
     }
-    Ok(stack.pop().unwrap_or(Value::Null))
+    Ok(())
 }
