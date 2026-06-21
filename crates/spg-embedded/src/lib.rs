@@ -3570,6 +3570,23 @@ impl Database {
             p.set_file_name(name);
             p
         };
+        // v7.37.5 (mailrs crash-recovery Ask 2) — also clear the
+        // in-process registry entry for this lock_path. The operator
+        // calling `force_unlock` asserts "no one is using this catalog;
+        // nuke the lock"; the in-process registry would otherwise
+        // keep an in-flight sibling `Database::open_path` task
+        // registered, and a same-process retry post-force_unlock
+        // would refuse honestly with the Ask 1 in-flight error
+        // even though the operator just declared the catalog free.
+        // Drop the registry entry before the disk lock so retries
+        // see a consistent "free" state. The orphaned in-flight
+        // task, if any, will surface its own error when it tries
+        // to release the now-vanished lock dir; that's the
+        // single-instance contract `force_unlock` documents.
+        {
+            let mut set = active_open_paths().lock().unwrap_or_else(|e| e.into_inner());
+            set.remove(&lock_path);
+        }
         if !lock_path.exists() {
             return Ok(());
         }
@@ -3878,7 +3895,7 @@ fn process_start_time(_pid: u32) -> Option<String> {
 ///
 /// The on-disk identity (pid + start-time + hostname + boot id)
 /// is sufficient ACROSS processes but ambiguous WITHIN one
-/// process; this set settles it directly. `LockRegistryGuard`
+/// process; this set settles it directly. `acquire_path_lock`
 /// consults the set first: if the path is present, the on-disk
 /// lock is held by a live sibling task and we refuse honestly
 /// without reading the pid file. If absent, a same-pid on-disk
@@ -4493,13 +4510,12 @@ mod tests {
 
     // ─────────────────────────────────────────────────────────────
     // v7.37.5 — mailrs crash-recovery lock-hang regression tests.
-    //   Ask 1 (this commit) — in-process registry refuses sibling
-    //   Ask 3 (Catalog::apply_redo batching, committed separately
-    //          in the storage layer) — verified end-to-end here:
-    //          the differential test confirms batched + legacy
-    //          paths produce byte-identical row state, and the
-    //          synthetic prod-shape reproducer enforces the
-    //          27 min → < 10 s budget.
+    // Three asks; each closed atomically:
+    //   Ask 1 — in-process registry refuses sibling sl-blocking
+    //   Ask 2 — force_unlock clears the in-process registry too
+    //   Ask 3 — apply_redo batches DELETE/INSERT/UPDATE so the
+    //           index rebuild happens once per replay, not once
+    //           per WAL record
     // ─────────────────────────────────────────────────────────────
 
     fn tmpdir() -> std::path::PathBuf {
@@ -4554,6 +4570,41 @@ mod tests {
         assert!(
             third.is_ok(),
             "post-drop open_path on same path must succeed, got {third:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask2_force_unlock_clears_in_process_registry() {
+        // `force_unlock` is the operator's "no one owns this catalog"
+        // assertion. Post-Ask-1 the in-process registry would refuse
+        // a sibling open even after force_unlock — Ask 2 wires
+        // force_unlock to ALSO clear the registry so retries see a
+        // consistent "free" state.
+        let dir = tmpdir();
+        let db_path = dir.join("u.spg");
+        // Open a database to populate the registry, then keep the
+        // handle so the registry entry survives.
+        let _first = Database::open_path(&db_path).expect("first open succeeds");
+        let lock_path = {
+            let mut p = db_path.clone();
+            let mut s = p.file_name().unwrap().to_os_string();
+            s.push(".lock");
+            p.set_file_name(s);
+            p
+        };
+        assert!(is_lock_path_active_in_process(&lock_path));
+        // force_unlock — operator declares the catalog free.
+        Database::force_unlock(&db_path).expect("force_unlock succeeds");
+        // Registry MUST be cleared (Ask 2 contract).
+        assert!(
+            !is_lock_path_active_in_process(&lock_path),
+            "force_unlock must clear the in-process registry entry"
+        );
+        // Disk lock is also gone.
+        assert!(
+            !lock_path.exists(),
+            "force_unlock must remove the on-disk lock dir"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -73,6 +73,27 @@ impl SpgConnectOptions {
             shared: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
+
+    /// v7.37.5 (mailrs crash-recovery Ask 2) — force the shared
+    /// `OnceCell<AsyncDatabase>` back to empty so the next
+    /// `connect()` re-opens the catalog instead of handing back a
+    /// stale cached handle. Pairs with
+    /// `spg_embedded::Database::force_unlock`: when the operator
+    /// asserts "no one owns this catalog; nuke the lock", any
+    /// previously-shared `AsyncDatabase` that still holds the
+    /// engine in this process must also be discarded so the new
+    /// boot's `connect_with` opens fresh.
+    ///
+    /// Replaces the `Arc<OnceCell<_>>` with a brand-new empty cell;
+    /// existing clones of these options that already grabbed an
+    /// `Arc` clone to the prior cell keep using it (they're the
+    /// callers that opted in to the shared handle); this method
+    /// only resets THIS handle. The typical mailrs shape — one
+    /// `SpgConnectOptions` per pool, recycled at force_unlock
+    /// time — is correctly served.
+    pub fn clear_shared(&mut self) {
+        self.shared = std::sync::Arc::new(tokio::sync::OnceCell::new());
+    }
 }
 
 impl FromStr for SpgConnectOptions {
