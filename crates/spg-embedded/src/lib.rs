@@ -3584,7 +3584,9 @@ impl Database {
         // to release the now-vanished lock dir; that's the
         // single-instance contract `force_unlock` documents.
         {
-            let mut set = active_open_paths().lock().unwrap_or_else(|e| e.into_inner());
+            let mut set = active_open_paths()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             set.remove(&lock_path);
         }
         if !lock_path.exists() {
@@ -3925,7 +3927,9 @@ pub(crate) struct LockRegistryGuard {
 
 impl LockRegistryGuard {
     fn try_acquire(lock_path: &Path) -> Result<Self, EngineError> {
-        let mut set = active_open_paths().lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = active_open_paths()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if set.contains(lock_path) {
             return Err(EngineError::Unsupported(format!(
                 "database is locked by an in-flight task in this process: {} \
@@ -3944,7 +3948,9 @@ impl LockRegistryGuard {
 
 impl Drop for LockRegistryGuard {
     fn drop(&mut self) {
-        let mut set = active_open_paths().lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = active_open_paths()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set.remove(&self.path);
     }
 }
@@ -4630,9 +4636,18 @@ mod tests {
             let mut cat = Catalog::new();
             cat.create_table(TableSchema::new("t", columns)).unwrap();
             // 3 BTree indices on a, b, c.
-            cat.get_mut("t").unwrap().add_index("idx_a".into(), "a").unwrap();
-            cat.get_mut("t").unwrap().add_index("idx_b".into(), "b").unwrap();
-            cat.get_mut("t").unwrap().add_index("idx_c".into(), "c").unwrap();
+            cat.get_mut("t")
+                .unwrap()
+                .add_index("idx_a".into(), "a")
+                .unwrap();
+            cat.get_mut("t")
+                .unwrap()
+                .add_index("idx_b".into(), "b")
+                .unwrap();
+            cat.get_mut("t")
+                .unwrap()
+                .add_index("idx_c".into(), "c")
+                .unwrap();
             for r in 0..100 {
                 cat.get_mut("t")
                     .unwrap()
@@ -4678,9 +4693,17 @@ mod tests {
         for change in &changes {
             match change {
                 RowChange::Insert { table, row } => {
-                    cat_legacy.get_mut(table).unwrap().insert(row.clone()).unwrap();
+                    cat_legacy
+                        .get_mut(table)
+                        .unwrap()
+                        .insert(row.clone())
+                        .unwrap();
                 }
-                RowChange::Update { table, pos, new_row } => {
+                RowChange::Update {
+                    table,
+                    pos,
+                    new_row,
+                } => {
                     cat_legacy
                         .get_mut(table)
                         .unwrap()
