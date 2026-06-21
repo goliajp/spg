@@ -32,6 +32,12 @@ repository   = "https://github.com/goliajp/spg"
 [workspace.dependencies]
 hashbrown   = { version = "0.15", default-features = false, features = ["default-hasher"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# v7.37.42-arena (T1) — per-query bump arena for the Cow-arena Value
+# refactor (see notes/v7.37.42-value-row-arena-design.md). Models PG's
+# MemoryContext: query-scoped arena, O(1) bulk reset at query end.
+# Already a transitive dep via sqlx; pinned here explicitly so spg-
+# storage / spg-engine / spg-server can import without churn.
+bumpalo     = { version = "3", default-features = false, features = ["collections"] }
 # v7.8.1 — internal crates declared once here so `cargo publish` sees
 # `version = "X.Y"` alongside the `path = …`. crates.io strips paths
 # and uses the version; `path` keeps local development from going via

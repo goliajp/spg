@@ -1607,6 +1607,7 @@ dependencies = [
 name = "spg-storage"
 version = "7.37.3"
 dependencies = [
+ "bumpalo",
  "criterion",
  "spg-crypto",
 ]
