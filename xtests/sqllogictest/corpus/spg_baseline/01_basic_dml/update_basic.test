@@ -1,0 +1,47 @@
+# UPDATE SET, UPDATE SET WHERE, multi-column SET.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, score INT)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)
+
+statement ok
+UPDATE t SET score = 99 WHERE id = 2
+
+query IT rowsort
+SELECT id, score FROM t
+----
+1
+10
+2
+99
+3
+30
+
+statement ok
+UPDATE t SET name = 'z', score = 0 WHERE id = 1
+
+query TI rowsort
+SELECT name, score FROM t WHERE id = 1
+----
+z
+0
+
+statement ok
+UPDATE t SET score = score + 1
+
+query I rowsort
+SELECT score FROM t
+----
+1
+100
+31
+
+statement ok
+UPDATE t SET score = NULL WHERE id = 3
+
+query I rowsort
+SELECT score FROM t WHERE id = 3
+----
+NULL

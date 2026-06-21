@@ -1,0 +1,27 @@
+# TEXT / VARCHAR(n) / CHAR(n).
+
+statement ok
+CREATE TABLE t (a TEXT, v VARCHAR(8), c CHAR(4))
+
+statement ok
+INSERT INTO t VALUES ('hello world', 'abc', 'xy')
+
+query I rowsort
+SELECT length(a) FROM t
+----
+11
+
+query I rowsort
+SELECT length(v) FROM t
+----
+3
+
+# CHAR(4) right-pads.
+query I rowsort
+SELECT length(c) FROM t
+----
+4
+
+# VARCHAR(8) rejects overflow.
+statement error
+INSERT INTO t VALUES ('x', '123456789', 'z')

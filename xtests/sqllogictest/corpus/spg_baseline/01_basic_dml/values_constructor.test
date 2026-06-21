@@ -1,0 +1,17 @@
+# INSERT VALUES (multi-row) — the directly supported VALUES form.
+
+statement ok
+CREATE TABLE dst (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO dst VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+query IT rowsort
+SELECT id, name FROM dst
+----
+1
+a
+2
+b
+3
+c

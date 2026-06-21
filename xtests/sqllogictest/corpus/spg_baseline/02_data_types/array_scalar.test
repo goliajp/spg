@@ -1,0 +1,18 @@
+# INT[] / TEXT[] / BIGINT[] columns.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, tags TEXT[])
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY['a', 'b', 'c'])
+
+statement ok
+INSERT INTO t VALUES (2, ARRAY['x'])
+
+query IT rowsort
+SELECT id, tags FROM t ORDER BY id
+----
+1
+{a,b,c}
+2
+{x}

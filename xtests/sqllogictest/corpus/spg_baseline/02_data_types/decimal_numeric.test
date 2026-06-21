@@ -1,0 +1,20 @@
+# NUMERIC(p,s) / DECIMAL exact decimal type.
+
+statement ok
+CREATE TABLE t (price NUMERIC(10, 2))
+
+statement ok
+INSERT INTO t VALUES (123.45), (-9.99), (0.01)
+
+query T nosort
+SELECT price FROM t ORDER BY price
+----
+-9.99
+0.01
+123.45
+
+statement error
+INSERT INTO t VALUES (100000000.00)
+
+statement ok
+INSERT INTO t VALUES (99999999.99)

@@ -1,0 +1,25 @@
+# JOIN with same column on both sides via ON.
+# USING (col) sugar is not yet shipped (parser level); the equivalent
+# ON-form is the supported baseline.
+
+statement ok
+CREATE TABLE a (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE b (id INT NOT NULL, val INT NOT NULL)
+
+statement ok
+INSERT INTO a VALUES (1, 'x'), (2, 'y')
+
+statement ok
+INSERT INTO b VALUES (1, 100), (2, 200)
+
+query ITI rowsort
+SELECT a.id, a.name, b.val FROM a INNER JOIN b ON a.id = b.id
+----
+1
+x
+100
+2
+y
+200

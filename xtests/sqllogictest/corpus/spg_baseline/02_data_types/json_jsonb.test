@@ -1,0 +1,21 @@
+# JSON / JSONB literals + access operators.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, doc JSONB)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a": 1, "b": "x"}')
+
+statement ok
+INSERT INTO t VALUES (2, '{"a": 2, "b": "y"}')
+
+query I rowsort
+SELECT id FROM t WHERE doc->>'b' = 'x'
+----
+1
+
+query T rowsort
+SELECT doc->>'b' FROM t ORDER BY id
+----
+x
+y

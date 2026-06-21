@@ -1,0 +1,12 @@
+# NOW() / CURRENT_DATE / CURRENT_TIMESTAMP — deterministic clock pinned
+# to 2025-06-15T12:00:00Z by the runner.
+
+query T rowsort
+SELECT CURRENT_DATE
+----
+2025-06-15
+
+query T rowsort
+SELECT CURRENT_TIMESTAMP
+----
+2025-06-15 12:00:00

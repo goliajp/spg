@@ -1,0 +1,32 @@
+# LEFT JOIN with WHERE on right side — promotes to INNER semantics for
+# matching rows but preserves the NULL row when the WHERE allows NULL.
+
+statement ok
+CREATE TABLE a (id INT NOT NULL)
+
+statement ok
+CREATE TABLE b (a_id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO a VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO b VALUES (1, 10), (2, 20)
+
+# Matching rows only.
+query II rowsort
+SELECT a.id, b.v FROM a INNER JOIN b ON a.id = b.a_id WHERE b.v >= 20
+----
+2
+20
+
+# LEFT JOIN preserves the missing one.
+query II rowsort
+SELECT a.id, b.v FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id <= 3
+----
+1
+10
+2
+20
+3
+NULL

@@ -1,0 +1,22 @@
+# PG text functions: substr, replace, trim.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'Hello World')
+
+query T rowsort
+SELECT substr(s, 1, 5) FROM t
+----
+Hello
+
+query T rowsort
+SELECT replace(s, 'World', 'SPG') FROM t
+----
+Hello SPG
+
+query T rowsort
+SELECT trim('  hi  ')
+----
+hi

@@ -1,0 +1,17 @@
+# Self join (m.id = m2.parent_id).
+
+statement ok
+CREATE TABLE m (id INT NOT NULL, parent_id INT, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO m VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'aa')
+
+query TT rowsort
+SELECT m.name, p.name FROM m INNER JOIN m AS p ON m.parent_id = p.id
+----
+a
+root
+aa
+a
+b
+root

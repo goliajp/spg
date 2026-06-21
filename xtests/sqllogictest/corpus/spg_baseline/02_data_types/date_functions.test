@@ -1,0 +1,27 @@
+# DATE_PART / EXTRACT against stored DATE.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, d DATE NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, '2024-06-15')
+
+query I rowsort
+SELECT DATE_PART('year', d) FROM t
+----
+2024
+
+query I rowsort
+SELECT DATE_PART('month', d) FROM t
+----
+6
+
+query I rowsort
+SELECT DATE_PART('day', d) FROM t
+----
+15
+
+query I rowsort
+SELECT EXTRACT(YEAR FROM d) FROM t
+----
+2024

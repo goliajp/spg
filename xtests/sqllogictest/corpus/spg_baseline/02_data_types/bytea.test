@@ -1,0 +1,10 @@
+# BYTEA hex literal.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, b BYTEA)
+
+statement ok
+INSERT INTO t VALUES (1, E'\\x0102')
+
+statement ok
+INSERT INTO t VALUES (2, E'\\xdeadbeef')

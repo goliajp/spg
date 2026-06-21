@@ -1,0 +1,57 @@
+# SELECT shape: star projection, named columns, expressions.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b TEXT NOT NULL, c INT)
+
+statement ok
+INSERT INTO t VALUES (1, 'alpha', 10)
+
+statement ok
+INSERT INTO t VALUES (2, 'beta', 20)
+
+statement ok
+INSERT INTO t VALUES (3, 'gamma', NULL)
+
+query ITI rowsort
+SELECT * FROM t
+----
+1
+alpha
+10
+2
+beta
+20
+3
+gamma
+NULL
+
+query I rowsort
+SELECT a FROM t
+----
+1
+2
+3
+
+query TI rowsort
+SELECT b, c FROM t
+----
+alpha
+10
+beta
+20
+gamma
+NULL
+
+query I rowsort
+SELECT a + 100 FROM t
+----
+101
+102
+103
+
+query I rowsort
+SELECT a * 2 FROM t
+----
+2
+4
+6
