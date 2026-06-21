@@ -14,6 +14,10 @@ workspace = true
 
 [dependencies]
 spg-crypto = { workspace = true }
+# v7.37.42-arena (T1) — bump arena for query-scoped Value lifetime.
+# Direct dep instead of transitive so Value<'arena>'s bumpalo helpers
+# (bumpalo::collections::Vec, bumpalo::collections::String) are reachable.
+bumpalo    = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
