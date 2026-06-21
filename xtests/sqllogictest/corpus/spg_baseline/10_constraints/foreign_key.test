@@ -1,0 +1,16 @@
+# FOREIGN KEY REFERENCES.
+
+statement ok
+CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE child (id INT NOT NULL, parent_id INT NOT NULL REFERENCES parent(id))
+
+statement ok
+INSERT INTO parent VALUES (1, 'a'), (2, 'b')
+
+statement ok
+INSERT INTO child VALUES (10, 1)
+
+statement error
+INSERT INTO child VALUES (11, 99)

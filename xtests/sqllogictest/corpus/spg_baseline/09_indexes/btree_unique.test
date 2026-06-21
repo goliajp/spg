@@ -1,0 +1,13 @@
+# UNIQUE constraint enforced.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, code TEXT NOT NULL UNIQUE)
+
+statement ok
+INSERT INTO t VALUES (1, 'a')
+
+statement error
+INSERT INTO t VALUES (2, 'a')
+
+statement ok
+INSERT INTO t VALUES (3, 'b')

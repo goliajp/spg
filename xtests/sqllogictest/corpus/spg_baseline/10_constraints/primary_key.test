@@ -1,0 +1,21 @@
+# PRIMARY KEY enforces uniqueness + NOT NULL.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'a')
+
+statement error
+INSERT INTO t VALUES (1, 'b')
+
+statement ok
+INSERT INTO t VALUES (2, 'b')
+
+query IT rowsort
+SELECT id, name FROM t ORDER BY id
+----
+1
+a
+2
+b

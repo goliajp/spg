@@ -1,0 +1,23 @@
+# Composite PRIMARY KEY (a, b).
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, val INT NOT NULL, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (1, 2, 11), (2, 1, 20)
+
+statement error
+INSERT INTO t VALUES (1, 1, 999)
+
+query III rowsort
+SELECT a, b, val FROM t ORDER BY a, b
+----
+1
+1
+10
+1
+2
+11
+2
+1
+20
