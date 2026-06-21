@@ -2907,6 +2907,15 @@ pub struct ScalarPkProbeFastPath {
     pub inner_table_name: String,
     /// Column position of the inner-side PK on which we probe.
     pub inner_pos: usize,
+    /// v7.37.42 (docker-fair SCALARSQ attack 1) — cached insertion-order
+    /// index of `inner_table_name` in the active catalog at PREPARE time.
+    /// The executor and prepare share a single engine `RwLock` read guard
+    /// per query (see `pgwire.rs` simple-query path), so the catalog
+    /// can't mutate mid-query — the cached index stays in sync with the
+    /// string name. The per-row probe therefore skips the
+    /// `BTreeMap<String, usize>` descent that `Catalog::get(&str)` would
+    /// otherwise perform, saving ~300 ns × N outer rows.
+    pub table_idx: usize,
 }
 
 impl ScalarPkProbeFastPath {
@@ -2969,7 +2978,12 @@ impl Engine {
             Some(Value::Null) | None => return Value::Int(0),
             _ => return Value::Int(0),
         };
-        let Some(inner_table) = self.active_catalog().get(plan.inner_table_name.as_str()) else {
+        // v7.37.42 attack 1 — bypass per-row `BTreeMap<String,usize>::get`
+        // by going through the cached positional index. The prepare-time
+        // analyser stores the index against the same catalog snapshot
+        // the executor sees (same engine read guard), so the cached
+        // index remains valid for the query's duration.
+        let Some(inner_table) = self.active_catalog().tables_at(plan.table_idx) else {
             return Value::Int(0);
         };
         let Some(idx) = inner_table.index_on(plan.inner_pos) else {
@@ -3069,8 +3083,12 @@ impl Engine {
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&outer_col.name))?;
         // Inner column must be a single-column PK on an integer family.
+        // v7.37.42 attack 1 — resolve the inner table's positional index
+        // alongside the table fetch so the per-row probe can skip the
+        // `BTreeMap<String,usize>::get(&str)` descent.
         let catalog = self.active_catalog();
-        let inner_table = catalog.get(inner_table_name.as_str())?;
+        let table_idx = catalog.tables_position_of(inner_table_name.as_str())?;
+        let inner_table = catalog.tables_at(table_idx)?;
         let inner_schema_ref = inner_table.schema();
         let inner_pos = inner_schema_ref
             .columns
@@ -3095,6 +3113,7 @@ impl Engine {
             outer_pos,
             inner_table_name,
             inner_pos,
+            table_idx,
         })
     }
 

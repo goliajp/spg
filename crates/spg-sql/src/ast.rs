@@ -1989,7 +1989,7 @@ pub struct Cte {
 /// outer query to reference the CTE alias by; an empty RETURNING is
 /// only valid if no outer reference materialises (rare — typically
 /// caught at planning).
-#[allow(clippy::large_enum_variant)] // Select dominates classical CTE path; Boxing would touch every match site
+#[allow(clippy::large_enum_variant)] // CteBody::Select dominates; Boxing would touch every match site
 #[derive(Debug, Clone, PartialEq)]
 pub enum CteBody {
     Select(SelectStatement),
