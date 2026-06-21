@@ -3442,7 +3442,8 @@ impl Catalog {
         // a contiguous slice of changes targeting that table; a
         // mid-run change targeting a DIFFERENT table forces a
         // flush of the current run.
-        let mut runs: alloc::vec::Vec<(String, alloc::vec::Vec<&RowChange>)> = alloc::vec::Vec::new();
+        let mut runs: alloc::vec::Vec<(String, alloc::vec::Vec<&RowChange>)> =
+            alloc::vec::Vec::new();
         for change in changes {
             let table = match change {
                 RowChange::Insert { table, .. }
@@ -3484,8 +3485,7 @@ impl Catalog {
         // mapping that walks live indices in order). An `Update`
         // edits in place — collected into an overlay map keyed by
         // ORIGINAL row position so later Updates win.
-        let original_rows: alloc::vec::Vec<Row<'static>> =
-            table.rows().iter().cloned().collect();
+        let original_rows: alloc::vec::Vec<Row<'static>> = table.rows().iter().cloned().collect();
         let mut live: alloc::vec::Vec<bool> = alloc::vec![true; original_rows.len()];
         let mut tail: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
         // Overlay: index into ORIGINAL row space (existing rows
@@ -3498,11 +3498,7 @@ impl Catalog {
         // ABSOLUTE position in the unified live + tail space
         // by walking the live vector + tail. Returns None when
         // the position is out of range.
-        fn translate(
-            live: &[bool],
-            tail_len: usize,
-            current_pos: usize,
-        ) -> Option<usize> {
+        fn translate(live: &[bool], tail_len: usize, current_pos: usize) -> Option<usize> {
             // Walk live[..] counting live entries until we hit
             // current_pos. Then if not yet matched, dip into tail.
             let mut seen = 0usize;
@@ -3649,8 +3645,8 @@ impl Catalog {
             new_rows.push_mut(final_row);
         }
         for row in tail {
-            new_hot_bytes = new_hot_bytes
-                .saturating_add(row_body_encoded_len(&row, &schema_snapshot) as u64);
+            new_hot_bytes =
+                new_hot_bytes.saturating_add(row_body_encoded_len(&row, &schema_snapshot) as u64);
             new_rows.push_mut(row);
         }
         table.set_rows_and_rebuild_indices(new_rows, new_hot_bytes);

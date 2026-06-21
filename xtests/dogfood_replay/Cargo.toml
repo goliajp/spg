@@ -2,7 +2,6 @@
 name         = "spg-dogfood-replay"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "SPG dogfood-replay testbed — every customer prod incident encoded as a SPG-internal regression gate."

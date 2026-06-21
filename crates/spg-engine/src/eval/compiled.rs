@@ -336,16 +336,12 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 steps.push(Step::Subtree(e.clone()));
                 return;
             }
-            let op_c = operand
-                .as_deref()
-                .map(|o| compile_expr(o, ctx));
+            let op_c = operand.as_deref().map(|o| compile_expr(o, ctx));
             let branches_c: alloc::vec::Vec<(CompiledExpr, CompiledExpr)> = branches
                 .iter()
                 .map(|(w, t)| (compile_expr(w, ctx), compile_expr(t, ctx)))
                 .collect();
-            let else_c = else_branch
-                .as_deref()
-                .map(|el| compile_expr(el, ctx));
+            let else_c = else_branch.as_deref().map(|el| compile_expr(el, ctx));
             steps.push(Step::Case {
                 operand: op_c,
                 branches: branches_c,
