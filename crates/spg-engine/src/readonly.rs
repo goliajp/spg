@@ -186,6 +186,80 @@ impl Engine {
     /// post-LIMIT) for the `CommandComplete` tag. Non-SELECT
     /// statements surface as `Unsupported` so the caller can fall
     /// back to the materialising read path.
+    /// v7.37.x (docker-fair SCALARSQ wire-overhead attack) — prepared-
+    /// SelectStatement variant. Caller has already run
+    /// `parser::parse_statement_with` + `rewrite_clock_calls` +
+    /// `resolve_order_by_position` + `reorder::reorder_joins` (the
+    /// per-connection parse cache in spg-server's pgwire layer caches
+    /// the post-prepare AST and re-applies `rewrite_clock_calls` per
+    /// invocation since the clock value embedded in the AST drifts).
+    /// Otherwise identical to the SQL-string entry point.
+    pub fn prepare_select_streaming(
+        &self,
+        sql: &str,
+    ) -> Result<spg_sql::ast::SelectStatement, EngineError> {
+        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        let now_micros = self.clock.map(|f| f());
+        rewrite_clock_calls(&mut stmt, now_micros);
+        let Statement::Select(mut s) = stmt else {
+            return Err(EngineError::Unsupported(
+                "prepare_select_streaming: not a SELECT".into(),
+            ));
+        };
+        resolve_order_by_position(&mut s);
+        reorder::reorder_joins(&mut s, &self.catalog, &self.statistics);
+        Ok(s)
+    }
+
+    /// Re-apply `rewrite_clock_calls` to a previously-prepared AST
+    /// (cache-friendly: the cached AST's embedded clock literal gets
+    /// re-pointed to current time without re-parsing).
+    pub fn refresh_clock(&self, s: &mut spg_sql::ast::SelectStatement) {
+        let now_micros = self.clock.map(|f| f());
+        if now_micros.is_none() {
+            return;
+        }
+        // Wrap as Statement::Select temporarily to reuse the public
+        // walker; cheap (one enum tag manipulation).
+        let mut stmt = Statement::Select(core::mem::take(s));
+        rewrite_clock_calls(&mut stmt, now_micros);
+        if let Statement::Select(rewritten) = stmt {
+            *s = rewritten;
+        }
+    }
+
+    pub fn execute_readonly_select_streaming_prepared<F>(
+        &self,
+        s: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        mut emit: F,
+    ) -> Result<usize, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        cancel.check()?;
+        if !crate::expr_tree_has_subquery(s)
+            && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
+        {
+            return Ok(n);
+        }
+        let QueryResult::Rows { columns, rows } = self.exec_select_cancel(s, cancel)? else {
+            return Err(EngineError::Unsupported(
+                "streaming SELECT got a non-Rows result".into(),
+            ));
+        };
+        emit(crate::StreamItem::Header(&columns))?;
+        let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
+        for row in &rows {
+            cell_refs.clear();
+            for v in &row.values {
+                cell_refs.push(v);
+            }
+            emit(crate::StreamItem::Row(&cell_refs))?;
+        }
+        Ok(rows.len())
+    }
+
     pub fn execute_readonly_select_streaming<F>(
         &self,
         sql: &str,
