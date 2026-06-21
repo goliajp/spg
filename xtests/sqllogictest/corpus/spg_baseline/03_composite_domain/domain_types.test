@@ -1,0 +1,19 @@
+# CREATE DOMAIN with CHECK.
+
+statement ok
+CREATE DOMAIN nonneg AS INT CHECK (VALUE >= 0)
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, q nonneg NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement error
+INSERT INTO t VALUES (2, -1)
+
+query II rowsort
+SELECT id, q FROM t
+----
+1
+10

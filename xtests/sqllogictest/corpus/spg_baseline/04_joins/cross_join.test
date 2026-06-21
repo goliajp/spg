@@ -1,0 +1,25 @@
+# CROSS JOIN.
+
+statement ok
+CREATE TABLE a (x INT NOT NULL)
+
+statement ok
+CREATE TABLE b (y INT NOT NULL)
+
+statement ok
+INSERT INTO a VALUES (1), (2)
+
+statement ok
+INSERT INTO b VALUES (10), (20)
+
+query II rowsort
+SELECT a.x, b.y FROM a CROSS JOIN b
+----
+1
+10
+1
+20
+2
+10
+2
+20

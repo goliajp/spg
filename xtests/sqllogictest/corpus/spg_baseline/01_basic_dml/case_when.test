@@ -1,0 +1,17 @@
+# CASE WHEN expression.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, score INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 90), (2, 60), (3, 30)
+
+query IT rowsort
+SELECT id, CASE WHEN score >= 80 THEN 'A' WHEN score >= 50 THEN 'B' ELSE 'F' END FROM t ORDER BY id
+----
+1
+A
+2
+B
+3
+F

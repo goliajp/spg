@@ -1,0 +1,27 @@
+# COALESCE / NULLIF.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, a INT, b INT)
+
+statement ok
+INSERT INTO t VALUES (1, NULL, 5), (2, 10, NULL), (3, NULL, NULL)
+
+query II rowsort
+SELECT id, COALESCE(a, b, 0) FROM t ORDER BY id
+----
+1
+5
+2
+10
+3
+0
+
+query II rowsort
+SELECT id, NULLIF(a, 10) FROM t ORDER BY id
+----
+1
+NULL
+2
+NULL
+3
+NULL

@@ -1,0 +1,23 @@
+# Column / table alias.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+query II rowsort
+SELECT a AS x, b AS y FROM t
+----
+1
+10
+2
+20
+
+query II rowsort
+SELECT x.a, x.b FROM t AS x
+----
+1
+10
+2
+20

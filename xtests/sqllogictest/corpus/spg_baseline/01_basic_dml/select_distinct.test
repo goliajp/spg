@@ -1,0 +1,21 @@
+# SELECT DISTINCT — single + multi-column.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (1, 'x'), (2, 'y')
+
+query I rowsort
+SELECT DISTINCT a FROM t
+----
+1
+2
+
+query IT rowsort
+SELECT DISTINCT a, b FROM t
+----
+1
+x
+2
+y

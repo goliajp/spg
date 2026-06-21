@@ -1,0 +1,29 @@
+# Three-table join.
+
+statement ok
+CREATE TABLE a (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE b (id INT NOT NULL, a_id INT NOT NULL, kind TEXT NOT NULL)
+
+statement ok
+CREATE TABLE c (b_id INT NOT NULL, val INT NOT NULL)
+
+statement ok
+INSERT INTO a VALUES (1, 'A'), (2, 'B')
+
+statement ok
+INSERT INTO b VALUES (10, 1, 'x'), (11, 2, 'y')
+
+statement ok
+INSERT INTO c VALUES (10, 100), (11, 200)
+
+query TTI rowsort
+SELECT a.name, b.kind, c.val FROM a INNER JOIN b ON a.id = b.a_id INNER JOIN c ON b.id = c.b_id
+----
+A
+x
+100
+B
+y
+200

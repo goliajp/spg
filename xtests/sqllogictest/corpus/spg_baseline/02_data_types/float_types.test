@@ -1,0 +1,20 @@
+# FLOAT / REAL / DOUBLE PRECISION.
+
+statement ok
+CREATE TABLE t (f FLOAT, r REAL, d DOUBLE PRECISION)
+
+statement ok
+INSERT INTO t VALUES (1.5, 2.5, 3.5)
+
+statement ok
+INSERT INTO t VALUES (-0.25, -0.5, -1.25)
+
+query RRR rowsort
+SELECT f, r, d FROM t
+----
+-0.250
+-0.500
+-1.250
+1.500
+2.500
+3.500

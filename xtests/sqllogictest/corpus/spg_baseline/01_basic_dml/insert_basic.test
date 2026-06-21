@@ -1,0 +1,45 @@
+# INSERT VALUES single + multi, INSERT INTO ... SELECT.
+
+statement ok
+CREATE TABLE src (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE dst (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO src VALUES (1, 'a')
+
+statement ok
+INSERT INTO src VALUES (2, 'b'), (3, 'c'), (4, 'd')
+
+query IT rowsort
+SELECT * FROM src
+----
+1
+a
+2
+b
+3
+c
+4
+d
+
+statement ok
+INSERT INTO dst SELECT id, name FROM src WHERE id <= 2
+
+query IT rowsort
+SELECT * FROM dst
+----
+1
+a
+2
+b
+
+statement ok
+INSERT INTO dst (id, name) VALUES (99, 'x')
+
+query IT rowsort
+SELECT * FROM dst WHERE id = 99
+----
+99
+x

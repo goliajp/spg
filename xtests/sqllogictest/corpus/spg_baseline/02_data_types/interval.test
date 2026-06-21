@@ -1,0 +1,19 @@
+# INTERVAL literal + arithmetic. v7.37.5 PG type-completeness.
+# INTERVAL is available as an expression / literal type; the v7.37.5
+# column-type story is captured in the data-types audit notes.
+
+statement ok
+CREATE TABLE anchor (id INT NOT NULL, d DATE NOT NULL)
+
+statement ok
+INSERT INTO anchor VALUES (1, '2024-01-15')
+
+query T rowsort
+SELECT d + INTERVAL '1 day' FROM anchor
+----
+2024-01-16
+
+query T rowsort
+SELECT d + INTERVAL '5 days' FROM anchor
+----
+2024-01-20

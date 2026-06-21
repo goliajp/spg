@@ -1,0 +1,27 @@
+# Integer arithmetic: +, -, *, /.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (10, 3)
+
+query I rowsort
+SELECT a + b FROM t
+----
+13
+
+query I rowsort
+SELECT a - b FROM t
+----
+7
+
+query I rowsort
+SELECT a * b FROM t
+----
+30
+
+query I rowsort
+SELECT a / b FROM t
+----
+3

@@ -1,0 +1,24 @@
+# DATE / TIMESTAMP / INTERVAL.
+
+statement ok
+CREATE TABLE t (d DATE, ts TIMESTAMP)
+
+statement ok
+INSERT INTO t VALUES ('2024-01-15', '2024-01-15 12:34:56')
+
+query TT rowsort
+SELECT d, ts FROM t
+----
+2024-01-15
+2024-01-15 12:34:56
+
+# DATE arithmetic with INTERVAL — SPG returns DATE for whole-day intervals.
+query T rowsort
+SELECT d + INTERVAL '1 day' FROM t
+----
+2024-01-16
+
+query T rowsort
+SELECT d - INTERVAL '1 day' FROM t
+----
+2024-01-14

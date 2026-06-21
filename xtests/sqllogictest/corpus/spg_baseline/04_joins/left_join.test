@@ -1,0 +1,26 @@
+# LEFT JOIN (LEFT OUTER JOIN).
+
+statement ok
+CREATE TABLE a (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE b (a_id INT NOT NULL, val INT NOT NULL)
+
+statement ok
+INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+INSERT INTO b VALUES (1, 100), (2, 200)
+
+query ITI rowsort
+SELECT a.id, a.name, b.val FROM a LEFT JOIN b ON a.id = b.a_id
+----
+1
+x
+100
+2
+y
+200
+3
+z
+NULL
