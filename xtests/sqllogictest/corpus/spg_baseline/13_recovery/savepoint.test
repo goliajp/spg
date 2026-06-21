@@ -1,0 +1,28 @@
+# SAVEPOINT / ROLLBACK TO.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement ok
+SAVEPOINT sp1
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+ROLLBACK TO sp1
+
+statement ok
+COMMIT
+
+query II rowsort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10

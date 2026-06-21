@@ -1,0 +1,13 @@
+# PG || string concatenation.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'Hello', ' World')
+
+query IT rowsort
+SELECT id, a || b FROM t
+----
+1
+Hello World

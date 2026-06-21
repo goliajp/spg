@@ -1,0 +1,18 @@
+# PG DEFAULT clause.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, n INT NOT NULL DEFAULT 42)
+
+statement ok
+INSERT INTO t (id) VALUES (1)
+
+statement ok
+INSERT INTO t (id, n) VALUES (2, 99)
+
+query II rowsort
+SELECT id, n FROM t ORDER BY id
+----
+1
+42
+2
+99

@@ -1,0 +1,11 @@
+# PG-specific RETURNING — covered in 01_basic_dml. This file adds the
+# RETURNING * variant.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+query IT rowsort
+INSERT INTO t VALUES (1, 'a') RETURNING *
+----
+1
+a
