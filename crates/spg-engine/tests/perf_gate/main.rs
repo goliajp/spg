@@ -87,6 +87,7 @@ static PEAK_TRACKING_ALLOC: PeakTracker = PeakTracker;
 mod content_worker_top_n;
 mod count_unseen;
 mod join_reorder;
+mod mailrs_prod_cascade_100k;
 mod never_die;
 mod ordered_agg;
 mod plan_cache;
