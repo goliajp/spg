@@ -1318,7 +1318,7 @@ fn mentions_pg_table(sql_bytes: &[u8], table: &[u8]) -> bool {
 enum CannedResponse {
     Rows {
         columns: Vec<ColumnSchema>,
-        rows: Vec<Row>,
+        rows: Vec<Row<'static>>,
     },
     /// v4.15: empty-result statement that just needs a
     /// CommandComplete with a specific tag. Used for DISCARD ALL /
@@ -1331,7 +1331,7 @@ impl CannedResponse {
     fn single_text(col: &'static str, val: &'static str) -> Self {
         Self::Rows {
             columns: vec![ColumnSchema::new(col, DataType::Text, false)],
-            rows: vec![Row::new(vec![Value::Text(val.to_string())])],
+            rows: vec![Row::new(vec![Value::text(val)])],
         }
     }
 }
@@ -1385,8 +1385,8 @@ fn pg_class_response(state: &Arc<ServerState>) -> CannedResponse {
                 .map(|(i, name)| {
                     Row::new(vec![
                         Value::BigInt(16384 + i as i64), // synthetic oid (PG user oids start ~16384)
-                        Value::Text(name),
-                        Value::Text("r".to_string()),
+                        Value::text(name),
+                        Value::text("r"),
                         Value::BigInt(2200), // public schema oid
                         Value::BigInt(10),   // owner oid (synthetic admin)
                     ])
@@ -1405,7 +1405,7 @@ fn pg_namespace_response() -> CannedResponse {
     ];
     let rows = vec![Row::new(vec![
         Value::BigInt(2200),
-        Value::Text("public".to_string()),
+        Value::text("public"),
         Value::BigInt(10),
     ])];
     CannedResponse::Rows { columns, rows }
@@ -1419,7 +1419,7 @@ fn pg_database_response() -> CannedResponse {
     ];
     let rows = vec![Row::new(vec![
         Value::BigInt(16384),
-        Value::Text("spg".to_string()),
+        Value::text("spg"),
         Value::BigInt(10),
     ])];
     CannedResponse::Rows { columns, rows }
@@ -1436,7 +1436,7 @@ fn pg_user_response(state: &Arc<ServerState>) -> CannedResponse {
         .map(|e| {
             if e.users().is_empty() {
                 vec![Row::new(vec![
-                    Value::Text("admin".to_string()),
+                    Value::text("admin"),
                     Value::Bool(true),
                 ])]
             } else {
@@ -1444,7 +1444,7 @@ fn pg_user_response(state: &Arc<ServerState>) -> CannedResponse {
                     .iter()
                     .map(|(name, rec)| {
                         Row::new(vec![
-                            Value::Text(name.to_string()),
+                            Value::text(name.to_string()),
                             Value::Bool(matches!(rec.role, spg_engine::Role::Admin)),
                         ])
                     })
@@ -1470,9 +1470,9 @@ fn pg_tables_response(state: &Arc<ServerState>) -> CannedResponse {
                 .into_iter()
                 .map(|name| {
                     Row::new(vec![
-                        Value::Text("public".to_string()),
-                        Value::Text(name),
-                        Value::Text("admin".to_string()),
+                        Value::text("public"),
+                        Value::text(name),
+                        Value::text("admin"),
                     ])
                 })
                 .collect()
@@ -1530,7 +1530,7 @@ struct Portal {
     /// Bound parameter values, already decoded from text format
     /// into typed `spg_storage::Value`s. Empty when the prepared
     /// statement has no `$N` placeholders.
-    params: Vec<spg_storage::Value>,
+    params: Vec<spg_storage::Value<'static>>,
 }
 
 /// Parse a null-terminated C string starting at `pos` of `body`.
@@ -1695,7 +1695,7 @@ fn handle_bind(
     // `Value::Text`; the engine's `coerce_value` path turns Text
     // into the column's declared type at row-insert time, same as
     // simple-query INSERT VALUES would.
-    let mut params: Vec<spg_storage::Value> = Vec::with_capacity(param_count);
+    let mut params: Vec<spg_storage::Value<'static>> = Vec::with_capacity(param_count);
     for i in 0..param_count {
         if cur + 4 > body.len() {
             return Err("Bind: truncated parameter length".into());
@@ -1743,7 +1743,7 @@ fn handle_bind(
 /// would then fail to compare against an INT column without an
 /// explicit cast). The narrowing is conservative: only inputs
 /// that round-trip cleanly to text get the typed treatment.
-fn text_param_to_value(s: &str) -> spg_storage::Value {
+fn text_param_to_value(s: &str) -> spg_storage::Value<'static> {
     let trimmed = s.trim();
     if trimmed.eq_ignore_ascii_case("true") {
         return spg_storage::Value::Bool(true);
@@ -1765,9 +1765,9 @@ fn text_param_to_value(s: &str) -> spg_storage::Value {
     // the 128-float text literal through the SQL lexer when the same
     // prepared statement runs across many embeddings.
     if let Some(v) = parse_vector_text(trimmed) {
-        return spg_storage::Value::Vector(v);
+        return spg_storage::Value::vector(v);
     }
-    spg_storage::Value::Text(s.to_string())
+    spg_storage::Value::text(s)
 }
 
 /// v6.3.4 — decode a binary-format Bind parameter according to its
@@ -1791,7 +1791,7 @@ fn text_param_to_value(s: &str) -> spg_storage::Value {
 ///   1700 = numeric       (variable-precision packed-digit format)
 ///
 /// Unknown OID + binary format → error (text is the safe default).
-fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, String> {
+fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value<'static>, String> {
     use spg_storage::Value;
     match oid {
         16 => {
@@ -1821,11 +1821,15 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
                             acc.push_str(&format!("{b:02x}"));
                             acc
                         });
-                Ok(Value::Text(if s.is_empty() { "\\x".into() } else { s }))
+                Ok(Value::text(if s.is_empty() {
+                    "\\x".to_string()
+                } else {
+                    s
+                }))
             } else {
                 let s = std::str::from_utf8(bytes)
                     .map_err(|_| "Bind binary TEXT/VARCHAR: invalid UTF-8".to_string())?;
-                Ok(Value::Text(s.to_string()))
+                Ok(Value::text(s))
             }
         }
         20 => {
@@ -1959,7 +1963,7 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
 /// PG binary NUMERIC: `i16 ndigits; i16 weight; i16 sign; i16 dscale;
 /// i16 digits[ndigits]` (each digit is a base-10000 chunk). Reconstruct
 /// to canonical scaled-i128 form.
-fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value, String> {
+fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value<'static>, String> {
     if bytes.len() < 8 {
         return Err("Bind binary NUMERIC: header truncated".into());
     }
@@ -2318,9 +2322,9 @@ fn render_show(name: &str, settings: &std::collections::HashMap<String, String>)
             ColumnSchema::new("setting", DataType::Text, false),
             ColumnSchema::new("description", DataType::Text, true),
         ];
-        let rows: Vec<Row> = entries
+        let rows: Vec<Row<'static>> = entries
             .into_iter()
-            .map(|(n, v)| Row::new(vec![Value::Text(n), Value::Text(v), Value::Null]))
+            .map(|(n, v)| Row::new(vec![Value::text(n), Value::text(v), Value::Null]))
             .collect();
         return CannedResponse::Rows { columns, rows };
     }
@@ -2337,7 +2341,7 @@ fn render_show(name: &str, settings: &std::collections::HashMap<String, String>)
     let columns = vec![ColumnSchema::new(name.to_string(), DataType::Text, false)];
     CannedResponse::Rows {
         columns,
-        rows: vec![Row::new(vec![Value::Text(value)])],
+        rows: vec![Row::new(vec![Value::text(value)])],
     }
 }
 
@@ -3972,7 +3976,7 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
         // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
         // must round-trip to a literal pg_dump would emit (i.e.
