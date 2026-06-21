@@ -933,7 +933,10 @@ impl PreparedEntry {
 ///       signed) + per-value encoded data
 ///     * == 0: reuse last bound types (we don't cache, so this
 ///       surfaces as an error)
-fn parse_execute_params(entry: &PreparedEntry, payload: &[u8]) -> Result<Vec<Value>, String> {
+fn parse_execute_params(
+    entry: &PreparedEntry,
+    payload: &[u8],
+) -> Result<Vec<Value<'static>>, String> {
     let n = entry.param_count as usize;
     if n == 0 {
         return Ok(Vec::new());
@@ -976,7 +979,11 @@ fn parse_execute_params(entry: &PreparedEntry, payload: &[u8]) -> Result<Vec<Val
     Ok(out)
 }
 
-fn decode_binary_param(ty: u8, unsigned: bool, buf: &[u8]) -> Result<(Value, usize), String> {
+fn decode_binary_param(
+    ty: u8,
+    unsigned: bool,
+    buf: &[u8],
+) -> Result<(Value<'static>, usize), String> {
     match ty {
         // MYSQL_TYPE_TINY
         0x01 => {
@@ -1069,7 +1076,7 @@ fn decode_binary_param(ty: u8, unsigned: bool, buf: &[u8]) -> Result<(Value, usi
                     _ => 1,
                 };
             let s = String::from_utf8_lossy(&bytes).into_owned();
-            Ok((Value::Text(s), consumed))
+            Ok((Value::text(s), consumed))
         }
         other => Err(format!("unsupported binary param type 0x{other:02x}")),
     }
@@ -1227,7 +1234,7 @@ fn value_to_mysql_text(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Date(days) => format_date_mysql(*days),
         Value::Timestamp(us) => format_timestamp_mysql(*us),
         // Other types fall through to engine's canonical text

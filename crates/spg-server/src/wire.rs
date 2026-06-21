@@ -243,9 +243,9 @@ fn value_to_wire(v: &Value) -> WireValue {
         // v4.9: TEXT and JSON ride the wire identically — the
         // client's column type (RowDescription OID) carries the
         // "this is JSON" semantic.
-        Value::Text(s) | Value::Json(s) => WireValue::Text(s.clone()),
+        Value::Text(s) | Value::Json(s) => WireValue::Text(s.to_string()),
         Value::Bool(b) => WireValue::Bool(*b),
-        Value::Vector(v) => WireValue::Vector(v.clone()),
+        Value::Vector(v) => WireValue::Vector(v.to_vec()),
         // v6.0.1: SQ8 cells dequantise to f32 on the wire so
         // pgwire clients (psql, drivers, the conformance corpora)
         // see the same `WireValue::Vector` shape regardless of
@@ -342,7 +342,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         }
         // XML rides the wire as raw text — clients use OID 142 in
         // RowDescription to decode.
-        Value::Xml(s) => WireValue::Text(s.clone()),
+        Value::Xml(s) => WireValue::Text(s.to_string()),
         // `"char"` is a single byte; render as one-char string
         // (matches PG: `'A'::"char"` renders `A`).
         Value::Char1(b) => WireValue::Text((*b as char).to_string()),

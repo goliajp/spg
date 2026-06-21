@@ -1876,9 +1876,7 @@ fn handle_set_wal_level(
 /// row `(effective_wal_level TEXT NOT NULL)`.
 fn handle_show_wal_level(stream: &mut TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let level = state.wal_level.load(Ordering::Acquire);
-    let row = vec![Row::new(vec![Value::Text(
-        wal_level_label(level).to_string(),
-    )])];
+    let row = vec![Row::new(vec![Value::text(wal_level_label(level))])];
     let columns = vec![ColumnSchema::new(
         "effective_wal_level",
         DataType::Text,
