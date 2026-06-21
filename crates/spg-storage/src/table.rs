@@ -1156,6 +1156,31 @@ impl Table {
     }
 
     pub fn delete_rows(&mut self, positions: &[usize]) -> usize {
+        let removed = self.delete_rows_no_index(positions);
+        if removed > 0 {
+            self.rebuild_indices();
+            // v7.34 — capture row-level redo. Record the input positions
+            // (replay's `delete_rows` dedups + bounds-filters identically);
+            // skip a no-op delete so the log stays minimal.
+            self.record_redo(|table| RowChange::Delete {
+                table,
+                positions: positions.to_vec(),
+            });
+        }
+        removed
+    }
+
+    /// v7.37.5 (mailrs crash-recovery Ask 3) — row-only delete for the
+    /// WAL-replay batch path: removes the rows + decrements `hot_bytes`,
+    /// **does NOT** call `rebuild_indices()` and does **NOT** capture
+    /// redo. The caller is responsible for invoking `rebuild_indices_pub`
+    /// once after a sequence of `*_no_index` mutations on this table.
+    /// Skipping the per-call rebuild closes the
+    /// O(records × rows × indices × log rows) replay blow-up
+    /// (5000 DELETEs × 100k × 13 × ln 100k ≈ minutes → seconds).
+    /// Returns the number of rows actually removed (dedup + bounds-
+    /// filtered identically to `delete_rows`).
+    pub fn delete_rows_no_index(&mut self, positions: &[usize]) -> usize {
         if positions.is_empty() {
             return 0;
         }
@@ -1170,6 +1195,9 @@ impl Table {
                 removed += 1;
             }
         }
+        if removed == 0 {
+            return 0;
+        }
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
         let mut removed_bytes: u64 = 0;
         for (i, row) in self.rows.iter().enumerate() {
@@ -1182,17 +1210,96 @@ impl Table {
         }
         self.rows = new_rows;
         self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
+        removed
+    }
+
+    /// v7.37.5 — public alias for the private `rebuild_indices` helper.
+    /// Used by `Catalog::apply_redo` to coalesce per-record rebuilds
+    /// across a batch of `RowChange`s into one rebuild per touched table.
+    pub fn rebuild_indices_pub(&mut self) {
         self.rebuild_indices();
-        // v7.34 — capture row-level redo. Record the input positions
-        // (replay's `delete_rows` dedups + bounds-filters identically);
-        // skip a no-op delete so the log stays minimal.
-        if removed > 0 {
-            self.record_redo(|table| RowChange::Delete {
-                table,
-                positions: positions.to_vec(),
+    }
+
+    /// v7.37.5 (mailrs crash-recovery Ask 3) — replace the table's
+    /// row vector + `hot_bytes` in one shot, then rebuild every
+    /// index from the new rows. Used by `Catalog::apply_redo`'s
+    /// batched run: a contiguous slice of `RowChange`s targeting
+    /// this table is composed into a final `(PersistentVec<Row>,
+    /// hot_bytes)` pair via in-memory bookkeeping, then handed to
+    /// this method ONCE for index regeneration. Replaces N per-
+    /// record `rebuild_indices` calls with 1 per run.
+    pub fn set_rows_and_rebuild_indices(
+        &mut self,
+        new_rows: PersistentVec<Row<'static>>,
+        new_hot_bytes: u64,
+    ) {
+        self.rows = new_rows;
+        self.hot_bytes = new_hot_bytes;
+        self.rebuild_indices();
+    }
+
+    /// v7.37.5 (mailrs crash-recovery Ask 3) — row-only insert for the
+    /// WAL-replay batch path: pushes the row + bumps `hot_bytes`, and
+    /// **does NOT** update any index (B-tree, GIN, NSW). The caller is
+    /// responsible for invoking `rebuild_indices_pub` once after a
+    /// sequence of `*_no_index` mutations on this table.
+    /// Schema validation (arity + per-column type compatibility) is
+    /// applied so a malformed redo log surfaces honestly.
+    pub fn insert_no_index(&mut self, row: Row<'static>) -> Result<(), StorageError> {
+        if row.len() != self.schema.columns.len() {
+            return Err(StorageError::ArityMismatch {
+                expected: self.schema.columns.len(),
+                actual: row.len(),
             });
         }
-        removed
+        validate_row_against_schema(&row.values, &self.schema)?;
+        self.hot_bytes = self
+            .hot_bytes
+            .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
+        self.rows.push_mut(row);
+        Ok(())
+    }
+
+    /// v7.37.5 (mailrs crash-recovery Ask 3) — row-only update for the
+    /// WAL-replay batch path: replaces the row at `position` + adjusts
+    /// `hot_bytes`, and **does NOT** touch any index. Skipping the
+    /// per-update incremental index work is safe because the trailing
+    /// `rebuild_indices_pub` regenerates indices from `self.rows` in
+    /// their final state.
+    pub fn update_row_no_index(
+        &mut self,
+        position: usize,
+        new_values: Vec<Value<'static>>,
+    ) -> Result<(), StorageError> {
+        if position >= self.rows.len() {
+            return Err(StorageError::Corrupt(alloc::format!(
+                "update_row_no_index: position {position} out of bounds (rows={})",
+                self.rows.len()
+            )));
+        }
+        if new_values.len() != self.schema.columns.len() {
+            return Err(StorageError::ArityMismatch {
+                expected: self.schema.columns.len(),
+                actual: new_values.len(),
+            });
+        }
+        validate_row_against_schema(&new_values, &self.schema)?;
+        let old_row = self
+            .rows
+            .get(position)
+            .expect("position bounds-checked above");
+        let old_bytes = row_body_encoded_len(old_row, &self.schema) as u64;
+        let new_row = Row::new(new_values);
+        let new_bytes = row_body_encoded_len(&new_row, &self.schema) as u64;
+        self.rows = self
+            .rows
+            .set(position, new_row)
+            .expect("position bounds-checked above");
+        self.hot_bytes = self
+            .hot_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        Ok(())
     }
 
     /// v4.4: replace the row at `position` with `new_values` (must
@@ -1667,6 +1774,61 @@ impl Table {
         }
         Ok(())
     }
+}
+
+/// v7.37.5 (mailrs crash-recovery Ask 3) — per-cell schema-compat
+/// check shared by `insert_no_index` and `update_row_no_index`. The
+/// logic mirrors the inline body in `insert` / `update_row` (NULL
+/// handling, the cross-type compatibility map: TEXT ↔ VARCHAR/CHAR/
+/// JSON/JSONB, TIMESTAMP ↔ TIMESTAMPTZ, BIT ↔ VARBIT, INET ↔ CIDR,
+/// NUMERIC scale match).
+fn validate_row_against_schema(
+    values: &[Value<'static>],
+    schema: &TableSchema,
+) -> Result<(), StorageError> {
+    for (i, (val, col)) in values.iter().zip(&schema.columns).enumerate() {
+        if val.is_null() {
+            if !col.nullable {
+                return Err(StorageError::NullInNotNull {
+                    column: col.name.clone(),
+                });
+            }
+            continue;
+        }
+        let actual = val.data_type().expect("non-null");
+        let compatible = actual == col.ty
+            || matches!(
+                (actual, col.ty),
+                (
+                    DataType::Text,
+                    DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
+                ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                    | (DataType::Json, DataType::Jsonb)
+                    | (DataType::Jsonb, DataType::Json)
+                    | (DataType::Timestamp, DataType::Timestamptz)
+                    | (DataType::Timestamptz, DataType::Timestamp)
+                    | (DataType::Bit, DataType::BitVarying)
+                    | (DataType::BitVarying, DataType::Bit)
+                    | (DataType::Inet, DataType::Cidr)
+                    | (DataType::Cidr, DataType::Inet)
+            )
+            || matches!(
+                (actual, col.ty),
+                (
+                    DataType::Numeric { scale: a, .. },
+                    DataType::Numeric { scale: b, .. },
+                ) if a == b
+            );
+        if !compatible {
+            return Err(StorageError::TypeMismatch {
+                column: col.name.clone(),
+                expected: col.ty,
+                actual,
+                position: i,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// v6.0.4 — re-encode a single cell to the target `VecEncoding`.
