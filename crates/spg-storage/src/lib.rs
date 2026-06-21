@@ -1507,11 +1507,23 @@ pub enum IndexKey {
 }
 
 impl IndexKey {
+    /// v7.37.43 (INSUBQ B-4) — inline-friendly BigInt fast path.
+    /// `try_count_star_pk_in_subquery_fast` (and any other hot loop
+    /// probing an integer PK) already holds an `i64`; this builds the
+    /// `IndexKey` without going through the generic `from_value`
+    /// dispatch tree.
+    #[inline]
+    pub fn from_i64(n: i64) -> Self {
+        Self::Int(n)
+    }
+
     pub fn from_value(v: &Value<'_>) -> Option<Self> {
         match v {
+            // v7.37.43 (INSUBQ B-4) — BigInt hits first (the dominant
+            // INSUBQ shape probes PK as BigInt). Tiny micro-win.
+            Value::BigInt(n) => Some(Self::Int(*n)),
             Value::SmallInt(n) => Some(Self::Int(i64::from(*n))),
             Value::Int(n) => Some(Self::Int(i64::from(*n))),
-            Value::BigInt(n) => Some(Self::Int(*n)),
             Value::Text(s) => Some(Self::Text(s.clone().into_owned())),
             Value::Bool(b) => Some(Self::Bool(*b)),
             // Date/Timestamp use their integer storage repr as the
@@ -2156,6 +2168,24 @@ impl Index {
             // BRIN / NSW / GIN / trigram-GIN / fulltext-GIN have
             // no IndexKey-keyed map; lookup is a no-op. GIN uses
             // [`Index::gin_lookup_word`] instead.
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => &[][..],
+        }
+    }
+
+    /// v7.37.43 (INSUBQ B-2) — specialised lookup for integer-PK probes.
+    /// `try_count_star_pk_in_subquery_fast` already holds an `i64` (the
+    /// inner survivor key); skip the `IndexKey::from_value` enum-dispatch
+    /// trip and build the key inline. ~20 ns × N_survivors saved on
+    /// the INSUBQ hot loop.
+    #[inline]
+    pub fn lookup_eq_i64(&self, n: i64) -> &[RowLocator] {
+        match &self.kind {
+            IndexKind::BTree(m) => m.get(&IndexKey::Int(n)).map_or(&[][..], Vec::as_slice),
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
