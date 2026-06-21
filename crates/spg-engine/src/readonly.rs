@@ -228,6 +228,26 @@ impl Engine {
         }
     }
 
+    /// v7.37.x (docker-fair SCALARSQ wire-overhead attack) — prepared
+    /// SELECT that returns the full materialised `QueryResult` instead
+    /// of driving an emit closure per row. The streaming variant is
+    /// only a win when the engine can stream rows lazily (joined
+    /// non-aggregate projection through `try_exec_joined_streaming`);
+    /// for shapes that materialise inside the engine anyway (anything
+    /// with a subquery — including the SCALARSQ shape — and most
+    /// aggregates), the emit closure dispatch + cell_refs Vec
+    /// management add ~25-50 µs / 100-row response for zero benefit.
+    /// This API lets the caller skip the streaming wrapper entirely
+    /// and iterate the result rows directly into the wire encoder.
+    pub fn execute_readonly_select_prepared(
+        &self,
+        s: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
+        self.exec_select_cancel(s, cancel)
+    }
+
     pub fn execute_readonly_select_streaming_prepared<F>(
         &self,
         s: &spg_sql::ast::SelectStatement,

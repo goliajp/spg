@@ -4023,7 +4023,7 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
 /// Quick scan for any subquery-bearing node in a SELECT's WHERE /
 /// projection / `order_by` — saves cloning the AST when there are
 /// none (the common case).
-pub(crate) fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
+pub fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
     let mut any = false;
     for item in &stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
