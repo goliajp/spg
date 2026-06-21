@@ -48,7 +48,7 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
 /// the v7.16.2 view returns the columns mailrs probes; broader
 /// PG-spec parity (ordinal_position, is_nullable, character_
 /// maximum_length, udt_name, …) lands as needed.
-pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
@@ -58,24 +58,24 @@ pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSche
         ColumnSchema::new("is_nullable", DataType::Text, false),
         ColumnSchema::new("data_type", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             rows.push(Row::new(alloc::vec![
-                Value::Text("spg".into()),
-                Value::Text("public".into()),
-                Value::Text(tname.clone()),
-                Value::Text(col.name.clone()),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text(col.name.clone()),
                 Value::Int(ordinal),
-                Value::Text(if col.nullable {
-                    "YES".into()
+                Value::text::<&str>(if col.nullable {
+                    "YES"
                 } else {
-                    "NO".into()
+                    "NO"
                 }),
-                Value::Text(pg_data_type_text(col.ty)),
+                Value::text(pg_data_type_text(col.ty)),
             ]));
         }
     }
@@ -83,20 +83,20 @@ pub(crate) fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSche
 }
 
 /// v7.16.2 — synthesise `information_schema.tables`.
-pub(crate) fn synth_information_schema_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_information_schema_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
         ColumnSchema::new("table_type", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         rows.push(Row::new(alloc::vec![
-            Value::Text("spg".into()),
-            Value::Text("public".into()),
-            Value::Text(tname.clone()),
-            Value::Text("BASE TABLE".into()),
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(tname.clone()),
+            Value::text("BASE TABLE"),
         ]));
     }
     (schema, rows)
@@ -105,17 +105,17 @@ pub(crate) fn synth_information_schema_tables(cat: &Catalog) -> (Vec<ColumnSchem
 /// v7.16.2 — synthesise `pg_catalog.pg_class`. Minimum shape
 /// for psql `\d` / ORM probes: `relname` + `relkind`. Each
 /// user table emits one row.
-pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("relname", DataType::Text, false),
         ColumnSchema::new("relkind", DataType::Text, false),
         ColumnSchema::new("relnamespace", DataType::BigInt, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         rows.push(Row::new(alloc::vec![
-            Value::Text(tname.clone()),
-            Value::Text("r".into()),
+            Value::text(tname.clone()),
+            Value::text("r"),
             Value::BigInt(2200), // PG's `public` namespace OID
         ]));
     }
@@ -125,7 +125,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// v7.16.2 — synthesise `pg_catalog.pg_attribute`. Minimum
 /// shape: `attrelid` (text — SPG has no OID), `attname`,
 /// `attnum`, `atttypid` (text), `attnotnull`.
-pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("attrelid", DataType::Text, false),
         ColumnSchema::new("attname", DataType::Text, false),
@@ -133,17 +133,17 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
         ColumnSchema::new("atttypid", DataType::Text, false),
         ColumnSchema::new("attnotnull", DataType::Bool, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             rows.push(Row::new(alloc::vec![
-                Value::Text(tname.clone()),
-                Value::Text(col.name.clone()),
+                Value::text(tname.clone()),
+                Value::text(col.name.clone()),
                 Value::Int(ordinal),
-                Value::Text(pg_data_type_text(col.ty)),
+                Value::text(pg_data_type_text(col.ty)),
                 Value::Bool(!col.nullable),
             ]));
         }
@@ -167,7 +167,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
 /// Other pg_type columns (typowner, typinput/typoutput, etc.)
 /// land in follow-up work — sqlx encoders don't query them at
 /// connect time.
-pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("typname", DataType::Text, false),
@@ -256,14 +256,14 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
         (3643, "_tsvector", 3614),
         (3645, "_tsquery", 3615),
     ];
-    let mut rows: Vec<Row> = Vec::with_capacity(scalars.len() + arrays.len());
+    let mut rows: Vec<Row<'static>> = Vec::with_capacity(scalars.len() + arrays.len());
     for &(oid, name, len, ty, cat, elem, arr) in scalars {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
-            Value::Text(name.into()),
+            Value::text::<String>(name.into()),
             Value::SmallInt(len),
-            Value::Text(ty.into()),
-            Value::Text(cat.into()),
+            Value::text::<String>(ty.into()),
+            Value::text::<String>(cat.into()),
             Value::BigInt(elem),
             Value::BigInt(arr),
             Value::BigInt(2200),
@@ -272,10 +272,10 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
     for &(oid, name, elem) in arrays {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
-            Value::Text(name.into()),
+            Value::text::<String>(name.into()),
             Value::SmallInt(-1),
-            Value::Text("b".into()),
-            Value::Text("A".into()),
+            Value::text::<String>("b".into()),
+            Value::text::<String>("A".into()),
             Value::BigInt(elem),
             Value::BigInt(0),
             Value::BigInt(2200),
@@ -302,7 +302,7 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// 'O'/'D') plus pragmatic text columns PG keeps relational
 /// (relname, timing, events, function) so health checks don't need
 /// oid joins.
-pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("tgname", DataType::Text, false),
         ColumnSchema::new("relname", DataType::Text, false),
@@ -311,24 +311,24 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
         ColumnSchema::new("events", DataType::Text, false),
         ColumnSchema::new("function", DataType::Text, false),
     ];
-    let rows: Vec<Row> = cat
+    let rows: Vec<Row<'static>> = cat
         .triggers()
         .iter()
         .map(|t| {
             Row::new(alloc::vec![
-                Value::Text(t.name.clone()),
-                Value::Text(t.table.clone()),
-                Value::Text(if t.enabled { "O".into() } else { "D".into() }),
-                Value::Text(t.timing.clone()),
-                Value::Text(t.events.join(" OR ")),
-                Value::Text(t.function.clone()),
+                Value::text(t.name.clone()),
+                Value::text(t.table.clone()),
+                Value::text(if t.enabled { "O" } else { "D" }),
+                Value::text(t.timing.clone()),
+                Value::text(t.events.join(" OR ")),
+                Value::text(t.function.clone()),
             ])
         })
         .collect();
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("proname", DataType::Text, false),
@@ -416,13 +416,13 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
         (3108, "last_value", "w", 1, 2283),
         (3109, "nth_value", "w", 2, 2283),
     ];
-    let mut rows: Vec<Row> = Vec::with_capacity(funcs.len());
+    let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
     for &(oid, name, kind, nargs, rettype) in funcs {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
-            Value::Text(name.into()),
+            Value::text::<String>(name.into()),
             Value::BigInt(11),
-            Value::Text(kind.into()),
+            Value::text::<String>(kind.into()),
             Value::Int(nargs),
             Value::BigInt(rettype),
         ]));
@@ -435,24 +435,24 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// connect time to list accounts. SPG ships one row per
 /// UserStore entry plus a synthetic `root` superuser row for
 /// MySQL bootstrap compat.
-pub(crate) fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("user", DataType::Text, false),
         ColumnSchema::new("host", DataType::Text, false),
         ColumnSchema::new("select_priv", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     rows.push(Row::new(alloc::vec![
-        Value::Text("root".into()),
-        Value::Text("localhost".into()),
-        Value::Text("Y".into()),
+        Value::text("root"),
+        Value::text("localhost"),
+        Value::text("Y"),
     ]));
     for (name, _) in engine.users.iter() {
         if name != "root" {
             rows.push(Row::new(alloc::vec![
-                Value::Text(name.to_string()),
-                Value::Text("%".into()),
-                Value::Text("Y".into()),
+                Value::text(name.to_string()),
+                Value::text::<String>("%".into()),
+                Value::text::<String>("Y".into()),
             ]));
         }
     }
@@ -463,7 +463,7 @@ pub(crate) fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>)
 /// per-database privileges table. SPG is single-database so the
 /// table surfaces one row per declared user with full privileges
 /// on the canonical `postgres` database.
-pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("host", DataType::Text, false),
         ColumnSchema::new("db", DataType::Text, false),
@@ -471,10 +471,10 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row>) {
         ColumnSchema::new("select_priv", DataType::Text, false),
     ];
     let rows = alloc::vec![Row::new(alloc::vec![
-        Value::Text("localhost".into()),
-        Value::Text("postgres".into()),
-        Value::Text("root".into()),
-        Value::Text("Y".into()),
+        Value::text("localhost"),
+        Value::text("postgres"),
+        Value::text("root"),
+        Value::text::<String>("Y".into()),
     ])];
     (schema, rows)
 }
@@ -491,7 +491,7 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row>) {
 ///   * ORDINAL_POSITION (Int)
 ///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
 ///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
-pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("constraint_name", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
@@ -500,7 +500,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
         ColumnSchema::new("referenced_table_name", DataType::Text, false),
         ColumnSchema::new("referenced_column_name", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let cols = &t.schema().columns;
@@ -527,12 +527,12 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                 #[allow(clippy::cast_possible_wrap)]
                 let ordinal = (i + 1) as i32;
                 rows.push(Row::new(alloc::vec![
-                    Value::Text(conname.clone()),
-                    Value::Text(tname.clone()),
-                    Value::Text(col_name_at(local)),
+                    Value::text(conname.clone()),
+                    Value::text(tname.clone()),
+                    Value::text(col_name_at(local)),
                     Value::Int(ordinal),
-                    Value::Text(fk.parent_table.clone()),
-                    Value::Text(parent_name),
+                    Value::text(fk.parent_table.clone()),
+                    Value::text(parent_name),
                 ]));
             }
         }
@@ -547,12 +547,12 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                 #[allow(clippy::cast_possible_wrap)]
                 let ordinal = (i + 1) as i32;
                 rows.push(Row::new(alloc::vec![
-                    Value::Text(conname.clone()),
-                    Value::Text(tname.clone()),
-                    Value::Text(col_name_at(local)),
+                    Value::text(conname.clone()),
+                    Value::text(tname.clone()),
+                    Value::text(col_name_at(local)),
                     Value::Int(ordinal),
-                    Value::Text(String::new()),
-                    Value::Text(String::new()),
+                    Value::text(String::new()),
+                    Value::text(String::new()),
                 ]));
             }
         }
@@ -562,7 +562,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
 
 /// v7.17.0 Phase 3.P0-64 — synthesise
 /// `information_schema.REFERENTIAL_CONSTRAINTS`. One row per FK.
-pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("constraint_name", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
@@ -579,7 +579,7 @@ pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSc
             spg_storage::FkAction::NoAction => "NO ACTION",
         }
     }
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
@@ -588,11 +588,11 @@ pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSc
                 .clone()
                 .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
             rows.push(Row::new(alloc::vec![
-                Value::Text(conname),
-                Value::Text(tname.clone()),
-                Value::Text(fk.parent_table.clone()),
-                Value::Text(rule_name(fk.on_update).into()),
-                Value::Text(rule_name(fk.on_delete).into()),
+                Value::text(conname),
+                Value::text(tname.clone()),
+                Value::text(fk.parent_table.clone()),
+                Value::text::<String>(rule_name(fk.on_update).into()),
+                Value::text::<String>(rule_name(fk.on_delete).into()),
             ]));
         }
     }
@@ -602,7 +602,7 @@ pub(crate) fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSc
 /// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.STATISTICS`.
 /// One row per (index × column) — admin tools walk this to
 /// surface index-cardinality estimates.
-pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_name", DataType::Text, false),
         ColumnSchema::new("index_name", DataType::Text, false),
@@ -611,7 +611,7 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
         ColumnSchema::new("non_unique", DataType::Int, false),
         ColumnSchema::new("index_type", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
@@ -621,12 +621,12 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
                 .get(idx.column_position)
                 .map_or("?".into(), |c| c.name.clone());
             rows.push(Row::new(alloc::vec![
-                Value::Text(tname.clone()),
-                Value::Text(idx.name.clone()),
-                Value::Text(col),
+                Value::text(tname.clone()),
+                Value::text(idx.name.clone()),
+                Value::text(col),
                 Value::Int(1),
                 Value::Int(i32::from(!idx.is_unique)),
-                Value::Text("BTREE".into()),
+                Value::text("BTREE"),
             ]));
         }
     }
@@ -636,7 +636,7 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
 /// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.ROUTINES`.
 /// SPG has no user-defined functions in v7.17 so the surface is
 /// always empty; admin tools just need the table to exist.
-pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("routine_name", DataType::Text, false),
         ColumnSchema::new("routine_type", DataType::Text, false),
@@ -659,7 +659,7 @@ pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row>) {
 ///     empty string otherwise)
 ///   * conkey (Text) — comma-separated column names
 ///   * confkey (Text) — comma-separated parent column names (FK only)
-pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("conname", DataType::Text, false),
         ColumnSchema::new("contype", DataType::Text, false),
@@ -668,7 +668,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
         ColumnSchema::new("conkey", DataType::Text, false),
         ColumnSchema::new("confkey", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let cols = &t.schema().columns;
@@ -686,12 +686,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
             };
             let conkey: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
             rows.push(Row::new(alloc::vec![
-                Value::Text(conname),
-                Value::Text(kind.into()),
-                Value::Text(tname.clone()),
-                Value::Text(String::new()),
-                Value::Text(conkey.join(",")),
-                Value::Text(String::new()),
+                Value::text(conname),
+                Value::text::<String>(kind.into()),
+                Value::text(tname.clone()),
+                Value::text(String::new()),
+                Value::text(conkey.join(",")),
+                Value::text(String::new()),
             ]));
         }
         // Single-column PK / UNIQUE indexes that have no
@@ -717,12 +717,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
                 continue;
             }
             rows.push(Row::new(alloc::vec![
-                Value::Text(conname),
-                Value::Text(kind.into()),
-                Value::Text(tname.clone()),
-                Value::Text(String::new()),
-                Value::Text(col_name),
-                Value::Text(String::new()),
+                Value::text(conname),
+                Value::text::<String>(kind.into()),
+                Value::text(tname.clone()),
+                Value::text(String::new()),
+                Value::text(col_name),
+                Value::text(String::new()),
             ]));
         }
         // Foreign keys.
@@ -752,12 +752,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
                     .collect()
             };
             rows.push(Row::new(alloc::vec![
-                Value::Text(conname),
-                Value::Text("f".into()),
-                Value::Text(tname.clone()),
-                Value::Text(fk.parent_table.clone()),
-                Value::Text(conkey.join(",")),
-                Value::Text(confkey.join(",")),
+                Value::text(conname),
+                Value::text("f"),
+                Value::text(tname.clone()),
+                Value::text(fk.parent_table.clone()),
+                Value::text(conkey.join(",")),
+                Value::text(confkey.join(",")),
             ]));
         }
     }
@@ -768,7 +768,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
 /// SPG is single-database so we surface a single row keyed on the
 /// canonical `postgres` database name (matching what every PG
 /// admin tool's startup screen expects to find).
-pub(crate) fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
@@ -778,10 +778,10 @@ pub(crate) fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
     ];
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
-        Value::Text("postgres".into()),
+        Value::text("postgres"),
         Value::BigInt(10),
         Value::Int(6), // UTF8
-        Value::Text("en_US.UTF-8".into()),
+        Value::text("en_US.UTF-8"),
     ])];
     (schema, rows)
 }
@@ -790,7 +790,7 @@ pub(crate) fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
 /// pg_roles is a view over pg_authid showing all roles. SPG ships
 /// one row per declared user from the engine's UserStore so admin
 /// tool startup screens can populate.
-pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("rolname", DataType::Text, false),
@@ -798,12 +798,12 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
         ColumnSchema::new("rolinherit", DataType::Bool, false),
         ColumnSchema::new("rolcanlogin", DataType::Bool, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     let oid: i64 = 10;
     for (i, (name, _)) in engine.users.iter().enumerate() {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid + (i as i64) + 1),
-            Value::Text(name.to_string()),
+            Value::text(name.to_string()),
             Value::Bool(false),
             Value::Bool(true),
             Value::Bool(true),
@@ -819,7 +819,7 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
             0,
             Row::new(alloc::vec![
                 Value::BigInt(10),
-                Value::Text("postgres".into()),
+                Value::text("postgres"),
                 Value::Bool(true),
                 Value::Bool(true),
                 Value::Bool(true),
@@ -837,7 +837,7 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// the table lists those as installed — `SELECT … FROM pg_extension
 /// WHERE extname = 'vector'` probes from PG clients (mailrs embed
 /// round-12) answer truthfully about capability presence.
-pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("extname", DataType::Text, false),
@@ -851,27 +851,27 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row>) {
         .map(|(i, (name, ver))| {
             Row::new(alloc::vec![
                 Value::BigInt(16384 + i as i64),
-                Value::Text((*name).into()),
-                Value::Text((*ver).into()),
-                Value::Text("pg_catalog".into()),
+                Value::text::<String>((*name).into()),
+                Value::text::<String>((*ver).into()),
+                Value::text("pg_catalog"),
             ])
         })
         .collect();
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("viewname", DataType::Text, false),
         ColumnSchema::new("definition", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for (name, def) in cat.views() {
         rows.push(Row::new(alloc::vec![
-            Value::Text("public".into()),
-            Value::Text(name.clone()),
-            Value::Text(def.body.clone()),
+            Value::text("public"),
+            Value::text(name.clone()),
+            Value::text(def.body.clone()),
         ]));
     }
     (schema, rows)
@@ -882,13 +882,13 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// tools read `pg_settings` to discover server-side configuration.
 /// SPG surfaces every session_param + a small set of canonical PG
 /// defaults so the pre-flight queries match.
-pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("setting", DataType::Text, false),
         ColumnSchema::new("category", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     // Canonical defaults every admin tool expects to find.
     let defaults: &[(&str, &str, &str)] = &[
         ("server_version", "16.0 (spg)", "Preset Options"),
@@ -902,9 +902,9 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>
     ];
     for &(name, val, cat) in defaults {
         rows.push(Row::new(alloc::vec![
-            Value::Text(name.into()),
-            Value::Text(val.into()),
-            Value::Text(cat.into()),
+            Value::text::<String>(name.into()),
+            Value::text::<String>(val.into()),
+            Value::text::<String>(cat.into()),
         ]));
     }
     // Session-set params override the static defaults.
@@ -914,9 +914,9 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>
             .any(|(n, _, _)| (*n).eq_ignore_ascii_case(k))
         {
             rows.push(Row::new(alloc::vec![
-                Value::Text(k.clone()),
-                Value::Text(v.clone()),
-                Value::Text("Session".into()),
+                Value::text(k.clone()),
+                Value::text(v.clone()),
+                Value::text::<String>("Session".into()),
             ]));
         }
     }
@@ -933,14 +933,14 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>
 ///   * tablename (Text)
 ///   * indexname (Text)
 ///   * indexdef (Text) — best-effort CREATE INDEX DDL
-pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("tablename", DataType::Text, false),
         ColumnSchema::new("indexname", DataType::Text, false),
         ColumnSchema::new("indexdef", DataType::Text, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
@@ -957,10 +957,10 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
                 col_name
             );
             rows.push(Row::new(alloc::vec![
-                Value::Text("public".into()),
-                Value::Text(tname.clone()),
-                Value::Text(idx.name.clone()),
-                Value::Text(indexdef),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text(idx.name.clone()),
+                Value::text(indexdef),
             ]));
         }
     }
@@ -978,7 +978,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 ///   * indnatts (Int) — number of indexed columns
 ///   * indisunique (Bool)
 ///   * indisprimary (Bool)
-pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("indexrelid", DataType::BigInt, false),
         ColumnSchema::new("indrelid", DataType::BigInt, false),
@@ -986,7 +986,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
         ColumnSchema::new("indisunique", DataType::Bool, false),
         ColumnSchema::new("indisprimary", DataType::Bool, false),
     ];
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row<'static>> = Vec::new();
     let mut idx_oid: i64 = 100_000;
     for (table_idx, tname) in cat.table_names().iter().enumerate() {
         let Some(t) = cat.get(tname) else { continue };
@@ -1013,7 +1013,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>)
 /// SPG is single-schema so we expose the canonical PG schemas:
 /// `public` (user-facing), `pg_catalog` (built-in), and
 /// `information_schema` (PG meta).
-pub(crate) fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+pub(crate) fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("nspname", DataType::Text, false),
@@ -1022,17 +1022,17 @@ pub(crate) fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>
     let rows = alloc::vec![
         Row::new(alloc::vec![
             Value::BigInt(11),
-            Value::Text("pg_catalog".into()),
+            Value::text("pg_catalog"),
             Value::BigInt(10),
         ]),
         Row::new(alloc::vec![
             Value::BigInt(2200),
-            Value::Text("public".into()),
+            Value::text("public"),
             Value::BigInt(10),
         ]),
         Row::new(alloc::vec![
             Value::BigInt(13000),
-            Value::Text("information_schema".into()),
+            Value::text("information_schema"),
             Value::BigInt(10),
         ]),
     ];
@@ -1045,7 +1045,7 @@ pub(crate) fn materialise_meta_view(
     catalog: &mut Catalog,
     name: &str,
     columns: Vec<ColumnSchema>,
-    rows: Vec<Row>,
+    rows: Vec<Row<'static>>,
 ) -> Result<(), EngineError> {
     let schema = TableSchema::new(name.to_string(), columns);
     catalog.create_table(schema).map_err(EngineError::Storage)?;

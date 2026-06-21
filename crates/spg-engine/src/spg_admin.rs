@@ -36,7 +36,7 @@ impl Engine {
             // value across every column row of the same table.
             ColumnSchema::new("cold_row_count", DataType::BigInt, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .statistics
             .iter()
             .map(|((t, c), s)| {
@@ -45,11 +45,11 @@ impl Engine {
                     .get(t)
                     .map_or(0, |table| table.cold_row_count());
                 Row::new(alloc::vec![
-                    Value::Text(t.clone()),
-                    Value::Text(c.clone()),
+                    Value::text(t.clone()),
+                    Value::text(c.clone()),
                     Value::Float(f64::from(s.null_frac)),
                     Value::BigInt(i64::try_from(s.n_distinct).unwrap_or(i64::MAX)),
-                    Value::Text(render_histogram_bounds(&s.histogram_bounds)),
+                    Value::text(render_histogram_bounds(&s.histogram_bounds)),
                     Value::BigInt(i64::try_from(cold).unwrap_or(i64::MAX)),
                 ])
             })
@@ -71,14 +71,14 @@ impl Engine {
             ColumnSchema::new("last_received_pos", DataType::BigInt, false),
             ColumnSchema::new("enabled", DataType::Bool, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .subscriptions
             .iter()
             .map(|(name, sub)| {
                 Row::new(alloc::vec![
-                    Value::Text(name.clone()),
-                    Value::Text(sub.conn_str.clone()),
-                    Value::Text(sub.publications.join(",")),
+                    Value::text(name.clone()),
+                    Value::text(sub.conn_str.clone()),
+                    Value::text(sub.publications.join(",")),
                     Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
                     Value::Bool(sub.enabled),
                 ])
@@ -160,13 +160,13 @@ impl Engine {
             ColumnSchema::new("approx_index_bytes", DataType::BigInt, false),
         ];
         #[allow(clippy::cast_possible_wrap)]
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .memory_stats()
             .tables
             .into_iter()
             .map(|t| {
                 Row::new(alloc::vec![
-                    Value::Text(t.name),
+                    Value::text(t.name),
                     Value::BigInt(t.hot_rows as i64),
                     Value::BigInt(t.cold_rows as i64),
                     Value::BigInt(t.hot_encoded_bytes as i64),
@@ -214,7 +214,7 @@ impl Engine {
                 }
             }
         }
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .catalog
             .cold_segment_ids_global()
             .iter()
@@ -224,7 +224,7 @@ impl Engine {
                 let owner = segment_owners.get(&id).cloned().unwrap_or_default();
                 Some(Row::new(alloc::vec![
                     Value::BigInt(i64::from(id)),
-                    Value::Text(owner),
+                    Value::text(owner),
                     Value::BigInt(i64::try_from(meta.num_rows).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::from(meta.num_pages)),
                     Value::BigInt(i64::try_from(meta.total_bytes).unwrap_or(i64::MAX)),
@@ -248,7 +248,7 @@ impl Engine {
             ColumnSchema::new("max_us", DataType::BigInt, false),
             ColumnSchema::new("last_seen_us", DataType::BigInt, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .query_stats
             .snapshot()
             .into_iter()
@@ -259,7 +259,7 @@ impl Engine {
                     s.total_us / s.exec_count
                 };
                 Row::new(alloc::vec![
-                    Value::Text(sql),
+                    Value::text(sql),
                     Value::BigInt(i64::try_from(s.exec_count).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::try_from(s.total_us).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::try_from(mean).unwrap_or(i64::MAX)),
@@ -326,7 +326,7 @@ impl Engine {
             ColumnSchema::new("in_transaction", DataType::Bool, false),
             ColumnSchema::new("application_name", DataType::Text, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .activity_provider
             .map(|f| f())
             .unwrap_or_default()
@@ -334,13 +334,13 @@ impl Engine {
             .map(|r| {
                 Row::new(alloc::vec![
                     Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
-                    Value::Text(r.user),
+                    Value::text(r.user),
                     Value::BigInt(r.started_at_us),
-                    Value::Text(r.current_sql),
-                    Value::Text(r.wait_event),
+                    Value::text(r.current_sql),
+                    Value::text(r.wait_event),
                     Value::BigInt(r.elapsed_us),
                     Value::Bool(r.in_transaction),
-                    Value::Text(r.application_name),
+                    Value::text(r.application_name),
                 ])
             })
             .collect();
@@ -355,7 +355,7 @@ impl Engine {
             ColumnSchema::new("table_name", DataType::Text, false),
             ColumnSchema::new("ddl", DataType::Text, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .catalog
             .table_names()
             .into_iter()
@@ -363,7 +363,7 @@ impl Engine {
             .filter_map(|name| {
                 let table = self.catalog.get(&name)?;
                 let ddl = render_create_table(&name, &table.schema().columns);
-                Some(Row::new(alloc::vec![Value::Text(name), Value::Text(ddl),]))
+                Some(Row::new(alloc::vec![Value::text(name), Value::text(ddl),]))
             })
             .collect();
         QueryResult::Rows { columns, rows }
@@ -377,7 +377,7 @@ impl Engine {
             ColumnSchema::new("role_name", DataType::Text, false),
             ColumnSchema::new("ddl", DataType::Text, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .users
             .iter()
             .map(|(name, rec)| {
@@ -386,8 +386,8 @@ impl Engine {
                     rec.role.as_str(),
                 );
                 Row::new(alloc::vec![
-                    Value::Text(String::from(name)),
-                    Value::Text(ddl)
+                    Value::text(String::from(name)),
+                    Value::text(ddl)
                 ])
             })
             .collect();
@@ -419,7 +419,7 @@ impl Engine {
         }
         QueryResult::Rows {
             columns,
-            rows: alloc::vec![Row::new(alloc::vec![Value::Text(out)])],
+            rows: alloc::vec![Row::new(alloc::vec![Value::text(out)])],
         }
     }
 
@@ -434,7 +434,7 @@ impl Engine {
             ColumnSchema::new("entry_hash", DataType::Text, false),
             ColumnSchema::new("sql", DataType::Text, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .audit_chain_provider
             .map(|f| f())
             .unwrap_or_default()
@@ -443,9 +443,9 @@ impl Engine {
                 Row::new(alloc::vec![
                     Value::BigInt(r.seq),
                     Value::BigInt(r.ts_ms),
-                    Value::Text(r.prev_hash_hex),
-                    Value::Text(r.entry_hash_hex),
-                    Value::Text(r.sql),
+                    Value::text(r.prev_hash_hex),
+                    Value::text(r.entry_hash_hex),
+                    Value::text(r.sql),
                 ])
             })
             .collect();

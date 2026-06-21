@@ -129,7 +129,7 @@ pub enum QueryResult {
     /// `SELECT` returned a (possibly empty) row set.
     Rows {
         columns: Vec<ColumnSchema>,
-        rows: Vec<Row>,
+        rows: Vec<Row<'static>>,
     },
 }
 

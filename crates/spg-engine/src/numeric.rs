@@ -15,7 +15,7 @@ pub(crate) fn numeric_from_integer(
     precision: u8,
     scale: u8,
     col_name: &str,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     let factor = pow10_i128(scale);
     let scaled = n.checked_mul(factor).ok_or_else(|| {
         EngineError::Unsupported(alloc::format!(
@@ -34,7 +34,7 @@ pub(crate) fn numeric_from_float(
     precision: u8,
     scale: u8,
     col_name: &str,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     if !x.is_finite() {
         return Err(EngineError::Unsupported(alloc::format!(
             "cannot store non-finite float in NUMERIC column `{col_name}`"
@@ -135,7 +135,7 @@ pub(crate) fn numeric_rescale(
     precision: u8,
     dst_scale: u8,
     col_name: &str,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     let new_scaled = if dst_scale >= src_scale {
         let bump = pow10_i128(dst_scale - src_scale);
         scaled.checked_mul(bump).ok_or_else(|| {

@@ -12,6 +12,7 @@
 //! `use super::`.
 
 use alloc::format;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{BinOp, UnOp};
@@ -22,7 +23,7 @@ use super::{
     parse_date_literal, parse_timestamp_literal, ts_match, tsvector_concat, value_to_text,
 };
 
-pub(super) fn apply_unary(op: UnOp, v: Value) -> Result<Value, EvalError> {
+pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>, EvalError> {
     match (op, v) {
         (_, Value::Null) => Ok(Value::Null),
         (UnOp::Neg, Value::Int(n)) => {
@@ -58,7 +59,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value) -> Result<Value, EvalError> {
 
 /// v7.9.27b — true when two values are "not distinct" per PG:
 /// both NULL counts as equal; otherwise reduces to regular Eq.
-fn values_not_distinct(l: &Value, r: &Value) -> bool {
+fn values_not_distinct(l: &Value<'static>, r: &Value<'static>) -> bool {
     match (l, r) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
@@ -66,7 +67,7 @@ fn values_not_distinct(l: &Value, r: &Value) -> bool {
     }
 }
 
-pub(super) fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
+pub(super) fn apply_binary(op: BinOp, l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     // SQL three-valued logic for AND / OR with NULL is special — handle before
     // the general NULL-propagation rule.
     if let BinOp::And = op {
@@ -144,7 +145,7 @@ pub(super) fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalE
 /// Calendar arithmetic. Returns `Some(value)` when the operand pair
 /// is a date/time combo this function understands, `None` to let the
 /// caller fall through to the regular numeric / text paths.
-fn apply_binary_calendar(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value>, EvalError> {
+fn apply_binary_calendar(op: BinOp, l: &Value<'static>, r: &Value<'static>) -> Result<Option<Value<'static>>, EvalError> {
     let int_value = |v: &Value| -> Option<i64> {
         match v {
             Value::SmallInt(n) => Some(i64::from(*n)),
@@ -216,12 +217,12 @@ fn apply_binary_calendar(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value
 /// the caller can fall through.
 pub(crate) fn apply_binary_interval(
     op: BinOp,
-    l: &Value,
-    r: &Value,
-) -> Result<Option<Value>, EvalError> {
+    l: &Value<'static>,
+    r: &Value<'static>,
+) -> Result<Option<Value<'static>>, EvalError> {
     // Normalise so the interval (if any) is always on the right for Add;
     // Sub stays left-handed because it isn't commutative.
-    let (lhs, rhs, sign): (&Value, &Value, i64) = match (l, r, op) {
+    let (lhs, rhs, sign): (&Value<'static>, &Value<'static>, i64) = match (l, r, op) {
         (Value::Interval { .. }, _, BinOp::Add) => (r, l, 1),
         (_, Value::Interval { .. }, BinOp::Add) => (l, r, 1),
         (_, Value::Interval { .. }, BinOp::Sub) => (l, r, -1),
@@ -367,7 +368,7 @@ fn add_interval_to_micros(t: i64, months: i64, days: i64, micros: i64) -> Result
 /// Other-side integers / floats are promoted to a NUMERIC at a common
 /// scale; all add / sub / mul / div / compare paths stay in i128.
 #[allow(clippy::needless_pass_by_value)] // mirrors `apply_binary`'s by-value calling convention
-fn apply_binary_numeric(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
+fn apply_binary_numeric(op: BinOp, l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     // Float still wins — Numeric + Float coerces both to f64 and runs
     // through the float path. PG demotes Numeric to float in this mix
     // too (the documented behaviour for `numeric + double precision`).
@@ -482,7 +483,7 @@ fn apply_binary_numeric(op: BinOp, l: Value, r: Value) -> Result<Value, EvalErro
 /// Express `v` as a `(scaled_i128, scale)` pair. Plain integers come
 /// back with `scale=0`; NUMERIC keeps its own scale. Anything else
 /// returns `None` and the caller raises a type error.
-fn numeric_or_widen(v: &Value) -> Option<(i128, u8)> {
+fn numeric_or_widen(v: &Value<'static>) -> Option<(i128, u8)> {
     match v {
         Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
         Value::Int(n) => Some((i128::from(*n), 0)),
@@ -541,7 +542,7 @@ const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
 /// lexemes present on both sides merge (positions concatenated,
 /// the higher weight wins — SPG models weight per lexeme, PG per
 /// position, so the stronger label is the faithful collapse).
-fn text_concat(l: &Value, r: &Value) -> Value {
+fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
     if let (Value::TsVector(a), Value::TsVector(b)) = (l, r) {
         return tsvector_concat(a, b);
     }
@@ -571,13 +572,13 @@ fn text_concat(l: &Value, r: &Value) -> Value {
         }
         (Value::TextArray(a), Value::Text(s)) => {
             let mut out = a.clone();
-            out.push(Some(s.clone()));
+            out.push(Some(s.to_string()));
             return Value::TextArray(out);
         }
         (Value::Text(s), Value::TextArray(b)) => {
             let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
                 alloc::vec::Vec::with_capacity(1 + b.len());
-            out.push(Some(s.clone()));
+            out.push(Some(s.to_string()));
             out.extend(b.iter().cloned());
             return Value::TextArray(out);
         }
@@ -663,20 +664,20 @@ fn text_concat(l: &Value, r: &Value) -> Value {
         }
         // v7.11.15 — BYTEA `||` is byte concatenation.
         (Value::Bytes(a), Value::Bytes(b)) => {
-            let mut out = a.clone();
+            let mut out = a.clone().into_owned();
             out.extend_from_slice(b);
-            return Value::Bytes(out);
+            return Value::bytes(out);
         }
         _ => {}
     }
     let a = value_to_text(l);
     let b = value_to_text(r);
-    Value::Text(a + &b)
+    Value::text(a + &b)
 }
 
 /// pgvector inner-product `<#>`. Returns the *negative* dot product so
 /// smaller still means more similar — same convention as pgvector.
-fn inner_product(l: Value, r: Value) -> Result<Value, EvalError> {
+fn inner_product(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     let (a, b) = unwrap_vec_pair(l, r, "<#>")?;
     let mut dot: f64 = 0.0;
     for (x, y) in a.iter().zip(b.iter()) {
@@ -687,7 +688,7 @@ fn inner_product(l: Value, r: Value) -> Result<Value, EvalError> {
 
 /// pgvector cosine distance `<=>` — `1 - (a·b) / (‖a‖ ‖b‖)`. A zero-norm
 /// operand produces NaN (matches pgvector).
-fn cosine_distance(l: Value, r: Value) -> Result<Value, EvalError> {
+fn cosine_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     let (a, b) = unwrap_vec_pair(l, r, "<=>")?;
     let mut dot: f64 = 0.0;
     let mut na: f64 = 0.0;
@@ -706,7 +707,7 @@ fn cosine_distance(l: Value, r: Value) -> Result<Value, EvalError> {
     Ok(Value::Float(1.0 - dot / denom))
 }
 
-fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
+fn unwrap_vec_pair(l: Value<'static>, r: Value<'static>, op: &str) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
     // v6.0.1: SQ8 cells coming through the SQL evaluator are
     // dequantised to f32 here so the existing scalar distance
     // arithmetic stays intact. HNSW kNN search continues to use
@@ -716,7 +717,7 @@ fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>),
     // projection of `v <-> $1`, etc.).
     let to_f32 = |v: Value| -> Option<Vec<f32>> {
         match v {
-            Value::Vector(a) => Some(a),
+            Value::Vector(a) => Some(a.into_owned()),
             Value::Sq8Vector(q) => Some(spg_storage::quantize::dequantize(&q)),
             // v6.0.3: bit-exact dequant for halfvec cells.
             Value::HalfVector(h) => Some(h.to_f32_vec()),
@@ -748,12 +749,12 @@ fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>),
 /// types only — SmallInt widens to Int, Int x BigInt widens to
 /// BigInt, anything else is a type error (mailrs embed round-12).
 fn bitop(
-    l: Value,
-    r: Value,
+    l: Value<'static>,
+    r: Value<'static>,
     f: impl Fn(i64, i64) -> i64,
     op_name: &str,
-) -> Result<Value, EvalError> {
-    let widen = |v: Value| -> Value {
+) -> Result<Value<'static>, EvalError> {
+    let widen = |v: Value<'static>| -> Value<'static> {
         match v {
             Value::SmallInt(n) => Value::Int(i32::from(n)),
             other => other,
@@ -776,15 +777,15 @@ fn bitop(
 }
 
 fn arith(
-    l: Value,
-    r: Value,
+    l: Value<'static>,
+    r: Value<'static>,
     int_op: impl Fn(i64, i64) -> Option<i64>,
     float_op: impl Fn(f64, f64) -> f64,
     op_name: &str,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     // Widen SmallInt to Int up front so the rest of the arithmetic
     // table only deals with Int / BigInt / Float pairs.
-    let widen = |v: Value| -> Value {
+    let widen = |v: Value<'static>| -> Value<'static> {
         match v {
             Value::SmallInt(n) => Value::Int(i32::from(n)),
             other => other,
@@ -837,7 +838,7 @@ fn arith(
 /// comparison / sort plumbing. Mismatched dims or non-vector operands
 /// raise `TypeMismatch`.
 #[allow(clippy::many_single_char_names)] // l, r, a, b, d are the natural names
-fn l2_distance(l: Value, r: Value) -> Result<Value, EvalError> {
+fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
@@ -868,7 +869,7 @@ fn sqrt_newton(x: f64) -> f64 {
     g
 }
 
-fn div_op(l: Value, r: Value) -> Result<Value, EvalError> {
+fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     let any_float = matches!(l.data_type(), Some(DataType::Float))
         || matches!(r.data_type(), Some(DataType::Float));
     if any_float {
@@ -896,7 +897,7 @@ fn div_op(l: Value, r: Value) -> Result<Value, EvalError> {
     })
 }
 
-fn as_f64(v: &Value) -> Result<f64, EvalError> {
+fn as_f64(v: &Value<'static>) -> Result<f64, EvalError> {
     match v {
         Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
@@ -917,7 +918,7 @@ fn as_f64(v: &Value) -> Result<f64, EvalError> {
     }
 }
 
-pub(super) fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
+pub(super) fn compare(op: BinOp, l: &Value<'static>, r: &Value<'static>) -> Result<Value<'static>, EvalError> {
     let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => i64::from(*a).cmp(&i64::from(*b)),
         (Value::Int(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
@@ -1041,7 +1042,7 @@ pub(super) fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalErro
 }
 
 // SQL three-valued AND / OR.
-pub(crate) fn and_3vl(l: Value, r: Value) -> Result<Value, EvalError> {
+pub(crate) fn and_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     match (l, r) {
         (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
         (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
@@ -1056,7 +1057,7 @@ pub(crate) fn and_3vl(l: Value, r: Value) -> Result<Value, EvalError> {
     }
 }
 
-fn or_3vl(l: Value, r: Value) -> Result<Value, EvalError> {
+fn or_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     match (l, r) {
         (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
         (Value::Bool(false), Value::Bool(false)) => Ok(Value::Bool(false)),

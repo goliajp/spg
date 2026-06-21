@@ -282,14 +282,14 @@ impl Engine {
             ColumnSchema::new("enabled", DataType::Bool, false),
             ColumnSchema::new("last_received_pos", DataType::BigInt, false),
         ];
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'static>> = self
             .subscriptions
             .iter()
             .map(|(name, sub)| {
                 Row::new(alloc::vec![
-                    Value::Text(name.clone()),
-                    Value::Text(sub.conn_str.clone()),
-                    Value::Text(sub.publications.join(", ")),
+                    Value::text(name.clone()),
+                    Value::text(sub.conn_str.clone()),
+                    Value::text(sub.publications.join(", ")),
                     Value::Bool(sub.enabled),
                     Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
                 ])

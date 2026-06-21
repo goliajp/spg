@@ -18,25 +18,25 @@ use super::*;
 /// lowercase input.
 pub(super) fn apply_function_lower(
     name_lower: &str,
-    args: &[Value],
+    args: &[Value<'static>],
     ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(name_lower, args, ctx)
 }
 
 pub(super) fn apply_function(
     name: &str,
-    args: &[Value],
+    args: &[Value<'static>],
     ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(&name.to_ascii_lowercase(), args, ctx)
 }
 
 fn apply_function_dispatch(
     name: &str,
-    args: &[Value],
+    args: &[Value<'static>],
     ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     match name {
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
@@ -46,7 +46,7 @@ fn apply_function_dispatch(
                 });
             }
             let seq_name = match &args[0] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 Value::Null => return Ok(Value::Null),
                 other => {
                     return Err(EvalError::TypeMismatch {
@@ -72,7 +72,7 @@ fn apply_function_dispatch(
                 });
             }
             let seq_name = match &args[0] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 Value::Null => return Ok(Value::Null),
                 other => {
                     return Err(EvalError::TypeMismatch {
@@ -98,7 +98,7 @@ fn apply_function_dispatch(
                 });
             }
             let seq_name = match &args[0] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 Value::Null => return Ok(Value::Null),
                 other => {
                     return Err(EvalError::TypeMismatch {
@@ -403,8 +403,8 @@ fn apply_function_dispatch(
                     let end = start.saturating_add(len);
                     if end <= 1 || len < 0 {
                         return Ok(match &args[0] {
-                            Value::Text(_) => Value::Text(String::new()),
-                            Value::Bytes(_) => Value::Bytes(Vec::new()),
+                            Value::Text(_) => Value::text(String::new()),
+                            Value::Bytes(_) => Value::bytes(Vec::new()),
                             other => {
                                 return Err(EvalError::TypeMismatch {
                                     detail: format!(
@@ -427,24 +427,24 @@ fn apply_function_dispatch(
                     let chars: Vec<char> = s.chars().collect();
                     let skip = (effective_start - 1) as usize;
                     if skip >= chars.len() {
-                        return Ok(Value::Text(String::new()));
+                        return Ok(Value::text(String::new()));
                     }
                     let take = match effective_length {
                         Some(n) => (n as usize).min(chars.len() - skip),
                         None => chars.len() - skip,
                     };
-                    Ok(Value::Text(chars[skip..skip + take].iter().collect()))
+                    Ok(Value::text(chars[skip..skip + take].iter().collect::<String>()))
                 }
                 Value::Bytes(b) => {
                     let skip = (effective_start - 1) as usize;
                     if skip >= b.len() {
-                        return Ok(Value::Bytes(Vec::new()));
+                        return Ok(Value::bytes(Vec::new()));
                     }
                     let take = match effective_length {
                         Some(n) => (n as usize).min(b.len() - skip),
                         None => b.len() - skip,
                     };
-                    Ok(Value::Bytes(b[skip..skip + take].to_vec()))
+                    Ok(Value::bytes(b[skip..skip + take].to_vec()))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -496,7 +496,7 @@ fn apply_function_dispatch(
                         return Ok(Value::Int(0));
                     }
                     for i in 0..=haystack.len() - needle.len() {
-                        if &haystack[i..i + needle.len()] == needle.as_slice() {
+                        if &haystack[i..i + needle.len()] == needle.as_ref() {
                             return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
                         }
                     }
@@ -519,7 +519,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => Ok(Value::Text(s.to_uppercase())),
+                Value::Text(s) => Ok(Value::text(s.to_uppercase())),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("upper() needs text, got {:?}", other.data_type()),
                 }),
@@ -533,7 +533,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => Ok(Value::Text(s.to_lowercase())),
+                Value::Text(s) => Ok(Value::text(s.to_lowercase())),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("lower() needs text, got {:?}", other.data_type()),
                 }),
@@ -611,7 +611,7 @@ fn apply_function_dispatch(
                 }
                 out.push_str(&value_to_format_text(v));
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         // PG `concat_ws(sep, val1 [, val2 ...])` — like concat but
         // with a separator inserted between each pair of NON-NULL
@@ -1261,7 +1261,7 @@ fn apply_function_dispatch(
                 }
             };
             if n <= 0 {
-                return Ok(Value::Text(String::new()));
+                return Ok(Value::text(String::new()));
             }
             // Safety cap so a runaway argument doesn't allocate
             // terabytes. PG itself enforces a similar cap via
@@ -1280,7 +1280,7 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            Ok(Value::Text(s.repeat(n as usize)))
+            Ok(Value::text(s.repeat(n as usize)))
         }
         "split_part" => {
             if args.len() != 3 {
@@ -1328,9 +1328,9 @@ fn apply_function_dispatch(
                 total + n
             };
             if idx < 0 || idx >= total {
-                return Ok(Value::Text(String::new()));
+                return Ok(Value::text(String::new()));
             }
-            Ok(Value::Text(parts[idx as usize].to_string()))
+            Ok(Value::text(parts[idx as usize].to_string()))
         }
         // PG `translate(s, from, to)` — char-by-char positional
         // mapping. Each codepoint in `from` is replaced by the
@@ -1370,7 +1370,7 @@ fn apply_function_dispatch(
                     None => out.push(c),
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "replace" => {
             if args.len() != 3 {
@@ -1388,13 +1388,13 @@ fn apply_function_dispatch(
             let from = value_to_format_text(&args[1]);
             let to = value_to_format_text(&args[2]);
             if from.is_empty() {
-                return Ok(Value::Text(s));
+                return Ok(Value::text(s));
             }
             // std `String::replace` matches PG semantics exactly:
             // non-overlapping, left-to-right, no re-scan of
             // inserted text. Sealed test surface verifies the
             // edge cases independently.
-            Ok(Value::Text(s.replace(&from[..], &to)))
+            Ok(Value::text(s.replace(&from[..], &to)))
         }
         "trim" | "btrim" => string_trim(args, TrimSide::Both, "trim"),
         "ltrim" => string_trim(args, TrimSide::Left, "ltrim"),
@@ -1423,7 +1423,7 @@ fn apply_function_dispatch(
                 }
                 out.push_str(&value_to_format_text(v));
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         // v7.17.0 Phase 3.7 — PG regex function family.
         "regexp_matches" => regexp_matches(args),
@@ -1440,9 +1440,9 @@ fn apply_function_dispatch(
             }
             // Json input passes through verbatim — PG identity.
             if let Value::Json(s) = &args[0] {
-                return Ok(Value::Json(s.clone()));
+                return Ok(Value::json(s.clone()));
             }
-            Ok(Value::Json(crate::json::value_to_json_text(&args[0])))
+            Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
         "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
         "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
@@ -1513,14 +1513,14 @@ fn apply_function_dispatch(
         // and friends. SPG is single-schema; accept-as-no-op
         // returning either the new value or NULL.
         "set_config" => Ok(args.get(1).cloned().unwrap_or(Value::Null)),
-        "current_setting" => Ok(Value::Text(String::new())),
+        "current_setting" => Ok(Value::text(String::new())),
         // PG `pg_catalog.*` discovery / cast helpers commonly
         // emitted by ORMs probing the server. Accept-as-no-op
         // with sensible defaults so the dump preamble doesn't
         // fail. `pg_get_serial_sequence` returns NULL (no
         // sequence — SPG has AUTO_INCREMENT instead).
         "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
-        "version" => Ok(Value::Text("PostgreSQL 16 (SPG-compat)".into())),
+        "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
         // (`WHERE schemaname = current_schema()`, `SELECT *,
@@ -1528,9 +1528,9 @@ fn apply_function_dispatch(
         // shortcuts only catch the bare top-level SELECT shape.
         // SPG is single-database + single-schema; the values
         // mirror the wire-layer canned defaults.
-        "current_database" | "database" => Ok(Value::Text("spg".into())),
-        "current_schema" => Ok(Value::Text("public".into())),
-        "current_user" | "session_user" | "user" => Ok(Value::Text("admin".into())),
+        "current_database" | "database" => Ok(Value::text("spg")),
+        "current_schema" => Ok(Value::text::<String>("public".into())),
+        "current_user" | "session_user" | "user" => Ok(Value::text::<String>("admin".into())),
         // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
         // canonical PG lowercase type name. sqlx / SQLAlchemy /
         // Diesel emit this during describe; generic ORMs may
@@ -1543,7 +1543,7 @@ fn apply_function_dispatch(
                     detail: format!("pg_typeof() takes 1 arg, got {}", args.len()),
                 });
             }
-            Ok(Value::Text(pg_typeof_name(&args[0]).into()))
+            Ok(Value::text::<String>(pg_typeof_name(&args[0]).into()))
         }
         // v7.17.0 — `nextval` / `currval` / `setval` are handled
         // at the top of this match against the SequenceResolver.
@@ -1564,7 +1564,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             }
             let a = match &args[0] {
-                Value::Text(s) => s.as_str(),
+                Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("similarity() needs text, got {:?}", other.data_type()),
@@ -1572,7 +1572,7 @@ fn apply_function_dispatch(
                 }
             };
             let b = match &args[1] {
-                Value::Text(s) => s.as_str(),
+                Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("similarity() needs text, got {:?}", other.data_type()),
@@ -1593,7 +1593,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             }
             let s = match &args[0] {
-                Value::Text(s) => s.as_str(),
+                Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("show_trgm() needs text, got {:?}", other.data_type()),

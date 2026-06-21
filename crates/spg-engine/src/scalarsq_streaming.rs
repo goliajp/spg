@@ -5,12 +5,12 @@
 //   SELECT col1 [, col2 ...] FROM <single_table> [WHERE …] [LIMIT N]
 //
 // where at least one projection item is an `Expr::ScalarSubquery`. For
-// this shape the engine never has to materialise a `Vec<Row>` before
+// this shape the engine never has to materialise a `Vec<Row<'static>>` before
 // emitting — each output row depends only on its outer row + the per-
 // row scalar subquery evaluation. The plan-cached PK probe fast path
 // (v7.37.37) makes the per-row inner evaluation a single index seek;
 // what remains is the `tagged: Vec<…>` buffer and the wire-layer
-// `Vec<Row>` round trip, both of which a streaming executor (Step 2
+// `Vec<Row<'static>>` round trip, both of which a streaming executor (Step 2
 // of the (A3) plan) will skip directly into `wbuf` via an emit
 // callback.
 //

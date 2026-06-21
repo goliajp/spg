@@ -47,7 +47,7 @@ impl Engine {
         // Fn-shaped.
         let engine_cell = core::cell::RefCell::new(&mut *self);
         let resolver_fn =
-            |stmt: &spg_sql::ast::Statement| -> Result<Value, triggers::TriggerError> {
+            |stmt: &spg_sql::ast::Statement| -> Result<Value<'static>, triggers::TriggerError> {
                 let mut eng = engine_cell.borrow_mut();
                 let r = eng
                     .execute_stmt_with_cancel(stmt.clone(), CancelToken::none())

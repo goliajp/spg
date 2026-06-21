@@ -191,7 +191,7 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Int(n) => alloc::format!("{n}"),
         Value::BigInt(n) => alloc::format!("{n}"),
         Value::Float(x) => alloc::format!("{x:?}"),
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         Value::Date(d) => eval::format_date(*d),
         Value::Timestamp(t) => eval::format_timestamp(*t),
@@ -359,7 +359,7 @@ fn cmp_multi_key(a: &[f64], b: &[f64], descs: &[bool]) -> core::cmp::Ordering {
 /// resulting keys into a `Vec<f64>`. NULL → `f64::INFINITY`.
 pub(crate) fn build_order_keys(
     order_by: &[OrderBy],
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext,
 ) -> Result<Vec<f64>, EngineError> {
     let mut keys = Vec::with_capacity(order_by.len());
@@ -388,7 +388,7 @@ pub(crate) fn build_order_keys(
 /// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`
 /// agree: OFFSET applies *after* ORDER BY but *before* LIMIT (so
 /// `LIMIT 10 OFFSET 5` keeps rows 6..=15).
-pub(crate) fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Option<u32>) {
+pub(crate) fn apply_offset_and_limit(rows: &mut Vec<Row<'static>>, offset: Option<u32>, limit: Option<u32>) {
     if let Some(off) = offset {
         let off = off as usize;
         if off >= rows.len() {

@@ -62,7 +62,7 @@ pub enum TriggerOutcome {
     /// (e.g. `NEW.search_vector := …` rewrote a cell). For AFTER
     /// triggers, the value is currently ignored — but we still
     /// surface it for symmetric callers / future v7.12.5 use.
-    Row(Row),
+    Row(Row<'static>),
     /// `RETURN NULL;` or trigger fell off the end. For a BEFORE
     /// trigger, the row writer must skip the affected row. For
     /// an AFTER trigger, no-op.
@@ -179,11 +179,11 @@ impl fmt::Display for TriggerError {
 // material gain.
 pub fn fire_row_trigger(
     function: &FunctionDef,
-    new_row: Option<Row>,
-    old_row: Option<&Row>,
+    new_row: Option<Row<'static>>,
+    old_row: Option<&Row<'static>>,
     table_name: &str,
     columns: &[ColumnSchema],
-    params: &[Value],
+    params: &[Value<'static>],
     default_text_search_config: Option<&str>,
     is_after: bool,
 ) -> Result<(TriggerOutcome, Vec<DeferredEmbeddedStmt>), TriggerError> {
@@ -207,7 +207,7 @@ pub fn fire_row_trigger(
     // block. Each init expr (if any) evaluates against the
     // so-far-bound scope + the NEW/OLD context, so later DECLAREs
     // can reference earlier ones.
-    let mut locals: BTreeMap<String, Value> = BTreeMap::new();
+    let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
     init_locals_from_declarations(
         &block.declarations,
         &mut locals,
@@ -263,7 +263,7 @@ struct BodyCtx<'a> {
     function: &'a str,
     table_name: &'a str,
     columns: &'a [ColumnSchema],
-    params: &'a [Value],
+    params: &'a [Value<'static>],
     default_text_search_config: Option<&'a str>,
     is_after: bool,
     /// v7.16.2 — synchronous SELECT … INTO resolver. Provided
@@ -279,13 +279,13 @@ struct BodyCtx<'a> {
 /// on `BodyCtx`. Runs the supplied SELECT statement against
 /// the engine, returns the first row's first column.
 pub type SelectIntoResolver<'a> =
-    dyn Fn(&spg_sql::ast::Statement) -> Result<Value, TriggerError> + 'a;
+    dyn Fn(&spg_sql::ast::Statement) -> Result<Value<'static>, TriggerError> + 'a;
 
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
-    current_new: &mut Option<Row>,
-    old_row: Option<&Row>,
-    locals: &mut BTreeMap<String, Value>,
+    current_new: &mut Option<Row<'static>>,
+    old_row: Option<&Row<'static>>,
+    locals: &mut BTreeMap<String, Value<'static>>,
     ctx: &BodyCtx<'_>,
     deferred: &mut Vec<DeferredEmbeddedStmt>,
 ) -> Result<BodyOutcome, TriggerError> {
@@ -512,7 +512,7 @@ pub fn execute_do_block_top_level<'a>(
     default_text_search_config: Option<&'a str>,
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
-    let mut locals: BTreeMap<String, Value> = BTreeMap::new();
+    let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
     let empty_cols: &[ColumnSchema] = &[];
     init_locals_from_declarations(
         &block.declarations,
@@ -553,8 +553,8 @@ pub fn execute_do_block_top_level<'a>(
 
 fn resolve_return(
     target: ReturnTarget,
-    current_new: Option<Row>,
-    old_row: Option<&Row>,
+    current_new: Option<Row<'static>>,
+    old_row: Option<&Row<'static>>,
 ) -> TriggerOutcome {
     match target {
         ReturnTarget::New => current_new.map_or(TriggerOutcome::Skip, TriggerOutcome::Row),
@@ -572,11 +572,11 @@ fn resolve_return(
 fn init_locals_from_declarations(
     decls: &[PlPgSqlDeclare],
     locals: &mut BTreeMap<String, Value>,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     columns: &[ColumnSchema],
     table_name: &str,
-    params: &[Value],
+    params: &[Value<'static>],
     default_text_search_config: Option<&str>,
     function_name: &str,
 ) -> Result<(), TriggerError> {
@@ -647,7 +647,7 @@ fn value_to_display_string(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => x.to_string(),
-        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -666,14 +666,14 @@ fn value_to_display_string(v: &Value) -> String {
 #[allow(clippy::too_many_arguments)]
 fn eval_with_new_old_and_locals(
     expr: &Expr,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     locals: &BTreeMap<String, Value>,
     columns: &[ColumnSchema],
     table_alias: &str,
-    params: &[Value],
+    params: &[Value<'static>],
     default_text_search_config: Option<&str>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     let mut rewritten = expr.clone();
     substitute_locals(&mut rewritten, locals);
     substitute_new_old(&mut rewritten, new_row, old_row, columns)?;
@@ -769,13 +769,13 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
 
 fn eval_with_new_old(
     expr: &Expr,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     columns: &[ColumnSchema],
     table_alias: &str,
-    params: &[Value],
+    params: &[Value<'static>],
     default_text_search_config: Option<&str>,
-) -> Result<Value, EvalError> {
+) -> Result<Value<'static>, EvalError> {
     let mut rewritten = expr.clone();
     substitute_new_old(&mut rewritten, new_row, old_row, columns)?;
     let ctx = EvalContext::new(columns, Some(table_alias))
@@ -796,8 +796,8 @@ fn eval_with_new_old(
 /// function calls + binary operators.
 fn substitute_new_old(
     expr: &mut Expr,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     columns: &[ColumnSchema],
 ) -> Result<(), EvalError> {
     if let Expr::Column(c) = expr {
@@ -909,7 +909,7 @@ fn value_to_literal_expr(_columns: &[ColumnSchema], _pos: usize, v: Value) -> Ex
         Value::Int(n) => Literal::Integer(i64::from(n)),
         Value::BigInt(n) => Literal::Integer(n),
         Value::Float(x) => Literal::Float(x),
-        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         // Other values (Vector, Date, Timestamp, TsVector, etc.)
         // round-trip through the Display form back into a string
         // literal. v7.12.5 will add typed-literal variants here
@@ -926,8 +926,8 @@ fn value_to_literal_expr(_columns: &[ColumnSchema], _pos: usize, v: Value) -> Ex
 /// trigger context.
 fn substitute_trigger_context_in_statement(
     stmt: &mut spg_sql::ast::Statement,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     locals: &BTreeMap<String, Value>,
     columns: &[ColumnSchema],
 ) -> Result<(), EvalError> {
@@ -973,8 +973,8 @@ fn substitute_trigger_context_in_statement(
 
 fn substitute_trigger_context_in_select(
     s: &mut spg_sql::ast::SelectStatement,
-    new_row: Option<&Row>,
-    old_row: Option<&Row>,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
     locals: &BTreeMap<String, Value>,
     columns: &[ColumnSchema],
 ) -> Result<(), EvalError> {

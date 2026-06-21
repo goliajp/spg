@@ -388,7 +388,7 @@ fn re_find(node: &ReNode, s: &[char], from: usize) -> Option<(usize, usize)> {
 /// across all captures; SPG simplifies to first-match-only TEXT[].
 /// The `g` flag form `regexp_matches(s, pat, 'g')` falls through
 /// to all-matches concatenation as a flat array.)
-pub(super) fn regexp_matches(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn regexp_matches(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let (text, pat, all_matches) = match args.len() {
         2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),
         3 => {
@@ -432,7 +432,7 @@ pub(super) fn regexp_matches(args: &[Value]) -> Result<Value, EvalError> {
 /// v7.17.0 Phase 3.7 — `regexp_replace(s, pat, repl[, flags])`.
 /// `flags` containing `g` replaces all matches; absent flag
 /// replaces only the first match (PG default).
-pub(super) fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn regexp_replace(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     let (text, pat, repl, flags) = match args.len() {
         3 => (
             text_arg(&args[0])?,
@@ -477,7 +477,7 @@ pub(super) fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
                     if from <= chars.len() {
                         out.extend(chars[from..].iter());
                     }
-                    return Ok(Value::Text(out));
+                    return Ok(Value::text(out));
                 }
                 if from > chars.len() {
                     break;
@@ -489,12 +489,12 @@ pub(super) fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
             }
         }
     }
-    Ok(Value::Text(out))
+    Ok(Value::text(out))
 }
 
 /// v7.17.0 Phase 3.7 — `regexp_split_to_array(s, pat)`. Returns
 /// TEXT[] of the pieces between matches.
-pub(super) fn regexp_split_to_array(args: &[Value]) -> Result<Value, EvalError> {
+pub(super) fn regexp_split_to_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("regexp_split_to_array() takes 2 args, got {}", args.len()),

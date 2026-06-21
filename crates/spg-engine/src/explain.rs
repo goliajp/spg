@@ -385,9 +385,9 @@ impl Engine {
             lines.push(total);
         }
         let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
-        let rows: Vec<Row> = lines
+        let rows: Vec<Row<'static>> = lines
             .into_iter()
-            .map(|l| Row::new(alloc::vec![Value::Text(l)]))
+            .map(|l| Row::new(alloc::vec![Value::text(l)]))
             .collect();
         Ok(QueryResult::Rows { columns, rows })
     }

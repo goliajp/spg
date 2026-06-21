@@ -68,7 +68,7 @@ impl Engine {
         // qualifier-aware column resolver same as the aggregate /
         // projection paths on JOIN.
         let (schema_cols_owned, alias_opt): (Vec<ColumnSchema>, Option<&str>);
-        let filtered: Vec<Row>;
+        let filtered: Vec<Row<'static>>;
         if from.joins.is_empty() {
             let primary = &from.primary;
             let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
@@ -84,8 +84,8 @@ impl Engine {
             // shape. The clone is cheap relative to the window
             // computation that follows.
             let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
-            let mut owned: Vec<Row> = Vec::new();
-            let mut emit = |row: &Row, i: usize| -> Result<(), EngineError> {
+            let mut owned: Vec<Row<'static>> = Vec::new();
+            let mut emit = |row: &Row<'static>, i: usize| -> Result<(), EngineError> {
                 if i.is_multiple_of(256) {
                     cancel.check()?;
                 }
@@ -129,9 +129,9 @@ impl Engine {
         let alias = alias_opt.unwrap_or("");
         let n_rows = filtered.len();
         // Borrow refs into the owned row vec once so the downstream
-        // `compute_window_partition` call (which takes `&[&Row]`) and
+        // `compute_window_partition` call (which takes `&[&Row<'static>]`) and
         // the per-row eval loops share a single backing buffer.
-        let filtered_refs: Vec<&Row> = filtered.iter().collect();
+        let filtered_refs: Vec<&Row<'static>> = filtered.iter().collect();
 
         // 2) Collect unique window function nodes from projection.
         let mut window_nodes: Vec<Expr> = Vec::new();
@@ -143,7 +143,7 @@ impl Engine {
 
         // 3) For each window, compute per-row value.
         // Index: same order as window_nodes; for row i, win_vals[w][i].
-        let mut win_vals: Vec<Vec<Value>> = Vec::with_capacity(window_nodes.len());
+        let mut win_vals: Vec<Vec<Value<'static>>> = Vec::with_capacity(window_nodes.len());
         for wnode in &window_nodes {
             let Expr::WindowFunction {
                 name,
@@ -157,10 +157,10 @@ impl Engine {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
             };
             // Compute (partition_key, order_key, original_index) for each row.
-            let mut indexed: Vec<(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)> =
+            let mut indexed: Vec<(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)> =
                 Vec::with_capacity(n_rows);
             for (i, row) in filtered.iter().enumerate() {
-                let pkey: Vec<Value> = partition_by
+                let pkey: Vec<Value<'static>> = partition_by
                     .iter()
                     .map(|p| eval::eval_expr(p, row, &ctx))
                     .collect::<Result<_, _>>()?;
@@ -180,7 +180,7 @@ impl Engine {
                 order_key_cmp(&a.1, &b.1)
             });
             // Per-partition compute.
-            let mut out_vals: Vec<Value> = alloc::vec![Value::Null; n_rows];
+            let mut out_vals: Vec<Value<'static>> = alloc::vec![Value::Null; n_rows];
             let mut p_start = 0;
             while p_start < indexed.len() {
                 let mut p_end = p_start + 1;
@@ -217,7 +217,7 @@ impl Engine {
             ));
         }
         // 5) Build extended rows: each row gets its window values appended.
-        let mut ext_rows: Vec<Row> = Vec::with_capacity(n_rows);
+        let mut ext_rows: Vec<Row<'static>> = Vec::with_capacity(n_rows);
         for i in 0..n_rows {
             let mut values = filtered[i].values.clone();
             for w in 0..window_nodes.len() {
@@ -277,7 +277,7 @@ impl Engine {
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
             sort_by_keys(&mut tagged, &descs);
         }
-        let mut out_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        let mut out_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
             .into_iter()
@@ -565,7 +565,7 @@ impl Engine {
         cte: &spg_sql::ast::Cte,
         base_catalog: &Catalog,
         cancel: CancelToken<'_>,
-    ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row<'static>>), EngineError> {
         const MAX_TOTAL_ROWS: usize = 1_000_000;
         const MAX_ITERATIONS: usize = 100_000;
         cancel.check()?;
@@ -614,8 +614,8 @@ impl Engine {
                 col.name.clone_from(name);
             }
         }
-        let mut all_rows: Vec<Row> = anchor_rows.clone();
-        let mut working_set: Vec<Row> = anchor_rows;
+        let mut all_rows: Vec<Row<'static>> = anchor_rows.clone();
+        let mut working_set: Vec<Row<'static>> = anchor_rows;
         let mut seen: alloc::collections::BTreeSet<Vec<u8>> = alloc::collections::BTreeSet::new();
         // Track at least one "all UNION ALL" flag — if every union
         // kind is ALL we skip the dedup step (faster + matches PG).
@@ -650,7 +650,7 @@ impl Engine {
                 iter_engine = iter_engine.with_salt_fn(f);
             }
             // Run each recursive term in sequence and collect new rows.
-            let mut next_set: Vec<Row> = Vec::new();
+            let mut next_set: Vec<Row<'static>> = Vec::new();
             for (_, term) in &union_terms {
                 let mut term = term.clone();
                 term.ctes = Vec::new();
@@ -855,11 +855,11 @@ impl Engine {
     /// `SelectItem::Expr` via the regular eval path.
     pub(crate) fn project_row_simple(
         &self,
-        row: &Row,
+        row: &Row<'static>,
         items: &[SelectItem],
         schema_cols: &[ColumnSchema],
         alias: &str,
-    ) -> Result<Row, EngineError> {
+    ) -> Result<Row<'static>, EngineError> {
         let ctx = EvalContext::new(schema_cols, Some(alias));
         let cancel = CancelToken::none();
         let mut out_vals = Vec::new();
@@ -1153,7 +1153,7 @@ impl Engine {
         let dummy_row = Row::new(alloc::vec::Vec::new());
         // v7.11.13 — unnest dispatches per array element type so
         // INT[] / BIGINT[] surface their PG types in projection.
-        let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row>) =
+        let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
             match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
                 Value::Null => (DataType::Text, alloc::vec::Vec::new()),
                 Value::TextArray(items) => {
@@ -1161,7 +1161,7 @@ impl Engine {
                         .into_iter()
                         .map(|item| {
                             Row::new(alloc::vec![match item {
-                                Some(s) => Value::Text(s),
+                                Some(s) => Value::text(s),
                                 None => Value::Null,
                             }])
                         })
@@ -1217,7 +1217,7 @@ impl Engine {
         let schema_cols = alloc::vec![col_schema.clone()];
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
         // Apply WHERE.
-        let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
+        let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
             for row in rows {
                 cancel.check()?;
@@ -1240,7 +1240,7 @@ impl Engine {
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
             let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
-            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+            let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
                 self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
@@ -1262,7 +1262,7 @@ impl Engine {
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
-        let mut projected_rows: alloc::vec::Vec<Row> =
+        let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         // v7.19 P5 — Set-Returning-Function in projection
         // position (PG `SELECT unnest(arr) FROM t` shape). When a
@@ -1326,11 +1326,11 @@ impl Engine {
         // Re-evaluate ORDER BY against the source schema (pre-projection
         // so col refs by name still resolve through `scan_ctx`).
         if !stmt.order_by.is_empty() {
-            let mut indexed: alloc::vec::Vec<(usize, Vec<Value>)> = filtered
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
                 .iter()
                 .enumerate()
                 .map(|(i, r)| -> Result<_, EngineError> {
-                    let keys: Result<Vec<Value>, EngineError> = stmt
+                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
                         .order_by
                         .iter()
                         .map(|ob| {
@@ -1392,7 +1392,7 @@ impl Engine {
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
         let ctx = EvalContext::new(&empty_schema, None);
         let dummy_row = Row::new(alloc::vec::Vec::new());
-        let mut arg_values: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(args.len());
+        let mut arg_values: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::with_capacity(args.len());
         for a in args {
             arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
         }
@@ -1449,7 +1449,7 @@ impl Engine {
         let schema_cols = alloc::vec![col_schema.clone()];
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
         // WHERE.
-        let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
+        let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
             for row in rows {
                 cancel.check()?;
@@ -1476,7 +1476,7 @@ impl Engine {
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
             let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
-            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+            let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
                 self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
@@ -1498,7 +1498,7 @@ impl Engine {
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
-        let mut projected_rows: alloc::vec::Vec<Row> =
+        let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         let mut proj_memo = memoize::MemoizeCache::default();
         for row in &filtered {
@@ -1521,11 +1521,11 @@ impl Engine {
             .collect();
         // ORDER BY against the source schema.
         if !stmt.order_by.is_empty() {
-            let mut indexed: alloc::vec::Vec<(usize, Vec<Value>)> = filtered
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
                 .iter()
                 .enumerate()
                 .map(|(i, r)| -> Result<_, EngineError> {
-                    let keys: Result<Vec<Value>, EngineError> = stmt
+                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
                         .order_by
                         .iter()
                         .map(|ob| {
@@ -1656,7 +1656,7 @@ impl Engine {
             // (vector cells aren't promoted to cold segments), so wrap
             // the returned row indices as `Cow::Borrowed` for the
             // unified `materialise_in_order` shape.
-            let ordered: Vec<Cow<'_, Row>> = nsw_rows
+            let ordered: Vec<Cow<'_, Row<'static>>> = nsw_rows
                 .into_iter()
                 .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
                 .collect();
@@ -1700,7 +1700,7 @@ impl Engine {
         // full scan over the hot tier (cold-tier rows are only reached
         // via index seek in v5.1 — full table scans against cold-tier
         // data ship in v5.2 with the freezer's per-segment scan API).
-        let indexed_rows: Option<Vec<Cow<'_, Row>>> = stmt.where_.as_ref().and_then(|w| {
+        let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
             // BTree / col=literal seek first — covers the v7.11.3 multi-
             // column AND case and the leading-column equality lookup.
             try_index_seek(w, schema_cols, self.active_catalog(), table, alias)
@@ -2039,11 +2039,11 @@ impl Engine {
         table: &'a spg_storage::Table,
         schema_cols: &'a [ColumnSchema],
         alias: &str,
-        indexed_rows: Option<Vec<Cow<'a, Row>>>,
+        indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let ctx = self.ev_ctx(schema_cols, Some(alias));
-        let mut filtered: Vec<&Row> = Vec::new();
+        let mut filtered: Vec<&Row<'static>> = Vec::new();
         // v6.2.6 — Memoize: per-query LRU cache for correlated
         // scalar subqueries. Fresh per row-loop entry so each
         // SELECT execution gets an isolated cache.
@@ -2064,9 +2064,9 @@ impl Engine {
             .as_ref()
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, &ctx));
-        let mut eval_stack: Vec<Value> = Vec::new();
-        let mut row_passes_where = |row: &Row,
-                                    eval_stack: &mut Vec<Value>,
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
+        let mut row_passes_where = |row: &Row<'static>,
+                                    eval_stack: &mut Vec<Value<'static>>,
                                     memo: &mut memoize::MemoizeCache|
          -> Result<bool, EngineError> {
             match (&compiled_where, &stmt.where_) {
@@ -2094,7 +2094,7 @@ impl Engine {
         // v7.36 (cold-tier coverage) — single-table aggregate's
         // non-indexed full scan was hot-only and silently lost cold
         // rows on COUNT/SUM/etc. Materialise cold rows once into
-        // `cold_rows_storage` (Vec<Row>) so the `filtered: Vec<&Row>`
+        // `cold_rows_storage` (Vec<Row<'static>>) so the `filtered: Vec<&Row<'static>>`
         // shape stays unchanged; the cold rows live until the end of
         // the aggregate run.
         let cold_rows_storage = if indexed_rows.is_none() {
@@ -2121,7 +2121,7 @@ impl Engine {
         // subqueries batch-evaluate once (group map) instead of
         // executing per group.
         let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
-        let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+        let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
             self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                 .map_err(|err| match err {
                     EngineError::Eval(ev) => ev,
@@ -2151,7 +2151,7 @@ impl Engine {
         table: &'a spg_storage::Table,
         schema_cols: &'a [ColumnSchema],
         alias: &str,
-        indexed_rows: Option<Vec<Cow<'a, Row>>>,
+        indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let ctx = self.ev_ctx(schema_cols, Some(alias));
@@ -2167,7 +2167,7 @@ impl Engine {
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
-        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
+        let mut tagged: Vec<(Vec<f64>, Row<'static>)> = Vec::new();
         // v7.33 (C1, ceiling-first/never-die) — charge each accumulated
         // output row to the per-query byte budget as it is built, so a
         // fat single-table scan / sort REJECTS with QueryBytesExceeded
@@ -2187,7 +2187,7 @@ impl Engine {
             .as_ref()
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, &ctx));
-        let mut eval_stack: Vec<Value> = Vec::new();
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         // v7.37.x (docker-fair SCALARSQ attack) — pre-analyse every
         // SELECT-item scalar subquery for the PK-probe fast path. The
         // analysis (gate checks + catalog lookups) takes ~500 ns; doing
@@ -2225,7 +2225,7 @@ impl Engine {
         };
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
-        let mut process_row = |row: &Row, loop_idx: usize| -> Result<(), EngineError> {
+        let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
             if loop_idx.is_multiple_of(256) {
                 cancel.check()?;
             }
@@ -2253,7 +2253,7 @@ impl Engine {
                 let arr_val = eval::eval_expr(srf_arg, row, &ctx)?;
                 let elements = array_value_to_elements(&arr_val)?;
                 for elem in elements {
-                    let mut values = Vec::with_capacity(projection.len());
+                    let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
                     for (i, p) in projection.iter().enumerate() {
                         if i == srf_idx {
                             values.push(elem.clone());
@@ -2266,7 +2266,7 @@ impl Engine {
                     tagged.push((order_keys.clone(), out));
                 }
             } else {
-                let mut values = Vec::with_capacity(projection.len());
+                let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
                 for (i, p) in projection.iter().enumerate() {
                     // v7.37.x (docker-fair SCALARSQ attack) — pre-
                     // analysed PK-probe fast path. The per-row work is
@@ -2368,7 +2368,7 @@ impl Engine {
         // combination; SPG silently drops the tie extension here so
         // the customer doesn't see a hard error mid-query — the
         // user-visible result is still correct, just narrower).
-        let output_rows: Vec<Row> = if stmt.limit_with_ties && !stmt.distinct {
+        let output_rows: Vec<Row<'static>> = if stmt.limit_with_ties && !stmt.distinct {
             apply_offset_and_limit_tagged(
                 &mut tagged,
                 stmt.offset_literal(),
@@ -2377,7 +2377,7 @@ impl Engine {
             );
             tagged.into_iter().map(|(_, r)| r).collect()
         } else {
-            let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+            let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
             if stmt.distinct {
                 output_rows = dedup_rows(output_rows);
             }
@@ -2472,7 +2472,7 @@ impl Engine {
     /// ORDER BY / DISTINCT / GROUP BY / HAVING / LIMIT / OFFSET /
     /// UNION). Walks the deferred join survivors and emits
     /// `&[&Value]` borrowed straight out of the source tables — no
-    /// `.cloned()`, no `Vec<Row>`. Skips the 25 k × 3-TEXT clone tax
+    /// `.cloned()`, no `Vec<Row<'static>>`. Skips the 25 k × 3-TEXT clone tax
     /// on the mailrs `PROJ` shape (about 4 ms saved).
     ///
     /// Returns `Ok(None)` when the shape doesn't qualify; the caller
@@ -2675,7 +2675,7 @@ impl Engine {
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
             let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
-            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+            let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
                 self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
@@ -2732,7 +2732,7 @@ impl Engine {
         // ORDER BY (when present) still evaluates against a materialised
         // Row — keep the order-key encoder correct rather than fork it.
         let need_eval_row = !all_proj_bound || !stmt.order_by.is_empty();
-        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
+        let mut tagged: Vec<(Vec<f64>, Row<'static>)> = Vec::new();
         let mut proj_memo = memoize::MemoizeCache::default();
         let sources_ref = &deferred.sources;
         let stride = deferred.stride;
@@ -2741,7 +2741,7 @@ impl Engine {
         for surv_i in 0..n_surv {
             let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
             let row = &refs[surv_i];
-            let materialised: Option<Cow<'_, Row>> = if need_eval_row {
+            let materialised: Option<Cow<'_, Row<'static>>> = if need_eval_row {
                 Some(row.as_row())
             } else {
                 None
@@ -2753,20 +2753,21 @@ impl Engine {
                     // partition_point. tuple[k] is the row index in
                     // sources[k]; LEFT-NULL slots are `usize::MAX`.
                     let ri = tuple[k];
-                    let v = if ri == usize::MAX {
+                    let v: Value<'static> = if ri == usize::MAX {
                         Value::Null
                     } else {
                         sources_ref[k]
                             .get(ri)
                             .and_then(|r| r.values.get(col_in_src))
                             .cloned()
+                            .map(Value::into_owned)
                             .unwrap_or(Value::Null)
                     };
                     values.push(v);
                 } else if let Some(pos) = proj_pos[i] {
                     // Bound but couldn't decompose (shouldn't normally
                     // happen — keep as a safe path).
-                    values.push(row.get(pos).cloned().unwrap_or(Value::Null));
+                    values.push(row.get(pos).cloned().map(Value::into_owned).unwrap_or(Value::Null));
                 } else {
                     // Eval path — `materialised` is Some whenever any
                     // projection item is non-bound (need_eval_row true).
@@ -2802,7 +2803,7 @@ impl Engine {
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
             partial_sort_tagged(&mut tagged, keep, &descs);
         }
-        let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
@@ -2875,7 +2876,7 @@ impl Engine {
                     "AS OF SEGMENT: cold segment {segment_id} not registered"
                 ))
             })?;
-        let mut out_rows: Vec<Row> = Vec::new();
+        let mut out_rows: Vec<Row<'static>> = Vec::new();
         let mut limit_remaining: Option<usize> =
             stmt.limit_literal().and_then(|n| usize::try_from(n).ok());
         for (_key, body) in seg.scan() {
@@ -2914,7 +2915,7 @@ impl Engine {
     fn eval_expr_simple(
         &self,
         expr: &Expr,
-        row: &Row,
+        row: &Row<'static>,
         ctx: &EvalContext,
     ) -> Result<Value, EngineError> {
         let cancel = CancelToken::none();
@@ -2935,12 +2936,12 @@ pub(crate) struct ProjectedItem {
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
-/// structural (`Vec<Value>` ⇒ pairwise `Value` equality), which gives SQL
+/// structural (`Vec<Value<'static>>` ⇒ pairwise `Value` equality), which gives SQL
 /// `NULL = NULL → TRUE` and `NaN = NaN → FALSE`. The first agrees with
 /// the spec's "two NULLs are not distinct"; the second is a tolerated
 /// quirk for v1 (no NaN literals are reachable from the SQL surface).
-fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
-    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
+    let mut out: Vec<Row<'static>> = Vec::with_capacity(rows.len());
     for r in rows {
         if !out.iter().any(|seen| seen == &r) {
             out.push(r);
@@ -3166,7 +3167,7 @@ pub(crate) fn build_projection(
 /// non-column expressions). Lets `WITH t(n) AS (SELECT 1 ...)`
 /// land an Int column in the CTE storage table rather than failing
 /// the insert with "expected TEXT, got INT".
-pub(crate) fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchema> {
+pub(crate) fn infer_column_types(columns: &[ColumnSchema], rows: &[Row<'static>]) -> Vec<ColumnSchema> {
     let mut out = columns.to_vec();
     for (col_idx, col) in out.iter_mut().enumerate() {
         if col.ty != DataType::Text {
@@ -3211,7 +3212,7 @@ pub(crate) fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<
 /// v4.22: encode a Row to a comparable byte key for UNION-DISTINCT
 /// dedup inside the recursive iteration. Crude but deterministic
 /// — Debug prints embed type discriminants so NULL ≠ "" ≠ 0.
-fn encode_row_key(row: &Row) -> Vec<u8> {
+fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
     let mut out = Vec::new();
     for v in &row.values {
         let s = alloc::format!("{v:?}|");
@@ -3230,7 +3231,7 @@ fn generate_series_integers(
     stop: i64,
     step: i64,
     cancel: &CancelToken<'_>,
-) -> Result<alloc::vec::Vec<Row>, EngineError> {
+) -> Result<alloc::vec::Vec<Row<'static>>, EngineError> {
     if step == 0 {
         return Err(EngineError::Unsupported(
             "generate_series(): step argument cannot be zero".into(),
@@ -3274,7 +3275,7 @@ fn generate_series_timestamps(
     stop: i64,
     step: Value,
     cancel: &CancelToken<'_>,
-) -> Result<alloc::vec::Vec<Row>, EngineError> {
+) -> Result<alloc::vec::Vec<Row<'static>>, EngineError> {
     let (months, days, micros) = match &step {
         Value::Interval {
             months,
@@ -3378,14 +3379,14 @@ fn top_level_unnest_arg(expr: &spg_sql::ast::Expr) -> Option<&spg_sql::ast::Expr
 /// `unnest()` projection emits. NULL → empty list (PG: `unnest(NULL)
 /// = (no rows)`). Non-array values fall through to a type-mismatch
 /// error.
-fn array_value_to_elements(v: &Value) -> Result<Vec<Value>, EngineError> {
+fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, EngineError> {
     match v {
         Value::Null => Ok(Vec::new()),
         Value::TextArray(items) => Ok(items
             .iter()
             .map(|opt| {
                 opt.as_ref()
-                    .map(|s| Value::Text(s.clone()))
+                    .map(|s| Value::text(s.clone()))
                     .unwrap_or(Value::Null)
             })
             .collect()),

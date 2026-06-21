@@ -328,7 +328,7 @@ pub(crate) fn on_conflict_keys_exist(
     let Some(table) = catalog.get(table_name) else {
         return false;
     };
-    let matches = |r: &Row| {
+    let matches = |r: &Row<'static>| {
         column_positions
             .iter()
             .enumerate()
@@ -355,17 +355,17 @@ pub(crate) fn on_conflict_keys_exist(
 /// Each assignment substitutes `EXCLUDED.col` with the matching
 /// incoming value, evaluates the resulting expression against
 /// the existing row, and writes the new value into the
-/// corresponding column of the returned `Vec<Value>`. If
+/// corresponding column of the returned `Vec<Value<'static>>`. If
 /// `where_` evaluates falsy, returns Ok(None) — PG behaviour:
 /// the conflicting row is silently kept unchanged.
 pub(crate) fn apply_on_conflict_assignments(
     catalog: &Catalog,
     table_name: &str,
     target_pos: usize,
-    incoming: &[Value],
+    incoming: &[Value<'static>],
     assignments: &[(String, Expr)],
     where_: Option<&Expr>,
-) -> Result<Option<Vec<Value>>, EngineError> {
+) -> Result<Option<Vec<Value<'static>>>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
@@ -414,7 +414,7 @@ pub(crate) fn apply_on_conflict_assignments(
 /// "EXCLUDED", name }` reference with a `Literal` of the matching
 /// value from the incoming-row vec. Resolution against the
 /// child-table column list (by name).
-fn substitute_excluded_refs(expr: Expr, schema_cols: &[ColumnSchema], incoming: &[Value]) -> Expr {
+fn substitute_excluded_refs(expr: Expr, schema_cols: &[ColumnSchema], incoming: &[Value<'static>]) -> Expr {
     use spg_sql::ast::ColumnName;
     match expr {
         Expr::Column(ColumnName { qualifier, name })
@@ -536,7 +536,7 @@ pub(crate) fn enforce_uniqueness_inserts(
     catalog: &Catalog,
     child_table: &str,
     constraints: &[spg_storage::UniquenessConstraint],
-    rows: &[Vec<Value>],
+    rows: &[Vec<Value<'static>>],
 ) -> Result<(), EngineError> {
     if constraints.is_empty() {
         return Ok(());
@@ -557,7 +557,7 @@ pub(crate) fn enforce_uniqueness_inserts(
     // collated_key_cell before encoding, NULL-bearing keys skip the
     // set unless nulls_not_distinct.
     for uc in constraints {
-        let fold_key = |values: &[Value]| -> Vec<Value> {
+        let fold_key = |values: &[Value<'static>]| -> Vec<Value<'static>> {
             uc.columns
                 .iter()
                 .map(|&i| {
@@ -611,12 +611,12 @@ fn collated_key_cell(
     v: &spg_storage::Value,
     column_position: usize,
     schema: &spg_storage::TableSchema,
-) -> spg_storage::Value {
+) -> spg_storage::Value<'static> {
     match (v, schema.columns.get(column_position).map(|c| c.collation)) {
         (spg_storage::Value::Text(s), Some(spg_storage::Collation::CaseInsensitive)) => {
-            spg_storage::Value::Text(s.to_ascii_lowercase())
+            spg_storage::Value::text(s.to_ascii_lowercase())
         }
-        _ => v.clone(),
+        _ => v.clone().into_owned(),
     }
 }
 
@@ -645,7 +645,7 @@ fn predicate_truthy(v: &spg_storage::Value) -> bool {
 pub(crate) fn check_existing_unique_violation(
     idx: &spg_storage::Index,
     schema: &spg_storage::TableSchema,
-    rows: &[spg_storage::Row],
+    rows: &[spg_storage::Row<'static>],
 ) -> Result<(), EngineError> {
     let predicate_expr = match idx.partial_predicate.as_deref() {
         Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
@@ -657,7 +657,7 @@ pub(crate) fn check_existing_unique_violation(
     };
     let ctx = eval::EvalContext::new(&schema.columns, None);
     let key_positions = unique_key_positions(idx);
-    let mut seen: alloc::vec::Vec<alloc::vec::Vec<spg_storage::Value>> = alloc::vec::Vec::new();
+    let mut seen: alloc::vec::Vec<alloc::vec::Vec<spg_storage::Value<'static>>> = alloc::vec::Vec::new();
     for row in rows {
         if let Some(expr) = &predicate_expr {
             let v = eval::eval_expr(expr, row, &ctx).map_err(|e| {
@@ -669,7 +669,7 @@ pub(crate) fn check_existing_unique_violation(
                 continue;
             }
         }
-        let key: alloc::vec::Vec<spg_storage::Value> = key_positions
+        let key: alloc::vec::Vec<spg_storage::Value<'static>> = key_positions
             .iter()
             .map(|&p| {
                 let v = row
@@ -714,7 +714,7 @@ fn unique_key_positions(idx: &spg_storage::Index) -> alloc::vec::Vec<usize> {
 pub(crate) fn enforce_unique_index_inserts(
     catalog: &Catalog,
     table_name: &str,
-    rows: &[alloc::vec::Vec<spg_storage::Value>],
+    rows: &[alloc::vec::Vec<spg_storage::Value<'static>>],
 ) -> Result<(), EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -738,7 +738,7 @@ pub(crate) fn enforce_unique_index_inserts(
             None => None,
         };
         let key_positions = unique_key_positions(idx);
-        let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
+        let key_of = |values: &[spg_storage::Value<'static>]| -> alloc::vec::Vec<spg_storage::Value<'static>> {
             key_positions
                 .iter()
                 .map(|&p| {
@@ -747,7 +747,7 @@ pub(crate) fn enforce_unique_index_inserts(
                 })
                 .collect()
         };
-        let participates = |values: &[spg_storage::Value]| -> Result<bool, EngineError> {
+        let participates = |values: &[spg_storage::Value<'static>]| -> Result<bool, EngineError> {
             let Some(expr) = &predicate_expr else {
                 return Ok(true);
             };
@@ -808,8 +808,8 @@ pub(crate) fn enforce_unique_index_inserts(
 pub(crate) fn any_column_changed(
     filter_cols: &[String],
     schema_cols: &[ColumnSchema],
-    old_row: &Row,
-    new_row: &Row,
+    old_row: &Row<'static>,
+    new_row: &Row<'static>,
 ) -> bool {
     for col_name in filter_cols {
         let Some(pos) = schema_cols
@@ -834,7 +834,7 @@ pub(crate) fn any_column_changed(
 pub(crate) fn enforce_check_constraints(
     catalog: &Catalog,
     table_name: &str,
-    rows: &[alloc::vec::Vec<spg_storage::Value>],
+    rows: &[alloc::vec::Vec<spg_storage::Value<'static>>],
 ) -> Result<(), EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -944,7 +944,7 @@ pub(crate) fn enforce_check_constraints(
 /// Same shape: PK-backed BTree iteration + `resolve_cold_locator`
 /// per cold locator, no dedup state because the PK uniqueness
 /// contract gives per-row uniqueness.
-pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row> {
+pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row<'static>> {
     let schema = parent.schema();
     let Some(pk_col_pos) = schema
         .uniqueness_constraints
@@ -991,7 +991,7 @@ pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::
 pub(crate) fn iter_cold_rows_with_locator_map(
     catalog: &Catalog,
     table: &spg_storage::Table,
-) -> (Vec<Row>, hashbrown::HashMap<i64, usize>) {
+) -> (Vec<Row<'static>>, hashbrown::HashMap<i64, usize>) {
     let schema = table.schema();
     let Some(pk_col_pos) = schema
         .uniqueness_constraints
@@ -1033,7 +1033,7 @@ pub(crate) fn iter_cold_rows_with_locator_map(
 pub(crate) fn iter_cold_rows_with_pk_key(
     catalog: &Catalog,
     table: &spg_storage::Table,
-) -> Vec<(spg_storage::IndexKey, Row)> {
+) -> Vec<(spg_storage::IndexKey, Row<'static>)> {
     let schema = table.schema();
     let Some(pk_col_pos) = schema
         .uniqueness_constraints
@@ -1086,7 +1086,7 @@ pub(crate) fn enforce_fk_inserts(
     catalog: &Catalog,
     child_table: &str,
     fks: &[spg_storage::ForeignKeyConstraint],
-    rows: &[Vec<Value>],
+    rows: &[Vec<Value<'static>>],
 ) -> Result<(), EngineError> {
     for fk in fks {
         let parent_is_self = fk.parent_table == child_table;
@@ -1113,7 +1113,7 @@ pub(crate) fn enforce_fk_inserts(
         // the cold parent rows ONCE per FK (the composite path only
         // — single-column FKs already ride `idx.lookup_eq` which
         // surfaces both tiers).
-        let cold_parent_rows: alloc::vec::Vec<Row> = if fk.local_columns.len() == 1 {
+        let cold_parent_rows: alloc::vec::Vec<Row<'static>> = if fk.local_columns.len() == 1 {
             Vec::new()
         } else {
             iter_cold_rows_of_parent(catalog, parent)
@@ -1171,7 +1171,7 @@ pub(crate) fn enforce_fk_inserts(
                     continue;
                 }
                 let local: Vec<&Value> = fk.local_columns.iter().map(|&i| &row_values[i]).collect();
-                let matches_parent_row = |prow: &Row| {
+                let matches_parent_row = |prow: &Row<'static>| {
                     fk.parent_columns
                         .iter()
                         .enumerate()
@@ -1224,7 +1224,7 @@ pub(crate) enum FkChildAction {
     SetDefault {
         positions: Vec<usize>,
         columns: Vec<usize>,
-        defaults: Vec<Value>,
+        defaults: Vec<Value<'static>>,
     },
 }
 
@@ -1247,7 +1247,7 @@ pub(crate) fn plan_fk_parent_deletions(
     catalog: &Catalog,
     parent_table_name: &str,
     to_delete_positions: &[usize],
-    to_delete_rows: &[Vec<Value>],
+    to_delete_rows: &[Vec<Value<'static>>],
 ) -> Result<Vec<FkChildStep>, EngineError> {
     use alloc::collections::{BTreeMap, BTreeSet};
     if to_delete_rows.is_empty() {
@@ -1261,7 +1261,7 @@ pub(crate) fn plan_fk_parent_deletions(
     for &p in to_delete_positions {
         visited.insert((parent_table_name.to_string(), p));
     }
-    let mut work: Vec<(String, Vec<Value>)> = to_delete_rows
+    let mut work: Vec<(String, Vec<Value<'static>>)> = to_delete_rows
         .iter()
         .map(|r| (parent_table_name.to_string(), r.clone()))
         .collect();
@@ -1444,7 +1444,7 @@ pub(crate) fn plan_fk_parent_deletions(
 pub(crate) fn plan_fk_parent_updates(
     catalog: &Catalog,
     parent_table_name: &str,
-    plan_with_old: &[(usize, Vec<Value>, Vec<Value>)],
+    plan_with_old: &[(usize, Vec<Value<'static>>, Vec<Value<'static>>)],
 ) -> Result<Vec<FkChildStep>, EngineError> {
     use alloc::collections::BTreeMap;
     if plan_with_old.is_empty() {
@@ -1672,10 +1672,10 @@ fn apply_per_cell_writes(
     child: &mut spg_storage::Table,
     positions: &[usize],
     columns: &[usize],
-    mut value_for: impl FnMut(usize) -> Value,
+    mut value_for: impl FnMut(usize) -> Value<'static>,
 ) -> Result<(), EngineError> {
     use alloc::collections::BTreeMap;
-    let mut by_row: BTreeMap<usize, Vec<(usize, Value)>> = BTreeMap::new();
+    let mut by_row: BTreeMap<usize, Vec<(usize, Value<'static>)>> = BTreeMap::new();
     for i in 0..positions.len() {
         by_row
             .entry(positions[i])

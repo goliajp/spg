@@ -137,7 +137,7 @@ pub(crate) fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
 /// Total order over partition-key tuples. NULL sorts as the
 /// lowest value (matches the `<` partial order's NULL-last
 /// behaviour with `INFINITY` flipped).
-pub(crate) fn partition_key_cmp(a: &[Value], b: &[Value]) -> core::cmp::Ordering {
+pub(crate) fn partition_key_cmp(a: &[Value<'static>], b: &[Value<'static>]) -> core::cmp::Ordering {
     for (x, y) in a.iter().zip(b.iter()) {
         let c = value_cmp(x, y);
         if c != core::cmp::Ordering::Equal {
@@ -205,8 +205,8 @@ pub(crate) fn compute_window_partition(
     ordered: bool,
     frame: Option<&WindowFrame>,
     null_treatment: spg_sql::ast::NullTreatment,
-    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
-    filtered_rows: &[&Row],
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
+    filtered_rows: &[&Row<'static>],
     ctx: &EvalContext<'_>,
     out_vals: &mut [Value],
 ) -> Result<(), EngineError> {
@@ -251,7 +251,7 @@ pub(crate) fn compute_window_partition(
         "sum" | "avg" | "min" | "max" | "count" | "count_star" => {
             // Pre-evaluate the function arg per row in the slice
             // (count_star has no arg).
-            let arg_values: Vec<Value> = if lower == "count_star" || args.is_empty() {
+            let arg_values: Vec<Value<'static>> = if lower == "count_star" || args.is_empty() {
                 slice.iter().map(|_| Value::Null).collect()
             } else {
                 slice
@@ -343,7 +343,7 @@ pub(crate) fn compute_window_partition(
             } else {
                 Value::Null
             };
-            let values: Vec<Value> = slice
+            let values: Vec<Value<'static>> = slice
                 .iter()
                 .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
                 .collect::<Result<_, _>>()
@@ -401,7 +401,7 @@ pub(crate) fn compute_window_partition(
                     "{lower}() requires at least one argument"
                 )));
             }
-            let values: Vec<Value> = slice
+            let values: Vec<Value<'static>> = slice
                 .iter()
                 .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
                 .collect::<Result<_, _>>()
@@ -645,7 +645,7 @@ fn effective_frame(
 fn frame_bounds_for_row(
     eff: &(FrameKind, FrameBound, FrameBound),
     i: usize,
-    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
 ) -> (usize, usize) {
     let (kind, start, end) = eff;
     let n = slice.len();
@@ -715,7 +715,7 @@ fn frame_bounds_for_row(
 /// order, so peers are contiguous.
 #[allow(clippy::type_complexity)]
 fn peer_group_start(
-    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
     i: usize,
 ) -> usize {
     let key = &slice[i].1;
@@ -730,7 +730,7 @@ fn peer_group_start(
 /// BY key as `slice[i]`.
 #[allow(clippy::type_complexity)]
 fn peer_group_end(
-    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
     i: usize,
 ) -> usize {
     let key = &slice[i].1;

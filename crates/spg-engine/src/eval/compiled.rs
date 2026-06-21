@@ -24,7 +24,7 @@ pub(crate) enum Step {
     /// Pre-resolved column read (position into the row).
     Column(usize),
     /// Pre-converted literal.
-    Lit(Value),
+    Lit(Value<'static>),
     /// Pops rhs then lhs, pushes the op result. Eager both-sides
     /// evaluation — same as the interpreter (no short-circuit).
     Binary(BinOp),
@@ -431,10 +431,10 @@ pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
 /// for the machine itself.
 pub(crate) fn eval_compiled(
     c: &CompiledExpr,
-    row: &Row,
+    row: &Row<'static>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value>,
-) -> Result<Value, EvalError> {
+    stack: &mut Vec<Value<'static>>,
+) -> Result<Value<'static>, EvalError> {
     eval_compiled_ref(c, &crate::join::RowRef::Owned(row), ctx, stack)
 }
 
@@ -450,13 +450,13 @@ pub(crate) fn eval_compiled_ref(
     c: &CompiledExpr,
     row: &crate::join::RowRef<'_>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value>,
-) -> Result<Value, EvalError> {
+    stack: &mut Vec<Value<'static>>,
+) -> Result<Value<'static>, EvalError> {
     stack.clear();
     for step in &c.steps {
         match step {
             Step::Column(pos) => {
-                stack.push(row.get(*pos).cloned().unwrap_or(Value::Null));
+                stack.push(row.get(*pos).cloned().map(Value::into_owned).unwrap_or(Value::Null));
             }
             Step::Lit(v) => stack.push(v.clone()),
             Step::Binary(op) => {
@@ -465,8 +465,8 @@ pub(crate) fn eval_compiled_ref(
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::BinaryCi(op) => {
-                let fold = |v: Value| match v {
-                    Value::Text(s) => Value::Text(s.to_ascii_lowercase()),
+                let fold = |v: Value<'static>| match v {
+                    Value::Text(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,
                 };
                 let r = fold(stack.pop().unwrap_or(Value::Null));
@@ -504,7 +504,7 @@ pub(crate) fn eval_compiled_ref(
                         s.contains(&i64::from(*n))
                     }
                     (Value::BigInt(n), crate::memoize::InListSet::Int(s)) => s.contains(n),
-                    (Value::Text(t), crate::memoize::InListSet::Text(s)) => s.contains(t.as_str()),
+                    (Value::Text(t), crate::memoize::InListSet::Text(s)) => s.contains(t.as_ref()),
                     // Cross-family needle: take the interpreter's
                     // exact coercion / error path on the whole node.
                     _ => {

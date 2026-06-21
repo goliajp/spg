@@ -76,7 +76,7 @@ impl Engine {
     pub fn execute_readonly_prepared_on_snapshot(
         snapshot: &CatalogSnapshot,
         stmt: Statement,
-        params: &[Value],
+        params: &[Value<'static>],
     ) -> Result<QueryResult, EngineError> {
         Self::execute_readonly_prepared_on_snapshot_with_cancel(
             snapshot,
@@ -91,7 +91,7 @@ impl Engine {
     pub fn execute_readonly_prepared_on_snapshot_with_cancel(
         snapshot: &CatalogSnapshot,
         mut stmt: Statement,
-        params: &[Value],
+        params: &[Value<'static>],
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
@@ -177,7 +177,7 @@ impl Engine {
     /// callback. For PROJ-shape SQLs (joined non-aggregate projection
     /// of bound columns over thousands of rows) the engine produces
     /// each row to the emit fn WITHOUT materialising the result into
-    /// `Vec<Row>` — the per-cell `.cloned()` and per-row
+    /// `Vec<Row<'static>>` — the per-cell `.cloned()` and per-row
     /// `Row::new(values)` disappear. On the 25 k-row PROJ shape
     /// that's about 4 ms saved (one less full result allocation pass
     /// at the engine output boundary).
@@ -304,7 +304,7 @@ impl Engine {
         // bound columns. Falls back to the materialising path inside
         // `try_exec_joined_streaming` returning None for any shape
         // that needs the full result (aggregate, ORDER BY, DISTINCT,
-        // subqueries, etc.) — the caller's `Vec<Row>` round-trip
+        // subqueries, etc.) — the caller's `Vec<Row<'static>>` round-trip
         // still wins because Engine::execute path keeps materialising.
         if !crate::expr_tree_has_subquery(&s)
             && let Some(n) = self.try_exec_joined_streaming(&s, cancel, &mut emit)?

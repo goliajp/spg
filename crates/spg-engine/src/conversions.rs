@@ -100,7 +100,7 @@ enum UniformArrayKind {
 }
 
 impl UniformArrayKind {
-    fn build(self, items: alloc::vec::Vec<Value>) -> Value {
+    fn build(self, items: alloc::vec::Vec<Value<'static>>) -> Value {
         match self {
             Self::Bool => Value::BoolArray(
                 items
@@ -167,7 +167,7 @@ impl UniformArrayKind {
                     .into_iter()
                     .map(|v| match v {
                         Value::Null => None,
-                        Value::Bytes(b) => Some(b),
+                        Value::Bytes(b) => Some(b.into_owned()),
                         _ => unreachable!("uniform Bytes"),
                     })
                     .collect(),
@@ -204,7 +204,7 @@ impl UniformArrayKind {
     }
 }
 
-fn widen_uniform_typed(items: &[Value]) -> Option<UniformArrayKind> {
+fn widen_uniform_typed(items: &[Value<'static>]) -> Option<UniformArrayKind> {
     let mut kind: Option<UniformArrayKind> = None;
     let mut saw_non_null = false;
     for v in items {
@@ -262,7 +262,7 @@ fn discriminant_eq(a: UniformArrayKind, b: UniformArrayKind) -> bool {
 ///   - any BigInt without Text → BigIntArray (widening)
 ///   - any Text → TextArray (fallback; non-string elements
 ///     render as text)
-pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value>) -> Value {
+pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value<'static>>) -> Value {
     // v7.37.5 γ — first, detect a uniform new-array-type. If every
     // non-NULL element shares one of the array-of-scalar element
     // shapes (Bool / Float / Numeric / Date / Timestamp / Uuid /
@@ -289,7 +289,7 @@ pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value>) -> Value {
             .into_iter()
             .map(|v| match v {
                 Value::Null => None,
-                Value::Text(s) | Value::Json(s) => Some(s),
+                Value::Text(s) | Value::Json(s) => Some(s.into_owned()),
                 other => Some(alloc::format!("{other:?}")),
             })
             .collect();
@@ -784,7 +784,7 @@ pub fn format_text_2d_text_pub(
 /// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
 /// `'empty'`. Lower / upper may be empty (unbounded). Returns
 /// `None` on any parse failure; caller surfaces as hard error.
-pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value<'static>> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("empty") {
         return Some(Value::Range {
@@ -895,7 +895,7 @@ pub(crate) fn parse_multirange_str(
 
 /// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
 /// the matching element Value for the RangeKind.
-pub(crate) fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+pub(crate) fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value<'static>> {
     let text = text.trim().trim_matches('"');
     use spg_storage::RangeKind as K;
     match kind {
@@ -1522,7 +1522,7 @@ pub(crate) fn parse_timetz_str(s: &str) -> Option<(i64, i32)> {
 /// YEAR range validation: 0 sentinel or 1901..=2155. Out-of-range
 /// surfaces as a hard SQL error (no silent truncation, mirrors PG
 /// `time_in` / `uuid_in` discipline).
-pub(crate) fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value, EngineError> {
+pub(crate) fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value<'static>, EngineError> {
     if n == 0 || (1901..=2155).contains(&n) {
         // u16::try_from cannot fail in this range; the cast also
         // covers the 0 sentinel.
@@ -1781,7 +1781,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
 /// Convert an INSERT VALUES expression to a storage Value. Supports literal
 /// expressions, unary-minus over numeric literals, and pgvector-style
 /// `'[..]'::vector` cast (v1.2). Anything more complex returns `Unsupported`.
-pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
+pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, EngineError> {
     match expr {
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Cast { expr, target } => {
@@ -1840,7 +1840,7 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
         // → TextArray. Cast targets (`ARRAY[]::INT[]`) flow through
         // the outer Cast arm before reaching here and re-coerce.
         Expr::Array(items) => {
-            let mut materialised: alloc::vec::Vec<Value> =
+            let mut materialised: alloc::vec::Vec<Value<'static>> =
                 alloc::vec::Vec::with_capacity(items.len());
             for elem in items {
                 materialised.push(literal_expr_to_value(elem)?);
@@ -1868,14 +1868,14 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
     }
 }
 
-pub(crate) fn literal_to_value(l: Literal) -> Value {
+pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
     match l {
         Literal::Integer(n) => int_value_for(n),
         Literal::Float(x) => Value::Float(x),
-        Literal::String(s) => Value::Text(s),
+        Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
-        Literal::Vector(v) => Value::Vector(v),
+        Literal::Vector(v) => Value::vector(v),
         Literal::TextArray(items) => Value::TextArray(items),
         Literal::IntArray(items) => Value::IntArray(items),
         Literal::BigIntArray(items) => Value::BigIntArray(items),
@@ -1895,7 +1895,7 @@ pub(crate) fn literal_to_value(l: Literal) -> Value {
 /// Pick `Int` (`i32`) when the literal fits, else `BigInt`. `INT` vs `BIGINT`
 /// columns will still enforce the right tag downstream — this is just the
 /// default we synthesise from an unannotated integer literal.
-pub(crate) fn int_value_for(n: i64) -> Value {
+pub(crate) fn int_value_for(n: i64) -> Value<'static> {
     if let Ok(small) = i32::try_from(n) {
         Value::Int(small)
     } else {
@@ -1937,11 +1937,11 @@ pub(crate) fn check_unsigned_range(
 }
 
 pub(crate) fn coerce_value(
-    v: Value,
+    v: Value<'static>,
     expected: DataType,
     col_name: &str,
     position: usize,
-) -> Result<Value, EngineError> {
+) -> Result<Value<'static>, EngineError> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -1949,7 +1949,7 @@ pub(crate) fn coerce_value(
     if actual == expected {
         return Ok(v);
     }
-    let coerced = match (v, expected) {
+    let coerced: Option<Value<'static>> = match (v, expected) {
         (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
         (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
         (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
@@ -2039,16 +2039,16 @@ pub(crate) fn coerce_value(
         // v4.9: Text ↔ JSON coercion. No structural validation —
         // any text literal is accepted; the responsibility for
         // valid JSON lies with the producer.
-        (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
-        (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
+        (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::json(s)),
+        (Value::Json(s), DataType::Text) => Some(Value::text(s)),
         // v7.13.3 — mailrs round-7 S10. SPG's storage represents
-        // both JSON and JSONB on-disk as `Value::Json(String)` —
+        // both JSON and JSONB on-disk as `Value::json(String)` —
         // they share the underlying text payload. The cast
         // `'<text>'::jsonb` produces a Value::Json that needs to
         // satisfy a DataType::Jsonb column. Identity coerce in
         // both directions so JSON ↔ JSONB assignments work at all
         // INSERT / ALTER COLUMN TYPE / DEFAULT contexts.
-        (Value::Json(s), DataType::Jsonb | DataType::Json) => Some(Value::Json(s)),
+        (Value::Json(s), DataType::Jsonb | DataType::Json) => Some(Value::json(s)),
         // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
         //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
         //   - Escape: `Hello\\000world`  (backslash + octal triples)
@@ -2063,12 +2063,12 @@ pub(crate) fn coerce_value(
                     ),
                 })
             })?;
-            Some(Value::Bytes(bytes))
+            Some(Value::bytes(bytes))
         }
         // v7.10.4 — BYTEA → Text round-trip uses the PG hex
         // output (lowercase, `\x` prefix). Important when a
         // SELECT pulls a bytea cell through a Text column path.
-        (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
+        (Value::Bytes(b), DataType::Text) => Some(Value::text(encode_bytea_hex(&b))),
         // v7.17.0 — Text → UUID. PG accepts canonical hyphenated,
         // unhyphenated, uppercase, and `{...}`-braced forms; we
         // funnel all four through `spg_storage::parse_uuid_str`.
@@ -2090,7 +2090,7 @@ pub(crate) fn coerce_value(
         // Surfaces when a SELECT plucks a uuid cell through a
         // Text column path (e.g. INSERT INTO log SELECT id::text
         // FROM other_table).
-        (Value::Uuid(b), DataType::Text) => Some(Value::Text(spg_storage::format_uuid(&b))),
+        (Value::Uuid(b), DataType::Text) => Some(Value::text(spg_storage::format_uuid(&b))),
         // v7.17.0 Phase 3.P0-32 — Text → TIME. Accepts
         // `HH:MM:SS` and `HH:MM:SS.ffffff` (1-6 fractional digits).
         // Out-of-range hour/min/sec is a hard SQL error (no
@@ -2107,7 +2107,7 @@ pub(crate) fn coerce_value(
             }
         },
         // v7.17.0 Phase 3.P0-32 — TIME → Text canonical `HH:MM:SS[.ffffff]`.
-        (Value::Time(us), DataType::Text) => Some(Value::Text(eval::format_time(us))),
+        (Value::Time(us), DataType::Text) => Some(Value::text(eval::format_time(us))),
         // v7.17.0 Phase 3.P0-33 — int / bigint → YEAR. Range
         // check enforces the MySQL canonical 1901..=2155 + 0
         // sentinel; out-of-range is a hard SQL error (no silent
@@ -2129,7 +2129,7 @@ pub(crate) fn coerce_value(
             }
         },
         // YEAR → Text 4-digit zero-padded.
-        (Value::Year(y), DataType::Text) => Some(Value::Text(alloc::format!("{y:04}"))),
+        (Value::Year(y), DataType::Text) => Some(Value::text(alloc::format!("{y:04}"))),
         // v7.17.0 Phase 3.P0-34 — Text → TIMETZ. Mandatory
         // signed offset suffix; missing offset is a hard error
         // (SPG has no session TZ wired into eval, unlike PG).
@@ -2146,7 +2146,7 @@ pub(crate) fn coerce_value(
         },
         // TIMETZ → Text canonical `HH:MM:SS[.ffffff]±HH[:MM]`.
         (Value::TimeTz { us, offset_secs }, DataType::Text) => {
-            Some(Value::Text(eval::format_timetz(us, offset_secs)))
+            Some(Value::text(eval::format_timetz(us, offset_secs)))
         }
         // v7.17.0 Phase 3.P0-35 — Text → MONEY. Accepts `$N.NN`,
         // `$N,NNN.NN`, optional leading `-`. Bare numeric literals
@@ -2197,7 +2197,7 @@ pub(crate) fn coerce_value(
             Some(Value::Money(i64::try_from(cents).unwrap_or(i64::MAX)))
         }
         // MONEY → Text canonical `$N,NNN.CC`.
-        (Value::Money(c), DataType::Text) => Some(Value::Text(eval::format_money(c))),
+        (Value::Money(c), DataType::Text) => Some(Value::text(eval::format_money(c))),
         // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
         // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
         // `'(a,b)'`, with empty lower or upper for unbounded.
@@ -2212,7 +2212,7 @@ pub(crate) fn coerce_value(
             }
         },
         // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
-        (v @ Value::Range { .. }, DataType::Text) => Some(Value::Text(format_range_str(&v))),
+        (v @ Value::Range { .. }, DataType::Text) => Some(Value::text(format_range_str(&v))),
         // v7.37.5 ζ-A — Text → network / bit / xml / "char" / money[].
         (Value::Text(s), DataType::Inet) => match parse_inet_text(&s) {
             Some((family, bits, addr)) => Some(Value::Inet { family, bits, addr }),
@@ -2264,7 +2264,7 @@ pub(crate) fn coerce_value(
             Some(Value::BitString { nbits, bytes })
         }
         (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
-            Some((nbits, bytes)) => Some(Value::BitString { nbits, bytes }),
+            Some((nbits, bytes)) => Some(Value::bit_string(nbits, bytes)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
@@ -2273,25 +2273,25 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
-        (Value::Text(s), DataType::Xml) => Some(Value::Xml(s)),
+        (Value::Text(s), DataType::Xml) => Some(Value::xml(s)),
         (Value::Text(s), DataType::Char1) => {
             let b = s.bytes().next().unwrap_or(0);
             Some(Value::Char1(b))
         }
         // v7.37.5 ζ-A — inverse coerces.
         (Value::Inet { family, bits, addr }, DataType::Text) => {
-            Some(Value::Text(format_inet(family, bits, &addr)))
+            Some(Value::text(format_inet(family, bits, &addr)))
         }
         (Value::Cidr { family, bits, addr }, DataType::Text) => {
-            Some(Value::Text(format_inet(family, bits, &addr)))
+            Some(Value::text(format_inet(family, bits, &addr)))
         }
-        (Value::Macaddr(m), DataType::Text) => Some(Value::Text(format_macaddr(&m))),
-        (Value::Macaddr8(m), DataType::Text) => Some(Value::Text(format_macaddr8(&m))),
+        (Value::Macaddr(m), DataType::Text) => Some(Value::text(format_macaddr(&m))),
+        (Value::Macaddr8(m), DataType::Text) => Some(Value::text(format_macaddr8(&m))),
         (Value::BitString { nbits, bytes }, DataType::Text) => {
-            Some(Value::Text(format_bit_string(nbits, &bytes)))
+            Some(Value::text(format_bit_string(nbits, &bytes)))
         }
-        (Value::Xml(s), DataType::Text) => Some(Value::Text(s)),
-        (Value::Char1(b), DataType::Text) => Some(Value::Text((b as char).to_string())),
+        (Value::Xml(s), DataType::Text) => Some(Value::text(s)),
+        (Value::Char1(b), DataType::Text) => Some(Value::text((b as char).to_string())),
         // v7.37.5 ε — Text → geometry coerce. Each parser returns
         // None on malformed input; we surface a TypeMismatch with
         // the column name so the engine error is debuggable.
@@ -2366,17 +2366,17 @@ pub(crate) fn coerce_value(
             }
         },
         // v7.37.5 ε — geometry → Text canonical forms.
-        (Value::Point(p), DataType::Text) => Some(Value::Text(format_point(p))),
-        (Value::Lseg(p1, p2), DataType::Text) => Some(Value::Text(format_lseg(p1, p2))),
-        (Value::PgBox(ur, ll), DataType::Text) => Some(Value::Text(format_pg_box(ur, ll))),
-        (Value::Line { a, b, c }, DataType::Text) => Some(Value::Text(format_line(a, b, c))),
+        (Value::Point(p), DataType::Text) => Some(Value::text(format_point(p))),
+        (Value::Lseg(p1, p2), DataType::Text) => Some(Value::text(format_lseg(p1, p2))),
+        (Value::PgBox(ur, ll), DataType::Text) => Some(Value::text(format_pg_box(ur, ll))),
+        (Value::Line { a, b, c }, DataType::Text) => Some(Value::text(format_line(a, b, c))),
         (Value::Circle { center, radius }, DataType::Text) => {
-            Some(Value::Text(format_circle(center, radius)))
+            Some(Value::text(format_circle(center, radius)))
         }
         (Value::Path { points, closed }, DataType::Text) => {
-            Some(Value::Text(format_path(&points, closed)))
+            Some(Value::text(format_path(&points, closed)))
         }
-        (Value::Polygon(points), DataType::Text) => Some(Value::Text(format_polygon(&points))),
+        (Value::Polygon(points), DataType::Text) => Some(Value::text(format_polygon(&points))),
         // v7.37.5 δ — Text → Multirange. Accepts `{}` empty and
         // `{[a,b),[c,d),...}` comma-separated ranges; each
         // subrange parses with the parent kind.
@@ -2392,7 +2392,7 @@ pub(crate) fn coerce_value(
         },
         // Multirange → Text canonical form (`{[a,b),[c,d)}`).
         (Value::Multirange { ranges, .. }, DataType::Text) => {
-            Some(Value::Text(format_multirange(&ranges)))
+            Some(Value::text(format_multirange(&ranges)))
         }
         // v7.17.0 Phase 3.P0-39 — Text → Hstore.
         (Value::Text(s), DataType::Hstore) => match parse_hstore_str(&s) {
@@ -2406,7 +2406,7 @@ pub(crate) fn coerce_value(
             }
         },
         // Hstore → Text canonical `"k"=>"v"` form.
-        (Value::Hstore(pairs), DataType::Text) => Some(Value::Text(format_hstore_str(&pairs))),
+        (Value::Hstore(pairs), DataType::Text) => Some(Value::text(format_hstore_str(&pairs))),
         // v7.17.0 Phase 3.P0-40 — Text → 2D arrays via PG
         // external `'{{a,b},{c,d}}'` literal.
         (Value::Text(s), DataType::IntArray2D) => match parse_int_2d_literal(&s) {
@@ -2440,11 +2440,11 @@ pub(crate) fn coerce_value(
             }
         },
         // 2D arrays → Text canonical nested form.
-        (Value::IntArray2D(rows), DataType::Text) => Some(Value::Text(format_int_2d_text(&rows))),
+        (Value::IntArray2D(rows), DataType::Text) => Some(Value::text(format_int_2d_text(&rows))),
         (Value::BigIntArray2D(rows), DataType::Text) => {
-            Some(Value::Text(format_bigint_2d_text(&rows)))
+            Some(Value::text(format_bigint_2d_text(&rows)))
         }
-        (Value::TextArray2D(rows), DataType::Text) => Some(Value::Text(format_text_2d_text(&rows))),
+        (Value::TextArray2D(rows), DataType::Text) => Some(Value::text(format_text_2d_text(&rows))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or
@@ -2519,7 +2519,7 @@ pub(crate) fn coerce_value(
         // v7.10.11 — TEXT[] → Text round-trip uses PG's
         // external array form (`{a,b,NULL}`). Lets a SELECT
         // pull an array column through any Text-side codepath.
-        (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        (Value::TextArray(items), DataType::Text) => Some(Value::text(encode_text_array(&items))),
         // v7.37.5 ship triage — empty `ARRAY[]` literal lands as
         // `Value::TextArray(vec![])`. Allow widening to the typed
         // array sibling so `ARRAY[]::BOOL[]` / `::FLOAT[]` etc.
@@ -2620,7 +2620,7 @@ pub(crate) fn coerce_value(
                 }));
             }
             Some(match encoding {
-                VecEncoding::F32 => Value::Vector(parsed),
+                VecEncoding::F32 => Value::vector(parsed),
                 VecEncoding::Sq8 => Value::Sq8Vector(spg_storage::quantize::quantize(&parsed)),
                 VecEncoding::F16 => {
                     Value::HalfVector(spg_storage::halfvec::HalfVector::from_f32_slice(&parsed))
@@ -2701,7 +2701,7 @@ pub(crate) fn coerce_value(
         // VARCHAR(n) enforces an upper bound on character count.
         (Value::Text(s), DataType::Varchar(max)) => {
             if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
-                Some(Value::Text(s))
+                Some(Value::text(s))
             } else {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "value for VARCHAR({max}) column `{col_name}` exceeds length: \
@@ -2749,12 +2749,12 @@ pub(crate) fn coerce_value(
                 )));
             }
             let need = (size - len) as usize;
-            let mut padded = s;
+            let mut padded = s.into_owned();
             padded.reserve(need);
             for _ in 0..need {
                 padded.push(' ');
             }
-            Some(Value::Text(padded))
+            Some(Value::text(padded))
         }
         _ => None,
     };

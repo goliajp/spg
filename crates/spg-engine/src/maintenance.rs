@@ -93,7 +93,7 @@ impl Engine {
             if matches!(col_schema.ty, DataType::Vector { .. }) {
                 continue;
             }
-            let mut non_null_values: Vec<Value> = Vec::with_capacity(row_count);
+            let mut non_null_values: Vec<Value<'static>> = Vec::with_capacity(row_count);
             let mut nulls: u64 = 0;
             for row in table.rows() {
                 match row.values.get(col_pos) {
@@ -169,12 +169,12 @@ impl Engine {
             ColumnSchema::new("deleted_rows_pruned", DataType::BigInt, false),
             ColumnSchema::new("bytes_reclaimed_estimate", DataType::BigInt, false),
         ];
-        let rows: Vec<Row> = reports
+        let rows: Vec<Row<'static>> = reports
             .into_iter()
             .map(|(tname, iname, report)| {
                 Row::new(alloc::vec![
-                    Value::Text(tname),
-                    Value::Text(iname),
+                    Value::text(tname),
+                    Value::text(iname),
                     Value::BigInt(i64::try_from(report.sources.len()).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::from(report.merged_segment_id.unwrap_or(0))),
                     Value::BigInt(i64::try_from(report.merged_rows).unwrap_or(i64::MAX)),

@@ -3713,7 +3713,7 @@ impl Catalog {
         table_name: &str,
         segment_id: u32,
         key: &IndexKey,
-    ) -> Option<Row> {
+    ) -> Option<Row<'static>> {
         let t = self.get(table_name)?;
         let u64_key = index_key_as_u64(key)?;
         let seg = self.cold_segments.get(segment_id as usize)?.as_ref()?;

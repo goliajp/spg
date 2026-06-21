@@ -106,7 +106,7 @@ fn create_table_vector_using_sq8_succeeds() {
 #[test]
 fn insert_into_sq8_column_quantises_f32_payload() {
     // v6.0.1 step 3: INSERT-time `coerce_value` rewrites a raw
-    // `Value::Vector(Vec<f32>)` literal into the column's
+    // `Value::vector(Vec<f32>)` literal into the column's
     // quantised representation. The row that lands in the
     // catalog must therefore hold a `Value::Sq8Vector`, not the
     // original f32 buffer — that's the bit that delivers the
@@ -131,7 +131,7 @@ fn insert_into_sq8_column_quantises_f32_payload() {
 #[test]
 fn create_table_vector_using_half_succeeds_and_insert_converts_to_f16() {
     // v6.0.3: CREATE TABLE accepts USING HALF; INSERT path
-    // converts the incoming `Value::Vector(Vec<f32>)` cell
+    // converts the incoming `Value::vector(Vec<f32>)` cell
     // into `Value::HalfVector(HalfVector)` via the new
     // `coerce_value` arm. The dequantised round-trip is
     // bit-exact for f16-representable values, so 0.0 / 0.25
@@ -255,7 +255,7 @@ fn prepared_insert_substitutes_placeholders() {
         .unwrap();
     let stmt = e.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
-        e.execute_prepared(stmt.clone(), &[Value::Int(id), Value::Text(name.into())])
+        e.execute_prepared(stmt.clone(), &[Value::Int(id), Value::text::<String>(name.into())])
             .unwrap();
     }
     // Read back via simple-query SELECT.
@@ -310,7 +310,7 @@ fn bytea_cast_round_trips_text_input() {
         panic!("expected Rows")
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[0], Value::Bytes(b"hello".to_vec()));
+    assert_eq!(rows[0].values[0], Value::bytes(b"hello".to_vec()));
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn bytea_cast_pg_escape_hex_form() {
     };
     assert_eq!(
         rows[0].values[0],
-        Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+        Value::bytes(vec![0xde, 0xad, 0xbe, 0xef])
     );
 }
 
@@ -538,7 +538,7 @@ fn select_star_returns_all_rows_in_insertion_order() {
     assert_eq!(rows.len(), 3);
     assert_eq!(
         rows[1].values,
-        vec![Value::Int(2), Value::Text("two".into())]
+        vec![Value::Int(2), Value::text("two")]
     );
 }
 
@@ -566,7 +566,7 @@ fn make_three_row_users(e: &mut Engine) {
         .unwrap();
 }
 
-fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row>) {
+fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     match r {
         QueryResult::Rows { columns, rows } => (columns, rows),
         QueryResult::CommandOk { .. } => panic!("expected Rows"),
@@ -592,7 +592,7 @@ fn where_with_null_result_filters_out_row() {
     let r = e.execute("SELECT * FROM users WHERE score > 80").unwrap();
     let (_, rows) = unwrap_rows(r);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[1], Value::Text("alice".into()));
+    assert_eq!(rows[0].values[1], Value::text("alice"));
 }
 
 #[test]
@@ -607,7 +607,7 @@ fn projection_named_columns() {
     assert_eq!(rows.len(), 3);
     assert_eq!(
         rows[0].values,
-        vec![Value::Text("alice".into()), Value::Int(90)]
+        vec![Value::text("alice"), Value::Int(90)]
     );
 }
 
@@ -621,7 +621,7 @@ fn projection_with_column_alias() {
     let (cols, rows) = unwrap_rows(r);
     assert_eq!(cols[0].name, "who");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[0], Value::Text("alice".into()));
+    assert_eq!(rows[0].values[0], Value::text("alice"));
 }
 
 #[test]
@@ -1022,7 +1022,7 @@ fn show_publications_returns_one_row_per_publication_ordered_by_name() {
         .iter()
         .map(|r| {
             if let Value::Text(s) = &r.values[0] {
-                s.as_str()
+                s.as_ref()
             } else {
                 panic!()
             }
@@ -1144,7 +1144,7 @@ fn show_subscriptions_returns_rows_ordered_by_name() {
         .iter()
         .map(|r| {
             if let Value::Text(s) = &r.values[0] {
-                s.as_str()
+                s.as_ref()
             } else {
                 panic!()
             }
@@ -1152,12 +1152,12 @@ fn show_subscriptions_returns_rows_ordered_by_name() {
         .collect();
     assert_eq!(names, alloc::vec!["a_sub", "z_sub"]);
     // Row 0: a_sub
-    assert_eq!(rows[0].values[1], Value::Text("h=y".to_string()));
-    assert_eq!(rows[0].values[2], Value::Text("p3".to_string()));
+    assert_eq!(rows[0].values[1], Value::text("h=y".to_string()));
+    assert_eq!(rows[0].values[2], Value::text("p3".to_string()));
     assert_eq!(rows[0].values[3], Value::Bool(true));
     assert_eq!(rows[0].values[4], Value::BigInt(0));
     // Row 1: z_sub — publications join with ", "
-    assert_eq!(rows[1].values[2], Value::Text("p1, p2".to_string()));
+    assert_eq!(rows[1].values[2], Value::text("p1, p2".to_string()));
 }
 
 #[test]

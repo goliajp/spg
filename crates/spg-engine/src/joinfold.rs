@@ -220,7 +220,7 @@ impl Engine {
 struct FoldPlan {
     join_idx: usize,
     outer_expr: Expr,
-    pk_values: Vec<Value>,
+    pk_values: Vec<Value<'static>>,
 }
 
 impl Engine {
@@ -705,7 +705,7 @@ fn value_to_literal(v: &Value) -> Literal {
         Value::BigInt(n) => Literal::Integer(*n),
         Value::Bool(b) => Literal::Bool(*b),
         Value::Float(x) => Literal::Float(*x),
-        Value::Text(s) => Literal::String(s.clone()),
+        Value::Text(s) => Literal::String(s.to_string()),
         _ => Literal::Null,
     }
 }
@@ -746,7 +746,7 @@ impl Engine {
         pk_col: &str,
         inner_preds: &[Expr],
         cancel: CancelToken<'_>,
-    ) -> Result<Vec<Value>, EngineError> {
+    ) -> Result<Vec<Value<'static>>, EngineError> {
         let primary = spg_sql::ast::TableRef {
             name: table_name.to_string(),
             alias: Some(alias.to_string()),
@@ -788,7 +788,7 @@ impl Engine {
                 "joinfold: inner probe returned non-Rows for {table_name}"
             )));
         };
-        let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+        let mut out: Vec<Value<'static>> = Vec::with_capacity(rows.len());
         for r in rows {
             if let Some(v) = r.values.into_iter().next() {
                 out.push(v);
