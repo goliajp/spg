@@ -248,6 +248,46 @@ impl Engine {
         self.exec_select_cancel(s, cancel)
     }
 
+    /// v7.37.42 (A3 Step 2) — SCALARSQ streaming-shape API. Drives
+    /// the per-row `emit` callback directly out of `exec_scalarsq_
+    /// streaming` without building an intermediate `Vec<Row>` or
+    /// going through the generic streaming wrapper. Returns the
+    /// emitted column set + row count.
+    ///
+    /// Falls back to the generic materialised path
+    /// (`exec_select_cancel` followed by row-by-row emit) when the
+    /// statement isn't a streaming shape — keeps callers shape-blind.
+    /// The shape check is fast (~10 boolean field reads + items
+    /// walk); calling on every prepared SELECT is fine.
+    pub fn execute_readonly_select_scalarsq_streaming<F>(
+        &self,
+        s: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        mut emit: F,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, usize), EngineError>
+    where
+        F: FnMut(&[spg_storage::ColumnSchema], &[spg_storage::Value]) -> Result<(), EngineError>,
+    {
+        cancel.check()?;
+        if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
+            return self.exec_scalarsq_streaming(s, cancel, emit);
+        }
+        // Generic fallback — same as `execute_readonly_select_prepared`
+        // but adapted to the streaming-shape API's columns+row callback
+        // signature. Used by shape-blind callers (wire path); the
+        // streaming-shape early return above is the perf win.
+        let QueryResult::Rows { columns, rows } = self.exec_select_cancel(s, cancel)? else {
+            return Err(EngineError::Unsupported(
+                "scalarsq_streaming fallback got a non-Rows result".into(),
+            ));
+        };
+        for row in &rows {
+            emit(&columns, &row.values)?;
+        }
+        let n = rows.len();
+        Ok((columns, n))
+    }
+
     pub fn execute_readonly_select_streaming_prepared<F>(
         &self,
         s: &spg_sql::ast::SelectStatement,
