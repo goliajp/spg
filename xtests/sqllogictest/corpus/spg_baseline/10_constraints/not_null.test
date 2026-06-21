@@ -1,0 +1,10 @@
+# NOT NULL enforced.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement error
+INSERT INTO t (id) VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (1, 'a')

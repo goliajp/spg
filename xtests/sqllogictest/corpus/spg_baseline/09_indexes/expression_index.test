@@ -1,0 +1,16 @@
+# Functional / expression index. SPG accepts CREATE INDEX ON t (lower(name))
+# without the wrapping double parens — that's the supported baseline.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE INDEX t_lower_name_idx ON t (lower(name))
+
+statement ok
+INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB')
+
+query I rowsort
+SELECT id FROM t WHERE lower(name) = 'alice'
+----
+1

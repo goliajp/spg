@@ -1,0 +1,15 @@
+# Multi-column btree.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c TEXT NOT NULL)
+
+statement ok
+CREATE INDEX t_ab_idx ON t (a, b)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (1, 20, 'y'), (2, 10, 'z')
+
+query T rowsort
+SELECT c FROM t WHERE a = 1 AND b = 10
+----
+x

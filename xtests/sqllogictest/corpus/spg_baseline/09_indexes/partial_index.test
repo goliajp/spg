@@ -1,0 +1,15 @@
+# CREATE INDEX … WHERE — partial index.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, active BOOL NOT NULL, v INT NOT NULL)
+
+statement ok
+CREATE INDEX t_active_idx ON t (v) WHERE active
+
+statement ok
+INSERT INTO t VALUES (1, true, 10), (2, false, 20), (3, true, 30)
+
+query I rowsort
+SELECT id FROM t WHERE active AND v = 30
+----
+3

@@ -1,0 +1,13 @@
+# CHECK constraint.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, age INT NOT NULL CHECK (age >= 0))
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement error
+INSERT INTO t VALUES (2, -5)
+
+statement ok
+INSERT INTO t VALUES (3, 0)
