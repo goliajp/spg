@@ -31,6 +31,11 @@ spg-wire     = { workspace = true }
 spg-sql      = { workspace = true }
 spg-engine   = { workspace = true }
 spg-storage  = { workspace = true }
+# v7.37.42-arena Phase 2 — pgwire allocates a per-query Bump arena
+# and threads it into the SCALARSQ streaming executor so the row
+# scratch + projection buffer live in the arena (bulk reset at
+# query end instead of per-row Drop).
+bumpalo      = { workspace = true }
 spg-audit    = { workspace = true }
 spg-crypto   = { workspace = true }
 # v7.1 — manifest format extracted into a standalone crate so
