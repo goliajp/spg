@@ -48,6 +48,22 @@ const PER_THREAD: usize = 5;
 const USERS: usize = 30;
 
 fn build() -> Engine {
+    build_inner(true)
+}
+
+/// `build_no_analyze` reproduces the `Database::open_path` + fresh-
+/// import scenario: catalog is populated by INSERTs but ANALYZE has
+/// never been called. This is the mailrs-prod boot shape (no
+/// background auto-analyze worker wired in the embed host), and is
+/// where the planner falls back to source-order JOIN because the
+/// `reorder_joins` pass bails on `stats.is_empty()`. The general fix
+/// must work for both `build()` (post-ANALYZE) and `build_no_analyze()`
+/// — same query plan latency floor regardless of stats freshness.
+fn build_no_analyze() -> Engine {
+    build_inner(false)
+}
+
+fn build_inner(run_analyze: bool) -> Engine {
     let mut eng = Engine::new();
     // Mailboxes — small (USERS × ~3 = 90 rows). Same shape as the
     // prod schema (`crates/server/src/pg.rs` + `crates/mailbox`).
@@ -103,6 +119,49 @@ fn build() -> Engine {
         ))
         .unwrap();
     }
+    // email_analysis — 1:1 with messages, for the conversations
+    // correlated subquery shape (`SELECT ea.category FROM
+    // email_analysis ea JOIN messages m2 ... WHERE m2.thread_id =
+    // m.thread_id ORDER BY m2.internal_date DESC LIMIT 1`).
+    eng.execute(
+        "CREATE TABLE email_analysis (message_id BIGINT PRIMARY KEY, \
+         category TEXT, summary TEXT, requires_action BOOLEAN)",
+    )
+    .unwrap();
+    for b in 0..(N / 500) {
+        let mut rows = Vec::with_capacity(500);
+        for j in 0..500 {
+            let i = b * 500 + j;
+            rows.push(format!(
+                "({}, 'cat{}', 'summary text {i}', {})",
+                i + 1,
+                i % 7,
+                if i % 11 == 0 { "true" } else { "false" }
+            ));
+        }
+        eng.execute(&format!(
+            "INSERT INTO email_analysis (message_id, category, summary, requires_action) VALUES {}",
+            rows.join(",")
+        ))
+        .unwrap();
+    }
+    // snoozed_conversations — small (one row per ~1000 messages).
+    eng.execute(
+        "CREATE TABLE snoozed_conversations (thread_id TEXT NOT NULL, \
+         account_address TEXT NOT NULL, snoozed_until BIGINT NOT NULL)",
+    )
+    .unwrap();
+    eng.execute("CREATE INDEX idx_snz_thread ON snoozed_conversations(thread_id)")
+        .unwrap();
+    for i in 0..(N / 1000) {
+        let user = i % USERS;
+        eng.execute(&format!(
+            "INSERT INTO snoozed_conversations (thread_id, account_address, snoozed_until) \
+             VALUES ('th-{}', 'u{user}@x', 1)",
+            i * 7
+        ))
+        .unwrap();
+    }
     // attachment_content — every message gets one. Worst case for
     // the content_worker NOT EXISTS shape: LIMIT 64 never short-
     // circuits, so the planner must rely on the indexed NOT EXISTS
@@ -133,7 +192,9 @@ fn build() -> Engine {
     // analyze (`tables_needing_analyze`) covers this when the embed
     // host wires it, but the perf gate runs ANALYZE explicitly so
     // the timed shape is the planner's best plan, not its fallback.
-    eng.execute("ANALYZE").unwrap();
+    if run_analyze {
+        eng.execute("ANALYZE").unwrap();
+    }
     eng
 }
 
@@ -163,6 +224,44 @@ const SQL_CONVERSATIONS_LITE: &str = "SELECT m.thread_id, MAX(m.internal_date), 
       WHERE mb.user_address = 'u0@x' \
    GROUP BY m.thread_id \
    ORDER BY MAX(m.internal_date) DESC LIMIT 50";
+
+/// Shape (C) — full mailrs prod conversations SQL from
+/// `spg-7.37.3-prod-conversations-real-sql-2026-06-18.md`. 14
+/// aggregates per group + 3 correlated `LIMIT 1 ORDER BY internal_date
+/// DESC` subqueries on email_analysis + LEFT JOIN email_analysis +
+/// NOT EXISTS (snoozed). This is the heavy aggregating shape that
+/// goes 2.5s in mailrs prod. Stripped of `string_agg`, `BOOL_OR`,
+/// `(array_agg ORDER BY)[1]`, `LEFT(...)`, `COUNT(DISTINCT CASE)` —
+/// only the parts SPG can compile at the worktree head (some PG
+/// dialect ops aren't all wired here yet); the dominant cost path
+/// (small-driver, 3-subquery, GROUP BY + ORDER BY) is preserved.
+const SQL_CONVERSATIONS_REAL_SHAPE: &str = "SELECT m.thread_id, MAX(m.subject), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       COALESCE((SELECT ea_s.summary FROM email_analysis ea_s \
+                   JOIN messages m_s ON ea_s.message_id = m_s.id \
+                  WHERE m_s.thread_id = m.thread_id \
+                    AND ea_s.summary IS NOT NULL \
+                    AND ea_s.summary != '' \
+                  ORDER BY m_s.internal_date DESC LIMIT 1), \
+                ''), \
+       MAX(m.subject) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'u0@x' \
+   AND m.thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 9999999999) \
+ GROUP BY m.thread_id \
+ ORDER BY MAX(m.internal_date) DESC \
+ LIMIT 50";
 
 fn run_query(eng: &mut Engine, sql: &str, iters: u32) -> f64 {
     // Warm once so plan rewrite / cache / cold-tier promotion are
@@ -212,6 +311,81 @@ fn mailrs_conversations_100k_small_driver_under_budget() {
     );
 }
 
+/// Real prod conversations shape (Shape C) — LEFT JOIN +
+/// NOT EXISTS + 2 correlated `LIMIT 1 ORDER BY DESC` subqueries +
+/// GROUP BY + ORDER BY MAX(date) DESC LIMIT. This is the actual
+/// shape that hits 2.5s in mailrs prod; the reduced "lite" form
+/// above misses the correlated-subquery × per-group cost (the
+/// dominant 50× regression vector). Budget 500 ms — the real prod
+/// shape has 3 correlated subqueries instead of 2 in this gate
+/// (the third uses a `LEFT(m3.text_body, 80)` form not yet wired
+/// here), and the gate must not regress past mailrs's "annoying"
+/// UX line.
+#[test]
+fn mailrs_conversations_real_shape_100k_under_budget() {
+    let _lock = crate::perf_lock();
+    let mut eng = build();
+    let mean = run_query(&mut eng, SQL_CONVERSATIONS_REAL_SHAPE, 2);
+    let budget = 0.500;
+    assert!(
+        mean < budget,
+        "mailrs conversations real-shape 100k mean {mean:.4}s exceeds budget \
+         {budget:.4}s — correlated subqueries on GROUP BY thread_id should batch- \
+         evaluate via the per-query memo, not per-group re-execute"
+    );
+}
+
+#[test]
+fn mailrs_conversations_real_shape_100k_no_analyze_under_budget() {
+    let _lock = crate::perf_lock();
+    let mut eng = build_no_analyze();
+    let mean = run_query(&mut eng, SQL_CONVERSATIONS_REAL_SHAPE, 2);
+    let budget = 0.500;
+    assert!(
+        mean < budget,
+        "mailrs conversations real-shape 100k no-ANALYZE mean {mean:.4}s exceeds \
+         budget {budget:.4}s — the fix must work without ANALYZE (mailrs prod's \
+         shape)"
+    );
+}
+
+/// mailrs prod doesn't wire a background auto-ANALYZE worker into
+/// the embed host today — fresh `Database::open_path` + INSERT
+/// catalog runs with empty `Statistics`, so `reorder_joins` bails
+/// (it gates on `stats.is_empty()`). Source-order JOIN under that
+/// shape: `messages` (100k) drives, `mailboxes` (90) joins second.
+/// Without WHERE-driven row reduction the running set stays at
+/// 100k through the join. The fix must keep this case fast too —
+/// the planner needs a stats-free fallback that respects table
+/// sizes (mailrs prod's actual entry shape).
+#[test]
+fn mailrs_content_worker_100k_no_analyze_under_budget() {
+    let _lock = crate::perf_lock();
+    let mut eng = build_no_analyze();
+    let mean = run_query(&mut eng, SQL_CONTENT_WORKER, 3);
+    let budget = 0.100;
+    assert!(
+        mean < budget,
+        "mailrs content_worker 100k no-ANALYZE mean {mean:.4}s exceeds budget \
+         {budget:.4}s — reorder_joins likely bailed on empty stats and source-order \
+         JOIN forced a 100k-row materialise instead of the walker fast path"
+    );
+}
+
+#[test]
+fn mailrs_conversations_100k_no_analyze_under_budget() {
+    let _lock = crate::perf_lock();
+    let mut eng = build_no_analyze();
+    let mean = run_query(&mut eng, SQL_CONVERSATIONS_LITE, 3);
+    let budget = 0.200;
+    assert!(
+        mean < budget,
+        "mailrs conversations 100k no-ANALYZE mean {mean:.4}s exceeds budget \
+         {budget:.4}s — planner needs a stats-free size-aware fallback (mailrs prod \
+         runs without ANALYZE; the cost-based reorder bails)"
+    );
+}
+
 /// Full-tier (ignored) — extended sweep for visibility into the
 /// per-shape cost at the 100k seed. Documents headroom against the
 /// fast-tier budgets above.
@@ -219,26 +393,29 @@ fn mailrs_conversations_100k_small_driver_under_budget() {
 #[ignore]
 fn mailrs_100k_cascade_p50_p95_p99_sweep() {
     let _lock = crate::perf_lock();
-    let mut eng = build();
-    for (name, sql, budget_ms) in [
-        ("content_worker", SQL_CONTENT_WORKER, 100.0_f64),
-        ("conversations", SQL_CONVERSATIONS_LITE, 200.0),
-    ] {
-        let _ = eng.execute(sql).expect("warm");
-        let iters: usize = 20;
-        let mut samples: Vec<f64> = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let t0 = Instant::now();
-            let r = eng.execute(std::hint::black_box(sql)).expect("ok");
-            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(r);
+    for (label, mut eng) in [("with-analyze", build()), ("no-analyze", build_no_analyze())] {
+        eprintln!("== {label} ==");
+        for (name, sql, budget_ms) in [
+            ("content_worker", SQL_CONTENT_WORKER, 100.0_f64),
+            ("conversations_lite", SQL_CONVERSATIONS_LITE, 200.0),
+            ("conversations_real", SQL_CONVERSATIONS_REAL_SHAPE, 500.0),
+        ] {
+            let _ = eng.execute(sql).expect("warm");
+            let iters: usize = 20;
+            let mut samples: Vec<f64> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                let r = eng.execute(std::hint::black_box(sql)).expect("ok");
+                samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(r);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = samples[iters / 2];
+            let p95 = samples[(iters * 19) / 20];
+            let p99 = samples[(iters * 99) / 100];
+            eprintln!(
+                "  {name}: p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms (budget {budget_ms:.0}ms)"
+            );
         }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p50 = samples[iters / 2];
-        let p95 = samples[(iters * 19) / 20];
-        let p99 = samples[(iters * 99) / 100];
-        eprintln!(
-            "{name}: p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms (budget {budget_ms:.0}ms)"
-        );
     }
 }
