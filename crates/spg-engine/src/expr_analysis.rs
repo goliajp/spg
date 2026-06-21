@@ -89,7 +89,14 @@ pub(crate) fn collect_qualified_refs(
         collect_qualified_refs(peer, out)?;
     }
     for cte in &stmt.ctes {
-        collect_qualified_refs(&cte.body, out)?;
+        // v7.37.43-T4.4 — only Select-bodied CTEs participate in
+        // qualified-ref analysis here; modifying CTE bodies
+        // (INSERT/UPDATE/DELETE) are independently planned and
+        // their inner SELECTs (e.g. INSERT…SELECT) get scanned by
+        // dml-side passes.
+        if let Some(s) = cte.body.as_select() {
+            collect_qualified_refs(s, out)?;
+        }
     }
     Some(())
 }

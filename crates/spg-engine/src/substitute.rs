@@ -366,7 +366,15 @@ pub(crate) fn walk_select_exprs_mut(
     f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
     for cte in &mut s.ctes {
-        walk_select_exprs_mut(&mut cte.body, f)?;
+        // v7.37.43-T4.4 — modifying CTE bodies (INSERT/UPDATE/DELETE)
+        // have their own expression slots; walk each variant
+        // explicitly through the dml-statement helpers.
+        match &mut cte.body {
+            spg_sql::ast::CteBody::Select(s2) => walk_select_exprs_mut(s2, f)?,
+            spg_sql::ast::CteBody::Insert(ins) => walk_insert_exprs_mut(ins, f)?,
+            spg_sql::ast::CteBody::Update(upd) => walk_update_exprs_mut(upd, f)?,
+            spg_sql::ast::CteBody::Delete(del) => walk_delete_exprs_mut(del, f)?,
+        }
     }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
@@ -406,6 +414,104 @@ pub(crate) fn walk_select_exprs_mut(
     Ok(())
 }
 
+/// v7.37.43-T4.4 — walk every Expr slot in an INSERT body, including
+/// per-row VALUES tuples, ON CONFLICT assignments / where, RETURNING
+/// projection, and the optional INSERT…SELECT source.
+pub(crate) fn walk_insert_exprs_mut(
+    ins: &mut spg_sql::ast::InsertStatement,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for cte in &mut ins.ctes {
+        match &mut cte.body {
+            spg_sql::ast::CteBody::Select(s2) => walk_select_exprs_mut(s2, f)?,
+            spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
+            spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
+            spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+        }
+    }
+    for row in &mut ins.rows {
+        for cell in row.iter_mut() {
+            f(cell)?;
+        }
+    }
+    if let Some(sel) = &mut ins.select_source {
+        walk_select_exprs_mut(sel, f)?;
+    }
+    if let Some(oc) = &mut ins.on_conflict
+        && let spg_sql::ast::OnConflictAction::Update { assignments, where_ } = &mut oc.action
+    {
+        for (_, e) in assignments.iter_mut() {
+            f(e)?;
+        }
+        if let Some(w) = where_ {
+            f(w)?;
+        }
+    }
+    if let Some(items) = &mut ins.returning {
+        for it in items.iter_mut() {
+            if let SelectItem::Expr { expr, .. } = it {
+                f(expr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.37.43-T4.4 — walk every Expr slot in an UPDATE body.
+pub(crate) fn walk_update_exprs_mut(
+    upd: &mut spg_sql::ast::UpdateStatement,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for cte in &mut upd.ctes {
+        match &mut cte.body {
+            spg_sql::ast::CteBody::Select(s2) => walk_select_exprs_mut(s2, f)?,
+            spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
+            spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
+            spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+        }
+    }
+    for (_, e) in upd.assignments.iter_mut() {
+        f(e)?;
+    }
+    if let Some(w) = &mut upd.where_ {
+        f(w)?;
+    }
+    if let Some(items) = &mut upd.returning {
+        for it in items.iter_mut() {
+            if let SelectItem::Expr { expr, .. } = it {
+                f(expr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.37.43-T4.4 — walk every Expr slot in a DELETE body.
+pub(crate) fn walk_delete_exprs_mut(
+    del: &mut spg_sql::ast::DeleteStatement,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for cte in &mut del.ctes {
+        match &mut cte.body {
+            spg_sql::ast::CteBody::Select(s2) => walk_select_exprs_mut(s2, f)?,
+            spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
+            spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
+            spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+        }
+    }
+    if let Some(w) = &mut del.where_ {
+        f(w)?;
+    }
+    if let Some(items) = &mut del.returning {
+        for it in items.iter_mut() {
+            if let SelectItem::Expr { expr, .. } = it {
+                f(expr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn substitute_select(
     s: &mut SelectStatement,
     params: &[Value<'static>],
@@ -416,7 +522,13 @@ pub(crate) fn substitute_select(
     // above only visits Expr slots), so handle them per nested
     // statement here.
     for cte in &mut s.ctes {
-        resolve_limit_offset_placeholders(&mut cte.body, params)?;
+        if let Some(sel) = cte.body.as_select_mut() {
+            resolve_limit_offset_placeholders(sel, params)?;
+        }
+        // Modifying CTE bodies don't carry top-level LIMIT/OFFSET
+        // (PG syntax forbids LIMIT/OFFSET on INSERT/DELETE; UPDATE
+        // RETURNING similarly); inner SELECT/FROM walks happen
+        // through `walk_select_exprs_mut`'s recursion above.
     }
     for (_, peer) in &mut s.unions {
         resolve_limit_offset_placeholders(peer, params)?;
@@ -447,7 +559,9 @@ fn resolve_limit_offset_placeholders(
         s.offset = Some(resolve_limit_placeholder(le, params)?);
     }
     for cte in &mut s.ctes {
-        resolve_limit_offset_placeholders(&mut cte.body, params)?;
+        if let Some(sel) = cte.body.as_select_mut() {
+            resolve_limit_offset_placeholders(sel, params)?;
+        }
     }
     for (_, peer) in &mut s.unions {
         resolve_limit_offset_placeholders(peer, params)?;

@@ -1725,6 +1725,9 @@ impl fmt::Display for ColumnTypeName {
 /// inserted into the affected B-tree on each row change.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
+    /// v7.37.43-T4.4 — leading `WITH cte AS (…)` clauses on a top-
+    /// level UPDATE. Empty for a plain UPDATE.
+    pub ctes: Vec<Cte>,
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
@@ -1739,6 +1742,9 @@ pub struct UpdateStatement {
 /// from the active catalog and prunes them from every index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStatement {
+    /// v7.37.43-T4.4 — leading `WITH cte AS (…)` clauses on a top-
+    /// level DELETE. Empty for a plain DELETE.
+    pub ctes: Vec<Cte>,
     pub table: String,
     pub where_: Option<Expr>,
     /// v7.9.4 — `RETURNING <projection>`.
@@ -1798,6 +1804,11 @@ pub enum MergeAction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
+    /// v7.37.43-T4.4 — leading `WITH cte AS (…)` clauses on a top-
+    /// level INSERT (writable CTE outer body). Empty for a plain
+    /// INSERT. PG semantics: each CTE materialises before the
+    /// outer INSERT runs, sharing the same transaction.
+    pub ctes: Vec<Cte>,
     pub table: String,
     /// Optional column list — `INSERT INTO t (a, b) VALUES (...)`. When
     /// `None`, every tuple is positional and must match the table arity.
@@ -1952,7 +1963,14 @@ impl SelectStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cte {
     pub name: String,
-    pub body: SelectStatement,
+    /// v7.37.43-T4.4 — body is either a SELECT (read-only CTE, the
+    /// classical case) or a data-modifying statement
+    /// (INSERT / UPDATE / DELETE … RETURNING …) per PG writable
+    /// CTE semantics. The modifying body's RETURNING projection
+    /// becomes the materialised CTE table the outer query can
+    /// reference; the modifying statement runs once before the
+    /// outer query, within the same transaction.
+    pub body: CteBody,
     /// v4.22: `WITH RECURSIVE` — set when the WITH clause had the
     /// RECURSIVE keyword. Applies to every CTE in the clause per
     /// PG semantics. A non-recursive body in a RECURSIVE WITH is
@@ -1963,6 +1981,47 @@ pub struct Cte {
     /// position-by-position; the engine errors out if the count
     /// doesn't match the body's projection width.
     pub column_overrides: Vec<String>,
+}
+
+/// v7.37.43-T4.4 — CTE body. Read-only (Select) or data-modifying
+/// (Insert / Update / Delete with optional RETURNING). The
+/// data-modifying variants must carry a RETURNING projection for the
+/// outer query to reference the CTE alias by; an empty RETURNING is
+/// only valid if no outer reference materialises (rare — typically
+/// caught at planning).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CteBody {
+    Select(SelectStatement),
+    Insert(Box<InsertStatement>),
+    Update(Box<UpdateStatement>),
+    Delete(Box<DeleteStatement>),
+}
+
+impl CteBody {
+    /// Convenience accessor used by classical (read-only) CTE
+    /// callsites that still expect a SELECT body. Returns None for
+    /// data-modifying CTEs; callers must explicitly route those
+    /// through `exec_with_ctes`'s modifying branch.
+    #[must_use]
+    pub fn as_select(&self) -> Option<&SelectStatement> {
+        match self {
+            Self::Select(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_select_mut(&mut self) -> Option<&mut SelectStatement> {
+        match self {
+            Self::Select(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_modifying(&self) -> bool {
+        !matches!(self, Self::Select(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2040,6 +2099,18 @@ pub struct TableRef {
     /// Mutually exclusive with `name` / `unnest_expr` /
     /// `generate_series_args`.
     pub lateral_subquery: Option<Box<SelectStatement>>,
+    /// v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
+    /// function as a FROM item. PG semantics: for each key/value
+    /// pair in the JSONB object argument, emit one (key TEXT,
+    /// value TEXT) row. When prefixed by `LATERAL` and joined via
+    /// `CROSS JOIN LATERAL`, the argument may reference columns
+    /// from a preceding FROM item, in which case the executor
+    /// evaluates `<expr>` per outer row.
+    /// Mutually exclusive with `unnest_expr` / `generate_series_args`
+    /// / `lateral_subquery`. The optional `LATERAL` keyword does not
+    /// require a separate flag — the executor evaluates per-row
+    /// whenever the join sits in a JoinKind context.
+    pub jsonb_each_text_arg: Option<Box<Expr>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -3928,6 +3999,17 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
+impl fmt::Display for CteBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Select(s) => write!(f, "{s}"),
+            Self::Insert(s) => write!(f, "{s}"),
+            Self::Update(s) => write!(f, "{s}"),
+            Self::Delete(s) => write!(f, "{s}"),
+        }
+    }
+}
+
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // v7.30.1 (mailrs round-24 class audit) — the WITH clause
@@ -4685,6 +4767,7 @@ mod tests {
                     unnest_column_aliases: Vec::new(),
                     generate_series_args: None,
                     lateral_subquery: None,
+                    jsonb_each_text_arg: None,
                 },
                 joins: vec![],
             }),

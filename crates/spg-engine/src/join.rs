@@ -2386,6 +2386,20 @@ fn substitute_outer_in_select(
             substitute_outer_in_expr(expr, outer_row, outer_schema);
         }
     }
+    // v7.37.43-T4.5 — walk FROM-side SRF argument expressions
+    // (`unnest(<expr>)` / `generate_series(<args>)` /
+    // `jsonb_each_text(<expr>)`) so a LATERAL SRF with an outer-
+    // column reference gets the reference substituted before
+    // per-row execution.
+    if let Some(from) = &mut stmt.from {
+        substitute_outer_in_table_ref(&mut from.primary, outer_row, outer_schema);
+        for j in &mut from.joins {
+            substitute_outer_in_table_ref(&mut j.table, outer_row, outer_schema);
+            if let Some(on) = &mut j.on {
+                substitute_outer_in_expr(on, outer_row, outer_schema);
+            }
+        }
+    }
     if let Some(w) = &mut stmt.where_ {
         substitute_outer_in_expr(w, outer_row, outer_schema);
     }
@@ -2402,6 +2416,27 @@ fn substitute_outer_in_select(
     }
     for (_, peer) in &mut stmt.unions {
         substitute_outer_in_select(peer, outer_row, outer_schema);
+    }
+}
+
+fn substitute_outer_in_table_ref(
+    t: &mut spg_sql::ast::TableRef,
+    outer_row: &Row<'static>,
+    outer_schema: &[ColumnSchema],
+) {
+    if let Some(arg) = t.jsonb_each_text_arg.as_deref_mut() {
+        substitute_outer_in_expr(arg, outer_row, outer_schema);
+    }
+    if let Some(arg) = t.unnest_expr.as_deref_mut() {
+        substitute_outer_in_expr(arg, outer_row, outer_schema);
+    }
+    if let Some(args) = t.generate_series_args.as_mut() {
+        for a in args.iter_mut() {
+            substitute_outer_in_expr(a, outer_row, outer_schema);
+        }
+    }
+    if let Some(inner) = t.lateral_subquery.as_deref_mut() {
+        substitute_outer_in_select(inner, outer_row, outer_schema);
     }
 }
 

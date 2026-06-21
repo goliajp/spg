@@ -1102,7 +1102,12 @@ pub(crate) fn select_references_meta_view(stmt: &SelectStatement) -> bool {
         }
     }
     for cte in &stmt.ctes {
-        if select_references_meta_view(&cte.body) {
+        // v7.37.43-T4.4 — only Select-bodied CTEs need meta-view
+        // scanning; data-modifying CTE bodies (INSERT/UPDATE/DELETE)
+        // never reference info_schema / pg_catalog views directly.
+        if let Some(s) = cte.body.as_select()
+            && select_references_meta_view(s)
+        {
             return true;
         }
     }
@@ -1133,6 +1138,8 @@ pub(crate) fn collect_meta_view_names(
         }
     }
     for cte in &stmt.ctes {
-        collect_meta_view_names(&cte.body, into);
+        if let Some(s) = cte.body.as_select() {
+            collect_meta_view_names(s, into);
+        }
     }
 }

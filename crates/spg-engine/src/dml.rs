@@ -46,6 +46,10 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
+        if !stmt.ctes.is_empty() {
+            return self.exec_update_with_ctes(stmt.clone(), cancel);
+        }
         // v7.12.5 — snapshot BEFORE/AFTER UPDATE row triggers + the
         // session FTS config before the table mut-borrow opens (the
         // INSERT path uses the same pattern). Empty vecs are the
@@ -730,6 +734,10 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.37.43-T4.4 — writable CTE outer body (DELETE).
+        if !stmt.ctes.is_empty() {
+            return self.exec_delete_with_ctes(stmt.clone(), cancel);
+        }
         // v7.12.5 — snapshot BEFORE/AFTER DELETE row triggers + the
         // session FTS config before the mut borrow (same shape as
         // INSERT / UPDATE).
@@ -1096,6 +1104,20 @@ impl Engine {
         &mut self,
         mut stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.37.43-T4.4 — writable CTE outer body: materialise every
+        // leading WITH clause first (running any modifying CTE
+        // bodies against the active catalog so their writes land
+        // in the same transaction as the outer INSERT), then
+        // execute the INSERT against an enriched catalog where
+        // the CTE alias resolves to the materialised RETURNING
+        // rows. Sentori 0065's
+        //   WITH new_scopes AS (INSERT … RETURNING id, name)
+        //   INSERT INTO org_identity_scopes …
+        //     SELECT … FROM orgs o JOIN new_scopes …
+        // is the exact shape we exercise here.
+        if !stmt.ctes.is_empty() {
+            return self.exec_insert_with_ctes(stmt);
+        }
         // v7.17.0 Phase 1.1 — pre-resolve any nextval / currval /
         // setval calls against the catalog before the row loop. We
         // walk each tuple expression and replace matching
@@ -1141,6 +1163,7 @@ impl Engine {
                 materialised.push(tuple);
             }
             let recurse = InsertStatement {
+                ctes: Vec::new(),
                 table: stmt.table,
                 columns: stmt.columns,
                 rows: materialised,
@@ -1556,6 +1579,7 @@ impl Engine {
         let mut total_affected: usize = 0;
         for (child_name, rows) in buckets {
             let child_stmt = InsertStatement {
+                ctes: Vec::new(),
                 table: child_name,
                 columns: stmt.columns.clone(),
                 rows,
@@ -1572,6 +1596,202 @@ impl Engine {
             affected: total_affected,
             modified_catalog: !self.in_transaction(),
         })
+    }
+
+    /// v7.37.43-T4.4 — execute an INSERT carrying leading `WITH cte
+    /// AS (…)` clauses (PG writable CTE outer). Materialises every
+    /// CTE through `materialise_ctes` (running any modifying CTE
+    /// bodies against the active engine so their mutations land in
+    /// the current transaction), then runs the outer INSERT
+    /// against an enriched catalog where each CTE alias resolves
+    /// to its materialised rows. We add CTE temp tables to the
+    /// active catalog for the duration of the outer execution and
+    /// drop them when done — keeping the writes from the outer
+    /// INSERT on the original tables intact.
+    pub(crate) fn exec_insert_with_ctes(
+        &mut self,
+        mut stmt: InsertStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_insert(stmt))
+    }
+
+    /// v7.37.43-T4.4 — UPDATE counterpart of `exec_insert_with_ctes`.
+    pub(crate) fn exec_update_with_ctes(
+        &mut self,
+        mut stmt: spg_sql::ast::UpdateStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_update_cancel(&stmt, cancel))
+    }
+
+    /// v7.37.43-T4.4 — DELETE counterpart of `exec_insert_with_ctes`.
+    pub(crate) fn exec_delete_with_ctes(
+        &mut self,
+        mut stmt: spg_sql::ast::DeleteStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_delete_cancel(&stmt, cancel))
+    }
+
+    /// v7.37.43-T4.4 — install each CTE alias as a temp table on
+    /// the active catalog (running modifying CTE bodies through
+    /// `self` so writes land transactionally), execute the
+    /// caller-supplied closure, then drop every CTE temp table
+    /// regardless of success or failure (RAII-style cleanup
+    /// keeps the catalog in a consistent shape after the outer
+    /// statement returns).
+    fn run_with_cte_temps<F>(
+        &mut self,
+        ctes: &[spg_sql::ast::Cte],
+        body: F,
+    ) -> Result<QueryResult, EngineError>
+    where
+        F: FnOnce(&mut Engine) -> Result<QueryResult, EngineError>,
+    {
+        // Phase 1 — execute / materialise each CTE in declaration
+        // order, mutating self (real-table writes go through) and
+        // capturing the rows that will populate the CTE alias.
+        let mut installed: alloc::vec::Vec<String> = alloc::vec::Vec::with_capacity(ctes.len());
+        for cte in ctes {
+            if self.active_catalog().get(&cte.name).is_some() {
+                self.drop_cte_temps(&installed);
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CTE name {:?} shadows an existing table; rename the CTE",
+                    cte.name
+                )));
+            }
+            let result = self.materialise_one_cte_to_temp(cte);
+            let (columns, rows) = match result {
+                Ok(out) => out,
+                Err(e) => {
+                    self.drop_cte_temps(&installed);
+                    return Err(e);
+                }
+            };
+            let inferred = crate::select::infer_column_types(&columns, &rows);
+            let mut columns = inferred;
+            if !cte.column_overrides.is_empty() {
+                if cte.column_overrides.len() != columns.len() {
+                    self.drop_cte_temps(&installed);
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "CTE {:?} column list has {} names but body returns {} columns",
+                        cte.name,
+                        cte.column_overrides.len(),
+                        columns.len()
+                    )));
+                }
+                for (col, name) in columns.iter_mut().zip(cte.column_overrides.iter()) {
+                    col.name.clone_from(name);
+                }
+            }
+            let schema = spg_storage::TableSchema::new(cte.name.clone(), columns);
+            if let Err(e) = self.active_catalog_mut().create_table(schema) {
+                self.drop_cte_temps(&installed);
+                return Err(EngineError::Storage(e));
+            }
+            installed.push(cte.name.clone());
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&cte.name)
+                .expect("just-created CTE temp must exist");
+            for row in rows {
+                if let Err(e) = table.insert(row) {
+                    let installed_clone = installed.clone();
+                    self.drop_cte_temps(&installed_clone);
+                    return Err(EngineError::Storage(e));
+                }
+            }
+        }
+        // Phase 2 — execute the outer statement against the
+        // enriched catalog.
+        let outcome = body(self);
+        // Phase 3 — drop CTE temp tables regardless of outcome.
+        self.drop_cte_temps(&installed);
+        outcome
+    }
+
+    fn drop_cte_temps(&mut self, names: &[String]) {
+        for name in names {
+            let _ = self.active_catalog_mut().drop_table(name);
+        }
+    }
+
+    /// v7.37.43-T4.4 — materialise one CTE body, running any
+    /// modifying statement against the active catalog and
+    /// capturing the RETURNING projection.
+    fn materialise_one_cte_to_temp(
+        &mut self,
+        cte: &spg_sql::ast::Cte,
+    ) -> Result<(alloc::vec::Vec<spg_storage::ColumnSchema>, alloc::vec::Vec<Row<'static>>), EngineError>
+    {
+        use spg_sql::ast::CteBody;
+        let cancel = CancelToken::none();
+        match &cte.body {
+            CteBody::Select(s) if cte.recursive => {
+                // Reuse the SELECT-side recursive helper by wrapping
+                // through a synthetic Cte (CteBody::Select).
+                let snapshot = self.active_catalog().clone();
+                let synthetic = spg_sql::ast::Cte {
+                    name: cte.name.clone(),
+                    body: CteBody::Select(s.clone()),
+                    recursive: true,
+                    column_overrides: cte.column_overrides.clone(),
+                };
+                let (columns, rows) =
+                    self.materialise_recursive_cte(&synthetic, &snapshot, cancel)?;
+                Ok((columns, rows))
+            }
+            CteBody::Select(s) => {
+                let result = self.exec_select_cancel(s, cancel)?;
+                match result {
+                    QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+                    other => Err(EngineError::Unsupported(alloc::format!(
+                        "CTE {:?} SELECT body produced {other:?}",
+                        cte.name
+                    ))),
+                }
+            }
+            CteBody::Insert(body) => {
+                let mut body = (**body).clone();
+                body.ctes = alloc::vec::Vec::new();
+                let result = self.exec_insert(body)?;
+                self.cte_returning_or_empty(&cte.name, result)
+            }
+            CteBody::Update(body) => {
+                let mut body = (**body).clone();
+                body.ctes = alloc::vec::Vec::new();
+                let result = self.exec_update_cancel(&body, cancel)?;
+                self.cte_returning_or_empty(&cte.name, result)
+            }
+            CteBody::Delete(body) => {
+                let mut body = (**body).clone();
+                body.ctes = alloc::vec::Vec::new();
+                let result = self.exec_delete_cancel(&body, cancel)?;
+                self.cte_returning_or_empty(&cte.name, result)
+            }
+        }
+    }
+
+    fn cte_returning_or_empty(
+        &self,
+        cte_name: &str,
+        result: QueryResult,
+    ) -> Result<(alloc::vec::Vec<spg_storage::ColumnSchema>, alloc::vec::Vec<Row<'static>>), EngineError>
+    {
+        match result {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            QueryResult::CommandOk { .. } => {
+                let placeholder = spg_storage::ColumnSchema::new(
+                    alloc::format!("{cte_name}_returning_absent"),
+                    spg_storage::DataType::Text,
+                    true,
+                );
+                Ok((alloc::vec![placeholder], alloc::vec::Vec::new()))
+            }
+        }
     }
 }
 
