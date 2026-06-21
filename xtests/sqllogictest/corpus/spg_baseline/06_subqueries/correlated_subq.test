@@ -1,0 +1,23 @@
+# Correlated subquery. Round-30 prod livelock fix protects this surface.
+
+statement ok
+CREATE TABLE outer_t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+CREATE TABLE inner_t (oid INT NOT NULL, w INT NOT NULL)
+
+statement ok
+INSERT INTO outer_t VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO inner_t VALUES (1, 100), (2, 200), (2, 300)
+
+query II rowsort
+SELECT id, (SELECT SUM(w) FROM inner_t WHERE inner_t.oid = outer_t.id) FROM outer_t
+----
+1
+100
+2
+500
+3
+NULL

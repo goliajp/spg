@@ -1,0 +1,19 @@
+# Multiple CTEs in one WITH.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+query II rowsort
+WITH low AS (SELECT id, v FROM t WHERE v <= 20), high AS (SELECT id, v FROM t WHERE v >= 30) SELECT id, v FROM low UNION ALL SELECT id, v FROM high
+----
+1
+10
+2
+20
+3
+30
+4
+40

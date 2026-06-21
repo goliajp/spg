@@ -1,0 +1,15 @@
+# array_agg with ORDER BY.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, x INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('a', 3), ('a', 1), ('a', 2), ('b', 10)
+
+query TT rowsort
+SELECT g, array_agg(x ORDER BY x) FROM t GROUP BY g
+----
+a
+{1,2,3}
+b
+{10}

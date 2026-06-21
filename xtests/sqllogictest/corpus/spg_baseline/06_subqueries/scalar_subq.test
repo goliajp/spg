@@ -1,0 +1,19 @@
+# Scalar subquery in projection.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+CREATE TABLE s (id INT NOT NULL, w INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO s VALUES (1, 99)
+
+query I rowsort
+SELECT (SELECT w FROM s WHERE s.id = 1) FROM t
+----
+99
+99

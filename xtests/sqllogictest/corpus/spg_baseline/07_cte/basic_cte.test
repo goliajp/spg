@@ -1,0 +1,13 @@
+# WITH cte AS (SELECT …).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+query I rowsort
+WITH big AS (SELECT id, v FROM t WHERE v >= 20) SELECT id FROM big
+----
+2
+3

@@ -1,0 +1,17 @@
+# MIN, MAX.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, v INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 50), (3, 20), (4, NULL)
+
+query I rowsort
+SELECT MIN(v) FROM t
+----
+10
+
+query I rowsort
+SELECT MAX(v) FROM t
+----
+50

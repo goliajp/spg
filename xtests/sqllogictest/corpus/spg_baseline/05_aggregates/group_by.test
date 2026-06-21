@@ -1,0 +1,31 @@
+# GROUP BY single + multi-column.
+
+statement ok
+CREATE TABLE t (g TEXT NOT NULL, h TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('x', '1', 10), ('x', '2', 20), ('y', '1', 5), ('y', '2', 5)
+
+query TI rowsort
+SELECT g, SUM(v) FROM t GROUP BY g
+----
+x
+30
+y
+10
+
+query TTI rowsort
+SELECT g, h, SUM(v) FROM t GROUP BY g, h
+----
+x
+1
+10
+x
+2
+20
+y
+1
+5
+y
+2
+5
