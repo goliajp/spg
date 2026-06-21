@@ -389,7 +389,57 @@ fn handle_pg_simple_query(
                 }
             }
         };
-        let stream_result = if let Some(s) = prepared_stmt.as_ref() {
+        // v7.37.x (docker-fair SCALARSQ wire-overhead attack) — for
+        // shapes the engine materialises internally anyway (anything
+        // with a subquery — including the SCALARSQ `(SELECT … FROM
+        // …)`-in-projection shape — and all aggregates), the streaming
+        // wrapper's emit closure + cell_refs Vec management adds
+        // ~25-50 µs of pure overhead for zero benefit. Take the
+        // materialised path directly: call
+        // `execute_readonly_select_prepared`, then iterate the
+        // resulting `Vec<Row>` straight into `encode_data_row`. The
+        // streaming wrapper still runs for prepared SELECTs without
+        // subqueries (joined non-aggregate projection — the original
+        // PROJ-shape consumer).
+        // v7.37.x (docker-fair SCALARSQ wire-overhead attack) —
+        // shapes the engine materialises internally anyway (anything
+        // with a subquery — including the SCALARSQ shape — and all
+        // aggregates) take the direct materialised path: call the
+        // prepared SELECT and iterate `Vec<Row>` straight into
+        // `encode_data_row`, skipping the streaming wrapper's emit
+        // closure + cell_refs Vec management. The streaming wrapper
+        // still runs for prepared SELECTs without subqueries (joined
+        // non-aggregate projection — the original PROJ consumer).
+        let take_materialised_path = prepared_stmt
+            .as_ref()
+            .is_some_and(|s| spg_engine::expr_tree_has_subquery(s.as_ref()));
+        let stream_result: Result<usize, spg_engine::EngineError> = if take_materialised_path {
+            let s = prepared_stmt
+                .as_ref()
+                .expect("guarded by is_some_and above");
+            (|| -> Result<usize, spg_engine::EngineError> {
+                match engine_lock.execute_readonly_select_prepared(s.as_ref(), cancel)? {
+                    spg_engine::QueryResult::Rows { columns, rows } => {
+                        cols_storage.extend_from_slice(&columns);
+                        send_row_description(wbuf, &columns)
+                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                        wrote_header = true;
+                        for row in &rows {
+                            let before = wbuf.len();
+                            encode_data_row(wbuf, &cols_storage, row)
+                                .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                            if first_row_size.is_none() {
+                                first_row_size = Some(wbuf.len() - before);
+                            }
+                        }
+                        Ok(rows.len())
+                    }
+                    _ => Err(spg_engine::EngineError::Unsupported(
+                        "select returned non-Rows".into(),
+                    )),
+                }
+            })()
+        } else if let Some(s) = prepared_stmt.as_ref() {
             engine_lock.execute_readonly_select_streaming_prepared(s.as_ref(), cancel, &mut emit)
         } else {
             engine_lock.execute_readonly_select_streaming(sql, cancel, &mut emit)

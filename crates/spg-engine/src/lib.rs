@@ -87,11 +87,9 @@ pub use subquery::{
     BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
     BATCHED_SCALAR_KEYED_PROBE_COUNT, EXISTS_BATCH_FALL_THROUGH_COUNT, EXISTS_BATCH_FIRE_COUNT,
     EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE, PULLUP_LIMIT1_FIRE_COUNT,
-    SCALARSQ_PK_PROBE_FIRED, ScalarPkProbeFastPath,
+    SCALARSQ_PK_PROBE_FIRED, ScalarPkProbeFastPath, expr_tree_has_subquery,
 };
-pub(crate) use subquery::{
-    build_in_list_set, collect_scalar_subqueries, expr_has_subquery, expr_tree_has_subquery,
-};
+pub(crate) use subquery::{build_in_list_set, collect_scalar_subqueries, expr_has_subquery};
 pub use substitute::substitute_placeholders;
 use substitute::*;
 use system_catalog::*;
