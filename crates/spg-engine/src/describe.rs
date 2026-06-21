@@ -283,6 +283,39 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 nullable: true,
             })
         }
+        // v7.37.43-T4 — `$N` placeholders in a projection. Pre-T4 this
+        // arm fell through to `_ => None`, which made
+        // `describe_select_items` return an empty Vec, which made
+        // pgwire send `NoData` in response to Describe. But the same
+        // placeholder DID produce a column at Execute time (engine
+        // substitutes the bound value, the column appears in the
+        // result), so pgwire then sent `RowDescription + DataRow`
+        // anyway. The wire stream went `NoData` → `RowDescription` →
+        // `DataRow` — a sequence libpq / sqlx-postgres / pg-jdbc don't
+        // accept (NoData is a terminal answer: no rows ever). sqlx
+        // hit `unexpected message: RowDescription` mid-stream, which
+        // dispatched into its boxed-future error recovery and
+        // stack-overflowed the calling thread.
+        //
+        // The repro is `SELECT $1` (literally any sqlx prepared SELECT
+        // with a parameter) — including the `pg_advisory_lock($1)`
+        // that `sqlx::migrate!()` issues right after `current_database()`.
+        // Pre-T4 every sqlx user crashed on the very first parameterised
+        // prepared SELECT.
+        //
+        // Fix: when describing a `$N` placeholder, return a Text shape
+        // (oid 25 — the SQL text format that pgwire returns on the
+        // text wire path) so Describe yields a RowDescription with one
+        // column. The actual data type comes from the bound value at
+        // Execute time; sqlx tolerates this because the text wire
+        // format makes the per-column type advisory rather than load-
+        // bearing. The column name "?column?" mirrors PG's own
+        // canonical projection-of-an-expression name.
+        Expr::Placeholder(_) => Some(ExprShape {
+            name: "?column?".to_string(),
+            ty: DataType::Text,
+            nullable: true,
+        }),
         _ => None,
     }
 }
@@ -456,9 +489,26 @@ fn collect_parameter_oids(stmt: &Statement) -> Vec<u32> {
     if max == 0 {
         return Vec::new();
     }
-    // PG ParameterDescription is one OID per declared $N. We don't
-    // infer types, so report 0 ("unknown — bind-time inference").
-    alloc::vec![0u32; max as usize]
+    // PG ParameterDescription is one OID per declared $N.
+    //
+    // v7.37.43-T4 — return TEXT (oid 25) instead of "unknown"
+    // (oid 0) for placeholders SPG can't statically type. sqlx-
+    // postgres 0.8 treats OID 0 as "user-defined type, fetch
+    // metadata from pg_catalog.pg_type", which routes through
+    // `maybe_fetch_type_info_by_oid` → `fetch_type_by_oid`'s
+    // `SELECT … FROM pg_catalog.pg_type WHERE oid = $1`. That
+    // inner query also has a placeholder typed OID 0, recursing
+    // through ParameterDescription handling until the calling
+    // thread's stack overflows. Affected `sqlx::migrate!()`
+    // (every drop-in user) and `sqlx::query("…").bind(…)`
+    // (every parameterised SELECT) on the very first Execute.
+    //
+    // OID 25 is the TEXT built-in. sqlx's `PgTypeInfo::try_from_oid(25)`
+    // returns `Some(Text)` synchronously and skips the catalog
+    // round-trip. The actual data type comes from the bound
+    // value at Execute time; the text wire format makes the
+    // type advisory rather than load-bearing.
+    alloc::vec![25u32; max as usize]
 }
 
 fn max_placeholder(stmt: &Statement) -> u16 {
@@ -649,7 +699,13 @@ mod tests {
     fn describe_counts_placeholders() {
         let stmt = parse("SELECT * FROM t WHERE id = $1 AND name = $2");
         let (params, _) = describe_prepared(&stmt, &Catalog::new());
-        assert_eq!(params, alloc::vec![0u32, 0u32]);
+        // v7.37.43-T4 — placeholders report OID 25 (TEXT) instead of
+        // OID 0 ("unknown") because sqlx-postgres 0.8 routes OID 0
+        // through a recursive pg_catalog.pg_type fetch that
+        // stack-overflows the caller; 25 hits the synchronous
+        // PgTypeInfo::try_from_oid fast path. See `collect_parameter_oids`
+        // for the full rationale.
+        assert_eq!(params, alloc::vec![25u32, 25u32]);
     }
 
     #[test]
