@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -113,7 +113,7 @@ fn path_query_first_returns_one() {
         e.execute(r#"SELECT jsonb_path_query_first('{"items":[10,20]}'::JSONB, '$.items[*]')"#)
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Json("10".into()));
+    assert_eq!(r[0][0], Value::json("10"));
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn path_query_array_returns_wrapped() {
         e.execute(r#"SELECT jsonb_path_query_array('{"items":[10,20,30]}'::JSONB, '$.items[*]')"#)
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Json("[10,20,30]".into()));
+    assert_eq!(r[0][0], Value::json("[10,20,30]"));
 }
 
 #[test]

@@ -225,7 +225,7 @@ impl MemoizeCache {
     /// Look up a cached scalar value. On hit, re-promotes the
     /// entry to the LRU front and bumps `hit_count`. On miss,
     /// returns `None` (caller runs the subquery + `insert`s).
-    pub fn get(&mut self, key: &CacheKey) -> Option<Value> {
+    pub fn get(&mut self, key: &CacheKey) -> Option<Value<'static>> {
         let pos = self.entries.iter().position(|(k, _)| k == key);
         if let Some(p) = pos {
             let (k, v) = self.entries.remove(p)?;

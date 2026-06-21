@@ -12,7 +12,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
@@ -28,7 +28,7 @@ fn text_result(e: &mut Engine, sql: &str) -> String {
     });
     let row = one_row(r);
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -226,7 +226,7 @@ fn concat_on_text_columns() {
         .execute("SELECT concat(first_name, ' ', last_name) FROM u")
         .unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text("John Doe".into()));
+    assert_eq!(row[0], Value::text("John Doe"));
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn concat_with_nullable_column_skips_null_row() {
     let r = e.execute("SELECT concat(a, b) FROM u").unwrap();
     let row = one_row(r);
     // NULL b is skipped — result is 'x'.
-    assert_eq!(row[0], Value::Text("x".into()));
+    assert_eq!(row[0], Value::text("x"));
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn concat_returns_non_null_even_when_every_input_null() {
     e.execute("INSERT INTO u VALUES (NULL, NULL)").unwrap();
     let r = e.execute("SELECT concat(a, b) FROM u").unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text(String::new()));
+    assert_eq!(row[0], Value::text(String::new()));
     assert!(!matches!(row[0], Value::Null));
 }
 
@@ -310,7 +310,7 @@ fn concat_used_in_order_by() {
         panic!()
     };
     // concat results: 'za', 'az'. Sorted: 'az' first then 'za'.
-    assert_eq!(rows[0].values[0], Value::Text("a".into()));
+    assert_eq!(rows[0].values[0], Value::text("a"));
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn concat_inside_insert_value() {
         .unwrap();
     let r = e.execute("SELECT display FROM u").unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text("U-42".into()));
+    assert_eq!(row[0], Value::text("U-42"));
 }
 
 #[test]

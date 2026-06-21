@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -35,7 +35,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
             .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
     );
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -228,9 +228,9 @@ fn lpad_zero_padded_ids_for_display() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("000001".into()));
-    assert_eq!(rows[1].values[0], Value::Text("000042".into()));
-    assert_eq!(rows[2].values[0], Value::Text("001234".into()));
+    assert_eq!(rows[0].values[0], Value::text("000001"));
+    assert_eq!(rows[1].values[0], Value::text("000042"));
+    assert_eq!(rows[2].values[0], Value::text("001234"));
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn rpad_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (rpad('Alice', 10, '.'))")
         .unwrap();
     let row = one_row(e.execute("SELECT name_field FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("Alice.....".into()));
+    assert_eq!(row[0], Value::text("Alice....."));
 }
 
 // ── COLUMN TYPE ──────────────────────────────────────────────────

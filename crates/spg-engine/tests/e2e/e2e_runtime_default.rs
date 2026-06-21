@@ -63,7 +63,7 @@ fn literal_default_still_works() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("unset".into()));
+    assert_eq!(rows[0].values[0], Value::text("unset"));
 }
 
 #[test]

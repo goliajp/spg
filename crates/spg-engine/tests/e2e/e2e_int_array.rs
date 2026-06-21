@@ -11,7 +11,7 @@ fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
         .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
-fn select_value(eng: &mut Engine, sql: &str) -> Value {
+fn select_value(eng: &mut Engine, sql: &str) -> Value<'static> {
     match ok(eng, sql) {
         QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -22,7 +22,7 @@ fn select_value(eng: &mut Engine, sql: &str) -> Value {
     }
 }
 
-fn select_rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn select_rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match ok(eng, sql) {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected Rows, got {other:?}"),

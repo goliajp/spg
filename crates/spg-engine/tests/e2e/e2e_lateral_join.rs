@@ -20,7 +20,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -53,9 +53,9 @@ fn lateral_subquery_correlated_in_where() {
     );
     // alice: min order amount = 100. bob: min = 50.
     assert_eq!(r.len(), 2);
-    assert_eq!(r[0][0], Value::Text("alice".into()));
+    assert_eq!(r[0][0], Value::text("alice"));
     assert_eq!(r[0][1], Value::Int(100));
-    assert_eq!(r[1][0], Value::Text("bob".into()));
+    assert_eq!(r[1][0], Value::text("bob"));
     assert_eq!(r[1][1], Value::Int(50));
 }
 
@@ -101,7 +101,7 @@ fn lateral_subquery_with_no_inner_matches_drops_outer() {
     // zero rows for her.
     assert_eq!(r.len(), 4);
     for row in &r {
-        assert_ne!(row[0], Value::Text("carol".into()));
+        assert_ne!(row[0], Value::text("carol"));
     }
 }
 

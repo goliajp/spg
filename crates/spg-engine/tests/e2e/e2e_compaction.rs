@@ -20,7 +20,7 @@ fn populated_users(eng: &mut Engine, n: i64) {
     }
 }
 
-fn read_rows(res: QueryResult) -> Vec<Vec<Value>> {
+fn read_rows(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values.clone()).collect(),
         other => panic!("expected Rows, got {other:?}"),
@@ -44,8 +44,8 @@ fn compact_merges_small_segments() {
     let rows = read_rows(res);
     assert_eq!(rows.len(), 1, "exactly one (table, index) pair compacted");
     let report = &rows[0];
-    assert_eq!(report[0], Value::Text("users".into()));
-    assert_eq!(report[1], Value::Text("by_id".into()));
+    assert_eq!(report[0], Value::text("users"));
+    assert_eq!(report[1], Value::text("by_id"));
     // sources_merged = 2; merged_rows = 6; deleted_rows_pruned = 0.
     assert_eq!(report[2], Value::BigInt(2));
     assert_eq!(report[4], Value::BigInt(6));

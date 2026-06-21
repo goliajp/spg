@@ -58,7 +58,7 @@ fn inline_pk_supports_text_columns_too() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("localhost".into()));
+    assert_eq!(rows[0].values[0], Value::text("localhost"));
 }
 
 #[test]

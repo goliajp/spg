@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -63,15 +63,15 @@ fn row_number_partitioned_by_dept_over_inner_join() {
     // Sales partition (2 rows): Dave=80→1, Eve=70→2.
     assert_eq!(r.len(), 5);
     // Check the deterministic ones.
-    assert_eq!(r[0][1], Value::Text("Eng".into()));
+    assert_eq!(r[0][1], Value::text("Eng"));
     assert_eq!(r[0][2], Value::BigInt(1));
-    assert_eq!(r[0][0], Value::Text("Alice".into()));
-    assert_eq!(r[3][1], Value::Text("Sales".into()));
+    assert_eq!(r[0][0], Value::text("Alice"));
+    assert_eq!(r[3][1], Value::text("Sales"));
     assert_eq!(r[3][2], Value::BigInt(1));
-    assert_eq!(r[3][0], Value::Text("Dave".into()));
-    assert_eq!(r[4][1], Value::Text("Sales".into()));
+    assert_eq!(r[3][0], Value::text("Dave"));
+    assert_eq!(r[4][1], Value::text("Sales"));
     assert_eq!(r[4][2], Value::BigInt(2));
-    assert_eq!(r[4][0], Value::Text("Eve".into()));
+    assert_eq!(r[4][0], Value::text("Eve"));
 }
 
 #[test]
@@ -90,16 +90,16 @@ fn rank_partitioned_by_dept_handles_ties() {
     );
     assert_eq!(r.len(), 5);
     // Eng: Alice=100 → rk=1; Bob=90 → rk=2; Carol=90 → rk=2.
-    assert_eq!(r[0][0], Value::Text("Alice".into()));
+    assert_eq!(r[0][0], Value::text("Alice"));
     assert_eq!(r[0][1], Value::BigInt(1));
-    assert_eq!(r[1][0], Value::Text("Bob".into()));
+    assert_eq!(r[1][0], Value::text("Bob"));
     assert_eq!(r[1][1], Value::BigInt(2));
-    assert_eq!(r[2][0], Value::Text("Carol".into()));
+    assert_eq!(r[2][0], Value::text("Carol"));
     assert_eq!(r[2][1], Value::BigInt(2));
     // Sales: Dave=80 → rk=1; Eve=70 → rk=2.
-    assert_eq!(r[3][0], Value::Text("Dave".into()));
+    assert_eq!(r[3][0], Value::text("Dave"));
     assert_eq!(r[3][1], Value::BigInt(1));
-    assert_eq!(r[4][0], Value::Text("Eve".into()));
+    assert_eq!(r[4][0], Value::text("Eve"));
     assert_eq!(r[4][1], Value::BigInt(2));
 }
 
@@ -150,7 +150,7 @@ fn window_over_left_join_keeps_null_extended_row() {
     // row partition with all-NULL key sorts as one group).
     assert!(
         r.iter()
-            .any(|row| { row[0] == Value::Text("Empty".into()) && row[1] == Value::Null })
+            .any(|row| { row[0] == Value::text("Empty") && row[1] == Value::Null })
     );
 }
 
@@ -171,7 +171,7 @@ fn window_with_bare_column_when_unambiguous() {
         .unwrap(),
     );
     assert_eq!(r.len(), 5);
-    assert_eq!(r[0][0], Value::Text("Alice".into()));
+    assert_eq!(r[0][0], Value::text("Alice"));
     assert_eq!(r[0][1], Value::BigInt(1));
 }
 
@@ -190,8 +190,8 @@ fn single_table_window_path_still_works_regression() {
         .unwrap(),
     );
     assert_eq!(r.len(), 5);
-    assert_eq!(r[0][0], Value::Text("Alice".into()));
+    assert_eq!(r[0][0], Value::text("Alice"));
     assert_eq!(r[0][1], Value::BigInt(1));
-    assert_eq!(r[4][0], Value::Text("Eve".into()));
+    assert_eq!(r[4][0], Value::text("Eve"));
     assert_eq!(r[4][1], Value::BigInt(5));
 }

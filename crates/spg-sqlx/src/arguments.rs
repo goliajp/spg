@@ -8,7 +8,7 @@ use sqlx_core::error::BoxDynError;
 use sqlx_core::impl_into_arguments_for_arguments;
 use sqlx_core::types::Type;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::database::Spg;
 use crate::type_info::SpgTypeInfo;

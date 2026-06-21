@@ -21,7 +21,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -63,7 +63,7 @@ fn nullif_text_equal_returns_null() {
 fn nullif_text_unequal_returns_first() {
     let mut e = Engine::new();
     let row = one_row(e.execute("SELECT nullif('hello', 'world')").unwrap());
-    assert_eq!(row[0], Value::Text("hello".into()));
+    assert_eq!(row[0], Value::text("hello"));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn nullif_empty_string_to_null() {
     };
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values[1], Value::Null);
-    assert_eq!(rows[1].values[1], Value::Text("alice".into()));
+    assert_eq!(rows[1].values[1], Value::text("alice"));
 }
 
 #[test]

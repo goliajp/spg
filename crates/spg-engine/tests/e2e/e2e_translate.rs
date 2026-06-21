@@ -18,7 +18,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -34,7 +34,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
             .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
     );
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }

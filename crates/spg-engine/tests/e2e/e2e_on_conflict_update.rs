@@ -16,7 +16,7 @@ fn engine_with(sqls: &[&str]) -> Engine {
     eng
 }
 
-fn select(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn select(eng: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -37,7 +37,7 @@ fn upsert_existing_row_via_excluded() {
     )
     .unwrap();
     let rows = select(&mut eng, "SELECT password_hash FROM accounts");
-    assert_eq!(rows[0][0], Value::Text("new_hash".into()));
+    assert_eq!(rows[0][0], Value::text("new_hash"));
 }
 
 #[test]
@@ -65,8 +65,8 @@ fn upsert_multi_assignment_with_excluded_refs() {
     )
     .unwrap();
     let rows = select(&mut eng, "SELECT payload, etag FROM calendar_events");
-    assert_eq!(rows[0][0], Value::Text("v2".into()));
-    assert_eq!(rows[0][1], Value::Text("e2".into()));
+    assert_eq!(rows[0][0], Value::text("v2"));
+    assert_eq!(rows[0][1], Value::text("e2"));
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn upsert_returning_yields_post_update_row() {
     };
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::Int(1));
-    assert_eq!(rows[0].values[1], Value::Text("new".into()));
+    assert_eq!(rows[0].values[1], Value::text("new"));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn upsert_with_where_skips_when_false() {
     )
     .unwrap();
     let rows = select(&mut eng, "SELECT reason FROM suppression");
-    assert_eq!(rows[0][0], Value::Text("bounce".into()));
+    assert_eq!(rows[0][0], Value::text("bounce"));
 }
 
 #[test]
@@ -152,11 +152,7 @@ fn upsert_excluded_inside_case_and_or() {
         &mut eng,
         "SELECT display_name, is_mailing_list FROM email_contacts",
     );
-    assert_eq!(
-        rows[0][0],
-        Value::Text("New Name".into()),
-        "CASE picked EXCLUDED"
-    );
+    assert_eq!(rows[0][0], Value::text("New Name"), "CASE picked EXCLUDED");
     assert_eq!(rows[0][1], Value::Bool(true), "OR folded EXCLUDED");
 
     // The empty-incoming branch keeps the existing name.
@@ -168,9 +164,5 @@ fn upsert_excluded_inside_case_and_or() {
     )
     .unwrap();
     let rows = select(&mut eng, "SELECT display_name FROM email_contacts");
-    assert_eq!(
-        rows[0][0],
-        Value::Text("New Name".into()),
-        "CASE kept existing"
-    );
+    assert_eq!(rows[0][0], Value::text("New Name"), "CASE kept existing");
 }

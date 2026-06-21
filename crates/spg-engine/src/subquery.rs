@@ -373,7 +373,8 @@ impl Engine {
                         && let Some(Some(es)) = m.exists_sets.get(&repr)
                     {
                         let (outer_cols, set) = es.as_ref();
-                        let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
+                        let mut key_vals: Vec<Value<'static>> =
+                            Vec::with_capacity(outer_cols.len());
                         let mut any_null = false;
                         for oc in outer_cols {
                             let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
@@ -815,69 +816,70 @@ impl Engine {
         // join the promotion can't safely reorder, returns None and
         // the caller falls back to the lazy all-keys batch (no
         // regression).
-        let keyed: Option<(&[Row<'static>], &EvalContext<'_>)> = restrict.and_then(|(rows, rctx)| {
-            // Resolve the table that owns the correlation column.
-            let driver_name: &str = if from.joins.is_empty() {
-                from.primary.name.as_str()
-            } else {
-                let q = inner_col.qualifier.as_deref()?;
-                let primary_alias = from
-                    .primary
-                    .alias
-                    .as_deref()
-                    .unwrap_or(from.primary.name.as_str());
-                if primary_alias.eq_ignore_ascii_case(q) {
+        let keyed: Option<(&[Row<'static>], &EvalContext<'_>)> =
+            restrict.and_then(|(rows, rctx)| {
+                // Resolve the table that owns the correlation column.
+                let driver_name: &str = if from.joins.is_empty() {
                     from.primary.name.as_str()
                 } else {
-                    from.joins
-                        .iter()
-                        .find(|j| {
-                            j.table
-                                .alias
-                                .as_deref()
-                                .unwrap_or(j.table.name.as_str())
-                                .eq_ignore_ascii_case(q)
-                        })
-                        .map(|j| j.table.name.as_str())?
-                }
-            };
-            let table = self.active_catalog().get(driver_name)?;
-            let pos = table
-                .schema()
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(&inner_col.name))?;
-            table.index_on(pos)?;
-            // v7.33 (mailrs 7.32.1) — cost guard. The keyed path runs one
-            // index seek (a full `exec_select_cancel` round trip) per
-            // surviving correlation key. That wins when few keys survive
-            // (a tight outer LIMIT leaves a handful), but a *correlated
-            // select-list subquery with no outer LIMIT* leaves every group
-            // alive — `restrict` is then all ~N groups, and N seeks dwarf
-            // a single grouped all-keys scan of the same driver. Reproduced
-            // on the conversation aggregation (`get_conversations_by_thread_ids`,
-            // no LIMIT): 24k per-key seeks took 78–155 ms vs ~one scan.
-            // Fall through to the all-keys batch (`keyed = None` → the
-            // `else` arm below) when the survivor set is large relative to
-            // the driver; the batch's group map ⊇ the keyed map for every
-            // covered key, so the result is identical. Crossover ~rows/4
-            // (measured per-seek exec overhead vs per-row scan cost).
-            if rows.len().saturating_mul(4) >= table.row_count() {
-                return None;
-            }
-            // For a join inner, drive the seek from the correlation
-            // table so `inner_col = <lit>` lands as a primary index
-            // seek (else the source-order primary scans the full
-            // relation and the join hash-builds the whole peer — the
-            // 12 GB all-keys hog R30 hit at prod scale).
-            if !from.joins.is_empty() {
-                let driver_alias = inner_col.qualifier.as_deref()?;
-                if !reorder::drive_from(&mut batch, driver_alias) {
+                    let q = inner_col.qualifier.as_deref()?;
+                    let primary_alias = from
+                        .primary
+                        .alias
+                        .as_deref()
+                        .unwrap_or(from.primary.name.as_str());
+                    if primary_alias.eq_ignore_ascii_case(q) {
+                        from.primary.name.as_str()
+                    } else {
+                        from.joins
+                            .iter()
+                            .find(|j| {
+                                j.table
+                                    .alias
+                                    .as_deref()
+                                    .unwrap_or(j.table.name.as_str())
+                                    .eq_ignore_ascii_case(q)
+                            })
+                            .map(|j| j.table.name.as_str())?
+                    }
+                };
+                let table = self.active_catalog().get(driver_name)?;
+                let pos = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&inner_col.name))?;
+                table.index_on(pos)?;
+                // v7.33 (mailrs 7.32.1) — cost guard. The keyed path runs one
+                // index seek (a full `exec_select_cancel` round trip) per
+                // surviving correlation key. That wins when few keys survive
+                // (a tight outer LIMIT leaves a handful), but a *correlated
+                // select-list subquery with no outer LIMIT* leaves every group
+                // alive — `restrict` is then all ~N groups, and N seeks dwarf
+                // a single grouped all-keys scan of the same driver. Reproduced
+                // on the conversation aggregation (`get_conversations_by_thread_ids`,
+                // no LIMIT): 24k per-key seeks took 78–155 ms vs ~one scan.
+                // Fall through to the all-keys batch (`keyed = None` → the
+                // `else` arm below) when the survivor set is large relative to
+                // the driver; the batch's group map ⊇ the keyed map for every
+                // covered key, so the result is identical. Crossover ~rows/4
+                // (measured per-seek exec overhead vs per-row scan cost).
+                if rows.len().saturating_mul(4) >= table.row_count() {
                     return None;
                 }
-            }
-            Some((rows, rctx))
-        });
+                // For a join inner, drive the seek from the correlation
+                // table so `inner_col = <lit>` lands as a primary index
+                // seek (else the source-order primary scans the full
+                // relation and the join hash-builds the whole peer — the
+                // 12 GB all-keys hog R30 hit at prod scale).
+                if !from.joins.is_empty() {
+                    let driver_alias = inner_col.qualifier.as_deref()?;
+                    if !reorder::drive_from(&mut batch, driver_alias) {
+                        return None;
+                    }
+                }
+                Some((rows, rctx))
+            });
         let rows = if let Some((restrict_rows, rctx)) = keyed {
             BATCHED_SCALAR_KEYED_FIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // v7.37.4 A' — collect the deduped surviving correlation
@@ -2908,7 +2910,7 @@ impl ScalarPkProbeFastPath {
     /// Per-row probe. Reads `row.values[self.outer_pos]`, looks up the
     /// inner table and PK index, and returns `Int(1)` on a hit or
     /// `Int(0)` on a miss / NULL outer key.
-    pub fn probe(&self, row: &Row<'static>) -> Value {
+    pub fn probe(&self, row: &Row<'static>) -> Value<'static> {
         // The engine handle is needed to access the live catalog. The
         // probe is called from the run-loop with the engine in scope,
         // so we look up the catalog via a thread_local-cached
@@ -2952,7 +2954,11 @@ impl Engine {
     /// Run a pre-analysed PK probe against the live catalog. Used by
     /// the per-row projection fast path to avoid going through
     /// `eval_expr_with_correlated`.
-    pub(crate) fn probe_with_pk_fast_path(&self, plan: &ScalarPkProbeFastPath, row: &Row<'static>) -> Value<'static> {
+    pub(crate) fn probe_with_pk_fast_path(
+        &self,
+        plan: &ScalarPkProbeFastPath,
+        row: &Row<'static>,
+    ) -> Value<'static> {
         let outer_int = match row.values.get(plan.outer_pos) {
             Some(Value::BigInt(n)) => *n,
             Some(Value::Int(n)) => i64::from(*n),
@@ -3094,7 +3100,7 @@ impl Engine {
         inner: &SelectStatement,
         row: &Row<'static>,
         ctx: &EvalContext<'_>,
-    ) -> Result<Option<Value>, EngineError> {
+    ) -> Result<Option<Value<'static>>, EngineError> {
         use spg_sql::ast::{BinOp, ColumnName, SelectItem};
         if !inner.ctes.is_empty()
             || !inner.unions.is_empty()

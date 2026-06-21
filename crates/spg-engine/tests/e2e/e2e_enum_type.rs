@@ -18,7 +18,7 @@ fn create_type_then_use_in_column() {
         _ => panic!("expected rows"),
     };
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1].values[1], spg_storage::Value::Text("sad".into()));
+    assert_eq!(rows[1].values[1], spg_storage::Value::text("sad"));
 }
 
 #[test]

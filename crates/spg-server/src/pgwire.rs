@@ -1435,10 +1435,7 @@ fn pg_user_response(state: &Arc<ServerState>) -> CannedResponse {
         .read()
         .map(|e| {
             if e.users().is_empty() {
-                vec![Row::new(vec![
-                    Value::text("admin"),
-                    Value::Bool(true),
-                ])]
+                vec![Row::new(vec![Value::text("admin"), Value::Bool(true)])]
             } else {
                 e.users()
                     .iter()

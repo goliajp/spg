@@ -4,7 +4,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -22,10 +22,10 @@ fn table_ddl_round_trips_through_execute() {
     let got = rows_of(res);
     let t_row = got
         .iter()
-        .find(|r| r[0] == Value::Text("t".to_string()))
+        .find(|r| r[0] == Value::text("t"))
         .expect("t row");
     let ddl = match &t_row[1] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected text ddl, got {other:?}"),
     };
 
@@ -50,10 +50,10 @@ fn role_ddl_round_trips() {
     let got = rows_of(res);
     let alice_row = got
         .iter()
-        .find(|r| r[0] == Value::Text("alice".to_string()))
+        .find(|r| r[0] == Value::text("alice"))
         .expect("alice row");
     let ddl = match &alice_row[1] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected text ddl, got {other:?}"),
     };
     assert!(ddl.contains("CREATE USER alice"));
@@ -73,7 +73,7 @@ fn database_ddl_includes_tables_and_users() {
     let got = rows_of(res);
     assert_eq!(got.len(), 1);
     let ddl = match &got[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected text ddl, got {other:?}"),
     };
     assert!(ddl.contains("CREATE USER bob"));

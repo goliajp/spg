@@ -7,7 +7,7 @@ use spg_engine::eval::EvalError;
 use spg_engine::{Engine, EngineError, QueryResult};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
-fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row>) {
+fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     match r {
         QueryResult::Rows { columns, rows } => (columns, rows),
         QueryResult::CommandOk { .. } => panic!("expected Rows"),
@@ -46,15 +46,11 @@ fn create_two_inserts_then_select_returns_two_rows() {
     assert_eq!(rows.len(), 2);
     assert_eq!(
         rows[0].values,
-        vec![
-            Value::BigInt(1),
-            Value::Text("alice".into()),
-            Value::Float(100.5),
-        ]
+        vec![Value::BigInt(1), Value::text("alice"), Value::Float(100.5),]
     );
     assert_eq!(
         rows[1].values,
-        vec![Value::BigInt(2), Value::Text("bob".into()), Value::Null]
+        vec![Value::BigInt(2), Value::text("bob"), Value::Null]
     );
 }
 
@@ -129,7 +125,7 @@ fn table_alias_used_in_where_and_projection() {
     let (cols, rows) = unwrap_rows(r);
     assert_eq!(cols.len(), 2);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].values[1], Value::Text("paid".into()));
+    assert_eq!(rows[0].values[1], Value::text("paid"));
 }
 
 #[test]

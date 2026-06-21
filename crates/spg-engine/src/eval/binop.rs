@@ -67,7 +67,11 @@ fn values_not_distinct(l: &Value<'static>, r: &Value<'static>) -> bool {
     }
 }
 
-pub(super) fn apply_binary(op: BinOp, l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+pub(super) fn apply_binary(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> Result<Value<'static>, EvalError> {
     // SQL three-valued logic for AND / OR with NULL is special — handle before
     // the general NULL-propagation rule.
     if let BinOp::And = op {
@@ -145,7 +149,11 @@ pub(super) fn apply_binary(op: BinOp, l: Value<'static>, r: Value<'static>) -> R
 /// Calendar arithmetic. Returns `Some(value)` when the operand pair
 /// is a date/time combo this function understands, `None` to let the
 /// caller fall through to the regular numeric / text paths.
-fn apply_binary_calendar(op: BinOp, l: &Value<'static>, r: &Value<'static>) -> Result<Option<Value<'static>>, EvalError> {
+fn apply_binary_calendar(
+    op: BinOp,
+    l: &Value<'static>,
+    r: &Value<'static>,
+) -> Result<Option<Value<'static>>, EvalError> {
     let int_value = |v: &Value| -> Option<i64> {
         match v {
             Value::SmallInt(n) => Some(i64::from(*n)),
@@ -368,7 +376,11 @@ fn add_interval_to_micros(t: i64, months: i64, days: i64, micros: i64) -> Result
 /// Other-side integers / floats are promoted to a NUMERIC at a common
 /// scale; all add / sub / mul / div / compare paths stay in i128.
 #[allow(clippy::needless_pass_by_value)] // mirrors `apply_binary`'s by-value calling convention
-fn apply_binary_numeric(op: BinOp, l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+fn apply_binary_numeric(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> Result<Value<'static>, EvalError> {
     // Float still wins — Numeric + Float coerces both to f64 and runs
     // through the float path. PG demotes Numeric to float in this mix
     // too (the documented behaviour for `numeric + double precision`).
@@ -707,7 +719,11 @@ fn cosine_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static
     Ok(Value::Float(1.0 - dot / denom))
 }
 
-fn unwrap_vec_pair(l: Value<'static>, r: Value<'static>, op: &str) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
+fn unwrap_vec_pair(
+    l: Value<'static>,
+    r: Value<'static>,
+    op: &str,
+) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
     // v6.0.1: SQ8 cells coming through the SQL evaluator are
     // dequantised to f32 here so the existing scalar distance
     // arithmetic stays intact. HNSW kNN search continues to use
@@ -918,7 +934,11 @@ fn as_f64(v: &Value<'static>) -> Result<f64, EvalError> {
     }
 }
 
-pub(super) fn compare(op: BinOp, l: &Value<'static>, r: &Value<'static>) -> Result<Value<'static>, EvalError> {
+pub(super) fn compare(
+    op: BinOp,
+    l: &Value<'static>,
+    r: &Value<'static>,
+) -> Result<Value<'static>, EvalError> {
     let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => i64::from(*a).cmp(&i64::from(*b)),
         (Value::Int(a), Value::BigInt(b)) => i64::from(*a).cmp(b),

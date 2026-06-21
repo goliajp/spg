@@ -40,16 +40,16 @@ fn setup() -> Engine {
     e
 }
 
-fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
     }
 }
 
-fn text(v: &Value) -> &str {
+fn text<'a>(v: &'a Value<'_>) -> &'a str {
     match v {
-        Value::Text(s) => s.as_str(),
+        Value::Text(s) => s.as_ref(),
         other => panic!("expected text, got {other:?}"),
     }
 }

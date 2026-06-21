@@ -26,7 +26,7 @@ fn seed() -> Engine {
     e
 }
 
-fn col1_by_group(r: QueryResult) -> Vec<Value> {
+fn col1_by_group(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -36,8 +36,8 @@ fn col1_by_group(r: QueryResult) -> Vec<Value> {
     }
 }
 
-fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+fn t(s: &str) -> Value<'static> {
+    Value::text(s)
 }
 
 #[test]

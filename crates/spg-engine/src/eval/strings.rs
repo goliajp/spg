@@ -88,7 +88,11 @@ pub(super) fn string_left_right(
 /// for multi-char fills, on the appropriate side. Empty fill +
 /// needs padding → returns input verbatim (potentially
 /// truncated). NULL on any arg → NULL.
-pub(super) fn string_pad(args: &[Value<'static>], is_left: bool, fn_name: &str) -> Result<Value<'static>, EvalError> {
+pub(super) fn string_pad(
+    args: &[Value<'static>],
+    is_left: bool,
+    fn_name: &str,
+) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 && args.len() != 3 {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("{fn_name}() takes 2 or 3 args, got {}", args.len()),

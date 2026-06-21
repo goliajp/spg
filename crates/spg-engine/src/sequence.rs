@@ -207,7 +207,11 @@ impl Engine {
     /// v7.17.0 Phase 1.1 — evaluate a single nextval/currval/
     /// setval call. `args` are already pre-resolved Expr nodes
     /// (literals) — we extract their constant values.
-    fn eval_sequence_call(&mut self, op: &str, args: &[Expr]) -> Result<Value, EngineError> {
+    fn eval_sequence_call(
+        &mut self,
+        op: &str,
+        args: &[Expr],
+    ) -> Result<Value<'static>, EngineError> {
         if args.is_empty() {
             return Err(EngineError::Unsupported(alloc::format!(
                 "{op}() takes at least one argument"

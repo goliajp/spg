@@ -50,13 +50,13 @@ fn setup() -> Engine {
     e
 }
 
-fn cat_of(rows: &[Row], thread: &str) -> String {
+fn cat_of(rows: &[Row<'static>], thread: &str) -> String {
     for r in rows {
         if let Value::Text(t) = &r.values[0]
-            && t == thread
+            && t.as_ref() == thread
             && let Value::Text(c) = &r.values[1]
         {
-            return c.clone();
+            return c.to_string();
         }
     }
     panic!("thread {thread} not found in result");

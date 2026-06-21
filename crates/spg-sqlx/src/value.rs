@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use sqlx_core::error::BoxDynError;
 use sqlx_core::value::{Value, ValueRef};
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::database::Spg;
 use crate::type_info::{Kind, SpgTypeInfo};

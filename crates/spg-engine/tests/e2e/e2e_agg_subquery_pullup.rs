@@ -8,7 +8,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -148,7 +148,7 @@ fn pullup_two_subqueries_one_query() {
     // grp 10 labels a,b → MAX = 'b'.
     assert_eq!(
         match &rows[0].values[2] {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => s.as_ref(),
             o => panic!("{o:?}"),
         },
         "b"
@@ -157,7 +157,7 @@ fn pullup_two_subqueries_one_query() {
     assert!(matches!(rows[1].values[1], Value::Null), "grp20 v null");
     assert_eq!(
         match &rows[1].values[2] {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => s.as_ref(),
             o => panic!("{o:?}"),
         },
         "c"

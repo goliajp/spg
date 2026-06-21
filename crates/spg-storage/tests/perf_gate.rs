@@ -62,7 +62,7 @@ fn build_catalog(n_rows: i32) -> Catalog {
     for i in 0..n_rows {
         t.insert(Row::new(vec![
             Value::Int(i),
-            Value::Text(format!("user-{i}")),
+            Value::text(format!("user-{i}")),
             Value::Float(f64::from(i) * 0.1),
         ]))
         .unwrap();
@@ -116,7 +116,7 @@ fn hnsw_search_under_budget() {
         let f = i as f32;
         t.insert(Row::new(vec![
             Value::Int(i),
-            Value::Vector(vec![
+            Value::vector(vec![
                 f * 0.01,
                 f * 0.02,
                 f * 0.03,

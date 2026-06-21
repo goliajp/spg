@@ -65,7 +65,7 @@ fn build_seed_catalog() -> Catalog {
     for i in 0..100 {
         t.insert(Row::new(vec![
             Value::Int(i),
-            Value::Text(format!("user-{i}")),
+            Value::text(format!("user-{i}")),
         ]))
         .unwrap();
     }

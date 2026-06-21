@@ -425,7 +425,8 @@ pub struct AggResult {
 /// ORDER BY of a GROUP BY query). The engine passes its
 /// correlated-aware evaluator; pure-library callers pass None and
 /// surviving subqueries keep erroring loudly.
-pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row<'static>, &EvalContext<'_>) -> Result<Value<'static>, EvalError>;
+pub type CorrelatedEval<'a> =
+    &'a dyn Fn(&Expr, &Row<'static>, &EvalContext<'_>) -> Result<Value<'static>, EvalError>;
 
 /// Output of the per-group projection stage (`project_groups`): the
 /// output schema, the projected rows, the synth rows kept alongside
@@ -978,12 +979,13 @@ fn accumulate_groups(
                 || s.arg2.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
                 || s.order_by.iter().any(|o| crate::expr_has_subquery(&o.expr))
         });
-    let eval_arg = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| -> Result<Value<'static>, EvalError> {
-        match correlated_eval {
-            Some(f) if any_agg_subquery && crate::expr_has_subquery(e) => f(e, r, c),
-            _ => eval::eval_expr(e, r, c),
-        }
-    };
+    let eval_arg =
+        |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| -> Result<Value<'static>, EvalError> {
+            match correlated_eval {
+                Some(f) if any_agg_subquery && crate::expr_has_subquery(e) => f(e, r, c),
+                _ => eval::eval_expr(e, r, c),
+            }
+        };
     // v7.36 (perf — mailrs Phase 1, post u64-hash) — single
     // anonymous group fast path. When the query has no GROUP BY
     // (`SELECT SUM(LENGTH(col)) FROM ...`, COUNT, AVG, etc.) the
@@ -1214,7 +1216,10 @@ fn accumulate_groups(
                         Some(&i) => i,
                         None => {
                             let i = order.len();
-                            order.push((alloc::vec![kv.clone().into_owned()], alloc::vec![AggState::default()]));
+                            order.push((
+                                alloc::vec![kv.clone().into_owned()],
+                                alloc::vec![AggState::default()],
+                            ));
                             groups.insert(keybuf_s.clone(), i);
                             i
                         }
@@ -1296,7 +1301,10 @@ fn accumulate_groups(
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         let v: Value<'static> = if let Some(p) = order_pos[i][k] {
-                            row.get(p).cloned().map(Value::into_owned).unwrap_or(Value::Null)
+                            row.get(p)
+                                .cloned()
+                                .map(Value::into_owned)
+                                .unwrap_or(Value::Null)
                         } else {
                             eval_arg(
                                 &o.expr,
@@ -1524,7 +1532,8 @@ fn accumulate_groups(
                         let i = order.len();
                         let init: Vec<AggState> =
                             (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                        let owned: Vec<Value<'static>> = refs.iter().map(|v| (*v).clone().into_owned()).collect();
+                        let owned: Vec<Value<'static>> =
+                            refs.iter().map(|v| (*v).clone().into_owned()).collect();
                         order.push((owned, init));
                         groups.insert(keybuf_s.clone(), i);
                         i
@@ -1600,7 +1609,11 @@ fn accumulate_groups(
                         // Bound ORDER key → read the cell by reference; only
                         // a non-bound key falls to the materialised eval path.
                         keys.push(match order_pos[i][k] {
-                            Some(p) => row.get(p).cloned().map(Value::into_owned).unwrap_or(Value::Null),
+                            Some(p) => row
+                                .get(p)
+                                .cloned()
+                                .map(Value::into_owned)
+                                .unwrap_or(Value::Null),
                             None => eval_arg(
                                 &o.expr,
                                 mat.as_deref().expect("needs_mat for non-bound ORDER key"),
@@ -2801,7 +2814,8 @@ fn update_state(
                 return Ok(());
             }
             st.items.push(v.clone().into_owned());
-            st.aux_items.push(arg2.cloned().map(Value::into_owned).unwrap_or(Value::Null));
+            st.aux_items
+                .push(arg2.cloned().map(Value::into_owned).unwrap_or(Value::Null));
             st.count += 1;
         }
     }

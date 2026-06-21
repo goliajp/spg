@@ -11,7 +11,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -26,7 +26,7 @@ fn pg_type_resolves_int4_by_oid() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("int4".into()));
+    assert_eq!(r[0][0], Value::text("int4"));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn pg_type_resolves_text_by_oid() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("text".into()));
+    assert_eq!(r[0][0], Value::text("text"));
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn pg_type_resolves_jsonb_array() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("_jsonb".into()));
+    assert_eq!(r[0][0], Value::text("_jsonb"));
     assert_eq!(r[0][1], Value::BigInt(3802));
 }
 
@@ -82,8 +82,8 @@ fn pg_type_array_links_to_scalar() {
         .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("_int4".into()));
-    assert_eq!(r[0][1], Value::Text("int4".into()));
+    assert_eq!(r[0][0], Value::text("_int4"));
+    assert_eq!(r[0][1], Value::text("int4"));
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn pg_type_typcategory_for_numeric_is_n() {
         .unwrap(),
     );
     for row in &r {
-        assert_eq!(row[0], Value::Text("N".into()));
+        assert_eq!(row[0], Value::text("N"));
     }
 }
 

@@ -9,7 +9,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_value(eng: &mut Engine, sql: &str) -> Value {
+fn one_value(eng: &mut Engine, sql: &str) -> Value<'static> {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().next().unwrap().values[0].clone(),
         _ => panic!("expected Rows"),
@@ -20,18 +20,18 @@ fn one_value(eng: &mut Engine, sql: &str) -> Value {
 fn encode_hex_round_trip() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, "SELECT encode('hello', 'hex')");
-    assert_eq!(v, Value::Text("68656c6c6f".to_string()));
+    assert_eq!(v, Value::text("68656c6c6f"));
     let v2 = one_value(&mut eng, "SELECT decode('68656c6c6f', 'hex')");
-    assert_eq!(v2, Value::Text("hello".to_string()));
+    assert_eq!(v2, Value::text("hello"));
 }
 
 #[test]
 fn encode_base64_round_trip() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, "SELECT encode('Hello, World!', 'base64')");
-    assert_eq!(v, Value::Text("SGVsbG8sIFdvcmxkIQ==".to_string()));
+    assert_eq!(v, Value::text("SGVsbG8sIFdvcmxkIQ=="));
     let v2 = one_value(&mut eng, "SELECT decode('SGVsbG8sIFdvcmxkIQ==', 'base64')");
-    assert_eq!(v2, Value::Text("Hello, World!".to_string()));
+    assert_eq!(v2, Value::text("Hello, World!"));
 }
 
 #[test]
@@ -62,9 +62,9 @@ fn encode_base32hex_round_trip() {
     let mut eng = Engine::new();
     // base32hex of "foo" — RFC 4648 §10 example.
     let v = one_value(&mut eng, "SELECT encode('foo', 'base32hex')");
-    assert_eq!(v, Value::Text("CPNMU===".to_string()));
+    assert_eq!(v, Value::text("CPNMU==="));
     let v2 = one_value(&mut eng, "SELECT decode('CPNMU===', 'base32hex')");
-    assert_eq!(v2, Value::Text("foo".to_string()));
+    assert_eq!(v2, Value::text("foo"));
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn error_on_null_returns_value_when_non_null() {
     let v = one_value(&mut eng, "SELECT error_on_null(42)");
     assert!(matches!(v, Value::Int(42) | Value::BigInt(42)));
     let v2 = one_value(&mut eng, "SELECT error_on_null('abc')");
-    assert_eq!(v2, Value::Text("abc".to_string()));
+    assert_eq!(v2, Value::text("abc"));
 }
 
 #[test]

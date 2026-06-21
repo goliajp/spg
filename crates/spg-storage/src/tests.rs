@@ -102,8 +102,7 @@ fn redo_capture_replays_to_identical_state() {
         .unwrap();
         c
     }
-    let mk =
-        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
+    let mk = |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
 
     let mut c1 = fresh();
     {
@@ -112,11 +111,8 @@ fn redo_capture_replays_to_identical_state() {
         t.insert(mk(1, "a")).unwrap();
         t.insert(mk(2, "b")).unwrap();
         t.insert(mk(3, "c")).unwrap();
-        t.update_row(
-            1,
-            alloc::vec![Value::BigInt(2), Value::text("B")],
-        )
-        .unwrap();
+        t.update_row(1, alloc::vec![Value::BigInt(2), Value::text("B")])
+            .unwrap();
         t.delete_rows(&[0]); // drop id=1
         t.delete_rows(&[99]); // out of range → no-op → must NOT be captured
     }
@@ -156,8 +152,7 @@ fn catalog_drain_redo_replays_multi_table() {
         }
         c
     }
-    let mk =
-        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
+    let mk = |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
 
     let mut c1 = fresh();
     c1.enable_redo_all();
@@ -166,10 +161,7 @@ fn catalog_drain_redo_replays_multi_table() {
     c1.get_mut("a").unwrap().insert(mk(3, "a2")).unwrap();
     c1.get_mut("a")
         .unwrap()
-        .update_row(
-            0,
-            alloc::vec![Value::BigInt(1), Value::text("A1")],
-        )
+        .update_row(0, alloc::vec![Value::BigInt(1), Value::text("A1")])
         .unwrap();
     c1.get_mut("b").unwrap().delete_rows(&[0]);
     let log = c1.drain_redo();

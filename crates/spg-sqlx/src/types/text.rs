@@ -5,7 +5,7 @@ use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 use sqlx_core::types::Type;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::arguments::SpgArgumentValue;
 use crate::database::Spg;
@@ -44,7 +44,7 @@ impl Type<Spg> for String {
 impl<'q> Encode<'q, Spg> for &'q str {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text((*self).to_string()),
+            value: EngineValue::text(*self),
             type_info: Some(<str as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -55,7 +55,7 @@ impl<'q> Encode<'q, Spg> for &'q str {
 impl<'q> Encode<'q, Spg> for String {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(self.clone()),
+            value: EngineValue::text(self.clone()),
             type_info: Some(<String as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -83,7 +83,7 @@ impl<'r> Decode<'r, Spg> for String {
             return Ok(s);
         }
         match value.engine() {
-            EngineValue::Text(s) | EngineValue::Json(s) => Ok(s.clone()),
+            EngineValue::Text(s) | EngineValue::Json(s) => Ok(s.to_string()),
             other => Err(format!("cannot decode {other:?} as String / TEXT").into()),
         }
     }
@@ -92,7 +92,7 @@ impl<'r> Decode<'r, Spg> for String {
 impl<'r> Decode<'r, Spg> for &'r str {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::Text(s) | EngineValue::Json(s) => Ok(s.as_str()),
+            EngineValue::Text(s) | EngineValue::Json(s) => Ok(s.as_ref()),
             other => Err(format!("cannot decode {other:?} as &str / TEXT").into()),
         }
     }

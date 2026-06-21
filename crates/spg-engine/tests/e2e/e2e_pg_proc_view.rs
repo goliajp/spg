@@ -8,7 +8,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -23,7 +23,7 @@ fn pg_proc_lists_now() {
             .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("now".into()));
+    assert_eq!(r[0][0], Value::text("now"));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn pg_proc_count_aggregate_is_aggregate_kind() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("a".into()));
+    assert_eq!(r[0][0], Value::text("a"));
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn pg_proc_window_function_kind() {
             .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("w".into()));
+    assert_eq!(r[0][0], Value::text("w"));
 }
 
 #[test]
@@ -65,6 +65,6 @@ fn pg_proc_joins_with_pg_type_on_return() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("length".into()));
-    assert_eq!(r[0][1], Value::Text("int4".into()));
+    assert_eq!(r[0][0], Value::text("length"));
+    assert_eq!(r[0][1], Value::text("int4"));
 }

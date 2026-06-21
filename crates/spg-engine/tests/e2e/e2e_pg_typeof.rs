@@ -29,7 +29,7 @@ fn one_text(eng: &mut Engine, sql: &str) -> String {
             assert_eq!(rows.len(), 1, "{sql}");
             let row = rows.into_iter().next().unwrap();
             match row.values.into_iter().next().unwrap() {
-                Value::Text(s) => s,
+                Value::Text(s) => s.into_owned(),
                 other => panic!("{sql}: expected Text, got {other:?}"),
             }
         }

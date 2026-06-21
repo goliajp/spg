@@ -414,7 +414,11 @@ pub(crate) fn apply_on_conflict_assignments(
 /// "EXCLUDED", name }` reference with a `Literal` of the matching
 /// value from the incoming-row vec. Resolution against the
 /// child-table column list (by name).
-fn substitute_excluded_refs(expr: Expr, schema_cols: &[ColumnSchema], incoming: &[Value<'static>]) -> Expr {
+fn substitute_excluded_refs(
+    expr: Expr,
+    schema_cols: &[ColumnSchema],
+    incoming: &[Value<'static>],
+) -> Expr {
     use spg_sql::ast::ColumnName;
     match expr {
         Expr::Column(ColumnName { qualifier, name })
@@ -657,7 +661,8 @@ pub(crate) fn check_existing_unique_violation(
     };
     let ctx = eval::EvalContext::new(&schema.columns, None);
     let key_positions = unique_key_positions(idx);
-    let mut seen: alloc::vec::Vec<alloc::vec::Vec<spg_storage::Value<'static>>> = alloc::vec::Vec::new();
+    let mut seen: alloc::vec::Vec<alloc::vec::Vec<spg_storage::Value<'static>>> =
+        alloc::vec::Vec::new();
     for row in rows {
         if let Some(expr) = &predicate_expr {
             let v = eval::eval_expr(expr, row, &ctx).map_err(|e| {
@@ -944,7 +949,10 @@ pub(crate) fn enforce_check_constraints(
 /// Same shape: PK-backed BTree iteration + `resolve_cold_locator`
 /// per cold locator, no dedup state because the PK uniqueness
 /// contract gives per-row uniqueness.
-pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row<'static>> {
+pub(crate) fn iter_cold_rows_of_parent(
+    catalog: &Catalog,
+    parent: &spg_storage::Table,
+) -> Vec<Row<'static>> {
     let schema = parent.schema();
     let Some(pk_col_pos) = schema
         .uniqueness_constraints

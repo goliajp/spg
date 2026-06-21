@@ -11,7 +11,7 @@
 
 use spg_engine::{Engine, QueryResult};
 
-fn rows_of(res: QueryResult) -> Vec<Vec<spg_storage::Value>> {
+fn rows_of(res: QueryResult) -> Vec<Vec<spg_storage::Value<'static>>> {
     match res {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),

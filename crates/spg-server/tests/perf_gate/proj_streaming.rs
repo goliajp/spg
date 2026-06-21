@@ -9,7 +9,7 @@
 //!   * Simple-query (`b'Q'`): the legacy materialising path.
 //!   * Extended-query (Parse / Bind / Execute / Sync): the v7.37
 //!     streaming path — joined-projection streamer skips
-//!     `Vec<Row>` + per-cell `.cloned()`.
+//!     `Vec<Row<'static>>` + per-cell `.cloned()`.
 //!
 //! Reports p50 / p90 / p99 for both and the simple → extended win.
 //! Ignored by default; meant for ad-hoc verification on mini.

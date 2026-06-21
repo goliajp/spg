@@ -19,7 +19,7 @@ use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 use sqlx_core::types::Type;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::arguments::SpgArgumentValue;
 use crate::database::Spg;
@@ -33,7 +33,7 @@ use crate::value::SpgValueRef;
 /// vector cells so the caller can keep trying.
 pub(crate) fn try_vector_as_string(value: &EngineValue) -> Option<String> {
     let v = match value {
-        EngineValue::Vector(v) => v.clone(),
+        EngineValue::Vector(v) => v.to_vec(),
         EngineValue::Sq8Vector(q) => spg_storage::quantize::dequantize(q),
         EngineValue::HalfVector(h) => h.to_f32_vec(),
         _ => return None,
@@ -122,7 +122,7 @@ impl Type<Spg> for Vec<f32> {
 impl<'q> Encode<'q, Spg> for Vec<f32> {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
-            value: EngineValue::Vector(self.clone()),
+            value: EngineValue::vector(self.clone()),
             type_info: Some(<Vec<f32> as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -133,7 +133,7 @@ impl<'q> Encode<'q, Spg> for Vec<f32> {
 impl<'r> Decode<'r, Spg> for Vec<f32> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::Vector(v) => Ok(v.clone()),
+            EngineValue::Vector(v) => Ok(v.to_vec()),
             EngineValue::Sq8Vector(q) => Ok(spg_storage::quantize::dequantize(q)),
             EngineValue::HalfVector(h) => Ok(h.to_f32_vec()),
             other => Err(format!("cannot decode {other:?} as Vec<f32> / VECTOR").into()),

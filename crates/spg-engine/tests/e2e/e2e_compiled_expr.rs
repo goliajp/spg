@@ -8,7 +8,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
@@ -18,7 +18,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-fn ids(rs: &[Vec<Value>]) -> Vec<i64> {
+fn ids(rs: &[Vec<Value<'static>>]) -> Vec<i64> {
     rs.iter()
         .map(|r| match r[0] {
             Value::Int(n) => i64::from(n),

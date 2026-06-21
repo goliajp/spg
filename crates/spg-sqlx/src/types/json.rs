@@ -9,7 +9,7 @@ use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 use sqlx_core::types::Type;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::arguments::SpgArgumentValue;
 use crate::database::Spg;
@@ -31,7 +31,7 @@ impl<'q> Encode<'q, Spg> for serde_json::Value {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = serde_json::to_string(self)?;
         buf.push(SpgArgumentValue {
-            value: EngineValue::Json(s),
+            value: EngineValue::json(s),
             type_info: Some(<serde_json::Value as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
@@ -43,7 +43,7 @@ impl<'r> Decode<'r, Spg> for serde_json::Value {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
             EngineValue::Json(s) | EngineValue::Text(s) => {
-                serde_json::from_str(s).map_err(|e| Box::new(e) as BoxDynError)
+                serde_json::from_str(s.as_ref()).map_err(|e| Box::new(e) as BoxDynError)
             }
             other => Err(format!("cannot decode {other:?} as serde_json::Value").into()),
         }

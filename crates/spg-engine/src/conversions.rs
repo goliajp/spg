@@ -100,7 +100,7 @@ enum UniformArrayKind {
 }
 
 impl UniformArrayKind {
-    fn build(self, items: alloc::vec::Vec<Value<'static>>) -> Value {
+    fn build(self, items: alloc::vec::Vec<Value<'static>>) -> Value<'static> {
         match self {
             Self::Bool => Value::BoolArray(
                 items
@@ -262,7 +262,7 @@ fn discriminant_eq(a: UniformArrayKind, b: UniformArrayKind) -> bool {
 ///   - any BigInt without Text → BigIntArray (widening)
 ///   - any Text → TextArray (fallback; non-string elements
 ///     render as text)
-pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value<'static>>) -> Value {
+pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value<'static>>) -> Value<'static> {
     // v7.37.5 γ — first, detect a uniform new-array-type. If every
     // non-NULL element shares one of the array-of-scalar element
     // shapes (Bool / Float / Numeric / Date / Timestamp / Uuid /
@@ -895,7 +895,10 @@ pub(crate) fn parse_multirange_str(
 
 /// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
 /// the matching element Value for the RangeKind.
-pub(crate) fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value<'static>> {
+pub(crate) fn parse_range_element(
+    text: &str,
+    kind: spg_storage::RangeKind,
+) -> Option<Value<'static>> {
     let text = text.trim().trim_matches('"');
     use spg_storage::RangeKind as K;
     match kind {

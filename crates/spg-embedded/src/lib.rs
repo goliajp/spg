@@ -77,7 +77,7 @@
 //! `no_std` boundary clean.
 
 pub use spg_engine::{CatalogSnapshot, Engine, EngineError, ParsedStatement, QueryResult};
-pub use spg_storage::{ColumnSchema, DataType, Value};
+pub use spg_storage::{ColumnSchema, DataType, Value, ValueOwned};
 
 /// v7.16.0 — handle for a parsed-and-planned SQL statement.
 /// Hand off to [`Database::execute_prepared`] / [`Database::query_prepared`]
@@ -123,7 +123,7 @@ impl Statement {
 /// the bind-final stmt referenced a placeholder past the params
 /// slice — and that case has already errored in the executor
 /// above before this helper runs, so we discard the Result here.
-fn wal_render_with_params(stmt: &mut ParsedStatement, params: &[Value]) {
+fn wal_render_with_params(stmt: &mut ParsedStatement, params: &[Value<'static>]) {
     let _ = spg_engine::substitute_placeholders(stmt, params);
 }
 
@@ -151,7 +151,7 @@ fn extract_query_plan_lines(result: QueryResult) -> Vec<String> {
             .into_iter()
             .filter_map(|r| {
                 r.values.into_iter().next().and_then(|v| match v {
-                    Value::Text(s) => Some(s),
+                    Value::Text(s) => Some(s.into_owned()),
                     _ => None,
                 })
             })
@@ -2569,7 +2569,7 @@ impl Database {
     /// strips the column-schema metadata for read-side
     /// ergonomics. Errors on non-Rows results (DML / DDL
     /// statements should go through `execute` instead).
-    pub fn query(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, EngineError> {
+    pub fn query(&mut self, sql: &str) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
         match self.engine.execute(sql)? {
             QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
             QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
@@ -2591,7 +2591,7 @@ impl Database {
     pub fn query_with_columns(
         &mut self,
         sql: &str,
-    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value<'static>>>), EngineError> {
         match self.engine.execute(sql)? {
             QueryResult::Rows { columns, rows } => {
                 Ok((columns, rows.into_iter().map(|r| r.values).collect()))
@@ -2612,8 +2612,8 @@ impl Database {
     pub fn query_prepared_with_columns(
         &mut self,
         stmt: &Statement,
-        params: &[Value],
-    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        params: &[Value<'static>],
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value<'static>>>), EngineError> {
         match self.engine.execute_prepared(stmt.stmt.clone(), params)? {
             QueryResult::Rows { columns, rows } => {
                 Ok((columns, rows.into_iter().map(|r| r.values).collect()))
@@ -2738,7 +2738,7 @@ impl Database {
     pub fn execute_prepared(
         &mut self,
         stmt: &Statement,
-        params: &[Value],
+        params: &[Value<'static>],
     ) -> Result<QueryResult, EngineError> {
         let (result, ticket) = self.execute_prepared_buffered(stmt, params)?;
         if let Some(t) = ticket {
@@ -2759,7 +2759,7 @@ impl Database {
     pub fn execute_prepared_buffered(
         &mut self,
         stmt: &Statement,
-        params: &[Value],
+        params: &[Value<'static>],
     ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute_prepared(stmt.stmt.clone(), params)?;
         let modified = matches!(
@@ -2802,8 +2802,8 @@ impl Database {
     pub fn query_prepared(
         &mut self,
         stmt: &Statement,
-        params: &[Value],
-    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        params: &[Value<'static>],
+    ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
         match self.engine.execute_prepared(stmt.stmt.clone(), params)? {
             QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
             QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
@@ -2850,7 +2850,7 @@ impl Database {
     pub fn execute_prepared_on_snapshot(
         snapshot: &CatalogSnapshot,
         stmt: &Statement,
-        params: &[Value],
+        params: &[Value<'static>],
     ) -> Result<QueryResult, EngineError> {
         spg_engine::Engine::execute_readonly_prepared_on_snapshot(
             snapshot,
@@ -2873,7 +2873,7 @@ impl Database {
     pub fn execute_prepared_on_snapshot_with_budget(
         snapshot: &CatalogSnapshot,
         stmt: &Statement,
-        params: &[Value],
+        params: &[Value<'static>],
         budget_us: u64,
     ) -> Result<QueryResult, EngineError> {
         fn mono_now_us() -> u64 {
@@ -3757,7 +3757,7 @@ impl FromSpgValue for bool {
 impl FromSpgValue for String {
     fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
         match v {
-            Value::Text(s) => Ok(s.clone()),
+            Value::Text(s) => Ok(s.to_string()),
             Value::Null => Err("NULL in non-Option text column"),
             _ => Err("non-text value in String column"),
         }
@@ -3767,7 +3767,7 @@ impl FromSpgValue for String {
 impl FromSpgValue for Vec<f32> {
     fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
         match v {
-            Value::Vector(xs) => Ok(xs.clone()),
+            Value::Vector(xs) => Ok(xs.to_vec()),
             Value::Null => Err("NULL in non-Option vector column"),
             _ => Err("non-vector value in Vec<f32> column"),
         }

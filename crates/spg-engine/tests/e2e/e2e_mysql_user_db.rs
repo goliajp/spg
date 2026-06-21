@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -18,8 +18,8 @@ fn mysql_user_lists_root() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("root".into()));
-    assert_eq!(r[0][1], Value::Text("localhost".into()));
+    assert_eq!(r[0][0], Value::text("root"));
+    assert_eq!(r[0][1], Value::text("localhost"));
 }
 
 #[test]
@@ -30,5 +30,5 @@ fn mysql_db_lists_canonical_grants() {
             .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][1], Value::Text("postgres".into()));
+    assert_eq!(r[0][1], Value::text("postgres"));
 }

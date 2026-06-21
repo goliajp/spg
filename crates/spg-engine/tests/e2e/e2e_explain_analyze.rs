@@ -9,7 +9,7 @@ fn rows_of(r: &QueryResult) -> Vec<String> {
             .iter()
             .filter_map(|row| {
                 if let Value::Text(s) = &row.values[0] {
-                    Some(s.clone())
+                    Some(s.to_string())
                 } else {
                     None
                 }

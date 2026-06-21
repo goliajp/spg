@@ -9,7 +9,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows_of(qr: QueryResult) -> Vec<Vec<Value>> {
+fn rows_of(qr: QueryResult) -> Vec<Vec<Value<'static>>> {
     match qr {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected Rows, got {other:?}"),
@@ -26,9 +26,9 @@ fn basic_unnest_projection_returns_one_row_per_element() {
     let r = e.execute("SELECT unnest(tags) FROM posts").unwrap();
     let rows = rows_of(r);
     assert_eq!(rows.len(), 3, "3 tags → 3 rows");
-    assert_eq!(rows[0][0], Value::Text("rust".into()));
-    assert_eq!(rows[1][0], Value::Text("db".into()));
-    assert_eq!(rows[2][0], Value::Text("wal".into()));
+    assert_eq!(rows[0][0], Value::text("rust"));
+    assert_eq!(rows[1][0], Value::text("db"));
+    assert_eq!(rows[2][0], Value::text("wal"));
 }
 
 #[test]
@@ -41,9 +41,9 @@ fn unnest_with_broadcast_id() {
     let rows = rows_of(r);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], Value::Int(7));
-    assert_eq!(rows[0][1], Value::Text("a".into()));
+    assert_eq!(rows[0][1], Value::text("a"));
     assert_eq!(rows[1][0], Value::Int(7));
-    assert_eq!(rows[1][1], Value::Text("b".into()));
+    assert_eq!(rows[1][1], Value::text("b"));
 }
 
 #[test]
@@ -84,11 +84,11 @@ fn unnest_across_multiple_input_rows() {
     // 2 + 1 + 0 = 3 rows.
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][0], Value::Int(1));
-    assert_eq!(rows[0][1], Value::Text("a".into()));
+    assert_eq!(rows[0][1], Value::text("a"));
     assert_eq!(rows[1][0], Value::Int(1));
-    assert_eq!(rows[1][1], Value::Text("b".into()));
+    assert_eq!(rows[1][1], Value::text("b"));
     assert_eq!(rows[2][0], Value::Int(2));
-    assert_eq!(rows[2][1], Value::Text("c".into()));
+    assert_eq!(rows[2][1], Value::text("c"));
 }
 
 #[test]

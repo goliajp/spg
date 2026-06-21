@@ -22,7 +22,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -148,7 +148,7 @@ fn full_sentori_cutover_walk_through() {
         "SELECT payload ->> 'event' FROM events_partitioned WHERE id = 1",
     );
     assert_eq!(payload_text.len(), 1);
-    assert_eq!(payload_text[0][0], Value::Text("login".to_string()));
+    assert_eq!(payload_text[0][0], Value::text("login"));
 
     // Planner pruning: WHERE that constrains to June only sees the
     // events_2026_06 child + DEFAULT (DEFAULT contributes zero rows

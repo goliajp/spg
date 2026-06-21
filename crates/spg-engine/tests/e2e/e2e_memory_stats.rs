@@ -130,7 +130,7 @@ fn spg_memory_stats_virtual_table_matches_api() {
             assert_eq!(rows.len(), api.tables.len());
             let notes = rows
                 .iter()
-                .find(|r| r.values[0] == Value::Text("notes".into()))
+                .find(|r| r.values[0] == Value::text("notes"))
                 .expect("notes row");
             assert_eq!(notes.values[1], Value::BigInt(3)); // hot_rows
             let api_notes = api.tables.iter().find(|t| t.name == "notes").unwrap();

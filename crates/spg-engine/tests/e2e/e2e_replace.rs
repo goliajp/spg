@@ -19,7 +19,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
@@ -35,7 +35,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
     });
     let row = one_row(r);
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -223,7 +223,7 @@ fn replace_over_column() {
     e.execute("CREATE TABLE u (n TEXT NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('foo bar baz')").unwrap();
     let row = one_row(e.execute("SELECT replace(n, ' ', '-') FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("foo-bar-baz".into()));
+    assert_eq!(row[0], Value::text("foo-bar-baz"));
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn replace_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (replace('a-b-c', '-', '_'))")
         .unwrap();
     let row = one_row(e.execute("SELECT n FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("a_b_c".into()));
+    assert_eq!(row[0], Value::text("a_b_c"));
 }
 
 #[test]

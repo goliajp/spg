@@ -25,10 +25,10 @@ async fn async_prepare_then_bind_query() {
         .unwrap();
     let rows = db.query_prepared(&stmt, vec![Value::Int(1)]).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Text("alice".into()));
+    assert_eq!(rows[0][0], Value::text("alice"));
 
     let rows = db.query_prepared(&stmt, vec![Value::Int(2)]).await.unwrap();
-    assert_eq!(rows[0][0], Value::Text("bob".into()));
+    assert_eq!(rows[0][0], Value::text("bob"));
 }
 
 #[tokio::test]
@@ -54,7 +54,7 @@ async fn async_clone_handle_concurrent_binds() {
             db_clone
                 .execute_prepared(
                     &stmt_clone,
-                    vec![Value::Int(i), Value::Text(format!("row-{i}"))],
+                    vec![Value::Int(i), Value::text(format!("row-{i}"))],
                 )
                 .await
                 .unwrap();
@@ -68,7 +68,7 @@ async fn async_clone_handle_concurrent_binds() {
     assert_eq!(rows.len(), 10);
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(row[0], Value::Int(i as i32));
-        assert_eq!(row[1], Value::Text(format!("row-{i}")));
+        assert_eq!(row[1], Value::text(format!("row-{i}")));
     }
 }
 
@@ -90,10 +90,10 @@ async fn async_prepare_dml_persists_via_wal() {
             .await
             .unwrap();
         let stmt = db.prepare("INSERT INTO kv VALUES ($1, $2)").await.unwrap();
-        db.execute_prepared(&stmt, vec![Value::Int(1), Value::Text("one".into())])
+        db.execute_prepared(&stmt, vec![Value::Int(1), Value::text("one")])
             .await
             .unwrap();
-        db.execute_prepared(&stmt, vec![Value::Int(2), Value::Text("two".into())])
+        db.execute_prepared(&stmt, vec![Value::Int(2), Value::text("two")])
             .await
             .unwrap();
     }
@@ -101,8 +101,8 @@ async fn async_prepare_dml_persists_via_wal() {
     let db = AsyncDatabase::open_path(&path).await.unwrap();
     let rows = db.query("SELECT k, v FROM kv ORDER BY k").await.unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![Value::Int(1), Value::Text("one".into())]);
-    assert_eq!(rows[1], vec![Value::Int(2), Value::Text("two".into())]);
+    assert_eq!(rows[0], vec![Value::Int(1), Value::text("one")]);
+    assert_eq!(rows[1], vec![Value::Int(2), Value::text("two")]);
 
     let _ = std::fs::remove_dir_all(&p);
 }

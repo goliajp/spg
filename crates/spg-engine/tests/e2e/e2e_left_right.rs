@@ -29,7 +29,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -45,7 +45,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
             .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
     );
     match &row[0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -260,7 +260,7 @@ fn right_inside_insert_values() {
     e.execute("INSERT INTO u VALUES (right('abc-XYZ', 3))")
         .unwrap();
     let row = one_row(e.execute("SELECT last3 FROM u").unwrap());
-    assert_eq!(row[0], Value::Text("XYZ".into()));
+    assert_eq!(row[0], Value::text("XYZ"));
 }
 
 // ── COLUMN TYPE ──────────────────────────────────────────────────
@@ -299,5 +299,5 @@ fn left_does_not_collide_with_left_join_keyword() {
         panic!()
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[1], Value::Text("hel".into()));
+    assert_eq!(rows[0].values[1], Value::text("hel"));
 }

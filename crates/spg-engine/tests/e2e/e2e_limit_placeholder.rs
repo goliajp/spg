@@ -14,7 +14,11 @@ fn engine_with(sqls: &[&str]) -> Engine {
     eng
 }
 
-fn fetch_with_params(eng: &mut Engine, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+fn fetch_with_params(
+    eng: &mut Engine,
+    sql: &str,
+    params: &[Value<'static>],
+) -> Vec<Vec<Value<'static>>> {
     let stmt = eng.prepare(sql).expect("parses");
     match eng.execute_prepared(stmt, params).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),

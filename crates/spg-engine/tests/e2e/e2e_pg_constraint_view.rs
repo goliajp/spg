@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -23,8 +23,8 @@ fn pg_constraint_lists_primary_key() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("p".into()));
-    assert_eq!(r[0][1], Value::Text("id".into()));
+    assert_eq!(r[0][0], Value::text("p"));
+    assert_eq!(r[0][1], Value::text("id"));
 }
 
 #[test]
@@ -45,11 +45,11 @@ fn pg_constraint_lists_foreign_key() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("f".into()));
-    assert_eq!(r[0][1], Value::Text("children".into()));
-    assert_eq!(r[0][2], Value::Text("parents".into()));
-    assert_eq!(r[0][3], Value::Text("parent_id".into()));
-    assert_eq!(r[0][4], Value::Text("id".into()));
+    assert_eq!(r[0][0], Value::text("f"));
+    assert_eq!(r[0][1], Value::text("children"));
+    assert_eq!(r[0][2], Value::text("parents"));
+    assert_eq!(r[0][3], Value::text("parent_id"));
+    assert_eq!(r[0][4], Value::text("id"));
 }
 
 #[test]
@@ -65,6 +65,6 @@ fn pg_constraint_lists_composite_unique() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::Text("u".into()));
-    assert_eq!(r[0][1], Value::Text("a,b".into()));
+    assert_eq!(r[0][0], Value::text("u"));
+    assert_eq!(r[0][1], Value::text("a,b"));
 }

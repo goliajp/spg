@@ -18,7 +18,7 @@ fn ok(e: &mut Engine, sql: &str) {
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
-fn first_value(e: &mut Engine, sql: &str) -> Value {
+fn first_value(e: &mut Engine, sql: &str) -> Value<'static> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -232,7 +232,7 @@ fn set_pg_catalog_qualified_config_accepted() {
 
 // --- v7.12.2: @@ match operator + ts_rank ---
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
@@ -469,7 +469,7 @@ fn gin_messages_eng() -> Engine {
     e
 }
 
-fn collect_ids(rs: Vec<spg_storage::Row>) -> Vec<i32> {
+fn collect_ids(rs: Vec<spg_storage::Row<'static>>) -> Vec<i32> {
     let mut out: Vec<i32> = rs
         .into_iter()
         .map(|r| match r.values[0] {

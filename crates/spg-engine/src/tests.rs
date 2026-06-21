@@ -255,8 +255,11 @@ fn prepared_insert_substitutes_placeholders() {
         .unwrap();
     let stmt = e.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
-        e.execute_prepared(stmt.clone(), &[Value::Int(id), Value::text::<String>(name.into())])
-            .unwrap();
+        e.execute_prepared(
+            stmt.clone(),
+            &[Value::Int(id), Value::text::<String>(name.into())],
+        )
+        .unwrap();
     }
     // Read back via simple-query SELECT.
     let rows_result = e.execute("SELECT id, name FROM t").unwrap();
@@ -536,10 +539,7 @@ fn select_star_returns_all_rows_in_insertion_order() {
     assert_eq!(columns.len(), 2);
     assert_eq!(columns[0].name, "a");
     assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows[1].values,
-        vec![Value::Int(2), Value::text("two")]
-    );
+    assert_eq!(rows[1].values, vec![Value::Int(2), Value::text("two")]);
 }
 
 #[test]
@@ -605,10 +605,7 @@ fn projection_named_columns() {
     assert_eq!(cols[0].name, "name");
     assert_eq!(cols[1].name, "score");
     assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows[0].values,
-        vec![Value::text("alice"), Value::Int(90)]
-    );
+    assert_eq!(rows[0].values, vec![Value::text("alice"), Value::Int(90)]);
 }
 
 #[test]

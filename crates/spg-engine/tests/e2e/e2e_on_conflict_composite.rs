@@ -15,7 +15,7 @@ fn engine_with(sqls: &[&str]) -> Engine {
     eng
 }
 
-fn select(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn select(eng: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match eng.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected Rows"),
@@ -50,8 +50,8 @@ fn composite_target_do_update_writes_post_state() {
     )
     .unwrap();
     let rows = select(&mut eng, "SELECT payload, etag FROM cal");
-    assert_eq!(rows[0][0], Value::Text("v2".into()));
-    assert_eq!(rows[0][1], Value::Text("e2".into()));
+    assert_eq!(rows[0][0], Value::text("v2"));
+    assert_eq!(rows[0][1], Value::text("e2"));
 }
 
 #[test]

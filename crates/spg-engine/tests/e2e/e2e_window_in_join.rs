@@ -12,7 +12,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -53,15 +53,15 @@ fn join_with_window_returns_correct_rows() {
     // alice has 2 orders (100, 200) → rn 1, 2.
     // bob has 3 orders (30, 50, 80) → rn 1, 2, 3.
     assert_eq!(r.len(), 5);
-    assert_eq!(r[0][0], Value::Text("alice".into()));
+    assert_eq!(r[0][0], Value::text("alice"));
     assert_eq!(r[0][1], Value::BigInt(1));
-    assert_eq!(r[1][0], Value::Text("alice".into()));
+    assert_eq!(r[1][0], Value::text("alice"));
     assert_eq!(r[1][1], Value::BigInt(2));
-    assert_eq!(r[2][0], Value::Text("bob".into()));
+    assert_eq!(r[2][0], Value::text("bob"));
     assert_eq!(r[2][1], Value::BigInt(1));
-    assert_eq!(r[3][0], Value::Text("bob".into()));
+    assert_eq!(r[3][0], Value::text("bob"));
     assert_eq!(r[3][1], Value::BigInt(2));
-    assert_eq!(r[4][0], Value::Text("bob".into()));
+    assert_eq!(r[4][0], Value::text("bob"));
     assert_eq!(r[4][1], Value::BigInt(3));
 }
 

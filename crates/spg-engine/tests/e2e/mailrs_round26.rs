@@ -16,7 +16,7 @@ fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
         .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
-fn rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
     match ok(eng, sql) {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected Rows for {sql:?}, got {other:?}"),
@@ -77,11 +77,11 @@ fn backfill_shape_limit_orders_and_projects() {
         matches!(got[0][2], Value::Null),
         "NULL body survives: {got:?}"
     );
-    assert_eq!(got[0][3], Value::Text("b@example.com".into()));
+    assert_eq!(got[0][3], Value::text("b@example.com"));
     assert_eq!(as_i64(&got[1][0]), 3);
-    assert_eq!(got[1][3], Value::Text("a@example.com".into()));
+    assert_eq!(got[1][3], Value::text("a@example.com"));
     assert_eq!(as_i64(&got[2][0]), 5);
-    assert_eq!(got[2][2], Value::Text("body-5".into()));
+    assert_eq!(got[2][2], Value::text("body-5"));
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn left_join_falls_back_and_null_extends() {
         matches!(got[0][1], Value::Null),
         "orphan NULL-extends: {got:?}"
     );
-    assert_eq!(got[1][1], Value::Text("b@example.com".into()));
+    assert_eq!(got[1][1], Value::text("b@example.com"));
 }
 
 #[test]

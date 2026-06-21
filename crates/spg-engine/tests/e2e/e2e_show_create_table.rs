@@ -3,7 +3,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -17,9 +17,9 @@ fn show_create_table_returns_ddl() {
         .unwrap();
     let r = rows(e.execute("SHOW CREATE TABLE users").unwrap());
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("users".into()));
+    assert_eq!(r[0][0], Value::text("users"));
     let ddl = match &r[0][1] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         _ => panic!(),
     };
     assert!(ddl.contains("CREATE TABLE"));
@@ -40,7 +40,7 @@ fn show_create_table_includes_foreign_key() {
     .unwrap();
     let r = rows(e.execute("SHOW CREATE TABLE children").unwrap());
     let ddl = match &r[0][1] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         _ => panic!(),
     };
     assert!(ddl.contains("FOREIGN KEY"));

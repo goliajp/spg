@@ -4,7 +4,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
-fn rows(r: QueryResult) -> Vec<Vec<Value>> {
+fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
     match r {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
@@ -80,7 +80,7 @@ fn replace_single_first_match() {
         e.execute("SELECT regexp_replace('hello world', 'world', 'PG')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("hello PG".into()));
+    assert_eq!(r[0][0], Value::text("hello PG"));
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn replace_first_match_only_by_default() {
         e.execute("SELECT regexp_replace('a b a b', 'a', 'X')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("X b a b".into()));
+    assert_eq!(r[0][0], Value::text("X b a b"));
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn replace_global_flag() {
         e.execute("SELECT regexp_replace('a b a b', 'a', 'X', 'g')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("X b X b".into()));
+    assert_eq!(r[0][0], Value::text("X b X b"));
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn replace_with_character_class() {
         e.execute(r"SELECT regexp_replace('Hello, World!', '[^a-zA-Z0-9]', '-', 'g')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("Hello--World-".into()));
+    assert_eq!(r[0][0], Value::text("Hello--World-"));
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn replace_digit_with_hash() {
         e.execute(r"SELECT regexp_replace('order #1234', '\d+', '#', 'g')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("order ##".into()));
+    assert_eq!(r[0][0], Value::text("order ##"));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn replace_no_match_unchanged() {
         e.execute(r"SELECT regexp_replace('hello', '\d+', 'X')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text("hello".into()));
+    assert_eq!(r[0][0], Value::text("hello"));
 }
 
 // ── regexp_split_to_array ──────────────────────────────────────────

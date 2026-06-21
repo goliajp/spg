@@ -10,7 +10,7 @@ use sqlx_core::database::Database;
 use sqlx_core::error::Error;
 use sqlx_core::row::Row;
 
-use spg_embedded::Value as EngineValue;
+use spg_embedded::ValueOwned as EngineValue;
 
 use crate::column::SpgColumn;
 use crate::database::Spg;

@@ -36,7 +36,7 @@ fn write_seed_catalog(path: &std::path::Path) {
     for i in 0..100 {
         t.insert(Row::new(vec![
             Value::Int(i),
-            Value::Text(format!("user-{i}")),
+            Value::text(format!("user-{i}")),
         ]))
         .unwrap();
     }
@@ -82,7 +82,7 @@ fn bench_backup_inmemory(c: &mut Criterion) {
     for i in 0..100 {
         t.insert(spg_storage::Row::new(vec![
             spg_storage::Value::Int(i),
-            spg_storage::Value::Text(format!("user-{i}")),
+            spg_storage::Value::text(format!("user-{i}")),
         ]))
         .unwrap();
     }

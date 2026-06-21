@@ -7,7 +7,7 @@ use spg_engine::{EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE, Engin
 use spg_storage::Value;
 use std::sync::atomic::Ordering;
 
-fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row<'static>> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows from {sql:?}, got {other:?}"),
@@ -120,7 +120,7 @@ fn multi_col_not_exists_pullup_byte_equal_to_batch_baseline() {
         .iter()
         .map(|r| {
             if let Value::Text(s) = &r.values[0] {
-                s.as_str()
+                s.as_ref()
             } else {
                 panic!("expected text thread_id, got {:?}", r.values[0])
             }

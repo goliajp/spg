@@ -4,7 +4,7 @@
 
 use spg_embedded::{Database, QueryResult, Value};
 
-fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value<'static>>> {
     match db.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         other => panic!("expected rows for {sql}, got {other:?}"),
@@ -20,11 +20,11 @@ fn ilike_matches_case_insensitively() {
         .unwrap();
     let r = rows_of(&mut db, "SELECT s FROM t WHERE s ILIKE '%hello%'");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("Hello World".into()));
+    assert_eq!(r[0][0], Value::text("Hello World"));
     // NOT ILIKE excludes the match AND the NULL (PG semantics).
     let r = rows_of(&mut db, "SELECT s FROM t WHERE s NOT ILIKE '%HELLO%'");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("goodbye".into()));
+    assert_eq!(r[0][0], Value::text("goodbye"));
     // Plain LIKE stays case-sensitive.
     let r = rows_of(&mut db, "SELECT COUNT(*) FROM t WHERE s LIKE '%hello%'");
     assert_eq!(r[0][0], Value::BigInt(0));
@@ -47,7 +47,7 @@ fn distinct_aggregates() {
         &mut db,
         "SELECT string_agg(DISTINCT sender, ',' ORDER BY sender) FROM m WHERE thread = 't1'",
     );
-    assert_eq!(r[0][0], Value::Text("alice,bob".into()));
+    assert_eq!(r[0][0], Value::text("alice,bob"));
     // The inbox unread-counter shape: DISTINCT over a CASE arm.
     let r = rows_of(
         &mut db,
@@ -65,7 +65,7 @@ fn cast_function_form() {
     db.execute("CREATE TABLE t (n BIGINT)").unwrap();
     db.execute("INSERT INTO t VALUES (1), (2), (2)").unwrap();
     let r = rows_of(&mut db, "SELECT CAST(1 AS TEXT)");
-    assert_eq!(r[0][0], Value::Text("1".into()));
+    assert_eq!(r[0][0], Value::text("1"));
     let r = rows_of(
         &mut db,
         "SELECT COUNT(DISTINCT CASE WHEN n > 0 THEN CAST(n AS TEXT) END) FROM t",
@@ -118,7 +118,7 @@ fn inbox_list_shape_composes() {
          SELECT thread, msgs, unread_senders FROM agg ORDER BY thread",
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("t1".into()));
+    assert_eq!(r[0][0], Value::text("t1"));
     assert_eq!(r[0][1], Value::BigInt(2));
     assert_eq!(r[0][2], Value::BigInt(1));
 }
@@ -206,7 +206,7 @@ fn round19_seeded_group_eval_composite() {
     assert_eq!(r.len(), 1);
     assert_eq!(
         r[0][1],
-        Value::Text("billing2".into()),
+        Value::text("billing2"),
         "latest message's category"
     );
 
@@ -234,16 +234,16 @@ fn round19_seeded_group_eval_composite() {
      HAVING COUNT(DISTINCT m.id) > 0 AND COALESCE(BOOL_OR(ea.requires_action), false) \
      ORDER BY COALESCE(BOOL_OR(ea.requires_action), false) DESC, \
               MAX(m.internal_date) DESC NULLS LAST";
-    let check = |rows: &[Vec<Value>]| {
+    let check = |rows: &[Vec<Value<'static>>]| {
         assert_eq!(rows.len(), 1, "one group row");
-        assert_eq!(rows[0][0], Value::Text("th-1".into()));
+        assert_eq!(rows[0][0], Value::text("th-1"));
         assert_eq!(rows[0][1], Value::BigInt(2), "COUNT(DISTINCT m.id)");
         assert_eq!(
             rows[0][3],
             Value::Bool(true),
             "BOOL_OR over LEFT JOIN alias"
         );
-        assert_eq!(rows[0][4], Value::Text("billing2".into()), "A-shape column");
+        assert_eq!(rows[0][4], Value::text("billing2"), "A-shape column");
         assert_eq!(rows[0][8], Value::BigInt(1), "DISTINCT CASE counter");
     };
     let direct = rows_of(&mut db, sql);
@@ -253,7 +253,7 @@ fn round19_seeded_group_eval_composite() {
     let snap = db.engine().clone_snapshot();
     match Database::execute_prepared_on_snapshot(&snap, &stmt, &[]).unwrap() {
         QueryResult::Rows { rows, .. } => {
-            let vals: Vec<Vec<Value>> = rows.into_iter().map(|r| r.values).collect();
+            let vals: Vec<Vec<Value<'static>>> = rows.into_iter().map(|r| r.values).collect();
             check(&vals);
         }
         other => panic!("{other:?}"),

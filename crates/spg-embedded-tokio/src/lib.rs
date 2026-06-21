@@ -215,12 +215,12 @@ impl AsyncDatabase {
         .flatten_blocking()
     }
 
-    /// Run a SELECT and return rows as `Vec<Vec<Value>>`. Same
+    /// Run a SELECT and return rows as `Vec<Vec<Value<'static>>>`. Same
     /// dispatch shape as `execute` — lock + spawn_blocking.
     ///
     /// # Errors
     /// Propagates `EngineError` from the engine.
-    pub async fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>, EngineError> {
+    pub async fn query(&self, sql: &str) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
@@ -290,7 +290,7 @@ impl AsyncDatabase {
     pub async fn execute_prepared(
         &self,
         stmt: &AsyncStatement,
-        params: Vec<Value>,
+        params: Vec<Value<'static>>,
     ) -> Result<QueryResult, EngineError> {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
@@ -311,7 +311,7 @@ impl AsyncDatabase {
     }
 
     /// v7.16.0 — run a prepared SELECT with bound params and
-    /// return rows as `Vec<Vec<Value>>`. Errors when the prepared
+    /// return rows as `Vec<Vec<Value<'static>>>`. Errors when the prepared
     /// statement isn't a SELECT.
     ///
     /// # Errors
@@ -320,8 +320,8 @@ impl AsyncDatabase {
     pub async fn query_prepared(
         &self,
         stmt: &AsyncStatement,
-        params: Vec<Value>,
-    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        params: Vec<Value<'static>>,
+    ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
@@ -343,7 +343,7 @@ impl AsyncDatabase {
     pub async fn query_with_columns(
         &self,
         sql: &str,
-    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value<'static>>>), EngineError> {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
@@ -364,8 +364,8 @@ impl AsyncDatabase {
     pub async fn query_prepared_with_columns(
         &self,
         stmt: &AsyncStatement,
-        params: Vec<Value>,
-    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        params: Vec<Value<'static>>,
+    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value<'static>>>), EngineError> {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
@@ -503,7 +503,7 @@ impl AsyncReadHandle {
     pub async fn execute_prepared(
         &self,
         stmt: &AsyncStatement,
-        params: Vec<Value>,
+        params: Vec<Value<'static>>,
     ) -> Result<QueryResult, EngineError> {
         let snapshot = self.snapshot.clone();
         let stmt_inner = Arc::clone(&stmt.inner);

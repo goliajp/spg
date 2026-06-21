@@ -12,7 +12,7 @@
 use spg_engine::{Engine, QueryResult};
 use spg_storage::{DataType, Value};
 
-fn one_row(r: QueryResult) -> Vec<Value> {
+fn one_row(r: QueryResult) -> Vec<Value<'static>> {
     match r {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "expected exactly 1 row");
