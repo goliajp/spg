@@ -153,7 +153,11 @@ pub fn jsonb_each_text_rows(arg: &Value) -> Result<Vec<(String, Option<String>)>
             for (k, v) in entries {
                 let text = match &v {
                     JsonValue::Null => None,
-                    JsonValue::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
+                    JsonValue::Bool(b) => Some(if *b {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }),
                     JsonValue::Number(_) | JsonValue::NumberText(_) | JsonValue::String(_) => {
                         Some(v.as_text())
                     }
