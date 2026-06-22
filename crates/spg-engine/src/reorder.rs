@@ -132,6 +132,23 @@ fn choose_order_inner(
 }
 
 pub fn reorder_joins(stmt: &mut SelectStatement, catalog: &Catalog, stats: &Statistics) {
+    reorder_joins_with(stmt, catalog, stats, false);
+}
+
+/// v7.38 元机制 D acceptor — `SPG_TEST_PLAN_DETERMINISTIC=1` makes
+/// cost-based join reorder a no-op so regression tests that pin
+/// "same SQL → same plan order" don't drift when statistics shift.
+/// Production reads call `reorder_joins`(deterministic=false);
+/// the engine's gate is `crates/spg-engine/src/execute.rs::Engine::env_cfg().plan_deterministic`.
+pub fn reorder_joins_with(
+    stmt: &mut SelectStatement,
+    catalog: &Catalog,
+    stats: &Statistics,
+    plan_deterministic: bool,
+) {
+    if plan_deterministic {
+        return;
+    }
     let Some(from) = stmt.from.as_mut() else {
         return;
     };

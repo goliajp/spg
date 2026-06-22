@@ -41,7 +41,9 @@ mod e2e_enum_type;
 mod e2e_env_cfg_disable_joinfold;
 mod e2e_env_cfg_disable_topk;
 mod e2e_env_cfg_explain_no_costs;
+mod e2e_env_cfg_plan_deterministic;
 mod e2e_env_cfg_random_seed;
+mod e2e_env_cfg_stats_frozen;
 mod e2e_exists_decorrelation;
 #[allow(
     clippy::cast_lossless,

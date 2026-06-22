@@ -207,7 +207,12 @@ impl Engine {
             ));
         };
         resolve_order_by_position(&mut s);
-        reorder::reorder_joins(&mut s, &self.catalog, &self.statistics);
+        reorder::reorder_joins_with(
+            &mut s,
+            &self.catalog,
+            &self.statistics,
+            self.env_cfg.plan_deterministic,
+        );
         Ok(s)
     }
 
@@ -353,7 +358,12 @@ impl Engine {
             ));
         };
         resolve_order_by_position(&mut s);
-        reorder::reorder_joins(&mut s, &self.catalog, &self.statistics);
+        reorder::reorder_joins_with(
+            &mut s,
+            &self.catalog,
+            &self.statistics,
+            self.env_cfg.plan_deterministic,
+        );
         // Streaming fast path: joined non-aggregate projection of
         // bound columns. Falls back to the materialising path inside
         // `try_exec_joined_streaming` returning None for any shape
@@ -402,7 +412,14 @@ impl Engine {
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
             // v6.2.3 — cost-based JOIN reorder (read path).
-            reorder::reorder_joins(s, &self.catalog, &self.statistics);
+            // v7.38 元机制 D — gated on plan_deterministic so
+            // regression tests pin a stable join order.
+            reorder::reorder_joins_with(
+                s,
+                &self.catalog,
+                &self.statistics,
+                self.env_cfg.plan_deterministic,
+            );
         }
         self.execute_readonly_stmt_with_cancel(stmt, cancel)
     }
