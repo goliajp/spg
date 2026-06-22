@@ -8087,14 +8087,103 @@ impl Parser {
                     _ => break,
                 };
             let table = self.parse_table_ref()?;
+            // v7.37.7 C.1 — USING (col_list) sugar. Desugars to
+            // `prev_table.col1 = table.col1 AND prev_table.col2 = table.col2 …`
+            // where prev_table is the most-recent left-side table
+            // (the previous join's table if any, else the FROM primary).
+            // PG semantics around column merging are richer (USING'd
+            // cols become deduplicated single output columns); for
+            // sugar purposes the predicate-only form covers the
+            // baseline corpus shape and chained `… JOIN x USING (k)
+            // JOIN y USING (k)` calls.
+            let using_match = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using"));
             let on = if matches!(self.peek(), Token::On) {
                 self.advance();
                 Some(self.parse_expr(0)?)
+            } else if using_match {
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(format!(
+                        "expected '(' after USING, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut cols: Vec<String> = Vec::new();
+                loop {
+                    match self.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s) => {
+                            self.advance();
+                            cols.push(s);
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected column name inside USING (…), got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected ',' or ')' inside USING (…), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if cols.is_empty() {
+                    return Err(self.err("USING (…) requires at least one column".to_string()));
+                }
+                // Pick the left-side alias: prev join's table if any,
+                // else FROM primary. Use alias when present, else
+                // table name (PG-equivalent qualifier).
+                let left_qual: String = joins
+                    .last()
+                    .map(|j| {
+                        j.table
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| j.table.name.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        primary
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| primary.name.clone())
+                    });
+                let right_qual = table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| table.name.clone());
+                let mut iter = cols.into_iter().map(|c| Expr::Binary {
+                    lhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        qualifier: Some(left_qual.clone()),
+                        name: c.clone(),
+                    })),
+                    op: crate::ast::BinOp::Eq,
+                    rhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        qualifier: Some(right_qual.clone()),
+                        name: c,
+                    })),
+                });
+                let first = iter.next().expect("at least one col");
+                Some(iter.fold(first, |acc, pred| Expr::Binary {
+                    lhs: alloc::boxed::Box::new(acc),
+                    op: crate::ast::BinOp::And,
+                    rhs: alloc::boxed::Box::new(pred),
+                }))
             } else if kind == JoinKind::Cross {
                 None
             } else {
                 return Err(self.err(format!(
-                    "expected ON after {:?} JOIN, got {:?}",
+                    "expected ON or USING after {:?} JOIN, got {:?}",
                     kind,
                     self.peek()
                 )));
