@@ -1,0 +1,41 @@
+# SET TRANSACTION ISOLATION LEVEL — surface gap
+#
+# Status: parser does NOT recognise the syntax today (v7.37.8).
+# Each line below is marked `statement error` so a regression is
+# caught immediately when the surface lands (the assertion flips
+# from "errors today" to "must accept" → the author fills in the
+# behavioural checks).
+#
+# Per v7.38 plan §二 轴 4 + dashboard §1 metabox 4: SPG must
+# accept PG-standard `SET TRANSACTION ISOLATION LEVEL` and
+# `START TRANSACTION ISOLATION LEVEL`, track the current level
+# per-transaction, and reflect it through
+# `SHOW transaction_isolation`. The actual isolation semantics
+# (REPEATABLE READ snapshot, SERIALIZABLE SSI) are separate work
+# tracked in the same axis.
+#
+# Vision contract: SPG is to be ≥ PG on every angle
+# (memory/vision-spg-ge-pg-everywhere.md). PG ships these as
+# standard surface; SPG must too.
+#
+# When the surface lands:
+# 1. Implement parser support + engine state.
+# 2. Flip each `statement error` below to `statement ok`.
+# 3. Add `query T nosort` blocks asserting `SHOW transaction_isolation`
+#    returns the value just SET.
+# 4. Update 16_isolation/_README.md status column to LANDED.
+
+statement error
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+statement error
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+statement error
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+statement error
+START TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+statement error
+SHOW transaction_isolation

@@ -23,6 +23,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/13_recovery` | 27 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
 | `spg_baseline/15_regressions` | 46 | 0 | 0 | 100.0% |
+| `spg_baseline/16_isolation` | 5 | 0 | 0 | 100.0% |
 
 ## Per-file detail
 
@@ -354,3 +355,9 @@ Per-corpus pass / fail / skip:
 | `round_27_returning_type.test` | 5 | 0 | 0 |
 | `round_28_update_correlated.test` | 9 | 0 | 0 |
 | `round_29_filter_clause.test` | 5 | 0 | 0 |
+
+### `spg_baseline/16_isolation/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `set_transaction_isolation_level.test` | 5 | 0 | 0 |
