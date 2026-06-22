@@ -1244,6 +1244,16 @@ impl Engine {
                 // v7.31 — memory-campaign bucket meters.
                 "spg_memory_stats" => return Ok(self.exec_spg_memory_stats()),
                 "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
+                // v7.37.7 — PG's `pg_stat_statements` extension view is
+                // the de-facto observability surface tools like
+                // pgAdmin, pgmetrics, and Datadog query. SPG's native
+                // implementation is `spg_stat_query`; expose the
+                // PG name as an alias so dashboards built against
+                // PG just work. This is the read-side of the
+                // pg_stat_statements compatibility surface; the
+                // extension's tracking semantics are already SPG's
+                // default behaviour (cumulative per query shape).
+                "pg_stat_statements" => return Ok(self.exec_spg_stat_query()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
                 "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),

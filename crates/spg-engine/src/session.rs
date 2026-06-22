@@ -94,6 +94,31 @@ impl Engine {
             .map(String::as_str)
     }
 
+    /// v7.37.7 — PG `statement_timeout` GUC read accessor. Returns the
+    /// session-set value in **milliseconds**, parsed from the raw
+    /// `SET statement_timeout = N` string. Returns `None` when:
+    /// - the GUC is unset,
+    /// - the value is `0` (PG semantics: 0 = no timeout),
+    /// - the value fails to parse.
+    ///
+    /// Accepted input shapes mirror PG's `GUC_UNIT_MS` parser:
+    /// - bare digits: `100` → 100 ms (PG default unit when GUC is in ms)
+    /// - explicit ms: `100ms`, `100 ms`
+    /// - seconds:     `1s`, `30s` → 1000 / 30000 ms
+    /// - minutes:     `5min` → 300000 ms
+    ///
+    /// The host (`spg-server` per-query watchdog) consults this when
+    /// constructing the `CancelToken` deadline so a SQL-set
+    /// `SET statement_timeout = 1000` is honoured per-session — the
+    /// effective deadline becomes `min(SPG_QUERY_TIMEOUT_MS, session)`.
+    /// Returning `None` from this fn means "no session override, use
+    /// the host-level timeout only".
+    #[must_use]
+    pub fn session_statement_timeout_ms(&self) -> Option<u64> {
+        let raw = self.session_param("statement_timeout")?;
+        parse_pg_duration_ms(raw).filter(|ms| *ms > 0)
+    }
+
     /// v7.12.1 — build an `EvalContext` chained with the session's
     /// `default_text_search_config`. Engine-internal callers use
     /// this instead of `EvalContext::new` so the FTS function
@@ -105,5 +130,122 @@ impl Engine {
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
+    }
+}
+
+/// v7.37.7 — parse a PG-style `GUC_UNIT_MS` duration string into
+/// milliseconds. Accepts the same shapes PG itself accepts for
+/// `statement_timeout` and related ms-based GUCs.
+///
+/// Returns `None` on parse failure (callers treat None as "GUC not
+/// set / default applies").
+fn parse_pg_duration_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // PG accepts trailing unit suffix: ms / s / min / h / d. Strip in
+    // priority order (longer first so `min` doesn't match as `m`).
+    let lowered = s.to_ascii_lowercase();
+    let (num_part, multiplier_ms): (&str, u64) = if let Some(p) = lowered.strip_suffix("ms") {
+        (p, 1)
+    } else if let Some(p) = lowered.strip_suffix("min") {
+        (p, 60_000)
+    } else if let Some(p) = lowered.strip_suffix('s') {
+        (p, 1_000)
+    } else if let Some(p) = lowered.strip_suffix('h') {
+        (p, 3_600_000)
+    } else if let Some(p) = lowered.strip_suffix('d') {
+        (p, 86_400_000)
+    } else {
+        // No unit suffix — bare digits in the GUC's native unit (ms
+        // for `statement_timeout`).
+        (lowered.as_str(), 1)
+    };
+    let n: u64 = num_part.trim().parse().ok()?;
+    n.checked_mul(multiplier_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pg_duration_ms;
+    use alloc::format;
+
+    #[test]
+    fn parse_bare_digits_treats_as_ms() {
+        assert_eq!(parse_pg_duration_ms("100"), Some(100));
+        assert_eq!(parse_pg_duration_ms("0"), Some(0));
+        assert_eq!(parse_pg_duration_ms("60000"), Some(60_000));
+    }
+
+    #[test]
+    fn parse_ms_suffix() {
+        assert_eq!(parse_pg_duration_ms("100ms"), Some(100));
+        assert_eq!(parse_pg_duration_ms("100 ms"), Some(100));
+    }
+
+    #[test]
+    fn parse_seconds() {
+        assert_eq!(parse_pg_duration_ms("1s"), Some(1_000));
+        assert_eq!(parse_pg_duration_ms("30s"), Some(30_000));
+    }
+
+    #[test]
+    fn parse_minutes_uses_three_letter_suffix() {
+        assert_eq!(parse_pg_duration_ms("5min"), Some(300_000));
+        // `5m` is NOT valid PG (PG requires `min`); confirm we mirror.
+        assert_eq!(parse_pg_duration_ms("5m"), None);
+    }
+
+    #[test]
+    fn parse_invalid_returns_none() {
+        assert_eq!(parse_pg_duration_ms(""), None);
+        assert_eq!(parse_pg_duration_ms("abc"), None);
+        assert_eq!(parse_pg_duration_ms("100x"), None);
+    }
+
+    #[test]
+    fn parse_handles_whitespace() {
+        assert_eq!(parse_pg_duration_ms("  100  "), Some(100));
+    }
+
+    #[test]
+    fn parse_overflow_returns_none() {
+        // u64::MAX seconds overflows when multiplied by 1000 ms/s.
+        assert_eq!(parse_pg_duration_ms(&format!("{}s", u64::MAX)), None);
+    }
+
+    #[cfg(test)]
+    mod session_integration {
+        use crate::Engine;
+        use spg_sql::ast::SetValue;
+
+        #[test]
+        fn set_statement_timeout_round_trips_ms() {
+            let mut e = Engine::new();
+            e.set_session_param("statement_timeout".into(), SetValue::Number("250".into()));
+            assert_eq!(e.session_statement_timeout_ms(), Some(250));
+        }
+
+        #[test]
+        fn set_statement_timeout_zero_is_none() {
+            // PG semantics: 0 means "no timeout".
+            let mut e = Engine::new();
+            e.set_session_param("statement_timeout".into(), SetValue::Number("0".into()));
+            assert_eq!(e.session_statement_timeout_ms(), None);
+        }
+
+        #[test]
+        fn statement_timeout_unset_is_none() {
+            let e = Engine::new();
+            assert_eq!(e.session_statement_timeout_ms(), None);
+        }
+
+        #[test]
+        fn statement_timeout_accepts_ms_suffix_via_string_set() {
+            let mut e = Engine::new();
+            e.set_session_param("statement_timeout".into(), SetValue::String("1500ms".into()));
+            assert_eq!(e.session_statement_timeout_ms(), Some(1500));
+        }
     }
 }

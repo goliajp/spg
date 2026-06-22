@@ -550,7 +550,14 @@ fn main() {
         query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
         max_query_ns: parse_env_u64("SPG_MAX_QUERY_NS"),
         idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
-        slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS"),
+        // v7.37.7 (mailrs cascade 4 cycle disable signal) — slowlog
+        // is OFF by default in v7.37.6 and earlier, which is how 25
+        // budget-breach queries on a single prod cycle remained
+        // invisible to the SPG service log. v7.37.7 makes the
+        // **default 1000ms** so any prod deploy automatically captures
+        // slow queries without operator opt-in. Explicit unsets are
+        // still possible via `SPG_SLOW_QUERY_LOG_MS=0`.
+        slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS").or(Some(1000)),
         wal_min_free_bytes: parse_env_u64("SPG_WAL_MIN_FREE_BYTES"),
         shutdown_deadline_sec: parse_env_u64("SPG_SHUTDOWN_DEADLINE_SEC"),
     };
@@ -2101,11 +2108,17 @@ fn handle_query_op(
         // flag after the budget; the engine's row loops
         // poll it at checkpoints and bail.
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let watchdog = spawn_query_watchdog(state, &cancel_flag);
         let engine = state
             .engine
             .read()
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        // v7.37.7 — read session `statement_timeout` GUC (PG semantics)
+        // BEFORE spawning the watchdog so a SQL-level
+        // `SET statement_timeout = N` on this connection takes effect
+        // for the current query. The watchdog picks the tighter of
+        // env-var SPG_QUERY_TIMEOUT_MS and session GUC.
+        let session_timeout = engine.session_statement_timeout_ms();
+        let watchdog = spawn_query_watchdog(state, &cancel_flag, session_timeout);
         let budget = usize::try_from(
             state
                 .limits
@@ -2222,7 +2235,19 @@ fn handle_query_op(
         }
     }
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let watchdog = spawn_query_watchdog(state, &cancel_flag);
+    // v7.37.7 — session `statement_timeout` GUC also applies to writes
+    // (PG semantics). Read it before spawning the watchdog so a SQL
+    // `SET statement_timeout = N` honoured uniformly across read +
+    // write paths. RwLock read-borrow is dropped before the wrap path's
+    // write leader needs the lock.
+    let session_timeout_ms = {
+        let engine_guard = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        engine_guard.session_statement_timeout_ms()
+    };
+    let watchdog = spawn_query_watchdog(state, &cancel_flag, session_timeout_ms);
     // v4.42 — split the wrap path from the non-wrap path.
     //
     // **Wrap path** (auto-commit write, WAL on): push the
@@ -2570,7 +2595,11 @@ impl Watchdog {
     }
 }
 
-fn spawn_query_watchdog(state: &ServerState, cancel_flag: &Arc<AtomicBool>) -> Watchdog {
+fn spawn_query_watchdog(
+    state: &ServerState,
+    cancel_flag: &Arc<AtomicBool>,
+    session_timeout_ms: Option<u64>,
+) -> Watchdog {
     let completed = Arc::new(AtomicBool::new(false));
     // v6.10.1 — pick the tighter of `query_timeout_ms` and
     // `max_query_ns` (converted to a Duration). `None` from one
@@ -2583,12 +2612,17 @@ fn spawn_query_watchdog(state: &ServerState, cancel_flag: &Arc<AtomicBool>) -> W
         .limits
         .max_query_ns
         .map(std::time::Duration::from_nanos);
-    let total = match (timeout_dur, cpu_dur) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    // v7.37.7 — session `SET statement_timeout = N` is the third input.
+    // The session-set value (in ms) is read by the caller via
+    // `Engine::session_statement_timeout_ms()` and passed in here so a
+    // SQL-level GUC change takes effect for the very next statement on
+    // the same connection. PG semantics: per-session GUC + cluster
+    // (env-var) bound, the tighter wins.
+    let session_dur = session_timeout_ms.map(std::time::Duration::from_millis);
+    let total = [timeout_dur, cpu_dur, session_dur]
+        .into_iter()
+        .flatten()
+        .min();
     let Some(total) = total else {
         return Watchdog { completed };
     };
