@@ -1868,8 +1868,16 @@ impl Engine {
             if let Some(eliminated) = self.try_eliminate_redundant_left_joins(stmt) {
                 return self.exec_bare_select_cancel(&eliminated, cancel);
             }
-            if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
-                return self.exec_bare_select_cancel(&folded, cancel);
+            // v7.38 P0 元机制 D — `SPG_TEST_DISABLE_JOINFOLD=1` skips
+            // the v7.32 joinfold rewrite that turns inner JOINs into a
+            // single-table scan when the catalogue can prove key-only
+            // dependency. Tests use this to assert "without joinfold,
+            // the join still executes correctly" (joinfold is a
+            // semantically-equivalent rewrite, not a correctness fix).
+            if !self.env_cfg().disable_joinfold {
+                if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
+                    return self.exec_bare_select_cancel(&folded, cancel);
+                }
             }
             return self.exec_joined_select(stmt, from, cancel);
         }

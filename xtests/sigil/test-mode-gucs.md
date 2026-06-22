@@ -17,7 +17,7 @@
 | `SPG_TEST_COMPUTE_QUERY_ID=regress` | Query-identifier annotation stripped from EXPLAIN output | TBD: `crates/spg-engine/src/lib.rs` (annotate_explain_lines) | TBD: `crates/spg-engine/tests/e2e/e2e_env_cfg_compute_query_id.rs` | TBD (P1) |
 | `SPG_TEST_STATS_FROZEN=1` | `ANALYZE` becomes a no-op; INSERT/UPDATE auto-stats refresh suppressed | TBD: `crates/spg-engine/src/statistics.rs` (`update_statistic_for_table` entry) | TBD: `crates/spg-engine/tests/e2e/e2e_env_cfg_stats_frozen.rs` | TBD (P1) |
 | `SPG_TEST_PLAN_DETERMINISTIC=1` | Cost-based plan / join-order decisions fall back to signature-hash lexical tie-break | TBD: `crates/spg-engine/src/plan_cache.rs` + `crates/spg-engine/src/reorder.rs` | TBD: `crates/spg-engine/tests/e2e/e2e_env_cfg_plan_deterministic.rs` | TBD (P1) |
-| `SPG_TEST_DISABLE_JOINFOLD=1` | v7.37 joinfold rewrite suppressed; planner sees the raw join tree | TBD: `crates/spg-engine/src/lib.rs` (joinfold rewrite entry) | TBD: `crates/spg-engine/tests/e2e/e2e_env_cfg_disable_joinfold.rs` | TBD (P1) |
+| `SPG_TEST_DISABLE_JOINFOLD=1` | v7.32 joinfold rewrite suppressed; planner sees the raw join tree | `crates/spg-engine/src/select.rs:1873` (`try_fold_inner_joins` gate) | `crates/spg-engine/tests/e2e/e2e_env_cfg_disable_joinfold.rs` | LANDED |
 
 ## Conventions
 

@@ -38,6 +38,7 @@ mod e2e_do_block;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
+mod e2e_env_cfg_disable_joinfold;
 mod e2e_env_cfg_disable_topk;
 mod e2e_env_cfg_explain_no_costs;
 mod e2e_env_cfg_random_seed;

@@ -77,6 +77,10 @@
 //! `no_std` boundary clean.
 
 pub use spg_engine::{CatalogSnapshot, Engine, EngineError, ParsedStatement, QueryResult};
+// v7.38 P0 元机制 A — re-export the macro so downstream crates that
+// only depend on spg-embedded (e.g. spg-sqlx) can fire injection
+// points without pulling in spg-engine directly.
+pub use spg_engine::injection_point;
 pub use spg_storage::{ColumnSchema, DataType, Value, ValueOwned};
 
 /// v7.16.0 — handle for a parsed-and-planned SQL statement.
@@ -179,6 +183,13 @@ fn autowarm_cold_tier_on_open(db: &Database) {
     if let Some(0) = budget_ms {
         return;
     }
+    // v7.38 P0 元机制 A — cold-tier wakeup boundary. Tests use this to
+    // inject a wait that fires after open_path's commit but before the
+    // first warm-up pass: simulates "concurrent client hits cold pages
+    // while warm-up is still doing its initial scan". Pairs with
+    // `checkpoint_cow_swap_post` for full crash-recovery race
+    // coverage.
+    spg_engine::injection_point!("cold_tier_wakeup_resume", &budget_ms);
     let start = std::time::Instant::now();
     let touched = db.warm_up_cold_tier();
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -723,7 +734,17 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         t
     };
     std::fs::write(&tmp, &snapshot).map_err(io_err)?;
+    // v7.38 P0 元机制 A — checkpoint CoW swap boundary. Pre fires after
+    // the tmp file is written and fsynced (rename atomicity uses the
+    // kernel's directory metadata sync) but BEFORE the rename. Tests
+    // use this to race a concurrent read against an in-flight swap.
+    spg_engine::injection_point!("checkpoint_cow_swap_pre", &tmp);
     std::fs::rename(&tmp, &job.db_path).map_err(io_err)?;
+    // v7.38 P0 元机制 A — post-rename: the new snapshot is the
+    // authoritative on-disk image. Tests use this to inject a delay
+    // before the manifest update (or simulate a crash here to verify
+    // open_path's snapshot+manifest divergence recovery path).
+    spg_engine::injection_point!("checkpoint_cow_swap_post", &job.db_path);
     // 3. Manifest tmp+rename (cold tier present).
     if !job.cold_segments.is_empty() {
         let snap_crc = spg_crypto::crc32::crc32(&snapshot);

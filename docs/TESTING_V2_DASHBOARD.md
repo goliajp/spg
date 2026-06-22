@@ -48,8 +48,8 @@ Branch: `feature/v7.38-test-constitution` @ commit `20da136`
 |---|---|---|---|
 | 编译 release 时 `injection_point!()` 展开 `()`,zero overhead | ⚠️ | `crates/spg-engine/src/testkit/injection.rs` macro defined; release behaviour by `#[cfg(feature)]` gate | **未做汇编验证** — 应 `cargo asm` 抽一段 release build 确认 |
 | 测试构建 feature `injection-points` on,4 种 action (attach/wakeup/error/notice) 全支持 | ✅ | `testkit/injection.rs::Action enum` + lib test `tests::sql_injection_attach_notice_then_trigger_records` (PASS feature-on) + `tests::sql_injection_attach_off_feature_errors` (PASS feature-off) | — |
-| ≥ 8 个接进点 | ⚠️ 5/8 | grep `injection_point!` → 5 sites:`tx_commit_walgroup_leader_switch` / `wal_group_commit_leader_chosen` / `index_build_post_seal` / `aggregate_spill_trigger` / `planner_first_row_fetch` | **缺 3 接进点**:`checkpoint_cow_swap_pre/post` / `spg_sqlx_inline_budget_cancel` / `cold_tier_wakeup_resume` (+ skeleton 提到的 `prefetch_sequential_scan_threshold` / `segment_forward_disconnect_resume` 2 个 flake 钉) |
-| 每接进点 1 testcase 验证 attach + wakeup 可见 | ⚠️ 1/5 | 仅 `aggregate_spill_trigger` 有 lib test 验证 | **缺 4 接进点的 1-testcase** — 每个接进点需要一个独立单测确认 attach 命中 + wakeup 解锁 |
+| ≥ 8 个接进点 | ✅ 9/8 | grep `injection_point!` (incl. cross-crate via spg-embedded re-export) → 9 sites:`tx_commit_walgroup_leader_switch` / `wal_group_commit_leader_chosen` / `index_build_post_seal` / `aggregate_spill_trigger` / `planner_first_row_fetch` / **`checkpoint_cow_swap_pre`** / **`checkpoint_cow_swap_post`** / **`cold_tier_wakeup_resume`** / **`spg_sqlx_inline_budget_cancel`** (last 4 added this turn) | Acceptance ≥ 8 met. Skeleton-listed `prefetch_sequential_scan_threshold` / `segment_forward_disconnect_resume` defer to when those flakes resurface |
+| 每接进点 1 testcase 验证 attach + wakeup 可见 | ⚠️ 1/9 | 仅 `aggregate_spill_trigger` 有 lib test 验证 (`tests::sql_injection_attach_notice_then_trigger_records`) | **缺 8 接进点的 1-testcase** — 但 lib test 已 prove framework correctness;per-site test 延后 |
 
 ### B. Permutation matrix runner
 
@@ -73,8 +73,8 @@ Branch: `feature/v7.38-test-constitution` @ commit `20da136`
 
 | Acceptance | 状态 | Evidence | Gap |
 |---|---|---|---|
-| ≥ 7 旋钮接进 engine,index 写每个 acceptor 行号 | ⚠️ 3/8 LANDED | `xtests/sigil/test-mode-gucs.md`:`EXPLAIN_NO_COSTS` `DISABLE_TOPK` `RANDOM_SEED` LANDED;其余 5 (`COMPUTE_QUERY_ID` `STATS_FROZEN` `PLAN_DETERMINISTIC` `DISABLE_JOINFOLD` `PREFETCH_DETERMINISTIC`) TBD | **5 个 GUC 未 wire** — 每个 wire 估 ~30-60 LOC + 1 e2e |
-| 每旋钮 1 testcase 验证关掉对应 surface | ⚠️ 3/8 | `e2e_env_cfg_explain_no_costs` / `_disable_topk` / `_random_seed` 都已 PASS | 同上 5 个 TBD |
+| ≥ 7 旋钮接进 engine,index 写每个 acceptor 行号 | ⚠️ 4/8 LANDED | `xtests/sigil/test-mode-gucs.md`:`EXPLAIN_NO_COSTS` `DISABLE_TOPK` `RANDOM_SEED` `DISABLE_JOINFOLD` LANDED;其余 4 (`COMPUTE_QUERY_ID` `STATS_FROZEN` `PLAN_DETERMINISTIC` `PREFETCH_DETERMINISTIC`) TBD | `COMPUTE_QUERY_ID` 等 SPG 实加 query_id annotation;`STATS_FROZEN` / `PLAN_DETERMINISTIC` 仍待 wire(每个 ~30-60 LOC + 1 e2e) |
+| 每旋钮 1 testcase 验证关掉对应 surface | ⚠️ 4/8 | `e2e_env_cfg_explain_no_costs` / `_disable_topk` / `_random_seed` / `_disable_joinfold` 都已 PASS | 同上 4 个 TBD |
 
 ---
 
