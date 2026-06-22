@@ -1640,6 +1640,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spg-oracle-runner"
+version = "7.37.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "spg-engine",
+ "walkdir",
+]
+
+[[package]]
 name = "spg-server"
 version = "7.37.6"
 dependencies = [

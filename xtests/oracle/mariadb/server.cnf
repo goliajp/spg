@@ -1,0 +1,10 @@
+# MariaDB 11 oracle config — fast test mode + bin collation.
+# Mirrors mysql/my.cnf so both engines diverge only where their
+# behaviour really diverges, not on incidental config.
+
+[mariadb]
+innodb_flush_log_at_trx_commit = 0
+innodb_flush_method            = nosync
+sql_mode                       = STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION
+character_set_server           = utf8mb4
+collation_server               = utf8mb4_bin
