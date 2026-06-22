@@ -1004,11 +1004,24 @@ fn replay_wal_filtered(
 ) -> Result<usize, String> {
     let records = parse_wal_records(wal_bytes)?;
     let mut applied = 0usize;
+    // v7.37.7 A.1 — per-record-type timing histogram gated on env var.
+    // Records mailrs prod snapshot's WAL has ~thousands of WAL_V5_ROW_REDO
+    // entries; v7.37.5 ack claimed batched apply_redo brought replay to
+    // ~500ms but fresh-extract measurement shows ~250s. This histogram
+    // splits ROW_REDO vs SQL re-execute time so the fix target is concrete.
+    let timing = std::env::var_os("SPG_OPEN_PATH_TIMING").is_some();
+    let mut redo_count = 0u64;
+    let mut redo_us = 0u128;
+    let mut sql_count = 0u64;
+    let mut sql_us = 0u128;
+    let mut marker_count = 0u64;
+    let mut skip_count = 0u64;
     for r in &records {
         // Skip markers + non-SQL records.
         if r.type_byte == WAL_V3_TYPE_DURABILITY_CHECKPOINT
             || r.type_byte == WAL_V4_TYPE_CHECKPOINT_MARKER
         {
+            marker_count += 1;
             continue;
         }
         // v4 SQL records carry an LSN. Apply iff strictly above
@@ -1019,6 +1032,7 @@ fn replay_wal_filtered(
         {
             if let Some(lsn) = r.commit_lsn {
                 if lsn <= floor_lsn {
+                    skip_count += 1;
                     continue;
                 }
             }
@@ -1029,11 +1043,14 @@ fn replay_wal_filtered(
         // hung the mailrs P0). The payload is `encode_redo_log` bytes, not
         // SQL, so it never enters the from_utf8 / split_statements path.
         if r.type_byte == WAL_V5_TYPE_ROW_REDO {
+            let t = std::time::Instant::now();
             let changes = spg_storage::decode_redo_log(r.sql)
                 .map_err(|e| format!("redo decode at offset {}: {e:?}", r.offset))?;
             engine
                 .apply_redo(&changes)
                 .map_err(|e| format!("redo apply at offset {}: {e:?}", r.offset))?;
+            redo_us += t.elapsed().as_micros();
+            redo_count += 1;
             applied += 1;
             continue;
         }
@@ -1056,6 +1073,7 @@ fn replay_wal_filtered(
         // applying: the bricking class is a no-op-at-runtime
         // statement that re-applies non-idempotently, and skipping
         // just it reconstructs the runtime state.
+        let t = std::time::Instant::now();
         for stmt in split_statements(sql) {
             if let Err(e) = engine.execute(stmt) {
                 quarantine.push(QuarantinedStmt {
@@ -1065,7 +1083,22 @@ fn replay_wal_filtered(
                 });
             }
         }
+        sql_us += t.elapsed().as_micros();
+        sql_count += 1;
         applied += 1;
+    }
+    if timing {
+        eprintln!(
+            "[replay_wal_filtered] total_records={} applied={} redo={} ({:.3}s) sql={} ({:.3}s) marker={} skip_lsn={}",
+            records.len(),
+            applied,
+            redo_count,
+            redo_us as f64 / 1_000_000.0,
+            sql_count,
+            sql_us as f64 / 1_000_000.0,
+            marker_count,
+            skip_count,
+        );
     }
     Ok(applied)
 }
@@ -1834,7 +1867,28 @@ impl Database {
     /// WAL — operators that need a sync barrier at a specific
     /// point use `checkpoint()` explicitly.
     pub fn open_path(db_path: impl AsRef<Path>) -> Result<Self, EngineError> {
+        // v7.37.7 A.1 — per-stage timing gated on env var SPG_OPEN_PATH_TIMING.
+        // v7.37.5 ack reported `open_path 27min→646ms` after the WAL-replay
+        // fix, but fresh-tarball benchmarks showed ~250 s — strong evidence
+        // the ack number was on a warm OS page cache. These prints surface
+        // where the time actually goes per Database::open_path call. Zero
+        // cost when env unset (one syscall + branch per stage).
+        let timing = std::env::var_os("SPG_OPEN_PATH_TIMING").is_some();
+        let timing_start = std::time::Instant::now();
+        let mut last_stage = timing_start;
+        let mut stage = |name: &str, last: &mut std::time::Instant| {
+            if timing {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[open_path/{name}] +{:.3}s (total {:.3}s)",
+                    now.duration_since(*last).as_secs_f64(),
+                    now.duration_since(timing_start).as_secs_f64()
+                );
+                *last = now;
+            }
+        };
         let db_path = db_path.as_ref().to_path_buf();
+        stage("entry", &mut last_stage);
         // v7.19 — WAL is a directory of chunk files. Legacy
         // single-file path stays variable-named `wal_path` for
         // the backward-compat migration block below.
@@ -1883,14 +1937,17 @@ impl Database {
         // docs for why on-disk identity alone wasn't enough.
         let lock_registry_guard = LockRegistryGuard::try_acquire(&lock_path)?;
         acquire_path_lock(&lock_path)?;
+        stage("locks", &mut last_stage);
         let mut engine = if db_path.exists() {
             let bytes = std::fs::read(&db_path).map_err(io_err)?;
+            stage("fs::read_catalog", &mut last_stage);
             let engine = Engine::restore_envelope(&bytes).map_err(|e| {
                 EngineError::Storage(spg_storage::StorageError::Corrupt(format!(
                     "restore from {}: {e}",
                     db_path.display()
                 )))
             })?;
+            stage("restore_envelope", &mut last_stage);
             engine_with_query_byte_budget(engine.with_clock(wall_clock_micros))
         } else {
             engine_with_query_byte_budget(Engine::new().with_clock(wall_clock_micros))
@@ -1961,7 +2018,9 @@ impl Database {
         // checkpoint wrote its manifest). The segment binary's own
         // magic + CRC32 guards integrity — no need to trust a stale
         // manifest entry to trust the file.
+        stage("manifest+cold_segments", &mut last_stage);
         scan_cold_segments_dir(&cold_segments_dir, &mut engine, &mut cold_segment_paths);
+        stage("scan_cold_segments_dir", &mut last_stage);
         // v7.19 — chunked WAL on-disk layout.
         //
         // Three cases handled here:
@@ -2010,6 +2069,7 @@ impl Database {
         // is 0 and every record applies — exactly the v7.18
         // behaviour the migration is supposed to preserve.
         let chunk_paths = sorted_wal_chunks(&wal_dir).map_err(io_err)?;
+        stage("wal::sorted_chunks", &mut last_stage);
         let mut snapshot_lsn: u64 = 0;
         for chunk in &chunk_paths {
             let bytes = std::fs::read(chunk).map_err(io_err)?;
@@ -2025,6 +2085,7 @@ impl Database {
                 }
             }
         }
+        stage("wal::snapshot_lsn_scan", &mut last_stage);
         let mut quarantined: Vec<QuarantinedStmt> = Vec::new();
         for chunk in &chunk_paths {
             let bytes = std::fs::read(chunk).map_err(io_err)?;
@@ -2041,6 +2102,7 @@ impl Database {
                 }
             }
         }
+        stage("wal::replay_filtered", &mut last_stage);
         // v7.30.1 (mailrs round-24 ask 2) — replay rejects no longer
         // brick the open. Persist the rejected statements beside the
         // WAL chunks for forensics and say so loudly; the boot
@@ -2174,7 +2236,9 @@ impl Database {
         // `SPG_WARM_UP_COLD_BUDGET_MS` (default unset = no cap;
         // env-only spec channel, never a client-visible API). `0` =
         // skip warm-up entirely (escape hatch for fast restart).
+        stage("pre_autowarm", &mut last_stage);
         autowarm_cold_tier_on_open(&db);
+        stage("autowarm", &mut last_stage);
         Ok(db)
     }
 
