@@ -32,11 +32,11 @@ Branch: `feature/v7.38-test-constitution` @ commit `20da136`
 | 速度预算 4 项 | 0 | 2 | 2 | 25% |
 | Ship gate 8 项 | 1 | 2 | 5 | 19% |
 
-**最大缺口**(按学术 TDD 杠杆排序):
-1. **元机制 C 三主差分 oracle 完全是 stub**(`run_on_spg` / `run_on_oracle` / `self_diff` 全 return Error)— 没它,**所有 SQL 兼容性测试只是 self-consistency,不是 conformance**。
+**最大缺口**(按学术 TDD 杠杆排序;2026-06-23 更新):
+1. ~~**元机制 C 三主差分 oracle 完全是 stub**~~ ✅ **CLOSED 本 turn**(`run_on_spg` 实装 + 3/3 oracle fixture PASS 100% vs PG18 baseline + R32 closed)。剩 MySQL/MariaDB sqlx adapter 没建,但 PG18 已经从 self-consistency 升级到 conformance。**oracle corpus 4 fixtures 真小** — 下一步 port 多 fixture 才能让 PG18 conformance 形成体量。
 2. **轴 4 隔离 / 并发 整轴未起步** — Hermitage / Elle / PG isolationtester 全 0。这是数据库 TDD 的核心轴,缺它 = 没有 anomaly detection。
 3. **工艺纪律 10/10 几乎全空** — 现有测试不走 100×rerun / check-testcase / iter-OOM / 三模式同输出 / adjust_*() 五大学术 TDD 基础设施。
-4. **历史 regression 归属(纪律 #4)**:R32/R33/R34/round-NN.slt **全部未入 corpus**。下一次 cascade 再发,我们仍没法机械 detect。
+4. **历史 regression 归属(纪律 #4)**:R32/R33/R34/round-NN.slt **全部未入 corpus**(注意:R32 在 oracle 单 fixture 里已被 anchor,sqllogictest corpus 里仍无 round-32.slt 归属)。下一次 cascade 再发,我们仍没法机械 detect。
 
 ---
 
@@ -58,16 +58,16 @@ Branch: `feature/v7.38-test-constitution` @ commit `20da136`
 | 一份 sqllogictest corpus N× 跑(N = permutation 数)全绿 | ⚠️ 1/3 | `xtests/perm-runner/src/runner.rs::run_one_fixture_embedded` 实现;`server_simple` / `server_extended` permutation 返回 `PermStatus::SkippedPending` | **缺 server 桥** — `xtests/perm-runner/src/runner.rs` `run_one_fixture_server_*` 全是 stub。需要桥到 `spg-server` 二进制 + sqlx |
 | TOML 配置接进 CI,新增 permutation 无 code change | ⚠️ | TOML schema 已定义 `tests/permutations.toml`(从 plan + skeleton 引用) | **未接进 `gate.sh`**;dev 跑 corpus 默认走 `cargo run --bin sqllogictest`(不走 perm-runner) |
 
-### C. 三主差分 oracle ⚠️⚠️⚠️ MOST-LEVERAGED GAP
+### C. 三主差分 oracle
 
 | Acceptance | 状态 | Evidence | Gap |
 |---|---|---|---|
-| PG18 oracle 跑通(docker-compose),≥ 80% port | ❌ | `xtests/oracle/docker-compose.yml` 文件存在,4 个 fixture(port × 2 + orig × 1 + depd × 1);`run_on_spg` 返回 `stub error`;`run_on_oracle` 返回 `stub error` | **完全 unwired** — `xtests/oracle/src/runner.rs:140` `fn run_on_spg(_fixture: &Path) -> Result<String> { Err(anyhow!("run_on_spg: stub")) }`,line 152 同 |
-| MySQL oracle 跑通 | ❌ | docker-compose 含 MySQL service | 同上(sqlx adapter 未建) |
+| PG18 oracle 跑通,≥ 80% port | ⚠️ 3/3 currently | `cargo run --bin spg-oracle-runner -- run --oracle pg18` → **3/3 fixtures 100% PASS**(commit `[本 turn]`);`run_on_spg` 实装 in `xtests/oracle/src/runner.rs::run_on_spg` (Engine + psql-aligned format + depd directive resolver) | 80% port 目标按 PG regress 文件数计,当前 oracle corpus 只 3 fixtures;**需大规模 port 才能达 80%** |
+| MySQL oracle 跑通 | ❌ | docker-compose 含 MySQL service | sqlx-mysql adapter 未建(`run_on_oracle` 仍 stub for MySQL/MariaDB) |
 | MariaDB oracle 跑通 | ❌ | docker-compose 含 MariaDB service | 同上 |
-| R32 历史 regression 进 `port.subquery_correlated_agg.spg.out` 标 EXPECTED FAILURE,修后退步立刻被捕 | ❌ | 4 fixture 中含 `port.subquery_correlated_agg.sql` 但 `expected/` 仅有 `pg.out`,**无 spg.out + 无 EXPECTED FAILURE marker** | R32 EXPECTED FAILURE 机制未建 |
-| adjust_*() 归一化框架 | ❌ | `xtests/oracle/src/normalise.rs` 文件存在;内容 = stub | 未实现 |
-| self-diff(fast-tier 替代,跨 SPG 3 perm 自洽) | ❌ | `xtests/oracle/src/self_diff.rs::run` 返回 `Err("self-diff: stub — depends on v7.38 元机制 B...")` | 元机制 B 已加 lib(commit `d9d1ed8`)— **lib 已暴露 `run_permutation`,self-diff 现在可以 wire 了**(本 turn 候选 next move) |
+| R32 历史 regression 进 `port.subquery_correlated_agg.spg.out` 标 EXPECTED FAILURE,修后退步立刻被捕 | ✅ **CLOSED** | R32 EXPECTED FAILURE lock **DELETED 本 turn** — SPG output 实测 byte-equal 对 PG18 baseline after AdjustWhitespace;`port.subquery_correlated_agg.sql` 现 enforce PG baseline 直接 | R32 closed; outer-agg correlated subq dialect 在 v7.37.x 周期(K02 fix + planner work)悄悄修好了 — dashboard 触发的 audit 第一次正式 detect 这点 |
+| adjust_*() 归一化框架 | ⚠️ 2/8 working | `xtests/oracle/src/normalise.rs::AdjustWhitespace` + `AdjustOrderingViaSort` 实现并被实际差分用上;其他 6 step (`timestamps` / `seqs` / `dollar-quoted` / `explain-costs` / `float-repr` / `null-display`) 仍 stub | 6 step 等真 corpus 触碰才补 |
+| self-diff(fast-tier 替代,跨 SPG 3 perm 自洽) | ❌ | `xtests/oracle/src/self_diff.rs::run` 仍返回 `Err("self-diff: stub — depends on v7.38 元机制 B...")` | 元机制 B lib 已 expose(commit `d9d1ed8`);next move = wire self-diff to call `perm-runner::run_permutation` |
 
 ### D. 测试模式 GUC
 
