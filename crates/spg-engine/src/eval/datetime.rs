@@ -183,10 +183,22 @@ pub(super) fn age(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> 
     let delta = a.checked_sub(b).ok_or(EvalError::TypeMismatch {
         detail: "age() subtraction overflows i64 microseconds".into(),
     })?;
+    // v7.38 P1 (轴 1 pg_regress closure) — PG canonical AGE output
+    // splits whole days out of the microsecond residue so
+    // `AGE('2024-03-01'::TIMESTAMP, '2024-01-01'::TIMESTAMP)` reads
+    // `60 days` (not `1440:00:00`). Truncate toward zero so the day
+    // component carries delta's sign and micros retains the same sign
+    // — matches PG's interval normalisation for symmetric AGE diffs.
+    const US_PER_DAY: i64 = 86_400_000_000;
+    let days_i64 = delta / US_PER_DAY;
+    let micros = delta % US_PER_DAY;
+    let days = i32::try_from(days_i64).map_err(|_| EvalError::TypeMismatch {
+        detail: "age() day count exceeds i32".into(),
+    })?;
     Ok(Value::Interval {
         months: 0,
-        days: 0,
-        micros: delta,
+        days,
+        micros,
     })
 }
 
