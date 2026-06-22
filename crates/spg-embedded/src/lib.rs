@@ -250,17 +250,25 @@ const WAL_V5_TYPE_ROW_REDO: u8 = 0x13;
 /// this many bytes, the next successful `execute()` call ends
 /// with a `checkpoint()` so the WAL stays bounded. Tunable via
 /// `SPG_EMBEDDED_CHECKPOINT_BYTES` env.
-/// v7.34 (crash-recovery P0 #2) — opt-in row-level redo WAL records.
-/// Default OFF during bringup; `SPG_WAL_ROW_REDO=1` makes mutating
-/// statements log physical changes (0x13) instead of SQL, so crash
-/// recovery applies them in O(changed rows) rather than re-executing in
-/// O(records × catalog_rows) (the superlinear replay hang root-caused on
-/// the mailrs P0). DDL still logs as SQL (hybrid log). When this returns
-/// true, `open_path` arms the engine's redo capture.
+/// v7.37.8 — **default ON**. v7.34 introduced row-level redo (0x13
+/// records, replayed via `apply_redo` in O(changed rows) instead of
+/// re-executing SQL in O(records × catalog_rows)). It shipped opt-in
+/// (`SPG_WAL_ROW_REDO=1`) "during bringup", but the only meaningful
+/// prod consumer (mailrs) never had a path to set the env var (per
+/// the dogfood "zero mailrs change" contract). The result was 4
+/// recurrences of crash-recovery lock-hang between v7.37.5 and
+/// v7.37.7 — every restart paid the V4 SQL replay tax. v7.37.8
+/// flips the default ON so an `spg-X.Y.Z` upgrade alone delivers
+/// the fix; `SPG_WAL_ROW_REDO=0` remains available as an explicit
+/// operator opt-out for any caller that needs the legacy V4 SQL
+/// path (e.g. for forensics / downgrade prep). DDL still logs as
+/// SQL (hybrid log) on both sides. When this returns true,
+/// `open_path` arms the engine's redo capture.
 fn row_redo_enabled() -> bool {
-    std::env::var("SPG_WAL_ROW_REDO")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("SPG_WAL_ROW_REDO").ok() {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Some(_) | None => true,
+    }
 }
 
 fn default_checkpoint_threshold_bytes() -> u64 {
@@ -1003,7 +1011,20 @@ fn replay_wal_filtered(
     quarantine: &mut Vec<QuarantinedStmt>,
 ) -> Result<usize, String> {
     let records = parse_wal_records(wal_bytes)?;
+    let total_records = records.len();
     let mut applied = 0usize;
+    // v7.37.8 — periodic heartbeat. Operators / mailrs see in the
+    // container log that replay is making progress (or, if no line
+    // appears for 30+ s, that it isn't). The `SPG_REPLAY_HEARTBEAT_MS`
+    // env var tunes the cadence; 0 disables. Default 5 s — frequent
+    // enough that mailrs's 15 s pool retries see at least one beat,
+    // sparse enough not to flood normal startup logs.
+    let heartbeat_ms = std::env::var("SPG_REPLAY_HEARTBEAT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let mut last_beat = std::time::Instant::now();
+    let replay_started = last_beat;
     // v7.37.7 A.1 — per-record-type timing histogram gated on env var.
     // Records mailrs prod snapshot's WAL has ~thousands of WAL_V5_ROW_REDO
     // entries; v7.37.5 ack claimed batched apply_redo brought replay to
@@ -1052,6 +1073,19 @@ fn replay_wal_filtered(
             redo_us += t.elapsed().as_micros();
             redo_count += 1;
             applied += 1;
+            // v7.37.8 — emit heartbeat (operator visibility — see
+            // CHANGELOG v7.37.8).
+            if heartbeat_ms > 0
+                && last_beat.elapsed().as_millis() as u64 >= heartbeat_ms
+            {
+                eprintln!(
+                    "[spg replay heartbeat] applied={applied}/{total_records} \
+                     ({:.1}%, elapsed {:.1}s)",
+                    100.0 * applied as f64 / total_records.max(1) as f64,
+                    replay_started.elapsed().as_secs_f64()
+                );
+                last_beat = std::time::Instant::now();
+            }
             continue;
         }
         // v3 records (type 0x01, no LSN) always apply — the
@@ -1086,6 +1120,18 @@ fn replay_wal_filtered(
         sql_us += t.elapsed().as_micros();
         sql_count += 1;
         applied += 1;
+        // v7.37.8 — emit heartbeat. Duplicated against the V5
+        // ROW_REDO branch above; kept duplicated rather than
+        // factored so the hot loop stays readable.
+        if heartbeat_ms > 0 && last_beat.elapsed().as_millis() as u64 >= heartbeat_ms {
+            eprintln!(
+                "[spg replay heartbeat] applied={applied}/{total_records} \
+                 ({:.1}%, elapsed {:.1}s)",
+                100.0 * applied as f64 / total_records.max(1) as f64,
+                replay_started.elapsed().as_secs_f64()
+            );
+            last_beat = std::time::Instant::now();
+        }
     }
     if timing {
         eprintln!(
@@ -3452,22 +3498,48 @@ pub fn revert_wal_to_seq(
     } else {
         std::fs::read(path).map_err(io_err)?
     };
+    // v7.37.8 — switched from `decode_wal_record` (V1-V3 SQL-only) to
+    // `parse_wal_records` + per-type dispatch, mirroring
+    // `replay_wal_filtered`. The pre-v7.37.8 path silently mis-parsed
+    // V4/V5 framed records as "truncated" because their length
+    // headers carry the V2_SENTINEL / V3_FLAG bits that
+    // `decode_wal_record`'s legacy header-decode never strips. v7.37.8
+    // flips `SPG_WAL_ROW_REDO` default ON, so freshly written WALs
+    // are V5 ROW_REDO; the PITR utility must understand them too.
     let mut engine = Engine::new();
     let mut applied = 0u64;
-    let mut cur = 0usize;
-    while cur < wal_bytes.len() && applied < to_seq {
-        let (sql_bytes, total) = decode_wal_record(&wal_bytes[cur..])?;
-        cur += total;
-        if sql_bytes.is_empty() {
+    let records = parse_wal_records(&wal_bytes).map_err(|m| {
+        EngineError::Storage(spg_storage::StorageError::Corrupt(m))
+    })?;
+    for r in &records {
+        if applied >= to_seq {
+            break;
+        }
+        // Markers don't count toward the seq budget — they're metadata.
+        if r.type_byte == WAL_V3_TYPE_DURABILITY_CHECKPOINT
+            || r.type_byte == WAL_V4_TYPE_CHECKPOINT_MARKER
+        {
             continue;
         }
-        let sql = core::str::from_utf8(&sql_bytes).map_err(|e| {
+        if r.type_byte == WAL_V5_TYPE_ROW_REDO {
+            let changes = spg_storage::decode_redo_log(r.sql).map_err(|e| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(format!(
+                    "PITR: redo decode at offset {}: {e:?}",
+                    r.offset
+                )))
+            })?;
+            engine.apply_redo(&changes)?;
+            applied += 1;
+            continue;
+        }
+        // V1-V3 (legacy SQL) and V4 AUTO_COMMIT_SQL / TX_COMMIT_SQL —
+        // re-execute the SQL payload.
+        let sql = core::str::from_utf8(r.sql).map_err(|e| {
             EngineError::Storage(spg_storage::StorageError::Corrupt(format!(
-                "WAL record at offset {cur}: non-UTF-8 SQL: {e}"
+                "PITR: WAL record at offset {}: non-UTF-8 SQL: {e}",
+                r.offset
             )))
         })?;
-        // v7.21 — tx-commit records carry a multi-statement script;
-        // split_statements is a no-op for single-statement records.
         for stmt in split_statements(sql) {
             engine.execute(stmt)?;
         }
@@ -3981,9 +4053,8 @@ fn active_open_paths() -> &'static std::sync::Mutex<std::collections::HashSet<Pa
 /// present — that's the v7.37.5 honest refusal for a sibling
 /// in-flight `Database::open_path` on the same path. Carried by
 /// `Database` for the live duration of the handle so concurrent
-/// open attempts (sqlx pool retries, mailrs `force_unlock` +
-/// re-open dance) see the registration even while the prior
-/// open's `spawn_blocking` task is still in WAL replay.
+/// open attempts see the registration even while the prior open's
+/// `spawn_blocking` task is still in WAL replay.
 #[derive(Debug)]
 pub(crate) struct LockRegistryGuard {
     path: PathBuf,
