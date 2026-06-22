@@ -593,7 +593,14 @@ pub(crate) fn alias_referenced_strictly_elsewhere(
     false
 }
 
-fn expr_references_alias(e: &Expr, alias: &str) -> bool {
+/// True if `e` mentions `alias.col` anywhere or contains a Subquery/
+/// Unknown node we conservatively treat as referencing everything.
+///
+/// Visibility: `pub(crate)` since v7.37.6 — `join.rs::
+/// try_streamed_inner_join_walk_topn` reuses this to classify outer-only
+/// vs cross-alias WHERE conjuncts and short-circuit before materialising
+/// the combined join row.
+pub(crate) fn expr_references_alias(e: &Expr, alias: &str) -> bool {
     let mut hit = false;
     walk_expr(e, &mut |item| match item {
         WalkItem::Column(c) => {
@@ -607,7 +614,10 @@ fn expr_references_alias(e: &Expr, alias: &str) -> bool {
     hit
 }
 
-fn expr_references_any_other_alias(e: &Expr, alias: &str) -> bool {
+/// True if `e` mentions an alias other than `alias`, OR contains a
+/// Subquery/Unknown node we conservatively treat as referencing
+/// everything. v7.37.6: promoted to `pub(crate)` for join.rs reuse.
+pub(crate) fn expr_references_any_other_alias(e: &Expr, alias: &str) -> bool {
     let mut other = false;
     walk_expr(e, &mut |item| match item {
         WalkItem::Column(c) => {

@@ -2041,6 +2041,51 @@ impl Engine {
         let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
         let mut where_memo = memoize::MemoizeCache::default();
         let mut plain_sink: Vec<Row<'static>> = Vec::with_capacity(keep.min(1024));
+        // v7.37.6 (mailrs content_worker — Attack #2 from
+        // `v7.37.5-content-worker-prod-decomposition.md`): pre-split
+        // the WHERE predicate into conjuncts that reference only the
+        // outer (`primary_alias`) and conjuncts that touch the peer
+        // alias (mixed). Outer-only conjuncts can be evaluated against
+        // `left` BEFORE we materialise `combined_vals`, which lets the
+        // 25 k-iter content_worker hot path skip the 12-cell per-row
+        // clone when the InList probe (`m.id NOT IN`) misses — which it
+        // does on > 99 % of rows in the prod snapshot.
+        //
+        // We also split the ON residual the same way so a `mb.foo = …`
+        // predicate that's been mis-folded into the residual still goes
+        // through the slow combined-row path, and an `m.foo = …` one
+        // gates before the materialise.
+        //
+        // Implementation notes:
+        // - We allocate the split once per query (the walker iterates,
+        //   the split does not).
+        // - Outer-only conjuncts evaluate against
+        //   `&combined_schema[..left_arity]` paired with `left`, so the
+        //   column resolver indices match the way they would on the
+        //   combined row (positions 0..left_arity are identical).
+        // - The full WHERE still re-runs on the post-materialise path
+        //   only for the conjuncts the split could not classify as
+        //   outer-only (this keeps the semantics identical even when an
+        //   unknown / subquery node is present; `expr_references_alias`
+        //   is conservative).
+        let outer_schema: &[ColumnSchema] = &combined_schema[..left_arity];
+        let outer_ctx = EvalContext::new(outer_schema, None);
+        let where_conjuncts: Vec<&Expr> = stmt
+            .where_
+            .as_ref()
+            .map(|w| reorder::split_and_conjunctions(w))
+            .unwrap_or_default();
+        let (where_outer_only, where_mixed): (Vec<&Expr>, Vec<&Expr>) =
+            where_conjuncts.iter().copied().partition(|e| {
+                crate::joinfold::expr_references_alias(e, &primary_alias)
+                    && !crate::joinfold::expr_references_any_other_alias(e, &primary_alias)
+            });
+        let (residual_outer_only, residual_mixed): (Vec<&Expr>, Vec<&Expr>) =
+            residual.iter().copied().partition(|e| {
+                crate::joinfold::expr_references_alias(e, &primary_alias)
+                    && !crate::joinfold::expr_references_any_other_alias(e, &primary_alias)
+            });
+        let mut outer_memo = memoize::MemoizeCache::default();
         // Walker drive: walk primary via btree index in ORDER BY
         // direction. Rows arrive already sorted; plain_sink + early
         // stop replaces the heap.
@@ -2099,6 +2144,46 @@ impl Engine {
                 let Some(cands) = htable.get(&aggregate::encode_key(&keybuf)) else {
                     continue;
                 };
+                // v7.37.6 — gate the outer-only WHERE conjuncts +
+                // outer-only ON residual on `left` before we ever clone
+                // into `combined_vals`. content_worker's `m.size > 0
+                // AND m.id NOT IN (…25 k…)` is outer-only on `m.*`; if
+                // the InList probe misses (>99 %), we skip the 12-cell
+                // clone + extend + Row::new + budget charge for every
+                // peer candidate this outer row hashed to.
+                let mut outer_ok = true;
+                for r in &residual_outer_only {
+                    let cond = self.eval_expr_with_correlated(
+                        r,
+                        left,
+                        &outer_ctx,
+                        cancel,
+                        None,
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        outer_ok = false;
+                        break;
+                    }
+                }
+                if !outer_ok {
+                    continue;
+                }
+                for w in &where_outer_only {
+                    let cond = self.eval_expr_with_correlated(
+                        w,
+                        left,
+                        &outer_ctx,
+                        cancel,
+                        Some(&mut outer_memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        outer_ok = false;
+                        break;
+                    }
+                }
+                if !outer_ok {
+                    continue;
+                }
                 for &ri in cands {
                     let right = &peer_rows[ri];
                     let mut combined_vals: Vec<Value<'static>> =
@@ -2113,7 +2198,7 @@ impl Engine {
                     combined_vals.extend(right.values.iter().cloned());
                     let combined = Row::new(combined_vals);
                     let mut ok = true;
-                    for r in &residual {
+                    for r in &residual_mixed {
                         let cond =
                             self.eval_expr_with_correlated(r, &combined, &ctx, cancel, None)?;
                         if !matches!(cond, Value::Bool(true)) {
@@ -2124,7 +2209,7 @@ impl Engine {
                     if !ok {
                         continue;
                     }
-                    if let Some(w) = stmt.where_.as_ref() {
+                    for w in &where_mixed {
                         let cond = self.eval_expr_with_correlated(
                             w,
                             &combined,
@@ -2133,8 +2218,12 @@ impl Engine {
                             Some(&mut where_memo),
                         )?;
                         if !matches!(cond, Value::Bool(true)) {
-                            continue;
+                            ok = false;
+                            break;
                         }
+                    }
+                    if !ok {
+                        continue;
                     }
                     budget.charge(approx_row_bytes(&combined))?;
                     plain_sink.push(combined);
