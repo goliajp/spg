@@ -770,9 +770,16 @@ impl Parser {
                         let table = self.expect_ident_like()?;
                         Ok(Statement::ShowColumns(table))
                     }
-                    other => Err(self.err(format!(
-                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS, USERS, PUBLICATIONS"
-                    ))),
+                    // v7.38 轴 4 surface — `SHOW <param>` for any
+                    // remaining session / preset parameter name
+                    // (server_version, search_path, client_encoding,
+                    // …). The engine's ShowParameter handler does the
+                    // dispatch; unrecognised names error there with
+                    // a pointer to pg_settings, not at parse time —
+                    // so a driver that issues `SHOW spam_setting`
+                    // gets a clear runtime error instead of a
+                    // confusing "unknown SHOW target".
+                    other => Ok(Statement::ShowParameter(other.to_string())),
                 }
             }
             // v6.1.2: `DROP` is now a reserved keyword (it dispatches

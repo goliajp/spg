@@ -18,7 +18,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/08_partition` | 0 | 0 | 0 | 0.0% |
 | `spg_baseline/09_indexes` | 26 | 0 | 0 | 100.0% |
 | `spg_baseline/10_constraints` | 30 | 0 | 0 | 100.0% |
-| `spg_baseline/11_dialect` | 37 | 0 | 0 | 100.0% |
+| `spg_baseline/11_dialect` | 53 | 0 | 0 | 100.0% |
 | `spg_baseline/12_explain` | 9 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 27 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
@@ -320,6 +320,7 @@ Per-corpus pass / fail / skip:
 | `pg_like_ilike.test` | 6 | 0 | 0 |
 | `pg_returning.test` | 2 | 0 | 0 |
 | `pg_sequence.test` | 4 | 0 | 0 |
+| `pg_show_session_params.test` | 16 | 0 | 0 |
 | `pg_string_funcs.test` | 5 | 0 | 0 |
 
 ### `spg_baseline/12_explain/`
