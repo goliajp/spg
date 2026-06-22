@@ -133,15 +133,241 @@ fn run_one(
     Ok(())
 }
 
+/// Dump the canonicalised SPG output for a single fixture. Public
+/// entry for the `Cmd::Dump` subcommand. Useful when filling an
+/// EXPECTED FAILURE lock or bisecting an `adjust_*()` pipeline diff.
+pub fn dump_spg(fixture: &Path) -> Result<String> {
+    run_on_spg(fixture)
+}
+
 /// Execute a fixture on SPG using the embedded path.
 ///
-/// **Stub.** v7.38 C ships the call shape; P1 wires it to
-/// `spg-engine::Engine::execute` + result-set serialiser.
-fn run_on_spg(_fixture: &Path) -> Result<String> {
-    Err(anyhow!(
-        "run_on_spg: stub — wire spg-engine embedded path during \
-         v7.38 P1 fill (see design §6.1 step 2)"
-    ))
+/// **v7.38 P1**: lifted out of stub. Build a fresh `Engine`, resolve
+/// any `-- oracle: depends depd.X` directives by sourcing the matching
+/// `depd.X.sql` from the same corpus dir, then run the fixture's SQL
+/// statement-by-statement. Result rows from every SELECT are rendered
+/// in the psql-aligned shape (`col1 | col2 \n----+---- \n val1 | val2`)
+/// so the existing `AdjustWhitespace` pipeline step collapses any padding
+/// differences against the PG oracle baseline.
+fn run_on_spg(fixture: &Path) -> Result<String> {
+    use spg_engine::{Engine, QueryResult};
+
+    // Resolve depd.* fixtures referenced via `-- oracle: depends X` in
+    // the fixture header. The directive is recognised by the runner
+    // only — not the SPG parser (which sees it as a comment and skips).
+    let body = std::fs::read_to_string(fixture)
+        .with_context(|| format!("read fixture {}", fixture.display()))?;
+    let corpus_dir = fixture
+        .parent()
+        .ok_or_else(|| anyhow!("fixture {} has no parent dir", fixture.display()))?;
+
+    let mut engine = Engine::new();
+    for depd in scan_depd_directives(&body) {
+        let depd_path = corpus_dir.join(format!("{depd}.sql"));
+        let depd_body = std::fs::read_to_string(&depd_path)
+            .with_context(|| format!("read depd {}", depd_path.display()))?;
+        for stmt in split_sql_statements(&depd_body) {
+            engine
+                .execute(&stmt)
+                .map_err(|e| anyhow!("depd {depd}: {e:?} (sql: {stmt})"))?;
+        }
+    }
+
+    // Execute fixture body, capture every Rows result as a psql-style
+    // table block; CommandOk results contribute nothing to the diff
+    // (they're DDL/DML side-effects with no oracle visible output).
+    let mut out_blocks: Vec<String> = Vec::new();
+    for stmt in split_sql_statements(&body) {
+        let stmt_trim = stmt.trim();
+        if stmt_trim.is_empty() {
+            continue;
+        }
+        let r = engine.execute(&stmt).map_err(|e| {
+            anyhow!(
+                "SPG embedded execute failed on {}: {e:?}\nsql: {stmt}",
+                fixture.display()
+            )
+        })?;
+        if let QueryResult::Rows { columns, rows } = r {
+            out_blocks.push(format_rows_psql_aligned(&columns, &rows));
+        }
+    }
+    Ok(out_blocks.join("\n\n"))
+}
+
+/// Scan a fixture body for `-- oracle: depends <name>` directives.
+/// Directive lines look like `-- oracle: depends depd.setup_users`
+/// (case-sensitive prefix `-- oracle: depends `). Order preserved so
+/// dependent fixtures source in declared sequence.
+fn scan_depd_directives(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            t.strip_prefix("-- oracle: depends ")
+                .map(|name| name.trim().to_string())
+        })
+        .collect()
+}
+
+/// Split a SQL body into statement strings on top-level `;`. Tracks
+/// single-quote, double-quote, and `--` line-comment / `/* */` block-
+/// comment state so semicolons inside strings or comments don't break
+/// statements. The split is intentionally simple — the corpus is
+/// hand-authored and avoids dollar-quoted bodies for now.
+fn split_sql_statements(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = body.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            cur.push(c);
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            cur.push(c);
+            if c == '*' && chars.peek() == Some(&'/') {
+                cur.push(chars.next().unwrap());
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_single {
+            cur.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    // '' escape — consume both, stay inside the string
+                    cur.push(chars.next().unwrap());
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if in_double {
+            cur.push(c);
+            if c == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                cur.push(c);
+                in_single = true;
+            }
+            '"' => {
+                cur.push(c);
+                in_double = true;
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                cur.push(c);
+                cur.push(chars.next().unwrap());
+                in_line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                cur.push(c);
+                cur.push(chars.next().unwrap());
+                in_block_comment = true;
+            }
+            ';' => {
+                let trimmed = cur.trim().to_string();
+                if !trimmed.is_empty() {
+                    out.push(trimmed);
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Render rows in a psql `\pset format aligned` shape. The runner's
+/// `AdjustWhitespace` step collapses padding so byte-equal compare
+/// against the PG oracle baseline survives PG's exact alignment math.
+fn format_rows_psql_aligned(
+    columns: &[spg_storage::ColumnSchema],
+    rows: &[spg_storage::Row<'static>],
+) -> String {
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.values.iter().map(spg_value_to_psql_text).collect())
+        .collect();
+
+    // Column widths = max(header.len(), max cell.len()) per col.
+    let widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let header_w = c.name.len();
+            let cell_w = cells
+                .iter()
+                .map(|r| r.get(i).map(|s| s.len()).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            header_w.max(cell_w)
+        })
+        .collect();
+
+    let mut out = String::new();
+    // Header
+    let header: Vec<String> = columns
+        .iter()
+        .zip(widths.iter())
+        .map(|(c, w)| format!(" {:^width$} ", c.name, width = *w))
+        .collect();
+    out.push_str(&header.join("|"));
+    out.push('\n');
+    // Separator
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
+    out.push_str(&sep.join("+"));
+    out.push('\n');
+    // Rows
+    for r in &cells {
+        let cells_line: Vec<String> = r
+            .iter()
+            .zip(widths.iter())
+            .map(|(v, w)| format!(" {:>width$} ", v, width = *w))
+            .collect();
+        out.push_str(&cells_line.join("|"));
+        out.push('\n');
+    }
+    out
+}
+
+/// Map a single SPG `Value` to its psql-style text form. PG renders
+/// `NULL` as empty in aligned mode by default; we follow suit since
+/// `AdjustNullDisplay` does its own normalisation downstream.
+fn spg_value_to_psql_text(v: &spg_storage::Value<'_>) -> String {
+    use spg_storage::Value;
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(f) => {
+            // Match PG's default-precision representation.
+            if f.fract() == 0.0 && f.abs() < 1e16 {
+                format!("{f}")
+            } else {
+                format!("{f}")
+            }
+        }
+        Value::Text(s) => s.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Execute a fixture on a reference master via sqlx.

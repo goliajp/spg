@@ -64,6 +64,13 @@ enum Cmd {
     /// the docker path when the 60s fast-tier budget can't absorb
     /// container startup.
     SelfDiff,
+    /// Dump the canonicalised SPG output for a single fixture.
+    /// v7.38 P1 helper for filling EXPECTED FAILURE locks and
+    /// bisecting normalisation pipeline divergences.
+    Dump {
+        /// Path to the fixture .sql file.
+        fixture: std::path::PathBuf,
+    },
     /// Print a recap of the last run.
     Report,
 }
@@ -105,6 +112,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::SelfDiff => self_diff::run(&cli.corpus),
+        Cmd::Dump { fixture } => {
+            let raw = runner::dump_spg(&fixture)?;
+            print!("{raw}");
+            Ok(())
+        }
         Cmd::Report => Err(anyhow!(
             "report: not implemented in v7.38 C scaffolding — adopt during P1 fill"
         )),
