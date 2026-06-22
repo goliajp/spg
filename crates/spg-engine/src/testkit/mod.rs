@@ -10,5 +10,6 @@
 //! Index of acceptors / tests: `xtests/sigil/test-mode-gucs.md`.
 
 pub mod env_config;
+pub mod injection;
 
 pub use env_config::{ComputeQueryId, EnvConfig, EnvConfigBuilder};

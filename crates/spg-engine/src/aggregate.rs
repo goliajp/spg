@@ -535,6 +535,12 @@ pub(crate) fn run(
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
+    // v7.38 P0 元机制 A — fires at the top of the aggregate
+    // executor with the number of input rows. Tests use this to
+    // block before a hypothetical spill decision; in release it
+    // expands to `let _ = (...);`.
+    let __spg_row_count = rows.len();
+    crate::injection_point!("aggregate_spill_trigger", &__spg_row_count);
     // v7.35.0 — pure `SELECT COUNT(*) FROM … WHERE …` short-circuit.
     // The caller already filtered rows by WHERE (we run on the
     // post-WHERE survivor set), so for the canonical pure-COUNT(*)

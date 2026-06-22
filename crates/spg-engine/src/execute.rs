@@ -61,6 +61,11 @@ impl Engine {
         tx_id: TxId,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.38 P0 元机制 A — establish the per-engine injection
+        // scope for the duration of this execute. The guard pops
+        // the store on drop so nested or sibling engines don't see
+        // ours. No-op in release builds (feature off).
+        let _inj = self.enter_injection_scope();
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
         // v7.34 (crash-recovery P0 #2) — row-level redo capture. Arm the

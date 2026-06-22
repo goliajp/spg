@@ -485,6 +485,16 @@ pub struct Engine {
     /// `if env_cfg.<field>` gate. See `testkit::env_config` + the
     /// `xtests/sigil/test-mode-gucs.md` index.
     env_cfg: testkit::EnvConfig,
+    /// v7.38 P0 元机制 A — per-engine `injection_points` attach
+    /// table. Only exists when the crate is built with the
+    /// `injection-points` feature; release builds carry no field.
+    /// Pushed onto the thread-local stack by
+    /// `enter_injection_scope()` so the `injection_point!()` macro
+    /// can find it from anywhere in the executor without rewiring
+    /// every signature. See
+    /// `crates/spg-engine/src/testkit/injection.rs`.
+    #[cfg(feature = "injection-points")]
+    injection_store: alloc::sync::Arc<crate::testkit::injection::InjectionStore>,
     /// v7.34 (crash-recovery P0 #2) — row-level redo capture. When the
     /// embedding layer turns this on (persistence enabled), each mutating
     /// `execute` records the physical [`RowChange`]s it applied; the
@@ -576,6 +586,10 @@ impl Engine {
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
             env_cfg: testkit::EnvConfig::default(),
+            #[cfg(feature = "injection-points")]
+            injection_store: alloc::sync::Arc::new(
+                crate::testkit::injection::InjectionStore::default(),
+            ),
             redo_capture: false,
             last_redo: Vec::new(),
         }
@@ -629,6 +643,10 @@ impl Engine {
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
             env_cfg: testkit::EnvConfig::default(),
+            #[cfg(feature = "injection-points")]
+            injection_store: alloc::sync::Arc::new(
+                crate::testkit::injection::InjectionStore::default(),
+            ),
             redo_capture: false,
             last_redo: Vec::new(),
         }
@@ -697,6 +715,10 @@ impl Engine {
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),
                     env_cfg: testkit::EnvConfig::default(),
+                    #[cfg(feature = "injection-points")]
+                    injection_store: alloc::sync::Arc::new(
+                        crate::testkit::injection::InjectionStore::default(),
+                    ),
                     redo_capture: false,
                     last_redo: Vec::new(),
                 })
@@ -773,6 +795,35 @@ impl Engine {
             // state under a `setseed(0)`.
             None => 0xBAD_5EED_DEAD_BEEF,
         }
+    }
+
+    /// v7.38 P0 元机制 A — push this engine's `InjectionStore` onto
+    /// the thread-local stack so any `injection_point!()` reached
+    /// during the returned guard's lifetime resolves against this
+    /// engine. Mirrors PG's per-backend injection table.
+    ///
+    /// Returns a no-op guard when the `injection-points` feature is
+    /// off so call sites don't need `#[cfg]`.
+    #[must_use]
+    pub fn enter_injection_scope(&self) -> crate::testkit::injection::InjectionGuard {
+        #[cfg(feature = "injection-points")]
+        {
+            crate::testkit::injection::enter_scope(&self.injection_store)
+        }
+        #[cfg(not(feature = "injection-points"))]
+        {
+            crate::testkit::injection::new_guard()
+        }
+    }
+
+    /// v7.38 P0 元机制 A — expose the per-engine store so tests can
+    /// query notice counts / detach actions without parsing SQL
+    /// output. Only present when the feature is on.
+    #[cfg(feature = "injection-points")]
+    pub fn injection_store(
+        &self,
+    ) -> alloc::sync::Arc<crate::testkit::injection::InjectionStore> {
+        self.injection_store.clone()
     }
 
     /// Builder: cap the number of rows a single SELECT may return.

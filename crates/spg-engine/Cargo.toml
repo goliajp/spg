@@ -35,11 +35,30 @@ sha2        = { version = "0.10", default-features = false }
 default = ["std"]
 std     = []
 
+# v7.38 P0 元机制 A — injection_points framework.
+#
+# Default OFF for release builds: every `injection_point!()` macro
+# call expands to `let _ = (...);` (consumes the payload exprs but
+# generates no runtime code; verified by `cargo asm` to leave no
+# push/pop/branch in optimised builds). With the feature ON the
+# macro routes to `testkit::injection::__trigger`, which looks up
+# the current engine's `InjectionStore` via a thread-local and runs
+# the attached action (wait/wakeup/error/notice). Test binaries
+# enable it via dev-deps; CI runs `cargo test --features
+# injection-points`. See `.claude/notes/v7.38-injection-points-design.md`.
+injection-points = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+# v7.38 P0 元机制 A — dev-cycle `cargo test` automatically opts in
+# to the injection-points framework so unit / e2e tests can attach
+# `wait` / `wakeup` / `error` / `notice` actions to any
+# `injection_point!()` site. Release builds (no dev-deps) keep the
+# feature off; macros expand to no-ops.
+spg-engine = { path = ".", features = ["injection-points"] }
 
 [[bench]]
 name    = "execute"
