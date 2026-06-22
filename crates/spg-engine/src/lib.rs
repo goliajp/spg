@@ -50,6 +50,7 @@ pub mod subscriptions;
 mod substitute;
 mod system_catalog;
 mod table_access;
+pub mod testkit;
 mod transaction;
 pub mod triggers;
 pub mod users;
@@ -477,6 +478,13 @@ pub struct Engine {
     /// `select_references_meta_view`.
     meta_views_materialised: bool,
     pending_foreign_keys: Vec<(alloc::string::String, spg_sql::ast::ForeignKeyConstraint)>,
+    /// v7.38 元机制 D — frozen snapshot of `SPG_TEST_*` env vars. Read
+    /// once at construction (`with_env_cfg`) and queried on hot paths
+    /// via `engine.env_cfg().<field>`. Production builds keep this at
+    /// `EnvConfig::default()`, so the optimiser can const-fold every
+    /// `if env_cfg.<field>` gate. See `testkit::env_config` + the
+    /// `xtests/sigil/test-mode-gucs.md` index.
+    env_cfg: testkit::EnvConfig,
     /// v7.34 (crash-recovery P0 #2) — row-level redo capture. When the
     /// embedding layer turns this on (persistence enabled), each mutating
     /// `execute` records the physical [`RowChange`]s it applied; the
@@ -567,6 +575,7 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            env_cfg: testkit::EnvConfig::default(),
             redo_capture: false,
             last_redo: Vec::new(),
         }
@@ -619,6 +628,7 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            env_cfg: testkit::EnvConfig::default(),
             redo_capture: false,
             last_redo: Vec::new(),
         }
@@ -686,6 +696,7 @@ impl Engine {
                     foreign_key_checks: true,
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),
+                    env_cfg: testkit::EnvConfig::default(),
                     redo_capture: false,
                     last_redo: Vec::new(),
                 })
@@ -720,6 +731,48 @@ impl Engine {
     pub const fn with_salt_fn(mut self, f: SaltFn) -> Self {
         self.salt_fn = Some(f);
         self
+    }
+
+    /// v7.38 元机制 D — install a frozen [`testkit::EnvConfig`] snapshot.
+    ///
+    /// Hosts (spg-server, spg-embedded, tests) call this once at engine
+    /// init with either `EnvConfig::from_env()` (production-with-test-vars)
+    /// or `EnvConfig::builder()....build()` (programmatic). After
+    /// construction the engine never reads env vars; all test-mode
+    /// behaviour flows through `self.env_cfg()`.
+    #[must_use]
+    pub fn with_env_cfg(mut self, env_cfg: testkit::EnvConfig) -> Self {
+        self.env_cfg = env_cfg;
+        self
+    }
+
+    /// v7.38 元机制 D — frozen test-mode GUC snapshot. Hot paths gate
+    /// nondeterministic surfaces on fields of this struct; production
+    /// default keeps every field at `false / None / Auto` so the
+    /// optimiser can const-fold the gate.
+    pub fn env_cfg(&self) -> &testkit::EnvConfig {
+        &self.env_cfg
+    }
+
+    /// v7.38 元机制 D acceptor — single seed source for every
+    /// nondeterministic engine subsystem (hash builders, randomised
+    /// tie-breakers, …). Honour `SPG_TEST_RANDOM_SEED=N` when set;
+    /// otherwise derive from the engine's wall clock (production) or
+    /// fall back to a fixed sentinel when the host hasn't installed
+    /// a clock. Two engines built with the same builder seed return
+    /// byte-equal output for the same query.
+    /// See `xtests/sigil/test-mode-gucs.md`.
+    pub fn rng_seed(&self) -> u64 {
+        if let Some(seed) = self.env_cfg.random_seed {
+            return seed;
+        }
+        match self.clock {
+            Some(f) => f() as u64,
+            // Production engines without a clock installed get a fixed
+            // non-zero sentinel; same shape as PG's `random()` start
+            // state under a `setseed(0)`.
+            None => 0xBAD_5EED_DEAD_BEEF,
+        }
     }
 
     /// Builder: cap the number of rows a single SELECT may return.
