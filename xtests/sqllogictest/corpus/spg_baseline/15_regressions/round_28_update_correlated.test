@@ -1,0 +1,61 @@
+# Round-28 (v7.31.x, mailrs P0) — UPDATE SET/WHERE correlated subquery binding
+#
+# Before round-28:
+#   - `UPDATE t SET c = (SELECT … WHERE inner.col = t.col)` lost
+#     the target row binding mid-correlation.
+#   - The subquery saw an undefined / wrong `t.col` value and
+#     either failed or wrote garbage.
+#
+# After round-28:
+#   - The correlated subquery sees the CURRENT outer row on every
+#     iteration. Standard PG semantics.
+
+statement ok
+CREATE TABLE r28_users (id INT NOT NULL PRIMARY KEY, score INT NOT NULL DEFAULT 0)
+
+statement ok
+CREATE TABLE r28_actions (user_id INT NOT NULL, points INT NOT NULL)
+
+statement ok
+INSERT INTO r28_users (id, score) VALUES (1, 0), (2, 0), (3, 0)
+
+statement ok
+INSERT INTO r28_actions VALUES (1, 10), (1, 5), (2, 20), (3, 7), (3, 3)
+
+# UPDATE SET correlated subquery — each user's score becomes the
+# SUM of their actions' points.
+statement ok
+UPDATE r28_users
+SET score = (SELECT COALESCE(SUM(points), 0) FROM r28_actions WHERE user_id = r28_users.id)
+
+query II rowsort
+SELECT id, score FROM r28_users ORDER BY id
+----
+1
+15
+2
+20
+3
+10
+
+# UPDATE WHERE correlated subquery — only update users who have
+# at least one action recorded.
+statement ok
+INSERT INTO r28_users (id) VALUES (4)
+
+statement ok
+UPDATE r28_users
+SET score = -1
+WHERE EXISTS (SELECT 1 FROM r28_actions WHERE user_id = r28_users.id)
+
+query II rowsort
+SELECT id, score FROM r28_users ORDER BY id
+----
+1
+-1
+2
+-1
+3
+-1
+4
+0

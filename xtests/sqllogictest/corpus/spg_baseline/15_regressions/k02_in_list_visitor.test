@@ -1,0 +1,61 @@
+# K02 (v7.37.7) — `visit_expr_columns_and_subqueries` missed `Expr::InList` arm
+#
+# Before K02 fix:
+#   - `crates/spg-engine/src/expr_analysis.rs::visit_expr_columns_and_subqueries`
+#     had no match arm for `Expr::InList`.
+#   - The fall-through emitted a BAIL `ColumnName` with no qualifier.
+#   - `expr_is_all_inner` returned `false` on any
+#     `inner.col IN (literal, literal, …)` conjunct.
+#   - `pull_up_exists_sublinks` bailed → planner kept per-outer-row
+#     materialisation → mailrs prod Class B cascade × 4 recurrences
+#     (2026-06-16 → 06-22b).
+#
+# After K02 fix:
+#   - 5-LOC arm added (visit both `expr` and each `list` item).
+#   - Pull-up fires correctly on the InList-conjunct shape.
+#   - Cascade collapsed: mailrs Class B 70.42 ms → 1.4 ms single,
+#     615 ms → 1.6 ms conc-20.
+#
+# This corpus pins ONLY the SQL-correctness side (rows are right).
+# The perf-regression side lives in `xtests/dogfood_replay/fixtures/
+# mailrs-2026-06-22-class-b-unread-not-exists/` and trips
+# `gate.sh dogfood` (now a release.sh preflight per bf95666).
+# Together: correctness + perf both have permanent regression gates.
+
+statement ok
+CREATE TABLE k02_outer_t (id INT NOT NULL, org_id INT NOT NULL)
+
+statement ok
+CREATE TABLE k02_inner_t (org_id INT NOT NULL, status TEXT NOT NULL)
+
+statement ok
+INSERT INTO k02_outer_t VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+INSERT INTO k02_inner_t VALUES (10, 'active'), (20, 'archived'), (30, 'active'), (40, 'pending')
+
+# The exact cascade shape: NOT EXISTS over (inner.col IN (literals))
+query I rowsort
+SELECT id FROM k02_outer_t o
+WHERE NOT EXISTS (
+    SELECT 1 FROM k02_inner_t i
+    WHERE i.org_id = o.org_id
+      AND i.status IN ('archived', 'pending')
+)
+ORDER BY id
+----
+1
+3
+
+# Mirror with EXISTS — same visitor path, opposite truth.
+query I rowsort
+SELECT id FROM k02_outer_t o
+WHERE EXISTS (
+    SELECT 1 FROM k02_inner_t i
+    WHERE i.org_id = o.org_id
+      AND i.status IN ('archived', 'pending')
+)
+ORDER BY id
+----
+2
+4

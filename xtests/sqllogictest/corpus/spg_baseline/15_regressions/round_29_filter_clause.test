@@ -1,0 +1,50 @@
+# Round-29 (v7.32) — aggregate `FILTER (WHERE …)` clause
+#
+# Before round-29:
+#   - SPG parser didn't accept `agg(args) FILTER (WHERE cond)`.
+#   - The CASE-WHEN-THEN-NULL idiom was the only workaround.
+#
+# After round-29:
+#   - First-class FILTER modifier; semantics match PG.
+#
+# Note: v7.37.7 added a duplicate pin in `05_aggregates/13_filter_clause.test`
+# (mechanically-ported from PG regress); this corpus entry exists for the
+# 100_bugs.pl-style mailrs round归属.
+
+statement ok
+CREATE TABLE r29_t (g TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO r29_t VALUES ('a', 10), ('a', 20), ('a', 100), ('b', 5)
+
+# Basic FILTER on SUM
+query TI rowsort
+SELECT g, SUM(v) FILTER (WHERE v > 10) FROM r29_t GROUP BY g ORDER BY g
+----
+a
+120
+b
+NULL
+
+# FILTER on COUNT(*)
+query TI rowsort
+SELECT g, COUNT(*) FILTER (WHERE v > 10) FROM r29_t GROUP BY g ORDER BY g
+----
+a
+2
+b
+0
+
+# Two FILTER clauses on the same SELECT
+query TII rowsort
+SELECT g,
+       SUM(v) FILTER (WHERE v > 10),
+       COUNT(*) FILTER (WHERE v < 50)
+FROM r29_t GROUP BY g ORDER BY g
+----
+a
+120
+2
+b
+NULL
+1
