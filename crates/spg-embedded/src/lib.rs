@@ -2154,13 +2154,15 @@ impl Database {
         }
         stage("wal::snapshot_lsn_scan", &mut last_stage);
         let mut quarantined: Vec<QuarantinedStmt> = Vec::new();
+        let mut total_replayed = 0usize;
         for chunk in &chunk_paths {
             let bytes = std::fs::read(chunk).map_err(io_err)?;
             if bytes.is_empty() {
                 continue;
             }
-            replay_wal_filtered(&bytes, &mut engine, snapshot_lsn, &mut quarantined)
+            let applied = replay_wal_filtered(&bytes, &mut engine, snapshot_lsn, &mut quarantined)
                 .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
+            total_replayed = total_replayed.saturating_add(applied);
             if let Ok(records) = parse_wal_records(&bytes) {
                 if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
                     if max > initial_lsn {
@@ -2273,7 +2275,7 @@ impl Database {
         if row_redo_enabled() {
             engine.set_redo_capture(true);
         }
-        let db = Self {
+        let mut db = Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
             tx_wal: None,
@@ -2306,6 +2308,40 @@ impl Database {
         stage("pre_autowarm", &mut last_stage);
         autowarm_cold_tier_on_open(&db);
         stage("autowarm", &mut last_stage);
+        // v7.37.8 + v7.38 followup (mailrs lock-hang 4th-recurrence
+        // root-cause closure §"Open asks", ack §1) — if this boot
+        // actually replayed any records, force a checkpoint right
+        // here so the floor advances past them. Next restart skips
+        // them entirely via `snapshot_lsn_scan` + the marker the
+        // checkpoint emits. This is the in-place equivalent of an
+        // explicit V4 → V5 migration without rewriting WAL records:
+        // the post-replay catalog is snapshotted as the new
+        // authoritative image, and stale V4 records become
+        // skip-able on the next boot via the floor mechanism.
+        //
+        // Cost: ONE additional ~1-3 s catalog write on the upgrade
+        // boot (the boot already paid the ~187 s replay tax — this
+        // is +1-3% on top). Benefit: every subsequent restart
+        // permanently fast (V4 records below the new floor are
+        // skipped, V5 records replay in O(rows changed)).
+        //
+        // Failure path: checkpoint errors are logged to stderr but
+        // never propagate — the catalog state is in memory and
+        // valid; the next boot will replay again, which is exactly
+        // the pre-fix behaviour. So the only regression is "this
+        // optimisation didn't take effect this boot", not "the boot
+        // failed".
+        if total_replayed > 0 {
+            stage("pre_replay_checkpoint", &mut last_stage);
+            if let Err(e) = db.checkpoint() {
+                eprintln!(
+                    "spg-embedded: post-replay checkpoint failed: {e:?} \
+                     (WAL is intact; next boot will replay {total_replayed} \
+                     records again — non-fatal)"
+                );
+            }
+            stage("post_replay_checkpoint", &mut last_stage);
+        }
         Ok(db)
     }
 
