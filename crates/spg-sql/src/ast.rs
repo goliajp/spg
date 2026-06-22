@@ -707,6 +707,13 @@ pub struct ExplainStatement {
     /// query's WHERE / JOIN that has no covering index on the
     /// owning table.
     pub suggest: bool,
+    /// v7.37.7 — `EXPLAIN (COSTS OFF) <SELECT>` strips wall-clock
+    /// `elapsed=…us` annotations from the Total line (and any
+    /// future cost-bearing lines). PG-standard option used by
+    /// regression suites and diff-friendly EXPLAIN output. When
+    /// `true`, takes precedence over the per-session
+    /// `SPG_TEST_EXPLAIN_NO_COSTS` GUC.
+    pub costs_off: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

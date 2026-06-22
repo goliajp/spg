@@ -511,31 +511,72 @@ impl Parser {
                 self.advance();
                 let mut analyze = false;
                 let mut suggest = false;
-                // v6.8.3 — `EXPLAIN (SUGGEST)` opt-in.
+                let mut costs_off = false;
+                // v6.8.3 + v7.37.7 — `EXPLAIN (option [, option…])`
+                // syntax accepts SUGGEST + COSTS ON|OFF. Multiple
+                // options are comma-separated. Booleans default to ON
+                // when the value token is omitted (matches PG).
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
-                    let opt = match self.peek().clone() {
-                        Token::Ident(s) | Token::QuotedIdent(s) => s,
-                        other => {
+                    loop {
+                        let opt = match self.peek().clone() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected option keyword inside EXPLAIN (…), got {other:?}"
+                                )));
+                            }
+                        };
+                        self.advance();
+                        if opt.eq_ignore_ascii_case("suggest") {
+                            suggest = true;
+                            // SUGGEST takes no explicit value today.
+                        } else if opt.eq_ignore_ascii_case("costs") {
+                            // PG syntax: `COSTS [ON | OFF]`. Default
+                            // when value omitted is ON, so plain
+                            // `COSTS` is a no-op. `COSTS OFF` flips.
+                            // `ON` lexes to `Token::On` (reserved
+                            // keyword in JOIN ... ON contexts); accept
+                            // it alongside the bare Ident form so the
+                            // grammar matches PG verbatim.
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            costs_off = !value;
+                        } else {
                             return Err(self.err(format!(
-                                "expected option keyword inside EXPLAIN (…), got {other:?}"
+                                "unknown EXPLAIN option {opt:?}; v7.37.7 supports SUGGEST, COSTS"
                             )));
                         }
-                    };
-                    if !opt.eq_ignore_ascii_case("suggest") {
-                        return Err(self.err(format!(
-                            "unknown EXPLAIN option {opt:?}; v6.8.3 supports SUGGEST"
-                        )));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
                     }
-                    self.advance();
                     if !matches!(self.peek(), Token::RParen) {
                         return Err(self.err(format!(
-                            "expected ')' after EXPLAIN option, got {:?}",
+                            "expected ')' after EXPLAIN options, got {:?}",
                             self.peek()
                         )));
                     }
                     self.advance();
-                    suggest = true;
                 } else if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && (s.eq_ignore_ascii_case("analyze") || s.eq_ignore_ascii_case("analyse"))
                 {
@@ -550,6 +591,7 @@ impl Parser {
                     analyze,
                     inner: Box::new(s),
                     suggest,
+                    costs_off,
                 }))
             }
             Token::Create => self.parse_create_stmt(),

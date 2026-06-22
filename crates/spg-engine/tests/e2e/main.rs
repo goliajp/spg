@@ -47,6 +47,7 @@ mod e2e_exists_decorrelation;
     clippy::uninlined_format_args
 )]
 mod e2e_explain_analyze;
+mod e2e_explain_costs_off;
 mod e2e_expression_index;
 mod e2e_fetch_with_ties;
 mod e2e_fk_advanced;
