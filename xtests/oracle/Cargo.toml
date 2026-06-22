@@ -1,0 +1,28 @@
+[package]
+name         = "spg-oracle-runner"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "v7.38 differential oracle — runs SPG vs PG18 / MySQL 8 / MariaDB 11, sort-then-byte-equal compare with adjust_*() normalisation pipeline."
+
+# v7.38 C scaffolding: at this stage the crate compiles as a bin with
+# stub adapters; full sqlx/docker wiring (PG/MySQL/MariaDB clients,
+# docker-compose orchestration) lands during P1+ corpus fill.
+
+[[bin]]
+name = "spg-oracle-runner"
+path = "src/main.rs"
+
+[dependencies]
+# spg-engine pulls in the embedded execution path used for the SPG
+# side of every differential probe. Version pin matches the rest of
+# the xtests/ crates so the workspace lockfile stays clean.
+spg-engine = { path = "../../crates/spg-engine", version = "7.34" }
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+walkdir    = "2"
+
+[lints]
+workspace = true
