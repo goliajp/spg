@@ -405,8 +405,14 @@ impl Engine {
             };
             annotate_explain_lines(&mut lines, row_count, self);
             let mut total = alloc::format!("Total: rows={row_count}");
-            if let Some(us) = elapsed_micros {
-                total.push_str(&alloc::format!(" elapsed={us}us"));
+            // v7.38 元机制 D acceptor — `SPG_TEST_EXPLAIN_NO_COSTS=1`
+            // strips the nondeterministic wall-clock `elapsed=…us`
+            // annotation so EXPLAIN diffs are byte-equal across runs.
+            // See `xtests/sigil/test-mode-gucs.md`.
+            if !self.env_cfg().explain_no_costs {
+                if let Some(us) = elapsed_micros {
+                    total.push_str(&alloc::format!(" elapsed={us}us"));
+                }
             }
             lines.push(total);
         }

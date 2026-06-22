@@ -2803,7 +2803,14 @@ impl Engine {
             // WITH TIES likewise needs the full sort so the tie
             // extension can scan past `limit` to find rows that
             // share the last-kept row's key.
-            let keep = if stmt.distinct || stmt.limit_with_ties {
+            let keep = if stmt.distinct
+                || stmt.limit_with_ties
+                // v7.38 元机制 D acceptor — `SPG_TEST_DISABLE_TOPK=1`
+                // forces the full-sort fallback by suppressing the
+                // partial-sort `keep` budget. See
+                // `xtests/sigil/test-mode-gucs.md`.
+                || self.env_cfg().disable_topk
+            {
                 None
             } else {
                 stmt.limit_literal()
@@ -3253,7 +3260,10 @@ impl Engine {
             tagged.push((order_keys, out_row));
         }
         if !stmt.order_by.is_empty() {
-            let keep = if stmt.distinct {
+            let keep = if stmt.distinct
+                // v7.38 元机制 D acceptor — see other call site above.
+                || self.env_cfg().disable_topk
+            {
                 None
             } else {
                 stmt.limit_literal()

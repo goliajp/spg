@@ -27,6 +27,14 @@ sha1        = { version = "0.10", default-features = false }
 # stores SHA256(SHA256(password)) per user.
 sha2        = { version = "0.10", default-features = false }
 
+[features]
+# v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
+# engine stays `#![no_std]`-compatible. Default-on for the hosted
+# embedders (spg-server, spg-embedded, tests); downstream bare-metal
+# users can opt out via `default-features = false`.
+default = ["std"]
+std     = []
+
 [lints]
 workspace = true
 
