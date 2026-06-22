@@ -9820,6 +9820,36 @@ impl Parser {
                             target,
                         });
                     }
+                    // v7.37.7 C.1.8 — PG `substring(str FROM pos FOR len)` syntactic
+                    // form. Desugars to the comma-list shape evaluator already
+                    // handles. Triggered after the first arg when the function
+                    // name is substring / substr and the next token is FROM
+                    // (a reserved keyword in PG; SPG also reserves it).
+                    if (first.eq_ignore_ascii_case("substring")
+                        || first.eq_ignore_ascii_case("substr"))
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::From)
+                    {
+                        self.advance();
+                        let start = self.parse_expr(0)?;
+                        args.push(start);
+                        if matches!(self.peek(), Token::For) {
+                            self.advance();
+                            let length = self.parse_expr(0)?;
+                            args.push(length);
+                        }
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close substring(... FROM ... [FOR ...]), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        return Ok(Expr::FunctionCall {
+                            name: first.to_ascii_lowercase(),
+                            args,
+                        });
+                    }
                     // v7.24 (round-16 A) — aggregate-internal
                     // ordering: `array_agg(x ORDER BY y DESC NULLS
                     // LAST)`. Keys close the argument list.

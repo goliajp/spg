@@ -52,6 +52,7 @@ mod e2e_cardinality_modulo;
 mod e2e_explain_costs_off;
 mod e2e_filter_clause;
 mod e2e_join_using;
+mod e2e_substring_from_for;
 mod e2e_expression_index;
 mod e2e_fetch_with_ties;
 mod e2e_fk_advanced;
