@@ -1011,6 +1011,18 @@ impl Engine {
         self.redo_capture = on;
     }
 
+    /// v7.37.8 — read accessor for tests / observability. The
+    /// embedding layer flips this on once per `open_path` (after
+    /// replay completes) when `SPG_WAL_ROW_REDO` is enabled (now
+    /// default in v7.37.8). A consumer that wants to verify the
+    /// post-upgrade contract ("writes go to V5 ROW_REDO by default")
+    /// reads this through `Database::engine_redo_capture()` instead
+    /// of inspecting WAL bytes (which the auto-checkpoint truncates
+    /// on `Drop`).
+    pub fn redo_capture_enabled(&self) -> bool {
+        self.redo_capture
+    }
+
     /// v7.34 — take the redo captured by the most recent successful
     /// mutating `execute` (empty when capture is off, the statement was a
     /// read, or it changed nothing). The embedding layer writes these to
