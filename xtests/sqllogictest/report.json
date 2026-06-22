@@ -78,7 +78,7 @@
         { "file": "16_info_schema_mysql.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1258, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1338, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -253,6 +253,8 @@
         { "file": "86_pg_views_view.test", "pass": 4, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "87_pg_settings_view.test", "pass": 6, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "88_boolean.test", "pass": 80, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
