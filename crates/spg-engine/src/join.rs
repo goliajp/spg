@@ -2153,13 +2153,7 @@ impl Engine {
                 // peer candidate this outer row hashed to.
                 let mut outer_ok = true;
                 for r in &residual_outer_only {
-                    let cond = self.eval_expr_with_correlated(
-                        r,
-                        left,
-                        &outer_ctx,
-                        cancel,
-                        None,
-                    )?;
+                    let cond = self.eval_expr_with_correlated(r, left, &outer_ctx, cancel, None)?;
                     if !matches!(cond, Value::Bool(true)) {
                         outer_ok = false;
                         break;
