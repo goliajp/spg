@@ -61,6 +61,29 @@ manifest_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
     || { echo "preflight: Cargo.toml workspace version is ${manifest_version}, expected ${VERSION}" >&2; exit 1; }
 echo "preflight OK: master @ $(git rev-parse --short HEAD), tag v${VERSION}"
 
+# v7.37.8 followup (mailrs lock-hang 4th-recurrence ack P2 — prod-shape
+# catalog in CI gate). Run the dogfood-replay battery before any
+# crates.io / docker / acceptance work. Fast tier (~5 min) covers
+# every synthetic recovery + replay scenario and the in-tree fixtures;
+# the prod snapshot (mailrs.spg, 800 MB+) is skipped here but available
+# via `gate.sh dogfood --full` for nightly runs on a machine that
+# carries it. Setting SKIP_DOGFOOD=1 selects the legacy
+# "no preflight gate" behaviour for the rare case where the operator
+# already ran it externally.
+if [[ "${SKIP_DOGFOOD:-0}" == 0 ]]; then
+    banner "preflight gate: dogfood-replay (fast tier)"
+    if ! scripts/gate.sh dogfood; then
+        echo "preflight: dogfood-replay gate FAILED — release blocked. \
+Re-run with \`SKIP_DOGFOOD=1 scripts/release.sh $VERSION\` to override, \
+but only after triaging the failure (mailrs P0 4th-recurrence root \
+cause was exactly this kind of skipped gate)." >&2
+        exit 1
+    fi
+    echo "preflight gate: dogfood-replay PASS"
+else
+    echo "preflight gate: dogfood-replay SKIPPED (SKIP_DOGFOOD=1 set)"
+fi
+
 if [[ "$SKIP_CRATES" == 0 ]]; then
     banner "crates.io publish × ${#CRATES[@]}"
     # v7.37.7 — crates.io's data-access policy now rejects bare-curl GETs

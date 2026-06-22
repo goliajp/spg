@@ -118,10 +118,16 @@ run_dogfood() {
     # whose snapshot is >100 MB (i.e. not present in CI) and still
     # exercises every synthetic recovery scenario. `--full` runs
     # every fixture including snapshot-backed ones.
+    # v7.37.8 — `--bin spg-dogfood-replay` disambiguates against the
+    # peer `spg-stress-cascade` binary (added in v7.37.7 for the K02
+    # cascade reproducer). Without it cargo errors with
+    # "could not determine which binary to run".
     if [[ "$FULL" == 1 ]]; then
-        cargo run --release --locked -p spg-dogfood-replay -- all
+        cargo run --release --locked -p spg-dogfood-replay \
+            --bin spg-dogfood-replay -- all
     else
-        cargo run --release --locked -p spg-dogfood-replay -- all --fast
+        cargo run --release --locked -p spg-dogfood-replay \
+            --bin spg-dogfood-replay -- all --fast
     fi
 }
 

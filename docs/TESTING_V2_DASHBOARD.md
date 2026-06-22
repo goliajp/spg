@@ -17,8 +17,21 @@
 > **更新时机**:每个 v7.38 train commit 触碰本表所引文件时,同 commit 更新。
 > **本表退化(✅→⚠️ / ⚠️→❌)= release block**。
 
-Last update: 2026-06-23 (v7.38 P1 axis 1 closure + perm-runner lib + holistic audit)
-Branch: `feature/v7.38-test-constitution` @ commit `20da136`
+Last update: 2026-06-23 (post v7.37.8 mailrs lock-hang 4th-recurrence
+closure — `SPG_WAL_ROW_REDO` default flipped ON, ending 3 releases of
+sealed-fix negligence; dogfood-replay gate now blocks `release.sh`
+preflight)
+Branch: `feature/v7.38-test-constitution` @ commit `fcc9c3b`
+
+**v7.37.8 incident-driven additions** (all defended in this dashboard now):
+- 元机制 + 工艺纪律 add new row: **release.sh preflight runs `gate.sh
+  dogfood`** — release blocked on fail. Closes mailrs ask P2 ("prod-shape
+  catalog in SPG CI for any change touching open_path / WAL replay /
+  ACTIVE_OPEN_PATHS"). Operator can override with `SKIP_DOGFOOD=1` after
+  triage, never silently.
+- New memory `feedback-no-sealed-fix-behind-env-var`: perf / correctness
+  fixes targeting the dogfood customer must ship default ON; opt-in env
+  vars hide the fix from `0-let-fall` consumers.
 
 ---
 
