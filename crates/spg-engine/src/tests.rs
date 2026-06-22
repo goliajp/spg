@@ -1536,6 +1536,106 @@ fn sql_injection_attach_notice_then_trigger_records() {
     );
 }
 
+// v7.38 P0 元机制 A — per-site testcase: planner_first_row_fetch.
+// Any `SELECT` exercises `exec_select_cancel` which fires this
+// point at its head. Most basic inject-site coverage shape.
+#[cfg(feature = "injection-points")]
+#[test]
+fn inject_planner_first_row_fetch_fires_on_any_select() {
+    let mut e = crate::Engine::new();
+    e.execute("SELECT spg_injection_attach('planner_first_row_fetch', 'notice:select_seen')")
+        .expect("attach succeeds");
+    e.execute("CREATE TABLE inj_pfrf (id INT)").unwrap();
+    e.execute("INSERT INTO inj_pfrf VALUES (1), (2)").unwrap();
+    // Any SELECT triggers the head injection point.
+    e.execute("SELECT * FROM inj_pfrf").unwrap();
+    let store = e.injection_store();
+    assert!(
+        store.notice_count("planner_first_row_fetch") >= 1,
+        "planner_first_row_fetch did not fire under feature-on build"
+    );
+    assert_eq!(
+        store.notice_message("planner_first_row_fetch").as_deref(),
+        Some("select_seen")
+    );
+}
+
+// v7.38 P0 元机制 A — per-site testcase: index_build_post_seal.
+// `CREATE INDEX <name> ON <table>(<col>)` for the BTree method
+// fires this point right after `table.add_index`.
+#[cfg(feature = "injection-points")]
+#[test]
+fn inject_index_build_post_seal_fires_on_create_index() {
+    let mut e = crate::Engine::new();
+    e.execute("SELECT spg_injection_attach('index_build_post_seal', 'notice:index_sealed')")
+        .expect("attach succeeds");
+    e.execute("CREATE TABLE inj_ibps (id INT, v INT)").unwrap();
+    e.execute("CREATE INDEX inj_ibps_idx ON inj_ibps (v)").unwrap();
+    let store = e.injection_store();
+    assert!(
+        store.notice_count("index_build_post_seal") >= 1,
+        "index_build_post_seal did not fire under feature-on build"
+    );
+    assert_eq!(
+        store.notice_message("index_build_post_seal").as_deref(),
+        Some("index_sealed")
+    );
+}
+
+// v7.38 P0 元机制 A — per-site testcase: tx_commit_walgroup_leader_switch.
+// `COMMIT` after an explicit BEGIN fires the point at the head of
+// `exec_commit` (before the catalog merge). The wal_group_commit_leader_chosen
+// peer point fires *after* the merge — covered by the next test.
+#[cfg(feature = "injection-points")]
+#[test]
+fn inject_tx_commit_walgroup_leader_switch_fires_on_commit() {
+    let mut e = crate::Engine::new();
+    e.execute(
+        "SELECT spg_injection_attach('tx_commit_walgroup_leader_switch', 'notice:commit_pre')",
+    )
+    .expect("attach succeeds");
+    e.execute("CREATE TABLE inj_cwls (id INT)").unwrap();
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO inj_cwls VALUES (1)").unwrap();
+    e.execute("COMMIT").unwrap();
+    let store = e.injection_store();
+    assert!(
+        store.notice_count("tx_commit_walgroup_leader_switch") >= 1,
+        "tx_commit_walgroup_leader_switch did not fire under feature-on build"
+    );
+    assert_eq!(
+        store.notice_message("tx_commit_walgroup_leader_switch").as_deref(),
+        Some("commit_pre")
+    );
+}
+
+// v7.38 P0 元机制 A — per-site testcase: wal_group_commit_leader_chosen.
+// Same `COMMIT` flow as the previous test, but fires after the tx
+// state has moved off `tx_catalogs` — confirms the post-merge
+// point is reached too.
+#[cfg(feature = "injection-points")]
+#[test]
+fn inject_wal_group_commit_leader_chosen_fires_on_commit() {
+    let mut e = crate::Engine::new();
+    e.execute(
+        "SELECT spg_injection_attach('wal_group_commit_leader_chosen', 'notice:commit_post')",
+    )
+    .expect("attach succeeds");
+    e.execute("CREATE TABLE inj_wgclc (id INT)").unwrap();
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO inj_wgclc VALUES (1)").unwrap();
+    e.execute("COMMIT").unwrap();
+    let store = e.injection_store();
+    assert!(
+        store.notice_count("wal_group_commit_leader_chosen") >= 1,
+        "wal_group_commit_leader_chosen did not fire under feature-on build"
+    );
+    assert_eq!(
+        store.notice_message("wal_group_commit_leader_chosen").as_deref(),
+        Some("commit_post")
+    );
+}
+
 // v7.38 P0 元机制 A — the off-feature build refuses the SQL
 // surface so a production SPG (no feature) can't be coerced
 // into a deadlock by a malicious `SELECT spg_injection_attach`.
