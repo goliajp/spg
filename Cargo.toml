@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "7.37.7"
+version      = "7.37.8"
 edition      = "2024"
 authors      = ["GOLIA K.K. <lihao@golia.jp>"]
 license      = "MIT OR Apache-2.0"
