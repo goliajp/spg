@@ -53,66 +53,60 @@ struct Args {
     /// Warmup iters per worker per class (discarded from stats).
     #[arg(long, default_value_t = 5)]
     warmup: usize,
-    /// User address to bind in the query.
-    #[arg(long, default_value = "lihao@golia.ai")]
-    user: String,
-    /// Mailbox name for Class B mailbox_id lookup.
-    #[arg(long, default_value = "INBOX")]
-    mailbox: String,
+    /// Fixture directory root (each subdir has `queries.sql` read verbatim).
+    /// v7.37.7 fidelity fix — earlier versions inlined a simplified
+    /// 4-col Track A SQL; harness reported 4 ms while the real 167-col
+    /// fixture is 76 ms. Now both are aligned by reading the fixture
+    /// corpus directly.
+    #[arg(long, default_value = "xtests/dogfood_replay/fixtures")]
+    fixtures_root: PathBuf,
+    /// Fixture names to load (each must have <root>/<name>/queries.sql).
+    /// Comma-separated. Default matches the mailrs cascade trio.
+    #[arg(
+        long,
+        default_value = "mailrs-2026-06-22-track-a,mailrs-2026-06-22-class-b-unread-not-exists,mailrs-2026-06-22-class-c-dashboard-cte"
+    )]
+    fixtures: String,
 }
 
-const CLASSES: &[&str] = &["track-a", "class-b", "class-c"];
-
-fn sql_track_a(user: &str) -> String {
-    format!(
-        "SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
-                MAX(m.internal_date) \
-           FROM messages m \
-           JOIN mailboxes mb ON m.mailbox_id = mb.id \
-          WHERE mb.user_address = '{user}' \
-            AND m.thread_id != '' \
-          GROUP BY m.thread_id \
-          ORDER BY MAX(m.internal_date) DESC \
-          LIMIT 50"
+/// Strip `--` line comments and split on `;` — matches
+/// `dogfood_replay::bench::split_sql` so the stress binary executes
+/// the same statements the single-shot `run` subcommand does.
+fn load_fixture_sql(fixtures_root: &Path, fixture_name: &str) -> Result<String> {
+    let path = fixtures_root.join(fixture_name).join("queries.sql");
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("read fixture queries.sql at {}", path.display()))?;
+    // Take the first non-empty statement after splitting by `;` and
+    // stripping `--` line comments. Matches `bench::split_sql`.
+    for raw in body.split(';') {
+        let cleaned: String = raw
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = cleaned.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    bail!(
+        "fixture {} has no non-empty SQL statement after comment strip",
+        path.display()
     )
 }
 
-fn sql_class_b(user: &str, mailbox: &str) -> String {
-    format!(
-        "SELECT COUNT(*) FROM messages m \
-          WHERE m.mailbox_id = ( \
-                  SELECT id FROM mailboxes \
-                   WHERE user_address = '{user}' AND name = '{mailbox}' \
-                   LIMIT 1 \
-                ) \
-            AND (m.flags & 1) = 0 \
-            AND NOT EXISTS ( \
-                  SELECT 1 FROM email_analysis ea \
-                   WHERE ea.message_id = m.id \
-                     AND ea.category IN ('spam', 'scam') \
-                )"
-    )
-}
-
-fn sql_class_c(user: &str) -> String {
-    format!(
-        "WITH unread_threads AS ( \
-           SELECT m.thread_id \
-             FROM messages m \
-             JOIN mailboxes mb ON m.mailbox_id = mb.id \
-            WHERE mb.user_address = '{user}' \
-              AND m.thread_id != '' \
-              AND NOT EXISTS ( \
-                    SELECT 1 FROM email_analysis ea \
-                     WHERE ea.message_id = m.id \
-                       AND ea.category IN ('spam', 'scam') \
-                  ) \
-            GROUP BY m.thread_id \
-            HAVING BOOL_OR(m.archived) = false \
-               AND COUNT(CASE WHEN (m.flags & 1) = 0 THEN 1 END) > 0 \
-         ) \
-         SELECT COUNT(*) FROM unread_threads"
-    )
+/// Short tag used in the per-class summary output. Strips the
+/// `mailrs-YYYY-MM-DD-` prefix when present so the table fits.
+fn short_label(fixture_name: &str) -> String {
+    fixture_name
+        .strip_prefix("mailrs-")
+        .and_then(|s| {
+            // After "mailrs-", the next segment is the date "YYYY-MM-DD"
+            // (10 chars). Skip it + the separating dash.
+            s.get(11..)
+        })
+        .unwrap_or(fixture_name)
+        .to_string()
 }
 
 struct Workload {
@@ -120,14 +114,25 @@ struct Workload {
 }
 
 impl Workload {
-    fn new(user: &str, mailbox: &str) -> Self {
-        Self {
-            queries: vec![
-                (CLASSES[0].into(), sql_track_a(user)),
-                (CLASSES[1].into(), sql_class_b(user, mailbox)),
-                (CLASSES[2].into(), sql_class_c(user)),
-            ],
+    fn load(args: &Args) -> Result<Self> {
+        let names: Vec<String> = args
+            .fixtures
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            bail!("--fixtures argument resolved to zero names");
         }
+        let mut queries: Vec<(String, String)> = Vec::new();
+        for name in &names {
+            let sql = load_fixture_sql(&args.fixtures_root, name)?;
+            queries.push((short_label(name), sql));
+        }
+        Ok(Self { queries })
+    }
+    fn labels(&self) -> Vec<String> {
+        self.queries.iter().map(|(c, _)| c.clone()).collect()
     }
 }
 
@@ -202,8 +207,8 @@ fn run_phase(
 ) -> Vec<(String, Vec<u128>)> {
     let mut per_class: std::collections::HashMap<String, Vec<u128>> =
         std::collections::HashMap::new();
-    for c in CLASSES {
-        per_class.insert((*c).to_string(), Vec::with_capacity(workers * iters));
+    for c in workload.labels() {
+        per_class.insert(c, Vec::with_capacity(workers * iters));
     }
     let barrier = Arc::new(Barrier::new(workers));
     let handles: Vec<_> = (0..workers)
@@ -249,7 +254,7 @@ fn run_phase(
 fn print_stats(label: &str, per_class: &[(String, Vec<u128>)]) {
     println!("\n=== {label} ===");
     println!(
-        "{:>10}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "{:>32}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
         "class", "n", "p50", "p90", "p95", "p99", "max"
     );
     let mut sorted_by_class: Vec<(String, Vec<u128>)> = per_class.to_vec();
@@ -259,7 +264,7 @@ fn print_stats(label: &str, per_class: &[(String, Vec<u128>)]) {
         sorted.sort_unstable();
         let n = sorted.len();
         println!(
-            "{:>10}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "{:>32}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
             class,
             n,
             fmt_us(percentile(&sorted, 0.50)),
@@ -278,13 +283,17 @@ fn lookup_class<'a>(stats: &'a [(String, Vec<u128>)], class: &str) -> Option<&'a
         .map(|(_, v)| v.as_slice())
 }
 
-fn amplification_table(single: &[(String, Vec<u128>)], conc: &[(String, Vec<u128>)]) {
+fn amplification_table(
+    labels: &[String],
+    single: &[(String, Vec<u128>)],
+    conc: &[(String, Vec<u128>)],
+) {
     println!("\n=== Amplification (concurrent p50 / single-thread p50) ===");
     println!(
-        "{:>10}  {:>10}  {:>10}  {:>8}",
+        "{:>32}  {:>10}  {:>10}  {:>8}",
         "class", "single p50", "conc p50", "ratio"
     );
-    for c in CLASSES {
+    for c in labels {
         let s = lookup_class(single, c).unwrap_or(&[]);
         let cv = lookup_class(conc, c).unwrap_or(&[]);
         if s.is_empty() || cv.is_empty() {
@@ -302,7 +311,7 @@ fn amplification_table(single: &[(String, Vec<u128>)], conc: &[(String, Vec<u128
             c50 as f64 / s50 as f64
         };
         println!(
-            "{:>10}  {:>10}  {:>10}  {:>7.2}×",
+            "{:>32}  {:>10}  {:>10}  {:>7.2}×",
             c,
             fmt_us(s50),
             fmt_us(c50),
@@ -330,7 +339,13 @@ fn main() -> Result<()> {
     eprintln!("Database::open_path in {:.2}s", t.elapsed().as_secs_f64());
 
     let snapshot = Arc::new(db.engine().clone_snapshot());
-    let workload = Arc::new(Workload::new(&args.user, &args.mailbox));
+    let workload = Arc::new(Workload::load(&args)?);
+    eprintln!("loaded {} fixture queries:", workload.queries.len());
+    for (name, sql) in &workload.queries {
+        let preview: String = sql.chars().take(80).collect();
+        eprintln!("  - {name:<32} {preview}…");
+    }
+    let labels = workload.labels();
 
     // v7.37.7 round-2 contention instrumentation — reset
     // `MemoizeCache::counters` between phases to attribute new()/put()/drop
@@ -372,7 +387,7 @@ fn main() -> Result<()> {
         "\nspawning {} concurrent workers × {} iters × {} classes...",
         args.workers,
         args.iters,
-        CLASSES.len()
+        labels.len()
     );
     spg_engine::memoize::counters::reset();
     let conc = run_phase(
@@ -394,7 +409,7 @@ fn main() -> Result<()> {
         conc_counters.drop_with_entries
     );
 
-    amplification_table(&single, &conc);
+    amplification_table(&labels, &single, &conc);
 
     // Brief pause to let any background allocator/cleanup quiesce.
     thread::sleep(Duration::from_millis(50));
