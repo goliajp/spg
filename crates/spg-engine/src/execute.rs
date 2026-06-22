@@ -110,7 +110,14 @@ impl Engine {
             resolve_order_by_position(s);
             // v6.2.3 — cost-based JOIN reorder. No-op for
             // single-table FROMs or any non-INNER join shape.
-            reorder::reorder_joins(s, &self.catalog, &self.statistics);
+            // v7.38 元机制 D — `SPG_TEST_PLAN_DETERMINISTIC=1` gates
+            // this so regression tests pin a stable join order.
+            reorder::reorder_joins_with(
+                s,
+                &self.catalog,
+                &self.statistics,
+                self.env_cfg.plan_deterministic,
+            );
         }
         Ok(stmt)
     }

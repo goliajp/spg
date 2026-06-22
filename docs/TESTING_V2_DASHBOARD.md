@@ -86,8 +86,8 @@ Branch: `feature/v7.38-test-constitution` @ commit `fcc9c3b`
 
 | Acceptance | 状态 | Evidence | Gap |
 |---|---|---|---|
-| ≥ 7 旋钮接进 engine,index 写每个 acceptor 行号 | ⚠️ 4/8 LANDED | `xtests/sigil/test-mode-gucs.md`:`EXPLAIN_NO_COSTS` `DISABLE_TOPK` `RANDOM_SEED` `DISABLE_JOINFOLD` LANDED;其余 4 (`COMPUTE_QUERY_ID` `STATS_FROZEN` `PLAN_DETERMINISTIC` `PREFETCH_DETERMINISTIC`) TBD | `COMPUTE_QUERY_ID` 等 SPG 实加 query_id annotation;`STATS_FROZEN` / `PLAN_DETERMINISTIC` 仍待 wire(每个 ~30-60 LOC + 1 e2e) |
-| 每旋钮 1 testcase 验证关掉对应 surface | ⚠️ 4/8 | `e2e_env_cfg_explain_no_costs` / `_disable_topk` / `_random_seed` / `_disable_joinfold` 都已 PASS | 同上 4 个 TBD |
+| ≥ 7 旋钮接进 engine,index 写每个 acceptor 行号 | ⚠️ 6/8 LANDED | `xtests/sigil/test-mode-gucs.md`:`EXPLAIN_NO_COSTS` `DISABLE_TOPK` `RANDOM_SEED` `DISABLE_JOINFOLD` `STATS_FROZEN` `PLAN_DETERMINISTIC` LANDED;其余 2 (`COMPUTE_QUERY_ID` `PREFETCH_DETERMINISTIC`) TBD | `COMPUTE_QUERY_ID` 等 SPG 加 query_id annotation;`PREFETCH_DETERMINISTIC` 等 prefetch path 落 surface |
+| 每旋钮 1 testcase 验证关掉对应 surface | ⚠️ 6/8 | `e2e_env_cfg_explain_no_costs` / `_disable_topk` / `_random_seed` / `_disable_joinfold` / `_stats_frozen` / `_plan_deterministic` 都已 PASS | 同上 2 个 TBD |
 
 ---
 
