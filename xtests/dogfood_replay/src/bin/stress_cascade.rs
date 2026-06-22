@@ -332,8 +332,41 @@ fn main() -> Result<()> {
     let snapshot = Arc::new(db.engine().clone_snapshot());
     let workload = Arc::new(Workload::new(&args.user, &args.mailbox));
 
+    // v7.37.7 round-2 contention instrumentation — reset
+    // `MemoizeCache::counters` between phases to attribute new()/put()/drop
+    // counts strictly to the timed runs (warmup excluded).
+    spg_engine::memoize::counters::reset();
+    let pullup_before_single =
+        spg_engine::EXISTS_PULLUP_FIRE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let single = run_phase(&snapshot, &workload, 1, args.iters, args.warmup, "single");
+    let single_counters = spg_engine::memoize::counters::snapshot();
+    let pullup_single = spg_engine::EXISTS_PULLUP_FIRE_COUNT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - pullup_before_single;
     print_stats("Single-thread (workers=1)", &single);
+    println!(
+        "  [memoize counters / single] new={} put={} max_entries_seen={} drop_empty={} drop_with_entries={}",
+        single_counters.new_calls,
+        single_counters.put_calls,
+        single_counters.max_entries_seen,
+        single_counters.drop_with_zero_entries,
+        single_counters.drop_with_entries
+    );
+    println!(
+        "  [pullup / single] candidate={} fire={} bail_inner_shape={} bail_inner_from={} bail_no_where={} bail_residual_not_inner={} bail_no_corr={} bail_multicol_disabled={} bail_unique_key_missing={}",
+        spg_engine::EXISTS_PULLUP_CANDIDATE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        pullup_single,
+        spg_engine::EXISTS_PULLUP_BAIL_INNER_SHAPE.load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_INNER_FROM.load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_NO_WHERE.load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER
+            .load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_NO_CORR.load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_MULTICOL_DISABLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
 
     eprintln!(
         "\nspawning {} concurrent workers × {} iters × {} classes...",
@@ -341,6 +374,7 @@ fn main() -> Result<()> {
         args.iters,
         CLASSES.len()
     );
+    spg_engine::memoize::counters::reset();
     let conc = run_phase(
         &snapshot,
         &workload,
@@ -349,7 +383,16 @@ fn main() -> Result<()> {
         args.warmup,
         "concurrent",
     );
+    let conc_counters = spg_engine::memoize::counters::snapshot();
     print_stats(&format!("Concurrent (workers={})", args.workers), &conc);
+    println!(
+        "  [memoize counters / concurrent] new={} put={} max_entries_seen={} drop_empty={} drop_with_entries={}",
+        conc_counters.new_calls,
+        conc_counters.put_calls,
+        conc_counters.max_entries_seen,
+        conc_counters.drop_with_zero_entries,
+        conc_counters.drop_with_entries
+    );
 
     amplification_table(&single, &conc);
 
