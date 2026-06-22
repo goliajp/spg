@@ -527,6 +527,40 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
+            // v7.38 轴 4 — `SET TRANSACTION ISOLATION LEVEL …`. The
+            // surface is recorded on `Engine::current_isolation_level`
+            // and visible via `SHOW transaction_isolation`. Behavioural
+            // implementation (REPEATABLE READ snapshot / SERIALIZABLE
+            // SSI) lands separately; today every level reads as
+            // effective READ COMMITTED (same as PG's silent upgrade
+            // of READ UNCOMMITTED).
+            Statement::SetTransaction { isolation } => {
+                self.current_isolation_level = isolation;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
+            // v7.38 轴 4 — `SHOW transaction_isolation` returns the
+            // currently-selected level as a 1-row 1-column TEXT
+            // result (PG psql wire shape). Other parameters land as
+            // the session-parameter inventory grows.
+            Statement::ShowParameter(name) => {
+                use spg_storage::{ColumnSchema, DataType, Row, Value};
+                let value = match name.as_str() {
+                    "transaction_isolation" => self.current_isolation_level.as_pg_str(),
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "SHOW {other:?}: parameter not recognised in v7.37.8 \
+                             (v7.38 轴 4 surface expansion lands further parameters)"
+                        )));
+                    }
+                };
+                Ok(QueryResult::Rows {
+                    columns: alloc::vec![ColumnSchema::new(name, DataType::Text, false)],
+                    rows: alloc::vec![Row::new(alloc::vec![Value::text(value)])],
+                })
+            }
             // v7.14.0 — MySQL multi-assignment SET. Each pair runs
             // through `set_session_param` so engine-known params
             // (FOREIGN_KEY_CHECKS, session_replication_role, …) take

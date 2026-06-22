@@ -1,41 +1,94 @@
-# SET TRANSACTION ISOLATION LEVEL — surface gap
+# SET TRANSACTION ISOLATION LEVEL — landed in v7.37.8
 #
-# Status: parser does NOT recognise the syntax today (v7.37.8).
-# Each line below is marked `statement error` so a regression is
-# caught immediately when the surface lands (the assertion flips
-# from "errors today" to "must accept" → the author fills in the
-# behavioural checks).
+# History: was a gap-tracker (5 `statement error` records) until
+# v7.37.8 wired the SQL surface. Today the parser accepts all PG-
+# standard isolation levels + the optional READ ONLY / READ WRITE
+# / [NOT] DEFERRABLE clauses; the engine tracks the selected
+# level on `Engine::current_isolation_level()`; `SHOW
+# transaction_isolation` returns it as the PG-canonical string
+# (`read committed`, `repeatable read`, `serializable` — `read
+# uncommitted` silently upgrades to `read committed` per PG).
 #
-# Per v7.38 plan §二 轴 4 + dashboard §1 metabox 4: SPG must
-# accept PG-standard `SET TRANSACTION ISOLATION LEVEL` and
-# `START TRANSACTION ISOLATION LEVEL`, track the current level
-# per-transaction, and reflect it through
-# `SHOW transaction_isolation`. The actual isolation semantics
-# (REPEATABLE READ snapshot, SERIALIZABLE SSI) are separate work
-# tracked in the same axis.
-#
-# Vision contract: SPG is to be ≥ PG on every angle
-# (memory/vision-spg-ge-pg-everywhere.md). PG ships these as
-# standard surface; SPG must too.
-#
-# When the surface lands:
-# 1. Implement parser support + engine state.
-# 2. Flip each `statement error` below to `statement ok`.
-# 3. Add `query T nosort` blocks asserting `SHOW transaction_isolation`
-#    returns the value just SET.
-# 4. Update 16_isolation/_README.md status column to LANDED.
+# Actual MVCC / SSI semantic differentiation lands in the v7.38
+# isolation framework train (corpus 17_isolation_semantics/).
+# Until then every level reads as effective READ COMMITTED.
 
-statement error
+# Default before any SET: should be `read committed`.
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# READ COMMITTED — no-change for the default.
+statement ok
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED
 
-statement error
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# READ UNCOMMITTED upgrades to READ COMMITTED per PG.
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# REPEATABLE READ — recorded but treated as READ COMMITTED today.
+statement ok
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
 
-statement error
+query T nosort
+SHOW transaction_isolation
+----
+repeatable read
+
+# SERIALIZABLE — recorded but treated as READ COMMITTED today.
+statement ok
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
 
-statement error
-START TRANSACTION ISOLATION LEVEL SERIALIZABLE
-
-statement error
+query T nosort
 SHOW transaction_isolation
+----
+serializable
+
+# Reset for clean test ordering.
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+# START TRANSACTION ISOLATION LEVEL also parses (clauses parse-
+# and-ignored on START/BEGIN — see _README.md). The standalone
+# SET TRANSACTION afterwards is the supported way to record a
+# specific level.
+statement ok
+START TRANSACTION
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+query T nosort
+SHOW transaction_isolation
+----
+serializable
+
+statement ok
+COMMIT
+
+# READ ONLY / READ WRITE / DEFERRABLE / NOT DEFERRABLE all parse.
+statement ok
+SET TRANSACTION READ ONLY
+
+statement ok
+SET TRANSACTION READ WRITE
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE, NOT DEFERRABLE
+
+# Final value reflects the last ISOLATION LEVEL set.
+query T nosort
+SHOW transaction_isolation
+----
+serializable

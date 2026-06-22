@@ -20,7 +20,7 @@
 
 | File | Surface | Status |
 |---|---|---|
-| `set_transaction_isolation_level.test` | `SET TRANSACTION ISOLATION LEVEL { READ COMMITTED \| REPEATABLE READ \| SERIALIZABLE }` + `START TRANSACTION ISOLATION LEVEL …` + `SHOW transaction_isolation` | ⚠️ gap — parse fails today |
+| `set_transaction_isolation_level.test` | `SET TRANSACTION ISOLATION LEVEL { READ COMMITTED \| READ UNCOMMITTED \| REPEATABLE READ \| SERIALIZABLE }` (+ optional `READ ONLY/WRITE` + `[NOT] DEFERRABLE` modes, comma-separated) + `START TRANSACTION …` + `SHOW transaction_isolation` | **LANDED in v7.37.8** — parser accepts; engine tracks selected level on `Engine::current_isolation_level()`; SHOW returns the PG-canonical string (`read committed`, `repeatable read`, `serializable`; `read uncommitted` silently upgrades per PG) |
 
 ## How to flip a gap to LANDED
 

@@ -509,6 +509,12 @@ pub struct Engine {
     /// Redo captured by the most recent successful mutating `execute`,
     /// awaiting drain by the embedding layer. Cleared on each capture.
     last_redo: Vec<RowChange>,
+    /// v7.38 轴 4 — currently-selected SQL isolation level. Set by
+    /// `SET TRANSACTION ISOLATION LEVEL …`; read by
+    /// `SHOW transaction_isolation`. v7.37.8 implements the
+    /// SQL surface; actual semantic differentiation (REPEATABLE READ
+    /// snapshot / SERIALIZABLE SSI) lands in a separate train.
+    pub(crate) current_isolation_level: spg_sql::ast::IsolationLevel,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -595,6 +601,7 @@ impl Engine {
                 crate::testkit::injection::InjectionStore::default(),
             ),
             redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
         }
     }
@@ -652,6 +659,7 @@ impl Engine {
                 crate::testkit::injection::InjectionStore::default(),
             ),
             redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
         }
     }
@@ -724,6 +732,7 @@ impl Engine {
                         crate::testkit::injection::InjectionStore::default(),
                     ),
                     redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
                     last_redo: Vec::new(),
                 })
             }
@@ -1021,6 +1030,14 @@ impl Engine {
     /// on `Drop`).
     pub fn redo_capture_enabled(&self) -> bool {
         self.redo_capture
+    }
+
+    /// v7.38 轴 4 — currently-selected SQL isolation level. Default
+    /// `ReadCommitted` after construction; updated by
+    /// `SET TRANSACTION ISOLATION LEVEL …`. Read by
+    /// `SHOW transaction_isolation` and any future MVCC/SSI gate.
+    pub fn current_isolation_level(&self) -> spg_sql::ast::IsolationLevel {
+        self.current_isolation_level
     }
 
     /// v7.34 — take the redo captured by the most recent successful
