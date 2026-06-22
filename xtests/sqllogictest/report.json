@@ -463,7 +463,7 @@
         { "file": "serial.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "spg_baseline/11_dialect", "pass": 37, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/11_dialect", "pass": 53, "fail": 0, "skip": 0,
       "files": [
         { "file": "pg_array_ops.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -482,6 +482,8 @@
         { "file": "pg_returning.test", "pass": 2, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "pg_sequence.test", "pass": 4, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "pg_show_session_params.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "pg_string_funcs.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }

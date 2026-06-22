@@ -541,19 +541,68 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
-            // v7.38 轴 4 — `SHOW transaction_isolation` returns the
-            // currently-selected level as a 1-row 1-column TEXT
-            // result (PG psql wire shape). Other parameters land as
-            // the session-parameter inventory grows.
+            // v7.38 轴 4 surface expansion — `SHOW <parameter>`
+            // returns a 1-row 1-column TEXT result (the PG psql
+            // wire shape). The handler dispatches per-name:
+            //
+            // 1. transaction_isolation — direct read of
+            //    current_isolation_level (the v7.38 axis-4 surface).
+            // 2. PG preset / engine-tracked params — values mirror
+            //    pg_catalog.pg_settings to keep ORM /
+            //    driver-connect probes happy (sqlx asks
+            //    server_version + standard_conforming_strings +
+            //    client_encoding; npgsql asks application_name;
+            //    asyncpg asks search_path). Any
+            //    SET-tracked override on self.session_params wins.
+            // 3. Anything else — error with a list-pointer to
+            //    pg_settings (which lists every recognised name).
             Statement::ShowParameter(name) => {
                 use spg_storage::{ColumnSchema, DataType, Row, Value};
-                let value = match name.as_str() {
+                let owned;
+                let value: &str = match name.as_str() {
                     "transaction_isolation" => self.current_isolation_level.as_pg_str(),
+                    "server_version" => "16.0 (spg)",
+                    "server_encoding" => "UTF8",
+                    "is_superuser" => "on",
+                    "TimeZone" | "timezone" => self
+                        .session_param("TimeZone")
+                        .or_else(|| self.session_param("timezone"))
+                        .unwrap_or("UTC"),
+                    "DateStyle" | "datestyle" => self
+                        .session_param("DateStyle")
+                        .or_else(|| self.session_param("datestyle"))
+                        .unwrap_or("ISO, MDY"),
+                    "client_encoding" => {
+                        self.session_param("client_encoding").unwrap_or("UTF8")
+                    }
+                    "standard_conforming_strings" => self
+                        .session_param("standard_conforming_strings")
+                        .unwrap_or("on"),
+                    "search_path" => self.session_param("search_path").unwrap_or("\"$user\", public"),
+                    "application_name" => self.session_param("application_name").unwrap_or(""),
+                    "statement_timeout" => {
+                        self.session_param("statement_timeout").unwrap_or("0")
+                    }
+                    "default_transaction_isolation" => self
+                        .session_param("default_transaction_isolation")
+                        .unwrap_or("read committed"),
+                    "intervalstyle" | "IntervalStyle" => self
+                        .session_param("IntervalStyle")
+                        .or_else(|| self.session_param("intervalstyle"))
+                        .unwrap_or("postgres"),
                     other => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "SHOW {other:?}: parameter not recognised in v7.37.8 \
-                             (v7.38 轴 4 surface expansion lands further parameters)"
-                        )));
+                        // Fall through to session_params for any user-set
+                        // override that didn't fall into a named bucket.
+                        if let Some(v) = self.session_param(other) {
+                            owned = alloc::string::String::from(v);
+                            &owned
+                        } else {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "SHOW {other:?}: parameter not recognised; \
+                                 see `SELECT name, setting FROM pg_settings` for \
+                                 the full inventory"
+                            )));
+                        }
                     }
                 };
                 Ok(QueryResult::Rows {
