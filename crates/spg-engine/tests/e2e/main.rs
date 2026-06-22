@@ -47,6 +47,13 @@ mod e2e_exists_decorrelation;
     clippy::uninlined_format_args
 )]
 mod e2e_explain_analyze;
+mod e2e_b4_lateral_probe;
+mod e2e_c1_gap_probe;
+mod e2e_cardinality_modulo;
+mod e2e_explain_costs_off;
+mod e2e_filter_clause;
+mod e2e_join_using;
+mod e2e_substring_from_for;
 mod e2e_expression_index;
 mod e2e_fetch_with_ties;
 mod e2e_fk_advanced;

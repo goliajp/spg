@@ -8,6 +8,123 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.37.7] — 2026-06-22 (mailrs cascade 4th-recurrence closure + 8/11 parser gaps)
+
+Hotfix train. mailrs reported a 4th consecutive cascade on the
+v7.37.6 first prod cycle; this release closes the cascade at the
+planner layer + lands the observability/defense layer that should
+have surrounded the prior fixes, and finishes 8 of the 11 SQL
+surface gaps the v7.37.5 baseline-corpus follow-up flagged.
+
+**Cascade root cause (K02)** — `visit_expr_columns_and_subqueries`
+in `expr_analysis.rs` had no match arm for `Expr::InList`; the
+fall-through emitted a BAIL `ColumnName` with no qualifier, so
+`expr_is_all_inner` returned false on any `inner.col IN (literals)`
+conjunct, blocking `pull_up_exists_sublinks` for every mailrs
+Class B prod shape. ~5 LOC visitor fix → per-outer-row inner
+SELECT path goes away → cascade collapses.
+
+Stress harness on the 06-20 prod snapshot
+(SHA-256 `f0ad88ba…`), workers=20, 4-run range:
+
+| Metric              | Pre-K02 | Post-K02 (this release) |
+|---------------------|---------|-------------------------|
+| Class B single p50  | 70.42 ms| **1.4 ms**             |
+| Class B conc-20 p50 | 615 ms  | **1.6 ms**             |
+| Class B amplification | 8.74×  | **1.15× (1.12-1.22)**  |
+| Class B MemoizeCache::new per query | 9,335 | ~3 |
+| EXISTS_PULLUP fire rate | 0% | **100%** |
+
+vs PG18 baseline (`<100 ms cold` reported by mailrs) SPG now at
+1.3-1.6 ms warm — well past PG18 parity per vision-spg-ge-pg-everywhere.
+
+**Server-side hygiene (independent of K02)**
+- `SET statement_timeout = N` SQL GUC — PG-standard per-session
+  timeout. spg-server's per-query watchdog now picks the tighter
+  of `min(SPG_QUERY_TIMEOUT_MS, SPG_MAX_QUERY_NS, session
+  statement_timeout)`.
+- Slowlog default-on: `SPG_SLOW_QUERY_LOG_MS` defaults to `1000`
+  (1 s threshold) when unset. Any prod deploy now captures slow
+  queries without operator opt-in.
+- `pg_stat_statements` view alias to the native `spg_stat_query`
+  view so PG-native dashboards (pgAdmin, Datadog, pgmetrics) just
+  work.
+
+**Permanent dogfood infrastructure**
+- `xtests/dogfood_replay/src/bin/spg-stress-cascade` — concurrent
+  stress harness; reads queries verbatim from fixture `queries.sql`
+  files (A.3 fidelity fix means harness ≠ fixture drift can't
+  happen again).
+- `MemoizeCache::counters` (new / put / max_entries_seen /
+  drop_empty / drop_with_entries) and per-guard
+  `EXISTS_PULLUP_BAIL_*` counters — surfaced K02's exact failure
+  mode in seconds, kept on for every future cascade investigation.
+- `SPG_OPEN_PATH_TIMING=1` env var enables per-stage timing for
+  `Database::open_path`, including a per-WAL-record-type histogram
+  inside `replay_wal_filtered`. v7.37.5's claimed 646 ms open_path
+  was on a synthetic V5-record path; real prod snapshot replays
+  V4 SQL records and takes 218-250 s. The audit lives in
+  `.claude/notes/v7.37.7-A1-open-path-audit.md` with Option A/B/C
+  fix paths for a separate train.
+
+**SQL surface — 8 of 11 baseline-corpus gaps closed**
+- `EXPLAIN (COSTS OFF)` — PG-standard option; strips wall-clock
+  `elapsed=…us` from Total line. New AST field, no runtime cost
+  when off.
+- `JOIN … USING (col_list)` — parser sugar; desugars to
+  `prev_table.col = right.col [AND …]`.
+- `FILTER (WHERE …)` — pinned (already worked since v7.32; 4 new
+  e2e tests for diff-friendly corpus markers).
+- `cardinality(array)` — PG-standard 1-arg builtin alongside
+  existing `array_length(arr, dim)`.
+- `%` modulo operator — new `Token::Percent` + `BinOp::Mod`;
+  `i64::rem_euclid` for ints, C `fmod` for floats; same precedence
+  as `*` / `/`.
+- `substring(str FROM pos [FOR len])` — PG-keyword syntactic
+  form; desugars at parse time to the existing comma-list
+  evaluator path.
+- `INTERVAL` as column type — confirmed working.
+- `CREATE INDEX ((expr))` expression index — confirmed working.
+
+Remaining 3 (`VALUES (...) AS v(c1, c2)`, `ANY (subquery)` form,
+writable CTE with `INSERT/UPDATE/DELETE + RETURNING` wrapped in
+outer SELECT) are structural changes deferred to a follow-up
+train; gap probe e2e in `e2e_c1_gap_probe.rs` will keep them
+visible.
+
+**B sentori epics — already shipped audit**
+LATERAL / PARTITION BY RANGE / GENERATED ALWAYS … STORED /
+GIN-on-jsonb / jsonb_each_text SRF / Epic 7 throughput perf_gate
+all confirmed shipped in v7.37.4-6 trains; this release adds an
+LATERAL-beyond-jsonb-each-text probe and writes the audit into
+`.claude/notes/v7.37-backlog-checklist.md`.
+
+**Methodology change**
+v7.37.7 added a hard new principle to the project methodology:
+**counter-first, not samply-first**. samply attribution to
+`MemoizeCache::new` looked correct for the cascade (67.8% CPU);
+the K01 attack against that surface was sub-noise because the
+*cost mechanism* was per-row call frequency, not the eager
+`VecDeque` alloc samply pointed at. Runtime counters at the
+predicted cost site disambiguate "where the CPU lives" from
+"which code path drives it". See
+`memory/feedback-counter-first-not-samply.md` + the full lesson
+note `.claude/notes/v7.37.7-k02-lesson-samply-vs-counters.md`.
+
+**Validation**
+- `cargo test -p spg-engine`: 253 lib + 1820+ e2e PASS, 0 fail
+- `cargo test -p spg-engine --test perf_gate --release`: 16/16 PASS
+- `cargo test -p spg-server`: 45/45 PASS
+- `cargo test -p spg-embedded`: 12 + 146 + 1 PASS
+- 4-run stress harness stable at Class B amplification 1.12-1.22×
+
+Cascade-closure ack drafted at
+`stables/mailrs/.claude/notes/spg-7.37.7-cascade-closure-2026-06-22.md`
+with self-criticism first, full investigation narrative, and the
+counter-first methodology change documented.
+
+---
+
 ## [7.32.1] — 2026-06-15 (durability hotfix — server wire writes now reach the WAL)
 
 A database that loses acknowledged writes is broken. Every non-native
