@@ -125,7 +125,7 @@ Branch: `feature/v7.38-test-constitution` @ commit `fcc9c3b`
 | Hermitage 11 case × 3 iso level = 33 格 | ❌ | 同上 | — |
 | Elle on `list-append` + `rw-register` | ❌ | 同上 | — |
 | Jepsen postgresql-12.3 "fresh insert G2-item" 反向测试 — SPG **不修复** | ❌ | 同上;**重要**:SPG STABILITY.md 未明确列哪些 anomaly 故意不修(PG 兼容意味的) | 设计补 + 测试补 双坑 |
-| 轴 4 SQL surface gap-tracker | ⚠️ 1 file / 5 records | `xtests/sqllogictest/corpus/spg_baseline/16_isolation/set_transaction_isolation_level.test` — `SET / START TRANSACTION ISOLATION LEVEL` + `SHOW transaction_isolation` 全标 `statement error`(EXPECTED FAILURE 模式),surface 落即 flip 到 LANDED | parser + engine state 待加;dir + README 已建,后续 surface 直接登记 |
+| 轴 4 SQL surface | ✅ **LANDED v7.37.8** | `xtests/sqllogictest/corpus/spg_baseline/16_isolation/set_transaction_isolation_level.test` 18/18 PASS;parser 接所有 4 standard iso levels(`READ UNCOMMITTED`/`READ COMMITTED`/`REPEATABLE READ`/`SERIALIZABLE`)+ `READ ONLY/WRITE` + `[NOT] DEFERRABLE` + comma-separated combos;`Engine::current_isolation_level()` accessor;`SHOW transaction_isolation` 返回 PG-canonical string(`read uncommitted` silently upgrades 同 PG)| MVCC / SSI 真 isolation 语义(REPEATABLE READ snapshot / SERIALIZABLE SSI)— v7.38 isolation framework 单独 train |
 
 ### 轴 5 — 事务一致性 + 崩溃原子性(整轴未起步)
 

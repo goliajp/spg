@@ -23,10 +23,10 @@ use crate::ast::{
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
-    JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
-    PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
-    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
-    WindowFrame,
+    IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare,
+    PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem,
+    SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp,
+    UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -598,6 +598,38 @@ impl Parser {
             Token::Insert => self.parse_insert_stmt(),
             Token::Begin => {
                 self.advance();
+                // v7.38 轴 4 — PG-standard `BEGIN [WORK|TRANSACTION]
+                // [ISOLATION LEVEL …] [READ ONLY|WRITE]
+                // [[NOT] DEFERRABLE]`. We accept the optional
+                // TRANSACTION/WORK noise word and parse-and-ignore
+                // trailing iso modes (parser doesn't reject the
+                // syntax; the iso level is only honoured when set
+                // via the dedicated `SET TRANSACTION` statement
+                // until the v7.38 isolation framework lands a
+                // per-TX level field on the engine).
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("work") || s.eq_ignore_ascii_case("transaction"))
+                {
+                    self.advance();
+                    // Parse-and-ignore any trailing modes.
+                    let _ = self.parse_isolation_level_clauses()?;
+                }
+                Ok(Statement::Begin)
+            }
+            // v7.38 轴 4 — PG-standard `START TRANSACTION …` synonym
+            // for BEGIN. START is contextual in PG too; pattern-match
+            // on the ident here. Iso clauses are parse-and-ignored,
+            // same as BEGIN above.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("start") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected TRANSACTION after START, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let _ = self.parse_isolation_level_clauses()?;
                 Ok(Statement::Begin)
             }
             Token::Commit => {
@@ -661,6 +693,11 @@ impl Parser {
                 match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
+                    // v7.38 轴 4 — `SHOW transaction_isolation`
+                    // returns the currently-selected isolation level.
+                    "transaction_isolation" => Ok(Statement::ShowParameter(
+                        "transaction_isolation".to_string(),
+                    )),
                     // v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE
                     // TABLE <t>` returns a 2-column row: (Table,
                     // Create Table). mysqldump emits this for every
@@ -1176,6 +1213,24 @@ impl Parser {
                         }
                     }
                     return Ok(Statement::Empty);
+                }
+                // v7.38 轴 4 — `SET [SESSION] TRANSACTION
+                // ISOLATION LEVEL { READ COMMITTED | READ
+                // UNCOMMITTED | REPEATABLE READ | SERIALIZABLE }
+                // [, READ {ONLY|WRITE}] [, [NOT] DEFERRABLE]`.
+                // PG-standard surface. v7.37.8 accepts the syntax
+                // and tracks the selected level on
+                // `Engine::current_isolation_level()`; the actual
+                // MVCC / SSI semantics implementation lands in
+                // the 轴 4 isolation framework (separate train).
+                // PG itself maps READ UNCOMMITTED to READ COMMITTED
+                // internally; SPG behaves the same (effectively
+                // READ COMMITTED at every level today).
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction"))
+                {
+                    self.advance(); // TRANSACTION
+                    let level = self.parse_isolation_level_clauses()?;
+                    return Ok(Statement::SetTransaction { isolation: level });
                 }
                 // v7.14.0 — MySQL `SET CHARACTER SET <charset>`
                 // alias — same accept-as-no-op as SET NAMES.
@@ -3427,6 +3482,113 @@ impl Parser {
                 "expected literal, identifier, or DEFAULT after `=` in SET, got {other:?}"
             ))),
         }
+    }
+
+    /// v7.38 轴 4 — `[ISOLATION LEVEL …] [READ ONLY|WRITE]
+    /// [[NOT] DEFERRABLE]` modes after `SET TRANSACTION` or
+    /// `START TRANSACTION` / `BEGIN`. Returns the isolation level
+    /// (default `ReadCommitted` if no `ISOLATION LEVEL` clause was
+    /// present). Modes are comma-separated per PG; SPG also
+    /// accepts space-separated for tolerance. READ ONLY / WRITE
+    /// / DEFERRABLE are parsed-and-ignored (recorded for future
+    /// surface but not behaviorally honoured today).
+    fn parse_isolation_level_clauses(&mut self) -> Result<IsolationLevel, ParseError> {
+        let mut level = IsolationLevel::default();
+        let mut have_level = false;
+        loop {
+            // ISOLATION LEVEL …
+            let saw_isolation = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("isolation"));
+            if saw_isolation {
+                self.advance(); // ISOLATION
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("level"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected LEVEL after ISOLATION, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance(); // LEVEL
+                // SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED
+                let w1 = self
+                    .expect_ident_like()
+                    .map_err(|e| self.err(alloc::format!("isolation level: {e:?}")))?;
+                let lc = w1.to_ascii_lowercase();
+                level = match lc.as_str() {
+                    "serializable" => IsolationLevel::Serializable,
+                    "repeatable" => {
+                        // Expect READ
+                        let w2 = self
+                            .expect_ident_like()
+                            .map_err(|e| self.err(alloc::format!("REPEATABLE …: {e:?}")))?;
+                        if !w2.eq_ignore_ascii_case("read") {
+                            return Err(self.err(alloc::format!(
+                                "expected READ after REPEATABLE, got {w2:?}"
+                            )));
+                        }
+                        IsolationLevel::RepeatableRead
+                    }
+                    "read" => {
+                        let w2 = self
+                            .expect_ident_like()
+                            .map_err(|e| self.err(alloc::format!("READ …: {e:?}")))?;
+                        match w2.to_ascii_lowercase().as_str() {
+                            "committed" => IsolationLevel::ReadCommitted,
+                            "uncommitted" => IsolationLevel::ReadUncommitted,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected COMMITTED or UNCOMMITTED after READ, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "unknown isolation level {other:?}"
+                        )));
+                    }
+                };
+                have_level = true;
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("read"))
+            {
+                // READ ONLY | READ WRITE — parsed, not behaviorally honoured.
+                self.advance();
+                match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("only") => {
+                        self.advance();
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("write") => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ONLY or WRITE after READ, got {other:?}"
+                        )));
+                    }
+                }
+            } else if matches!(self.peek(), Token::Not) {
+                // NOT DEFERRABLE — `NOT` lexes as a reserved keyword.
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected DEFERRABLE after NOT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable"))
+            {
+                self.advance();
+            } else {
+                break;
+            }
+            // Optional comma between modes.
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            }
+        }
+        let _ = have_level;
+        Ok(level)
     }
 
     fn parse_wait_after_keyword(&mut self) -> Result<Statement, ParseError> {

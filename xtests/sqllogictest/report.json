@@ -527,9 +527,9 @@
         { "file": "round_29_filter_clause.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "spg_baseline/16_isolation", "pass": 5, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/16_isolation", "pass": 18, "fail": 0, "skip": 0,
       "files": [
-        { "file": "set_transaction_isolation_level.test", "pass": 5, "fail": 0, "skip": 0,
+        { "file": "set_transaction_isolation_level.test", "pass": 18, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] }
   ]
