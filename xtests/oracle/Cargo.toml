@@ -20,6 +20,11 @@ path = "src/main.rs"
 # side of every differential probe. Version pin matches the rest of
 # the xtests/ crates so the workspace lockfile stays clean.
 spg-engine = { path = "../../crates/spg-engine", version = "7.34" }
+# v7.38 P1 — self-diff (the fast-tier docker substitute) calls into
+# the permutation runner in-process to execute the same corpus on
+# embedded / server_simple / server_extended and assert byte-equal.
+# Bin-stage perm-runner exposes a lib surface as of v7.38 P1.
+spg-perm-runner = { path = "../perm-runner" }
 anyhow     = "1"
 clap       = { version = "4", features = ["derive"] }
 walkdir    = "2"

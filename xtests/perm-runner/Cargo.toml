@@ -7,6 +7,10 @@ license      = { workspace = true }
 description  = "v7.38 element B — permutation matrix runner. N config x 1 corpus."
 publish      = false
 
+[lib]
+name = "spg_perm_runner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "spg-perm-runner"
 path = "src/main.rs"
