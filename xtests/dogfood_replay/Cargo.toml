@@ -11,6 +11,13 @@ publish      = false
 name = "spg-dogfood-replay"
 path = "src/main.rs"
 
+[[bin]]
+# v7.37.7 — concurrent stress harness for mailrs cascade. Single-query
+# bench-style measurements have missed the cascade dynamic every cycle;
+# this binary closes the blind spot.
+name = "spg-stress-cascade"
+path = "src/bin/stress_cascade.rs"
+
 [dependencies]
 # v7.37.5 — dogfood-replay framework. Bin-only crate; the framework
 # is intentionally tight on deps so it stays buildable under
