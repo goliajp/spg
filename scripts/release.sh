@@ -63,12 +63,29 @@ echo "preflight OK: master @ $(git rev-parse --short HEAD), tag v${VERSION}"
 
 if [[ "$SKIP_CRATES" == 0 ]]; then
     banner "crates.io publish × ${#CRATES[@]}"
+    # v7.37.7 — crates.io's data-access policy now rejects bare-curl GETs
+    # with HTTP 403 ("usually means you are in violation of our API data
+    # access policy"). Send a real UA so the skip-check works again; the
+    # endpoint returns HTTP 200 when the version exists.
+    UA="release.sh/$VERSION (goliajp/spg; help@golia.jp)"
     for crate in "${CRATES[@]}"; do
-        if curl -fsS "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null 2>&1; then
+        if curl -fsS -A "$UA" "https://crates.io/api/v1/crates/${crate}/${VERSION}" \
+            >/dev/null 2>&1; then
             echo "  ${crate} ${VERSION} already on crates.io — skip"
         else
             echo "  publishing ${crate} ${VERSION}"
-            cargo publish -p "$crate" --locked
+            # If a prior retry left this version in the index but the UA
+            # check above somehow still missed it, the cargo publish call
+            # below will fail with "already exists on crates.io index";
+            # treat that case as success so the loop continues.
+            if ! cargo publish -p "$crate" --locked 2> /tmp/release-publish-err.txt; then
+                if grep -q "already exists on crates.io index" /tmp/release-publish-err.txt; then
+                    echo "  ${crate} ${VERSION} already on crates.io — skip (post-publish)"
+                else
+                    cat /tmp/release-publish-err.txt >&2
+                    exit 1
+                fi
+            fi
         fi
     done
 else
