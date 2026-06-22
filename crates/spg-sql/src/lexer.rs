@@ -62,6 +62,10 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    /// v7.37.7 C.1.7 — PG `%` integer modulo operator (also short for
+    /// `mod(y, x)`). MySQL accepts `MOD` keyword + `%`; SPG follows
+    /// the PG form here. Token alone (no `%=` etc., kept simple).
+    Percent,
     Eq,
     NotEq,
     Lt,
@@ -495,6 +499,7 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             }
             b'*' => single(&mut out, Token::Star, &mut i),
             b'/' => single(&mut out, Token::Slash, &mut i),
+            b'%' => single(&mut out, Token::Percent, &mut i),
             b'(' => single(&mut out, Token::LParen, &mut i),
             b')' => single(&mut out, Token::RParen, &mut i),
             b'[' => single(&mut out, Token::LBracket, &mut i),
@@ -1338,7 +1343,7 @@ mod tests {
     #[test]
     fn all_comparison_and_arithmetic_operators() {
         assert_eq!(
-            lex("= <> != < <= > >= + - * /"),
+            lex("= <> != < <= > >= + - * / %"),
             vec![
                 Token::Eq,
                 Token::NotEq,
@@ -1351,6 +1356,7 @@ mod tests {
                 Token::Minus,
                 Token::Star,
                 Token::Slash,
+                Token::Percent,
                 Token::Eof,
             ]
         );

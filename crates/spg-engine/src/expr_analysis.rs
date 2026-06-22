@@ -185,6 +185,25 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
             visit_expr_columns_and_subqueries(target, on_col, on_sub);
             visit_expr_columns_and_subqueries(index, on_col, on_sub);
         }
+        // v7.37.7 K02 root-cause fix (mailrs cascade 4th recurrence):
+        // missing arm caused `Expr::InList` to fall through to the
+        // exotic "_" arm which emits a BAIL ColumnName with no
+        // qualifier — `expr_is_all_inner` then returned false for
+        // ANY conjunct of the form `inner.col IN (literals)`, so the
+        // `pull_up_exists_sublinks` pass refused to rewrite Class B's
+        // `WHERE ea.message_id = m.id AND ea.category IN ('spam','scam')`
+        // and the per-outer-row inner SELECT path stayed live (~10k
+        // MemoizeCache lifecycles per query, ~1.9 GB allocator churn,
+        // cascaded under 20-conn concurrency to ~8× amplification).
+        // Visiting the `expr` and each list item is the same shape
+        // every other binary/n-ary node uses; semantics are preserved
+        // for callers that only count columns (no `BAIL` injected).
+        Expr::InList { expr, list, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+            for item in list {
+                visit_expr_columns_and_subqueries(item, on_col, on_sub);
+            }
+        }
         Expr::Literal(_) | Expr::Placeholder(_) => {}
         // Exotic nodes (window etc.) — visit nothing extra; their
         // columns are caught when the caller bails on bare names

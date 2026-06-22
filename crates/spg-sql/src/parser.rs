@@ -511,31 +511,72 @@ impl Parser {
                 self.advance();
                 let mut analyze = false;
                 let mut suggest = false;
-                // v6.8.3 — `EXPLAIN (SUGGEST)` opt-in.
+                let mut costs_off = false;
+                // v6.8.3 + v7.37.7 — `EXPLAIN (option [, option…])`
+                // syntax accepts SUGGEST + COSTS ON|OFF. Multiple
+                // options are comma-separated. Booleans default to ON
+                // when the value token is omitted (matches PG).
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
-                    let opt = match self.peek().clone() {
-                        Token::Ident(s) | Token::QuotedIdent(s) => s,
-                        other => {
+                    loop {
+                        let opt = match self.peek().clone() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected option keyword inside EXPLAIN (…), got {other:?}"
+                                )));
+                            }
+                        };
+                        self.advance();
+                        if opt.eq_ignore_ascii_case("suggest") {
+                            suggest = true;
+                            // SUGGEST takes no explicit value today.
+                        } else if opt.eq_ignore_ascii_case("costs") {
+                            // PG syntax: `COSTS [ON | OFF]`. Default
+                            // when value omitted is ON, so plain
+                            // `COSTS` is a no-op. `COSTS OFF` flips.
+                            // `ON` lexes to `Token::On` (reserved
+                            // keyword in JOIN ... ON contexts); accept
+                            // it alongside the bare Ident form so the
+                            // grammar matches PG verbatim.
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            costs_off = !value;
+                        } else {
                             return Err(self.err(format!(
-                                "expected option keyword inside EXPLAIN (…), got {other:?}"
+                                "unknown EXPLAIN option {opt:?}; v7.37.7 supports SUGGEST, COSTS"
                             )));
                         }
-                    };
-                    if !opt.eq_ignore_ascii_case("suggest") {
-                        return Err(self.err(format!(
-                            "unknown EXPLAIN option {opt:?}; v6.8.3 supports SUGGEST"
-                        )));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
                     }
-                    self.advance();
                     if !matches!(self.peek(), Token::RParen) {
                         return Err(self.err(format!(
-                            "expected ')' after EXPLAIN option, got {:?}",
+                            "expected ')' after EXPLAIN options, got {:?}",
                             self.peek()
                         )));
                     }
                     self.advance();
-                    suggest = true;
                 } else if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && (s.eq_ignore_ascii_case("analyze") || s.eq_ignore_ascii_case("analyse"))
                 {
@@ -550,6 +591,7 @@ impl Parser {
                     analyze,
                     inner: Box::new(s),
                     suggest,
+                    costs_off,
                 }))
             }
             Token::Create => self.parse_create_stmt(),
@@ -8045,14 +8087,103 @@ impl Parser {
                     _ => break,
                 };
             let table = self.parse_table_ref()?;
+            // v7.37.7 C.1 — USING (col_list) sugar. Desugars to
+            // `prev_table.col1 = table.col1 AND prev_table.col2 = table.col2 …`
+            // where prev_table is the most-recent left-side table
+            // (the previous join's table if any, else the FROM primary).
+            // PG semantics around column merging are richer (USING'd
+            // cols become deduplicated single output columns); for
+            // sugar purposes the predicate-only form covers the
+            // baseline corpus shape and chained `… JOIN x USING (k)
+            // JOIN y USING (k)` calls.
+            let using_match = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using"));
             let on = if matches!(self.peek(), Token::On) {
                 self.advance();
                 Some(self.parse_expr(0)?)
+            } else if using_match {
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(format!(
+                        "expected '(' after USING, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut cols: Vec<String> = Vec::new();
+                loop {
+                    match self.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s) => {
+                            self.advance();
+                            cols.push(s);
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected column name inside USING (…), got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected ',' or ')' inside USING (…), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if cols.is_empty() {
+                    return Err(self.err("USING (…) requires at least one column".to_string()));
+                }
+                // Pick the left-side alias: prev join's table if any,
+                // else FROM primary. Use alias when present, else
+                // table name (PG-equivalent qualifier).
+                let left_qual: String = joins
+                    .last()
+                    .map(|j| {
+                        j.table
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| j.table.name.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        primary
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| primary.name.clone())
+                    });
+                let right_qual = table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| table.name.clone());
+                let mut iter = cols.into_iter().map(|c| Expr::Binary {
+                    lhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        qualifier: Some(left_qual.clone()),
+                        name: c.clone(),
+                    })),
+                    op: crate::ast::BinOp::Eq,
+                    rhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        qualifier: Some(right_qual.clone()),
+                        name: c,
+                    })),
+                });
+                let first = iter.next().expect("at least one col");
+                Some(iter.fold(first, |acc, pred| Expr::Binary {
+                    lhs: alloc::boxed::Box::new(acc),
+                    op: crate::ast::BinOp::And,
+                    rhs: alloc::boxed::Box::new(pred),
+                }))
             } else if kind == JoinKind::Cross {
                 None
             } else {
                 return Err(self.err(format!(
-                    "expected ON after {:?} JOIN, got {:?}",
+                    "expected ON or USING after {:?} JOIN, got {:?}",
                     kind,
                     self.peek()
                 )));
@@ -9689,6 +9820,36 @@ impl Parser {
                             target,
                         });
                     }
+                    // v7.37.7 C.1.8 — PG `substring(str FROM pos FOR len)` syntactic
+                    // form. Desugars to the comma-list shape evaluator already
+                    // handles. Triggered after the first arg when the function
+                    // name is substring / substr and the next token is FROM
+                    // (a reserved keyword in PG; SPG also reserves it).
+                    if (first.eq_ignore_ascii_case("substring")
+                        || first.eq_ignore_ascii_case("substr"))
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::From)
+                    {
+                        self.advance();
+                        let start = self.parse_expr(0)?;
+                        args.push(start);
+                        if matches!(self.peek(), Token::For) {
+                            self.advance();
+                            let length = self.parse_expr(0)?;
+                            args.push(length);
+                        }
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close substring(... FROM ... [FOR ...]), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        return Ok(Expr::FunctionCall {
+                            name: first.to_ascii_lowercase(),
+                            args,
+                        });
+                    }
                     // v7.24 (round-16 A) — aggregate-internal
                     // ordering: `array_agg(x ORDER BY y DESC NULLS
                     // LAST)`. Keys close the argument list.
@@ -9889,6 +10050,7 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::Amp => (BinOp::BitAnd, 6),
         Token::Star => (BinOp::Mul, 7),
         Token::Slash => (BinOp::Div, 7),
+        Token::Percent => (BinOp::Mod, 7),
         // v4.14: JSON path ops bind tighter than comparisons (4)
         // and additive (6) so `doc->'k' = 'v'` parses correctly.
         // Same rung as the multiplicative ops.
