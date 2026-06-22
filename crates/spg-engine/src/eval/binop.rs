@@ -112,6 +112,7 @@ pub(super) fn apply_binary(
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
+        BinOp::Mod => mod_op(l, r),
         BinOp::L2Distance => l2_distance(l, r),
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),
@@ -397,6 +398,13 @@ fn apply_binary_numeric(
                     Err(EvalError::DivisionByZero)
                 } else {
                     Ok(Value::Float(af / bf))
+                }
+            }
+            BinOp::Mod => {
+                if bf == 0.0 {
+                    Err(EvalError::DivisionByZero)
+                } else {
+                    Ok(Value::Float(af % bf))
                 }
             }
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
@@ -885,6 +893,49 @@ fn sqrt_newton(x: f64) -> f64 {
     g
 }
 
+/// v7.37.7 C.1.7 — PG integer modulo. Float operands fall back to
+/// `f64::rem_euclid` (PG `%` on floats is C `fmod` semantics; the
+/// `rem_euclid` choice keeps the sign of the divisor for the
+/// uncommon negative-divisor case — matches PG 14+ behaviour).
+/// Division by zero surfaces as `DivisionByZero` so callers see the
+/// same error variant for `/` and `%`.
+fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+    let any_float = matches!(l.data_type(), Some(DataType::Float))
+        || matches!(r.data_type(), Some(DataType::Float));
+    if any_float {
+        let a = as_f64(&l)?;
+        let b = as_f64(&r)?;
+        if b == 0.0 {
+            return Err(EvalError::DivisionByZero);
+        }
+        return Ok(Value::Float(a % b));
+    }
+    // `arith()` is integer-only when the float fast path above didn't
+    // match; both closures take `i64`. `rem_euclid` is well-defined
+    // for i64 division (panics only on divide-by-zero, which the gate
+    // above prevents). We DO NOT need an `rem_euclid` for f64 — that
+    // path returned earlier with `%` (C-style fmod), matching PG.
+    arith(
+        l,
+        r,
+        |a, b| {
+            if b == 0 {
+                None
+            } else {
+                Some(a.rem_euclid(b))
+            }
+        },
+        // f64 fallback (when widening to Float happens inside arith);
+        // f64's `%` is C `fmod` semantics, matching PG `%` on floats.
+        |a, b| if b == 0.0 { 0.0 } else { a % b },
+        "%",
+    )
+    .map_err(|e| match e {
+        EvalError::TypeMismatch { detail } if detail.contains('%') => EvalError::DivisionByZero,
+        other => other,
+    })
+}
+
 fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     let any_float = matches!(l.data_type(), Some(DataType::Float))
         || matches!(r.data_type(), Some(DataType::Float));
@@ -1034,6 +1085,7 @@ pub(super) fn compare(
         | BinOp::Sub
         | BinOp::Mul
         | BinOp::Div
+        | BinOp::Mod
         | BinOp::L2Distance
         | BinOp::InnerProduct
         | BinOp::CosineDistance

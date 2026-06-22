@@ -40,6 +40,57 @@ use spg_storage::Value;
 /// entries" figure (V6_2_DESIGN.md L2 row 6).
 pub const DEFAULT_MAX_ENTRIES: usize = 1024;
 
+/// v7.37.7 (mailrs cascade contention round 2 instrumentation) —
+/// runtime counters to disambiguate samply attribution.
+/// `samply` reported 67.8% CPU in `MemoizeCache::new` + drop_in_place
+/// under 20-worker stress, but K01 (eager-alloc → lazy) didn't move
+/// cascade amplification — suggesting either the attribution was off
+/// or the eager 96 KB alloc isn't the dominant cost. These counters
+/// provide ground truth: how many times is `new()` actually called,
+/// how many entries does any cache ever hold, how many caches die
+/// empty. Read once at end of bench via `MemoizeCache::counter_snapshot()`.
+///
+/// Counters use Relaxed atomic ops (visibility, no synchronization).
+/// Cost per op is sub-ns and does not introduce contention.
+pub mod counters {
+    use core::sync::atomic::AtomicU64;
+
+    pub static NEW_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static PUT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static MAX_ENTRIES_SEEN: AtomicU64 = AtomicU64::new(0);
+    pub static DROP_WITH_ZERO_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    pub static DROP_WITH_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Snapshot {
+        pub new_calls: u64,
+        pub put_calls: u64,
+        pub max_entries_seen: u64,
+        pub drop_with_zero_entries: u64,
+        pub drop_with_entries: u64,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        use core::sync::atomic::Ordering::Relaxed;
+        Snapshot {
+            new_calls: NEW_CALLS.load(Relaxed),
+            put_calls: PUT_CALLS.load(Relaxed),
+            max_entries_seen: MAX_ENTRIES_SEEN.load(Relaxed),
+            drop_with_zero_entries: DROP_WITH_ZERO_ENTRIES.load(Relaxed),
+            drop_with_entries: DROP_WITH_ENTRIES.load(Relaxed),
+        }
+    }
+
+    pub fn reset() {
+        use core::sync::atomic::Ordering::Relaxed;
+        NEW_CALLS.store(0, Relaxed);
+        PUT_CALLS.store(0, Relaxed);
+        MAX_ENTRIES_SEEN.store(0, Relaxed);
+        DROP_WITH_ZERO_ENTRIES.store(0, Relaxed);
+        DROP_WITH_ENTRIES.store(0, Relaxed);
+    }
+}
+
 /// v6.2.6 — default cumulative bytes cap. 16 MiB matches the
 /// v5.5 per-query budget's 1/16 share.
 pub const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -187,6 +238,7 @@ impl Default for MemoizeCache {
 
 impl MemoizeCache {
     pub fn new() -> Self {
+        counters::NEW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             entries: VecDeque::with_capacity(DEFAULT_MAX_ENTRIES),
             max_entries: DEFAULT_MAX_ENTRIES,
@@ -256,6 +308,20 @@ impl MemoizeCache {
         }
         self.current_bytes = self.current_bytes.saturating_add(entry_bytes);
         self.entries.push_front((key, value));
+        counters::PUT_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let len = self.entries.len() as u64;
+        counters::MAX_ENTRIES_SEEN.fetch_max(len, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for MemoizeCache {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if self.entries.is_empty() {
+            counters::DROP_WITH_ZERO_ENTRIES.fetch_add(1, Relaxed);
+        } else {
+            counters::DROP_WITH_ENTRIES.fetch_add(1, Relaxed);
+        }
     }
 }
 

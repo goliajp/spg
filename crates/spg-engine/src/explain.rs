@@ -405,7 +405,13 @@ impl Engine {
             };
             annotate_explain_lines(&mut lines, row_count, self);
             let mut total = alloc::format!("Total: rows={row_count}");
-            if let Some(us) = elapsed_micros {
+            // v7.37.7 C.1 — `EXPLAIN (COSTS OFF)` strips the
+            // wall-clock `elapsed=…us` annotation so EXPLAIN diffs
+            // are byte-equal across runs. PG-standard option; used by
+            // regression suites and any diff-friendly EXPLAIN flow.
+            if !e.costs_off
+                && let Some(us) = elapsed_micros
+            {
                 total.push_str(&alloc::format!(" elapsed={us}us"));
             }
             lines.push(total);

@@ -707,6 +707,13 @@ pub struct ExplainStatement {
     /// query's WHERE / JOIN that has no covering index on the
     /// owning table.
     pub suggest: bool,
+    /// v7.37.7 — `EXPLAIN (COSTS OFF) <SELECT>` strips wall-clock
+    /// `elapsed=…us` annotations from the Total line (and any
+    /// future cost-bearing lines). PG-standard option used by
+    /// regression suites and diff-friendly EXPLAIN output. When
+    /// `true`, takes precedence over the per-session
+    /// `SPG_TEST_EXPLAIN_NO_COSTS` GUC.
+    pub costs_off: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2545,6 +2552,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// v7.37.7 C.1.7 — PG / SQL standard integer modulo. Same
+    /// precedence as Mul/Div; result type follows left operand.
+    Mod,
     /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
     /// operands of equal dimension; engine returns `Value::Float(d)`.
     L2Distance,
@@ -4611,6 +4621,7 @@ impl fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::Mod => "%",
             Self::L2Distance => "<->",
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
