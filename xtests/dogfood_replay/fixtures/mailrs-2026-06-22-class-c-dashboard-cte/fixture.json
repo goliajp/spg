@@ -1,0 +1,29 @@
+{
+  "name": "mailrs-2026-06-22-class-c-dashboard-cte",
+  "filed": "2026-06-22",
+  "source": "mailrs",
+  "report": "stables/mailrs/.claude/notes/spg-7.37.6-prod-pool-cascade-4th-recurrence-2026-06-22.md",
+  "production": true,
+  "kind": {
+    "type": "query",
+    "snapshot": {
+      "path": "snapshot.tar.gz",
+      "url": "https://snapshots.example.com/mailrs-2026-06-22.tar.gz",
+      "sha256": "f0ad88ba16b11ec2f7b53a0e50da59e20099d0ed472d061edb6bc80c195a609e",
+      "size_bytes": 246371557
+    },
+    "queries": [
+      {
+        "file": "queries.sql",
+        "warmup_iters": 20,
+        "measure_iters": 100
+      }
+    ],
+    "expected": {
+      "_comment": "Class C is the dashboard unread-CTE; PG18 baseline <100 ms cold per mailrs report. Initial budgets loose pending Phase A decomp + Phase B attack. Tighten to PG18 parity after fix lands.",
+      "cold_ms_max": 300,
+      "warm_ms_max": 200,
+      "p95_ms_max": 250
+    }
+  }
+}

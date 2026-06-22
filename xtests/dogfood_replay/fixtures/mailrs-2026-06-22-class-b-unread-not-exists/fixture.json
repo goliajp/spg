@@ -1,0 +1,29 @@
+{
+  "name": "mailrs-2026-06-22-class-b-unread-not-exists",
+  "filed": "2026-06-22",
+  "source": "mailrs",
+  "report": "stables/mailrs/.claude/notes/spg-7.37.6-prod-pool-cascade-4th-recurrence-2026-06-22.md",
+  "production": true,
+  "kind": {
+    "type": "query",
+    "snapshot": {
+      "path": "snapshot.tar.gz",
+      "url": "https://snapshots.example.com/mailrs-2026-06-22.tar.gz",
+      "sha256": "f0ad88ba16b11ec2f7b53a0e50da59e20099d0ed472d061edb6bc80c195a609e",
+      "size_bytes": 246371557
+    },
+    "queries": [
+      {
+        "file": "queries.sql",
+        "warmup_iters": 20,
+        "measure_iters": 100
+      }
+    ],
+    "expected": {
+      "_comment": "Class B is the simplest of the three classes in the 4th recurrence (mailrs 2026-06-22). PG18 baseline: <100 ms cold per mailrs report. Initial baseline budget is loose pending real measurement; tighten after Phase A decomposition + Phase B attack lands.",
+      "cold_ms_max": 200,
+      "warm_ms_max": 100,
+      "p95_ms_max": 150
+    }
+  }
+}

@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "spg-audit"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "spg-bench-competitor"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
  "spg-embedded",
@@ -1577,14 +1577,14 @@ dependencies = [
 
 [[package]]
 name = "spg-crypto"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "spg-dogfood-replay"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "spg-embedded"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "spg-embedded-tokio"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "spg-embedded",
  "spg-engine",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "spg-engine"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -1635,14 +1635,14 @@ dependencies = [
 
 [[package]]
 name = "spg-manifest"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "spg-crypto",
 ]
 
 [[package]]
 name = "spg-oracle-runner"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "spg-perm-runner"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "spg-engine",
  "spg-storage",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "spg-server"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "bumpalo",
  "libc",
@@ -1680,14 +1680,14 @@ dependencies = [
 
 [[package]]
 name = "spg-sql"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "spg-sqlx"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "spg-sqlx-pgwire"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "chrono",
  "serde_json",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "spg-storage"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -1728,14 +1728,14 @@ dependencies = [
 
 [[package]]
 name = "spg-wire"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "spgctl"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "sqllogictest"
-version = "7.37.6"
+version = "7.37.7"
 dependencies = [
  "spg-engine",
  "spg-storage",

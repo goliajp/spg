@@ -405,14 +405,19 @@ impl Engine {
             };
             annotate_explain_lines(&mut lines, row_count, self);
             let mut total = alloc::format!("Total: rows={row_count}");
-            // v7.38 元机制 D acceptor — `SPG_TEST_EXPLAIN_NO_COSTS=1`
-            // strips the nondeterministic wall-clock `elapsed=…us`
-            // annotation so EXPLAIN diffs are byte-equal across runs.
-            // See `xtests/sigil/test-mode-gucs.md`.
-            if !self.env_cfg().explain_no_costs {
-                if let Some(us) = elapsed_micros {
-                    total.push_str(&alloc::format!(" elapsed={us}us"));
-                }
+            // Two independent gates suppress the wall-clock
+            // `elapsed=…us` annotation:
+            // - v7.37.7 C.1: `EXPLAIN (COSTS OFF)` (per-statement SQL
+            //   option; PG-standard).
+            // - v7.38 元机制 D: `SPG_TEST_EXPLAIN_NO_COSTS=1`
+            //   (per-session env var; SPG-specific test-mode GUC).
+            // Either gate active → skip the annotation. Both default
+            // off in production builds.
+            if !e.costs_off
+                && !self.env_cfg().explain_no_costs
+                && let Some(us) = elapsed_micros
+            {
+                total.push_str(&alloc::format!(" elapsed={us}us"));
             }
             lines.push(total);
         }
