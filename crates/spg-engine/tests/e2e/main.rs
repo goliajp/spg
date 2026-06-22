@@ -48,6 +48,7 @@ mod e2e_exists_decorrelation;
 )]
 mod e2e_explain_analyze;
 mod e2e_explain_costs_off;
+mod e2e_filter_clause;
 mod e2e_join_using;
 mod e2e_expression_index;
 mod e2e_fetch_with_ties;
