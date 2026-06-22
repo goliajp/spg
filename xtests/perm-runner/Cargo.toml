@@ -1,0 +1,20 @@
+[package]
+name         = "spg-perm-runner"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "v7.38 element B — permutation matrix runner. N config x 1 corpus."
+publish      = false
+
+[[bin]]
+name = "spg-perm-runner"
+path = "src/main.rs"
+
+[dependencies]
+spg-engine  = { path = "../../crates/spg-engine", version = "7.34" }
+spg-storage = { path = "../../crates/spg-storage", version = "7.34" }
+sqllogictest = { path = "../sqllogictest" }
+
+[lints]
+workspace = true

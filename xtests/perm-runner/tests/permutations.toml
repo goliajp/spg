@@ -1,0 +1,72 @@
+# v7.38 element B — permutation matrix source-of-truth.
+#
+# A permutation = (mode, env-vars). The runner forks a sub-process per
+# permutation, passes its env-vars, runs the corpus through that
+# permutation's mode, and reports byte-equal vs the reference
+# permutation (`embedded`).
+#
+# Schema (minimal TOML subset; runner has its own parser):
+#   [default]
+#   corpus_root        — relative to workspace root
+#   include_globs      — list of corpus subdir names (matched literally)
+#   fast_tier          — list of permutation names included in `--fast`
+#   fast_tier_sample   — corpus subdir restricted-to in `--fast`
+#   timeout_secs       — per-fixture wallclock budget
+#
+#   [[permutation]]
+#   name               — unique identifier
+#   mode               — "embedded" | "server" (server pending v7.38 day 6)
+#   env                — table of env-vars exported into the child
+#   full_only          — bool; true = only run under `--full`
+
+[default]
+corpus_root        = "xtests/sqllogictest/corpus"
+include_globs      = ["spg_baseline"]
+fast_tier          = ["embedded", "server_simple", "topk_off"]
+fast_tier_sample   = "spg_baseline/01_basic_dml"
+timeout_secs       = 30
+
+# ---------------------------------------------------------------------------
+# 5 core permutations (every run)
+# ---------------------------------------------------------------------------
+
+[[permutation]]
+name = "embedded"
+mode = "embedded"
+env  = { }
+
+[[permutation]]
+name = "server_simple"
+mode = "server"
+env  = { SPG_PERMUTATION = "server_simple", SPG_FORCE_SIMPLE_QUERY = "1" }
+
+[[permutation]]
+name = "server_extended"
+mode = "server"
+env  = { SPG_PERMUTATION = "server_extended" }
+
+[[permutation]]
+name = "joinfold_off"
+mode = "embedded"
+env  = { SPG_TEST_DISABLE_JOINFOLD = "1" }
+
+[[permutation]]
+name = "topk_off"
+mode = "embedded"
+env  = { SPG_TEST_DISABLE_TOPK = "1" }
+
+# ---------------------------------------------------------------------------
+# --full only (release / nightly)
+# ---------------------------------------------------------------------------
+
+[[permutation]]
+name = "debug_asserts"
+mode = "embedded"
+full_only = true
+env  = { }
+
+[[permutation]]
+name = "hot_only"
+mode = "embedded"
+full_only = true
+env  = { SPG_FORCE_HOT_TIER = "1" }
