@@ -44,6 +44,34 @@ pub static BATCHED_SCALAR_FALL_THROUGH_COUNT: core::sync::atomic::AtomicU64 =
 /// the NOT EXISTS conjunct in `/api/conversations` costs ~165 ms
 /// per 100k bench iteration — figure out which path is actually
 /// being taken.
+/// v7.37.7 round-2 — counts every entry into `try_pull_up_exists_sublink`.
+/// Paired with `EXISTS_PULLUP_FIRE_COUNT` (which only fires on successful
+/// rewrite) and `EXISTS_PULLUP_BAIL_*` (per-guard rejection) so we can
+/// see WHICH guard rejects the mailrs Class B prod shape on a stress run.
+pub static EXISTS_PULLUP_CANDIDATE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2369: inner has CTE / UNION / GROUP BY / HAVING / DISTINCT
+/// / ORDER BY / LIMIT / OFFSET.
+pub static EXISTS_PULLUP_BAIL_INNER_SHAPE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2380: inner from has joins / lateral / unnest / generate_series / as_of.
+pub static EXISTS_PULLUP_BAIL_INNER_FROM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2405: inner has no WHERE.
+pub static EXISTS_PULLUP_BAIL_NO_WHERE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2446: a WHERE conjunct is not `outer=inner` Eq AND not all-inner.
+pub static EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2451: no correlation pair found.
+pub static EXISTS_PULLUP_BAIL_NO_CORR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2459: multi-col + EXISTS_PULLUP_MULTICOL_DISABLE knob.
+pub static EXISTS_PULLUP_BAIL_MULTICOL_DISABLED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bail at line 2475: positive EXISTS + inner key not single-col UNIQUE.
+pub static EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 pub static EXISTS_PULLUP_FIRE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static EXISTS_BATCH_FIRE_COUNT: core::sync::atomic::AtomicU64 =
@@ -2366,6 +2394,7 @@ impl Engine {
         outer_aliases: &alloc::collections::BTreeSet<String>,
         alias_n: usize,
     ) -> Option<(FromJoin, Option<Expr>)> {
+        EXISTS_PULLUP_CANDIDATE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if !inner.ctes.is_empty()
             || !inner.unions.is_empty()
             || inner.group_by.is_some()
@@ -2375,6 +2404,7 @@ impl Engine {
             || inner.limit.is_some()
             || inner.offset.is_some()
         {
+            EXISTS_PULLUP_BAIL_INNER_SHAPE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
         let from = inner.from.as_ref()?;
@@ -2384,6 +2414,7 @@ impl Engine {
             || from.primary.generate_series_args.is_some()
             || from.primary.as_of_segment.is_some()
         {
+            EXISTS_PULLUP_BAIL_INNER_FROM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
         let inner_table = from.primary.name.clone();
@@ -2402,7 +2433,10 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
         };
-        let w = inner.where_.as_ref()?;
+        let Some(w) = inner.where_.as_ref() else {
+            EXISTS_PULLUP_BAIL_NO_WHERE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
         // v7.37.4 A'' (mailrs prod /api/conversations 2-col anti-join) —
         // accept multi-column correlation. Today's single-pair restriction
         // forced mailrs's
@@ -2443,11 +2477,14 @@ impl Engine {
                 }
             }
             if !expr_is_all_inner(c, &inner_alias) {
+                EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return None;
             }
             rest.push(c.clone());
         }
         if corr_pairs.is_empty() {
+            EXISTS_PULLUP_BAIL_NO_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
         // Differential knob — refuse the multi-col case under test so
@@ -2456,6 +2493,8 @@ impl Engine {
         if corr_pairs.len() > 1
             && EXISTS_PULLUP_MULTICOL_DISABLE.load(core::sync::atomic::Ordering::Relaxed)
         {
+            EXISTS_PULLUP_BAIL_MULTICOL_DISABLED
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
         // EXISTS (semi-join) requires uniqueness on EVERY inner key so
@@ -2472,6 +2511,8 @@ impl Engine {
             // path (mailrs) is negated so deferring is safe.
             for (k, _) in &corr_pairs {
                 if !self.column_is_single_unique(&inner_table, k) {
+                    EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
             }
