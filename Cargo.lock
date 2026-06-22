@@ -1647,6 +1647,7 @@ dependencies = [
  "anyhow",
  "clap",
  "spg-engine",
+ "spg-perm-runner",
  "walkdir",
 ]
 
