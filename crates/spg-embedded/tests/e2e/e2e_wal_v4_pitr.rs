@@ -172,13 +172,21 @@ fn v3_records_still_load_for_backward_compat() {
     std::mem::forget(db);
 
     // Inspect: the WAL now contains the v3 prefix (migrated by
-    // open_path into wal_dir/0000…wal) + a v4 record from the
+    // open_path into wal_dir/0000…wal) + a new record from the
     // INSERT we just did. read_wal_chunks() concats every chunk
-    // in sorted order so both records show up.
+    // in sorted order so both records show up. v7.37.8: the new
+    // INSERT may emit either V4 SQL (0x10, legacy) or V5 ROW_REDO
+    // (0x13, new default since v7.37.8 flipped SPG_WAL_ROW_REDO ON)
+    // — both are correct "new write" shapes; this test cares only
+    // that the v3 prefix still loaded.
     let bytes = read_wal_chunks(&db_path);
     let recs = parse_wal_records(&bytes).unwrap();
     assert!(recs.iter().any(|r| r.type_byte == 0x01), "v3 record");
-    assert!(recs.iter().any(|r| r.type_byte == 0x10), "v4 record");
+    assert!(
+        recs.iter()
+            .any(|r| r.type_byte == 0x10 || r.type_byte == 0x13),
+        "post-load write record (v4 0x10 or v5 0x13)"
+    );
 }
 
 #[test]
