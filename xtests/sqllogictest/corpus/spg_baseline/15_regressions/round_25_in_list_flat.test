@@ -1,0 +1,64 @@
+# Round-25 (v7.30.2, mailrs P0) — IN (subquery) flat materialisation
+#
+# Before round-25:
+#   - `WHERE col IN (SELECT inner_col FROM t)` materialised the
+#     inner result set as a LEFT-DEEP `OR` chain (`col=a OR col=b
+#     OR col=c ...`).
+#   - Expression depth scaled with the inner row count.
+#   - On a 24k-row inner select, that's 24k nested `Expr::Binary`
+#     nodes → stack overflow during eval (and drop) → abort.
+#
+# After round-25:
+#   - `IN (...)` materialises to a flat `Expr::InList`.
+#   - Eval iterates over the literal list (no recursion).
+#   - Drop is iterative (no recursion).
+#
+# This corpus pins:
+#   1. Basic `IN (literal_list)` behaviour.
+#   2. `IN (subquery)` over a 100-row inner — proves the inner-row-
+#      count regression doesn't reappear at small N (the engine-
+#      level test `e2e_in_list_depth.rs` exercises the 1k+ case
+#      against a 512 KiB stack so the depth regression bisects fast).
+
+statement ok
+CREATE TABLE r25_outer (id INT NOT NULL, val INT NOT NULL)
+
+statement ok
+INSERT INTO r25_outer VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+statement ok
+CREATE TABLE r25_inner (target INT NOT NULL)
+
+statement ok
+INSERT INTO r25_inner VALUES (10), (30), (50)
+
+# Basic literal IN list.
+query II rowsort
+SELECT id, val FROM r25_outer WHERE val IN (10, 30, 50) ORDER BY id
+----
+1
+10
+3
+30
+5
+50
+
+# Subquery IN list — the regression's exact failure shape.
+query II rowsort
+SELECT id, val FROM r25_outer WHERE val IN (SELECT target FROM r25_inner) ORDER BY id
+----
+1
+10
+3
+30
+5
+50
+
+# NOT IN works on the same flat lowering.
+query II rowsort
+SELECT id, val FROM r25_outer WHERE val NOT IN (10, 30, 50) ORDER BY id
+----
+2
+20
+4
+40

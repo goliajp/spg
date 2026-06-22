@@ -1,0 +1,48 @@
+# Round-27 (v7.31.0, mailrs P0) — RETURNING expression type inference
+#
+# Before round-27:
+#   - `INSERT/UPDATE/DELETE … RETURNING <expr>` defaulted result
+#     columns to TEXT regardless of the underlying type.
+#   - Casts in the RETURNING list (`RETURNING id::INT, value::BIGINT`)
+#     came back as TEXT representations.
+#
+# After round-27:
+#   - RETURNING expression types flow from the SELECT-list inference
+#     path: bare columns inherit the source column type; casts honour
+#     their target; arithmetic stays in its widened type.
+#
+# This corpus pins the type-preservation behaviour. (Engine-level
+# coverage in `e2e_returning.rs` already exists; the corpus version
+# locks the SQL surface so a parser regression that silently downgrades
+# RETURNING types to TEXT trips here too.)
+
+statement ok
+CREATE TABLE r27_t (id INT NOT NULL PRIMARY KEY, n INT NOT NULL, b BIGINT NOT NULL)
+
+# RETURNING preserves INT
+query II nosort
+INSERT INTO r27_t (id, n, b) VALUES (1, 100, 9999999999) RETURNING id, n
+----
+1
+100
+
+# RETURNING preserves BIGINT
+query II nosort
+INSERT INTO r27_t (id, n, b) VALUES (2, 200, 8888888888) RETURNING id, b
+----
+2
+8888888888
+
+# Arithmetic in RETURNING stays in the widened type
+query II nosort
+INSERT INTO r27_t (id, n, b) VALUES (3, 300, 1) RETURNING id, n + 1
+----
+3
+301
+
+# UPDATE RETURNING preserves types too
+query II nosort
+UPDATE r27_t SET n = n + 1000 WHERE id = 1 RETURNING id, n
+----
+1
+1100

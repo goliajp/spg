@@ -509,6 +509,19 @@
     { "name": "spg_baseline/14_dialect_compat", "pass": 0, "fail": 0, "skip": 0,
       "files": [
 
+      ] },
+    { "name": "spg_baseline/15_regressions", "pass": 32, "fail": 0, "skip": 0,
+      "files": [
+        { "file": "k02_in_list_visitor.test", "pass": 6, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "round_25_in_list_flat.test", "pass": 7, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "round_27_returning_type.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "round_28_update_correlated.test", "pass": 9, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "round_29_filter_clause.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] }
       ] }
   ]
 }
