@@ -20,10 +20,10 @@
       }
     ],
     "expected": {
-      "_comment": "v7.37.5 shipped baseline (was prod 3700ms median = 37x improvement). v7.37.6 target: warm < 10ms after JOIN+WHERE walker fix.",
-      "cold_ms_max": 110,
-      "warm_ms_max": 100,
-      "p95_ms_max": 110
+      "_comment": "v7.37.6 — attack #1 (defer combined_vals materialise in try_streamed_inner_join_walk_topn) cut warm from 86ms to 7.9ms. Budgets tightened to warm <= 12ms / p95 <= 14ms with a small variance margin. Previous v7.37.5 budgets (warm 100 / cold 110) kept for cold to give a wider margin for the first-fire JIT / plan-cache cost.",
+      "cold_ms_max": 15,
+      "warm_ms_max": 12,
+      "p95_ms_max": 14
     }
   }
 }
