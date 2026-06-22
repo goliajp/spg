@@ -8,6 +8,98 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.37.8] — 2026-06-23 (mailrs lock-hang 4th recurrence — V4 SQL replay tax killed by default-on V5 ROW_REDO)
+
+Hotfix. mailrs reported a 4th distinct lock-hang on prod
+crash-recovery (`spg-7.37.7-prod-lock-hang-4th-recurrence-1.7.175-deploy-2026-06-22.md`),
+30-minute outage. v7.37.5's `ACTIVE_OPEN_PATHS` registry closed
+one race; this one is the OTHER root cause v7.37.5 missed.
+
+**Single root-cause line**: `SPG_WAL_ROW_REDO` shipped opt-in
+default-OFF "during bringup" since v7.34 (the previous "mailrs P0
+#2" ack). The only meaningful prod consumer (mailrs) is bound by
+the dogfood "zero mailrs change" contract — they cannot set env
+vars to opt into SPG fixes. Result: across **4 cascade recurrences
+between 06-16 and 06-23**, mailrs paid the V4 SQL replay tax on
+every container restart, and v7.34's actual fix never reached prod.
+**v7.37.8 flips the default ON**. An `spg-7.37.8` upgrade alone
+delivers what was always supposed to be the v7.34 fix.
+
+**What this fixes (per the mailrs 06-22 incident)**: 893 V4
+`AUTO_COMMIT_SQL` records in the quarantined WAL (715 UPDATE +
+161 INSERT + 17 DELETE, mostly `UPDATE messages SET text_body =
+'<email body>' WHERE id = ?` at ~150 ms each due to GIN/trigram
+index updates on large text bodies) take ~187 s to replay through
+the V4 SQL path. The 1st `Database::open_path` task wedges
+for that duration; the 2nd open from the sqlx pool sees
+`ACTIVE_OPEN_PATHS` populated and refuses honestly with
+"sibling busy"; mailrs's pool-retry loop times out at 4 min,
+container health-check fails, caddy returns 502. Manual
+quarantine of the WAL was the only recovery.
+
+With `SPG_WAL_ROW_REDO` default ON in v7.37.8:
+- New writes emit V5 `ROW_REDO` records (physical row changes
+  via `apply_redo`, O(rows changed)).
+- Replay applies them directly without re-executing SQL —
+  measured against the existing v7.34 differential at ~100×
+  speedup (`crates/spg-embedded/src/lib.rs::tests::ask3_apply_redo_*`).
+- The mailrs upgrade flow: ONE more 187 s replay tax on the
+  v7.37.8 upgrade boot (to drain existing V4 records), then
+  permanently fast (V4 floor advances past them at the next
+  checkpoint; future writes are V5).
+- `SPG_WAL_ROW_REDO=0` remains as an explicit operator opt-out
+  for forensics / downgrade prep.
+
+**Two more changes that keep the fix honest**:
+
+1. `pub fn revert_wal_to_seq` (PITR utility) re-routes through
+   `parse_wal_records` + per-type dispatch (mirrors
+   `replay_wal_filtered`). The pre-v7.37.8 path used
+   `decode_wal_record` which only knew V1-V3 legacy headers and
+   mis-parsed V4/V5 framed records as "truncated WAL". With V5
+   the new default, PITR has to understand it too.
+2. `Engine::redo_capture_enabled()` public read accessor so
+   embedding layers + tests verify the post-upgrade contract
+   without inspecting WAL bytes (the auto-checkpoint on `Drop`
+   truncates them).
+
+**Diagnostic kept** (NOT a behavioural fix — pure stderr output):
+`replay_wal_filtered` now emits a `[spg replay heartbeat]
+applied=N/M (X%, elapsed Ts)` line every 5 s while replay is
+running (tunable via `SPG_REPLAY_HEARTBEAT_MS`, 0 disables).
+Operators see in container logs whether replay is making
+progress.
+
+**What this commit explicitly DROPS** (per dogfood "zero mailrs
+change" contract): an earlier draft of this hotfix introduced a
+cooperative-wait surface with `SPG_OPEN_PATH_WAIT_MS=N` that
+required mailrs to set env vars to receive the fix. That's
+"擦屁股" — SPG making mailrs do its work. Reverted in this
+commit. The 2nd open_path still errors immediately with
+"sibling busy"; the FIX is that the sibling-busy window now
+collapses from minutes to milliseconds because the holder spends
+~1 ms in `apply_redo` instead of ~200 ms × N in `Engine::execute`.
+
+**Validation**:
+- `crates/spg-embedded/tests/v37_8_row_redo_default_on.rs`:
+  - default (no env) → `redo_capture_enabled() == true`
+  - `SPG_WAL_ROW_REDO=0` → `redo_capture_enabled() == false`
+  - `SPG_WAL_ROW_REDO=1` → `redo_capture_enabled() == true`
+- `crates/spg-embedded/tests/redo_recovery.rs` (v7.34 e2e crash
+  recovery via 0x13 records): PASS unchanged.
+- `crates/spg-embedded/src/lib.rs::tests::ask3_apply_redo_*` (the
+  v7.34 differential proof that `apply_redo` skips index rebuilds
+  vs per-record re-execute): PASS unchanged.
+- `crates/spg-embedded/tests/e2e/e2e_wal_v4_pitr.rs::v3_records_still_load_for_backward_compat`:
+  the v3 prefix still loads; the post-load write record is
+  either V4 (0x10) or V5 (0x13) under v7.37.8 default.
+- `crates/spg-embedded/tests/e2e/e2e_revert::revert_to_seq_apply_all_when_budget_exceeds_records`:
+  PITR works against V5 records via the new dispatch.
+- `cargo test -p spg-embedded`: 12 lib + 146 e2e + 1 redo_recovery
+  + 1 v37_8 = all PASS, 0 fail.
+
+---
+
 ## [7.37.7] — 2026-06-22 (mailrs cascade 4th-recurrence closure + 8/11 parser gaps)
 
 Hotfix train. mailrs reported a 4th consecutive cascade on the
