@@ -222,6 +222,37 @@ fn apply_function_dispatch(
         // matching PG semantics for unsupported dimensions). NULL
         // array → NULL. v7.11 TEXT[] only; non-array operand is
         // a type mismatch.
+        // v7.37.7 C.1.6 — `cardinality(arr)` is PG-standard for total
+        // element count across all dimensions. SPG v7.11 models only
+        // single-dim arrays, so the answer equals array_length(arr, 1)
+        // for non-NULL arrays; NULL array → NULL. Routed here as a
+        // synonym so dashboards / regression tools written against PG
+        // just work.
+        "cardinality" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("cardinality() takes 1 arg, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let len = match &args[0] {
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "cardinality() arg must be an array, got {:?}",
+                            args[0].data_type()
+                        ),
+                    });
+                }
+            };
+            let n = i32::try_from(len).unwrap_or(i32::MAX);
+            Ok(Value::Int(n))
+        }
         "array_length" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {

@@ -10020,6 +10020,7 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::Amp => (BinOp::BitAnd, 6),
         Token::Star => (BinOp::Mul, 7),
         Token::Slash => (BinOp::Div, 7),
+        Token::Percent => (BinOp::Mod, 7),
         // v4.14: JSON path ops bind tighter than comparisons (4)
         // and additive (6) so `doc->'k' = 'v'` parses correctly.
         // Same rung as the multiplicative ops.

@@ -2552,6 +2552,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// v7.37.7 C.1.7 — PG / SQL standard integer modulo. Same
+    /// precedence as Mul/Div; result type follows left operand.
+    Mod,
     /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
     /// operands of equal dimension; engine returns `Value::Float(d)`.
     L2Distance,
@@ -4618,6 +4621,7 @@ impl fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::Mod => "%",
             Self::L2Distance => "<->",
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
