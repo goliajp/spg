@@ -247,6 +247,16 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::TextArray(items) => spg_engine::eval::format_text_array(items),
         Value::IntArray(items) => spg_engine::eval::format_int_array(items),
         Value::BigIntArray(items) => spg_engine::eval::format_bigint_array(items),
+        // v7.38 P1 (轴 1 SQL conformance closure) — Inet / Cidr /
+        // Macaddr / Macaddr8 render as their PG-canonical text form
+        // (`10.0.0.5`, `10.0.0.0/8`, `00:50:56:c0:00:01`). Previously
+        // fell through to the Debug-format fallback which leaked
+        // `Inet { family: 4, bits: 32, addr: [10,0,0,5,…] }` into
+        // sqllogictest output, failing pg_regress 35_inet_types.
+        Value::Inet { family, bits, addr } => spg_engine::format_inet(*family, *bits, addr),
+        Value::Cidr { family, bits, addr } => spg_engine::format_inet(*family, *bits, addr),
+        Value::Macaddr(m) => spg_engine::format_macaddr(m),
+        Value::Macaddr8(m) => spg_engine::format_macaddr8(m),
         // v7.5.0 — Value is #[non_exhaustive]; Debug-form fallback
         // for any future variant.
         _ => format!("{v:?}"),
