@@ -1177,6 +1177,11 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.38 P0 元机制 A — first observable point inside the
+        // planner / executor. Tests use this to inject a delay or
+        // a cancellation race before any row is produced. Release
+        // build expands to `let _ = (...);` — zero cost.
+        crate::injection_point!("planner_first_row_fetch", &stmt.from);
         // v7.17.0 Phase 1.2 — user-defined VIEW expansion. If the
         // FROM / JOIN graph references any catalogued view name,
         // re-parse the view body and prepend it as a synthetic

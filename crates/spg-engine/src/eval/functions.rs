@@ -38,6 +38,15 @@ fn apply_function_dispatch(
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     match name {
+        // v7.38 P0 元机制 A — SQL-facing handles for the injection
+        // points framework. Tests call these to attach an action
+        // (`wait` / `error[:msg]` / `notice[:msg]`) to a registered
+        // point, wake parked threads, or detach. Release builds
+        // (feature off) reject the calls outright so a production
+        // SPG can't be coerced into deadlocking.
+        "spg_injection_attach" => return spg_injection_attach(args),
+        "spg_injection_wakeup" => return spg_injection_wakeup(args),
+        "spg_injection_detach" => return spg_injection_detach(args),
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {
@@ -1673,4 +1682,111 @@ fn apply_function_dispatch(
             detail: format!("unknown function `{other}`"),
         }),
     }
+}
+
+// v7.38 P0 元机制 A — SQL-facing handles for the injection_points
+// framework. Tests call these via `SELECT spg_injection_attach(...)` /
+// `_wakeup` / `_detach`. With the `injection-points` feature OFF
+// (release builds) all three return an error so a production SPG
+// can't be coerced into deadlocking via SQL.
+
+fn expect_text_arg<'a>(
+    args: &'a [Value<'static>],
+    idx: usize,
+    fn_name: &str,
+) -> Result<&'a str, EvalError> {
+    let v = args.get(idx).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("{fn_name} requires {} args, got {}", idx + 1, args.len()),
+    })?;
+    match v {
+        Value::Text(s) => Ok(s.as_ref()),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{fn_name} argument {} must be TEXT, got {:?}",
+                idx + 1,
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_attach(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_attach takes (point_name TEXT, action TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_attach")?;
+    let action_str = expect_text_arg(args, 1, "spg_injection_attach")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_attach: no engine injection scope active".into(),
+        })?;
+    let action = crate::testkit::injection::parse_action(action_str)
+        .map_err(|detail| EvalError::TypeMismatch { detail })?;
+    store.attach(name.to_string(), action);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_wakeup(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_wakeup takes (point_name TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_wakeup")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_wakeup: no engine injection scope active".into(),
+        })?;
+    store.wakeup(name);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_detach(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_detach takes (point_name TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_detach")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_detach: no engine injection scope active".into(),
+        })?;
+    store.detach(name);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_attach(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_attach: injection-points feature not enabled in this build".into(),
+    })
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_wakeup(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_wakeup: injection-points feature not enabled in this build".into(),
+    })
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_detach(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_detach: injection-points feature not enabled in this build".into(),
+    })
 }
