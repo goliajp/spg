@@ -1490,3 +1490,62 @@ fn v1_v2_envelope_loads_with_empty_publications() {
     let e2 = Engine::restore_envelope(&buf).expect("v2 envelope restores");
     assert!(e2.publications().is_empty());
 }
+
+// v7.38 P0 元机制 A — SQL-facing roundtrip. Verifies that
+// `SELECT spg_injection_attach(...)` finds the per-engine store
+// via the thread-local scope set up by `execute_*`, and that a
+// subsequent `injection_point!` hit at one of the registered
+// sites records / blocks per the attached action.
+#[cfg(feature = "injection-points")]
+#[test]
+fn sql_injection_attach_notice_then_trigger_records() {
+    use crate::QueryResult;
+    let mut e = crate::Engine::new();
+    // Attach a `notice` action via SQL — exercises
+    // `eval::spg_injection_attach`, which is the test driver's
+    // sole hook for plumbing actions in.
+    let r = e
+        .execute("SELECT spg_injection_attach('aggregate_spill_trigger', 'notice:from_sql')")
+        .expect("attach succeeds");
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Bool(true));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+
+    // Trigger the `aggregate_spill_trigger` point by running a
+    // GROUP BY query — `aggregate::run` fires the point at its
+    // entry.
+    e.execute("CREATE TABLE inj_t (a INT)").unwrap();
+    e.execute("INSERT INTO inj_t VALUES (1), (2), (1)").unwrap();
+    e.execute("SELECT a, COUNT(*) FROM inj_t GROUP BY a").unwrap();
+
+    // The notice action records into the per-engine store. The
+    // store is shared via Arc, so reading from the engine handle
+    // here sees the same tally the trigger updated.
+    let store = e.injection_store();
+    assert!(
+        store.notice_count("aggregate_spill_trigger") >= 1,
+        "aggregate inject point did not fire under feature-on build"
+    );
+    assert_eq!(
+        store.notice_message("aggregate_spill_trigger").as_deref(),
+        Some("from_sql")
+    );
+}
+
+// v7.38 P0 元机制 A — the off-feature build refuses the SQL
+// surface so a production SPG (no feature) can't be coerced
+// into a deadlock by a malicious `SELECT spg_injection_attach`.
+#[cfg(not(feature = "injection-points"))]
+#[test]
+fn sql_injection_attach_off_feature_errors() {
+    let mut e = crate::Engine::new();
+    let r = e.execute("SELECT spg_injection_attach('foo', 'wait')");
+    assert!(
+        r.is_err(),
+        "off-feature build must refuse SQL injection-attach"
+    );
+}
