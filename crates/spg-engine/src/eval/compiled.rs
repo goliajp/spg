@@ -554,16 +554,41 @@ fn run_compiled_steps(
             Step::Column(pos) => {
                 STEP_VM_COLUMN_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                stack.push(
-                    row.get(*pos)
-                        .cloned()
-                        .map(Value::into_owned)
-                        .unwrap_or(Value::Null),
-                );
+                let cell = row
+                    .get(*pos)
+                    .cloned()
+                    .map(Value::into_owned)
+                    .unwrap_or(Value::Null);
+                // v7.37.9 Round 3 — count cells that allocate when
+                // .into_owned() forces a Cow::Borrowed → Cow::Owned
+                // conversion (Text / Bytes / Json / Vector). This is
+                // the per-fire heap-alloc count for the T3 stack
+                // lifetime structural attack's gain estimate.
+                if matches!(
+                    &cell,
+                    spg_storage::Value::Text(_)
+                        | spg_storage::Value::Bytes(_)
+                        | spg_storage::Value::Json(_)
+                        | spg_storage::Value::Vector(_)
+                ) {
+                    STEP_VM_COLUMN_HEAP_ALLOC
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                stack.push(cell);
             }
             Step::Lit(v) => {
                 STEP_VM_LIT_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if matches!(
+                    v,
+                    spg_storage::Value::Text(_)
+                        | spg_storage::Value::Bytes(_)
+                        | spg_storage::Value::Json(_)
+                        | spg_storage::Value::Vector(_)
+                ) {
+                    STEP_VM_LIT_HEAP_ALLOC
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 stack.push(v.clone())
             }
             Step::Binary(op) => {
@@ -811,4 +836,14 @@ pub static STEP_VM_FUNCTION_FIRE: core::sync::atomic::AtomicU64 =
 pub static STEP_VM_CAST_FIRE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.9 Round 3 — heap-alloc counters specifically for the T3
+/// structural attack's ROI estimate. Step::Column / Step::Lit hits
+/// pay a String alloc when the cell variant is heap-bearing
+/// (Text/Bytes/Json/Vector). T3 stack-lifetime push-by-borrow
+/// would eliminate these for the bulk of per-row work.
+pub static STEP_VM_COLUMN_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);

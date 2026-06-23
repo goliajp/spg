@@ -91,6 +91,9 @@ fn snapshot_counters() -> Vec<(&'static str, u64)> {
         ("STEP_VM_FUNCTION_FIRE", e::eval::compiled::STEP_VM_FUNCTION_FIRE.load(Relaxed)),
         ("STEP_VM_CAST_FIRE", e::eval::compiled::STEP_VM_CAST_FIRE.load(Relaxed)),
         ("STEP_VM_CASE_FIRE", e::eval::compiled::STEP_VM_CASE_FIRE.load(Relaxed)),
+        // v7.37.9 Round 3 — heap-alloc per Step::Column / Step::Lit fire (T3 attack ROI)
+        ("STEP_VM_COLUMN_HEAP_ALLOC", e::eval::compiled::STEP_VM_COLUMN_HEAP_ALLOC.load(Relaxed)),
+        ("STEP_VM_LIT_HEAP_ALLOC", e::eval::compiled::STEP_VM_LIT_HEAP_ALLOC.load(Relaxed)),
     ]
 }
 
