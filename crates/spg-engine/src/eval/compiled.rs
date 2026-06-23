@@ -659,9 +659,26 @@ where
             Step::Binary(op) => {
                 STEP_VM_BINARY_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                // v7.37.9 T3 S1 — apply_binary still wants `Value<'static>`.
-                // Force into_owned at the pop boundary. S4 will replace
-                // with apply_binary_by_ref for comparison ops.
+                // v7.37.9 T3 S4 — try the by-ref fast path first
+                // (comparison + 3VL ops). For those, operand bytes are
+                // read but never stored in the result; we avoid the
+                // .into_owned() that would clone every Cow::Borrowed
+                // Text/Bytes/Json/Vector pushed by S2/S3. For ops that
+                // build owned results (arithmetic, concat, json get,
+                // etc.) apply_binary_by_ref returns None and we fall
+                // through to the owning path.
+                let n = stack.len();
+                if n >= 2 {
+                    if let Some(result) = super::apply_binary_by_ref(
+                        *op,
+                        &stack[n - 2],
+                        &stack[n - 1],
+                    )? {
+                        stack.truncate(n - 2);
+                        stack.push(result);
+                        continue;
+                    }
+                }
                 let r = stack.pop().unwrap_or(Value::Null).into_owned();
                 let l = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
