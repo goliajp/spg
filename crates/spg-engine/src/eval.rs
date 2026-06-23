@@ -25,7 +25,7 @@ use spg_storage::{ColumnSchema, Row, Value};
 
 mod binop;
 mod cast;
-mod compiled;
+pub mod compiled;
 mod datetime;
 mod encoding;
 mod format;

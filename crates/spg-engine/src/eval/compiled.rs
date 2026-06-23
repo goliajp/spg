@@ -543,9 +543,17 @@ fn run_compiled_steps(
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'static>>,
 ) -> Result<(), EvalError> {
+    // v7.37.9 Phase 1A-ext-2 T1 — counter per call into the Step VM
+    // interpreter. Tells us "how many steps does the average compiled
+    // arg run per row" → narrows the attack target (subtree CSE vs
+    // column-ref-push vs multi-spec combine). Read-only.
+    STEP_VM_CALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    STEP_VM_STEPS_TOTAL.fetch_add(steps.len() as u64, core::sync::atomic::Ordering::Relaxed);
     for step in steps {
         match step {
             Step::Column(pos) => {
+                STEP_VM_COLUMN_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 stack.push(
                     row.get(*pos)
                         .cloned()
@@ -553,8 +561,14 @@ fn run_compiled_steps(
                         .unwrap_or(Value::Null),
                 );
             }
-            Step::Lit(v) => stack.push(v.clone()),
+            Step::Lit(v) => {
+                STEP_VM_LIT_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                stack.push(v.clone())
+            }
             Step::Binary(op) => {
+                STEP_VM_BINARY_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let r = stack.pop().unwrap_or(Value::Null);
                 let l = stack.pop().unwrap_or(Value::Null);
                 stack.push(apply_binary(*op, l, r)?);
@@ -692,6 +706,8 @@ fn run_compiled_steps(
                 stack.push(pushed);
             }
             Step::Function { name_lower, n_args } => {
+                STEP_VM_FUNCTION_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let start = stack.len().saturating_sub(*n_args);
                 // `apply_function` borrows the trailing `n_args`
                 // values off the stack; we then truncate + push the
@@ -704,6 +720,8 @@ fn run_compiled_steps(
                 stack.push(result);
             }
             Step::Cast { target } => {
+                STEP_VM_CAST_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let v = stack.pop().unwrap_or(Value::Null);
                 stack.push(super::cast::cast_value(v, target.clone())?);
             }
@@ -712,6 +730,8 @@ fn run_compiled_steps(
                 branches,
                 else_branch,
             } => {
+                STEP_VM_CASE_FIRE
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 // v7.37.5-A2b — short-circuit Case executor. Mirrors
                 // `Expr::Case` interpreter semantics bit-for-bit (each
                 // WHEN evaluates with its own scratch stack; first
@@ -771,3 +791,24 @@ fn run_compiled_steps(
     }
     Ok(())
 }
+
+/// v7.37.9 Phase 1A-ext-2 T1 — Step VM internal step-type counters.
+/// Read-only diagnostic; gates no behaviour. Used by counter_dump.rs
+/// to ground-truth subtree CSE / column-ref-push / multi-spec-combine
+/// attack ROI estimates.
+pub static STEP_VM_CALL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_STEPS_TOTAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_COLUMN_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_LIT_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_BINARY_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_FUNCTION_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CAST_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
