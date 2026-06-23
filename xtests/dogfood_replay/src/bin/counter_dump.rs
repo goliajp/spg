@@ -76,6 +76,12 @@ fn snapshot_counters() -> Vec<(&'static str, u64)> {
         ("REORDER_INNER_RUN_FIRED", e::reorder::REORDER_INNER_RUN_FIRED.load(Relaxed)),
         ("DISTA_LITERAL_ARG2_CACHE_FIRE", e::aggregate::DISTA_LITERAL_ARG2_CACHE_FIRE.load(Relaxed)),
         ("AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE", e::aggregate::AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE.load(Relaxed)),
+        // v7.37.9 Phase 1A-ext — per-row spec dispatch branches
+        ("AGG_PER_ROW_FAST_POS", e::aggregate::AGG_PER_ROW_FAST_POS.load(Relaxed)),
+        ("AGG_PER_ROW_COMPILED_HIT", e::aggregate::AGG_PER_ROW_COMPILED_HIT.load(Relaxed)),
+        ("AGG_PER_ROW_COMPILED_MISS", e::aggregate::AGG_PER_ROW_COMPILED_MISS.load(Relaxed)),
+        ("AGG_PER_ROW_EVAL_FALLBACK", e::aggregate::AGG_PER_ROW_EVAL_FALLBACK.load(Relaxed)),
+        ("AGG_PER_ROW_COUNT_STAR_SENTINEL", e::aggregate::AGG_PER_ROW_COUNT_STAR_SENTINEL.load(Relaxed)),
     ]
 }
 
