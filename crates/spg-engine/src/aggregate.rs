@@ -979,7 +979,11 @@ fn accumulate_groups(
     // touch the allocator zero times.
     let mut keybuf_s = String::new();
     // v7.36 — reused Step VM eval stack for compiled aggregate args.
-    let mut eval_stack: Vec<Value<'static>> = Vec::new();
+    // v7.37.9 T3 S2 — elided lifetime so the Vec's `'val` binds to the
+    // row-borrow lifetime per call (`eval_compiled_ref<'row, 'val>` now
+    // requires `'row: 'val`). Caller-side Vec<Value<'_>> lets compiler
+    // infer the shortest lifetime that covers all calls.
+    let mut eval_stack: Vec<Value<'_>> = Vec::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
     // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /

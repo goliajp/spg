@@ -497,11 +497,20 @@ pub(crate) fn eval_compiled(
     c: &CompiledExpr,
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
+    _stack: &mut Vec<Value<'static>>,
 ) -> Result<Value<'static>, EvalError> {
-    // Owned-row callers keep the `'static` stack contract — `'r = 'static`
-    // is inferred from this Vec parameter.
-    eval_compiled_ref(c, &crate::join::RowRef::Owned(row), ctx, stack)
+    // v7.37.9 T3 S2 — the public eval_compiled keeps its
+    // `Vec<Value<'static>>` API for callers (post-group projection
+    // path at aggregate.rs:702), but internally drops the borrowed
+    // stack into a local one because the borrow lifetime of the
+    // caller's stack can't bridge the row-borrow `'row` constraint
+    // that eval_compiled_ref needs after S2. This callsite fires
+    // ~50 × per query (LIMIT 50 surviving groups), so the per-call
+    // Vec alloc is negligible compared to the per-row hot path.
+    let rowref = crate::join::RowRef::Owned(row);
+    let mut local_stack: Vec<Value<'_>> = Vec::with_capacity(16);
+    let result = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)?;
+    Ok(result.into_owned())
 }
 
 /// v7.32 (P4 borrow channel, increment 2) — the RowRef-borrowing form of
@@ -523,10 +532,13 @@ pub(crate) fn eval_compiled(
 // switch to borrowed push to eliminate per-row String allocs.
 pub(crate) fn eval_compiled_ref<'row, 'val>(
     c: &CompiledExpr,
-    row: &crate::join::RowRef<'row>,
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
-) -> Result<Value<'val>, EvalError> {
+) -> Result<Value<'val>, EvalError>
+where
+    'row: 'val,
+{
     stack.clear();
     run_compiled_steps(&c.steps, row, ctx, stack)?;
     Ok(stack.pop().unwrap_or(Value::Null))
@@ -539,21 +551,27 @@ pub(crate) fn eval_compiled_ref<'row, 'val>(
 /// out of public surface — only the Case opcode reaches for it.
 fn eval_compiled_ref_into<'row, 'val>(
     c: &CompiledExpr,
-    row: &crate::join::RowRef<'row>,
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
     _mark: usize,
-) -> Result<(), EvalError> {
+) -> Result<(), EvalError>
+where
+    'row: 'val,
+{
     run_compiled_steps(&c.steps, row, ctx, stack)
 }
 
 #[inline]
 fn run_compiled_steps<'row, 'val>(
     steps: &[Step],
-    row: &crate::join::RowRef<'row>,
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
-) -> Result<(), EvalError> {
+) -> Result<(), EvalError>
+where
+    'row: 'val,
+{
     // v7.37.9 Phase 1A-ext-2 T1 — counter per call into the Step VM
     // interpreter. Tells us "how many steps does the average compiled
     // arg run per row" → narrows the attack target (subtree CSE vs
@@ -565,16 +583,32 @@ fn run_compiled_steps<'row, 'val>(
             Step::Column(pos) => {
                 STEP_VM_COLUMN_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                let cell = row
-                    .get(*pos)
-                    .cloned()
-                    .map(Value::into_owned)
-                    .unwrap_or(Value::Null);
-                // v7.37.9 Round 3 — count cells that allocate when
-                // .into_owned() forces a Cow::Borrowed → Cow::Owned
-                // conversion (Text / Bytes / Json / Vector). This is
-                // the per-fire heap-alloc count for the T3 stack
-                // lifetime structural attack's gain estimate.
+                // v7.37.9 T3 S2 — catalog rows hold `Cow::Owned(String)`
+                // for Text-class variants (per `spg-storage/src/lib.rs:539`
+                // — "Persistent / catalog Values use Value<'static> with
+                // Cow::Owned(...)"). Plain `.clone()` would therefore
+                // still trigger `String::clone()` per cell read. Instead
+                // manually wrap the existing storage into a borrowed Cow
+                // pointing at the same bytes — zero-alloc push.
+                let cell: Value<'val> = match row.get(*pos) {
+                    Some(spg_storage::Value::Text(s)) => {
+                        spg_storage::Value::Text(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    Some(spg_storage::Value::Bytes(b)) => {
+                        spg_storage::Value::Bytes(alloc::borrow::Cow::Borrowed(b.as_ref()))
+                    }
+                    Some(spg_storage::Value::Json(s)) => {
+                        spg_storage::Value::Json(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    Some(spg_storage::Value::Vector(v)) => {
+                        spg_storage::Value::Vector(alloc::borrow::Cow::Borrowed(v.as_ref()))
+                    }
+                    // Copy-light variants: clone is free (just enum copy).
+                    Some(v) => v.clone(),
+                    None => Value::Null,
+                };
+                // Classification counter unchanged (still counts cells
+                // that WERE heap-bearing in the baseline).
                 if matches!(
                     &cell,
                     spg_storage::Value::Text(_)
