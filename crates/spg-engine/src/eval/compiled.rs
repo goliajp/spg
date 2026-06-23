@@ -576,13 +576,12 @@ where
     // interpreter. Tells us "how many steps does the average compiled
     // arg run per row" → narrows the attack target (subtree CSE vs
     // column-ref-push vs multi-spec combine). Read-only.
-    STEP_VM_CALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    STEP_VM_STEPS_TOTAL.fetch_add(steps.len() as u64, core::sync::atomic::Ordering::Relaxed);
+    crate::bump_counter!(STEP_VM_CALL_COUNT);
+    crate::bump_counter!(STEP_VM_STEPS_TOTAL, steps.len() as u64);
     for step in steps {
         match step {
             Step::Column(pos) => {
-                STEP_VM_COLUMN_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_COLUMN_FIRE);
                 // v7.37.9 T3 S2 — catalog rows hold `Cow::Owned(String)`
                 // for Text-class variants (per `spg-storage/src/lib.rs:539`
                 // — "Persistent / catalog Values use Value<'static> with
@@ -616,14 +615,12 @@ where
                         | spg_storage::Value::Json(_)
                         | spg_storage::Value::Vector(_)
                 ) {
-                    STEP_VM_COLUMN_HEAP_ALLOC
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::bump_counter!(STEP_VM_COLUMN_HEAP_ALLOC);
                 }
                 stack.push(cell);
             }
             Step::Lit(v) => {
-                STEP_VM_LIT_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_LIT_FIRE);
                 if matches!(
                     v,
                     spg_storage::Value::Text(_)
@@ -631,8 +628,7 @@ where
                         | spg_storage::Value::Json(_)
                         | spg_storage::Value::Vector(_)
                 ) {
-                    STEP_VM_LIT_HEAP_ALLOC
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::bump_counter!(STEP_VM_LIT_HEAP_ALLOC);
                 }
                 // v7.37.9 T3 S3 — borrow literal storage instead of
                 // String::clone'ing it. Step variants own their
@@ -657,8 +653,7 @@ where
                 stack.push(pushed);
             }
             Step::Binary(op) => {
-                STEP_VM_BINARY_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_BINARY_FIRE);
                 // v7.37.9 T3 S4 — try the by-ref fast path first
                 // (comparison + 3VL ops). For those, operand bytes are
                 // read but never stored in the result; we avoid the
@@ -816,8 +811,7 @@ where
                 stack.push(pushed);
             }
             Step::Function { name_lower, n_args } => {
-                STEP_VM_FUNCTION_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_FUNCTION_FIRE);
                 let start = stack.len().saturating_sub(*n_args);
                 // `apply_function` borrows the trailing `n_args`
                 // values off the stack; we then truncate + push the
@@ -834,8 +828,7 @@ where
                 stack.push(result);
             }
             Step::Cast { target } => {
-                STEP_VM_CAST_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_CAST_FIRE);
                 let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(super::cast::cast_value(v, target.clone())?);
             }
@@ -844,8 +837,7 @@ where
                 branches,
                 else_branch,
             } => {
-                STEP_VM_CASE_FIRE
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::bump_counter!(STEP_VM_CASE_FIRE);
                 // v7.37.5-A2b — short-circuit Case executor. Mirrors
                 // `Expr::Case` interpreter semantics bit-for-bit (each
                 // WHEN evaluates with its own scratch stack; first

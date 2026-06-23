@@ -1294,22 +1294,19 @@ fn accumulate_groups(
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
                     (Some(p), _, _) => {
                         // v7.37.9 Phase 1A-ext counter — fast position-bound arg.
-                        AGG_PER_ROW_FAST_POS
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_FAST_POS);
                         row.get(*p).unwrap_or(&Value::Null)
                     }
                     (None, None, None) => {
                         // COUNT(*) sentinel
-                        AGG_PER_ROW_COUNT_STAR_SENTINEL
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_COUNT_STAR_SENTINEL);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
                     (None, Some(s), _) => {
                         if row_eval_cache[s].is_none() {
                             // v7.37.9 Phase 1A-ext counter — Step-VM ran (cache miss).
-                            AGG_PER_ROW_COMPILED_MISS
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_MISS);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
@@ -1318,16 +1315,14 @@ fn accumulate_groups(
                         } else {
                             // v7.37.9 Phase 1A-ext counter — CSE cache hit
                             // (compiled arg deduped across specs in same row).
-                            AGG_PER_ROW_COMPILED_HIT
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_HIT);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
                         // v7.37.9 Phase 1A-ext counter — eval_expr fallback
                         // (uncompilable spec — Cow row materialise per row).
-                        AGG_PER_ROW_EVAL_FALLBACK
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_EVAL_FALLBACK);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -1343,8 +1338,7 @@ fn accumulate_groups(
                     (Some(_), Some(lit)) => {
                         // v7.37.9 Phase 0 diagnostic — count per-row
                         // hits of the DISTA A-3 fast path.
-                        DISTA_LITERAL_ARG2_CACHE_FIRE
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(DISTA_LITERAL_ARG2_CACHE_FIRE);
                         Some(lit.clone())
                     }
                     (Some(e), None) => Some(eval_arg(
@@ -1356,8 +1350,7 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
-                    AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::bump_counter!(AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         let v: Value<'static> = if let Some(p) = order_pos[i][k] {
@@ -1624,13 +1617,11 @@ fn accumulate_groups(
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
                     (Some(p), _, _) => {
-                        AGG_PER_ROW_FAST_POS
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_FAST_POS);
                         row.get(*p).unwrap_or(&Value::Null)
                     }
                     (None, None, None) => {
-                        AGG_PER_ROW_COUNT_STAR_SENTINEL
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_COUNT_STAR_SENTINEL);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
@@ -1642,22 +1633,19 @@ fn accumulate_groups(
                         // FILTER semantics: a spec filtered out above
                         // never reaches here, so its arg stays unevaled.
                         if row_eval_cache[s].is_none() {
-                            AGG_PER_ROW_COMPILED_MISS
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_MISS);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
                         } else {
-                            AGG_PER_ROW_COMPILED_HIT
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_HIT);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
-                        AGG_PER_ROW_EVAL_FALLBACK
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(AGG_PER_ROW_EVAL_FALLBACK);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -1673,8 +1661,7 @@ fn accumulate_groups(
                     (Some(_), Some(lit)) => {
                         // v7.37.9 Phase 0 diagnostic — count per-row
                         // hits of the DISTA A-3 fast path.
-                        DISTA_LITERAL_ARG2_CACHE_FIRE
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::bump_counter!(DISTA_LITERAL_ARG2_CACHE_FIRE);
                         Some(lit.clone())
                     }
                     (Some(e), None) => Some(eval_arg(
@@ -1686,8 +1673,7 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
-                    AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::bump_counter!(AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         // Bound ORDER key → read the cell by reference; only

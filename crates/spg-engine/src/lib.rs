@@ -6,6 +6,34 @@
 
 extern crate alloc;
 
+// v7.37.9 T3 — `bump_counter!(C)` / `bump_counter!(C, N)` macros for the
+// Step VM + aggregate hot-path diagnostic counters. Gated on the
+// `perf-counters` feature so release builds pay zero cost; the
+// `xtests/dogfood_replay/spg-counter-dump` binary turns the feature on
+// to attribute Class A / B / C cascade cost.
+#[cfg(not(feature = "perf-counters"))]
+#[macro_export]
+macro_rules! bump_counter {
+    ($c:path) => {{
+        let _ = &$c;
+    }};
+    ($c:path, $n:expr) => {{
+        let _ = &$c;
+        let _ = &$n;
+    }};
+}
+
+#[cfg(feature = "perf-counters")]
+#[macro_export]
+macro_rules! bump_counter {
+    ($c:path) => {{
+        $c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }};
+    ($c:path, $n:expr) => {{
+        $c.fetch_add($n, core::sync::atomic::Ordering::Relaxed);
+    }};
+}
+
 pub mod aggregate;
 mod bytebudget;
 mod cancel;
