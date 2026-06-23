@@ -202,6 +202,23 @@ pub enum Statement {
     /// a recognised engine parameter (e.g. `FOREIGN_KEY_CHECKS`)
     /// go through the regular `set_session_param` path.
     SetParameterList(Vec<(String, SetValue)>),
+    /// v7.38 轴 4 — `SET [SESSION] TRANSACTION ISOLATION LEVEL …`
+    /// (plus optional READ ONLY / READ WRITE / DEFERRABLE clauses
+    /// silently accepted). PG-standard surface for picking an
+    /// isolation level. Engine tracks the value on
+    /// `Engine::current_isolation_level()`; actual MVCC / SSI
+    /// semantics implementation lands separately. PG itself maps
+    /// READ UNCOMMITTED to READ COMMITTED; SPG mirrors that —
+    /// effectively every level reads as READ COMMITTED in v7.37.8.
+    SetTransaction {
+        isolation: IsolationLevel,
+    },
+    /// v7.38 轴 4 — `SHOW <param>` returns a 1-column 1-row result
+    /// with the parameter's current value as TEXT. Today the only
+    /// recognised param is `transaction_isolation`; further
+    /// surfaces (`search_path`, `application_name`, …) land as the
+    /// session-parameter inventory grows.
+    ShowParameter(String),
     /// v7.12.1 — `RESET <name>` / `RESET ALL`. Restores parameter
     /// to its default. No-op for parameters SPG does not track.
     ResetParameter(Option<String>),
@@ -407,6 +424,47 @@ pub enum SetValue {
     Ident(String),
     Number(String),
     Default,
+}
+
+/// v7.38 轴 4 — PG-standard isolation levels. SPG accepts all four
+/// at parse time and tracks the selected value on the engine. The
+/// actual semantic differentiation (REPEATABLE READ snapshot,
+/// SERIALIZABLE SSI) lands in the v7.38 isolation framework train;
+/// today every level reads as effective READ COMMITTED (which is
+/// also how PG treats READ UNCOMMITTED — it silently upgrades to
+/// READ COMMITTED). Default = `ReadCommitted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Canonical PG-style display name, as `SHOW transaction_isolation`
+    /// would return it (`"read committed"`, `"repeatable read"`,
+    /// `"serializable"`). `READ UNCOMMITTED` maps to `"read committed"`
+    /// per the documented PG behaviour.
+    pub fn as_pg_str(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted | Self::ReadCommitted => "read committed",
+            Self::RepeatableRead => "repeatable read",
+            Self::Serializable => "serializable",
+        }
+    }
+}
+
+impl core::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_pg_str())
+    }
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        Self::ReadCommitted
+    }
 }
 
 /// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
@@ -2705,6 +2763,8 @@ impl Statement {
             | Statement::CompactColdSegments
             | Statement::SetParameter { .. }
             | Statement::SetParameterList(_)
+            | Statement::SetTransaction { .. }
+            | Statement::ShowParameter(_)
             | Statement::ResetParameter(_)
             | Statement::CreateFunction(_)
             | Statement::CreateTrigger(_)
@@ -2946,6 +3006,17 @@ impl fmt::Display for Statement {
                     SetValue::Default => f.write_str("DEFAULT"),
                 }
             }
+            Self::SetTransaction { isolation } => {
+                write!(f, "SET TRANSACTION ISOLATION LEVEL ")?;
+                let name = match isolation {
+                    IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+                    IsolationLevel::ReadCommitted => "READ COMMITTED",
+                    IsolationLevel::RepeatableRead => "REPEATABLE READ",
+                    IsolationLevel::Serializable => "SERIALIZABLE",
+                };
+                f.write_str(name)
+            }
+            Self::ShowParameter(name) => write!(f, "SHOW {name}"),
             Self::SetParameterList(pairs) => {
                 f.write_str("SET ")?;
                 for (i, (name, value)) in pairs.iter().enumerate() {

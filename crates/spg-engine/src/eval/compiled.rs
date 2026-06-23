@@ -497,9 +497,20 @@ pub(crate) fn eval_compiled(
     c: &CompiledExpr,
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
+    _stack: &mut Vec<Value<'static>>,
 ) -> Result<Value<'static>, EvalError> {
-    eval_compiled_ref(c, &crate::join::RowRef::Owned(row), ctx, stack)
+    // v7.37.9 T3 S2 — the public eval_compiled keeps its
+    // `Vec<Value<'static>>` API for callers (post-group projection
+    // path at aggregate.rs:702), but internally drops the borrowed
+    // stack into a local one because the borrow lifetime of the
+    // caller's stack can't bridge the row-borrow `'row` constraint
+    // that eval_compiled_ref needs after S2. This callsite fires
+    // ~50 × per query (LIMIT 50 surviving groups), so the per-call
+    // Vec alloc is negligible compared to the per-row hot path.
+    let rowref = crate::join::RowRef::Owned(row);
+    let mut local_stack: Vec<Value<'_>> = Vec::with_capacity(16);
+    let result = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)?;
+    Ok(result.into_owned())
 }
 
 /// v7.32 (P4 borrow channel, increment 2) — the RowRef-borrowing form of
@@ -510,12 +521,24 @@ pub(crate) fn eval_compiled(
 /// equivalent to the Owned path — `eval_compiled` above is now a thin
 /// `RowRef::Owned` wrapper, so there is a single interpreter (invariant
 /// I3); a differential test pins the equivalence.
-pub(crate) fn eval_compiled_ref(
-    c: &CompiledExpr,
-    row: &crate::join::RowRef<'_>,
+// v7.37.9 T3 S1 — row-lifetime stack plumbing. Two lifetimes:
+// `'row` = the RowRef's data lifetime; `'val` = stack value lifetime
+// (must outlive function return). Constraint `'row: 'val` allows the
+// step body to push `Value::Text(Cow::Borrowed(row_cell))` (S2+) while
+// the caller's stack stays at whatever lifetime it declared (often
+// `'static` for Vec<Value<'static>>). S1 keeps every step body forcing
+// `.into_owned()` so behaviour is bit-identical; later stages
+// (S2 Column, S3 Lit, S4 Binary, S6 Function, S7 Case) progressively
+// switch to borrowed push to eliminate per-row String allocs.
+pub(crate) fn eval_compiled_ref<'row, 'val>(
+    c: &'val CompiledExpr,
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
-) -> Result<Value<'static>, EvalError> {
+    stack: &mut Vec<Value<'val>>,
+) -> Result<Value<'val>, EvalError>
+where
+    'row: 'val,
+{
     stack.clear();
     run_compiled_steps(&c.steps, row, ctx, stack)?;
     Ok(stack.pop().unwrap_or(Value::Null))
@@ -526,37 +549,133 @@ pub(crate) fn eval_compiled_ref(
 /// stack; pushes the program's result on top of whatever was already
 /// there. Caller uses the `mark` to know where to truncate / pop. Kept
 /// out of public surface — only the Case opcode reaches for it.
-fn eval_compiled_ref_into(
-    c: &CompiledExpr,
-    row: &crate::join::RowRef<'_>,
+fn eval_compiled_ref_into<'row, 'val>(
+    c: &'val CompiledExpr,
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
+    stack: &mut Vec<Value<'val>>,
     _mark: usize,
-) -> Result<(), EvalError> {
+) -> Result<(), EvalError>
+where
+    'row: 'val,
+{
     run_compiled_steps(&c.steps, row, ctx, stack)
 }
 
 #[inline]
-fn run_compiled_steps(
-    steps: &[Step],
-    row: &crate::join::RowRef<'_>,
+fn run_compiled_steps<'row, 'val>(
+    steps: &'val [Step],
+    row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
-) -> Result<(), EvalError> {
+    stack: &mut Vec<Value<'val>>,
+) -> Result<(), EvalError>
+where
+    'row: 'val,
+{
+    // v7.37.9 Phase 1A-ext-2 T1 — counter per call into the Step VM
+    // interpreter. Tells us "how many steps does the average compiled
+    // arg run per row" → narrows the attack target (subtree CSE vs
+    // column-ref-push vs multi-spec combine). Read-only.
+    crate::bump_counter!(STEP_VM_CALL_COUNT);
+    crate::bump_counter!(STEP_VM_STEPS_TOTAL, steps.len() as u64);
     for step in steps {
         match step {
             Step::Column(pos) => {
-                stack.push(
-                    row.get(*pos)
-                        .cloned()
-                        .map(Value::into_owned)
-                        .unwrap_or(Value::Null),
-                );
+                crate::bump_counter!(STEP_VM_COLUMN_FIRE);
+                // v7.37.9 T3 S2 — catalog rows hold `Cow::Owned(String)`
+                // for Text-class variants (per `spg-storage/src/lib.rs:539`
+                // — "Persistent / catalog Values use Value<'static> with
+                // Cow::Owned(...)"). Plain `.clone()` would therefore
+                // still trigger `String::clone()` per cell read. Instead
+                // manually wrap the existing storage into a borrowed Cow
+                // pointing at the same bytes — zero-alloc push.
+                let cell: Value<'val> = match row.get(*pos) {
+                    Some(spg_storage::Value::Text(s)) => {
+                        spg_storage::Value::Text(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    Some(spg_storage::Value::Bytes(b)) => {
+                        spg_storage::Value::Bytes(alloc::borrow::Cow::Borrowed(b.as_ref()))
+                    }
+                    Some(spg_storage::Value::Json(s)) => {
+                        spg_storage::Value::Json(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    Some(spg_storage::Value::Vector(v)) => {
+                        spg_storage::Value::Vector(alloc::borrow::Cow::Borrowed(v.as_ref()))
+                    }
+                    // Copy-light variants: clone is free (just enum copy).
+                    Some(v) => v.clone(),
+                    None => Value::Null,
+                };
+                // Classification counter unchanged (still counts cells
+                // that WERE heap-bearing in the baseline).
+                if matches!(
+                    &cell,
+                    spg_storage::Value::Text(_)
+                        | spg_storage::Value::Bytes(_)
+                        | spg_storage::Value::Json(_)
+                        | spg_storage::Value::Vector(_)
+                ) {
+                    crate::bump_counter!(STEP_VM_COLUMN_HEAP_ALLOC);
+                }
+                stack.push(cell);
             }
-            Step::Lit(v) => stack.push(v.clone()),
+            Step::Lit(v) => {
+                crate::bump_counter!(STEP_VM_LIT_FIRE);
+                if matches!(
+                    v,
+                    spg_storage::Value::Text(_)
+                        | spg_storage::Value::Bytes(_)
+                        | spg_storage::Value::Json(_)
+                        | spg_storage::Value::Vector(_)
+                ) {
+                    crate::bump_counter!(STEP_VM_LIT_HEAP_ALLOC);
+                }
+                // v7.37.9 T3 S3 — borrow literal storage instead of
+                // String::clone'ing it. Step variants own their
+                // literal (`Value<'static>` enum payload), so we can
+                // safely construct a `Cow::Borrowed(&'static …)` view.
+                // Same pattern as S2's Column path.
+                let pushed: Value<'val> = match v {
+                    spg_storage::Value::Text(s) => {
+                        spg_storage::Value::Text(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    spg_storage::Value::Bytes(b) => {
+                        spg_storage::Value::Bytes(alloc::borrow::Cow::Borrowed(b.as_ref()))
+                    }
+                    spg_storage::Value::Json(s) => {
+                        spg_storage::Value::Json(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    spg_storage::Value::Vector(vec) => {
+                        spg_storage::Value::Vector(alloc::borrow::Cow::Borrowed(vec.as_ref()))
+                    }
+                    other => other.clone(),
+                };
+                stack.push(pushed);
+            }
             Step::Binary(op) => {
-                let r = stack.pop().unwrap_or(Value::Null);
-                let l = stack.pop().unwrap_or(Value::Null);
+                crate::bump_counter!(STEP_VM_BINARY_FIRE);
+                // v7.37.9 T3 S4 — try the by-ref fast path first
+                // (comparison + 3VL ops). For those, operand bytes are
+                // read but never stored in the result; we avoid the
+                // .into_owned() that would clone every Cow::Borrowed
+                // Text/Bytes/Json/Vector pushed by S2/S3. For ops that
+                // build owned results (arithmetic, concat, json get,
+                // etc.) apply_binary_by_ref returns None and we fall
+                // through to the owning path.
+                let n = stack.len();
+                if n >= 2 {
+                    if let Some(result) = super::apply_binary_by_ref(
+                        *op,
+                        &stack[n - 2],
+                        &stack[n - 1],
+                    )? {
+                        stack.truncate(n - 2);
+                        stack.push(result);
+                        continue;
+                    }
+                }
+                let r = stack.pop().unwrap_or(Value::Null).into_owned();
+                let l = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::BinaryCi(op) => {
@@ -564,12 +683,12 @@ fn run_compiled_steps(
                     Value::Text(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,
                 };
-                let r = fold(stack.pop().unwrap_or(Value::Null));
-                let l = fold(stack.pop().unwrap_or(Value::Null));
+                let r = fold(stack.pop().unwrap_or(Value::Null).into_owned());
+                let l = fold(stack.pop().unwrap_or(Value::Null).into_owned());
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::Unary(op) => {
-                let v = stack.pop().unwrap_or(Value::Null);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_unary(*op, v)?);
             }
             Step::IsNull { negated } => {
@@ -624,7 +743,7 @@ fn run_compiled_steps(
                 negated,
                 case_insensitive,
             } => {
-                let v = stack.pop().unwrap_or(Value::Null);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 match v {
                     Value::Null => stack.push(Value::Null),
                     Value::Text(t) => {
@@ -692,19 +811,25 @@ fn run_compiled_steps(
                 stack.push(pushed);
             }
             Step::Function { name_lower, n_args } => {
+                crate::bump_counter!(STEP_VM_FUNCTION_FIRE);
                 let start = stack.len().saturating_sub(*n_args);
                 // `apply_function` borrows the trailing `n_args`
                 // values off the stack; we then truncate + push the
                 // result. `name_lower` is pre-lowercased at compile
                 // time, so dispatch skips the per-row
                 // `to_ascii_lowercase()` allocation.
+                // v7.37.9 T3 S6 — apply_function_lower signature relaxed
+                // to `&[Value<'_>]`; pass the borrowed stack slice
+                // directly. Eliminates the Vec materialise + per-arg
+                // String::clone that S1 introduced as a placeholder.
                 let result =
                     super::functions::apply_function_lower(name_lower, &stack[start..], ctx)?;
                 stack.truncate(start);
                 stack.push(result);
             }
             Step::Cast { target } => {
-                let v = stack.pop().unwrap_or(Value::Null);
+                crate::bump_counter!(STEP_VM_CAST_FIRE);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(super::cast::cast_value(v, target.clone())?);
             }
             Step::Case {
@@ -712,6 +837,7 @@ fn run_compiled_steps(
                 branches,
                 else_branch,
             } => {
+                crate::bump_counter!(STEP_VM_CASE_FIRE);
                 // v7.37.5-A2b — short-circuit Case executor. Mirrors
                 // `Expr::Case` interpreter semantics bit-for-bit (each
                 // WHEN evaluates with its own scratch stack; first
@@ -722,28 +848,47 @@ fn run_compiled_steps(
                 // `Vec<Value>` per sub-program which showed up as
                 // ~3 % `drop_in_place<Vec<Value>>` self time.
                 let mark = stack.len();
-                let operand_value = if let Some(op) = operand {
-                    // Recursive call reuses the same stack: it
-                    // `stack.clear()`s at entry so we hand it a fresh
-                    // logical view; pop the sub-program's result
-                    // afterwards and restore our prefix manually.
+                // v7.37.9 T3 S7 — Case sub-program lifetime threads
+                // through naturally via S1's `'row: 'val`. Operand /
+                // when / matched / else results are pushed by sub-progs
+                // into our same stack; we pop them as `Value<'val>` and
+                // keep them at that lifetime instead of forcing
+                // into_owned. The simple-form operand match (Eq) uses
+                // apply_binary_by_ref to avoid the operand clone +
+                // pop-side into_owned the S1 placeholder was paying.
+                let operand_value: Option<Value<'val>> = if let Some(op) = operand {
                     eval_compiled_ref_into(op, row, ctx, stack, mark)?;
                     Some(stack.pop().unwrap_or(Value::Null))
                 } else {
                     None
                 };
                 stack.truncate(mark);
-                let mut matched_value: Option<Value<'static>> = None;
+                let mut matched_value: Option<Value<'val>> = None;
                 for (when_c, then_c) in branches {
                     eval_compiled_ref_into(when_c, row, ctx, stack, mark)?;
                     let when_v = stack.pop().unwrap_or(Value::Null);
                     stack.truncate(mark);
                     let matched = match &operand_value {
                         None => matches!(when_v, Value::Bool(true)),
-                        Some(op_v) => matches!(
-                            apply_binary(BinOp::Eq, op_v.clone(), when_v)?,
-                            Value::Bool(true)
-                        ),
+                        Some(op_v) => {
+                            // Try the by-ref comparison fast path; fall
+                            // back to owning apply_binary only if the
+                            // by-ref path returns None (non-comparison
+                            // op, which Eq never is).
+                            let eq_result = match super::apply_binary_by_ref(
+                                BinOp::Eq,
+                                op_v,
+                                &when_v,
+                            )? {
+                                Some(v) => v,
+                                None => apply_binary(
+                                    BinOp::Eq,
+                                    op_v.clone().into_owned(),
+                                    when_v.clone().into_owned(),
+                                )?,
+                            };
+                            matches!(eq_result, Value::Bool(true))
+                        }
                     };
                     if matched {
                         eval_compiled_ref_into(then_c, row, ctx, stack, mark)?;
@@ -752,7 +897,7 @@ fn run_compiled_steps(
                         break;
                     }
                 }
-                let v = match matched_value {
+                let v: Value<'val> = match matched_value {
                     Some(v) => v,
                     None => match else_branch {
                         Some(el) => {
@@ -771,3 +916,34 @@ fn run_compiled_steps(
     }
     Ok(())
 }
+
+/// v7.37.9 Phase 1A-ext-2 T1 — Step VM internal step-type counters.
+/// Read-only diagnostic; gates no behaviour. Used by counter_dump.rs
+/// to ground-truth subtree CSE / column-ref-push / multi-spec-combine
+/// attack ROI estimates.
+pub static STEP_VM_CALL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_STEPS_TOTAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_COLUMN_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_LIT_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_BINARY_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_FUNCTION_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CAST_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.9 Round 3 — heap-alloc counters specifically for the T3
+/// structural attack's ROI estimate. Step::Column / Step::Lit hits
+/// pay a String alloc when the cell variant is heap-bearing
+/// (Text/Bytes/Json/Vector). T3 stack-lifetime push-by-borrow
+/// would eliminate these for the bulk of per-row work.
+pub static STEP_VM_COLUMN_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);

@@ -16,6 +16,8 @@ members = [
     "xtests/sqllogictest",
     "xtests/sqlx-pgwire",
     "xtests/dogfood_replay",
+    "xtests/oracle",
+    "xtests/perm-runner",
     "xbench/competitor",
 ]
 

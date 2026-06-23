@@ -18,7 +18,7 @@ use super::{EvalContext, EvalError};
 /// supports the canonical `(vec, query)` two-arg form mailrs uses;
 /// optional weight-array / normalisation arguments error with an
 /// "unsupported" message rather than silently changing semantics.
-pub(super) fn fts_ts_rank(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let (vec, query) = parse_rank_args("ts_rank", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
@@ -26,7 +26,7 @@ pub(super) fn fts_ts_rank(args: &[Value<'static>]) -> Result<Value<'static>, Eva
     }
 }
 
-pub(super) fn fts_ts_rank_cd(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let (vec, query) = parse_rank_args("ts_rank_cd", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
@@ -36,7 +36,7 @@ pub(super) fn fts_ts_rank_cd(args: &[Value<'static>]) -> Result<Value<'static>, 
 
 fn parse_rank_args(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
 ) -> Result<
     (
         Option<Vec<spg_storage::TsLexeme>>,
@@ -106,7 +106,7 @@ pub(super) fn ts_match(l: Value, r: Value) -> Result<Value<'static>, EvalError> 
 /// to `simple` when unset); with two args the first picks the
 /// config. NULL text → NULL.
 pub(super) fn fts_to_tsvector(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("to_tsvector", args, ctx)?;
@@ -118,7 +118,7 @@ pub(super) fn fts_to_tsvector(
 
 /// v7.24 (round-16 C) — `setweight(tsvector, "char")`. Relabels
 /// every lexeme with the given PG weight letter (A=3 B=2 C=1 D=0).
-pub(super) fn fts_setweight(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn fts_setweight(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let [vec_arg, weight_arg] = args else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("setweight expects 2 arguments, got {}", args.len()),
@@ -162,7 +162,7 @@ pub(super) fn fts_setweight(args: &[Value<'static>]) -> Result<Value<'static>, E
 }
 
 pub(super) fn fts_plainto_tsquery(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("plainto_tsquery", args, ctx)?;
@@ -173,7 +173,7 @@ pub(super) fn fts_plainto_tsquery(
 }
 
 pub(super) fn fts_phraseto_tsquery(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("phraseto_tsquery", args, ctx)?;
@@ -184,7 +184,7 @@ pub(super) fn fts_phraseto_tsquery(
 }
 
 pub(super) fn fts_websearch_to_tsquery(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("websearch_to_tsquery", args, ctx)?;
@@ -195,7 +195,7 @@ pub(super) fn fts_websearch_to_tsquery(
 }
 
 pub(super) fn fts_to_tsquery(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let (config, text) = parse_fts_args("to_tsquery", args, ctx)?;
@@ -211,7 +211,7 @@ pub(super) fn fts_to_tsquery(
 /// config from the session's `default_text_search_config`.
 fn parse_fts_args(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<(crate::fts::TsConfig, Option<String>), EvalError> {
     let (config_arg, text_arg) = match args {

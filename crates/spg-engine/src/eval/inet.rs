@@ -16,7 +16,7 @@ use spg_storage::Value;
 
 use super::EvalError;
 
-pub(super) fn inet_host(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn inet_host(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),
@@ -30,7 +30,7 @@ pub(super) fn inet_host(args: &[Value<'static>]) -> Result<Value<'static>, EvalE
     Ok(Value::text(host))
 }
 
-pub(super) fn inet_network(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),
@@ -71,7 +71,7 @@ pub(super) fn inet_network(args: &[Value<'static>]) -> Result<Value<'static>, Ev
     Ok(Value::text(out))
 }
 
-pub(super) fn inet_masklen(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn inet_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Null] => return Ok(Value::Null),

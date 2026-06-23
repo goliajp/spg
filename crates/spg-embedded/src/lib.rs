@@ -77,6 +77,10 @@
 //! `no_std` boundary clean.
 
 pub use spg_engine::{CatalogSnapshot, Engine, EngineError, ParsedStatement, QueryResult};
+// v7.38 P0 元机制 A — re-export the macro so downstream crates that
+// only depend on spg-embedded (e.g. spg-sqlx) can fire injection
+// points without pulling in spg-engine directly.
+pub use spg_engine::injection_point;
 pub use spg_storage::{ColumnSchema, DataType, Value, ValueOwned};
 
 /// v7.16.0 — handle for a parsed-and-planned SQL statement.
@@ -179,6 +183,13 @@ fn autowarm_cold_tier_on_open(db: &Database) {
     if let Some(0) = budget_ms {
         return;
     }
+    // v7.38 P0 元机制 A — cold-tier wakeup boundary. Tests use this to
+    // inject a wait that fires after open_path's commit but before the
+    // first warm-up pass: simulates "concurrent client hits cold pages
+    // while warm-up is still doing its initial scan". Pairs with
+    // `checkpoint_cow_swap_post` for full crash-recovery race
+    // coverage.
+    spg_engine::injection_point!("cold_tier_wakeup_resume", &budget_ms);
     let start = std::time::Instant::now();
     let touched = db.warm_up_cold_tier();
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -731,7 +742,17 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         t
     };
     std::fs::write(&tmp, &snapshot).map_err(io_err)?;
+    // v7.38 P0 元机制 A — checkpoint CoW swap boundary. Pre fires after
+    // the tmp file is written and fsynced (rename atomicity uses the
+    // kernel's directory metadata sync) but BEFORE the rename. Tests
+    // use this to race a concurrent read against an in-flight swap.
+    spg_engine::injection_point!("checkpoint_cow_swap_pre", &tmp);
     std::fs::rename(&tmp, &job.db_path).map_err(io_err)?;
+    // v7.38 P0 元机制 A — post-rename: the new snapshot is the
+    // authoritative on-disk image. Tests use this to inject a delay
+    // before the manifest update (or simulate a crash here to verify
+    // open_path's snapshot+manifest divergence recovery path).
+    spg_engine::injection_point!("checkpoint_cow_swap_post", &job.db_path);
     // 3. Manifest tmp+rename (cold tier present).
     if !job.cold_segments.is_empty() {
         let snap_crc = spg_crypto::crc32::crc32(&snapshot);
@@ -2133,13 +2154,15 @@ impl Database {
         }
         stage("wal::snapshot_lsn_scan", &mut last_stage);
         let mut quarantined: Vec<QuarantinedStmt> = Vec::new();
+        let mut total_replayed = 0usize;
         for chunk in &chunk_paths {
             let bytes = std::fs::read(chunk).map_err(io_err)?;
             if bytes.is_empty() {
                 continue;
             }
-            replay_wal_filtered(&bytes, &mut engine, snapshot_lsn, &mut quarantined)
+            let applied = replay_wal_filtered(&bytes, &mut engine, snapshot_lsn, &mut quarantined)
                 .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
+            total_replayed = total_replayed.saturating_add(applied);
             if let Ok(records) = parse_wal_records(&bytes) {
                 if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
                     if max > initial_lsn {
@@ -2252,7 +2275,7 @@ impl Database {
         if row_redo_enabled() {
             engine.set_redo_capture(true);
         }
-        let db = Self {
+        let mut db = Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
             tx_wal: None,
@@ -2285,6 +2308,40 @@ impl Database {
         stage("pre_autowarm", &mut last_stage);
         autowarm_cold_tier_on_open(&db);
         stage("autowarm", &mut last_stage);
+        // v7.37.8 + v7.38 followup (mailrs lock-hang 4th-recurrence
+        // root-cause closure §"Open asks", ack §1) — if this boot
+        // actually replayed any records, force a checkpoint right
+        // here so the floor advances past them. Next restart skips
+        // them entirely via `snapshot_lsn_scan` + the marker the
+        // checkpoint emits. This is the in-place equivalent of an
+        // explicit V4 → V5 migration without rewriting WAL records:
+        // the post-replay catalog is snapshotted as the new
+        // authoritative image, and stale V4 records become
+        // skip-able on the next boot via the floor mechanism.
+        //
+        // Cost: ONE additional ~1-3 s catalog write on the upgrade
+        // boot (the boot already paid the ~187 s replay tax — this
+        // is +1-3% on top). Benefit: every subsequent restart
+        // permanently fast (V4 records below the new floor are
+        // skipped, V5 records replay in O(rows changed)).
+        //
+        // Failure path: checkpoint errors are logged to stderr but
+        // never propagate — the catalog state is in memory and
+        // valid; the next boot will replay again, which is exactly
+        // the pre-fix behaviour. So the only regression is "this
+        // optimisation didn't take effect this boot", not "the boot
+        // failed".
+        if total_replayed > 0 {
+            stage("pre_replay_checkpoint", &mut last_stage);
+            if let Err(e) = db.checkpoint() {
+                eprintln!(
+                    "spg-embedded: post-replay checkpoint failed: {e:?} \
+                     (WAL is intact; next boot will replay {total_replayed} \
+                     records again — non-fatal)"
+                );
+            }
+            stage("post_replay_checkpoint", &mut last_stage);
+        }
         Ok(db)
     }
 
@@ -2524,6 +2581,20 @@ impl Database {
             t.wait()?;
         }
         Ok(result)
+    }
+
+    /// v7.37.9 — apply a decoded V5 row-redo log directly to the
+    /// engine. Used by spgctl's PITR restore path to handle
+    /// `WAL_V5_TYPE_ROW_REDO` (0x13) records the same way `open_path`
+    /// does in its replay loop. Without this, spgctl errors out on
+    /// any WAL chunk whose floor was past v7.37.8's SPG_WAL_ROW_REDO
+    /// default-ON flip — exactly the failing-test shape in
+    /// `crates/spgctl/src/main.rs::tests::pitr_restore_*`.
+    pub fn apply_redo(
+        &mut self,
+        changes: &[spg_storage::RowChange],
+    ) -> Result<(), EngineError> {
+        self.engine.apply_redo(changes)
     }
 
     /// v7.20 P2 — group-commit write entry. Runs the engine

@@ -1177,6 +1177,11 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.38 P0 元机制 A — first observable point inside the
+        // planner / executor. Tests use this to inject a delay or
+        // a cancellation race before any row is produced. Release
+        // build expands to `let _ = (...);` — zero cost.
+        crate::injection_point!("planner_first_row_fetch", &stmt.from);
         // v7.17.0 Phase 1.2 — user-defined VIEW expansion. If the
         // FROM / JOIN graph references any catalogued view name,
         // re-parse the view body and prepend it as a synthetic
@@ -1863,8 +1868,16 @@ impl Engine {
             if let Some(eliminated) = self.try_eliminate_redundant_left_joins(stmt) {
                 return self.exec_bare_select_cancel(&eliminated, cancel);
             }
-            if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
-                return self.exec_bare_select_cancel(&folded, cancel);
+            // v7.38 P0 元机制 D — `SPG_TEST_DISABLE_JOINFOLD=1` skips
+            // the v7.32 joinfold rewrite that turns inner JOINs into a
+            // single-table scan when the catalogue can prove key-only
+            // dependency. Tests use this to assert "without joinfold,
+            // the join still executes correctly" (joinfold is a
+            // semantically-equivalent rewrite, not a correctness fix).
+            if !self.env_cfg().disable_joinfold {
+                if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
+                    return self.exec_bare_select_cancel(&folded, cancel);
+                }
             }
             return self.exec_joined_select(stmt, from, cancel);
         }
@@ -2813,7 +2826,14 @@ impl Engine {
             // WITH TIES likewise needs the full sort so the tie
             // extension can scan past `limit` to find rows that
             // share the last-kept row's key.
-            let keep = if stmt.distinct || stmt.limit_with_ties {
+            let keep = if stmt.distinct
+                || stmt.limit_with_ties
+                // v7.38 元机制 D acceptor — `SPG_TEST_DISABLE_TOPK=1`
+                // forces the full-sort fallback by suppressing the
+                // partial-sort `keep` budget. See
+                // `xtests/sigil/test-mode-gucs.md`.
+                || self.env_cfg().disable_topk
+            {
                 None
             } else {
                 stmt.limit_literal()
@@ -3263,7 +3283,10 @@ impl Engine {
             tagged.push((order_keys, out_row));
         }
         if !stmt.order_by.is_empty() {
-            let keep = if stmt.distinct {
+            let keep = if stmt.distinct
+                // v7.38 元机制 D acceptor — see other call site above.
+                || self.env_cfg().disable_topk
+            {
                 None
             } else {
                 stmt.limit_literal()

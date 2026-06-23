@@ -8,6 +8,39 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.0] — Unreleased (test constitution train, in progress)
+
+v7.38 is a minor version doing one thing: **establish the SPG test
+suite as professional / high-perf / complete / daily-runnable**. Once
+landed, all future versions must pass v7.38's gate.
+
+Vision lock (2026-06-22): SPG is to be ≥ PG on every angle. Vision-
+level feature roadmap (RLS, schema isolation, multi-DB, triggers/PL,
+inheritance/partitioning, full-text, replication, extensions) is
+anchored in `memory/vision-spg-ge-pg-everywhere.md`. v7.38 builds the
+gate that lets all of that ship without regressions.
+
+**4 元机制(P0,必须先建)**:
+- A. injection_points framework — Rust macro, compile-time no-op in
+  release, attach/wakeup surface in test
+- B. permutation matrix runner — `xtests/perm-runner/` + 5 perm
+  (embedded / server_simple / server_extended / joinfold_off / topk_off)
+- C. 三主差分 oracle — `xtests/oracle/{pg18,mysql,mariadb}/` docker
+  + sort-then-compare + adjust_*() normalization
+- D. 测试模式 GUC framework — 7 旋钮接 engine surface
+
+**8 轴**:SQL conformance / 三方言 specifics / pool stress /
+isolation+并发 / 事务一致性+崩溃原子性 / dump+import / 灾难恢复 /
+perf 四层(micro / simple e2e / stress / scale)
+
+**速度预算**:`gate.sh` fast tier ≤ 5 min on mini;`bench --fast`
+≤ 30 s;dev cargo cycle 不退化
+
+详 `.claude/notes/v7.38-plan.md` + `docs/TESTING_V2_SKELETON.md` +
+`docs/PERF_METHODOLOGY_VS_FOSS.md`(横向 perf doctrine,入立法引用).
+
+---
+
 ## [7.37.8] — 2026-06-23 (mailrs lock-hang 4th recurrence — V4 SQL replay tax killed by default-on V5 ROW_REDO)
 
 Hotfix. mailrs reported a 4th distinct lock-hang on prod

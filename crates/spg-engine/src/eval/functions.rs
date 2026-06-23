@@ -16,9 +16,15 @@ use super::*;
 /// }`), so dispatch skips the per-call `to_ascii_lowercase()`
 /// allocation. Equivalent to `apply_function` for any already-
 /// lowercase input.
+// v7.37.9 T3 S6 — args relaxed from `&[Value<'static>]` to
+// `&[Value<'_>]` so the Step VM's borrow-bearing stack slice can be
+// passed in directly (no per-row Vec materialise). The dispatch body
+// reads args by reference and constructs the result owned, so the
+// lifetime relaxation is a pure signature widening — no behaviour
+// change.
 pub(super) fn apply_function_lower(
     name_lower: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(name_lower, args, ctx)
@@ -26,7 +32,7 @@ pub(super) fn apply_function_lower(
 
 pub(super) fn apply_function(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(&name.to_ascii_lowercase(), args, ctx)
@@ -34,10 +40,19 @@ pub(super) fn apply_function(
 
 fn apply_function_dispatch(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     match name {
+        // v7.38 P0 元机制 A — SQL-facing handles for the injection
+        // points framework. Tests call these to attach an action
+        // (`wait` / `error[:msg]` / `notice[:msg]`) to a registered
+        // point, wake parked threads, or detach. Release builds
+        // (feature off) reject the calls outright so a production
+        // SPG can't be coerced into deadlocking.
+        "spg_injection_attach" => return spg_injection_attach(args),
+        "spg_injection_wakeup" => return spg_injection_wakeup(args),
+        "spg_injection_detach" => return spg_injection_detach(args),
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {
@@ -591,7 +606,7 @@ fn apply_function_dispatch(
         "coalesce" => {
             for a in args {
                 if !matches!(a, Value::Null) {
-                    return Ok(a.clone());
+                    return Ok(a.clone().into_owned());
                 }
             }
             Ok(Value::Null)
@@ -948,7 +963,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             }
             let is_greatest = name.eq_ignore_ascii_case("greatest");
-            let mut best = non_null[0].clone();
+            let mut best: Value<'static> = non_null[0].clone().into_owned();
             for v in &non_null[1..] {
                 let ord = value_cmp_for_min_max(&best, v);
                 let take = if is_greatest {
@@ -957,7 +972,7 @@ fn apply_function_dispatch(
                     ord == core::cmp::Ordering::Greater
                 };
                 if take {
-                    best = (*v).clone();
+                    best = (*v).clone().into_owned();
                 }
             }
             Ok(best)
@@ -973,7 +988,7 @@ fn apply_function_dispatch(
             }
             for v in args {
                 if !matches!(v, Value::Null) {
-                    return Ok(v.clone());
+                    return Ok(v.clone().into_owned());
                 }
             }
             Ok(Value::Null)
@@ -1001,9 +1016,9 @@ fn apply_function_dispatch(
                 _ => true,
             };
             if truthy {
-                Ok(args[1].clone())
+                Ok(args[1].clone().into_owned())
             } else {
-                Ok(args[2].clone())
+                Ok(args[2].clone().into_owned())
             }
         }
         "nullif" => {
@@ -1014,7 +1029,7 @@ fn apply_function_dispatch(
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) => Ok(Value::Null),
-                (a, Value::Null) => Ok(a.clone()),
+                (a, Value::Null) => Ok(a.clone().into_owned()),
                 (a, b) => {
                     // Use value_cmp (already defined as Ord-like
                     // function in lib.rs) — but it's not accessible
@@ -1022,7 +1037,7 @@ fn apply_function_dispatch(
                     if values_equal_for_nullif(a, b) {
                         Ok(Value::Null)
                     } else {
-                        Ok(a.clone())
+                        Ok(a.clone().into_owned())
                     }
                 }
             }
@@ -1031,7 +1046,7 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                     Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1105,7 +1120,7 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                     Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1194,7 +1209,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1219,7 +1234,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1545,7 +1560,7 @@ fn apply_function_dispatch(
         // `SELECT pg_catalog.set_config('search_path', '', false);`
         // and friends. SPG is single-schema; accept-as-no-op
         // returning either the new value or NULL.
-        "set_config" => Ok(args.get(1).cloned().unwrap_or(Value::Null)),
+        "set_config" => Ok(args.get(1).cloned().map(Value::into_owned).unwrap_or(Value::Null)),
         "current_setting" => Ok(Value::text(String::new())),
         // PG `pg_catalog.*` discovery / cast helpers commonly
         // emitted by ORMs probing the server. Accept-as-no-op
@@ -1673,4 +1688,111 @@ fn apply_function_dispatch(
             detail: format!("unknown function `{other}`"),
         }),
     }
+}
+
+// v7.38 P0 元机制 A — SQL-facing handles for the injection_points
+// framework. Tests call these via `SELECT spg_injection_attach(...)` /
+// `_wakeup` / `_detach`. With the `injection-points` feature OFF
+// (release builds) all three return an error so a production SPG
+// can't be coerced into deadlocking via SQL.
+
+fn expect_text_arg<'a>(
+    args: &'a [Value<'_>],
+    idx: usize,
+    fn_name: &str,
+) -> Result<&'a str, EvalError> {
+    let v = args.get(idx).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("{fn_name} requires {} args, got {}", idx + 1, args.len()),
+    })?;
+    match v {
+        Value::Text(s) => Ok(s.as_ref()),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{fn_name} argument {} must be TEXT, got {:?}",
+                idx + 1,
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_attach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_attach takes (point_name TEXT, action TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_attach")?;
+    let action_str = expect_text_arg(args, 1, "spg_injection_attach")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_attach: no engine injection scope active".into(),
+        })?;
+    let action = crate::testkit::injection::parse_action(action_str)
+        .map_err(|detail| EvalError::TypeMismatch { detail })?;
+    store.attach(name.to_string(), action);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_wakeup(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_wakeup takes (point_name TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_wakeup")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_wakeup: no engine injection scope active".into(),
+        })?;
+    store.wakeup(name);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(feature = "injection-points")]
+fn spg_injection_detach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_detach takes (point_name TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_detach")?;
+    let store =
+        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+            detail: "spg_injection_detach: no engine injection scope active".into(),
+        })?;
+    store.detach(name);
+    Ok(Value::Bool(true))
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_attach(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_attach: injection-points feature not enabled in this build".into(),
+    })
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_wakeup(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_wakeup: injection-points feature not enabled in this build".into(),
+    })
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_detach(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_detach: injection-points feature not enabled in this build".into(),
+    })
 }

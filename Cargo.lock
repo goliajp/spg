@@ -1628,6 +1628,7 @@ dependencies = [
  "sha1",
  "sha2",
  "spg-crypto",
+ "spg-engine",
  "spg-sql",
  "spg-storage",
 ]
@@ -1637,6 +1638,27 @@ name = "spg-manifest"
 version = "7.37.8"
 dependencies = [
  "spg-crypto",
+]
+
+[[package]]
+name = "spg-oracle-runner"
+version = "7.37.8"
+dependencies = [
+ "anyhow",
+ "clap",
+ "spg-engine",
+ "spg-perm-runner",
+ "spg-storage",
+ "walkdir",
+]
+
+[[package]]
+name = "spg-perm-runner"
+version = "7.37.8"
+dependencies = [
+ "spg-engine",
+ "spg-storage",
+ "sqllogictest",
 ]
 
 [[package]]

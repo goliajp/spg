@@ -1,0 +1,55 @@
+# Round-20 (v7.26.0, prod-live) — typed aggregate/expression columns
+# + honest missing-column errors
+#
+# Before round-20:
+#   - SELECT-list expressions and aggregates returned generic TEXT
+#     in some shapes (e.g. `SUM(v)` came back as TEXT instead of
+#     BIGINT depending on the source column type).
+#   - References to non-existent columns returned an EMPTY result
+#     silently instead of the expected error.
+#
+# After round-20:
+#   - Aggregate expression columns carry the correct result type
+#     (SUM stays in widened-int / BIGINT; AVG stays in NUMERIC;
+#     COUNT(*) is BIGINT).
+#   - Missing column references error out with the column name in
+#     the message — caller can debug instead of seeing 0 rows.
+
+statement ok
+CREATE TABLE r20_t (g TEXT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO r20_t VALUES ('a', 10), ('a', 20), ('b', 30)
+
+# SUM/COUNT carry the right widened integer type — sqllogictest's
+# 'query I' (integer) decoding here would fail at runtime if the
+# result came back as TEXT.
+query TI rowsort
+SELECT g, SUM(v) FROM r20_t GROUP BY g ORDER BY g
+----
+a
+30
+b
+30
+
+query I nosort
+SELECT COUNT(*) FROM r20_t
+----
+3
+
+# Plain expression column carries the widened type too.
+query I rowsort
+SELECT v * 2 FROM r20_t ORDER BY v
+----
+20
+40
+60
+
+# Missing-column reference errors out cleanly. The pre-round-20
+# behaviour silently returned 0 rows; the regression bar is
+# 'statement error', not 'returns empty rows'.
+statement error
+SELECT no_such_column FROM r20_t
+
+statement error
+SELECT g, SUM(no_such_column) FROM r20_t GROUP BY g

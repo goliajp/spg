@@ -1,0 +1,68 @@
+# xtests/oracle/docker-compose.yml — v7.38 oracle harness
+#
+# Brought up by `spg-oracle-runner docker up`, torn down by
+# `... docker down`. All three engines on an isolated network so the
+# runner can hit them concurrently without colliding with any
+# developer-local PG/MySQL on standard ports.
+#
+# `tmpfs:` keeps the data dir in RAM — combined with the fast-mode
+# config in each engine's Dockerfile this brings cold-start to <60s
+# (the gate.sh full-tier budget).
+
+services:
+  pg18:
+    build: ./pg18
+    container_name: spg-oracle-pg18
+    image: spg-oracle-pg18:v7.38
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_USER: testuser
+      POSTGRES_DB: testdb
+      POSTGRES_INITDB_ARGS: --locale=C.UTF-8 --encoding=UTF8
+    ports:
+      - "55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    build: ./mysql
+    container_name: spg-oracle-mysql
+    image: spg-oracle-mysql:v7.38
+    environment:
+      MYSQL_ROOT_PASSWORD: testpass
+      MYSQL_DATABASE: testdb
+    ports:
+      - "53306:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-ptestpass"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mariadb:
+    build: ./mariadb
+    container_name: spg-oracle-mariadb
+    image: spg-oracle-mariadb:v7.38
+    environment:
+      MARIADB_ROOT_PASSWORD: testpass
+      MARIADB_DATABASE: testdb
+    ports:
+      - "53307:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+networks:
+  default:
+    name: spg-oracle-net

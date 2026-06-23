@@ -27,11 +27,48 @@ sha1        = { version = "0.10", default-features = false }
 # stores SHA256(SHA256(password)) per user.
 sha2        = { version = "0.10", default-features = false }
 
+[features]
+# v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
+# engine stays `#![no_std]`-compatible. Default-on for the hosted
+# embedders (spg-server, spg-embedded, tests); downstream bare-metal
+# users can opt out via `default-features = false`.
+default = ["std"]
+std     = []
+
+# v7.38 P0 元机制 A — injection_points framework.
+#
+# Default OFF for release builds: every `injection_point!()` macro
+# call expands to `let _ = (...);` (consumes the payload exprs but
+# generates no runtime code; verified by `cargo asm` to leave no
+# push/pop/branch in optimised builds). With the feature ON the
+# macro routes to `testkit::injection::__trigger`, which looks up
+# the current engine's `InjectionStore` via a thread-local and runs
+# the attached action (wait/wakeup/error/notice). Test binaries
+# enable it via dev-deps; CI runs `cargo test --features
+# injection-points`. See `.claude/notes/v7.38-injection-points-design.md`.
+injection-points = []
+
+# v7.37.9 T3 — diagnostic perf counters for Step VM / aggregate hot
+# paths. Default OFF for release builds: every `bump_counter!(...)`
+# macro call expands to `let _ = (...);` (no runtime code). With the
+# feature ON the macro routes to the underlying `AtomicU64::fetch_add`.
+# Used by the `xtests/dogfood_replay/src/bin/counter_dump.rs`
+# diagnostic binary to attribute Class A / B / C cascade cost; not
+# useful in production where the counters add ~3-4 ms/query overhead
+# (3.5M atomic Relaxed adds × ~1 ns).
+perf-counters = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+# v7.38 P0 元机制 A — dev-cycle `cargo test` automatically opts in
+# to the injection-points framework so unit / e2e tests can attach
+# `wait` / `wakeup` / `error` / `notice` actions to any
+# `injection_point!()` site. Release builds (no dev-deps) keep the
+# feature off; macros expand to no-ops.
+spg-engine = { path = ".", features = ["injection-points"] }
 
 [[bench]]
 name    = "execute"
