@@ -531,7 +531,7 @@ pub(crate) fn eval_compiled(
 // (S2 Column, S3 Lit, S4 Binary, S6 Function, S7 Case) progressively
 // switch to borrowed push to eliminate per-row String allocs.
 pub(crate) fn eval_compiled_ref<'row, 'val>(
-    c: &CompiledExpr,
+    c: &'val CompiledExpr,
     row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
@@ -550,7 +550,7 @@ where
 /// there. Caller uses the `mark` to know where to truncate / pop. Kept
 /// out of public surface — only the Case opcode reaches for it.
 fn eval_compiled_ref_into<'row, 'val>(
-    c: &CompiledExpr,
+    c: &'val CompiledExpr,
     row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
@@ -564,7 +564,7 @@ where
 
 #[inline]
 fn run_compiled_steps<'row, 'val>(
-    steps: &[Step],
+    steps: &'val [Step],
     row: &'val crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
@@ -634,7 +634,27 @@ where
                     STEP_VM_LIT_HEAP_ALLOC
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                stack.push(v.clone())
+                // v7.37.9 T3 S3 — borrow literal storage instead of
+                // String::clone'ing it. Step variants own their
+                // literal (`Value<'static>` enum payload), so we can
+                // safely construct a `Cow::Borrowed(&'static …)` view.
+                // Same pattern as S2's Column path.
+                let pushed: Value<'val> = match v {
+                    spg_storage::Value::Text(s) => {
+                        spg_storage::Value::Text(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    spg_storage::Value::Bytes(b) => {
+                        spg_storage::Value::Bytes(alloc::borrow::Cow::Borrowed(b.as_ref()))
+                    }
+                    spg_storage::Value::Json(s) => {
+                        spg_storage::Value::Json(alloc::borrow::Cow::Borrowed(s.as_ref()))
+                    }
+                    spg_storage::Value::Vector(vec) => {
+                        spg_storage::Value::Vector(alloc::borrow::Cow::Borrowed(vec.as_ref()))
+                    }
+                    other => other.clone(),
+                };
+                stack.push(pushed);
             }
             Step::Binary(op) => {
                 STEP_VM_BINARY_FIRE
