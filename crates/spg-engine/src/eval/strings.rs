@@ -27,7 +27,7 @@ pub(super) enum TrimSide {
 /// support negative n which means "all but |n| chars from the
 /// opposite side". n=0 → ''. Codepoint-counted. NULL → NULL.
 pub(super) fn string_left_right(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     is_left: bool,
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
@@ -89,7 +89,7 @@ pub(super) fn string_left_right(
 /// needs padding → returns input verbatim (potentially
 /// truncated). NULL on any arg → NULL.
 pub(super) fn string_pad(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     is_left: bool,
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
@@ -152,7 +152,7 @@ pub(super) fn string_pad(
 /// of UTF-8 codepoints (not a substring). NULL on either arg
 /// poisons the result.
 pub(super) fn string_trim(
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     side: TrimSide,
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
@@ -202,7 +202,7 @@ pub(super) fn string_trim(
 ///   * `%%` — literal `%`
 ///   * `%n$X` — argument position (1-based) before the specifier
 ///     character (e.g. `%2$s` picks the 2nd arg)
-pub(super) fn format_string(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() {
         return Err(EvalError::TypeMismatch {
             detail: "format() takes at least 1 arg (format string)".into(),
@@ -403,7 +403,7 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
     }
 }
 
-pub(super) fn to_char(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {

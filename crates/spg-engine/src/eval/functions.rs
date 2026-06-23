@@ -16,9 +16,15 @@ use super::*;
 /// }`), so dispatch skips the per-call `to_ascii_lowercase()`
 /// allocation. Equivalent to `apply_function` for any already-
 /// lowercase input.
+// v7.37.9 T3 S6 — args relaxed from `&[Value<'static>]` to
+// `&[Value<'_>]` so the Step VM's borrow-bearing stack slice can be
+// passed in directly (no per-row Vec materialise). The dispatch body
+// reads args by reference and constructs the result owned, so the
+// lifetime relaxation is a pure signature widening — no behaviour
+// change.
 pub(super) fn apply_function_lower(
     name_lower: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(name_lower, args, ctx)
@@ -26,7 +32,7 @@ pub(super) fn apply_function_lower(
 
 pub(super) fn apply_function(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     apply_function_dispatch(&name.to_ascii_lowercase(), args, ctx)
@@ -34,7 +40,7 @@ pub(super) fn apply_function(
 
 fn apply_function_dispatch(
     name: &str,
-    args: &[Value<'static>],
+    args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     match name {
@@ -600,7 +606,7 @@ fn apply_function_dispatch(
         "coalesce" => {
             for a in args {
                 if !matches!(a, Value::Null) {
-                    return Ok(a.clone());
+                    return Ok(a.clone().into_owned());
                 }
             }
             Ok(Value::Null)
@@ -957,7 +963,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             }
             let is_greatest = name.eq_ignore_ascii_case("greatest");
-            let mut best = non_null[0].clone();
+            let mut best: Value<'static> = non_null[0].clone().into_owned();
             for v in &non_null[1..] {
                 let ord = value_cmp_for_min_max(&best, v);
                 let take = if is_greatest {
@@ -966,7 +972,7 @@ fn apply_function_dispatch(
                     ord == core::cmp::Ordering::Greater
                 };
                 if take {
-                    best = (*v).clone();
+                    best = (*v).clone().into_owned();
                 }
             }
             Ok(best)
@@ -982,7 +988,7 @@ fn apply_function_dispatch(
             }
             for v in args {
                 if !matches!(v, Value::Null) {
-                    return Ok(v.clone());
+                    return Ok(v.clone().into_owned());
                 }
             }
             Ok(Value::Null)
@@ -1010,9 +1016,9 @@ fn apply_function_dispatch(
                 _ => true,
             };
             if truthy {
-                Ok(args[1].clone())
+                Ok(args[1].clone().into_owned())
             } else {
-                Ok(args[2].clone())
+                Ok(args[2].clone().into_owned())
             }
         }
         "nullif" => {
@@ -1023,7 +1029,7 @@ fn apply_function_dispatch(
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) => Ok(Value::Null),
-                (a, Value::Null) => Ok(a.clone()),
+                (a, Value::Null) => Ok(a.clone().into_owned()),
                 (a, b) => {
                     // Use value_cmp (already defined as Ord-like
                     // function in lib.rs) — but it's not accessible
@@ -1031,7 +1037,7 @@ fn apply_function_dispatch(
                     if values_equal_for_nullif(a, b) {
                         Ok(Value::Null)
                     } else {
-                        Ok(a.clone())
+                        Ok(a.clone().into_owned())
                     }
                 }
             }
@@ -1040,7 +1046,7 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                     Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1114,7 +1120,7 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                     Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1203,7 +1209,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1228,7 +1234,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1554,7 +1560,7 @@ fn apply_function_dispatch(
         // `SELECT pg_catalog.set_config('search_path', '', false);`
         // and friends. SPG is single-schema; accept-as-no-op
         // returning either the new value or NULL.
-        "set_config" => Ok(args.get(1).cloned().unwrap_or(Value::Null)),
+        "set_config" => Ok(args.get(1).cloned().map(Value::into_owned).unwrap_or(Value::Null)),
         "current_setting" => Ok(Value::text(String::new())),
         // PG `pg_catalog.*` discovery / cast helpers commonly
         // emitted by ORMs probing the server. Accept-as-no-op
@@ -1691,7 +1697,7 @@ fn apply_function_dispatch(
 // can't be coerced into deadlocking via SQL.
 
 fn expect_text_arg<'a>(
-    args: &'a [Value<'static>],
+    args: &'a [Value<'_>],
     idx: usize,
     fn_name: &str,
 ) -> Result<&'a str, EvalError> {
@@ -1711,7 +1717,7 @@ fn expect_text_arg<'a>(
 }
 
 #[cfg(feature = "injection-points")]
-fn spg_injection_attach(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_attach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1733,7 +1739,7 @@ fn spg_injection_attach(args: &[Value<'static>]) -> Result<Value<'static>, EvalE
 }
 
 #[cfg(feature = "injection-points")]
-fn spg_injection_wakeup(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_wakeup(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1752,7 +1758,7 @@ fn spg_injection_wakeup(args: &[Value<'static>]) -> Result<Value<'static>, EvalE
 }
 
 #[cfg(feature = "injection-points")]
-fn spg_injection_detach(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_detach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1771,21 +1777,21 @@ fn spg_injection_detach(args: &[Value<'static>]) -> Result<Value<'static>, EvalE
 }
 
 #[cfg(not(feature = "injection-points"))]
-fn spg_injection_attach(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_attach(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     Err(EvalError::TypeMismatch {
         detail: "spg_injection_attach: injection-points feature not enabled in this build".into(),
     })
 }
 
 #[cfg(not(feature = "injection-points"))]
-fn spg_injection_wakeup(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_wakeup(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     Err(EvalError::TypeMismatch {
         detail: "spg_injection_wakeup: injection-points feature not enabled in this build".into(),
     })
 }
 
 #[cfg(not(feature = "injection-points"))]
-fn spg_injection_detach(_args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn spg_injection_detach(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     Err(EvalError::TypeMismatch {
         detail: "spg_injection_detach: injection-points feature not enabled in this build".into(),
     })

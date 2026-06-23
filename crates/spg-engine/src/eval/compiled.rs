@@ -824,17 +824,12 @@ where
                 // result. `name_lower` is pre-lowercased at compile
                 // time, so dispatch skips the per-row
                 // `to_ascii_lowercase()` allocation.
-                // v7.37.9 T3 S1 — `apply_function_lower` still wants
-                // `&[Value<'static>]`. For S1 (no behaviour change) we
-                // materialise an owned copy of the relevant stack slice.
-                // S6 will replace this with an `apply_function_lower_ref`
-                // that accepts borrowed args.
-                let owned_args: Vec<Value<'static>> = stack[start..]
-                    .iter()
-                    .map(|v| v.clone().into_owned())
-                    .collect();
+                // v7.37.9 T3 S6 — apply_function_lower signature relaxed
+                // to `&[Value<'_>]`; pass the borrowed stack slice
+                // directly. Eliminates the Vec materialise + per-arg
+                // String::clone that S1 introduced as a placeholder.
                 let result =
-                    super::functions::apply_function_lower(name_lower, &owned_args, ctx)?;
+                    super::functions::apply_function_lower(name_lower, &stack[start..], ctx)?;
                 stack.truncate(start);
                 stack.push(result);
             }
