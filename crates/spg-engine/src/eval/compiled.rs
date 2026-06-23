@@ -499,6 +499,8 @@ pub(crate) fn eval_compiled(
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'static>>,
 ) -> Result<Value<'static>, EvalError> {
+    // Owned-row callers keep the `'static` stack contract — `'r = 'static`
+    // is inferred from this Vec parameter.
     eval_compiled_ref(c, &crate::join::RowRef::Owned(row), ctx, stack)
 }
 
@@ -510,12 +512,21 @@ pub(crate) fn eval_compiled(
 /// equivalent to the Owned path — `eval_compiled` above is now a thin
 /// `RowRef::Owned` wrapper, so there is a single interpreter (invariant
 /// I3); a differential test pins the equivalence.
-pub(crate) fn eval_compiled_ref(
+// v7.37.9 T3 S1 — row-lifetime stack plumbing. Two lifetimes:
+// `'row` = the RowRef's data lifetime; `'val` = stack value lifetime
+// (must outlive function return). Constraint `'row: 'val` allows the
+// step body to push `Value::Text(Cow::Borrowed(row_cell))` (S2+) while
+// the caller's stack stays at whatever lifetime it declared (often
+// `'static` for Vec<Value<'static>>). S1 keeps every step body forcing
+// `.into_owned()` so behaviour is bit-identical; later stages
+// (S2 Column, S3 Lit, S4 Binary, S6 Function, S7 Case) progressively
+// switch to borrowed push to eliminate per-row String allocs.
+pub(crate) fn eval_compiled_ref<'row, 'val>(
     c: &CompiledExpr,
-    row: &crate::join::RowRef<'_>,
+    row: &crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
-) -> Result<Value<'static>, EvalError> {
+    stack: &mut Vec<Value<'val>>,
+) -> Result<Value<'val>, EvalError> {
     stack.clear();
     run_compiled_steps(&c.steps, row, ctx, stack)?;
     Ok(stack.pop().unwrap_or(Value::Null))
@@ -526,22 +537,22 @@ pub(crate) fn eval_compiled_ref(
 /// stack; pushes the program's result on top of whatever was already
 /// there. Caller uses the `mark` to know where to truncate / pop. Kept
 /// out of public surface — only the Case opcode reaches for it.
-fn eval_compiled_ref_into(
+fn eval_compiled_ref_into<'row, 'val>(
     c: &CompiledExpr,
-    row: &crate::join::RowRef<'_>,
+    row: &crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
+    stack: &mut Vec<Value<'val>>,
     _mark: usize,
 ) -> Result<(), EvalError> {
     run_compiled_steps(&c.steps, row, ctx, stack)
 }
 
 #[inline]
-fn run_compiled_steps(
+fn run_compiled_steps<'row, 'val>(
     steps: &[Step],
-    row: &crate::join::RowRef<'_>,
+    row: &crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
-    stack: &mut Vec<Value<'static>>,
+    stack: &mut Vec<Value<'val>>,
 ) -> Result<(), EvalError> {
     // v7.37.9 Phase 1A-ext-2 T1 — counter per call into the Step VM
     // interpreter. Tells us "how many steps does the average compiled
@@ -594,8 +605,11 @@ fn run_compiled_steps(
             Step::Binary(op) => {
                 STEP_VM_BINARY_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                let r = stack.pop().unwrap_or(Value::Null);
-                let l = stack.pop().unwrap_or(Value::Null);
+                // v7.37.9 T3 S1 — apply_binary still wants `Value<'static>`.
+                // Force into_owned at the pop boundary. S4 will replace
+                // with apply_binary_by_ref for comparison ops.
+                let r = stack.pop().unwrap_or(Value::Null).into_owned();
+                let l = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::BinaryCi(op) => {
@@ -603,12 +617,12 @@ fn run_compiled_steps(
                     Value::Text(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,
                 };
-                let r = fold(stack.pop().unwrap_or(Value::Null));
-                let l = fold(stack.pop().unwrap_or(Value::Null));
+                let r = fold(stack.pop().unwrap_or(Value::Null).into_owned());
+                let l = fold(stack.pop().unwrap_or(Value::Null).into_owned());
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::Unary(op) => {
-                let v = stack.pop().unwrap_or(Value::Null);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_unary(*op, v)?);
             }
             Step::IsNull { negated } => {
@@ -663,7 +677,7 @@ fn run_compiled_steps(
                 negated,
                 case_insensitive,
             } => {
-                let v = stack.pop().unwrap_or(Value::Null);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 match v {
                     Value::Null => stack.push(Value::Null),
                     Value::Text(t) => {
@@ -739,15 +753,24 @@ fn run_compiled_steps(
                 // result. `name_lower` is pre-lowercased at compile
                 // time, so dispatch skips the per-row
                 // `to_ascii_lowercase()` allocation.
+                // v7.37.9 T3 S1 — `apply_function_lower` still wants
+                // `&[Value<'static>]`. For S1 (no behaviour change) we
+                // materialise an owned copy of the relevant stack slice.
+                // S6 will replace this with an `apply_function_lower_ref`
+                // that accepts borrowed args.
+                let owned_args: Vec<Value<'static>> = stack[start..]
+                    .iter()
+                    .map(|v| v.clone().into_owned())
+                    .collect();
                 let result =
-                    super::functions::apply_function_lower(name_lower, &stack[start..], ctx)?;
+                    super::functions::apply_function_lower(name_lower, &owned_args, ctx)?;
                 stack.truncate(start);
                 stack.push(result);
             }
             Step::Cast { target } => {
                 STEP_VM_CAST_FIRE
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                let v = stack.pop().unwrap_or(Value::Null);
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(super::cast::cast_value(v, target.clone())?);
             }
             Step::Case {
@@ -767,13 +790,13 @@ fn run_compiled_steps(
                 // `Vec<Value>` per sub-program which showed up as
                 // ~3 % `drop_in_place<Vec<Value>>` self time.
                 let mark = stack.len();
-                let operand_value = if let Some(op) = operand {
-                    // Recursive call reuses the same stack: it
-                    // `stack.clear()`s at entry so we hand it a fresh
-                    // logical view; pop the sub-program's result
-                    // afterwards and restore our prefix manually.
+                // v7.37.9 T3 S1 — Case operand/branches still drive
+                // `apply_binary(Eq)` which wants `Value<'static>`. Force
+                // into_owned on every pop in this block to preserve S1's
+                // behavioural equivalence. S4+ relaxes this.
+                let operand_value: Option<Value<'static>> = if let Some(op) = operand {
                     eval_compiled_ref_into(op, row, ctx, stack, mark)?;
-                    Some(stack.pop().unwrap_or(Value::Null))
+                    Some(stack.pop().unwrap_or(Value::Null).into_owned())
                 } else {
                     None
                 };
@@ -781,7 +804,7 @@ fn run_compiled_steps(
                 let mut matched_value: Option<Value<'static>> = None;
                 for (when_c, then_c) in branches {
                     eval_compiled_ref_into(when_c, row, ctx, stack, mark)?;
-                    let when_v = stack.pop().unwrap_or(Value::Null);
+                    let when_v = stack.pop().unwrap_or(Value::Null).into_owned();
                     stack.truncate(mark);
                     let matched = match &operand_value {
                         None => matches!(when_v, Value::Bool(true)),
@@ -792,17 +815,17 @@ fn run_compiled_steps(
                     };
                     if matched {
                         eval_compiled_ref_into(then_c, row, ctx, stack, mark)?;
-                        matched_value = Some(stack.pop().unwrap_or(Value::Null));
+                        matched_value = Some(stack.pop().unwrap_or(Value::Null).into_owned());
                         stack.truncate(mark);
                         break;
                     }
                 }
-                let v = match matched_value {
+                let v: Value<'static> = match matched_value {
                     Some(v) => v,
                     None => match else_branch {
                         Some(el) => {
                             eval_compiled_ref_into(el, row, ctx, stack, mark)?;
-                            let v = stack.pop().unwrap_or(Value::Null);
+                            let v = stack.pop().unwrap_or(Value::Null).into_owned();
                             stack.truncate(mark);
                             v
                         }
