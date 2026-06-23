@@ -2583,6 +2583,20 @@ impl Database {
         Ok(result)
     }
 
+    /// v7.37.9 — apply a decoded V5 row-redo log directly to the
+    /// engine. Used by spgctl's PITR restore path to handle
+    /// `WAL_V5_TYPE_ROW_REDO` (0x13) records the same way `open_path`
+    /// does in its replay loop. Without this, spgctl errors out on
+    /// any WAL chunk whose floor was past v7.37.8's SPG_WAL_ROW_REDO
+    /// default-ON flip — exactly the failing-test shape in
+    /// `crates/spgctl/src/main.rs::tests::pitr_restore_*`.
+    pub fn apply_redo(
+        &mut self,
+        changes: &[spg_storage::RowChange],
+    ) -> Result<(), EngineError> {
+        self.engine.apply_redo(changes)
+    }
+
     /// v7.20 P2 — group-commit write entry. Runs the engine
     /// mutation + encodes/enqueues the WAL record, then RETURNS
     /// WITHOUT waiting for the fsync. The caller must call
