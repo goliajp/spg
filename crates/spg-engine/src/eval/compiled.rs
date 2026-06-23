@@ -856,42 +856,61 @@ where
                 // `Vec<Value>` per sub-program which showed up as
                 // ~3 % `drop_in_place<Vec<Value>>` self time.
                 let mark = stack.len();
-                // v7.37.9 T3 S1 — Case operand/branches still drive
-                // `apply_binary(Eq)` which wants `Value<'static>`. Force
-                // into_owned on every pop in this block to preserve S1's
-                // behavioural equivalence. S4+ relaxes this.
-                let operand_value: Option<Value<'static>> = if let Some(op) = operand {
+                // v7.37.9 T3 S7 — Case sub-program lifetime threads
+                // through naturally via S1's `'row: 'val`. Operand /
+                // when / matched / else results are pushed by sub-progs
+                // into our same stack; we pop them as `Value<'val>` and
+                // keep them at that lifetime instead of forcing
+                // into_owned. The simple-form operand match (Eq) uses
+                // apply_binary_by_ref to avoid the operand clone +
+                // pop-side into_owned the S1 placeholder was paying.
+                let operand_value: Option<Value<'val>> = if let Some(op) = operand {
                     eval_compiled_ref_into(op, row, ctx, stack, mark)?;
-                    Some(stack.pop().unwrap_or(Value::Null).into_owned())
+                    Some(stack.pop().unwrap_or(Value::Null))
                 } else {
                     None
                 };
                 stack.truncate(mark);
-                let mut matched_value: Option<Value<'static>> = None;
+                let mut matched_value: Option<Value<'val>> = None;
                 for (when_c, then_c) in branches {
                     eval_compiled_ref_into(when_c, row, ctx, stack, mark)?;
-                    let when_v = stack.pop().unwrap_or(Value::Null).into_owned();
+                    let when_v = stack.pop().unwrap_or(Value::Null);
                     stack.truncate(mark);
                     let matched = match &operand_value {
                         None => matches!(when_v, Value::Bool(true)),
-                        Some(op_v) => matches!(
-                            apply_binary(BinOp::Eq, op_v.clone(), when_v)?,
-                            Value::Bool(true)
-                        ),
+                        Some(op_v) => {
+                            // Try the by-ref comparison fast path; fall
+                            // back to owning apply_binary only if the
+                            // by-ref path returns None (non-comparison
+                            // op, which Eq never is).
+                            let eq_result = match super::apply_binary_by_ref(
+                                BinOp::Eq,
+                                op_v,
+                                &when_v,
+                            )? {
+                                Some(v) => v,
+                                None => apply_binary(
+                                    BinOp::Eq,
+                                    op_v.clone().into_owned(),
+                                    when_v.clone().into_owned(),
+                                )?,
+                            };
+                            matches!(eq_result, Value::Bool(true))
+                        }
                     };
                     if matched {
                         eval_compiled_ref_into(then_c, row, ctx, stack, mark)?;
-                        matched_value = Some(stack.pop().unwrap_or(Value::Null).into_owned());
+                        matched_value = Some(stack.pop().unwrap_or(Value::Null));
                         stack.truncate(mark);
                         break;
                     }
                 }
-                let v: Value<'static> = match matched_value {
+                let v: Value<'val> = match matched_value {
                     Some(v) => v,
                     None => match else_branch {
                         Some(el) => {
                             eval_compiled_ref_into(el, row, ctx, stack, mark)?;
-                            let v = stack.pop().unwrap_or(Value::Null).into_owned();
+                            let v = stack.pop().unwrap_or(Value::Null);
                             stack.truncate(mark);
                             v
                         }
