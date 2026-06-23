@@ -82,6 +82,15 @@ fn snapshot_counters() -> Vec<(&'static str, u64)> {
         ("AGG_PER_ROW_COMPILED_MISS", e::aggregate::AGG_PER_ROW_COMPILED_MISS.load(Relaxed)),
         ("AGG_PER_ROW_EVAL_FALLBACK", e::aggregate::AGG_PER_ROW_EVAL_FALLBACK.load(Relaxed)),
         ("AGG_PER_ROW_COUNT_STAR_SENTINEL", e::aggregate::AGG_PER_ROW_COUNT_STAR_SENTINEL.load(Relaxed)),
+        // v7.37.9 Phase 1A-ext-2 T1 — Step VM internal step-type counters
+        ("STEP_VM_CALL_COUNT", e::eval::compiled::STEP_VM_CALL_COUNT.load(Relaxed)),
+        ("STEP_VM_STEPS_TOTAL", e::eval::compiled::STEP_VM_STEPS_TOTAL.load(Relaxed)),
+        ("STEP_VM_COLUMN_FIRE", e::eval::compiled::STEP_VM_COLUMN_FIRE.load(Relaxed)),
+        ("STEP_VM_LIT_FIRE", e::eval::compiled::STEP_VM_LIT_FIRE.load(Relaxed)),
+        ("STEP_VM_BINARY_FIRE", e::eval::compiled::STEP_VM_BINARY_FIRE.load(Relaxed)),
+        ("STEP_VM_FUNCTION_FIRE", e::eval::compiled::STEP_VM_FUNCTION_FIRE.load(Relaxed)),
+        ("STEP_VM_CAST_FIRE", e::eval::compiled::STEP_VM_CAST_FIRE.load(Relaxed)),
+        ("STEP_VM_CASE_FIRE", e::eval::compiled::STEP_VM_CASE_FIRE.load(Relaxed)),
     ]
 }
 
