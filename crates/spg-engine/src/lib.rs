@@ -6,6 +6,34 @@
 
 extern crate alloc;
 
+// v7.37.9 T3 — `bump_counter!(C)` / `bump_counter!(C, N)` macros for the
+// Step VM + aggregate hot-path diagnostic counters. Gated on the
+// `perf-counters` feature so release builds pay zero cost; the
+// `xtests/dogfood_replay/spg-counter-dump` binary turns the feature on
+// to attribute Class A / B / C cascade cost.
+#[cfg(not(feature = "perf-counters"))]
+#[macro_export]
+macro_rules! bump_counter {
+    ($c:path) => {{
+        let _ = &$c;
+    }};
+    ($c:path, $n:expr) => {{
+        let _ = &$c;
+        let _ = &$n;
+    }};
+}
+
+#[cfg(feature = "perf-counters")]
+#[macro_export]
+macro_rules! bump_counter {
+    ($c:path) => {{
+        $c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }};
+    ($c:path, $n:expr) => {{
+        $c.fetch_add($n, core::sync::atomic::Ordering::Relaxed);
+    }};
+}
+
 pub mod aggregate;
 mod bytebudget;
 mod cancel;
@@ -50,6 +78,7 @@ pub mod subscriptions;
 mod substitute;
 mod system_catalog;
 mod table_access;
+pub mod testkit;
 mod transaction;
 pub mod triggers;
 pub mod users;
@@ -481,6 +510,23 @@ pub struct Engine {
     /// `select_references_meta_view`.
     meta_views_materialised: bool,
     pending_foreign_keys: Vec<(alloc::string::String, spg_sql::ast::ForeignKeyConstraint)>,
+    /// v7.38 元机制 D — frozen snapshot of `SPG_TEST_*` env vars. Read
+    /// once at construction (`with_env_cfg`) and queried on hot paths
+    /// via `engine.env_cfg().<field>`. Production builds keep this at
+    /// `EnvConfig::default()`, so the optimiser can const-fold every
+    /// `if env_cfg.<field>` gate. See `testkit::env_config` + the
+    /// `xtests/sigil/test-mode-gucs.md` index.
+    env_cfg: testkit::EnvConfig,
+    /// v7.38 P0 元机制 A — per-engine `injection_points` attach
+    /// table. Only exists when the crate is built with the
+    /// `injection-points` feature; release builds carry no field.
+    /// Pushed onto the thread-local stack by
+    /// `enter_injection_scope()` so the `injection_point!()` macro
+    /// can find it from anywhere in the executor without rewiring
+    /// every signature. See
+    /// `crates/spg-engine/src/testkit/injection.rs`.
+    #[cfg(feature = "injection-points")]
+    injection_store: alloc::sync::Arc<crate::testkit::injection::InjectionStore>,
     /// v7.34 (crash-recovery P0 #2) — row-level redo capture. When the
     /// embedding layer turns this on (persistence enabled), each mutating
     /// `execute` records the physical [`RowChange`]s it applied; the
@@ -491,6 +537,12 @@ pub struct Engine {
     /// Redo captured by the most recent successful mutating `execute`,
     /// awaiting drain by the embedding layer. Cleared on each capture.
     last_redo: Vec<RowChange>,
+    /// v7.38 轴 4 — currently-selected SQL isolation level. Set by
+    /// `SET TRANSACTION ISOLATION LEVEL …`; read by
+    /// `SHOW transaction_isolation`. v7.37.8 implements the
+    /// SQL surface; actual semantic differentiation (REPEATABLE READ
+    /// snapshot / SERIALIZABLE SSI) lands in a separate train.
+    pub(crate) current_isolation_level: spg_sql::ast::IsolationLevel,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -571,7 +623,13 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            env_cfg: testkit::EnvConfig::default(),
+            #[cfg(feature = "injection-points")]
+            injection_store: alloc::sync::Arc::new(
+                crate::testkit::injection::InjectionStore::default(),
+            ),
             redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
         }
     }
@@ -623,7 +681,13 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            env_cfg: testkit::EnvConfig::default(),
+            #[cfg(feature = "injection-points")]
+            injection_store: alloc::sync::Arc::new(
+                crate::testkit::injection::InjectionStore::default(),
+            ),
             redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
         }
     }
@@ -690,7 +754,13 @@ impl Engine {
                     foreign_key_checks: true,
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),
+                    env_cfg: testkit::EnvConfig::default(),
+                    #[cfg(feature = "injection-points")]
+                    injection_store: alloc::sync::Arc::new(
+                        crate::testkit::injection::InjectionStore::default(),
+                    ),
                     redo_capture: false,
+            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
                     last_redo: Vec::new(),
                 })
             }
@@ -724,6 +794,77 @@ impl Engine {
     pub const fn with_salt_fn(mut self, f: SaltFn) -> Self {
         self.salt_fn = Some(f);
         self
+    }
+
+    /// v7.38 元机制 D — install a frozen [`testkit::EnvConfig`] snapshot.
+    ///
+    /// Hosts (spg-server, spg-embedded, tests) call this once at engine
+    /// init with either `EnvConfig::from_env()` (production-with-test-vars)
+    /// or `EnvConfig::builder()....build()` (programmatic). After
+    /// construction the engine never reads env vars; all test-mode
+    /// behaviour flows through `self.env_cfg()`.
+    #[must_use]
+    pub fn with_env_cfg(mut self, env_cfg: testkit::EnvConfig) -> Self {
+        self.env_cfg = env_cfg;
+        self
+    }
+
+    /// v7.38 元机制 D — frozen test-mode GUC snapshot. Hot paths gate
+    /// nondeterministic surfaces on fields of this struct; production
+    /// default keeps every field at `false / None / Auto` so the
+    /// optimiser can const-fold the gate.
+    pub fn env_cfg(&self) -> &testkit::EnvConfig {
+        &self.env_cfg
+    }
+
+    /// v7.38 元机制 D acceptor — single seed source for every
+    /// nondeterministic engine subsystem (hash builders, randomised
+    /// tie-breakers, …). Honour `SPG_TEST_RANDOM_SEED=N` when set;
+    /// otherwise derive from the engine's wall clock (production) or
+    /// fall back to a fixed sentinel when the host hasn't installed
+    /// a clock. Two engines built with the same builder seed return
+    /// byte-equal output for the same query.
+    /// See `xtests/sigil/test-mode-gucs.md`.
+    pub fn rng_seed(&self) -> u64 {
+        if let Some(seed) = self.env_cfg.random_seed {
+            return seed;
+        }
+        match self.clock {
+            Some(f) => f() as u64,
+            // Production engines without a clock installed get a fixed
+            // non-zero sentinel; same shape as PG's `random()` start
+            // state under a `setseed(0)`.
+            None => 0xBAD_5EED_DEAD_BEEF,
+        }
+    }
+
+    /// v7.38 P0 元机制 A — push this engine's `InjectionStore` onto
+    /// the thread-local stack so any `injection_point!()` reached
+    /// during the returned guard's lifetime resolves against this
+    /// engine. Mirrors PG's per-backend injection table.
+    ///
+    /// Returns a no-op guard when the `injection-points` feature is
+    /// off so call sites don't need `#[cfg]`.
+    #[must_use]
+    pub fn enter_injection_scope(&self) -> crate::testkit::injection::InjectionGuard {
+        #[cfg(feature = "injection-points")]
+        {
+            crate::testkit::injection::enter_scope(&self.injection_store)
+        }
+        #[cfg(not(feature = "injection-points"))]
+        {
+            crate::testkit::injection::new_guard()
+        }
+    }
+
+    /// v7.38 P0 元机制 A — expose the per-engine store so tests can
+    /// query notice counts / detach actions without parsing SQL
+    /// output. Only present when the feature is on.
+    #[cfg(feature = "injection-points")]
+    pub fn injection_store(
+        &self,
+    ) -> alloc::sync::Arc<crate::testkit::injection::InjectionStore> {
+        self.injection_store.clone()
     }
 
     /// Builder: cap the number of rows a single SELECT may return.
@@ -917,6 +1058,14 @@ impl Engine {
     /// on `Drop`).
     pub fn redo_capture_enabled(&self) -> bool {
         self.redo_capture
+    }
+
+    /// v7.38 轴 4 — currently-selected SQL isolation level. Default
+    /// `ReadCommitted` after construction; updated by
+    /// `SET TRANSACTION ISOLATION LEVEL …`. Read by
+    /// `SHOW transaction_isolation` and any future MVCC/SSI gate.
+    pub fn current_isolation_level(&self) -> spg_sql::ast::IsolationLevel {
+        self.current_isolation_level
     }
 
     /// v7.34 — take the redo captured by the most recent successful

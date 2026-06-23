@@ -1,0 +1,97 @@
+# PG-compatible SHOW <parameter> surface — v7.38 axis-4 follow-up
+#
+# Drivers issue these on connection setup:
+# - sqlx-postgres: SHOW server_version, SHOW standard_conforming_strings
+# - npgsql: SHOW application_name, SHOW search_path
+# - asyncpg: SHOW server_version, SHOW client_encoding, SHOW TimeZone
+# - psql admin: SHOW search_path, SHOW DateStyle
+#
+# Before this surface (v7.37.8): every name except a handful that
+# parser-mapped to dedicated Statement variants errored at parse
+# time → driver-connect failed before the first user query.
+#
+# After this surface (v7.37.8 → v7.38): the generic SHOW <name>
+# path returns the engine's known value for the name, falling
+# through to session_params for any SET-recorded override.
+# Unknown names error with a pointer to pg_settings.
+
+query T nosort
+SHOW server_version
+----
+16.0 (spg)
+
+query T nosort
+SHOW server_encoding
+----
+UTF8
+
+query T nosort
+SHOW client_encoding
+----
+UTF8
+
+query T nosort
+SHOW standard_conforming_strings
+----
+on
+
+query T nosort
+SHOW search_path
+----
+"$user", public
+
+query T nosort
+SHOW application_name
+----
+(empty)
+
+query T nosort
+SHOW statement_timeout
+----
+0
+
+query T nosort
+SHOW DateStyle
+----
+ISO, MDY
+
+query T nosort
+SHOW TimeZone
+----
+UTC
+
+query T nosort
+SHOW is_superuser
+----
+on
+
+query T nosort
+SHOW default_transaction_isolation
+----
+read committed
+
+query T nosort
+SHOW IntervalStyle
+----
+postgres
+
+# A SET-recorded override is reflected in the SHOW value next time.
+# SPG's SET parser uses `,` for multi-assignment, so the PG
+# comma-list form (`SET search_path = my_schema, public`) lands
+# in v7.38 plan §六 dialect cleanup. The simpler single-ident form
+# already works.
+statement ok
+SET search_path = my_schema
+
+query T nosort
+SHOW search_path
+----
+my_schema
+
+# Reset for clean test ordering.
+statement ok
+RESET search_path
+
+# Unknown name surfaces as a runtime error pointing at pg_settings.
+statement error
+SHOW spam_setting_that_does_not_exist

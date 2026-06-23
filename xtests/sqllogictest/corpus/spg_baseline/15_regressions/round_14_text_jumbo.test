@@ -1,0 +1,53 @@
+# Round-14 (v7.23.0, prod-live) — TEXT > 64 KiB encodes everywhere
+#
+# Before round-14:
+#   - The on-disk TEXT codec used a u16 length prefix.
+#   - Any TEXT value ≥ 65 536 bytes panicked at write time
+#     (u16 overflow) and bricked the column.
+#   - Prod hit this on mailrs's `text_body` column when an email
+#     with a long quoted reply chain landed.
+#
+# After round-14:
+#   - The TEXT codec uses u32 length internally; jumbo pages
+#     carry > 64 KiB values across all storage paths
+#     (hot, cold, snapshot, WAL).
+#
+# This corpus pins the SQL-surface behaviour: a 70 KB text body
+# round-trips through INSERT and SELECT without truncation.
+
+statement ok
+CREATE TABLE r14_msg (id INT NOT NULL PRIMARY KEY, body TEXT NOT NULL)
+
+# A 70 KB body — past the u16 boundary. sqllogictest will only show
+# the row count (we use LENGTH to verify the value survived).
+statement ok
+INSERT INTO r14_msg (id, body) VALUES (1, repeat('a', 70000))
+
+# LENGTH on the round-tripped value must report the original size,
+# proving no silent truncation at the u16 boundary.
+query I nosort
+SELECT LENGTH(body) FROM r14_msg WHERE id = 1
+----
+70000
+
+# Mixed page — a small row + a jumbo row in the same table.
+statement ok
+INSERT INTO r14_msg (id, body) VALUES (2, 'short text')
+
+query II rowsort
+SELECT id, LENGTH(body) FROM r14_msg ORDER BY id
+----
+1
+70000
+2
+10
+
+# UPDATE that grows a small row past the boundary must not crash.
+statement ok
+UPDATE r14_msg SET body = repeat('b', 80000) WHERE id = 2
+
+query II nosort
+SELECT id, LENGTH(body) FROM r14_msg WHERE id = 2
+----
+2
+80000

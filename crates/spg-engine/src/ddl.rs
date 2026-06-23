@@ -861,7 +861,14 @@ impl Engine {
                 .collect::<Result<Vec<_>, _>>()?
         };
         match stmt.method {
-            IndexMethod::BTree => table.add_index(stmt.name.clone(), &stmt.column)?,
+            IndexMethod::BTree => {
+                table.add_index(stmt.name.clone(), &stmt.column)?;
+                // v7.38 P0 元机制 A — index has been pushed onto
+                // the table's index vector. Tests use this point
+                // to race a sealed index against a concurrent
+                // read.
+                crate::injection_point!("index_build_post_seal", &stmt.name);
+            }
             IndexMethod::Hnsw => {
                 if !included_positions.is_empty() {
                     return Err(EngineError::Unsupported(

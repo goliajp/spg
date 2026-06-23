@@ -1,0 +1,94 @@
+# SET TRANSACTION ISOLATION LEVEL — landed in v7.37.8
+#
+# History: was a gap-tracker (5 `statement error` records) until
+# v7.37.8 wired the SQL surface. Today the parser accepts all PG-
+# standard isolation levels + the optional READ ONLY / READ WRITE
+# / [NOT] DEFERRABLE clauses; the engine tracks the selected
+# level on `Engine::current_isolation_level()`; `SHOW
+# transaction_isolation` returns it as the PG-canonical string
+# (`read committed`, `repeatable read`, `serializable` — `read
+# uncommitted` silently upgrades to `read committed` per PG).
+#
+# Actual MVCC / SSI semantic differentiation lands in the v7.38
+# isolation framework train (corpus 17_isolation_semantics/).
+# Until then every level reads as effective READ COMMITTED.
+
+# Default before any SET: should be `read committed`.
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# READ COMMITTED — no-change for the default.
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# READ UNCOMMITTED upgrades to READ COMMITTED per PG.
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+
+query T nosort
+SHOW transaction_isolation
+----
+read committed
+
+# REPEATABLE READ — recorded but treated as READ COMMITTED today.
+statement ok
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+query T nosort
+SHOW transaction_isolation
+----
+repeatable read
+
+# SERIALIZABLE — recorded but treated as READ COMMITTED today.
+statement ok
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+query T nosort
+SHOW transaction_isolation
+----
+serializable
+
+# Reset for clean test ordering.
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+# START TRANSACTION ISOLATION LEVEL also parses (clauses parse-
+# and-ignored on START/BEGIN — see _README.md). The standalone
+# SET TRANSACTION afterwards is the supported way to record a
+# specific level.
+statement ok
+START TRANSACTION
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+
+query T nosort
+SHOW transaction_isolation
+----
+serializable
+
+statement ok
+COMMIT
+
+# READ ONLY / READ WRITE / DEFERRABLE / NOT DEFERRABLE all parse.
+statement ok
+SET TRANSACTION READ ONLY
+
+statement ok
+SET TRANSACTION READ WRITE
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE, NOT DEFERRABLE
+
+# Final value reflects the last ISOLATION LEVEL set.
+query T nosort
+SHOW transaction_isolation
+----
+serializable

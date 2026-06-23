@@ -1,0 +1,34 @@
+[package]
+name         = "spg-oracle-runner"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "v7.38 differential oracle — runs SPG vs PG18 / MySQL 8 / MariaDB 11, sort-then-byte-equal compare with adjust_*() normalisation pipeline."
+
+# v7.38 C scaffolding: at this stage the crate compiles as a bin with
+# stub adapters; full sqlx/docker wiring (PG/MySQL/MariaDB clients,
+# docker-compose orchestration) lands during P1+ corpus fill.
+
+[[bin]]
+name = "spg-oracle-runner"
+path = "src/main.rs"
+
+[dependencies]
+# spg-engine pulls in the embedded execution path used for the SPG
+# side of every differential probe. Version pin matches the rest of
+# the xtests/ crates so the workspace lockfile stays clean.
+spg-engine = { path = "../../crates/spg-engine", version = "7.34" }
+spg-storage = { path = "../../crates/spg-storage", version = "7.34" }
+# v7.38 P1 — self-diff (the fast-tier docker substitute) calls into
+# the permutation runner in-process to execute the same corpus on
+# embedded / server_simple / server_extended and assert byte-equal.
+# Bin-stage perm-runner exposes a lib surface as of v7.38 P1.
+spg-perm-runner = { path = "../perm-runner" }
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+walkdir    = "2"
+
+[lints]
+workspace = true

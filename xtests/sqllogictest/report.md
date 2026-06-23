@@ -6,19 +6,24 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 141 | 0 | 0 | 100.0% |
-| `pg_regress` | 1252 | 6 | 0 | 99.5% |
+| `pg_regress` | 1338 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 10: row mismatch | expected:` |
-| 1 | `record 12: row mismatch | expected:` |
-| 1 | `record 18: row mismatch | expected:` |
-| 1 | `record 2: row mismatch | expected:` |
-| 1 | `record 5: row mismatch | expected:` |
-| 1 | `record 8: row mismatch | expected:` |
+| `spg_baseline/01_basic_dml` | 110 | 0 | 0 | 100.0% |
+| `spg_baseline/02_data_types` | 78 | 0 | 0 | 100.0% |
+| `spg_baseline/03_composite_domain` | 5 | 0 | 0 | 100.0% |
+| `spg_baseline/04_joins` | 36 | 0 | 0 | 100.0% |
+| `spg_baseline/05_aggregates` | 57 | 0 | 0 | 100.0% |
+| `spg_baseline/06_subqueries` | 25 | 0 | 0 | 100.0% |
+| `spg_baseline/07_cte` | 12 | 0 | 0 | 100.0% |
+| `spg_baseline/08_partition` | 0 | 0 | 0 | 0.0% |
+| `spg_baseline/09_indexes` | 26 | 0 | 0 | 100.0% |
+| `spg_baseline/10_constraints` | 30 | 0 | 0 | 100.0% |
+| `spg_baseline/11_dialect` | 53 | 0 | 0 | 100.0% |
+| `spg_baseline/12_explain` | 9 | 0 | 0 | 100.0% |
+| `spg_baseline/13_recovery` | 27 | 0 | 0 | 100.0% |
+| `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
+| `spg_baseline/15_regressions` | 46 | 0 | 0 | 100.0% |
+| `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Per-file detail
 
@@ -81,8 +86,8 @@ Per-corpus pass / fail / skip:
 | `07_date_functions.test` | 13 | 0 | 0 |
 | `08_now_and_date_arith.test` | 10 | 0 | 0 |
 | `09_bare_current.test` | 4 | 0 | 0 |
-| `10_interval.test` | 22 | 1 | 0 |
-| `11_date_functions_part2.test` | 23 | 2 | 0 |
+| `10_interval.test` | 23 | 0 | 0 |
+| `11_date_functions_part2.test` | 25 | 0 | 0 |
 | `12_pg_trgm.test` | 16 | 0 | 0 |
 | `13_timestamptz_offset.test` | 11 | 0 | 0 |
 | `14_disable_trigger_tsvector.test` | 23 | 0 | 0 |
@@ -106,7 +111,7 @@ Per-corpus pass / fail / skip:
 | `32_format.test` | 10 | 0 | 0 |
 | `33_regexp_family.test` | 13 | 0 | 0 |
 | `34_jsonb_path_query.test` | 12 | 0 | 0 |
-| `35_inet_types.test` | 12 | 3 | 0 |
+| `35_inet_types.test` | 15 | 0 | 0 |
 | `36_concat.test` | 25 | 0 | 0 |
 | `37_concat_ws.test` | 24 | 0 | 0 |
 | `38_now_bare_call.test` | 16 | 0 | 0 |
@@ -159,24 +164,7 @@ Per-corpus pass / fail / skip:
 | `85_pg_database_roles_view.test` | 3 | 0 | 0 |
 | `86_pg_views_view.test` | 4 | 0 | 0 |
 | `87_pg_settings_view.test` | 6 | 0 | 0 |
-
-<details><summary>`10_interval.test` fail snippets</summary>
-
-- record 18: row mismatch |   expected: ["12:00:00"] |   actual:   ["1 day -12:00:00"]
-</details>
-
-<details><summary>`11_date_functions_part2.test` fail snippets</summary>
-
-- record 10: row mismatch |   expected: ["60 days"] |   actual:   ["1440:00:00"]
-- record 12: row mismatch |   expected: ["-60 days"] |   actual:   ["-1440:00:00"]
-</details>
-
-<details><summary>`35_inet_types.test` fail snippets</summary>
-
-- record 2: row mismatch |   expected: ["10.0.0.5", "192.168.1.1"] |   actual:   ["Inet { family: 4, bits: 32, addr: [10, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }", "…
-- record 5: row mismatch |   expected: ["10.0.0.0/8", "192.168.0.0/16"] |   actual:   ["Cidr { family: 4, bits: 16, addr: [192, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, …
-- record 8: row mismatch |   expected: ["00:50:56:c0:00:01"] |   actual:   ["Macaddr([0, 80, 86, 192, 0, 1])"]
-</details>
+| `88_boolean.test` | 80 | 0 | 0 |
 
 ### `pgvector/`
 
@@ -191,3 +179,186 @@ Per-corpus pass / fail / skip:
 | `07_cast_vector_literal.test` | 3 | 0 | 0 |
 | `08_hnsw_knn.test` | 11 | 0 | 0 |
 | `09_hnsw_metrics_and_filter.test` | 10 | 0 | 0 |
+
+### `spg_baseline/01_basic_dml/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `case_when.test` | 3 | 0 | 0 |
+| `coalesce_nullif.test` | 4 | 0 | 0 |
+| `delete_basic.test` | 8 | 0 | 0 |
+| `in_list.test` | 4 | 0 | 0 |
+| `insert_basic.test` | 9 | 0 | 0 |
+| `returning.test` | 6 | 0 | 0 |
+| `select_alias.test` | 4 | 0 | 0 |
+| `select_basic.test` | 9 | 0 | 0 |
+| `select_distinct.test` | 4 | 0 | 0 |
+| `select_order_limit.test` | 13 | 0 | 0 |
+| `select_where.test` | 19 | 0 | 0 |
+| `union_intersect_except.test` | 6 | 0 | 0 |
+| `update_basic.test` | 10 | 0 | 0 |
+| `upsert_on_conflict.test` | 8 | 0 | 0 |
+| `values_constructor.test` | 3 | 0 | 0 |
+
+### `spg_baseline/02_data_types/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `array_ops.test` | 3 | 0 | 0 |
+| `array_scalar.test` | 4 | 0 | 0 |
+| `bool.test` | 5 | 0 | 0 |
+| `bytea.test` | 3 | 0 | 0 |
+| `date_functions.test` | 6 | 0 | 0 |
+| `date_time.test` | 5 | 0 | 0 |
+| `decimal_numeric.test` | 5 | 0 | 0 |
+| `enum.test` | 4 | 0 | 0 |
+| `float_types.test` | 4 | 0 | 0 |
+| `integer_arith.test` | 6 | 0 | 0 |
+| `integer_types.test` | 6 | 0 | 0 |
+| `interval.test` | 4 | 0 | 0 |
+| `json_jsonb.test` | 5 | 0 | 0 |
+| `now_current.test` | 2 | 0 | 0 |
+| `text_funcs.test` | 5 | 0 | 0 |
+| `text_varchar_char.test` | 6 | 0 | 0 |
+| `uuid.test` | 5 | 0 | 0 |
+
+### `spg_baseline/03_composite_domain/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `domain_types.test` | 5 | 0 | 0 |
+
+### `spg_baseline/04_joins/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `cross_join.test` | 5 | 0 | 0 |
+| `inner_join.test` | 5 | 0 | 0 |
+| `left_join.test` | 5 | 0 | 0 |
+| `left_join_filter.test` | 6 | 0 | 0 |
+| `multi_join.test` | 7 | 0 | 0 |
+| `self_join.test` | 3 | 0 | 0 |
+| `using_clause.test` | 5 | 0 | 0 |
+
+### `spg_baseline/05_aggregates/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `agg_empty.test` | 4 | 0 | 0 |
+| `agg_no_group.test` | 5 | 0 | 0 |
+| `array_agg.test` | 3 | 0 | 0 |
+| `bool_agg.test` | 4 | 0 | 0 |
+| `count_sum_avg.test` | 6 | 0 | 0 |
+| `distinct.test` | 4 | 0 | 0 |
+| `distinct_in_agg.test` | 5 | 0 | 0 |
+| `filter_clause.test` | 3 | 0 | 0 |
+| `group_by.test` | 4 | 0 | 0 |
+| `group_by_all.test` | 3 | 0 | 0 |
+| `having.test` | 3 | 0 | 0 |
+| `min_max.test` | 4 | 0 | 0 |
+| `string_agg.test` | 3 | 0 | 0 |
+| `window_basic.test` | 3 | 0 | 0 |
+| `window_frame.test` | 3 | 0 | 0 |
+
+### `spg_baseline/06_subqueries/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `any_all.test` | 3 | 0 | 0 |
+| `correlated_subq.test` | 5 | 0 | 0 |
+| `exists.test` | 6 | 0 | 0 |
+| `in_subq.test` | 6 | 0 | 0 |
+| `scalar_subq.test` | 5 | 0 | 0 |
+
+### `spg_baseline/07_cte/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `basic_cte.test` | 3 | 0 | 0 |
+| `cte_chain.test` | 3 | 0 | 0 |
+| `multi_cte.test` | 3 | 0 | 0 |
+| `writable_cte.test` | 3 | 0 | 0 |
+
+### `spg_baseline/08_partition/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+
+### `spg_baseline/09_indexes/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `btree_basic.test` | 5 | 0 | 0 |
+| `btree_unique.test` | 4 | 0 | 0 |
+| `expression_index.test` | 4 | 0 | 0 |
+| `index_drop.test` | 5 | 0 | 0 |
+| `multi_column_index.test` | 4 | 0 | 0 |
+| `partial_index.test` | 4 | 0 | 0 |
+
+### `spg_baseline/10_constraints/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `check_constraint.test` | 4 | 0 | 0 |
+| `fk_cascade.test` | 6 | 0 | 0 |
+| `foreign_key.test` | 5 | 0 | 0 |
+| `multi_pk.test` | 4 | 0 | 0 |
+| `not_null.test` | 3 | 0 | 0 |
+| `primary_key.test` | 5 | 0 | 0 |
+| `serial.test` | 3 | 0 | 0 |
+
+### `spg_baseline/11_dialect/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `pg_array_ops.test` | 3 | 0 | 0 |
+| `pg_cast_expr.test` | 4 | 0 | 0 |
+| `pg_concat_op.test` | 3 | 0 | 0 |
+| `pg_default_clause.test` | 4 | 0 | 0 |
+| `pg_information_schema.test` | 2 | 0 | 0 |
+| `pg_jsonb_ops.test` | 4 | 0 | 0 |
+| `pg_like_ilike.test` | 6 | 0 | 0 |
+| `pg_returning.test` | 2 | 0 | 0 |
+| `pg_sequence.test` | 4 | 0 | 0 |
+| `pg_show_session_params.test` | 16 | 0 | 0 |
+| `pg_string_funcs.test` | 5 | 0 | 0 |
+
+### `spg_baseline/12_explain/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `explain_analyze.test` | 3 | 0 | 0 |
+| `explain_basic.test` | 3 | 0 | 0 |
+| `explain_costs_off.test` | 3 | 0 | 0 |
+
+### `spg_baseline/13_recovery/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `commit.test` | 6 | 0 | 0 |
+| `rollback.test` | 6 | 0 | 0 |
+| `savepoint.test` | 8 | 0 | 0 |
+| `tx_visibility.test` | 7 | 0 | 0 |
+
+### `spg_baseline/14_dialect_compat/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+
+### `spg_baseline/15_regressions/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `k02_in_list_visitor.test` | 6 | 0 | 0 |
+| `round_14_text_jumbo.test` | 7 | 0 | 0 |
+| `round_20_typed_agg_columns.test` | 7 | 0 | 0 |
+| `round_25_in_list_flat.test` | 7 | 0 | 0 |
+| `round_27_returning_type.test` | 5 | 0 | 0 |
+| `round_28_update_correlated.test` | 9 | 0 | 0 |
+| `round_29_filter_clause.test` | 5 | 0 | 0 |
+
+### `spg_baseline/16_isolation/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `set_transaction_isolation_level.test` | 18 | 0 | 0 |

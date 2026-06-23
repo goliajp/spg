@@ -29,6 +29,18 @@ impl Engine {
         &mut self,
         target: Option<&str>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.38 元机制 D acceptor — `SPG_TEST_STATS_FROZEN=1` turns
+        // ANALYZE into a no-op so a test's statistic-version snapshot
+        // is stable across sessions. Pairs with the plan-cache
+        // version-aware invalidation: freezing stats also freezes
+        // plan reuse, which is what regression tests want when
+        // proving "same SQL, same plan".
+        if self.env_cfg().stats_frozen {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
         let names: Vec<String> = if let Some(name) = target {
             // Verify the table exists; surface a clear error if not.
             if self.catalog.get(name).is_none() {

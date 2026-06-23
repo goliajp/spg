@@ -29,11 +29,21 @@ impl Engine {
     }
 
     pub(crate) fn exec_commit(&mut self) -> Result<QueryResult, EngineError> {
+        // v7.38 P0 元机制 A — fires at the commit barrier entry.
+        // Represents "this thread is about to take the WAL group
+        // commit leader slot" so tests can block here and let a
+        // sibling thread arrive (`wal_group_commit_leader_chosen`
+        // fires once the slot is taken — see below).
+        crate::injection_point!("tx_commit_walgroup_leader_switch", &self.current_tx);
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
         let state = self
             .tx_catalogs
             .remove(&tx_id)
             .ok_or(EngineError::NoActiveTransaction)?;
+        // v7.38 P0 元机制 A — TX state has been moved off the
+        // `tx_catalogs` map; from the WAL group commit point of
+        // view, this thread is now the leader.
+        crate::injection_point!("wal_group_commit_leader_chosen", &tx_id);
         self.catalog = state.catalog;
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with

@@ -5,7 +5,10 @@
 #
 #   lint   cargo fmt --check + clippy -D warnings
 #   unit   in-crate #[test] (--lib --bins) + doc tests, debug
-#   e2e    every integration-test target (--tests), debug;
+#   e2e    every integration-test target (--tests), debug,
+#          followed by the v7.38 element-B permutation matrix
+#          runner (fast tier: 3 core permutations x sample corpus;
+#          --full: every non-full-only permutation x full corpus);
 #          perf/SLO targets compile empty here by design
 #   gates  release-mode budget gates: perf_gate × crates +
 #          prod_ready + slo_smoke
@@ -76,6 +79,18 @@ run_e2e() {
     # in-crate unittests, plus the perf/SLO targets — which compile
     # empty under debug, so this stays a functional sweep).
     cargo test --workspace --locked --tests -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+
+    # v7.38 element B — permutation matrix runner. Fast tier walks
+    # 3 core permutations (embedded / server_simple / topk_off) over
+    # the fast_tier_sample corpus subset (~15 fixtures). Full tier
+    # walks every non-full-only permutation over the include_globs.
+    # See xtests/perm-runner/README.md for the matrix definition.
+    banner "e2e: perm-runner"
+    if [[ "$FULL" == 1 ]]; then
+        cargo run --release --locked -p spg-perm-runner -- all --full
+    else
+        cargo run --release --locked -p spg-perm-runner -- all --fast
+    fi
 }
 
 run_gates() {
@@ -103,10 +118,16 @@ run_dogfood() {
     # whose snapshot is >100 MB (i.e. not present in CI) and still
     # exercises every synthetic recovery scenario. `--full` runs
     # every fixture including snapshot-backed ones.
+    # v7.37.8 — `--bin spg-dogfood-replay` disambiguates against the
+    # peer `spg-stress-cascade` binary (added in v7.37.7 for the K02
+    # cascade reproducer). Without it cargo errors with
+    # "could not determine which binary to run".
     if [[ "$FULL" == 1 ]]; then
-        cargo run --release --locked -p spg-dogfood-replay -- all
+        cargo run --release --locked -p spg-dogfood-replay \
+            --bin spg-dogfood-replay -- all
     else
-        cargo run --release --locked -p spg-dogfood-replay -- all --fast
+        cargo run --release --locked -p spg-dogfood-replay \
+            --bin spg-dogfood-replay -- all --fast
     fi
 }
 

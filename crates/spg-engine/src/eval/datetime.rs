@@ -103,7 +103,7 @@ fn civil_components(days: i32) -> (i32, u32, u32) {
 /// source)`. Same component dispatch (DATE / TIMESTAMP / INTERVAL) and
 /// same `BigInt` return shape; PG returns double precision but we keep the
 /// integer convention so the runner's `query I` shape works unchanged.
-pub(super) fn date_part(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -151,7 +151,7 @@ pub(super) fn date_part(args: &[Value<'static>]) -> Result<Value<'static>, EvalE
 /// the dispatcher errors instead of guessing a clock source. Callers
 /// who want PG's `age(t)` semantics should write `age(CURRENT_DATE, t)`
 /// explicitly so the clock reference is visible at the SQL layer.
-pub(super) fn age(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() || args.len() > 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("age() takes 1 or 2 args, got {}", args.len()),
@@ -183,10 +183,22 @@ pub(super) fn age(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> 
     let delta = a.checked_sub(b).ok_or(EvalError::TypeMismatch {
         detail: "age() subtraction overflows i64 microseconds".into(),
     })?;
+    // v7.38 P1 (轴 1 pg_regress closure) — PG canonical AGE output
+    // splits whole days out of the microsecond residue so
+    // `AGE('2024-03-01'::TIMESTAMP, '2024-01-01'::TIMESTAMP)` reads
+    // `60 days` (not `1440:00:00`). Truncate toward zero so the day
+    // component carries delta's sign and micros retains the same sign
+    // — matches PG's interval normalisation for symmetric AGE diffs.
+    const US_PER_DAY: i64 = 86_400_000_000;
+    let days_i64 = delta / US_PER_DAY;
+    let micros = delta % US_PER_DAY;
+    let days = i32::try_from(days_i64).map_err(|_| EvalError::TypeMismatch {
+        detail: "age() day count exceeds i32".into(),
+    })?;
     Ok(Value::Interval {
         months: 0,
-        days: 0,
-        micros: delta,
+        days,
+        micros,
     })
 }
 
@@ -208,7 +220,7 @@ pub(super) fn age(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> 
 ///
 /// Unknown `%X` tokens pass through verbatim (MySQL emits the `%`
 /// then the unknown letter).
-pub(super) fn date_format_mysql(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -340,7 +352,7 @@ pub(super) fn date_format_mysql(args: &[Value<'static>]) -> Result<Value<'static
 /// Bare `UNIX_TIMESTAMP()` (no args) is folded to a BigInt literal
 /// by clock_replacement_for at the rewrite layer — never reaches
 /// this arm.
-pub(super) fn unix_timestamp_of(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn unix_timestamp_of(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!("unix_timestamp() takes 0 or 1 arg, got {}", args.len()),
@@ -362,7 +374,7 @@ pub(super) fn unix_timestamp_of(args: &[Value<'static>]) -> Result<Value<'static
 /// v7.17.0 Phase 3.P0-29 — `FROM_UNIXTIME(n)` returns a TIMESTAMP
 /// at `n` seconds past the Unix epoch. `FROM_UNIXTIME(n, fmt)`
 /// applies MySQL date_format on top, returning TEXT.
-pub(super) fn from_unixtime(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn from_unixtime(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(1..=2).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: format!("from_unixtime() takes 1 or 2 args, got {}", args.len()),
@@ -401,7 +413,7 @@ pub(super) fn from_unixtime(args: &[Value<'static>]) -> Result<Value<'static>, E
 /// requested calendar boundary (year / month / day / hour / minute /
 /// second). Returns the truncated `TIMESTAMP`. NULL on either side
 /// propagates to NULL.
-pub(super) fn date_trunc(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("date_trunc() takes 2 args, got {}", args.len()),

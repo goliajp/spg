@@ -535,6 +535,12 @@ pub(crate) fn run(
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
+    // v7.38 P0 元机制 A — fires at the top of the aggregate
+    // executor with the number of input rows. Tests use this to
+    // block before a hypothetical spill decision; in release it
+    // expands to `let _ = (...);`.
+    let __spg_row_count = rows.len();
+    crate::injection_point!("aggregate_spill_trigger", &__spg_row_count);
     // v7.35.0 — pure `SELECT COUNT(*) FROM … WHERE …` short-circuit.
     // The caller already filtered rows by WHERE (we run on the
     // post-WHERE survivor set), so for the canonical pure-COUNT(*)
@@ -973,7 +979,11 @@ fn accumulate_groups(
     // touch the allocator zero times.
     let mut keybuf_s = String::new();
     // v7.36 — reused Step VM eval stack for compiled aggregate args.
-    let mut eval_stack: Vec<Value<'static>> = Vec::new();
+    // v7.37.9 T3 S2 — elided lifetime so the Vec's `'val` binds to the
+    // row-borrow lifetime per call (`eval_compiled_ref<'row, 'val>` now
+    // requires `'row: 'val`). Caller-side Vec<Value<'_>> lets compiler
+    // infer the shortest lifetime that covers all calls.
+    let mut eval_stack: Vec<Value<'_>> = Vec::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
     // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /
@@ -1282,22 +1292,37 @@ fn accumulate_groups(
                 }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
-                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _, _) => {
+                        // v7.37.9 Phase 1A-ext counter — fast position-bound arg.
+                        crate::bump_counter!(AGG_PER_ROW_FAST_POS);
+                        row.get(*p).unwrap_or(&Value::Null)
+                    }
                     (None, None, None) => {
+                        // COUNT(*) sentinel
+                        crate::bump_counter!(AGG_PER_ROW_COUNT_STAR_SENTINEL);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
                     (None, Some(s), _) => {
                         if row_eval_cache[s].is_none() {
+                            // v7.37.9 Phase 1A-ext counter — Step-VM ran (cache miss).
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_MISS);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
+                        } else {
+                            // v7.37.9 Phase 1A-ext counter — CSE cache hit
+                            // (compiled arg deduped across specs in same row).
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_HIT);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
+                        // v7.37.9 Phase 1A-ext counter — eval_expr fallback
+                        // (uncompilable spec — Cow row materialise per row).
+                        crate::bump_counter!(AGG_PER_ROW_EVAL_FALLBACK);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -1310,7 +1335,12 @@ fn accumulate_groups(
                     (None, _) => None,
                     // v7.37.43 (DISTA A-3) — literal arg2: clone the
                     // precomputed value, skip per-row eval & row mat.
-                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(_), Some(lit)) => {
+                        // v7.37.9 Phase 0 diagnostic — count per-row
+                        // hits of the DISTA A-3 fast path.
+                        crate::bump_counter!(DISTA_LITERAL_ARG2_CACHE_FIRE);
+                        Some(lit.clone())
+                    }
                     (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
@@ -1320,6 +1350,7 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
+                    crate::bump_counter!(AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         let v: Value<'static> = if let Some(p) = order_pos[i][k] {
@@ -1585,8 +1616,12 @@ fn accumulate_groups(
                 }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
-                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _, _) => {
+                        crate::bump_counter!(AGG_PER_ROW_FAST_POS);
+                        row.get(*p).unwrap_or(&Value::Null)
+                    }
                     (None, None, None) => {
+                        crate::bump_counter!(AGG_PER_ROW_COUNT_STAR_SENTINEL);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
@@ -1598,15 +1633,19 @@ fn accumulate_groups(
                         // FILTER semantics: a spec filtered out above
                         // never reaches here, so its arg stays unevaled.
                         if row_eval_cache[s].is_none() {
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_MISS);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
+                        } else {
+                            crate::bump_counter!(AGG_PER_ROW_COMPILED_HIT);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
+                        crate::bump_counter!(AGG_PER_ROW_EVAL_FALLBACK);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -1619,7 +1658,12 @@ fn accumulate_groups(
                     (None, _) => None,
                     // v7.37.43 (DISTA A-3) — literal arg2: clone the
                     // precomputed value, skip per-row eval & row mat.
-                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(_), Some(lit)) => {
+                        // v7.37.9 Phase 0 diagnostic — count per-row
+                        // hits of the DISTA A-3 fast path.
+                        crate::bump_counter!(DISTA_LITERAL_ARG2_CACHE_FIRE);
+                        Some(lit.clone())
+                    }
                     (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
@@ -1629,6 +1673,7 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
+                    crate::bump_counter!(AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         // Bound ORDER key → read the cell by reference; only
@@ -3717,3 +3762,33 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         _ => Equal,
     }
 }
+
+/// v7.37.9 Phase 0 diagnostic counters — see
+/// `.claude/notes/v7.37.9-class-a-c-cascade-closure-plan.md`. These
+/// are read-only telemetry, do not gate any code path. Used by
+/// `xtests/dogfood_replay/src/bin/counter_dump.rs` to verify
+/// whether the DISTA A-3 + array_agg-ordered fast paths actually
+/// fire on the mailrs Class A SQL shape.
+pub static DISTA_LITERAL_ARG2_CACHE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.9 Phase 1A-ext — per-row spec dispatch branches in
+/// `accumulate_groups`'s hot loop. Verifies the Phase 1A
+/// decomposition agent's S06 assumption ("14 specs × eval_expr per
+/// row"). Sum should equal `n_specs × n_input_rows`. Branch
+/// distribution tells which attack target ROI is highest:
+/// FAST_POS many = baseline OK; COMPILED_MISS many = Step-VM is
+/// hot path; EVAL_FALLBACK > 0 = uncompilable specs walking the
+/// eval_expr tree per row × Cow row materialise.
+pub static AGG_PER_ROW_FAST_POS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COMPILED_HIT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COMPILED_MISS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_EVAL_FALLBACK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COUNT_STAR_SENTINEL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);

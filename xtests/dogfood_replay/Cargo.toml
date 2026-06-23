@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "spg-stress-cascade"
 path = "src/bin/stress_cascade.rs"
 
+[[bin]]
+# v7.37.9 Phase 0 — counter readout for mailrs Class A / C SQL.
+# Reads atomic counters from spg-engine before / after running the
+# fixture's measure SQL. Read-only diagnostic; doesn't modify any
+# planner code. See `.claude/notes/v7.37.9-class-a-c-cascade-closure-plan.md`.
+name = "spg-counter-dump"
+path = "src/bin/counter_dump.rs"
+
 [dependencies]
 # v7.37.5 — dogfood-replay framework. Bin-only crate; the framework
 # is intentionally tight on deps so it stays buildable under
@@ -25,7 +33,9 @@ path = "src/bin/stress_cascade.rs"
 # for the fixture descriptor format (serde already in the lock); tar
 # extraction goes through `tar -xzf` on the host (no native dep);
 # SHA-256 lives in `sha2` which the workspace already locks.
-spg-engine   = { path = "../../crates/spg-engine",   version = "7.9" }
+# v7.37.9 — enable `perf-counters` here so the counter_dump diagnostic
+# binary sees non-zero values. Production crates leave the feature off.
+spg-engine   = { path = "../../crates/spg-engine",   version = "7.9", features = ["perf-counters"] }
 spg-embedded = { path = "../../crates/spg-embedded", version = "7.9" }
 spg-storage  = { path = "../../crates/spg-storage",  version = "7.9" }
 sha2         = "0.10"

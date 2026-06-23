@@ -426,6 +426,16 @@ async fn run_one(
         match inline {
             Ok(r) => r,
             Err(spg_embedded::EngineError::Cancelled) => {
+                // v7.38 P0 元机制 A — spg-sqlx inline budget cancellation
+                // boundary. Tests use this to inject a delay or notice when
+                // the inline path bailed and the query is about to be
+                // re-executed on the blocking pool. Distinguishes "query
+                // cancelled mid-inline" from "fresh blocking-pool dispatch"
+                // for pool-stress and budget-tuning regressions.
+                spg_embedded::injection_point!(
+                    "spg_sqlx_inline_budget_cancel",
+                    &budget_ms
+                );
                 let stmt = c.stmt.clone();
                 let params_owned: Vec<spg_embedded::Value> =
                     params.as_deref().unwrap_or(&[]).to_vec();

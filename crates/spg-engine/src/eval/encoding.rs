@@ -16,7 +16,7 @@ use super::EvalError;
 /// (raw UTF-8 bytes). Supported formats: base64 (PG default),
 /// base64url (RFC 4648 §5), base32hex (RFC 4648 §7 extended-hex),
 /// hex.
-pub(super) fn encode_text(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("encode() takes 2 args, got {}", args.len()),
@@ -58,7 +58,7 @@ pub(super) fn encode_text(args: &[Value<'static>]) -> Result<Value<'static>, Eva
 /// v6.4.3 — `decode(text, format)`. Inverse of `encode`; returns
 /// Text containing the raw decoded bytes (caller may CAST to bytea
 /// equivalent if SPG adds bytea later).
-pub(super) fn decode_text(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("decode() takes 2 args, got {}", args.len()),

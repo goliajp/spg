@@ -61,6 +61,11 @@ impl Engine {
         tx_id: TxId,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.38 P0 元机制 A — establish the per-engine injection
+        // scope for the duration of this execute. The guard pops
+        // the store on drop so nested or sibling engines don't see
+        // ours. No-op in release builds (feature off).
+        let _inj = self.enter_injection_scope();
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
         // v7.34 (crash-recovery P0 #2) — row-level redo capture. Arm the
@@ -105,7 +110,14 @@ impl Engine {
             resolve_order_by_position(s);
             // v6.2.3 — cost-based JOIN reorder. No-op for
             // single-table FROMs or any non-INNER join shape.
-            reorder::reorder_joins(s, &self.catalog, &self.statistics);
+            // v7.38 元机制 D — `SPG_TEST_PLAN_DETERMINISTIC=1` gates
+            // this so regression tests pin a stable join order.
+            reorder::reorder_joins_with(
+                s,
+                &self.catalog,
+                &self.statistics,
+                self.env_cfg.plan_deterministic,
+            );
         }
         Ok(stmt)
     }
@@ -513,6 +525,89 @@ impl Engine {
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: false,
+                })
+            }
+            // v7.38 轴 4 — `SET TRANSACTION ISOLATION LEVEL …`. The
+            // surface is recorded on `Engine::current_isolation_level`
+            // and visible via `SHOW transaction_isolation`. Behavioural
+            // implementation (REPEATABLE READ snapshot / SERIALIZABLE
+            // SSI) lands separately; today every level reads as
+            // effective READ COMMITTED (same as PG's silent upgrade
+            // of READ UNCOMMITTED).
+            Statement::SetTransaction { isolation } => {
+                self.current_isolation_level = isolation;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
+            // v7.38 轴 4 surface expansion — `SHOW <parameter>`
+            // returns a 1-row 1-column TEXT result (the PG psql
+            // wire shape). The handler dispatches per-name:
+            //
+            // 1. transaction_isolation — direct read of
+            //    current_isolation_level (the v7.38 axis-4 surface).
+            // 2. PG preset / engine-tracked params — values mirror
+            //    pg_catalog.pg_settings to keep ORM /
+            //    driver-connect probes happy (sqlx asks
+            //    server_version + standard_conforming_strings +
+            //    client_encoding; npgsql asks application_name;
+            //    asyncpg asks search_path). Any
+            //    SET-tracked override on self.session_params wins.
+            // 3. Anything else — error with a list-pointer to
+            //    pg_settings (which lists every recognised name).
+            Statement::ShowParameter(name) => {
+                use spg_storage::{ColumnSchema, DataType, Row, Value};
+                let owned;
+                let value: &str = match name.as_str() {
+                    "transaction_isolation" => self.current_isolation_level.as_pg_str(),
+                    "server_version" => "16.0 (spg)",
+                    "server_encoding" => "UTF8",
+                    "is_superuser" => "on",
+                    "TimeZone" | "timezone" => self
+                        .session_param("TimeZone")
+                        .or_else(|| self.session_param("timezone"))
+                        .unwrap_or("UTC"),
+                    "DateStyle" | "datestyle" => self
+                        .session_param("DateStyle")
+                        .or_else(|| self.session_param("datestyle"))
+                        .unwrap_or("ISO, MDY"),
+                    "client_encoding" => {
+                        self.session_param("client_encoding").unwrap_or("UTF8")
+                    }
+                    "standard_conforming_strings" => self
+                        .session_param("standard_conforming_strings")
+                        .unwrap_or("on"),
+                    "search_path" => self.session_param("search_path").unwrap_or("\"$user\", public"),
+                    "application_name" => self.session_param("application_name").unwrap_or(""),
+                    "statement_timeout" => {
+                        self.session_param("statement_timeout").unwrap_or("0")
+                    }
+                    "default_transaction_isolation" => self
+                        .session_param("default_transaction_isolation")
+                        .unwrap_or("read committed"),
+                    "intervalstyle" | "IntervalStyle" => self
+                        .session_param("IntervalStyle")
+                        .or_else(|| self.session_param("intervalstyle"))
+                        .unwrap_or("postgres"),
+                    other => {
+                        // Fall through to session_params for any user-set
+                        // override that didn't fall into a named bucket.
+                        if let Some(v) = self.session_param(other) {
+                            owned = alloc::string::String::from(v);
+                            &owned
+                        } else {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "SHOW {other:?}: parameter not recognised; \
+                                 see `SELECT name, setting FROM pg_settings` for \
+                                 the full inventory"
+                            )));
+                        }
+                    }
+                };
+                Ok(QueryResult::Rows {
+                    columns: alloc::vec![ColumnSchema::new(name, DataType::Text, false)],
+                    rows: alloc::vec![Row::new(alloc::vec![Value::text(value)])],
                 })
             }
             // v7.14.0 — MySQL multi-assignment SET. Each pair runs

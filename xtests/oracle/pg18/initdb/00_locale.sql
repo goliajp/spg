@@ -1,0 +1,4 @@
+-- Pin C.UTF-8 collation behaviour on the default DB. The image-level
+-- POSTGRES_INITDB_ARGS=--locale=C.UTF-8 covers cluster init; this
+-- script just records the intent in-tree so future contributors see
+-- it without grepping docker-compose.yml.

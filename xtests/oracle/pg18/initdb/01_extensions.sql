@@ -1,0 +1,4 @@
+-- Reserved for extensions needed by ported PG regress tests
+-- (btree_gin, btree_gist, etc.). Left empty in scaffolding so a
+-- bare oracle starts without surprise dependencies; populated
+-- alongside the corpus during P1 fill.

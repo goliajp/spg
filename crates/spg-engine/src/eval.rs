@@ -25,7 +25,7 @@ use spg_storage::{ColumnSchema, Row, Value};
 
 mod binop;
 mod cast;
-mod compiled;
+pub mod compiled;
 mod datetime;
 mod encoding;
 mod format;
@@ -39,7 +39,7 @@ mod textsearch;
 mod values;
 
 pub use crate::conversions::format_money_array;
-pub(crate) use binop::{and_3vl, apply_binary_interval};
+pub(crate) use binop::{and_3vl, apply_binary_interval, apply_binary_by_ref};
 use binop::{apply_binary, apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
@@ -721,7 +721,7 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 }
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
-fn fn_string_to_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let [text_arg, delim_arg] = args else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("string_to_array expects 2 arguments, got {}", args.len()),
@@ -763,7 +763,7 @@ fn fn_string_to_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalErr
 /// v6.4.3 — `error_on_null(v)`. Returns `v` unchanged if non-NULL;
 /// errors otherwise. Convenience to assert NOT NULL inside an
 /// expression without wrapping it in COALESCE + raise hacks.
-fn error_on_null(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+fn error_on_null(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::TypeMismatch {
             detail: format!("error_on_null() takes 1 arg, got {}", args.len()),
@@ -774,7 +774,7 @@ fn error_on_null(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
             detail: "error_on_null(): argument is NULL".into(),
         });
     }
-    Ok(args[0].clone())
+    Ok(args[0].clone().into_owned())
 }
 
 /// Helper: coerce a Value to an Option<String> for regex args. NULL

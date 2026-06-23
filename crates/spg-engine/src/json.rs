@@ -1134,7 +1134,7 @@ fn render_numeric(scaled: i128, scale: u8) -> String {
 /// `json_build_object(k, v, k, v, …)` — variadic, even-length.
 /// NULL key → error (PG: "argument cannot be null"). Values encoded
 /// via `value_to_json_text`. Returns Value::Json.
-pub fn build_object(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub fn build_object(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !args.len().is_multiple_of(2) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
@@ -1169,7 +1169,7 @@ pub fn build_object(args: &[Value<'static>]) -> Result<Value<'static>, EvalError
 
 /// `json_build_array(...)` — variadic; empty → "[]". Each arg
 /// encoded via `value_to_json_text`.
-pub fn build_array(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub fn build_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let mut out = String::from("[");
     for (i, v) in args.iter().enumerate() {
         if i > 0 {
@@ -1200,7 +1200,7 @@ fn format_value_as_text(v: &Value) -> String {
 ///   * Path step on array: integer index, negative counts from end.
 ///     Out-of-range with create_missing → append; without → no-op.
 ///   * Type mismatch (e.g. step on a scalar) → no-op (PG semantics).
-pub fn set(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("jsonb_set() takes 3 or 4 args, got {}", args.len()),
@@ -1303,7 +1303,7 @@ fn resolve_array_index(step: &str, len: usize) -> Option<usize> {
 ///     positive index → append; out-of-range negative → prepend.
 ///   * Object parent: key must NOT exist (PG raises). insert_after
 ///     has no effect for objects.
-pub fn insert(args: &[Value<'static>]) -> Result<Value<'static>, EvalError> {
+pub fn insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("jsonb_insert() takes 3 or 4 args, got {}", args.len()),

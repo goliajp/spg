@@ -1015,8 +1015,10 @@ fn pitr_restore(
                     .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
                 applied += 1;
             }
-            0x10 => {
+            0x10 | 0x12 => {
                 // v7.19 — skip records the snapshot already holds.
+                // 0x10 = V4 auto-commit SQL; 0x12 = V4 tx-commit SQL
+                // (whole-transaction payload, split + applied in order).
                 if let Some(lsn) = r.commit_lsn {
                     if lsn <= snapshot_floor {
                         continue;
@@ -1029,6 +1031,28 @@ fn pitr_restore(
                     .map_err(|e| format!("non-UTF-8 SQL at offset {}: {e}", r.offset))?;
                 db.execute(sql)
                     .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
+                applied += 1;
+            }
+            0x13 => {
+                // v7.34 / v7.37.8 — V5 row-redo. Payload is encoded
+                // RowChange bytes (not SQL); decode + apply via the
+                // engine's physical redo path. Same flow as
+                // spg-embedded's open_path replay loop. Pre-v7.37.9
+                // spgctl errored out here (`unknown WAL record type
+                // 0x13`), breaking PITR restore on any catalog that
+                // had logged after the V5 default-ON flip.
+                if let Some(lsn) = r.commit_lsn {
+                    if lsn <= snapshot_floor {
+                        continue;
+                    }
+                }
+                if !target.includes(r.commit_lsn, r.commit_unix_us) {
+                    continue;
+                }
+                let changes = spg_storage::decode_redo_log(r.sql)
+                    .map_err(|e| format!("redo decode at offset {}: {e:?}", r.offset))?;
+                db.apply_redo(&changes)
+                    .map_err(|e| format!("redo apply at offset {}: {e:?}", r.offset))?;
                 applied += 1;
             }
             other => {

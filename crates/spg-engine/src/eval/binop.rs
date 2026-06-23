@@ -59,11 +59,93 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
 
 /// v7.9.27b — true when two values are "not distinct" per PG:
 /// both NULL counts as equal; otherwise reduces to regular Eq.
-fn values_not_distinct(l: &Value<'static>, r: &Value<'static>) -> bool {
+fn values_not_distinct(l: &Value<'_>, r: &Value<'_>) -> bool {
     match (l, r) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
         _ => l == r,
+    }
+}
+
+/// v7.37.9 T3 S4 — by-reference comparison/3VL fast path.
+///
+/// Lifts the operand contract from owned `Value<'static>` to borrowed
+/// `&Value<'_>` for the **read-only** binary ops where the result is a
+/// fresh `Value::Bool` / `Value::Null` and the operand bytes are never
+/// stored in the result. Eliminates the per-pop `.into_owned()` that
+/// the owning `apply_binary` requires (which String::clones every
+/// Text/Bytes/Json/Vector value off the Step VM stack).
+///
+/// Returns `None` for ops that build a new owned result (Add / Sub /
+/// Concat / Json* / arithmetic etc.) — the caller falls through to the
+/// owning `apply_binary` path. This keeps the by-ref change a pure
+/// optimization with no behaviour change for non-comparison ops.
+pub(crate) fn apply_binary_by_ref(
+    op: BinOp,
+    l: &Value<'_>,
+    r: &Value<'_>,
+) -> Result<Option<Value<'static>>, EvalError> {
+    // 3VL And/Or/IS [NOT] DISTINCT FROM — NULL handling without
+    // moving operands. These mirror the owning path's pre-checks.
+    if let BinOp::IsNotDistinctFrom = op {
+        return Ok(Some(Value::Bool(values_not_distinct(l, r))));
+    }
+    if let BinOp::IsDistinctFrom = op {
+        return Ok(Some(Value::Bool(!values_not_distinct(l, r))));
+    }
+    if let BinOp::And = op {
+        return Ok(Some(and_3vl_by_ref(l, r)));
+    }
+    if let BinOp::Or = op {
+        return Ok(Some(or_3vl_by_ref(l, r)));
+    }
+    // Any NULL operand → NULL for the remaining ops.
+    if l.is_null() || r.is_null() {
+        match op {
+            BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Lt
+            | BinOp::LtEq
+            | BinOp::Gt
+            | BinOp::GtEq => return Ok(Some(Value::Null)),
+            _ => return Ok(None),
+        }
+    }
+    match op {
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+            Ok(Some(compare(op, l, r)?))
+        }
+        // Everything else needs owned semantics; caller falls back.
+        _ => Ok(None),
+    }
+}
+
+/// Read-only 3VL AND/OR mirror of `and_3vl` / `or_3vl` for the by-ref
+/// path. Reuses the existing helpers via cheap `.clone()` only when
+/// non-NULL branches need to be promoted to the owning code path; for
+/// the common case (one side NULL) we resolve directly.
+fn and_3vl_by_ref(l: &Value<'_>, r: &Value<'_>) -> Value<'static> {
+    // 3VL truth table:
+    //   FALSE AND _     = FALSE
+    //   _ AND FALSE     = FALSE
+    //   NULL AND TRUE/NULL = NULL
+    //   TRUE AND TRUE   = TRUE
+    match (l, r) {
+        (Value::Bool(false), _) | (_, Value::Bool(false)) => Value::Bool(false),
+        (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
+        _ => Value::Null,
+    }
+}
+
+fn or_3vl_by_ref(l: &Value<'_>, r: &Value<'_>) -> Value<'static> {
+    // TRUE OR _   = TRUE
+    // _ OR TRUE   = TRUE
+    // NULL OR FALSE/NULL = NULL
+    // FALSE OR FALSE = FALSE
+    match (l, r) {
+        (Value::Bool(true), _) | (_, Value::Bool(true)) => Value::Bool(true),
+        (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
+        _ => Value::Null,
     }
 }
 
@@ -299,21 +381,42 @@ pub(crate) fn apply_binary_interval(
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL months overflows i32".into(),
                 })?;
-            let new_days = i64::from(*lhs_days)
-                .checked_add(signed_days)
-                .and_then(|n| i32::try_from(n).ok())
-                .ok_or(EvalError::TypeMismatch {
-                    detail: "INTERVAL ± INTERVAL days overflows i32".into(),
-                })?;
-            let new_micros = lhs_us
+            let raw_days = i64::from(*lhs_days).checked_add(signed_days).ok_or(
+                EvalError::TypeMismatch {
+                    detail: "INTERVAL ± INTERVAL days overflows i64".into(),
+                },
+            )?;
+            let raw_micros = lhs_us
                 .checked_add(signed_micros)
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL micros overflows i64".into(),
                 })?;
+            // v7.38 P1 (轴 1 pg_regress closure) — PG normalises
+            // INTERVAL arithmetic at the day / sub-day boundary so
+            // mixed-sign components (e.g. `1 day - 12 hours`) collapse
+            // to a single sign before display. Rule:
+            //   total_us = days·86_400e6 + micros
+            //   new_days  = total_us / 86_400e6   (truncate toward 0)
+            //   new_micros = total_us % 86_400e6  (keeps total_us sign)
+            // No-op when signs already align (both positive or both
+            // negative); kills the `1 day -12:00:00` artefact.
+            // Months stay separate — their length is ambiguous (28-31
+            // days), and PG never merges them into the day count
+            // implicitly.
+            const US_PER_DAY: i64 = 86_400_000_000;
+            let total_us = raw_days.checked_mul(US_PER_DAY).and_then(|x| x.checked_add(raw_micros))
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "INTERVAL ± INTERVAL day-micros normalise overflows i64".into(),
+                })?;
+            let norm_days_i64 = total_us / US_PER_DAY;
+            let norm_micros = total_us % US_PER_DAY;
+            let new_days = i32::try_from(norm_days_i64).map_err(|_| EvalError::TypeMismatch {
+                detail: "INTERVAL ± INTERVAL day count exceeds i32".into(),
+            })?;
             Ok(Some(Value::Interval {
                 months: new_months,
                 days: new_days,
-                micros: new_micros,
+                micros: norm_micros,
             }))
         }
         _ => Err(EvalError::TypeMismatch {
@@ -964,7 +1067,7 @@ fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
     })
 }
 
-fn as_f64(v: &Value<'static>) -> Result<f64, EvalError> {
+fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
     match v {
         Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
@@ -987,8 +1090,8 @@ fn as_f64(v: &Value<'static>) -> Result<f64, EvalError> {
 
 pub(super) fn compare(
     op: BinOp,
-    l: &Value<'static>,
-    r: &Value<'static>,
+    l: &Value<'_>,
+    r: &Value<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => i64::from(*a).cmp(&i64::from(*b)),
