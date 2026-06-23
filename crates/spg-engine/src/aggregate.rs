@@ -1316,7 +1316,13 @@ fn accumulate_groups(
                     (None, _) => None,
                     // v7.37.43 (DISTA A-3) — literal arg2: clone the
                     // precomputed value, skip per-row eval & row mat.
-                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(_), Some(lit)) => {
+                        // v7.37.9 Phase 0 diagnostic — count per-row
+                        // hits of the DISTA A-3 fast path.
+                        DISTA_LITERAL_ARG2_CACHE_FIRE
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        Some(lit.clone())
+                    }
                     (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
@@ -1326,6 +1332,8 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
+                    AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         let v: Value<'static> = if let Some(p) = order_pos[i][k] {
@@ -1625,7 +1633,13 @@ fn accumulate_groups(
                     (None, _) => None,
                     // v7.37.43 (DISTA A-3) — literal arg2: clone the
                     // precomputed value, skip per-row eval & row mat.
-                    (Some(_), Some(lit)) => Some(lit.clone()),
+                    (Some(_), Some(lit)) => {
+                        // v7.37.9 Phase 0 diagnostic — count per-row
+                        // hits of the DISTA A-3 fast path.
+                        DISTA_LITERAL_ARG2_CACHE_FIRE
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        Some(lit.clone())
+                    }
                     (Some(e), None) => Some(eval_arg(
                         e,
                         mat.as_deref().expect("needs_mat for arg2"),
@@ -1635,6 +1649,8 @@ fn accumulate_groups(
                 let order_keys: Option<Vec<Value<'static>>> = if spec.order_by.is_empty() {
                     None
                 } else {
+                    AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let mut keys: Vec<Value<'static>> = Vec::with_capacity(spec.order_by.len());
                     for (k, o) in spec.order_by.iter().enumerate() {
                         // Bound ORDER key → read the cell by reference; only
@@ -3723,3 +3739,14 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         _ => Equal,
     }
 }
+
+/// v7.37.9 Phase 0 diagnostic counters — see
+/// `.claude/notes/v7.37.9-class-a-c-cascade-closure-plan.md`. These
+/// are read-only telemetry, do not gate any code path. Used by
+/// `xtests/dogfood_replay/src/bin/counter_dump.rs` to verify
+/// whether the DISTA A-3 + array_agg-ordered fast paths actually
+/// fire on the mailrs Class A SQL shape.
+pub static DISTA_LITERAL_ARG2_CACHE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
