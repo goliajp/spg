@@ -1288,22 +1288,42 @@ fn accumulate_groups(
                 }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
-                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _, _) => {
+                        // v7.37.9 Phase 1A-ext counter — fast position-bound arg.
+                        AGG_PER_ROW_FAST_POS
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        row.get(*p).unwrap_or(&Value::Null)
+                    }
                     (None, None, None) => {
+                        // COUNT(*) sentinel
+                        AGG_PER_ROW_COUNT_STAR_SENTINEL
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
                     (None, Some(s), _) => {
                         if row_eval_cache[s].is_none() {
+                            // v7.37.9 Phase 1A-ext counter — Step-VM ran (cache miss).
+                            AGG_PER_ROW_COMPILED_MISS
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
+                        } else {
+                            // v7.37.9 Phase 1A-ext counter — CSE cache hit
+                            // (compiled arg deduped across specs in same row).
+                            AGG_PER_ROW_COMPILED_HIT
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
+                        // v7.37.9 Phase 1A-ext counter — eval_expr fallback
+                        // (uncompilable spec — Cow row materialise per row).
+                        AGG_PER_ROW_EVAL_FALLBACK
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -1599,8 +1619,14 @@ fn accumulate_groups(
                 }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
-                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _, _) => {
+                        AGG_PER_ROW_FAST_POS
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        row.get(*p).unwrap_or(&Value::Null)
+                    }
                     (None, None, None) => {
+                        AGG_PER_ROW_COUNT_STAR_SENTINEL
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
@@ -1612,15 +1638,22 @@ fn accumulate_groups(
                         // FILTER semantics: a spec filtered out above
                         // never reaches here, so its arg stays unevaled.
                         if row_eval_cache[s].is_none() {
+                            AGG_PER_ROW_COMPILED_MISS
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             let c = arg_compiled[arg_unique_idx[s]]
                                 .as_ref()
                                 .expect("arg_unique_idx points at a compiled spec");
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
+                        } else {
+                            AGG_PER_ROW_COMPILED_HIT
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                         row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
+                        AGG_PER_ROW_EVAL_FALLBACK
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
@@ -3749,4 +3782,23 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
 pub static DISTA_LITERAL_ARG2_CACHE_FIRE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.9 Phase 1A-ext — per-row spec dispatch branches in
+/// `accumulate_groups`'s hot loop. Verifies the Phase 1A
+/// decomposition agent's S06 assumption ("14 specs × eval_expr per
+/// row"). Sum should equal `n_specs × n_input_rows`. Branch
+/// distribution tells which attack target ROI is highest:
+/// FAST_POS many = baseline OK; COMPILED_MISS many = Step-VM is
+/// hot path; EVAL_FALLBACK > 0 = uncompilable specs walking the
+/// eval_expr tree per row × Cow row materialise.
+pub static AGG_PER_ROW_FAST_POS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COMPILED_HIT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COMPILED_MISS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_EVAL_FALLBACK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AGG_PER_ROW_COUNT_STAR_SENTINEL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
