@@ -1552,7 +1552,6 @@ impl Engine {
         let compiled_where: Option<eval::CompiledExpr> = where_
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, ctx));
-        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             let rr = RowRef::Tuple {
@@ -1561,6 +1560,12 @@ impl Engine {
                 pos_to_src: &pipe.pos_to_src,
                 tuple,
             };
+            // v7.37.9 T3 S2 — declare eval_stack inside the per-tuple
+            // loop so its `'val` lifetime binds to `rr`'s local scope.
+            // The Vec allocation per tuple is amortised by the row's
+            // existing work; alternative (outer-scope Vec) hits the
+            // lifetime-contamination wall under `'row: 'val`.
+            let mut eval_stack: Vec<Value<'_>> = Vec::new();
             let pass = if let Some(cw) = &compiled_where {
                 matches!(
                     eval::eval_compiled_ref(cw, &rr, ctx, &mut eval_stack)
