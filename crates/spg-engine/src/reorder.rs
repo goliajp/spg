@@ -146,6 +146,13 @@ pub fn reorder_joins_with(
     stats: &Statistics,
     plan_deterministic: bool,
 ) {
+    // v7.37.9 Phase 0 diagnostic — every entry into reorder_joins_with
+    // bumps this counter, even when the function quickly returns
+    // because plan_deterministic=true or there are no joins. The
+    // PHASE-0 counter dump in xtests/dogfood_replay/bin/counter_dump.rs
+    // reads this to measure 'how many times planner asked us to
+    // reorder' across Class A / Class C SQL.
+    REORDER_INNER_RUN_TRIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if plan_deterministic {
         return;
     }
@@ -249,8 +256,20 @@ pub fn reorder_joins_with(
     if order.iter().enumerate().all(|(i, &j)| i == j) {
         return;
     }
+    // v7.37.9 Phase 0 diagnostic — bump only when reorder ACTUALLY
+    // permutes the chain (TRIED above counts entries, FIRED counts
+    // mutations).
+    REORDER_INNER_RUN_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     rewrite_from_with_trailing(from, &tables, &edges, &order, split);
 }
+
+/// v7.37.9 Phase 0 diagnostic counters — see
+/// `.claude/notes/v7.37.9-class-a-c-cascade-closure-plan.md`. These
+/// are read-only telemetry, do not gate any code path.
+pub static REORDER_INNER_RUN_TRIED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static REORDER_INNER_RUN_FIRED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 struct Edge {
     /// Sorted unique table indices the ON predicate references.

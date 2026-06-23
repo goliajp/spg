@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "spg-stress-cascade"
 path = "src/bin/stress_cascade.rs"
 
+[[bin]]
+# v7.37.9 Phase 0 — counter readout for mailrs Class A / C SQL.
+# Reads atomic counters from spg-engine before / after running the
+# fixture's measure SQL. Read-only diagnostic; doesn't modify any
+# planner code. See `.claude/notes/v7.37.9-class-a-c-cascade-closure-plan.md`.
+name = "spg-counter-dump"
+path = "src/bin/counter_dump.rs"
+
 [dependencies]
 # v7.37.5 — dogfood-replay framework. Bin-only crate; the framework
 # is intentionally tight on deps so it stays buildable under
