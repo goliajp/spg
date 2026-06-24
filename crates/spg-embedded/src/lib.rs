@@ -290,6 +290,22 @@ fn default_checkpoint_threshold_bytes() -> u64 {
         .unwrap_or(4 * 1024 * 1024)
 }
 
+/// v7.37.10 — time-based auto-checkpoint interval (seconds).
+/// Default 60 s — bounds data-loss-on-quarantine-WAL to ~1 minute of
+/// writes. `SPG_EMBEDDED_CHECKPOINT_SECONDS=0` disables the timer
+/// (byte-threshold path remains active); negative or invalid values
+/// fall back to the default.
+fn default_checkpoint_time_threshold() -> Option<core::time::Duration> {
+    match std::env::var("SPG_EMBEDDED_CHECKPOINT_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(core::time::Duration::from_secs(n)),
+        None => Some(core::time::Duration::from_secs(60)),
+    }
+}
+
 /// v7.30.3 (mailrs round-26) — per-query byte budget on join/filter
 /// materialisation, default ON at 256 MiB for embed parity with the
 /// server's allocator-level `SPG_MAX_QUERY_BYTES` default. A fat
@@ -1867,6 +1883,22 @@ struct PersistenceCtx {
     /// after the engine write lock is released.
     wal: Arc<WalGroup>,
     checkpoint_threshold_bytes: u64,
+    /// v7.37.10 (mailrs 06-23 cascade 7 P0 §"base catalog 17h 没更新")
+    /// — time-based auto-checkpoint floor. The byte-threshold path
+    /// (`checkpoint_threshold_bytes`, default 4 MiB) doesn't fire if
+    /// the workload's WAL growth rate is slower than the threshold ÷
+    /// quarantine-risk window. Mailrs measured 14 h between graceful
+    /// shutdowns with ~30 KB/hr write rate — well below 4 MiB; auto-
+    /// checkpoint never fired; the entire 14 h of writes was lost on
+    /// the quarantine-WAL recovery. This time-based companion bounds
+    /// the data-loss window to roughly `checkpoint_time_threshold`
+    /// seconds: any execute() arriving more than that interval after
+    /// the last checkpoint, with at least ONE WAL byte since, fires
+    /// a checkpoint via the same fire-and-forget worker enqueue.
+    /// Default 60 s. `SPG_EMBEDDED_CHECKPOINT_SECONDS=0` disables.
+    checkpoint_time_threshold: Option<core::time::Duration>,
+    last_checkpoint_at: Mutex<std::time::Instant>,
+    last_checkpoint_wal_len: Mutex<u64>,
     /// v7.1.4 — `<db_path>.spg/segments/` directory. Cold-tier
     /// segments produced by `freeze_oldest_to_cold` / compaction
     /// are persisted here as `seg_<id>.spg` files; the manifest
@@ -2285,6 +2317,9 @@ impl Database {
                 current_chunk_path: Arc::new(Mutex::new(current_chunk_path)),
                 wal,
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
+                checkpoint_time_threshold: default_checkpoint_time_threshold(),
+                last_checkpoint_at: Mutex::new(std::time::Instant::now()),
+                last_checkpoint_wal_len: Mutex::new(0),
                 cold_segments_dir,
                 cold_segment_paths,
                 lock_path,
@@ -2740,13 +2775,38 @@ impl Database {
                 group: Arc::clone(&p.wal),
                 seq,
             });
-            if p.wal.written_len() >= p.checkpoint_threshold_bytes {
+            // v7.37.10 — bytes OR time threshold. The byte path was the
+            // only trigger pre-v7.37.10 and silently mis-served slow-
+            // write workloads (mailrs measured 14 h between checkpoints
+            // at ~30 KB/hr; 4 MiB byte threshold needed 130+ h). Time
+            // path bounds the data-loss-on-WAL-quarantine window to
+            // the configured interval (default 60 s).
+            let bytes_trigger = p.wal.written_len() >= p.checkpoint_threshold_bytes;
+            let time_trigger = p.checkpoint_time_threshold.is_some_and(|threshold| {
+                let last = *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner());
+                let last_len = *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner());
+                let now = std::time::Instant::now();
+                let written_now = p.wal.written_len();
+                // Only fire if we've actually accumulated writes since the
+                // last checkpoint (avoid spinning on idle databases).
+                written_now > last_len && now.duration_since(last) >= threshold
+            });
+            if bytes_trigger || time_trigger {
                 // CoW-2 (v7.34): hot path — fire-and-forget. The worker
                 // serializes off this thread so the commit that just
                 // crossed the threshold doesn't stall on a multi-hundred-ms
                 // snapshot write. Any sticky error from a prior async
                 // checkpoint surfaces here.
                 self.trigger_checkpoint()?;
+                // Update markers AFTER trigger_checkpoint so the next
+                // request's time-threshold check waits the full interval
+                // from when the request landed (not when it actually
+                // completed; that's the worker's domain).
+                let p = self.persistence.as_ref().expect("checked above");
+                *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner()) =
+                    std::time::Instant::now();
+                *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner()) =
+                    p.wal.written_len();
             }
         }
         Ok(ticket)
