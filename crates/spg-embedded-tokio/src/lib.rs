@@ -59,6 +59,26 @@ struct OpenPathShared {
 
 static INFLIGHT_OPENS: OnceLock<Mutex<HashMap<PathBuf, Arc<OpenPathShared>>>> = OnceLock::new();
 
+/// v7.37.12 — observability counters for the v7.37.11 dedup path.
+/// Bumped on every `inflight_shared` lookup so an operator can
+/// confirm dedup is firing on real prod workloads without needing
+/// to attach a debugger. Public so external diagnostic binaries
+/// (e.g. spgctl or test harnesses) can read them.
+pub static OPEN_PATH_DEDUP_FIRST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static OPEN_PATH_DEDUP_EXISTING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.12 — when `SPG_OPEN_PATH_LOG=1` is set, every open_path
+/// call emits a single stderr line covering the dedup decision +
+/// total elapsed wait. Off-by-default so existing log scrapers
+/// don't break; on-by-env-var so an operator hitting a prod
+/// recurrence of v7.37.5 RAII-claim-vs-reality drift (mailrs
+/// pattern) can flip the flag without redeploying.
+fn open_path_log_enabled() -> bool {
+    std::env::var_os("SPG_OPEN_PATH_LOG").is_some()
+}
+
 enum InflightLookup {
     First(Arc<OpenPathShared>),
     Existing(Arc<OpenPathShared>),
@@ -68,8 +88,10 @@ fn inflight_shared(canonical: &Path) -> InflightLookup {
     let map = INFLIGHT_OPENS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = guard.get(canonical) {
+        OPEN_PATH_DEDUP_EXISTING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         InflightLookup::Existing(Arc::clone(s))
     } else {
+        OPEN_PATH_DEDUP_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let s = Arc::new(OpenPathShared {
             notify: Notify::new(),
             result: Mutex::new(None),
@@ -194,6 +216,8 @@ impl AsyncDatabase {
     pub async fn open_path<P: AsRef<Path>>(path: P) -> Result<Self, EngineError> {
         let path = path.as_ref().to_path_buf();
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let log_enabled = open_path_log_enabled();
+        let start = std::time::Instant::now();
         // v7.37.11 (mailrs 06-23 cascade 7 P0 #2) — process-wide dedup
         // of concurrent open_path calls for the same canonical path.
         //
@@ -219,6 +243,13 @@ impl AsyncDatabase {
             InflightLookup::First(s) => (true, s),
             InflightLookup::Existing(s) => (false, s),
         };
+        if log_enabled {
+            eprintln!(
+                "[spg open_path] path={} role={}",
+                canonical.display(),
+                if is_first { "first" } else { "existing" }
+            );
+        }
         if is_first {
             let canonical2 = canonical.clone();
             let shared2 = std::sync::Arc::clone(&shared);
@@ -247,6 +278,15 @@ impl AsyncDatabase {
             {
                 let g = shared.result.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(r) = &*g {
+                    if log_enabled {
+                        eprintln!(
+                            "[spg open_path] path={} role={} elapsed={:.3}s status={}",
+                            canonical.display(),
+                            if is_first { "first" } else { "existing" },
+                            start.elapsed().as_secs_f64(),
+                            if r.is_ok() { "ok" } else { "err" }
+                        );
+                    }
                     return r.clone();
                 }
             }
