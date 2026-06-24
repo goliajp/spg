@@ -39,7 +39,7 @@ pub use spg_embedded::{
 };
 pub use spg_engine::CatalogSnapshot;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinError;
 
 /// v7.37.11 (mailrs cascade 7 P0 #2) — process-wide registry of
@@ -51,10 +51,25 @@ use tokio::task::JoinError;
 /// in-process registry was designed to refuse — but mailrs's
 /// spg-sqlx Pool kept retrying after each refusal). With this
 /// dedup, the second-arrival caller never enters Database::open_path;
-/// it just `Notify.notified().await`s for the first caller's result.
+/// it just awaits the first caller's result over a watch channel.
+///
+/// v7.37.12 — replaced the original Notify+Mutex pair with a
+/// `tokio::sync::watch` channel. The Notify pattern had a
+/// theoretical (but on slow-open_path workloads, real) race: a
+/// late-arriving caller could subscribe to Notify *after* the
+/// spawn-blocking task fired `notify_waiters()` (which doesn't
+/// store a permit). The watch channel uses internal version marks
+/// so `changed().await` returns immediately if the value advanced
+/// between the receiver's last `borrow_and_update()` and the
+/// `.changed()` call — closing that race.
 struct OpenPathShared {
-    notify: Notify,
-    result: Mutex<Option<Result<AsyncDatabase, EngineError>>>,
+    sender: watch::Sender<OpenPathState>,
+}
+
+#[derive(Clone)]
+enum OpenPathState {
+    InFlight,
+    Done(Result<AsyncDatabase, EngineError>),
 }
 
 static INFLIGHT_OPENS: OnceLock<Mutex<HashMap<PathBuf, Arc<OpenPathShared>>>> = OnceLock::new();
@@ -92,10 +107,8 @@ fn inflight_shared(canonical: &Path) -> InflightLookup {
         InflightLookup::Existing(Arc::clone(s))
     } else {
         OPEN_PATH_DEDUP_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let s = Arc::new(OpenPathShared {
-            notify: Notify::new(),
-            result: Mutex::new(None),
-        });
+        let (sender, _) = watch::channel(OpenPathState::InFlight);
+        let s = Arc::new(OpenPathShared { sender });
         guard.insert(canonical.to_path_buf(), Arc::clone(&s));
         InflightLookup::First(s)
     }
@@ -257,11 +270,12 @@ impl AsyncDatabase {
                 let result = Database::open_path(path).map(|db| Self {
                     inner: std::sync::Arc::new(tokio::sync::RwLock::new(db)),
                 });
-                {
-                    let mut g = shared2.result.lock().unwrap_or_else(|e| e.into_inner());
-                    *g = Some(result);
-                }
-                shared2.notify.notify_waiters();
+                // Publish result + wake all watchers atomically.
+                // watch::Sender::send is fail-safe: returns Err only
+                // when no receivers exist, which can't happen here
+                // since the spawn task itself holds a Sender that
+                // hasn't dropped.
+                let _ = shared2.sender.send(OpenPathState::Done(result));
                 // Drop the map entry so future open_paths spawn a
                 // fresh worker (the AsyncDatabase clones the inner
                 // Arc<RwLock>, so the shared entry's purpose ends
@@ -274,10 +288,11 @@ impl AsyncDatabase {
                 }
             });
         }
+        let mut receiver = shared.sender.subscribe();
         loop {
             {
-                let g = shared.result.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(r) = &*g {
+                let state = receiver.borrow_and_update();
+                if let OpenPathState::Done(r) = &*state {
                     if log_enabled {
                         eprintln!(
                             "[spg open_path] path={} role={} elapsed={:.3}s status={}",
@@ -290,7 +305,19 @@ impl AsyncDatabase {
                     return r.clone();
                 }
             }
-            shared.notify.notified().await;
+            // changed() is race-safe: returns immediately if the
+            // version mark advanced between our last
+            // borrow_and_update() and this call, so we never miss a
+            // send() that fired in that gap (the Notify+Mutex pair
+            // this replaces had exactly that race window).
+            if receiver.changed().await.is_err() {
+                // Sender dropped without sending Done — only
+                // possible if the OpenPathShared was racing
+                // dropped after a successful Done, which we'd
+                // have observed via borrow_and_update above.
+                // Treat as cancellation.
+                return Err(EngineError::Cancelled);
+            }
         }
     }
 
