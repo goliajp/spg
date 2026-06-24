@@ -31,6 +31,8 @@ spg-engine = { workspace = true }
 [dev-dependencies]
 # `rt-multi-thread` + `macros` for the e2e tests' #[tokio::test].
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# v7.37.11 — dedup_tests use tempfile for per-test catalog paths.
+tempfile = "3"
 
 [lints]
 workspace = true
