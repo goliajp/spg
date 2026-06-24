@@ -30,16 +30,54 @@
 
 #![deny(missing_debug_implementations)]
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use spg_embedded::{
     ColumnSchema, DataType, Database, EngineError, ParsedStatement, QueryResult, Statement, Value,
 };
 pub use spg_engine::CatalogSnapshot;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinError;
+
+/// v7.37.11 (mailrs cascade 7 P0 #2) — process-wide registry of
+/// in-flight `AsyncDatabase::open_path` calls, keyed by canonical
+/// path. Concurrent open_path callers for the same path share the
+/// same `OpenPathShared` so they wait on ONE detached spawn_blocking
+/// instead of racing to construct overlapping `Database::open_path`
+/// invocations (the race that the v7.37.5 `ACTIVE_OPEN_PATHS`
+/// in-process registry was designed to refuse — but mailrs's
+/// spg-sqlx Pool kept retrying after each refusal). With this
+/// dedup, the second-arrival caller never enters Database::open_path;
+/// it just `Notify.notified().await`s for the first caller's result.
+struct OpenPathShared {
+    notify: Notify,
+    result: Mutex<Option<Result<AsyncDatabase, EngineError>>>,
+}
+
+static INFLIGHT_OPENS: OnceLock<Mutex<HashMap<PathBuf, Arc<OpenPathShared>>>> = OnceLock::new();
+
+enum InflightLookup {
+    First(Arc<OpenPathShared>),
+    Existing(Arc<OpenPathShared>),
+}
+
+fn inflight_shared(canonical: &Path) -> InflightLookup {
+    let map = INFLIGHT_OPENS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = guard.get(canonical) {
+        InflightLookup::Existing(Arc::clone(s))
+    } else {
+        let s = Arc::new(OpenPathShared {
+            notify: Notify::new(),
+            result: Mutex::new(None),
+        });
+        guard.insert(canonical.to_path_buf(), Arc::clone(&s));
+        InflightLookup::First(s)
+    }
+}
 
 /// v7.34.1 (mailrs prod report bug B): drop the previous
 /// `.expect("spawn_blocking join")` shape that panicked on
@@ -155,12 +193,65 @@ impl AsyncDatabase {
     /// sync path (IO errors, format errors, etc.).
     pub async fn open_path<P: AsRef<Path>>(path: P) -> Result<Self, EngineError> {
         let path = path.as_ref().to_path_buf();
-        let db = tokio::task::spawn_blocking(move || Database::open_path(path))
-            .await
-            .flatten_blocking()?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(db)),
-        })
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // v7.37.11 (mailrs 06-23 cascade 7 P0 #2) — process-wide dedup
+        // of concurrent open_path calls for the same canonical path.
+        //
+        // Bug: spg-sqlx Pool spawns N concurrent connections, each
+        // calling AsyncDatabase::open_path → Database::open_path →
+        // LockRegistryGuard::try_acquire. The first registers in
+        // ACTIVE_OPEN_PATHS; the rest hit "in this process" refusal.
+        // Worse: tokio::sync::OnceCell in spg-sqlx drops its init
+        // future on caller cancel, but the underlying spawn_blocking
+        // keeps running + keeps holding the registry slot — so a
+        // canceled-then-retried connect() sees the slot held by its
+        // OWN previous spawn_blocking generation and lock-hangs.
+        //
+        // Fix: every concurrent open_path for the SAME path shares
+        // ONE detached spawn_blocking. Per-caller awaits are
+        // cancellation-safe (Notify-based; the spawn_blocking task
+        // is NOT a tokio future — cancel can't kill it). The first
+        // caller seeds the shared entry; subsequent callers attach
+        // before the result is published. On result publication, all
+        // waiters wake; map entry is removed.
+        let shared = inflight_shared(&canonical);
+        let (is_first, shared) = match shared {
+            InflightLookup::First(s) => (true, s),
+            InflightLookup::Existing(s) => (false, s),
+        };
+        if is_first {
+            let canonical2 = canonical.clone();
+            let shared2 = std::sync::Arc::clone(&shared);
+            tokio::task::spawn_blocking(move || {
+                let result = Database::open_path(path).map(|db| Self {
+                    inner: std::sync::Arc::new(tokio::sync::RwLock::new(db)),
+                });
+                {
+                    let mut g = shared2.result.lock().unwrap_or_else(|e| e.into_inner());
+                    *g = Some(result);
+                }
+                shared2.notify.notify_waiters();
+                // Drop the map entry so future open_paths spawn a
+                // fresh worker (the AsyncDatabase clones the inner
+                // Arc<RwLock>, so the shared entry's purpose ends
+                // once results are delivered).
+                if let Some(map) = INFLIGHT_OPENS.get() {
+                    let _ = map
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&canonical2);
+                }
+            });
+        }
+        loop {
+            {
+                let g = shared.result.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(r) = &*g {
+                    return r.clone();
+                }
+            }
+            shared.notify.notified().await;
+        }
     }
 
     /// Execute a single SQL statement.
@@ -547,5 +638,73 @@ impl AsyncReadHandle {
         .await
         .unwrap_blocking();
         self.snapshot = new_snapshot;
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    /// v7.37.11 P0 #2 — N concurrent open_path calls for the SAME
+    /// path must all succeed without any "in this process" sibling
+    /// self-lock error. Pre-v7.37.11 this test would have failed
+    /// with N-1 of the calls returning `EngineError::Unsupported(
+    /// "database is locked by an in-flight task in this process")`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_open_path_dedup() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("dedup.spg");
+        // Seed: one synchronous open creates the catalog file. This
+        // ensures the per-thread spawn_blocking inside open_path sees
+        // a real (rather than fresh-creation) catalog to walk.
+        {
+            let mut db = AsyncDatabase::open_path(&path).await.expect("seed");
+            db.execute("CREATE TABLE t(id BIGINT)").await.expect("ddl");
+        }
+        // Now race N callers. Each clones the path. ALL must succeed.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                AsyncDatabase::open_path(p).await
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            let result = h.await.expect("join");
+            assert!(
+                result.is_ok(),
+                "caller {i} got error (expected dedup to serialize all 16 calls): {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// v7.37.11 — the spg-sqlx cancel-then-retry pattern: a caller
+    /// drops its future mid-await, then a fresh caller appears. The
+    /// dedup should ensure the second caller waits for the SAME
+    /// in-flight task (not spawn its own; the first caller's
+    /// spawn_blocking is detached so cancel doesn't kill it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_path_survives_caller_cancel() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("cancel.spg");
+        // Seed.
+        {
+            let mut db = AsyncDatabase::open_path(&path).await.expect("seed");
+            db.execute("CREATE TABLE u(id BIGINT)").await.expect("ddl");
+        }
+        // Caller 1: starts open_path then drops the future.
+        let p1 = path.clone();
+        let task1 = tokio::spawn(async move {
+            let _ = AsyncDatabase::open_path(p1).await;
+        });
+        // Force scheduling so the inflight entry is created.
+        tokio::task::yield_now().await;
+        task1.abort();
+        // The spawn_blocking task is still running; the inflight
+        // entry should still exist OR have been cleaned up. Either
+        // way, a second caller should succeed.
+        let result = AsyncDatabase::open_path(path).await;
+        assert!(result.is_ok(), "caller after abort got: {:?}", result.err());
     }
 }
