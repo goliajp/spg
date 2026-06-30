@@ -483,11 +483,104 @@ impl Engine {
         if e.wal {
             lines.push("WAL: records=0 bytes=0 fpi=0".into());
         }
+        // v7.37.23 (23.5) — EXPLAIN (FORMAT json|xml|yaml). PG's
+        // default is text (one row per line). Non-text formats
+        // bundle the whole plan into a single TEXT row whose body
+        // wraps the line list in the chosen container.
         let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
-        let rows: Vec<Row<'static>> = lines
-            .into_iter()
-            .map(|l| Row::new(alloc::vec![Value::text(l)]))
-            .collect();
+        let rows: Vec<Row<'static>> = match e.format {
+            spg_sql::ast::ExplainFormat::Text => lines
+                .into_iter()
+                .map(|l| Row::new(alloc::vec![Value::text(l)]))
+                .collect(),
+            spg_sql::ast::ExplainFormat::Json => {
+                // PG: a JSON array of plan objects. SPG's planner
+                // doesn't yet emit a tree of nodes — wrap each
+                // text line as a `{"Plan Line": "..."}` object
+                // inside the array. Dashboards parsing the line
+                // bodies see the same content; tools doing a
+                // strict PG-tree schema match should still call
+                // out to the engine via the text shape.
+                let mut body = alloc::string::String::from("[");
+                for (i, l) in lines.iter().enumerate() {
+                    if i > 0 {
+                        body.push_str(", ");
+                    }
+                    body.push_str("{\"Plan Line\": ");
+                    body.push_str(&json_string_lit(l));
+                    body.push('}');
+                }
+                body.push(']');
+                alloc::vec![Row::new(alloc::vec![Value::text(body)])]
+            }
+            spg_sql::ast::ExplainFormat::Xml => {
+                let mut body = alloc::string::String::from(
+                    "<explain xmlns=\"http://www.postgresql.org/2009/explain\">",
+                );
+                for l in &lines {
+                    body.push_str("<line>");
+                    body.push_str(&xml_escape(l));
+                    body.push_str("</line>");
+                }
+                body.push_str("</explain>");
+                alloc::vec![Row::new(alloc::vec![Value::text(body)])]
+            }
+            spg_sql::ast::ExplainFormat::Yaml => {
+                let mut body = alloc::string::String::from("- Plan:\n");
+                for l in &lines {
+                    body.push_str("  - ");
+                    body.push_str(&yaml_scalar(l));
+                    body.push('\n');
+                }
+                alloc::vec![Row::new(alloc::vec![Value::text(body)])]
+            }
+        };
         Ok(QueryResult::Rows { columns, rows })
     }
+}
+
+/// JSON-encode a string scalar with proper escaping for the
+/// EXPLAIN FORMAT JSON output.
+fn json_string_lit(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&alloc::format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// XML-escape a body fragment. Covers the five canonical entities;
+/// the EXPLAIN payload doesn't contain bytes outside `&<>"'`.
+fn xml_escape(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// YAML-quote a scalar that may contain `:` or other YAML-special
+/// characters. The simplest safe form is double-quoting with the
+/// same escapes JSON uses.
+fn yaml_scalar(s: &str) -> alloc::string::String {
+    json_string_lit(s)
 }

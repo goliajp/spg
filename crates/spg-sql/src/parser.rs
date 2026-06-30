@@ -516,6 +516,7 @@ impl Parser {
                 let mut timing_off = false;
                 let mut settings = false;
                 let mut wal = false;
+                let mut format = crate::ast::ExplainFormat::Text;
                 // v6.8.3 + v7.37.7 — `EXPLAIN (option [, option…])`
                 // syntax accepts SUGGEST + COSTS ON|OFF. Multiple
                 // options are comma-separated. Booleans default to ON
@@ -648,8 +649,21 @@ impl Parser {
                             // json / yaml / xml); skip the next token
                             // if it's an ident.
                             if opt.eq_ignore_ascii_case("format") {
-                                if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
+                                if let Token::Ident(v) | Token::QuotedIdent(v) = self.peek().clone()
+                                {
                                     self.advance();
+                                    format = match v.to_ascii_lowercase().as_str() {
+                                        "text" => crate::ast::ExplainFormat::Text,
+                                        "json" => crate::ast::ExplainFormat::Json,
+                                        "xml" => crate::ast::ExplainFormat::Xml,
+                                        "yaml" => crate::ast::ExplainFormat::Yaml,
+                                        other => {
+                                            return Err(self.err(format!(
+                                                "EXPLAIN (FORMAT …): unknown format {other:?}; \
+                                                 supports text, json, xml, yaml"
+                                            )));
+                                        }
+                                    };
                                 }
                             } else {
                                 // VERBOSE / SUMMARY take optional ON/OFF;
@@ -702,6 +716,7 @@ impl Parser {
                     timing_off,
                     settings,
                     wal,
+                    format,
                 }))
             }
             Token::Create => self.parse_create_stmt(),

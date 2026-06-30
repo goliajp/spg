@@ -812,6 +812,22 @@ pub struct ExplainStatement {
     /// write-side queries (INSERT/UPDATE/DELETE wrapped in EXPLAIN
     /// ANALYZE) report against the engine WAL counter delta.
     pub wal: bool,
+    /// v7.37.23 (23.5) — `EXPLAIN (FORMAT text|json|xml|yaml)`.
+    /// PG's standard format selector. Default is text. JSON / XML
+    /// / YAML emit a single-row TEXT result whose body wraps the
+    /// existing line-per-operator text in the chosen container —
+    /// PG-compatible just enough for dashboards that parse those
+    /// container shapes (pgAdmin's JSON path picker, etc.).
+    pub format: ExplainFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplainFormat {
+    #[default]
+    Text,
+    Json,
+    Xml,
+    Yaml,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
