@@ -385,6 +385,12 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.21 (21.13-b) — pg_catalog.pg_publication
+                // (one row per CREATE PUBLICATION).
+                "__spg_pg_publication" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_publication(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
