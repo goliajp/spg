@@ -451,6 +451,14 @@ impl Engine {
                     let (schema, rows) = synth_info_routines();
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.24 (24.2) — information_schema.domains.
+                "__spg_info_domains" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_information_schema_domains(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.9) — information_schema.schemata.
                 "__spg_info_schemata" => {
                     let (schema, rows) =
