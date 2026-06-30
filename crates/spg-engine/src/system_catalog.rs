@@ -193,6 +193,88 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.23 (23.7-a) — synthesise `pg_catalog.pg_statistic_ext`.
+/// PG's extended-statistics catalog (one row per CREATE
+/// STATISTICS). SPG accepts CREATE STATISTICS as a parser
+/// no-op today; the view ships empty so the column shape is
+/// stable. When the engine wires real extended-stats tracking
+/// (v7.38 candidate), rows light up here.
+///
+/// PG-canonical columns (subset that pg_dump + monitoring
+/// queries read at handshake):
+///   * oid (BigInt)
+///   * stxrelid (BigInt) — owning table OID
+///   * stxname (Text) — statistics name
+///   * stxnamespace (BigInt)
+///   * stxowner (BigInt)
+///   * stxkind (Text) — "{d,f,m,e}" array flattened to comma
+///   * stxkeys (Text) — int2vector of column positions, flat
+pub(crate) fn synth_pg_statistic_ext(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("stxrelid", DataType::BigInt, false),
+        ColumnSchema::new("stxname", DataType::Text, false),
+        ColumnSchema::new("stxnamespace", DataType::BigInt, false),
+        ColumnSchema::new("stxowner", DataType::BigInt, false),
+        ColumnSchema::new("stxkind", DataType::Text, false),
+        ColumnSchema::new("stxkeys", DataType::Text, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
+/// v7.37.24 (24.15) — synthesise `pg_catalog.pg_statistic`.
+/// PG's per-column statistics — the auto-collected histograms /
+/// MCV lists ANALYZE writes. SPG keeps live histograms in the
+/// `Statistics` engine module (see crates/spg-engine/src/
+/// statistics.rs); the view materialises one row per
+/// (table, column) pair so PG planner dashboards have a
+/// fan-out to query against. The actual histogram bytes
+/// (stavalues1 / stanumbers1 …) are deferred to v7.38 — the
+/// shape lands now so the dashboards parse.
+///
+/// PG-canonical columns (subset):
+///   * starelid (BigInt) — table OID
+///   * staattnum (SmallInt) — column position
+///   * stainherit (Bool) — inheritance flag (false in SPG)
+///   * stanullfrac (Float) — fraction of NULLs
+///   * stawidth (Int) — avg byte width
+///   * stadistinct (Float) — distinct estimate
+pub(crate) fn synth_pg_statistic(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("starelid", DataType::BigInt, false),
+        ColumnSchema::new("staattnum", DataType::SmallInt, false),
+        ColumnSchema::new("stainherit", DataType::Bool, false),
+        ColumnSchema::new("stanullfrac", DataType::Float, false),
+        ColumnSchema::new("stawidth", DataType::Int, false),
+        ColumnSchema::new("stadistinct", DataType::Float, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut starelid: i64 = 16384;
+    for name in cat.table_names() {
+        if crate::is_internal_table_name(&name) {
+            continue;
+        }
+        let Some(t) = cat.get(&name) else {
+            continue;
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        for (i, _col) in t.schema().columns.iter().enumerate() {
+            let attnum = (i + 1) as i16;
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(starelid),
+                Value::SmallInt(attnum),
+                Value::Bool(false),
+                Value::Float(0.0),
+                Value::Int(0),
+                Value::Float(0.0),
+            ]));
+        }
+        starelid = starelid.saturating_add(1);
+    }
+    (schema, rows)
+}
+
 /// v7.37.22 (22.18) — synthesise `pg_catalog.pg_stat_io` (PG 16+).
 /// One row per (backend_type, object, context) combo. Modern
 /// pgwatch / pganalyze dashboards prefer this surface over the

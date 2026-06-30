@@ -193,6 +193,7 @@ mod e2e_pg_stat_statements;
 mod e2e_pg_stat_user_indexes;
 mod e2e_pg_stat_user_tables;
 mod e2e_pg_statio_user_tables;
+mod e2e_pg_statistic_views;
 mod e2e_pg_time;
 mod e2e_pg_timetz;
 mod e2e_pg_type_view;
