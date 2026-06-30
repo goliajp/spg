@@ -163,8 +163,10 @@ fn startup_param_application_name_surfaces_in_activity() {
 
     send_query(&mut s, "SELECT * FROM spg_stat_activity");
     let msgs = read_until_ready(&mut s);
-    // user column index = 1; application_name column index = 7 (last).
-    let appname = find_row_cell(&msgs, 1, "alice", 7).expect("alice row + appname");
+    // v7.37.14 B6.3 — user col idx = 1; application_name col idx
+    // = 8 (was 7 pre-v7.37.14, +1 for the new `wait_event_type`
+    // column the PG-shape alignment inserted before `wait_event`).
+    let appname = find_row_cell(&msgs, 1, "alice", 8).expect("alice row + appname");
     assert_eq!(appname, "psql-alice");
 }
 
@@ -179,7 +181,7 @@ fn set_application_name_updates_activity_row() {
     // Pre-SET: empty.
     send_query(&mut s, "SELECT * FROM spg_stat_activity");
     let msgs0 = read_until_ready(&mut s);
-    let pre = find_row_cell(&msgs0, 1, "bob", 7).expect("bob row");
+    let pre = find_row_cell(&msgs0, 1, "bob", 8).expect("bob row");
     assert_eq!(
         pre, "",
         "pre-SET application_name is empty when no startup param"
@@ -192,7 +194,7 @@ fn set_application_name_updates_activity_row() {
     // Post-SET: updated.
     send_query(&mut s, "SELECT * FROM spg_stat_activity");
     let msgs1 = read_until_ready(&mut s);
-    let post = find_row_cell(&msgs1, 1, "bob", 7).expect("bob row after SET");
+    let post = find_row_cell(&msgs1, 1, "bob", 8).expect("bob row after SET");
     assert_eq!(post, "pytest-runner");
 }
 

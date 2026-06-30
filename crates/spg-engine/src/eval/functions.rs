@@ -1618,6 +1618,18 @@ fn apply_function_dispatch(
         | "pg_advisory_unlock"
         | "pg_advisory_unlock_shared" => Ok(Value::Bool(true)),
         "pg_advisory_unlock_all" => Ok(Value::Null),
+        // v7.37.14 (B6.5) — PG `pg_blocking_pids(pid)` returns the
+        // array of pids currently blocking `pid`. SPG's single-
+        // writer + Arc-snapshot model means there is no per-tuple
+        // lock chain to walk (write-lock contention is at most
+        // 1-deep, fully observable via spg_stat_activity.wait_event).
+        // Until v7.37.15 lands per-row tuple locks, this function
+        // always returns NULL — but its presence keeps PG-shaped
+        // monitoring queries (`SELECT pg_blocking_pids(pid)`)
+        // syntactically valid against SPG. Tests / dashboards
+        // written today against this surface keep working when
+        // v7.37.15 starts populating real chains.
+        "pg_blocking_pids" => Ok(Value::Null),
         // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
         // canonical PG lowercase type name. sqlx / SQLAlchemy /
         // Diesel emit this during describe; generic ORMs may

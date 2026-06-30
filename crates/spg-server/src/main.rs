@@ -386,6 +386,20 @@ impl ConnState {
             _ => "",
         }
     }
+
+    /// v7.37.14 (B6.3) — PG-style wait_event_type categorisation.
+    /// Maps the SPG wait_event enum to PG's high-level wait
+    /// categories so monitoring dashboards built against
+    /// `pg_stat_activity` queries work against SPG without per-
+    /// product translation.
+    pub(crate) fn wait_event_type_str(&self) -> &'static str {
+        match self.wait_event.load(Ordering::Relaxed) {
+            1 => "Lock",        // write_lock — engine RwLock contention
+            2 => "IO",          // fsync — WAL durability stall
+            3 => "IPC",         // group_commit — leader/follower coordination
+            _ => "",            // idle / no wait
+        }
+    }
 }
 
 /// v6.5.2 — global handle to `ServerState` so the engine's
@@ -485,6 +499,7 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
                 user: c.user.clone(),
                 started_at_us: c.started_at_us,
                 current_sql,
+                wait_event_type: c.wait_event_type_str().to_string(),
                 wait_event: c.wait_event_str().to_string(),
                 elapsed_us: c.elapsed_us(),
                 in_transaction: c.in_transaction.load(Ordering::Relaxed),
