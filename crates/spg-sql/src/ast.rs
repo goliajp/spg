@@ -735,6 +735,28 @@ pub enum AlterTableTarget {
         which: TriggerSelector,
         enabled: bool,
     },
+    /// v7.37.16 (16.3) — `ALTER TABLE parent ATTACH PARTITION child
+    /// <bounds>`. Promotes an existing table `child` to a partition
+    /// of `parent` using PG-style `FOR VALUES …` / `DEFAULT` bounds.
+    /// Engine validates that `child`'s columns are layout-compatible
+    /// with `parent` and that every row in `child` satisfies the
+    /// bound before installing the role.
+    AttachPartition {
+        child: String,
+        bounds: PartitionOfBoundsAst,
+    },
+    /// v7.37.16 (16.4 + 16.5) — `ALTER TABLE parent DETACH PARTITION
+    /// child [CONCURRENTLY] [FINALIZE]`. Demotes a partition back
+    /// to a standalone table (clears `partition_role`) and removes
+    /// it from the parent's child set. v7.37.16.5: `CONCURRENTLY`
+    /// is parser-accepted; engine performs the same atomic detach
+    /// (single-engine, no replication lag — the PG semantics that
+    /// require the two-phase split don't apply).
+    DetachPartition {
+        child: String,
+        concurrently: bool,
+        finalize: bool,
+    },
 }
 
 /// v7.16.1 — target of `ALTER TABLE … { ENABLE | DISABLE }
@@ -3783,6 +3805,46 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 TriggerSelector::All => f.write_str("ALL"),
                 TriggerSelector::Named(n) => f.write_str(&quote_ident(n)),
             }
+        }
+        AlterTableTarget::AttachPartition { child, bounds } => {
+            write!(f, "ATTACH PARTITION {} ", quote_ident(child))?;
+            match bounds {
+                PartitionOfBoundsAst::Range { lower, upper } => {
+                    write!(f, "FOR VALUES FROM ({}) TO ({})", *lower, *upper)
+                }
+                PartitionOfBoundsAst::List { values } => {
+                    f.write_str("FOR VALUES IN (")?;
+                    for (i, v) in values.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}", v)?;
+                    }
+                    f.write_str(")")
+                }
+                PartitionOfBoundsAst::Hash { modulus, remainder } => {
+                    write!(
+                        f,
+                        "FOR VALUES WITH (MODULUS {}, REMAINDER {})",
+                        modulus, remainder
+                    )
+                }
+                PartitionOfBoundsAst::Default => f.write_str("DEFAULT"),
+            }
+        }
+        AlterTableTarget::DetachPartition {
+            child,
+            concurrently,
+            finalize,
+        } => {
+            write!(f, "DETACH PARTITION {}", quote_ident(child))?;
+            if *concurrently {
+                f.write_str(" CONCURRENTLY")?;
+            }
+            if *finalize {
+                f.write_str(" FINALIZE")?;
+            }
+            Ok(())
         }
     }
 }

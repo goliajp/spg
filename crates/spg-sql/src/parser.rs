@@ -4612,8 +4612,210 @@ impl Parser {
                     enabled,
                 }])
             }
+            // v7.37.16 (16.3) — ATTACH PARTITION child <bounds>
+            Token::Ident(s) if s.eq_ignore_ascii_case("attach") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Partition)
+                    && !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("partition"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected PARTITION after ATTACH, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let child = self.expect_ident_like()?;
+                let bounds = self.parse_partition_bounds_tail()?;
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::AttachPartition { child, bounds }
+                ])
+            }
+            // v7.37.16 (16.4 + 16.5) — DETACH PARTITION child [CONCURRENTLY] [FINALIZE]
+            Token::Ident(s) if s.eq_ignore_ascii_case("detach") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Partition)
+                    && !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("partition"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected PARTITION after DETACH, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let child = self.expect_ident_like()?;
+                let mut concurrently = false;
+                let mut finalize = false;
+                loop {
+                    match self.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("concurrently") =>
+                        {
+                            self.advance();
+                            concurrently = true;
+                        }
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("finalize") =>
+                        {
+                            self.advance();
+                            finalize = true;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(alloc::vec![crate::ast::AlterTableTarget::DetachPartition {
+                    child,
+                    concurrently,
+                    finalize,
+                }])
+            }
             other => Err(self.err(alloc::format!(
-                "expected SET / ADD / DROP / ALTER / RENAME / ENABLE / DISABLE in ALTER TABLE, got {other:?}"
+                "expected SET / ADD / DROP / ALTER / RENAME / ENABLE / DISABLE / ATTACH / DETACH in ALTER TABLE, got {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.37.16 (16.3) — parse the `FOR VALUES …` / `DEFAULT`
+    /// tail used by both CREATE TABLE … PARTITION OF and ALTER
+    /// TABLE … ATTACH PARTITION. Shares the same grammar as
+    /// `parse_partition_of_tail`'s bounds branch.
+    fn parse_partition_bounds_tail(&mut self) -> Result<crate::ast::PartitionOfBoundsAst, ParseError> {
+        use crate::ast::PartitionOfBoundsAst;
+        match self.peek() {
+            Token::Default => {
+                self.advance();
+                Ok(PartitionOfBoundsAst::Default)
+            }
+            Token::For => {
+                self.advance();
+                if !matches!(self.peek(), Token::Values) {
+                    return Err(
+                        self.err(format!("expected VALUES after FOR, got {:?}", self.peek()))
+                    );
+                }
+                self.advance();
+                let want_with = matches!(
+                    self.peek(),
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with")
+                );
+                if want_with {
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after FOR VALUES WITH, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let (mut modulus, mut remainder): (Option<u32>, Option<u32>) = (None, None);
+                    loop {
+                        let key = self.expect_ident_like()?;
+                        let n = match self.peek().clone() {
+                            Token::Integer(v) if v >= 0 && v <= i64::from(u32::MAX) => {
+                                self.advance();
+                                v as u32
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "FOR VALUES WITH: expected unsigned integer literal, got {other:?}"
+                                )));
+                            }
+                        };
+                        match key.to_ascii_uppercase().as_str() {
+                            "MODULUS" => modulus = Some(n),
+                            "REMAINDER" => remainder = Some(n),
+                            other => {
+                                return Err(self.err(format!(
+                                    "FOR VALUES WITH: unknown key {other:?}; \
+                                     expected MODULUS or REMAINDER"
+                                )));
+                            }
+                        }
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                self.advance();
+                                break;
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected ',' or ')' in FOR VALUES WITH list, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    let modulus =
+                        modulus.ok_or_else(|| self.err("FOR VALUES WITH: missing MODULUS".to_string()))?;
+                    let remainder = remainder
+                        .ok_or_else(|| self.err("FOR VALUES WITH: missing REMAINDER".to_string()))?;
+                    if modulus == 0 {
+                        return Err(self.err("FOR VALUES WITH: MODULUS must be > 0".to_string()));
+                    }
+                    if remainder >= modulus {
+                        return Err(self.err(format!(
+                            "FOR VALUES WITH: REMAINDER ({remainder}) must be < MODULUS ({modulus})"
+                        )));
+                    }
+                    return Ok(PartitionOfBoundsAst::Hash { modulus, remainder });
+                }
+                match self.peek() {
+                    Token::From => {
+                        self.advance();
+                        let lower = Box::new(self.parse_partition_bound_expr()?);
+                        if !matches!(self.peek(), Token::To) {
+                            return Err(self.err(format!(
+                                "expected TO after FROM (...), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let upper = Box::new(self.parse_partition_bound_expr()?);
+                        Ok(PartitionOfBoundsAst::Range { lower, upper })
+                    }
+                    Token::In => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::LParen) {
+                            return Err(self.err(format!(
+                                "expected '(' after FOR VALUES IN, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let mut values = Vec::new();
+                        loop {
+                            values.push(self.parse_expr(0)?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.advance();
+                                }
+                                Token::RParen => {
+                                    self.advance();
+                                    break;
+                                }
+                                other => {
+                                    return Err(self.err(format!(
+                                        "expected ',' or ')' in FOR VALUES IN list, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        if values.is_empty() {
+                            return Err(self.err(
+                                "FOR VALUES IN requires at least one literal".to_string(),
+                            ));
+                        }
+                        Ok(PartitionOfBoundsAst::List { values })
+                    }
+                    other => Err(self.err(format!(
+                        "expected FROM / IN / WITH after FOR VALUES, got {other:?}"
+                    ))),
+                }
+            }
+            other => Err(self.err(format!(
+                "expected DEFAULT or FOR VALUES after ATTACH PARTITION child, got {other:?}"
             ))),
         }
     }
