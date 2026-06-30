@@ -96,7 +96,10 @@ impl Engine {
                 .ok_or_else(|| StorageError::TableNotFound {
                     name: tref.name.clone(),
                 })?;
-        let mut rows: Vec<Row<'static>> = table.rows().iter().cloned().collect();
+        // v7.37.15 Phase B — visibility-gated materialise.
+        let snap = self.current_snapshot();
+        let mut rows: Vec<Row<'static>> =
+            table.scan_visible(&snap).map(|(_, r)| r.clone()).collect();
         // v7.35.1 (mailrs prod #6 follow-up) — same fix as the
         // filtered variant: append every cold-tier row (one pass over
         // a unique BTree picks each row exactly once) so non-indexed
@@ -196,7 +199,9 @@ impl Engine {
                 }
             }
             None => {
-                for row in table.rows().iter() {
+                // v7.37.15 Phase B — visibility-gated full scan.
+                let snap = self.current_snapshot();
+                for (_, row) in table.scan_visible(&snap) {
                     push_if(row, &mut out)?;
                 }
                 // v7.35.1 (mailrs prod #6 follow-up) — cold-tier rows
@@ -397,7 +402,9 @@ impl Engine {
                 }
             }
             None => {
-                for (i, row) in table.rows().iter().enumerate() {
+                // v7.37.15 Phase B — visibility-gated predicate scan.
+                let snap = self.current_snapshot();
+                for (i, row) in table.scan_visible(&snap) {
                     if keep(row)? {
                         out.push(i);
                     }

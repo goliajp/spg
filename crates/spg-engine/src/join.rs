@@ -1397,10 +1397,13 @@ impl Engine {
         let lazy_rows: Option<Vec<Row<'static>>> =
             if peer.eager_rows.is_none() && peer.lateral.is_none() {
                 let tname = peer.join_table.as_deref().unwrap_or("");
+                // v7.37.15 Phase B — visibility-gated nested-loop
+                // fallback peer scan.
+                let snap = self.current_snapshot();
                 let mut rows: Vec<Row<'static>> = self
                     .active_catalog()
                     .get(tname)
-                    .map(|t| t.rows().iter().cloned().collect())
+                    .map(|t| t.scan_visible(&snap).map(|(_, r)| r.clone()).collect())
                     .unwrap_or_default();
                 // v7.36 — nested-loop fallback materialises the peer
                 // into `lazy_rows`. Append cold-tier rows so the fall-
@@ -2413,7 +2416,18 @@ impl Engine {
         // shape isn't a match. Hot rows borrow from `PersistentVec`;
         // cold rows are pre-materialised once and yielded in order.
         let primary_cold = self.iter_cold_rows_of_table(primary_table);
-        'scan: for left in primary_table.rows().iter().chain(primary_cold.iter()) {
+        // v7.37.15 Phase B — visibility gate the primary join scan.
+        // The cold tier still iterates directly because cold rows have
+        // no per-row header (they're frozen segments — equivalent to
+        // RowHeader::frozen() for visibility purposes). Phase D wires
+        // per-segment all-visible bitmaps so cold scans skip the
+        // visibility check entirely.
+        let snap = self.current_snapshot();
+        'scan: for left in primary_table
+            .scan_visible(&snap)
+            .map(|(_, r)| r)
+            .chain(primary_cold.iter())
+        {
             cancel.check()?;
             if keep == 0 {
                 break 'scan;
