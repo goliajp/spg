@@ -2652,6 +2652,55 @@ fn v7_37_15_phase_d_vacuum_all_aggregates_per_table() {
     assert_eq!(report.per_table[0].1, 1);
 }
 
+/// v7.37.15 (Phase C+D TDD) — end-to-end MVCC story across
+/// insert / delete / vacuum / snapshot:
+///
+/// 1. A writer at version V inserts a row. A snapshot taken BEFORE
+///    V commits (in_progress includes V) hides the row.
+/// 2. After V commits the row is visible.
+/// 3. A deleter at version W marks the row deleted. A snapshot
+///    taken BEFORE W commits still sees the row; AFTER does not.
+/// 4. Once oldest_active_snapshot exceeds W, vacuum reclaims the
+///    physical storage.
+#[test]
+fn v7_37_15_end_to_end_mvcc_lifecycle() {
+    use crate::snapshot::{InProgressSet, Snapshot};
+    use crate::vacuum::is_reclaimable;
+
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+
+    // Step 1: writer V=10 inserts; concurrent snapshot at version
+    // 15 with V in_progress hides the row.
+    t.insert_with_xmin(make_user_row(42, "alice"), 10).unwrap();
+    let mid_insert = Snapshot::new(15, InProgressSet::from_sorted(alloc::vec![10]), 10, 0);
+    assert!(!t.is_row_visible(0, &mid_insert), "writer in flight ⇒ hidden");
+
+    // Step 2: V committed (in_progress empty) → row visible.
+    let post_insert = Snapshot::new(20, InProgressSet::empty(), 20, 0);
+    assert!(t.is_row_visible(0, &post_insert), "committed insert ⇒ visible");
+
+    // Step 3: deleter W=30 stamps xmax. Snapshot at version 25 (pre-
+    // delete) still sees row.
+    t.mark_row_deleted(0, 30).unwrap();
+    let pre_delete = Snapshot::new(25, InProgressSet::empty(), 25, 0);
+    assert!(t.is_row_visible(0, &pre_delete), "pre-delete snapshot sees row");
+    let post_delete = Snapshot::new(50, InProgressSet::empty(), 30, 0);
+    assert!(!t.is_row_visible(0, &post_delete), "post-delete snapshot hides row");
+
+    // Step 4: vacuum reclaim. Only safe when oldest_active > xmax.
+    // oldest_active=25 → still possibly observable, do NOT reclaim.
+    assert!(!is_reclaimable(30, 25));
+    let dry_at_25 = t.vacuum(25, true);
+    assert_eq!(dry_at_25.rows_reclaimed, 0, "vacuum waits for oldest_active > xmax");
+    // oldest_active=40 → safe (every live snapshot is past 30).
+    assert!(is_reclaimable(30, 40));
+    let real_at_40 = t.vacuum(40, false);
+    assert_eq!(real_at_40.rows_reclaimed, 1);
+    assert_eq!(t.row_count(), 0, "row physically reclaimed by vacuum");
+}
+
 /// Validation guard tests. Each must return `Err` and **not
 /// mutate the catalog** — the API is all-or-nothing.
 #[test]
