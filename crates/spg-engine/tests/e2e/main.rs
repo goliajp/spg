@@ -14,6 +14,7 @@ mod e2e_array_family;
 mod e2e_array_ops;
 mod e2e_as_of_segment;
 mod e2e_audit_n6_remainder;
+mod e2e_autoanalyze_pass;
 mod e2e_bool_agg;
 mod e2e_brin;
 mod e2e_bytea;
