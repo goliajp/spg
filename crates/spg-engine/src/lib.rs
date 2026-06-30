@@ -59,6 +59,7 @@ pub mod memoize;
 mod numeric;
 mod orderby;
 mod partition;
+pub(crate) mod amcheck;
 pub(crate) mod partition_walks;
 pub mod plan_cache;
 mod plpgsql;

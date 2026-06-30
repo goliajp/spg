@@ -155,6 +155,7 @@ mod e2e_partition_by_range;
 mod e2e_partition_explain;
 mod e2e_partition_pruning;
 mod e2e_per_table_budget;
+mod e2e_pg_amcheck;
 mod e2e_pg_array_2d;
 mod e2e_pg_attribute_widened;
 mod e2e_pg_class_widened;
