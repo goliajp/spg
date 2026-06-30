@@ -193,6 +193,55 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.24 (24.2) — synthesise `information_schema.domains`.
+/// One row per DOMAIN type. PG-targeting tools (Liquibase /
+/// Alembic migrations) query this surface to round-trip DOMAIN
+/// declarations across the dump/restore cycle.
+///
+/// PG-canonical columns (SQL-standard):
+///   * domain_catalog / domain_schema / domain_name
+///   * data_type — PG-canonical type name of the base
+///   * udt_catalog / udt_schema / udt_name — underlying type
+///   * domain_default — DEFAULT expression text (NULL if none)
+///   * is_nullable — 'YES' / 'NO'
+pub(crate) fn synth_information_schema_domains(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("domain_catalog", DataType::Text, false),
+        ColumnSchema::new("domain_schema", DataType::Text, false),
+        ColumnSchema::new("domain_name", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("udt_catalog", DataType::Text, false),
+        ColumnSchema::new("udt_schema", DataType::Text, false),
+        ColumnSchema::new("udt_name", DataType::Text, false),
+        ColumnSchema::new("domain_default", DataType::Text, true),
+        ColumnSchema::new("is_nullable", DataType::Text, false),
+    ];
+    let rows: Vec<Row<'static>> = cat
+        .domain_types()
+        .iter()
+        .map(|(_name, def)| {
+            let base_name = pg_data_type_text(def.base_type);
+            Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(def.name.clone()),
+                Value::text(base_name.clone()),
+                Value::text("spg"),
+                Value::text("pg_catalog"),
+                Value::text(base_name),
+                def.default
+                    .as_ref()
+                    .map(|s| Value::text(s.clone()))
+                    .unwrap_or(Value::Null),
+                Value::text(if def.nullable { "YES" } else { "NO" }),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 /// v7.37.24 (24.1) — synthesise `pg_catalog.pg_enum`. One row
 /// per (enum_type, label) pair. Tools targeting PG (sqlx ENUM
 /// codec, ORM enum mappers, pg_dump's `--enum-by-label` query)
