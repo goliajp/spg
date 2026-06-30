@@ -619,7 +619,9 @@ impl Engine {
                     Value::Float(max_ms),
                     Value::Float(mean_ms),
                     Value::Float(0.0),     // stddev_exec_time
-                    Value::BigInt(0),      // rows (per-call tracking pending)
+                    // v7.37.22 (22.9) — total rows produced /
+                    // affected, mapped from query_stats.total_rows.
+                    Value::BigInt(i64::try_from(s.total_rows).unwrap_or(i64::MAX)),
                     // 8 shared_blks_*, 4 local_blks_*, 2 temp_blks_*
                     Value::BigInt(0),
                     Value::BigInt(0),

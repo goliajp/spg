@@ -85,6 +85,57 @@ fn tick_clock() -> i64 {
 }
 
 #[test]
+fn pg_stat_statements_rows_column_tracks_row_count() {
+    // v7.37.22 (22.9) — the `rows` column accumulates rows
+    // returned (SELECT) or affected (INSERT/UPDATE/DELETE)
+    // across every execution of the normalised template.
+    use spg_engine::Engine;
+    let mut e = Engine::new().with_clock(tick_clock);
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1)").unwrap(); // 1 affected
+    e.execute("INSERT INTO t VALUES (2)").unwrap(); // 1 affected
+    e.execute("INSERT INTO t VALUES (3)").unwrap(); // 1 affected
+    e.execute("SELECT * FROM t").unwrap();          // 3 returned
+    let r = e.execute("SELECT * FROM pg_stat_statements").unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    // Position 17 = rows.
+    // INSERT template (`insert into t values ($1)`): 3 calls × 1 row = 3.
+    let insert_row = rows
+        .iter()
+        .find(|r| {
+            if let Value::Text(s) = &r.values[4] {
+                s.starts_with("insert into t values")
+            } else {
+                false
+            }
+        })
+        .expect("insert template");
+    assert!(
+        matches!(insert_row.values[17], Value::BigInt(3)),
+        "insert rows expected 3, got {:?}",
+        insert_row.values[17]
+    );
+    // SELECT template (`select * from t`): 1 call × 3 rows = 3.
+    let select_row = rows
+        .iter()
+        .find(|r| {
+            if let Value::Text(s) = &r.values[4] {
+                s.starts_with("select * from t")
+            } else {
+                false
+            }
+        })
+        .expect("select template");
+    assert!(
+        matches!(select_row.values[17], Value::BigInt(3)),
+        "select rows expected 3, got {:?}",
+        select_row.values[17]
+    );
+}
+
+#[test]
 fn pg_stat_statements_rows_get_populated_after_select() {
     let mut e = Engine::new().with_clock(tick_clock);
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
