@@ -281,14 +281,32 @@ fn main() {
         // chunk whose filename prefix (unix_us) is older than
         // `now - N hours`, plus the matching <chunk>.checksum.
         // Reports how many chunks were kept / removed.
+        //
+        // v7.37.21 (21.17) — three retention dimensions. A chunk is
+        // dropped only when it fails EVERY enabled dimension; any
+        // single dimension keeping it wins:
+        //   --retention-hours <N>   keep chunks newer than N hours
+        //   --retention-bytes <N>   keep newest chunks totalling ≤ N bytes
+        //   --retention-count <N>   keep newest N chunks
+        // At least one dimension is required; pass two or three to OR
+        // them. Bytes accepts a plain integer (raw bytes); operator
+        // shorthand `K` / `M` / `G` parses too.
         Some("prune-pitr") => {
             let mut dir: Option<String> = None;
             let mut retention_hours: Option<u64> = None;
+            let mut retention_bytes: Option<u64> = None;
+            let mut retention_count: Option<u64> = None;
             while let Some(a) = args.next() {
                 match a.as_str() {
                     "--dir" => dir = args.next(),
                     "--retention-hours" => {
                         retention_hours = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    "--retention-bytes" => {
+                        retention_bytes = args.next().and_then(|s| parse_size_arg(&s));
+                    }
+                    "--retention-count" => {
+                        retention_count = args.next().and_then(|s| s.parse::<u64>().ok());
                     }
                     other => {
                         die(&format!("unknown prune-pitr arg: {other}"), 2);
@@ -296,14 +314,26 @@ fn main() {
                     }
                 }
             }
-            let (Some(dir), Some(retention_hours)) = (dir, retention_hours) else {
+            let Some(dir) = dir else {
                 die(
-                    "usage: spg prune-pitr --dir <backup_dir> --retention-hours <N>",
+                    "usage: spg prune-pitr --dir <backup_dir> --retention-hours <N> \
+                     [--retention-bytes <N|NK|NM|NG>] [--retention-count <N>]",
                     2,
                 );
                 return;
             };
-            match prune_pitr(&dir, retention_hours) {
+            if retention_hours.is_none()
+                && retention_bytes.is_none()
+                && retention_count.is_none()
+            {
+                die(
+                    "prune-pitr: at least one of --retention-hours / --retention-bytes / \
+                     --retention-count is required",
+                    2,
+                );
+                return;
+            }
+            match prune_pitr(&dir, retention_hours, retention_bytes, retention_count) {
                 Ok(report) => println!("{report}"),
                 Err(e) => die(&format!("prune-pitr failed: {e}"), 1),
             }
@@ -1022,12 +1052,50 @@ impl ArchiveStatus {
     }
 }
 
+/// v7.37.21 (21.17) — parse a `--retention-bytes` argument.
+/// Accepts plain integers (raw bytes) and `N{K|M|G}` shorthand
+/// (binary multipliers — 1K = 1024). Returns None on parse error.
+fn parse_size_arg(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let (num_part, mult): (&str, u64) = if let Some(rest) = s.strip_suffix(['G', 'g']) {
+        (rest, 1024 * 1024 * 1024)
+    } else if let Some(rest) = s.strip_suffix(['M', 'm']) {
+        (rest, 1024 * 1024)
+    } else if let Some(rest) = s.strip_suffix(['K', 'k']) {
+        (rest, 1024)
+    } else {
+        return None;
+    };
+    num_part
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+}
+
 /// v7.18 PITR P6 — delete WAL chunks older than the retention
 /// window. Walks `<dir>/wal/`, parses the unix_us prefix off each
 /// `<unix_us>_<max_lsn>.wal`, removes the chunk + its
-/// `<chunk>.checksum` sibling when `prefix_us / 1_000_000 +
-/// retention_hours * 3600 < now`. Returns a summary line.
-fn prune_pitr(dir: &str, retention_hours: u64) -> Result<String, String> {
+/// `<chunk>.checksum` sibling when EVERY enabled retention dimension
+/// says the chunk is expired. Returns a summary line.
+///
+/// v7.37.21 (21.17) — three dimensions ORed: a chunk is kept when
+/// ANY enabled dimension would retain it.
+///   - time:  `prefix_s ≥ now_s - retention_hours * 3600`
+///   - bytes: chunk fits within the newest-first running total
+///            ≤ retention_bytes
+///   - count: chunk is among the newest `retention_count` chunks
+/// Dimensions with `None` argument never reject (effectively
+/// retention=∞ for that dimension).
+fn prune_pitr(
+    dir: &str,
+    retention_hours: Option<u64>,
+    retention_bytes: Option<u64>,
+    retention_count: Option<u64>,
+) -> Result<String, String> {
     let wal_dir = std::path::PathBuf::from(dir).join("wal");
     if !wal_dir.exists() {
         return Ok(format!(
@@ -1038,9 +1106,16 @@ fn prune_pitr(dir: &str, retention_hours: u64) -> Result<String, String> {
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let cutoff_s = now_s.saturating_sub(retention_hours * 3_600);
-    let mut kept = 0u64;
-    let mut removed = 0u64;
+    let time_cutoff_s = retention_hours.map(|h| now_s.saturating_sub(h * 3_600));
+
+    // Collect every chunk with its (prefix_s, size). Sort newest
+    // first so the bytes + count dimensions walk in cut-off order.
+    struct ChunkEntry {
+        path: std::path::PathBuf,
+        prefix_s: u64,
+        size: u64,
+    }
+    let mut chunks: Vec<ChunkEntry> = Vec::new();
     for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read wal dir: {e}"))? {
         let entry = entry.map_err(|e| format!("read entry: {e}"))?;
         let path = entry.path();
@@ -1056,29 +1131,58 @@ fn prune_pitr(dir: &str, retention_hours: u64) -> Result<String, String> {
             .and_then(|(prefix, _)| prefix.parse().ok())
             .unwrap_or(0);
         let prefix_s = (prefix_us / 1_000_000) as u64;
-        if prefix_s < cutoff_s {
-            // Drop the chunk + its checksum sidecar.
-            fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
-            let cs = {
-                let mut p = path.clone();
-                let mut name = p
-                    .file_name()
-                    .map(std::ffi::OsStr::to_os_string)
-                    .unwrap_or_default();
-                name.push(".checksum");
-                p.set_file_name(name);
-                p
-            };
-            if cs.exists() {
-                fs::remove_file(&cs).map_err(|e| format!("remove {}: {e}", cs.display()))?;
+        let size = fs::metadata(&path).map_or(0, |m| m.len());
+        chunks.push(ChunkEntry { path, prefix_s, size });
+    }
+    chunks.sort_by(|a, b| b.prefix_s.cmp(&a.prefix_s)); // newest first
+
+    let mut running_bytes: u64 = 0;
+    let mut kept = 0u64;
+    let mut removed = 0u64;
+    for (idx, c) in chunks.iter().enumerate() {
+        let keep_by_time = match time_cutoff_s {
+            Some(cutoff) => c.prefix_s >= cutoff,
+            None => false, // dimension disabled — doesn't vote
+        };
+        let keep_by_bytes = match retention_bytes {
+            Some(budget) => {
+                let after = running_bytes.saturating_add(c.size);
+                if after <= budget {
+                    true
+                } else {
+                    false
+                }
             }
-            removed += 1;
-        } else {
+            None => false,
+        };
+        let keep_by_count = match retention_count {
+            Some(n) => (idx as u64) < n,
+            None => false,
+        };
+        if keep_by_time || keep_by_bytes || keep_by_count {
+            running_bytes = running_bytes.saturating_add(c.size);
             kept += 1;
+            continue;
         }
+        fs::remove_file(&c.path).map_err(|e| format!("remove {}: {e}", c.path.display()))?;
+        let cs = {
+            let mut p = c.path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".checksum");
+            p.set_file_name(name);
+            p
+        };
+        if cs.exists() {
+            fs::remove_file(&cs).map_err(|e| format!("remove {}: {e}", cs.display()))?;
+        }
+        removed += 1;
     }
     Ok(format!(
-        "OK retention_hours={retention_hours} kept={kept} removed={removed}"
+        "OK retention_hours={retention_hours:?} retention_bytes={retention_bytes:?} \
+         retention_count={retention_count:?} kept={kept} removed={removed}"
     ))
 }
 
@@ -2185,7 +2289,7 @@ mod tests {
         fs::write(&old_cs, b"abc\n").unwrap();
         fs::write(&recent_chunk, b"recent").unwrap();
 
-        let summary = prune_pitr(backup_dir.to_str().unwrap(), 1).unwrap();
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), Some(1), None, None).unwrap();
         assert!(summary.contains("removed=1"), "summary: {summary}");
         assert!(summary.contains("kept=1"), "summary: {summary}");
         assert!(!old_chunk.exists(), "old chunk should have been removed");
@@ -2200,8 +2304,103 @@ mod tests {
         let backup_dir = tmp_path("prune-empty");
         // backup_dir doesn't exist at all — prune should treat as
         // a noop, not error.
-        let summary = prune_pitr(backup_dir.to_str().unwrap(), 24).unwrap();
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), Some(24), None, None).unwrap();
         assert!(summary.contains("nothing to prune"), "summary: {summary}");
+    }
+
+    /// v7.37.21 (21.17) — count-only retention keeps the newest N.
+    #[test]
+    fn prune_pitr_retention_count_keeps_newest_n() {
+        let backup_dir = tmp_path("prune-count");
+        let wal_dir = backup_dir.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        for i in 0..5u128 {
+            // i = 0 oldest, i = 4 newest
+            let prefix = now_us.saturating_sub((5 - i) * 60 * 1_000_000);
+            let chunk = wal_dir.join(format!("{prefix}_{i}.wal"));
+            fs::write(&chunk, b"data").unwrap();
+        }
+
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), None, None, Some(2)).unwrap();
+        assert!(summary.contains("removed=3"), "summary: {summary}");
+        assert!(summary.contains("kept=2"), "summary: {summary}");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    /// v7.37.21 (21.17) — bytes-only retention keeps the newest set
+    /// whose cumulative size fits the budget.
+    #[test]
+    fn prune_pitr_retention_bytes_keeps_under_budget() {
+        let backup_dir = tmp_path("prune-bytes");
+        let wal_dir = backup_dir.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        // 3 chunks @ 1024 bytes each, oldest → newest.
+        for i in 0..3u128 {
+            let prefix = now_us.saturating_sub((3 - i) * 60 * 1_000_000);
+            let chunk = wal_dir.join(format!("{prefix}_{i}.wal"));
+            fs::write(&chunk, vec![0u8; 1024]).unwrap();
+        }
+
+        // Budget = 2048 → newest 2 fit; oldest gets dropped.
+        let summary = prune_pitr(
+            backup_dir.to_str().unwrap(),
+            None,
+            Some(2048),
+            None,
+        )
+        .unwrap();
+        assert!(summary.contains("removed=1"), "summary: {summary}");
+        assert!(summary.contains("kept=2"), "summary: {summary}");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    /// v7.37.21 (21.17) — dimensions OR: a chunk a time dimension
+    /// would drop is kept when the count dimension still wants it.
+    #[test]
+    fn prune_pitr_dimensions_or_together() {
+        let backup_dir = tmp_path("prune-or");
+        let wal_dir = backup_dir.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        // Two ancient chunks. retention_hours=1 would drop both;
+        // retention_count=1 keeps the newest. Union → kept=1.
+        for i in 0..2u128 {
+            let prefix = now_us.saturating_sub((10 - i) * 3_600 * 1_000_000);
+            let chunk = wal_dir.join(format!("{prefix}_{i}.wal"));
+            fs::write(&chunk, b"x").unwrap();
+        }
+
+        let summary = prune_pitr(
+            backup_dir.to_str().unwrap(),
+            Some(1),
+            None,
+            Some(1),
+        )
+        .unwrap();
+        assert!(summary.contains("kept=1"), "summary: {summary}");
+        assert!(summary.contains("removed=1"), "summary: {summary}");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn parse_size_arg_handles_kmg_suffix() {
+        assert_eq!(parse_size_arg("1024"), Some(1024));
+        assert_eq!(parse_size_arg("1K"), Some(1024));
+        assert_eq!(parse_size_arg("2M"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_arg("3G"), Some(3 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_arg("1k"), Some(1024));
+        assert_eq!(parse_size_arg("nope"), None);
     }
 
     // NOTE: archive_chunk end-to-end (SPG_PITR_ARCHIVE_CMD set /
