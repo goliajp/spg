@@ -4568,15 +4568,8 @@ impl Parser {
                                     self.tokens.get(self.pos + 2),
                                     Some(Token::Ident(f)) if f.eq_ignore_ascii_case("nextval")
                                 );
-                        // Capture the nextval target so the engine
-                        // can guarantee the sequence exists.
-                        let seq_name = if is_default_nextval {
-                            self.scan_sequence_name_until_boundary()
-                        } else {
-                            self.consume_until_statement_boundary();
-                            None
-                        };
                         if is_default_nextval {
+                            let seq_name = self.scan_sequence_name_until_boundary();
                             return Ok(alloc::vec![
                                 crate::ast::AlterTableTarget::SetColumnAutoIncrement {
                                     column: col_name,
@@ -4584,26 +4577,52 @@ impl Parser {
                                 }
                             ]);
                         }
-                        // Other SET DEFAULT … / SET NOT NULL forms
-                        // stay engine no-ops (real defaults arrive
-                        // inline in CREATE TABLE in every dump;
-                        // nullability change would need a row scan
-                        // — deferred).
-                        return Ok(Vec::new());
+                        // v7.37.18 (18.1 + 18.2) — proper lowering.
+                        self.advance(); // consume "set"
+                        match self.peek().clone() {
+                            Token::Default => {
+                                self.advance();
+                                let default_expr = self.parse_expr(0)?;
+                                return Ok(alloc::vec![
+                                    crate::ast::AlterTableTarget::AlterColumnSetDefault {
+                                        column: col_name,
+                                        default_expr,
+                                    }
+                                ]);
+                            }
+                            Token::Not => {
+                                self.advance();
+                                if !matches!(self.peek(), Token::Null) {
+                                    return Err(self.err(alloc::format!(
+                                        "expected NULL after ALTER COLUMN SET NOT, got {:?}",
+                                        self.peek()
+                                    )));
+                                }
+                                self.advance();
+                                return Ok(alloc::vec![
+                                    crate::ast::AlterTableTarget::AlterColumnSetNotNull {
+                                        column: col_name,
+                                    }
+                                ]);
+                            }
+                            other => {
+                                // Other SET subjects (STATISTICS,
+                                // STORAGE, COMPRESSION, …) currently
+                                // stay no-ops — they'll surface in
+                                // their own 18.x sub-items.
+                                let _ = other;
+                                self.consume_until_statement_boundary();
+                                return Ok(Vec::new());
+                            }
+                        }
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("drop") => {
-                        // ALTER COLUMN col DROP DEFAULT / DROP NOT NULL.
-                        self.consume_until_statement_boundary();
-                        return Ok(Vec::new());
+                        self.advance(); // consume "drop"
+                        return self.parse_alter_column_drop_tail(col_name);
                     }
                     Token::Drop => {
-                        // v7.37.43-T4 — same path as the Ident("drop")
-                        // arm above. `DROP` is unreserved per PG; the
-                        // lexer emits `Token::Drop` so the publication-
-                        // DROP path can dispatch on it, but ALTER COLUMN
-                        // DROP DEFAULT / DROP NOT NULL must also work.
-                        self.consume_until_statement_boundary();
-                        return Ok(Vec::new());
+                        self.advance(); // consume Drop token
+                        return self.parse_alter_column_drop_tail(col_name);
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                         // v7.22 (round-13 T2) — `ALTER COLUMN c ADD
@@ -4805,6 +4824,42 @@ impl Parser {
     /// tail used by both CREATE TABLE … PARTITION OF and ALTER
     /// TABLE … ATTACH PARTITION. Shares the same grammar as
     /// `parse_partition_of_tail`'s bounds branch.
+    /// v7.37.18 (18.1 + 18.2) — parse the tail of `ALTER COLUMN
+    /// col DROP …`. Accepts `DROP DEFAULT` and `DROP NOT NULL`,
+    /// lowering each to the respective AlterTableTarget. Any
+    /// other DROP subject (IDENTITY, EXPRESSION, etc.) stays a
+    /// no-op via consume_until_statement_boundary.
+    fn parse_alter_column_drop_tail(
+        &mut self,
+        col_name: String,
+    ) -> Result<Vec<crate::ast::AlterTableTarget>, ParseError> {
+        match self.peek().clone() {
+            Token::Default => {
+                self.advance();
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::AlterColumnDropDefault { column: col_name }
+                ])
+            }
+            Token::Not => {
+                self.advance();
+                if !matches!(self.peek(), Token::Null) {
+                    return Err(self.err(alloc::format!(
+                        "expected NULL after ALTER COLUMN DROP NOT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::AlterColumnDropNotNull { column: col_name }
+                ])
+            }
+            _ => {
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+        }
+    }
+
     fn parse_partition_bounds_tail(&mut self) -> Result<crate::ast::PartitionOfBoundsAst, ParseError> {
         use crate::ast::PartitionOfBoundsAst;
         match self.peek() {

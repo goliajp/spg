@@ -757,6 +757,23 @@ pub enum AlterTableTarget {
         concurrently: bool,
         finalize: bool,
     },
+    /// v7.37.18 (18.1) — `ALTER TABLE … ALTER COLUMN col SET DEFAULT
+    /// <expr>`. Engine re-parses + freezes the literal at this point,
+    /// matching CREATE TABLE-side default semantics. Volatile shapes
+    /// (`now()` / `nextval`) take the runtime-default path.
+    AlterColumnSetDefault {
+        column: String,
+        default_expr: Expr,
+    },
+    /// v7.37.18 (18.1) — `ALTER TABLE … ALTER COLUMN col DROP DEFAULT`.
+    AlterColumnDropDefault { column: String },
+    /// v7.37.18 (18.2) — `ALTER TABLE … ALTER COLUMN col SET NOT NULL`.
+    /// Engine validates that no existing row has NULL in that column
+    /// before flipping the flag (PG semantics — partial NOT NULL
+    /// would surface inconsistently).
+    AlterColumnSetNotNull { column: String },
+    /// v7.37.18 (18.2) — `ALTER TABLE … ALTER COLUMN col DROP NOT NULL`.
+    AlterColumnDropNotNull { column: String },
 }
 
 /// v7.16.1 — target of `ALTER TABLE … { ENABLE | DISABLE }
@@ -3884,6 +3901,24 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 f.write_str(" FINALIZE")?;
             }
             Ok(())
+        }
+        AlterTableTarget::AlterColumnSetDefault {
+            column,
+            default_expr,
+        } => write!(
+            f,
+            "ALTER COLUMN {} SET DEFAULT {}",
+            quote_ident(column),
+            default_expr
+        ),
+        AlterTableTarget::AlterColumnDropDefault { column } => {
+            write!(f, "ALTER COLUMN {} DROP DEFAULT", quote_ident(column))
+        }
+        AlterTableTarget::AlterColumnSetNotNull { column } => {
+            write!(f, "ALTER COLUMN {} SET NOT NULL", quote_ident(column))
+        }
+        AlterTableTarget::AlterColumnDropNotNull { column } => {
+            write!(f, "ALTER COLUMN {} DROP NOT NULL", quote_ident(column))
         }
     }
 }

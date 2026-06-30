@@ -90,7 +90,144 @@ impl Engine {
                 concurrently,
                 finalize,
             } => self.alter_detach_partition(tbl, child, concurrently, finalize),
+            T::AlterColumnSetDefault {
+                column,
+                default_expr,
+            } => self.alter_column_set_default(tbl, column, default_expr),
+            T::AlterColumnDropDefault { column } => {
+                self.alter_column_drop_default(tbl, column)
+            }
+            T::AlterColumnSetNotNull { column } => {
+                self.alter_column_set_not_null(tbl, column)
+            }
+            T::AlterColumnDropNotNull { column } => {
+                self.alter_column_drop_not_null(tbl, column)
+            }
         }
+    }
+
+    /// v7.37.18 (18.1) — set / drop column default.
+    fn alter_column_set_default(
+        &mut self,
+        tbl: &str,
+        column: String,
+        default_expr: spg_sql::ast::Expr,
+    ) -> Result<(), EngineError> {
+        // Volatile defaults (now(), nextval(), …) go through the
+        // runtime_default path; literal defaults freeze into `default`.
+        let display = alloc::format!("{}", default_expr);
+        let is_runtime = matches!(default_expr, spg_sql::ast::Expr::FunctionCall { .. });
+        let literal_value = if is_runtime {
+            None
+        } else {
+            crate::conversions::literal_expr_to_value(default_expr.clone()).ok()
+        };
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN SET DEFAULT: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        let col = &mut table.schema_mut().columns[pos];
+        if is_runtime {
+            col.runtime_default = Some(display);
+            col.default = None;
+        } else if let Some(v) = literal_value {
+            col.default = Some(v);
+            col.runtime_default = None;
+        } else {
+            // Could not evaluate; fall back to runtime path.
+            col.runtime_default = Some(display);
+            col.default = None;
+        }
+        Ok(())
+    }
+
+    fn alter_column_drop_default(
+        &mut self,
+        tbl: &str,
+        column: String,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN DROP DEFAULT: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        let col = &mut table.schema_mut().columns[pos];
+        col.default = None;
+        col.runtime_default = None;
+        Ok(())
+    }
+
+    /// v7.37.18 (18.2) — set / drop column NOT NULL flag.
+    fn alter_column_set_not_null(
+        &mut self,
+        tbl: &str,
+        column: String,
+    ) -> Result<(), EngineError> {
+        // Validate no existing row holds NULL in this column
+        // before flipping the flag. PG raises on first NULL hit.
+        let table = self.active_catalog().get(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN SET NOT NULL: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        for row in table.rows().iter() {
+            if matches!(row.values.get(pos), Some(spg_storage::Value::Null)) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN SET NOT NULL: column {column:?} contains NULL values; \
+                     run UPDATE to fill them in or drop the column first"
+                )));
+            }
+        }
+        let table = self.active_catalog_mut().get_mut(tbl).expect("checked above");
+        table.schema_mut().columns[pos].nullable = false;
+        Ok(())
+    }
+
+    fn alter_column_drop_not_null(
+        &mut self,
+        tbl: &str,
+        column: String,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN DROP NOT NULL: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        table.schema_mut().columns[pos].nullable = true;
+        Ok(())
     }
 
     /// v7.37.16 (16.3) — `ALTER TABLE parent ATTACH PARTITION child <bounds>`.
