@@ -44,6 +44,94 @@ impl Table {
         &mut self.headers
     }
 
+    /// v7.37.15 (Phase C) — engine writer path. Same as [`insert`]
+    /// but stamps `xmin` on the new row's header with the writing
+    /// transaction's id (caller-supplied; obtained from the engine's
+    /// monotonic version counter). The fresh insert is alive
+    /// (`xmax = XMAX_ALIVE`); a later UPDATE / DELETE will set
+    /// `xmax` to a later version, leaving the row physically
+    /// present until vacuum reclaims it (Phase D).
+    ///
+    /// Callers in [`crate::row_header::next_version`] order:
+    ///   1. allocate version V via `next_version()`
+    ///   2. call `insert_with_xmin(row, V)`
+    ///   3. update any indexes (as `insert` does)
+    ///
+    /// `xmin = XMIN_FROZEN` short-circuits to plain `insert`
+    /// behaviour so the legacy in-memory / WAL-replay paths keep
+    /// returning identical results when they end up here.
+    pub fn insert_with_xmin(
+        &mut self,
+        row: Row<'static>,
+        xmin: u64,
+    ) -> Result<(), StorageError> {
+        if xmin == crate::row_header::XMIN_FROZEN {
+            return self.insert(row);
+        }
+        self.insert(row)?;
+        // Insert appended `RowHeader::frozen()`; overwrite with the
+        // alive-xmin header so visibility scans against snapshots
+        // taken before the writer's commit hide this row. Subsequent
+        // commit is recorded by the WAL; replay re-applies via the
+        // plain `insert_no_index` path and stamps frozen — but a
+        // snapshot taken AFTER commit sees `xmin = V <= snapshot.version`
+        // and the in_progress bitset no longer contains V, so the
+        // row passes the visibility predicate identically.
+        let last = self
+            .headers
+            .len()
+            .checked_sub(1)
+            .expect("insert appended a header");
+        if let Some(new_headers) = self
+            .headers
+            .set(last, crate::row_header::RowHeader::alive(xmin))
+        {
+            self.headers = new_headers;
+        }
+        debug_assert_eq!(
+            self.rows.len(),
+            self.headers.len(),
+            "headers must stay in lock-step with rows after insert_with_xmin"
+        );
+        Ok(())
+    }
+
+    /// v7.37.15 (Phase C) — mark the row at `position` as deleted
+    /// by version `xmax`. The row stays physically present; later
+    /// vacuum (Phase D) reclaims it once no live snapshot can
+    /// still see it.
+    ///
+    /// Returns `Err(Corrupt)` on out-of-bounds and silently no-ops
+    /// when the row is already tombstoned (a later DELETE on an
+    /// already-deleted row should not change xmax — the original
+    /// deletion wins).
+    pub fn mark_row_deleted(
+        &mut self,
+        position: usize,
+        xmax: u64,
+    ) -> Result<(), StorageError> {
+        if position >= self.headers.len() {
+            return Err(StorageError::Corrupt(alloc::format!(
+                "mark_row_deleted: position {position} out of bounds (headers={})",
+                self.headers.len()
+            )));
+        }
+        let mut h = *self
+            .headers
+            .get(position)
+            .expect("position bounds-checked");
+        if h.xmax != crate::row_header::XMAX_ALIVE {
+            // Already tombstoned by an earlier delete. Keep the
+            // original xmax — first-deleter-wins.
+            return Ok(());
+        }
+        h.xmax = xmax;
+        if let Some(new_headers) = self.headers.set(position, h) {
+            self.headers = new_headers;
+        }
+        Ok(())
+    }
+
     /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
     /// this table (engine call before a mutating statement when
     /// persistence is on). Idempotent; existing captured changes are kept.

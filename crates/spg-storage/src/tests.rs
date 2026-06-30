@@ -2476,6 +2476,112 @@ fn v7_37_15_phase_b_scan_visible_filters_correctly() {
     );
 }
 
+/// v7.37.15 (Phase C TDD) — `insert_with_xmin` stamps the new
+/// row's header with the writing tx's version. A snapshot taken
+/// BEFORE that version was committed (i.e. with the writer's tx
+/// in `in_progress`) does not see the row; a snapshot taken
+/// AFTER does.
+#[test]
+fn v7_37_15_phase_c_insert_with_xmin_stamps_header() {
+    use crate::snapshot::{InProgressSet, Snapshot};
+
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    // Writer tx allocates version 17.
+    t.insert_with_xmin(make_user_row(7, "alice"), 17).unwrap();
+    let header = t.headers().get(0).expect("header exists");
+    assert_eq!(header.xmin, 17, "header xmin = writer's tx version");
+    assert_eq!(header.xmax, crate::row_header::XMAX_ALIVE);
+
+    // Snapshot taken WHILE tx 17 is still in-flight: row hidden.
+    let before = Snapshot::new(
+        20,                                                     // version
+        InProgressSet::from_sorted(alloc::vec![17]),            // tx 17 in flight
+        10,                                                     // oldest_active
+        0,                                                       // reader
+    );
+    assert!(!t.is_row_visible(0, &before), "row hidden while writer in-flight");
+
+    // Snapshot taken AFTER tx 17 commits: row visible.
+    let after = Snapshot::new(
+        20,
+        InProgressSet::empty(),
+        20,
+        0,
+    );
+    assert!(t.is_row_visible(0, &after), "row visible after writer commits");
+}
+
+/// v7.37.15 (Phase C TDD) — `mark_row_deleted` stamps `xmax`
+/// without removing the row physically. A snapshot taken BEFORE
+/// the delete commits still sees the row; AFTER does not.
+#[test]
+fn v7_37_15_phase_c_mark_row_deleted_writes_xmax() {
+    use crate::snapshot::{InProgressSet, Snapshot};
+
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    t.insert_with_xmin(make_user_row(7, "alice"), 17).unwrap();
+    // Delete-tx allocates version 25.
+    t.mark_row_deleted(0, 25).unwrap();
+    let h = t.headers().get(0).expect("header exists");
+    assert_eq!(h.xmin, 17);
+    assert_eq!(h.xmax, 25, "xmax = deleter's version");
+    // Row is still physically present; vacuum (Phase D) reclaims later.
+    assert_eq!(t.row_count(), 1);
+
+    // Snapshot taken BEFORE tx 25 commits sees the row.
+    let before = Snapshot::new(
+        30,
+        InProgressSet::from_sorted(alloc::vec![25]),
+        17,
+        0,
+    );
+    assert!(t.is_row_visible(0, &before), "row visible while deleter in-flight");
+
+    // Snapshot taken AFTER tx 25 commits doesn't see it.
+    let after = Snapshot::new(
+        30,
+        InProgressSet::empty(),
+        30,
+        0,
+    );
+    assert!(!t.is_row_visible(0, &after), "row hidden after deleter commits");
+}
+
+/// v7.37.15 (Phase C TDD) — re-deleting an already-tombstoned
+/// row does not overwrite the original `xmax`. First-deleter-wins.
+#[test]
+fn v7_37_15_phase_c_repeated_delete_preserves_original_xmax() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    t.insert_with_xmin(make_user_row(7, "alice"), 17).unwrap();
+    t.mark_row_deleted(0, 25).unwrap();
+    t.mark_row_deleted(0, 100).unwrap(); // attempted overwrite
+    let h = t.headers().get(0).expect("header exists");
+    assert_eq!(h.xmax, 25, "original xmax preserved; first-deleter-wins");
+}
+
+/// v7.37.15 (Phase C TDD) — `insert_with_xmin(row, XMIN_FROZEN)`
+/// short-circuits to the legacy frozen-insert path for backwards
+/// compatibility with WAL replay / in-memory tests.
+#[test]
+fn v7_37_15_phase_c_frozen_xmin_short_circuits_to_legacy_insert() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    t.insert_with_xmin(make_user_row(7, "alice"), crate::row_header::XMIN_FROZEN)
+        .unwrap();
+    let h = t.headers().get(0).expect("header exists");
+    assert!(
+        h.is_all_visible_fast(),
+        "frozen-xmin call must produce a frozen-fast header"
+    );
+}
+
 /// Validation guard tests. Each must return `Err` and **not
 /// mutate the catalog** — the API is all-or-nothing.
 #[test]
