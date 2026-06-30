@@ -620,7 +620,7 @@ fn effective_frame(
             // arithmetic on the ORDER BY key (e.g. `RANGE BETWEEN
             // INTERVAL '1 day' PRECEDING AND CURRENT ROW`). Not
             // implemented in v4.20.
-            if fr.kind == FrameKind::Range
+            if matches!(fr.kind, FrameKind::Range | FrameKind::Groups)
                 && (matches!(
                     fr.start,
                     FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
@@ -630,7 +630,7 @@ fn effective_frame(
                 ))
             {
                 return Err(EngineError::Unsupported(
-                    "RANGE with explicit offset bounds is not supported (v4.20: only UNBOUNDED / CURRENT ROW for RANGE)".into(),
+                    "RANGE / GROUPS with explicit offset bounds is not supported (v7.37.19: only UNBOUNDED / CURRENT ROW for peer-aware frames)".into(),
                 ));
             }
             Ok((fr.kind, fr.start.clone(), end))
@@ -680,23 +680,28 @@ fn frame_bounds_for_row(
             };
             (lo, hi)
         }
-        FrameKind::Range => {
+        FrameKind::Range | FrameKind::Groups => {
             // RANGE bounds are peer-aware. With only UNBOUNDED and
             // CURRENT ROW supported (rejected at effective_frame for
             // explicit offsets), the start/end map to the
             // partition's full extent at the same-order-key peer
             // group boundary.
+            //
+            // v7.37.19 (19.11) — GROUPS with UNBOUNDED / CURRENT ROW
+            // bounds behaves identically to RANGE. Integer-offset
+            // GROUPS (PG 11+ `GROUPS N PRECEDING`) is rejected at
+            // effective_frame the same way RANGE offsets are.
             let lo = match start {
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::CurrentRow => peer_group_start(slice, i),
                 FrameBound::UnboundedFollowing => last,
-                _ => unreachable!("offset bounds rejected for RANGE"),
+                _ => unreachable!("offset bounds rejected for RANGE/GROUPS"),
             };
             let hi = match end {
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::CurrentRow => peer_group_end(slice, i),
                 FrameBound::UnboundedFollowing => last,
-                _ => unreachable!("offset bounds rejected for RANGE"),
+                _ => unreachable!("offset bounds rejected for RANGE/GROUPS"),
             };
             (lo, hi)
         }
