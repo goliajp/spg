@@ -25,6 +25,38 @@ fn plan_text(e: &mut Engine, sql: &str) -> String {
 }
 
 #[test]
+fn explain_buffers_includes_cache_hit_ratio() {
+    // v7.37.19 (19.23 [PG+]) — BUFFERS line carries
+    // cache_hit_ratio next to hot_rows / cold_rows.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+    e.execute("INSERT INTO t VALUES (1), (2), (3), (4)")
+        .unwrap();
+    let plan = plan_text(&mut e, "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t");
+    assert!(
+        plan.contains("cache_hit_ratio="),
+        "missing cache_hit_ratio: {plan}"
+    );
+    // 4 hot, 0 cold → ratio = 100.00.
+    assert!(
+        plan.contains("cache_hit_ratio=100.00"),
+        "ratio for 4 hot / 0 cold should be 100.00: {plan}"
+    );
+}
+
+#[test]
+fn explain_buffers_cache_hit_ratio_is_na_on_empty_result() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    // Empty table — 0 hot + 0 cold → ratio = n/a.
+    let plan = plan_text(&mut e, "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t");
+    assert!(
+        plan.contains("cache_hit_ratio=n/a"),
+        "empty-result ratio should be n/a: {plan}"
+    );
+}
+
+#[test]
 fn explain_buffers_emits_hot_cold_line() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
