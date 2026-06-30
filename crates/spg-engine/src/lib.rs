@@ -845,7 +845,6 @@ impl Engine {
     ///
     /// Returns a no-op guard when the `injection-points` feature is
     /// off so call sites don't need `#[cfg]`.
-    #[must_use]
     pub fn enter_injection_scope(&self) -> crate::testkit::injection::InjectionGuard {
         #[cfg(feature = "injection-points")]
         {

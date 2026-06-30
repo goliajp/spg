@@ -15,6 +15,7 @@
 /// Every field defaults to "production behaviour"; only flips when explicitly
 /// set via env var (`EnvConfig::from_env`) or builder (`EnvConfig::builder`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // 5 deliberate orthogonal test knobs
 pub struct EnvConfig {
     /// `SPG_TEST_COMPUTE_QUERY_ID=regress` — strip query-id annotations
     /// from EXPLAIN output (regression-test mode).
@@ -53,19 +54,14 @@ pub struct EnvConfig {
 }
 
 /// Semantics of the `compute_query_id` knob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComputeQueryId {
     /// Production: hash + emit query id in EXPLAIN output.
+    #[default]
     Auto,
     /// Regression-test mode: elide query id from EXPLAIN output so diffs
     /// are byte-equal across runs.
     Regress,
-}
-
-impl Default for ComputeQueryId {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl Default for EnvConfig {
