@@ -1032,6 +1032,17 @@ pub enum PlPgSqlStmt {
     /// statement. Recursion depth into nested triggers is
     /// bounded by the engine's existing trigger-fire guard.
     EmbeddedSql(Box<Statement>),
+    /// v7.37.20 (20.14) — `ASSERT <condition> [, <message>];`. If
+    /// the condition evaluates falsy the trigger / DO block aborts
+    /// with the message (defaulting to a generic shape when none
+    /// is provided). Same propagation shape as `RAISE EXCEPTION`
+    /// — the error reaches the caller's query path. PG's behaviour
+    /// is identical except for a `plpgsql.check_asserts` GUC that
+    /// can disable the check globally; SPG always evaluates.
+    Assert {
+        condition: Expr,
+        message: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3566,6 +3577,13 @@ impl fmt::Display for PlPgSqlStmt {
                 Ok(())
             }
             Self::EmbeddedSql(s) => write!(f, "{s}"),
+            Self::Assert { condition, message } => {
+                write!(f, "ASSERT {condition}")?;
+                if let Some(m) = message {
+                    write!(f, ", {m}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
