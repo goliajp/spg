@@ -12,8 +12,8 @@ use alloc::vec::Vec;
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::{
-    ActivityProvider, AuditChainProvider, AuditVerifier, Engine, MemoryStats, QueryResult,
-    SlowQueryLogger, TableMemoryStats, approx_row_bytes, is_internal_table_name,
+    ActivityProvider, AuditChainProvider, AuditVerifier, Engine, EngineError, MemoryStats,
+    QueryResult, SlowQueryLogger, TableMemoryStats, approx_row_bytes, is_internal_table_name,
     render_create_table, render_histogram_bounds,
 };
 use crate::{query_stats, statistics};
@@ -919,5 +919,42 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// v7.37.22 (22.3) — autoanalyze pass.
+    ///
+    /// PG runs autovacuum + autoanalyze on a background timer.
+    /// SPG's spg-embedded / spg-server hosts call this from their
+    /// maintenance loop on a configurable cadence (default 60s,
+    /// matching PG's `autovacuum_naptime`). Each call:
+    ///
+    /// 1. Walks `tables_needing_analyze()` (same threshold as the
+    ///    existing introspection API).
+    /// 2. Runs `ANALYZE <table>` on each candidate.
+    /// 3. Returns the names that were analyzed so the host can
+    ///    log / emit metrics.
+    ///
+    /// Internally identical to `ANALYZE name1; ANALYZE name2; …`
+    /// but bundled so the plan-cache invalidation runs once at the
+    /// end (cheaper than invalidating per-table). The host can call
+    /// this under the engine write-lock without splicing extra
+    /// SQL through the parser.
+    ///
+    /// Returns the (possibly empty) list of tables analyzed.
+    pub fn autoanalyze_pass(&mut self) -> Result<Vec<String>, EngineError> {
+        let candidates = self.tables_needing_analyze();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        for name in &candidates {
+            // `exec_analyze` for a single table also bumps
+            // version + evicts that table's plans. Doing it
+            // per-table here matches `ANALYZE a; ANALYZE b;`
+            // semantics — a host that wants the bundled
+            // optimisation can call `exec_analyze(None)` for the
+            // bare ANALYZE-all path instead.
+            self.exec_analyze(Some(name))?;
+        }
+        Ok(candidates)
     }
 }
