@@ -638,17 +638,64 @@ fn run_replay_only(db_path: Option<PathBuf>, wal_path: Option<PathBuf>) -> std::
 /// Read a usize from `env_key`; non-positive / unparseable / unset
 /// becomes `None` (= unlimited). Used by the v4.2 limits envs.
 fn parse_env_usize(env_key: &str) -> Option<usize> {
-    env::var(env_key)
-        .ok()
+    env_resolve(env_key)
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
 }
 
 fn parse_env_u64(env_key: &str) -> Option<u64> {
-    env::var(env_key)
-        .ok()
+    env_resolve(env_key)
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
+}
+
+/// v7.37.25 (25.5) — PG GUC name alignment.
+///
+/// Maps the SPG-spelled env var key to the PG-spelled alias every
+/// env reader honours transparently. When both are set the PG-spelled
+/// alias wins (the migration target the doc commitment promised);
+/// when neither is set returns None — both env vars unset is the
+/// same as today.
+///
+/// Adding a new pair is one line below; the readers (`parse_env_u64`
+/// / `parse_env_usize` + any future `_string` variant) inherit
+/// resolution automatically.
+fn env_resolve(env_key: &str) -> Option<String> {
+    // PG-spelled alias → SPG-spelled current key. PG-spelled wins
+    // when set on the assumption that an operator who wrote the
+    // PG-style name was doing so deliberately.
+    const ALIASES: &[(&str, &str)] = &[
+        // SPG_STATEMENT_TIMEOUT mirrors PG's statement_timeout GUC,
+        // expressed in ms here (PG accepts unit suffixes; SPG keeps
+        // its existing bare-integer-ms surface — coercion ships in
+        // a follow-up if a customer needs unit-suffix parsing).
+        ("SPG_STATEMENT_TIMEOUT", "SPG_QUERY_TIMEOUT_MS"),
+        // PG's autovacuum_naptime is in seconds; SPG's surface is
+        // ms. PG operators converting will write a milliseconds
+        // value here, matching the existing semantics; the GUC name
+        // just makes the per-database scrape script obvious.
+        (
+            "SPG_AUTOVACUUM_NAPTIME",
+            "SPG_AUTO_ANALYZE_INTERVAL_MS",
+        ),
+        // PG's log_min_duration_statement is the ms threshold below
+        // which queries are not logged. SPG's existing name spells
+        // the same semantics with a different label.
+        (
+            "SPG_LOG_MIN_DURATION",
+            "SPG_SLOW_QUERY_THRESHOLD_MS",
+        ),
+    ];
+    // Prefer the PG-spelled alias when its mapping owns this key.
+    for (pg_name, spg_name) in ALIASES {
+        if *spg_name == env_key
+            && let Ok(v) = env::var(pg_name)
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    env::var(env_key).ok()
 }
 
 /// v5.1: parse `SPG_PRELOAD_COLD_SEGMENT` into a list of
@@ -785,8 +832,9 @@ fn generate_cluster_id() -> u64 {
 /// Defaults to 30 s. Tests set `SPG_AUTO_ANALYZE_INTERVAL_MS=200`
 /// so the sweep fires within their probe window.
 pub(crate) fn auto_analyze_interval_ms() -> u64 {
-    std::env::var("SPG_AUTO_ANALYZE_INTERVAL_MS")
-        .ok()
+    // v7.37.25 (25.5) — honours `SPG_AUTOVACUUM_NAPTIME` (PG-aligned
+    // alias) ahead of the legacy `SPG_AUTO_ANALYZE_INTERVAL_MS`.
+    env_resolve("SPG_AUTO_ANALYZE_INTERVAL_MS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(30_000)
 }
@@ -1176,8 +1224,9 @@ fn run(
         // taking ownership through std::mem::replace.
         let prev = std::mem::replace(&mut *e, Engine::new());
         // v6.5.6 — slow-query log threshold from env, default 100ms.
-        let slow_us: u64 = std::env::var("SPG_SLOW_QUERY_THRESHOLD_MS")
-            .ok()
+        // v7.37.25 (25.5) — honours `SPG_LOG_MIN_DURATION` (PG-aligned
+        // alias) ahead of the legacy `SPG_SLOW_QUERY_THRESHOLD_MS`.
+        let slow_us: u64 = env_resolve("SPG_SLOW_QUERY_THRESHOLD_MS")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(100)
             * 1_000;

@@ -114,18 +114,25 @@ release-build no-ops.
 | `SPG_TEST_RANDOM_SEED`            | Seed for any test-side RNG. |
 | `SPG_TEST_STATS_FROZEN`           | Treat ANALYZE as a no-op so the statistic-version snapshot stays stable. |
 
-## PG GUC alignment (25.5 follow-up)
+## PG GUC alignment (25.5 — shipped)
 
-25.5 will close the remaining naming gaps so every SPG-specific
-tunable maps 1-1 to a PG GUC:
+PG-spelled aliases are live for the three keys that map 1-1 to a
+named GUC. When both spellings are exported, the PG-spelled alias
+wins on the assumption that the operator wrote the PG-style name
+deliberately. Unit-of-measure stays the same as the legacy key
+(no unit-suffix parsing — `'5s'` still parses as 5 not 5000).
 
-| Today                              | Future (PG-aligned)        |
-|------------------------------------|----------------------------|
-| `SPG_QUERY_TIMEOUT_MS`             | `SPG_STATEMENT_TIMEOUT`    |
-| `SPG_AUTO_ANALYZE_INTERVAL_MS`     | `SPG_AUTOVACUUM_NAPTIME`   |
-| `SPG_SLOW_QUERY_THRESHOLD_MS`      | `SPG_LOG_MIN_DURATION`     |
-| `SPG_HOT_TIER_BYTES`               | (SPG-specific — keep)      |
-| `SPG_FREEZER_*`                    | (SPG-specific — keep)      |
+| Legacy SPG name                    | PG-aligned alias (preferred) |
+|------------------------------------|------------------------------|
+| `SPG_QUERY_TIMEOUT_MS`             | `SPG_STATEMENT_TIMEOUT`      |
+| `SPG_AUTO_ANALYZE_INTERVAL_MS`     | `SPG_AUTOVACUUM_NAPTIME`     |
+| `SPG_SLOW_QUERY_THRESHOLD_MS`      | `SPG_LOG_MIN_DURATION`       |
+| `SPG_HOT_TIER_BYTES`               | (SPG-specific — keep)        |
+| `SPG_FREEZER_*`                    | (SPG-specific — keep)        |
+
+Resolution path: `crates/spg-server/src/main.rs::env_resolve`. Add
+a new alias as one line in the `ALIASES` table; downstream readers
+inherit it automatically.
 
 ## Discovery
 
