@@ -10509,6 +10509,9 @@ impl Parser {
                 Some(FrameKind::Rows)
             } else if s.eq_ignore_ascii_case("range") {
                 Some(FrameKind::Range)
+            } else if s.eq_ignore_ascii_case("groups") {
+                // v7.37.19 (19.11) — PG 11+ GROUPS frame mode.
+                Some(FrameKind::Groups)
             } else {
                 None
             };

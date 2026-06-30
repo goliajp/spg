@@ -2498,6 +2498,13 @@ pub struct WindowFrame {
 pub enum FrameKind {
     Rows,
     Range,
+    /// v7.37.19 (19.11) — PG 11+ `GROUPS BETWEEN N PRECEDING AND M
+    /// FOLLOWING` peer-group frame mode. With UNBOUNDED / CURRENT ROW
+    /// bounds (no explicit integer offsets) GROUPS behaves identically
+    /// to RANGE — both consult the peer-group of the current row.
+    /// Integer offsets are not yet supported; the executor rejects
+    /// them at run time.
+    Groups,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4642,6 +4649,7 @@ impl fmt::Display for Expr {
                     let k = match fr.kind {
                         FrameKind::Rows => "ROWS",
                         FrameKind::Range => "RANGE",
+                        FrameKind::Groups => "GROUPS",
                     };
                     if let Some(end) = &fr.end {
                         write!(f, "{k} BETWEEN {} AND {}", fr.start, end)?;
