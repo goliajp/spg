@@ -4823,6 +4823,17 @@ impl Parser {
                     self.advance();
                     return Ok(Vec::new());
                 }
+                // v7.37.18 (18.12) — ENABLE/DISABLE ALWAYS TRIGGER
+                // and ENABLE/DISABLE REPLICA TRIGGER. PG uses these
+                // to gate triggers on session_replication_role; SPG
+                // has no replica role, so the prefix is consumed and
+                // treated identically to the plain ENABLE/DISABLE
+                // TRIGGER form.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("always"))
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("replica"))
+                {
+                    self.advance();
+                }
                 if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("trigger")) {
                     return Err(self.err(alloc::format!(
                         "expected TRIGGER after {}, got {:?}",
@@ -4833,8 +4844,17 @@ impl Parser {
                 self.advance();
                 // `ALL` lexes as Token::All (reserved); also
                 // accept Token::Ident("all") for symmetry.
+                // v7.37.18 (18.12) — USER / REPLICA / ALWAYS post-
+                // TRIGGER selectors. USER (= all user triggers) is
+                // semantically ALL here; REPLICA / ALWAYS gate on
+                // session_replication_role which SPG doesn't track.
+                // All map to TriggerSelector::All.
                 let which = if matches!(self.peek(), Token::All)
-                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("all"))
+                    || matches!(self.peek(), Token::Ident(s)
+                        if s.eq_ignore_ascii_case("all")
+                            || s.eq_ignore_ascii_case("user")
+                            || s.eq_ignore_ascii_case("replica")
+                            || s.eq_ignore_ascii_case("always"))
                 {
                     self.advance();
                     crate::ast::TriggerSelector::All
