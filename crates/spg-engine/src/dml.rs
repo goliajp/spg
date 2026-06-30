@@ -502,9 +502,17 @@ impl Engine {
                     name: stmt.target.clone(),
                 })
             })?;
+            // v7.37.15 Phase B — MERGE target snapshot consults
+            // visibility so an in-flight delete on the target table
+            // is not merged against. Phase B's `current_snapshot()`
+            // returns unbounded (every row visible) — behaviour
+            // matches pre-v7.37.15 exactly.
+            let snap = self.current_snapshot();
             (
                 t.schema().columns.clone(),
-                t.rows().iter().cloned().collect::<Vec<Row<'static>>>(),
+                t.scan_visible(&snap)
+                    .map(|(_, r)| r.clone())
+                    .collect::<Vec<Row<'static>>>(),
             )
         };
         let (source_cols, source_rows) = {
@@ -517,7 +525,10 @@ impl Engine {
             // input. Source rows are read-only inputs (we never
             // mutate the source) so this is the same shape as
             // `materialise_table_ref`'s v7.35.1 cold-aware lift.
-            let mut rows: Vec<Row<'static>> = s.rows().iter().cloned().collect();
+            // v7.37.15 Phase B — visibility-gated source scan.
+            let snap = self.current_snapshot();
+            let mut rows: Vec<Row<'static>> =
+                s.scan_visible(&snap).map(|(_, r)| r.clone()).collect();
             rows.extend(crate::constraints::iter_cold_rows_of_parent(
                 self.active_catalog(),
                 s,
