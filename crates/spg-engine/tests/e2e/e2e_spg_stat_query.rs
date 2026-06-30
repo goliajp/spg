@@ -26,6 +26,8 @@ fn rows_of(res: QueryResult) -> Vec<Vec<Value<'static>>> {
 
 #[test]
 fn counter_increments_on_each_execute() {
+    // v7.37.22 (22.6) — record() normalises sql before hashing.
+    // `INSERT INTO t VALUES (1)` × 3 collapses to one template.
     let mut eng = build_engine();
     eng.execute("CREATE TABLE t (id INT)").unwrap();
     eng.execute("INSERT INTO t VALUES (1)").unwrap();
@@ -36,18 +38,29 @@ fn counter_increments_on_each_execute() {
     let got = rows_of(res);
     let insert_row = got
         .iter()
-        .find(|r| r[0] == Value::text("INSERT INTO t VALUES (1)"))
-        .expect("INSERT row");
+        .find(|r| {
+            if let Value::Text(s) = &r[0] {
+                s.starts_with("insert into t values")
+            } else {
+                false
+            }
+        })
+        .expect("normalised INSERT row");
     assert_eq!(insert_row[1], Value::BigInt(3), "exec_count is 3");
 }
 
 #[test]
 fn distinct_sql_strings_yield_separate_rows() {
+    // v7.37.22 (22.6) — three INSERTs with different literals
+    // collapse to ONE row (same normalised template). Structurally
+    // distinct queries (DELETE, SELECT) yield distinct rows.
     let mut eng = build_engine();
     eng.execute("CREATE TABLE t (a INT, b INT)").unwrap();
     eng.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     eng.execute("INSERT INTO t VALUES (2, 2)").unwrap();
     eng.execute("INSERT INTO t VALUES (3, 3)").unwrap();
+    eng.execute("DELETE FROM t").unwrap();
+    eng.execute("SELECT * FROM t").unwrap();
 
     let res = eng.execute("SELECT * FROM spg_stat_query").unwrap();
     let got = rows_of(res);
@@ -55,13 +68,25 @@ fn distinct_sql_strings_yield_separate_rows() {
         .iter()
         .filter(|r| {
             if let Value::Text(s) = &r[0] {
-                s.starts_with("INSERT INTO t")
+                s.starts_with("insert into t values")
             } else {
                 false
             }
         })
         .count();
-    assert_eq!(n_inserts, 3, "each distinct INSERT SQL has its own row");
+    assert_eq!(n_inserts, 1, "three INSERTs collapse to one template");
+    // The DELETE template + the SELECT template are distinct.
+    let n_others = got
+        .iter()
+        .filter(|r| {
+            if let Value::Text(s) = &r[0] {
+                s.starts_with("delete") || s.starts_with("select")
+            } else {
+                false
+            }
+        })
+        .count();
+    assert!(n_others >= 2, "expected DELETE + SELECT templates, got {n_others}");
 }
 
 #[test]
@@ -114,6 +139,9 @@ fn pg_stat_statements_has_pg_compatible_columns() {
 
 #[test]
 fn pg_stat_statements_records_executions() {
+    // v7.37.22 (22.6) — record() normalises sql; the surface
+    // shows the template not the original. Two INSERTs with
+    // the literal 42 collapse to the same template row.
     let mut eng = build_engine();
     eng.execute("CREATE TABLE t (id INT)").unwrap();
     eng.execute("INSERT INTO t VALUES (42)").unwrap();
@@ -125,8 +153,14 @@ fn pg_stat_statements_records_executions() {
     //   4=query, 11=calls
     let insert_row = got
         .iter()
-        .find(|r| r[4] == Value::text("INSERT INTO t VALUES (42)"))
-        .expect("pg_stat_statements must surface the INSERT row");
+        .find(|r| {
+            if let Value::Text(s) = &r[4] {
+                s.starts_with("insert into t values")
+            } else {
+                false
+            }
+        })
+        .expect("pg_stat_statements must surface the INSERT template");
     assert_eq!(insert_row[11], Value::BigInt(2), "calls should be 2");
 }
 
