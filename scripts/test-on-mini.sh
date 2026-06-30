@@ -33,4 +33,9 @@ ssh "$HOST" "mkdir -p '$RDIR'"
 rsync -az --delete --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
 # OrbStack PATH so `docker` resolves on the non-interactive ssh shell.
-exec ssh "$HOST" "PATH=/Applications/OrbStack.app/Contents/MacOS/xbin:\$PATH cd '$RDIR' && exec scripts/gate.sh $*"
+# `export` (not just prefix) so child processes — including `cargo run`
+# subprocesses spawned by gate.sh — inherit the PATH and can find
+# docker. Without `export`, the prefix-set PATH was visible to bash
+# but not to its children, making biz dump_compat / data_compat fail
+# silently while sqllogictest (which doesn't shell out to docker) passed.
+exec ssh "$HOST" "export PATH=/Applications/OrbStack.app/Contents/MacOS/xbin:\$PATH && cd '$RDIR' && exec scripts/gate.sh $*"
