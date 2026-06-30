@@ -15,7 +15,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/05_aggregates` | 57 | 0 | 0 | 100.0% |
 | `spg_baseline/06_subqueries` | 25 | 0 | 0 | 100.0% |
 | `spg_baseline/07_cte` | 12 | 0 | 0 | 100.0% |
-| `spg_baseline/08_partition` | 0 | 0 | 0 | 0.0% |
+| `spg_baseline/08_partition` | 34 | 0 | 0 | 100.0% |
 | `spg_baseline/09_indexes` | 26 | 0 | 0 | 100.0% |
 | `spg_baseline/10_constraints` | 30 | 0 | 0 | 100.0% |
 | `spg_baseline/11_dialect` | 53 | 0 | 0 | 100.0% |
@@ -283,6 +283,9 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip |
 |---|---|---|---|
+| `partition_attach_detach.test` | 12 | 0 | 0 |
+| `partition_hash_basic.test` | 10 | 0 | 0 |
+| `partition_list_basic.test` | 12 | 0 | 0 |
 
 ### `spg_baseline/09_indexes/`
 

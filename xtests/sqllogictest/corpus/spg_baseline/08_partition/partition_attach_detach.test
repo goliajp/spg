@@ -1,0 +1,52 @@
+# v7.37.16 (16.3 / 16.4 / 16.5) — ATTACH / DETACH PARTITION
+# round-trip through pgwire.
+
+statement ok
+CREATE TABLE p (id BIGINT NOT NULL, region TEXT NOT NULL) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE c_apac (id BIGINT NOT NULL, region TEXT NOT NULL)
+
+statement ok
+ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
+
+statement ok
+INSERT INTO p VALUES (1, 'jp'), (2, 'kr')
+
+query I
+SELECT COUNT(*) FROM c_apac
+----
+2
+
+# Detach demotes the child back to standalone.
+statement ok
+ALTER TABLE p DETACH PARTITION c_apac
+
+# The rows stay in c_apac; parent UNION shows 0 since it's no
+# longer a partition.
+query I
+SELECT COUNT(*) FROM c_apac
+----
+2
+
+query I
+SELECT COUNT(*) FROM p
+----
+0
+
+# Re-ATTACH a non-empty child is rejected (16.3 empty-child gate).
+statement error
+ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
+
+# DELETE from c_apac to make it empty, then ATTACH succeeds.
+statement ok
+DELETE FROM c_apac
+
+statement ok
+ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
+
+# CONCURRENTLY + FINALIZE accepted at the parser (single-engine
+# = atomic detach internally; PG's two-phase split exists for
+# replication lag, which doesn't apply here).
+statement ok
+ALTER TABLE p DETACH PARTITION c_apac CONCURRENTLY FINALIZE
