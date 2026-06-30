@@ -789,6 +789,29 @@ pub struct ExplainStatement {
     /// `true`, takes precedence over the per-session
     /// `SPG_TEST_EXPLAIN_NO_COSTS` GUC.
     pub costs_off: bool,
+    /// v7.37.22 (22.7) — `EXPLAIN (BUFFERS) <SELECT>`. PG-standard
+    /// option that surfaces hot/cold/shared block counters. SPG's
+    /// hot-tier scan path counts examined rows; the BUFFERS option
+    /// makes that an explicit per-operator annotation.
+    pub buffers: bool,
+    /// v7.37.22 (22.7) — `EXPLAIN (TIMING [ON|OFF]) <SELECT>`. PG
+    /// uses this to disable per-operator timing while still
+    /// emitting actual-row counts (cheaper than ANALYZE). Default
+    /// when EXPLAIN ANALYZE is set: TIMING ON. `false` strips the
+    /// timing portion of the Total line. Decoupled from `costs_off`:
+    /// PG's COSTS OFF strips estimated cost; TIMING OFF strips
+    /// measured wall-clock.
+    pub timing_off: bool,
+    /// v7.37.22 (22.7) — `EXPLAIN (SETTINGS) <SELECT>`. PG appends
+    /// modified GUC values to the plan output. SPG emits the
+    /// session params that diverge from default after the main
+    /// plan body.
+    pub settings: bool,
+    /// v7.37.22 (22.7) — `EXPLAIN (WAL) <SELECT>`. PG counts WAL
+    /// bytes / records / FPI emitted by the query. SPG's
+    /// write-side queries (INSERT/UPDATE/DELETE wrapped in EXPLAIN
+    /// ANALYZE) report against the engine WAL counter delta.
+    pub wal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

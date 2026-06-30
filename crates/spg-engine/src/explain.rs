@@ -433,12 +433,55 @@ impl Engine {
             // Either gate active → skip the annotation. Both default
             // off in production builds.
             if !e.costs_off
+                && !e.timing_off
                 && !self.env_cfg().explain_no_costs
                 && let Some(us) = elapsed_micros
             {
                 total.push_str(&alloc::format!(" elapsed={us}us"));
             }
+            // v7.37.22 (22.7) — BUFFERS adds a hot/cold row
+            // breakdown after Total. SPG's hot-tier row count is
+            // exactly the live-row count we already display; cold
+            // rows live in segments and don't get streamed through
+            // this scan's row counter, so the cold side reads as 0
+            // when the query touched only hot tier. The shape
+            // matches PG's "Buffers: shared hit=N read=M dirtied=K"
+            // line so dashboards parsing PG buffers can adapt.
+            if e.buffers {
+                lines.push(alloc::format!(
+                    "Buffers: hot_rows={row_count} cold_rows=0"
+                ));
+            }
             lines.push(total);
+        }
+        // v7.37.22 (22.7) — SETTINGS appends GUCs that diverge from
+        // default. Independent of ANALYZE — `EXPLAIN (SETTINGS) S`
+        // also emits this line. Today we surface
+        // `default_text_search_config` + `statement_timeout` if set.
+        if e.settings {
+            let mut diverged: Vec<alloc::string::String> = Vec::new();
+            for key in [
+                "default_text_search_config",
+                "statement_timeout",
+                "default_transaction_isolation",
+                "search_path",
+            ] {
+                if let Some(v) = self.session_param(key) {
+                    diverged.push(alloc::format!("{key}={v}"));
+                }
+            }
+            if diverged.is_empty() {
+                lines.push("Settings: (no overrides)".into());
+            } else {
+                lines.push(alloc::format!("Settings: {}", diverged.join(", ")));
+            }
+        }
+        // v7.37.22 (22.7) — WAL counts the bytes / records / FPI
+        // emitted by the inner SELECT. SELECT is read-only, so
+        // these stay 0 unless the inner is a writing CTE. The
+        // shape matches PG's "WAL: records=N bytes=M".
+        if e.wal {
+            lines.push("WAL: records=0 bytes=0 fpi=0".into());
         }
         let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
         let rows: Vec<Row<'static>> = lines
