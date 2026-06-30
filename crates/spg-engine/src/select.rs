@@ -424,6 +424,20 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.16) — pg_catalog.pg_stat_bgwriter.
+                "__spg_pg_stat_bgwriter" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_bgwriter(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.23 (23.6-b) — pg_catalog.pg_tablespace.
+                "__spg_pg_tablespace" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_tablespace(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
