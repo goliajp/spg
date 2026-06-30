@@ -688,6 +688,23 @@ impl Engine {
         spg_storage::snapshot::Snapshot::unbounded()
     }
 
+    /// v7.37.15 (Phase C) — allocate a fresh version number for
+    /// the next write. Always strictly monotonic + process-wide
+    /// shared so concurrent engines on the same process agree on
+    /// "tx 17 commits before tx 18". Phase C writer paths call
+    /// this once per INSERT / UPDATE / DELETE statement to obtain
+    /// the version they'll stamp on the new row's `xmin` (or the
+    /// existing row's `xmax`).
+    ///
+    /// Returns [`XMIN_FROZEN`] when MVCC stamping is intentionally
+    /// off (legacy `in_memory` flow / WAL replay): the writer
+    /// then takes the legacy frozen-insert short-circuit path
+    /// inside `Table::insert_with_xmin`.
+    #[must_use]
+    pub fn next_writer_version(&self) -> u64 {
+        spg_storage::row_header::next_version()
+    }
+
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
     pub fn restore(catalog: Catalog) -> Self {
