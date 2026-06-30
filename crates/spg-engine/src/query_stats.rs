@@ -54,8 +54,12 @@ impl QueryStats {
 
     /// Returns the recorded stat snapshot, if any. Does NOT promote
     /// LRU (introspection should be side-effect free).
+    ///
+    /// v7.37.22 (22.6) — `sql` is normalised before lookup so
+    /// callers don't have to know about the normalisation rules.
     pub fn get(&self, sql: &str) -> Option<&QueryStat> {
-        self.entries.get(sql)
+        let key = Self::normalize_sql(sql);
+        self.entries.get(&key)
     }
 
     /// Iterate every recorded entry in deterministic (BTreeMap)
@@ -64,10 +68,142 @@ impl QueryStats {
         self.entries.iter()
     }
 
+    /// v7.37.22 (22.6) — normalise a SQL string for pg_stat_statements
+    /// grouping. Replaces literal values with `$N` placeholders so
+    /// `SELECT * FROM t WHERE id = 1` and `SELECT * FROM t WHERE id
+    /// = 2` collapse into the same key (matching PG's behaviour).
+    ///
+    /// Rules:
+    /// - Numeric literals (integer + float) → `$N`
+    /// - Single-quoted string literals (with `''` escape) → `$N`
+    /// - NULL / TRUE / FALSE → preserved (PG also preserves these)
+    /// - Whitespace runs → single space
+    /// - Comments stripped (`-- …` to EOL; `/* … */` block)
+    ///
+    /// Each replaced literal increments `N` so multi-literal
+    /// queries get `$1, $2, $3`. Round-trippable enough that DBAs
+    /// reading the normalised form can map it back to the original
+    /// query template.
+    pub fn normalize_sql(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let bytes = sql.as_bytes();
+        let mut i = 0usize;
+        let mut param_counter: u32 = 0;
+        let mut last_was_space = true; // suppress leading space
+        while i < bytes.len() {
+            let b = bytes[i];
+            // Line comment.
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment.
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = i.saturating_add(2).min(bytes.len());
+                continue;
+            }
+            // Whitespace collapse.
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+                i += 1;
+                continue;
+            }
+            // String literal (single-quoted) with PG-style `''` escape.
+            if b == b'\'' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2; // escaped quote inside the literal
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                param_counter += 1;
+                out.push('$');
+                let _ = core::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("{param_counter}"),
+                );
+                last_was_space = false;
+                continue;
+            }
+            // Numeric literal. PG considers digits, an optional
+            // leading sign (already separated by the prev token),
+            // a decimal point, an optional exponent (`e±NN`). The
+            // safe boundary: previous emitted char is NOT an
+            // identifier char (`[A-Za-z0-9_]`). When the previous
+            // char IS an ident char, treat the digits as part of
+            // an identifier (e.g. `col42`).
+            if b.is_ascii_digit() {
+                let prev_is_ident = out
+                    .as_bytes()
+                    .last()
+                    .map(|c| {
+                        c.is_ascii_alphanumeric() || *c == b'_'
+                    })
+                    .unwrap_or(false);
+                if !prev_is_ident {
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_digit()
+                            || bytes[i] == b'.'
+                            || bytes[i] == b'e'
+                            || bytes[i] == b'E'
+                            || (bytes[i] == b'+' || bytes[i] == b'-')
+                                && i > 0
+                                && (bytes[i - 1] == b'e' || bytes[i - 1] == b'E'))
+                    {
+                        i += 1;
+                    }
+                    param_counter += 1;
+                    out.push('$');
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("{param_counter}"),
+                    );
+                    last_was_space = false;
+                    continue;
+                }
+            }
+            // Default: copy through byte-for-byte. Identifier-like
+            // characters lower-case the alphabetic portion so
+            // `SELECT * FROM T` and `select * from t` collapse.
+            if b.is_ascii_uppercase() {
+                out.push(b.to_ascii_lowercase() as char);
+            } else {
+                out.push(b as char);
+            }
+            last_was_space = false;
+            i += 1;
+        }
+        // Trim trailing space.
+        if out.ends_with(' ') {
+            out.pop();
+        }
+        out
+    }
+
     /// Record one execution. `elapsed_us` is the wall-clock micros
     /// between start and end; `now_us` is the wall-clock micros at
     /// completion (used for `last_seen_us`).
+    ///
+    /// v7.37.22 (22.6) — the sql key is normalised so distinct
+    /// literal-bearing instances collapse to a single template.
     pub fn record(&mut self, sql: &str, elapsed_us: u64, now_us: u64) {
+        let sql = &Self::normalize_sql(sql);
+        let sql: &str = sql.as_str();
         if let Some(stat) = self.entries.get_mut(sql) {
             stat.exec_count = stat.exec_count.saturating_add(1);
             stat.total_us = stat.total_us.saturating_add(elapsed_us);
@@ -124,11 +260,60 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
+    fn normalize_strips_numeric_literals() {
+        assert_eq!(
+            QueryStats::normalize_sql("SELECT * FROM t WHERE id = 1"),
+            "select * from t where id = $1"
+        );
+        assert_eq!(
+            QueryStats::normalize_sql("SELECT * FROM t WHERE id = 42 AND age > 30"),
+            "select * from t where id = $1 and age > $2"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_string_literals() {
+        assert_eq!(
+            QueryStats::normalize_sql("SELECT * FROM t WHERE name = 'alice'"),
+            "select * from t where name = $1"
+        );
+        // Embedded escaped quote.
+        assert_eq!(
+            QueryStats::normalize_sql("SELECT 'a''b'"),
+            "select $1"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_identifiers_with_digit_suffix() {
+        assert_eq!(
+            QueryStats::normalize_sql("SELECT col42 FROM t"),
+            "select col42 from t"
+        );
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace_and_strips_comments() {
+        assert_eq!(
+            QueryStats::normalize_sql(
+                "  SELECT *\n  -- pick everything\n  FROM /* yes */ t  WHERE id = 1"
+            ),
+            "select * from t where id = $1"
+        );
+    }
+
+    #[test]
     fn record_increments_counters() {
+        // v7.37.22 (22.6) — `SELECT 1` normalises to `select $1`.
+        // get() also normalises the lookup key. Two distinct
+        // calls collapse to one entry per normalised template.
         let mut qs = QueryStats::new();
         qs.record("SELECT 1", 100, 1000);
         qs.record("SELECT 1", 200, 2000);
-        let s = qs.get("SELECT 1").expect("present");
+        let s = qs
+            .entries
+            .get("select $1")
+            .expect("normalised template present");
         assert_eq!(s.exec_count, 2);
         assert_eq!(s.total_us, 300);
         assert_eq!(s.max_us, 200);
@@ -137,24 +322,37 @@ mod tests {
 
     #[test]
     fn distinct_sql_yields_separate_entries() {
+        // v7.37.22 (22.6) — only structurally different queries
+        // create separate entries. Different literals collapse.
         let mut qs = QueryStats::new();
-        qs.record("SELECT 1", 10, 100);
-        qs.record("SELECT 2", 20, 200);
+        qs.record("SELECT a FROM t WHERE id = 1", 10, 100);
+        qs.record("SELECT a FROM t WHERE id = 2", 20, 200);
+        // Both collapse to `select a from t where id = $1`.
+        assert_eq!(qs.len(), 1);
+        qs.record("SELECT b FROM t WHERE id = 1", 30, 300);
+        // Now there's a structurally distinct template.
         assert_eq!(qs.len(), 2);
     }
 
     #[test]
     fn lru_evicts_oldest_at_cap() {
+        // v7.37.22 (22.6) — fill the cap with structurally
+        // distinct queries (different column names), then add
+        // one more and verify the oldest evicts.
         let mut qs = QueryStats::new();
         for i in 0..QUERY_STATS_MAX {
-            qs.record(&alloc::format!("SELECT {i}"), 1, i as u64);
+            // Use distinct ident-shaped names so normalisation
+            // doesn't collapse them.
+            qs.record(&alloc::format!("SELECT c{i} FROM t"), 1, i as u64);
         }
         assert_eq!(qs.len(), QUERY_STATS_MAX);
-        // Trigger cap.
-        qs.record("SELECT new", 1, QUERY_STATS_MAX as u64);
+        qs.record("SELECT new_col FROM t", 1, QUERY_STATS_MAX as u64);
         assert_eq!(qs.len(), QUERY_STATS_MAX);
-        assert!(qs.get("SELECT 0").is_none(), "oldest evicted");
-        assert!(qs.get("SELECT new").is_some());
+        assert!(
+            qs.entries.get("select c0 from t").is_none(),
+            "oldest evicted"
+        );
+        assert!(qs.entries.get("select new_col from t").is_some());
     }
 
     #[test]
