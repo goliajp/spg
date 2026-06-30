@@ -509,6 +509,144 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v7.37.22 (22.1) — materialise `pg_stat_statements` rows with
+    /// PG's exact column shape. The data source is the same
+    /// `query_stats` registry that backs `spg_stat_query`, but the
+    /// surface is PG-compatible so dashboards/queries written
+    /// against `SELECT … FROM pg_stat_statements ORDER BY
+    /// total_exec_time DESC LIMIT 10` keep working.
+    ///
+    /// SPG ↔ PG mapping:
+    ///   query            ← stats.sql
+    ///   calls            ← stats.exec_count
+    ///   total_exec_time  ← stats.total_us / 1000 (ms)
+    ///   min_exec_time    ← 0 (no per-call min tracked yet)
+    ///   max_exec_time    ← stats.max_us / 1000
+    ///   mean_exec_time   ← derived
+    ///   stddev_exec_time ← 0
+    ///   rows             ← 0 (per-row count tracking lands later)
+    ///   userid           ← 10 (PG's "postgres" superuser oid)
+    ///   dbid             ← 16384 (SPG single-db OID)
+    ///   queryid          ← hash of sql
+    ///   plans            ← stats.exec_count (one plan per call)
+    ///   shared_blks_*    ← 0 (no shared-buffer accounting)
+    ///   local_blks_*     ← 0
+    ///   temp_blks_*      ← 0
+    ///   *_blk_*_time     ← 0
+    ///   wal_records / wal_fpi / wal_bytes ← 0 (per-stmt accounting)
+    ///   jit_*            ← 0 (no JIT)
+    ///   stats_since / minmax_stats_since ← stats.last_seen_us
+    ///
+    /// 38 columns total to cover PG 18's pg_stat_statements view.
+    pub(crate) fn exec_pg_stat_statements(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("userid", DataType::BigInt, false),
+            ColumnSchema::new("dbid", DataType::BigInt, false),
+            ColumnSchema::new("toplevel", DataType::Bool, false),
+            ColumnSchema::new("queryid", DataType::BigInt, false),
+            ColumnSchema::new("query", DataType::Text, false),
+            ColumnSchema::new("plans", DataType::BigInt, false),
+            ColumnSchema::new("total_plan_time", DataType::Float, false),
+            ColumnSchema::new("min_plan_time", DataType::Float, false),
+            ColumnSchema::new("max_plan_time", DataType::Float, false),
+            ColumnSchema::new("mean_plan_time", DataType::Float, false),
+            ColumnSchema::new("stddev_plan_time", DataType::Float, false),
+            ColumnSchema::new("calls", DataType::BigInt, false),
+            ColumnSchema::new("total_exec_time", DataType::Float, false),
+            ColumnSchema::new("min_exec_time", DataType::Float, false),
+            ColumnSchema::new("max_exec_time", DataType::Float, false),
+            ColumnSchema::new("mean_exec_time", DataType::Float, false),
+            ColumnSchema::new("stddev_exec_time", DataType::Float, false),
+            ColumnSchema::new("rows", DataType::BigInt, false),
+            ColumnSchema::new("shared_blks_hit", DataType::BigInt, false),
+            ColumnSchema::new("shared_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("shared_blks_dirtied", DataType::BigInt, false),
+            ColumnSchema::new("shared_blks_written", DataType::BigInt, false),
+            ColumnSchema::new("local_blks_hit", DataType::BigInt, false),
+            ColumnSchema::new("local_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("local_blks_dirtied", DataType::BigInt, false),
+            ColumnSchema::new("local_blks_written", DataType::BigInt, false),
+            ColumnSchema::new("temp_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("temp_blks_written", DataType::BigInt, false),
+            ColumnSchema::new("blk_read_time", DataType::Float, false),
+            ColumnSchema::new("blk_write_time", DataType::Float, false),
+            ColumnSchema::new("wal_records", DataType::BigInt, false),
+            ColumnSchema::new("wal_fpi", DataType::BigInt, false),
+            ColumnSchema::new("wal_bytes", DataType::BigInt, false),
+            ColumnSchema::new("jit_functions", DataType::BigInt, false),
+            ColumnSchema::new("jit_generation_time", DataType::Float, false),
+            ColumnSchema::new("jit_inlining_count", DataType::BigInt, false),
+            ColumnSchema::new("jit_inlining_time", DataType::Float, false),
+            ColumnSchema::new("jit_emission_count", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row<'static>> = self
+            .query_stats
+            .snapshot()
+            .into_iter()
+            .map(|(sql, s)| {
+                let calls = i64::try_from(s.exec_count).unwrap_or(i64::MAX);
+                let total_ms = (s.total_us as f64) / 1000.0;
+                let max_ms = (s.max_us as f64) / 1000.0;
+                let mean_ms = if s.exec_count == 0 {
+                    0.0
+                } else {
+                    (s.total_us as f64) / 1000.0 / (s.exec_count as f64)
+                };
+                // queryid: PG uses a 64-bit hash of the normalised
+                // query text. SPG hashes the raw sql with FNV-1a-64
+                // (matches what pg_compatible_hash uses for HASH
+                // partitions). Stable across runs as long as the
+                // sql text is byte-identical.
+                let queryid =
+                    crate::partition::pg_compatible_hash(&spg_storage::Value::Text(
+                        alloc::borrow::Cow::Borrowed(&sql),
+                    )) as i64;
+                Row::new(alloc::vec![
+                    Value::BigInt(10),     // userid (PG superuser)
+                    Value::BigInt(16384),  // dbid
+                    Value::Bool(true),     // toplevel
+                    Value::BigInt(queryid),
+                    Value::Text(alloc::borrow::Cow::Owned(sql)),
+                    Value::BigInt(calls),  // plans
+                    Value::Float(0.0),     // total_plan_time
+                    Value::Float(0.0),     // min_plan_time
+                    Value::Float(0.0),     // max_plan_time
+                    Value::Float(0.0),     // mean_plan_time
+                    Value::Float(0.0),     // stddev_plan_time
+                    Value::BigInt(calls),  // calls
+                    Value::Float(total_ms),
+                    Value::Float(0.0),     // min_exec_time
+                    Value::Float(max_ms),
+                    Value::Float(mean_ms),
+                    Value::Float(0.0),     // stddev_exec_time
+                    Value::BigInt(0),      // rows (per-call tracking pending)
+                    // 8 shared_blks_*, 4 local_blks_*, 2 temp_blks_*
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::BigInt(0),
+                    Value::Float(0.0),     // blk_read_time
+                    Value::Float(0.0),     // blk_write_time
+                    Value::BigInt(0),      // wal_records
+                    Value::BigInt(0),      // wal_fpi
+                    Value::BigInt(0),      // wal_bytes
+                    Value::BigInt(0),      // jit_functions
+                    Value::Float(0.0),     // jit_generation_time
+                    Value::BigInt(0),      // jit_inlining_count
+                    Value::Float(0.0),     // jit_inlining_time
+                    Value::BigInt(0),      // jit_emission_count
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v7.37.22 (22.2) — materialise `pg_statio_user_tables` rows.
     /// PG exposes per-relation I/O counters that monitoring tools
     /// (pgwatch / pganalyze / Datadog) query routinely. SPG's

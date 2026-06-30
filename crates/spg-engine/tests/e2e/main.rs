@@ -165,6 +165,7 @@ mod e2e_pg_namespace_view;
 mod e2e_pg_proc_view;
 mod e2e_pg_range;
 mod e2e_pg_settings_view;
+mod e2e_pg_stat_statements;
 mod e2e_pg_statio_user_tables;
 mod e2e_pg_time;
 mod e2e_pg_timetz;

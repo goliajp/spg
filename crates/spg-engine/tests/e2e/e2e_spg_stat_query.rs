@@ -86,33 +86,34 @@ fn columns_match_design() {
     );
 }
 
-// v7.37.7 — `pg_stat_statements` view alias (mailrs cascade observability
+// v7.37.7 — `pg_stat_statements` view (mailrs cascade observability
 // gap closure). PG-native dashboards and tooling query
-// `pg_stat_statements`; SPG's underlying impl is `spg_stat_query`, so
-// the alias must return byte-equal results — same columns, same rows.
+// `pg_stat_statements`; v7.37.22 (22.1) promoted the alias to a
+// proper PG-shape view with 38 columns. spg_stat_query keeps its
+// own simplified shape for the human-facing spgctl path.
 #[test]
-fn pg_stat_statements_alias_yields_same_columns_as_spg_stat_query() {
+fn pg_stat_statements_has_pg_compatible_columns() {
     let mut eng = build_engine();
     let alias_res = eng.execute("SELECT * FROM pg_stat_statements").unwrap();
     let alias_cols = match alias_res {
         QueryResult::Rows { columns, .. } => columns,
         _ => panic!("expected Rows"),
     };
-    let native_res = eng.execute("SELECT * FROM spg_stat_query").unwrap();
-    let native_cols = match native_res {
-        QueryResult::Rows { columns, .. } => columns,
-        _ => panic!("expected Rows"),
-    };
-    let alias_names: Vec<String> = alias_cols.into_iter().map(|c| c.name).collect();
-    let native_names: Vec<String> = native_cols.into_iter().map(|c| c.name).collect();
-    assert_eq!(
-        alias_names, native_names,
-        "pg_stat_statements alias must surface the same columns as spg_stat_query"
-    );
+    let names: Vec<&str> = alias_cols.iter().map(|c| c.name.as_str()).collect();
+    // PG-canonical column names that dashboards depend on.
+    for must in [
+        "userid", "dbid", "query", "calls", "total_exec_time",
+        "max_exec_time", "mean_exec_time", "queryid",
+    ] {
+        assert!(
+            names.contains(&must),
+            "pg_stat_statements missing column {must}, got {names:?}"
+        );
+    }
 }
 
 #[test]
-fn pg_stat_statements_alias_records_executions() {
+fn pg_stat_statements_records_executions() {
     let mut eng = build_engine();
     eng.execute("CREATE TABLE t (id INT)").unwrap();
     eng.execute("INSERT INTO t VALUES (42)").unwrap();
@@ -120,11 +121,13 @@ fn pg_stat_statements_alias_records_executions() {
 
     let res = eng.execute("SELECT * FROM pg_stat_statements").unwrap();
     let got = rows_of(res);
+    // Column positions per v7.37.22 (22.1):
+    //   4=query, 11=calls
     let insert_row = got
         .iter()
-        .find(|r| r[0] == Value::text("INSERT INTO t VALUES (42)"))
-        .expect("alias must surface the same INSERT row as spg_stat_query");
-    assert_eq!(insert_row[1], Value::BigInt(2));
+        .find(|r| r[4] == Value::text("INSERT INTO t VALUES (42)"))
+        .expect("pg_stat_statements must surface the INSERT row");
+    assert_eq!(insert_row[11], Value::BigInt(2), "calls should be 2");
 }
 
 #[test]
