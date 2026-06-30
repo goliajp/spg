@@ -419,6 +419,14 @@ struct WalGroup {
     /// the leader's write+fsync doesn't block concurrent
     /// enqueues. Swapped by `checkpoint()` at rotation.
     file: Mutex<File>,
+    /// v7.37.13 (A1.4 / A1.5 TDD) — per-instance fsync-failure
+    /// inject for tests. Was process-wide; cross-test contention
+    /// armed it in one test and consumed it in another's worker
+    /// thread on Linux. Per-WalGroup keeps each test isolated.
+    /// Production builds compile this away (the field is gated to
+    /// cfg(test)).
+    #[cfg(test)]
+    fsync_fail_inject: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -486,7 +494,29 @@ impl WalGroup {
             }),
             cond: std::sync::Condvar::new(),
             file: Mutex::new(file),
+            #[cfg(test)]
+            fsync_fail_inject: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// v7.37.13 (A1.4 / A1.5 TDD) — arm the next sync_data on this
+    /// specific WalGroup to return EIO. One-shot: consumed by the
+    /// next sync_data call. Per-instance so parallel tests don't
+    /// stomp each other (the previous process-wide static had
+    /// cross-test contention on Linux).
+    #[cfg(test)]
+    fn arm_fsync_fail(&self) {
+        self.fsync_fail_inject
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.4 / A1.5 TDD) — consume the per-instance
+    /// inject flag for the current sync. Returns true once after
+    /// arm_fsync_fail; false thereafter.
+    #[cfg(test)]
+    fn take_fsync_fail_inject(&self) -> bool {
+        self.fsync_fail_inject
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Append `record` to the pending batch. Returns the seq the
@@ -542,7 +572,16 @@ impl WalGroup {
                 let io_result: std::io::Result<()> = (|| {
                     let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
                     f.write_all(&batch)?;
-                    wal_sync_data(&mut f)
+                    let r = wal_sync_data(&mut f);
+                    // v7.37.13 — per-instance inject after the
+                    // actual sync (we still WANT the real sync to
+                    // happen first so kernel state is consistent
+                    // before the simulated failure).
+                    #[cfg(test)]
+                    if self.take_fsync_fail_inject() {
+                        return Err(std::io::Error::other("injected fsync fail (per-instance)"));
+                    }
+                    r
                 })();
                 // v7.37.13 (A1.4) — apply the configured fsync-fail
                 // policy. The handler aborts on the default path
@@ -596,7 +635,12 @@ impl WalGroup {
         let io: std::io::Result<()> = (|| {
             let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
             f.write_all(&batch)?;
-            wal_sync_data(&mut f)
+            let r = wal_sync_data(&mut f);
+            #[cfg(test)]
+            if self.take_fsync_fail_inject() {
+                return Err(std::io::Error::other("injected fsync fail (per-instance)"));
+            }
+            r
         })();
         // v7.37.13 (A1.4) — same policy gate as the leader path.
         let io = match io {
@@ -1538,13 +1582,6 @@ fn handle_wal_fsync_fail(err: std::io::Error) -> std::io::Result<()> {
 pub(crate) static FSYNC_RETRY_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// v7.37.13 (A1.4) — `#[cfg(test)]` one-shot fsync-failure injection.
-/// Set to `true` to force the next WAL `sync_data` to return EIO.
-/// Consumed atomically (swap(false)) so each set fires exactly once.
-#[cfg(test)]
-pub(crate) static FSYNC_FAIL_INJECT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// v7.37.13 (A1.4) — `#[cfg(test)]` witness: set to `true` when the
 /// default (PANIC) branch fires inside a test (we panic instead of
 /// abort under test cfg so the runner survives, then assert this).
@@ -1552,19 +1589,12 @@ pub(crate) static FSYNC_FAIL_INJECT: std::sync::atomic::AtomicBool =
 pub(crate) static FSYNC_PANIC_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// v7.37.13 (A1.4) — `#[cfg(test)]` wrapper around `File::sync_data`
-/// that honours [`FSYNC_FAIL_INJECT`]. Tests flip the flag; the
-/// next call returns EIO. Release builds inline straight through
-/// `File::sync_data` (zero overhead, `#[inline(always)]`).
-#[cfg(test)]
-fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
-    if FSYNC_FAIL_INJECT.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        return Err(std::io::Error::other("injected fsync fail (test only)"));
-    }
-    f.sync_data()
-}
-
-#[cfg(not(test))]
+/// v7.37.13 (A1.4) — thin alias for `File::sync_data`. Was a wrapper
+/// for #[cfg(test)] global inject in earlier drafts; injection is
+/// now per-WalGroup (see `WalGroup::arm_fsync_fail`) so this helper
+/// is straight-through on every build. Kept as a named helper so
+/// future fsync-related policies (e.g. SPG_WAL_BARRIER mode) have
+/// a single chokepoint to hook.
 #[inline(always)]
 fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
     f.sync_data()
@@ -3321,6 +3351,17 @@ impl Database {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
         })
+    }
+
+    /// v7.37.13 (A1.4 / A1.5 TDD) — arm the next WAL sync_data on
+    /// this Database's WalGroup to return EIO. One-shot: consumed
+    /// by the next sync. Per-instance so parallel tests don't
+    /// stomp each other. Released builds compile this away.
+    #[cfg(test)]
+    pub(crate) fn arm_wal_fsync_fail_for_testing(&self) {
+        if let Some(p) = self.persistence.as_ref() {
+            p.wal.arm_fsync_fail();
+        }
     }
 
     /// v7.37.13 (A1.9) — snapshot of the current checkpoint stats.
@@ -5855,41 +5896,50 @@ mod tests {
     ///   - INSERT inside catch_unwind — expect panic + FSYNC_PANIC_OBSERVED
     #[test]
     fn v7_37_13_fsync_policy_retry_and_default_abort() {
+        // Serialise this test against any other test that might
+        // also touch the process-wide FSYNC_RETRY_OVERRIDE atomic
+        // (the policy switch, not the inject — inject is per-
+        // WalGroup since v7.37.13). FSYNC_FAIL_INJECT static no
+        // longer exists; per-instance arm via db.arm_wal_fsync_fail_for_testing.
+        static POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // ===== Phase 1: retry path =====
         let prev = FSYNC_RETRY_OVERRIDE.swap(1, std::sync::atomic::Ordering::AcqRel);
-        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
         {
             let dir = tmpdir();
             let db_path = dir.join("retry_path_db");
             let mut db = Database::open_path(&db_path).expect("open");
             db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
-            FSYNC_FAIL_INJECT.store(true, std::sync::atomic::Ordering::Release);
+            db.set_checkpoint_threshold_bytes(u64::MAX);
+            db.set_checkpoint_time_threshold(None);
+            db.checkpoint_wait().expect("drain pre-inject");
+
+            db.arm_wal_fsync_fail_for_testing();
             let result = db.execute("INSERT INTO t VALUES (1)");
             assert!(
                 result.is_err(),
-                "phase 1 (retry path): FSYNC_RETRY_OVERRIDE=1 + inject \
-                 must surface as a graceful Err (legacy poison path); \
+                "phase 1 (retry path): FSYNC_RETRY_OVERRIDE=1 + per-instance \
+                 inject must surface as a graceful Err (legacy poison path); \
                  got {result:?}"
             );
         }
 
         // ===== Phase 2: default abort path =====
         FSYNC_RETRY_OVERRIDE.store(0, std::sync::atomic::Ordering::Release);
-        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
         FSYNC_PANIC_OBSERVED.store(false, std::sync::atomic::Ordering::Release);
         {
             let dir = tmpdir();
             let db_path = dir.join("abort_path_db");
             let mut db = Database::open_path(&db_path).expect("open");
             db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
-            // Disable both checkpoint trigger paths so the worker
-            // can't race by consuming inject in a background thread
-            // (a panic in worker would not reach our catch_unwind).
             db.set_checkpoint_threshold_bytes(u64::MAX);
             db.set_checkpoint_time_threshold(None);
             db.checkpoint_wait().expect("drain pre-inject");
 
-            FSYNC_FAIL_INJECT.store(true, std::sync::atomic::Ordering::Release);
+            db.arm_wal_fsync_fail_for_testing();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = db.execute("INSERT INTO t VALUES (1)");
             }));
@@ -5908,7 +5958,6 @@ mod tests {
 
         // Restore so other tests see the prior policy.
         FSYNC_RETRY_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
-        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// v7.37.13 (A1.2 TDD) — v6 record round-trips through the
