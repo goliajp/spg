@@ -104,6 +104,69 @@ async fn execute_does_not_block_runtime() {
     );
 }
 
+/// v7.37.13 (A1.1 TDD red-then-green) — the CHECKPOINT WORKER must
+/// self-wake on its own timer when no SQL is flowing.
+///
+/// Pre-v7.37.13 model: time-based auto-checkpoint exists (v7.37.10),
+/// but it is checked only inside `wal_after_ok` — i.e. the front
+/// end's commit path. With ZERO writes (a truly idle process), or
+/// with caller-side wal_after_ok bypassed by any new path that
+/// forgets to call it, the time trigger is never evaluated, the
+/// snapshot never advances, the WAL grows, and the quarantine
+/// procedure later costs the customer every in-WAL write since the
+/// last byte-threshold fire (mailrs cascade 8, 2026-06-24 prod
+/// report: 17 h between base.spg mtime advances).
+///
+/// Closes AUDIT-3-categories.md A1.1 / Top-6 P0 #1. The fix is a
+/// background self-wake task that periodically invokes
+/// `trigger_checkpoint` on the live AsyncDatabase without needing
+/// any caller-driven SQL.
+///
+/// The test reads `spg_embedded_tokio::self_wake_fire_count()`
+/// before and after a pure-idle window with NO SQL whatsoever and
+/// asserts the counter advanced — i.e. the self-wake task ticked.
+/// A counter (not base.spg mtime) is used as the witness because
+/// `set_checkpoint_time_threshold`'s reset semantics make the
+/// caller-side path also fire when the next SQL lands, which would
+/// false-pass an mtime-only assertion.
+///
+/// TDD invariant: this test FAILS before the self-wake task exists
+/// (the counter is 0 forever). It PASSES once the task starts
+/// ticking on its own timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v7_37_13_checkpoint_self_wakes_when_idle() {
+    let dir = tempdir_unique("spg-v7-37-13-self-wake");
+    let path = dir.join("idle.spg");
+    let db = AsyncDatabase::open_path(&path).await.expect("open");
+    db.execute("CREATE TABLE t (id BIGINT)").await.expect("ddl");
+    db.checkpoint().await.expect("seed checkpoint");
+
+    db.set_checkpoint_time_threshold(Some(core::time::Duration::from_millis(150)))
+        .await;
+
+    let baseline = spg_embedded_tokio::self_wake_fire_count();
+
+    // PURE IDLE: no SQL at all. Only the self-wake task should run.
+    tokio::time::sleep(core::time::Duration::from_millis(600)).await;
+
+    let after = spg_embedded_tokio::self_wake_fire_count();
+    let fires = after.saturating_sub(baseline);
+
+    assert!(
+        fires >= 2,
+        "self-wake task did not tick at least twice during 600 ms idle \
+         with threshold=150 ms (saw {fires} fires); the v7.37.10 \
+         caller-side time trigger only fires inside wal_after_ok and \
+         is bypassed entirely when the application is idle. This is \
+         mailrs cascade 8 (2026-06-24 prod report) reproduced as a \
+         test for AUDIT-3-categories.md A1.1 / Top-6 P0 #1."
+    );
+
+    // Liveness: keep the db alive across the assert so Drop doesn't
+    // run mid-window and confuse the cause.
+    drop(db);
+}
+
 fn tempdir_unique(prefix: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
