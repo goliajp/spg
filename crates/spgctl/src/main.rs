@@ -58,6 +58,71 @@ fn main() {
         Some("version") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
         }
+        // v7.37.22 (22.10) — `spg top` polls `pg_stat_statements` over the
+        // existing pgwire/SPG-wire-compatible TCP path every `--interval`
+        // seconds (default 2) and prints the top-`--limit` queries
+        // (default 10) ranked by `total_exec_time`. Same shape as
+        // `top(1)` / `pg_top`, scoped to the workload SPG actually
+        // ran. Runs until Ctrl-C; `--once` prints one snapshot and
+        // exits (for cron / dashboards).
+        Some("top") => {
+            let mut addr = DEFAULT_ADDR.to_string();
+            let mut interval_secs: u64 = 2;
+            let mut limit: u32 = 10;
+            let mut once = false;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--addr" => {
+                        if let Some(v) = args.next() {
+                            addr = v;
+                        }
+                    }
+                    "--interval" => {
+                        if let Some(v) = args.next() {
+                            if let Ok(n) = v.parse::<u64>() {
+                                interval_secs = n.max(1);
+                            }
+                        }
+                    }
+                    "--limit" => {
+                        if let Some(v) = args.next() {
+                            if let Ok(n) = v.parse::<u32>() {
+                                limit = n.clamp(1, 1000);
+                            }
+                        }
+                    }
+                    "--once" => once = true,
+                    other => {
+                        die(&format!("top: unknown arg {other:?}"), 2);
+                        return;
+                    }
+                }
+            }
+            let sql = format!(
+                "SELECT queryid, calls, \
+                 total_exec_time, mean_exec_time, max_exec_time, \
+                 rows, query \
+                 FROM pg_catalog.pg_stat_statements \
+                 ORDER BY total_exec_time DESC NULLS LAST \
+                 LIMIT {limit}"
+            );
+            loop {
+                if !once {
+                    print!("\x1b[2J\x1b[H");
+                }
+                match query(&addr, &sql) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        die(&format!("top: {e}"), 1);
+                        return;
+                    }
+                }
+                if once {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+            }
+        }
         Some("import") => {
             // Offline bulk-load: open (or create) a catalog file and
             // execute every statement of a SQL script against it.
