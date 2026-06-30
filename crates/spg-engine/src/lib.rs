@@ -797,6 +797,30 @@ impl Engine {
         spg_storage::row_header::next_version()
     }
 
+    /// v7.37.15 (Phase C) — version a writer should stamp on
+    /// rows produced by the current statement. Inside an explicit
+    /// transaction the version is the tx's pre-allocated one (so
+    /// every statement in the tx commits atomically at COMMIT);
+    /// in autocommit it allocates a fresh version per statement.
+    ///
+    /// This is the canonical helper engine writers should call
+    /// — using it instead of `next_writer_version` ensures
+    /// explicit-tx semantics where every row produced by the tx
+    /// shares one xmin and concurrent readers don't see partial
+    /// state until COMMIT.
+    #[must_use]
+    pub fn writer_version_for_current_stmt(&self) -> u64 {
+        if let Some(tx_id) = self.current_tx
+            && let Some(&v) = self.tx_writer_versions.get(&tx_id)
+        {
+            return v;
+        }
+        // Autocommit shape: fresh version, immediately "committed"
+        // (no entry in active_writer_versions, so subsequent
+        // readers see the row).
+        self.next_writer_version()
+    }
+
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
     pub fn restore(catalog: Catalog) -> Self {
