@@ -20,8 +20,10 @@ mod nsw;
 pub mod persistent;
 pub mod persistent_btree;
 pub mod quantize;
+pub mod row_header;
 pub mod row_locator;
 pub mod segment;
+pub mod snapshot;
 mod table;
 pub mod trgm;
 
