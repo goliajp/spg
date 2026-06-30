@@ -1276,6 +1276,8 @@ impl Engine {
                 // to observe MVCC health (vacuum lag, in-flight
                 // tx count).
                 "spg_stat_mvcc" => return Ok(self.exec_spg_stat_mvcc()),
+                // v7.37.16 (16.11) — per-partition health row set.
+                "spg_partition_health" => return Ok(self.exec_spg_partition_health()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
                 "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
                 "spg_table_ddl" => return Ok(self.exec_spg_table_ddl()),
@@ -4067,11 +4069,12 @@ impl Engine {
                 "partition parent {parent_name:?} disappeared mid-expansion"
             )))
         })?;
-        let key_position = match &parent.schema().partition_role {
+        let (key_position, parent_kind) = match &parent.schema().partition_role {
             Some(PartitionRole::Parent {
                 key_column_positions,
+                kind,
                 ..
-            }) => *key_column_positions.first().unwrap_or(&0),
+            }) => (*key_column_positions.first().unwrap_or(&0), *kind),
             _ => {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "partition expansion: {parent_name:?} is not a parent"
@@ -4079,15 +4082,23 @@ impl Engine {
             }
         };
         let key_col_name = parent.schema().columns[key_position].name.clone();
-        // Extract the partition-key range from the WHERE clause. Bound
-        // `None` ⇒ open in that direction.
+        // v7.37.16 (16.7) — for RANGE we extract a (lo, hi) interval
+        // off the WHERE; for LIST / HASH we extract a single `=`
+        // literal (and the rest of the planner falls back to "keep
+        // every child" — same conservative path as 16.1/16.2).
         let (lo_bound, hi_bound) = match outer.where_.as_ref() {
             Some(expr) => extract_key_range(expr, &key_col_name),
             None => (None, None),
         };
+        let eq_value: Option<spg_storage::Value<'static>> = match outer.where_.as_ref() {
+            Some(expr) => extract_key_eq_value(expr, &key_col_name),
+            None => None,
+        };
         let children = crate::partition::children_of_parent(cat, parent_name);
         let mut kept: Vec<String> = Vec::new();
-        let mut has_default = false;
+        let mut default_child: Option<String> = None;
+        // First pass — apply per-strategy gates, defer DEFAULT until
+        // we know whether some non-DEFAULT child matched.
         for child_name in &children {
             let Some(child) = cat.get(child_name) else {
                 continue;
@@ -4098,22 +4109,58 @@ impl Engine {
                         kept.push(child_name.clone());
                     }
                 }
+                // v7.37.16 (16.7) — LIST pruning: if WHERE has `key
+                // = <lit>`, only the child whose values contain that
+                // literal survives. Otherwise (no equality predicate
+                // or planner couldn't extract one) keep the child
+                // conservatively.
+                Some(PartitionRole::List { values, .. }) => match &eq_value {
+                    Some(v) => {
+                        if values.iter().any(|b| b.equals_value(v)) {
+                            kept.push(child_name.clone());
+                        }
+                    }
+                    None => kept.push(child_name.clone()),
+                },
+                // v7.37.16 (16.7) — HASH pruning: with `key = <lit>`
+                // we know the residue class deterministically, so
+                // only the matching REMAINDER child survives.
+                Some(PartitionRole::Hash {
+                    modulus, remainder, ..
+                }) => match &eq_value {
+                    Some(v) => {
+                        let h = crate::partition::pg_compatible_hash(v);
+                        if h.rem_euclid(u64::from(*modulus)) == u64::from(*remainder) {
+                            kept.push(child_name.clone());
+                        }
+                    }
+                    None => kept.push(child_name.clone()),
+                },
                 Some(PartitionRole::Default { .. }) => {
-                    has_default = true;
-                    kept.push(child_name.clone());
-                }
-                // v7.37.16 (16.1/16.2) — LIST / HASH children: no
-                // TIMESTAMPTZ-Range pruning yet (planner pruning is
-                // 16.7-16.9). Always keep the child; correctness over
-                // planner micro-optimisation while the strategy
-                // matures.
-                Some(PartitionRole::List { .. }) | Some(PartitionRole::Hash { .. }) => {
-                    kept.push(child_name.clone());
+                    default_child = Some(child_name.clone());
                 }
                 _ => {}
             }
         }
-        let _ = has_default; // diagnostic only; pruning kept the DEFAULT unconditionally.
+        // PG-style DEFAULT semantics: the DEFAULT child must be
+        // scanned iff some row could fall outside every concrete
+        // child's bound predicate. We approximate that as "no
+        // concrete child matched" (== full prune) — strictly
+        // conservative for LIST / HASH (DEFAULT also catches rows
+        // outside the union of value-sets / residues), and matches
+        // PG for the equality case where we *do* know the routing
+        // outcome.
+        let _ = parent_kind; // used to silence dead-code lint while 16.8-9 lands.
+        if let Some(d) = default_child {
+            if kept.is_empty() {
+                kept.push(d);
+            } else if eq_value.is_none() {
+                // Without an equality literal, the DEFAULT child may
+                // still hold matching rows (e.g. LIKE on TEXT keys
+                // for which a LIST partition exists). Keep it.
+                kept.push(d);
+            }
+        }
         // Build the UNION ALL body text and re-parse — keeps the
         // rewrite expressible in surface SQL so the engine's existing
         // parser path handles the AST shape uniformly.
@@ -4329,6 +4376,69 @@ fn is_column_ref(e: &spg_sql::ast::Expr, key_col: &str) -> bool {
     } else {
         false
     }
+}
+
+/// v7.37.16 (16.7) — walk an AND-chain WHERE and pull a single
+/// `key_col = <literal>` predicate out for LIST/HASH partition
+/// pruning. Returns `None` when no equality literal can be lifted
+/// (planner then keeps every child — correctness preserved). The
+/// returned `Value<'static>` is an owned coercion so the caller can
+/// outlive any AST node it was extracted from.
+pub(crate) fn extract_key_eq_value(
+    expr: &spg_sql::ast::Expr,
+    key_col: &str,
+) -> Option<spg_storage::Value<'static>> {
+    let mut stack: Vec<&spg_sql::ast::Expr> = alloc::vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            spg_sql::ast::Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::And,
+                rhs,
+            } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            spg_sql::ast::Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } => {
+                let lit_side = if is_column_ref(lhs, key_col) {
+                    rhs.as_ref()
+                } else if is_column_ref(rhs, key_col) {
+                    lhs.as_ref()
+                } else {
+                    continue;
+                };
+                let cloned = lit_side.clone();
+                let Ok(v) = crate::conversions::literal_expr_to_value(cloned) else {
+                    continue;
+                };
+                // Coerce to an owned Value<'static> so the caller
+                // can hold it past the WHERE expression's lifetime.
+                let owned: spg_storage::Value<'static> = match v {
+                    spg_storage::Value::Text(s) => {
+                        spg_storage::Value::Text(alloc::borrow::Cow::Owned(s.into_owned()))
+                    }
+                    spg_storage::Value::SmallInt(n) => spg_storage::Value::SmallInt(n),
+                    spg_storage::Value::Int(n) => spg_storage::Value::Int(n),
+                    spg_storage::Value::BigInt(n) => spg_storage::Value::BigInt(n),
+                    spg_storage::Value::Date(d) => spg_storage::Value::Date(d),
+                    spg_storage::Value::Timestamp(t) => spg_storage::Value::Timestamp(t),
+                    spg_storage::Value::Bool(b) => spg_storage::Value::Bool(b),
+                    spg_storage::Value::Null => spg_storage::Value::Null,
+                    // Anything else (Vector / Json / Bytes / Numeric /
+                    // arrays / interval / …) isn't a current partition
+                    // key type; skip without pruning.
+                    _ => continue,
+                };
+                return Some(owned);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Coerce a literal Expr(after the parser folded sequence calls etc.)

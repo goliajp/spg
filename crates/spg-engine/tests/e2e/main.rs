@@ -150,6 +150,7 @@ mod e2e_partial_index;
 mod e2e_partition_attach_detach;
 mod e2e_partition_by_list_hash;
 mod e2e_partition_by_range;
+mod e2e_partition_pruning;
 mod e2e_per_table_budget;
 mod e2e_pg_array_2d;
 mod e2e_pg_constraint_view;
