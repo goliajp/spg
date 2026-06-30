@@ -509,6 +509,71 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v7.37.22 (22.2) — materialise `pg_statio_user_tables` rows.
+    /// PG exposes per-relation I/O counters that monitoring tools
+    /// (pgwatch / pganalyze / Datadog) query routinely. SPG's
+    /// storage model is hot-tier rows + cold-tier segments, both
+    /// of which the engine tracks at finer granularity than PG's
+    /// shared-buffer hit/read split. v7.37.22 (22.2) ships the
+    /// SQL shape with the columns PG dashboards expect; the
+    /// `heap_blks_*` / `idx_blks_*` numbers map to SPG's
+    /// hot/cold accounting where the mapping is unambiguous and
+    /// stay 0 otherwise.
+    ///
+    /// Columns (PG-exact order):
+    ///   relid OID NOT NULL              -- monotonic per table
+    ///   schemaname TEXT NOT NULL        -- always 'public'
+    ///   relname TEXT NOT NULL           -- table name
+    ///   heap_blks_read BIGINT NOT NULL  -- cold-tier reads (stub: 0)
+    ///   heap_blks_hit BIGINT NOT NULL   -- hot-tier reads (live row count)
+    ///   idx_blks_read BIGINT NOT NULL   -- cold-tier index reads (0)
+    ///   idx_blks_hit BIGINT NOT NULL    -- hot-tier index hits (sum of NSW + BTree probe counters, future)
+    ///   toast_blks_read BIGINT NOT NULL -- 0 (SPG has no TOAST)
+    ///   toast_blks_hit BIGINT NOT NULL  -- 0
+    ///   tidx_blks_read BIGINT NOT NULL  -- 0
+    ///   tidx_blks_hit BIGINT NOT NULL   -- 0
+    pub(crate) fn exec_pg_statio_user_tables(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("relid", DataType::BigInt, false),
+            ColumnSchema::new("schemaname", DataType::Text, false),
+            ColumnSchema::new("relname", DataType::Text, false),
+            ColumnSchema::new("heap_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("heap_blks_hit", DataType::BigInt, false),
+            ColumnSchema::new("idx_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("idx_blks_hit", DataType::BigInt, false),
+            ColumnSchema::new("toast_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("toast_blks_hit", DataType::BigInt, false),
+            ColumnSchema::new("tidx_blks_read", DataType::BigInt, false),
+            ColumnSchema::new("tidx_blks_hit", DataType::BigInt, false),
+        ];
+        let mut rows: Vec<Row<'static>> = Vec::new();
+        let mut relid: i64 = 16384; // PG starts user-relation OIDs above 16384
+        for name in self.catalog.table_names() {
+            if is_internal_table_name(&name) {
+                continue;
+            }
+            let Some(t) = self.catalog.get(&name) else {
+                continue;
+            };
+            let live_rows = t.rows().len() as i64;
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(relid),
+                Value::text::<String>("public".into()),
+                Value::Text(alloc::borrow::Cow::Owned(name)),
+                Value::BigInt(0),
+                Value::BigInt(live_rows),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+            ]));
+            relid += 1;
+        }
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v7.37.14 (B6.5) — materialise `pg_locks` rows. PG exposes a
     /// detailed lock table (locktype / database / relation /
     /// virtualtransaction / pid / mode / granted / fastpath /
