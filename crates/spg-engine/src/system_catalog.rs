@@ -193,6 +193,59 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.15) — synthesise `pg_catalog.pg_stat_user_indexes`.
+/// PG monitoring tools poll this to flag unused indexes (idx_scan
+/// = 0 over the scrape window) as drop candidates. Per-index
+/// counters land with v7.37.17's per-AM probes; the shape ships
+/// now so monitoring dashboards keep parsing.
+///
+/// PG-canonical columns:
+///   * relid (BigInt) — owning table OID
+///   * indexrelid (BigInt) — index OID
+///   * schemaname (Text) — 'public'
+///   * relname (Text) — owning table
+///   * indexrelname (Text)
+///   * idx_scan / idx_tup_read / idx_tup_fetch (BigInt) —
+///     usage counters
+pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("indexrelid", DataType::BigInt, false),
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("indexrelname", DataType::Text, false),
+        ColumnSchema::new("idx_scan", DataType::BigInt, false),
+        ColumnSchema::new("idx_tup_read", DataType::BigInt, false),
+        ColumnSchema::new("idx_tup_fetch", DataType::BigInt, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut relid: i64 = 16384;
+    let mut indexrelid: i64 = 100_000;
+    for tname in cat.table_names() {
+        if crate::is_internal_table_name(&tname) {
+            continue;
+        }
+        let Some(t) = cat.get(&tname) else {
+            continue;
+        };
+        for idx in t.indices() {
+            indexrelid = indexrelid.saturating_add(1);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(relid),
+                Value::BigInt(indexrelid),
+                Value::text("public"),
+                Value::Text(alloc::borrow::Cow::Owned(tname.clone())),
+                Value::Text(alloc::borrow::Cow::Owned(idx.name.clone())),
+                Value::BigInt(0), // idx_scan
+                Value::BigInt(0), // idx_tup_read
+                Value::BigInt(0), // idx_tup_fetch
+            ]));
+        }
+        relid = relid.saturating_add(1);
+    }
+    (schema, rows)
+}
+
 /// v7.37.22 (22.14) — synthesise `pg_catalog.pg_stat_user_tables`.
 /// PG monitoring tools poll this per-table view to track row
 /// churn (seq vs index scans, tup_ins/upd/del) and surface tables

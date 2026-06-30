@@ -415,6 +415,15 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.15) — pg_catalog.pg_stat_user_indexes
+                // (per-index usage counters; flag unused indexes).
+                "__spg_pg_stat_user_indexes" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_user_indexes(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
