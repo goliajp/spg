@@ -199,10 +199,7 @@ where
     pub fn publish_and_remove(&self, key: &K, shared: &Arc<RaceShared<V>>, value: V) {
         let _ = shared.sender.send(RaceState::Done(value));
         if let Some(map) = self.map.get() {
-            let _ = map
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(key);
+            let _ = map.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
         }
     }
 }
@@ -301,7 +298,9 @@ mod tests {
         // Second lookup — fresh leader.
         match guard.lookup(&key) {
             RaceLookup::First(_) => {}
-            RaceLookup::Existing(_) => panic!("after publish_and_remove, next lookup is fresh leader"),
+            RaceLookup::Existing(_) => {
+                panic!("after publish_and_remove, next lookup is fresh leader")
+            }
         }
         assert_eq!(
             guard.first_count.load(std::sync::atomic::Ordering::Relaxed),

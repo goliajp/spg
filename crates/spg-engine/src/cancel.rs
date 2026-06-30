@@ -246,7 +246,10 @@ mod tests {
         advance_clock(30);
         let _ = token.check_with_budget(&mut last, 100_000);
         let after_first = last;
-        assert!(after_first > 0, "first call must perform real check + update");
+        assert!(
+            after_first > 0,
+            "first call must perform real check + update"
+        );
 
         // Second call within budget — last must NOT change.
         advance_clock(30);
