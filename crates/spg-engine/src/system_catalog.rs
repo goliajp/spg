@@ -193,6 +193,75 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.14) — synthesise `pg_catalog.pg_stat_user_tables`.
+/// PG monitoring tools poll this per-table view to track row
+/// churn (seq vs index scans, tup_ins/upd/del) and surface tables
+/// that are candidates for ANALYZE or autovacuum.
+///
+/// PG-canonical columns (subset that monitoring tools actually
+/// consume; the full PG 18 view has 24 columns and the omitted
+/// ones are deprecated or per-column instrumented internals):
+///   * relid (BigInt) — table OID
+///   * schemaname (Text) — 'public'
+///   * relname (Text)
+///   * seq_scan (BigInt) — sequential-scan count
+///   * seq_tup_read (BigInt) — rows read via seqscan
+///   * idx_scan (BigInt) — index-scan count
+///   * idx_tup_fetch (BigInt) — rows fetched via index
+///   * n_tup_ins / n_tup_upd / n_tup_del (BigInt) — row write
+///     counters
+///   * n_live_tup / n_dead_tup (BigInt) — live + dead row
+///     estimates (live = row_count; dead = 0 until v7.37.15
+///     vacuum daemon tracks them)
+///   * last_vacuum / last_analyze (TIMESTAMPTZ, NULL)
+pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("seq_scan", DataType::BigInt, false),
+        ColumnSchema::new("seq_tup_read", DataType::BigInt, false),
+        ColumnSchema::new("idx_scan", DataType::BigInt, false),
+        ColumnSchema::new("idx_tup_fetch", DataType::BigInt, false),
+        ColumnSchema::new("n_tup_ins", DataType::BigInt, false),
+        ColumnSchema::new("n_tup_upd", DataType::BigInt, false),
+        ColumnSchema::new("n_tup_del", DataType::BigInt, false),
+        ColumnSchema::new("n_live_tup", DataType::BigInt, false),
+        ColumnSchema::new("n_dead_tup", DataType::BigInt, false),
+        ColumnSchema::new("last_vacuum", DataType::Timestamptz, true),
+        ColumnSchema::new("last_analyze", DataType::Timestamptz, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut relid: i64 = 16384; // PG user-relation OID floor
+    for name in cat.table_names() {
+        if crate::is_internal_table_name(&name) {
+            continue;
+        }
+        let Some(t) = cat.get(&name) else {
+            continue;
+        };
+        let live_rows = t.rows().len() as i64;
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(relid),
+            Value::text("public"),
+            Value::Text(alloc::borrow::Cow::Owned(name)),
+            Value::BigInt(0),       // seq_scan
+            Value::BigInt(0),       // seq_tup_read
+            Value::BigInt(0),       // idx_scan
+            Value::BigInt(0),       // idx_tup_fetch
+            Value::BigInt(0),       // n_tup_ins
+            Value::BigInt(0),       // n_tup_upd
+            Value::BigInt(0),       // n_tup_del
+            Value::BigInt(live_rows),
+            Value::BigInt(0),       // n_dead_tup (vacuum tracks; 0 until 15.16)
+            Value::Null,            // last_vacuum
+            Value::Null,            // last_analyze
+        ]));
+        relid = relid.saturating_add(1);
+    }
+    (schema, rows)
+}
+
 /// v7.37.22 (22.x-stat-db) — synthesise `pg_catalog.pg_stat_database`.
 /// PG's per-database scrape view that every monitoring tool
 /// (pgwatch, pganalyze, Datadog) polls to track per-DB query

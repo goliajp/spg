@@ -406,6 +406,15 @@ impl Engine {
                         crate::system_catalog::synth_pg_stat_database(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.14) — pg_catalog.pg_stat_user_tables
+                // (per-table churn counters; live_tup = row count).
+                "__spg_pg_stat_user_tables" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_user_tables(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
