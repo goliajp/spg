@@ -176,6 +176,7 @@ mod e2e_pg_enum_view;
 mod e2e_pg_hstore;
 mod e2e_pg_index_widened;
 mod e2e_pg_indexes_view;
+mod e2e_pg_inherits_depend;
 mod e2e_pg_money;
 mod e2e_pg_namespace_view;
 mod e2e_pg_proc_view;
