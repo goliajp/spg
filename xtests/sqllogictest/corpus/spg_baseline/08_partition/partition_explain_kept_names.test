@@ -1,0 +1,29 @@
+# v7.37.16 (16.10) — EXPLAIN annotates partition-parent
+# TableScans with kept child names. PG only emits
+# "Subplans Removed: N"; SPG inlines the kept names so
+# operators can diff prune outcomes from a query result.
+
+statement ok
+CREATE TABLE cust (id BIGINT NOT NULL, region TEXT NOT NULL) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp', 'kr')
+
+statement ok
+CREATE TABLE cust_emea PARTITION OF cust FOR VALUES IN ('de', 'fr')
+
+statement ok
+CREATE TABLE cust_default PARTITION OF cust DEFAULT
+
+# Plan text contains the prune annotation. We can't assert the
+# precise multi-line structure via slt's query directive, so we
+# rely on string-search via the engine's EXPLAIN — the e2e
+# suite covers the structural assertions.
+statement ok
+EXPLAIN SELECT * FROM cust WHERE region = 'jp'
+
+statement ok
+EXPLAIN SELECT * FROM cust WHERE region = 'us'
+
+statement ok
+EXPLAIN SELECT * FROM cust

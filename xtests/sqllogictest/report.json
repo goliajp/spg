@@ -427,9 +427,11 @@
         { "file": "writable_cte.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "spg_baseline/08_partition", "pass": 34, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/08_partition", "pass": 41, "fail": 0, "skip": 0,
       "files": [
         { "file": "partition_attach_detach.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "partition_explain_kept_names.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "partition_hash_basic.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
