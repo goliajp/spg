@@ -193,6 +193,56 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.21 (21.13-b) — synthesise `pg_catalog.pg_publication`.
+/// One row per CREATE PUBLICATION declaration. Logical-replication
+/// subscribers query this at handshake to validate the publication
+/// exists + carries the expected table set.
+///
+/// PG-canonical columns:
+///   * oid (BigInt) — publication OID (synthetic, monotonic)
+///   * pubname (Text)
+///   * pubowner (BigInt) — always 10 (postgres superuser OID)
+///   * puballtables (Bool) — true for `FOR ALL TABLES`
+///   * pubinsert / pubupdate / pubdelete / pubtruncate (Bool) —
+///     SPG publishes all four event types by default; flags
+///     surface true to match PG's default scope
+///   * pubviaroot (Bool) — partition-parent routing (PG 13+);
+///     false for SPG since we route at the engine layer
+pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_sql::ast::PublicationScope;
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("pubname", DataType::Text, false),
+        ColumnSchema::new("pubowner", DataType::BigInt, false),
+        ColumnSchema::new("puballtables", DataType::Bool, false),
+        ColumnSchema::new("pubinsert", DataType::Bool, false),
+        ColumnSchema::new("pubupdate", DataType::Bool, false),
+        ColumnSchema::new("pubdelete", DataType::Bool, false),
+        ColumnSchema::new("pubtruncate", DataType::Bool, false),
+        ColumnSchema::new("pubviaroot", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    // Synthetic OID band — pubs land above the table OID band
+    // (16384..) and above pg_enum's user band (50_000..).
+    let mut oid: i64 = 70_000;
+    for (name, scope) in eng.publications().iter() {
+        oid = oid.saturating_add(1);
+        let all_tables = matches!(scope, PublicationScope::AllTables);
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text(name.clone()),
+            Value::BigInt(10),
+            Value::Bool(all_tables),
+            Value::Bool(true),  // pubinsert
+            Value::Bool(true),  // pubupdate
+            Value::Bool(true),  // pubdelete
+            Value::Bool(true),  // pubtruncate
+            Value::Bool(false), // pubviaroot
+        ]));
+    }
+    (schema, rows)
+}
+
 /// v7.37.21 (21.13) — synthesise `pg_catalog.pg_replication_slots`.
 /// PG's slot table tracks each physical/logical replication
 /// stream's persistent LSN/restart-LSN position so a subscriber
