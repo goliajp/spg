@@ -733,9 +733,14 @@ impl Engine {
         }
         // v7.37.15 Phase C — MERGE inserts allocate one shared
         // writer version: every row produced by the same statement
-        // commits atomically so they share `xmin`. Snapshots taken
-        // before the statement commits hide every inserted row;
-        // snapshots after see them all.
+        // commits atomically so they share `xmin`. SPG's single-
+        // writer invariant guarantees no concurrent reader can
+        // observe the partial state, so we stamp + commit in
+        // one step (no in_progress lifetime). Phase C.next hooks
+        // begin/commit_writer_version into exec_begin/exec_commit
+        // so an explicit `BEGIN ... INSERT ... <other thread
+        // SELECT> ... COMMIT` shape hides the in-flight inserts
+        // from concurrent readers until COMMIT.
         let xmin = spg_storage::row_header::next_version();
         for vals in inserts {
             table
