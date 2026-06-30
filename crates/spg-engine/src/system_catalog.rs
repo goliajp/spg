@@ -193,6 +193,83 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.x-stat-db) — synthesise `pg_catalog.pg_stat_database`.
+/// PG's per-database scrape view that every monitoring tool
+/// (pgwatch, pganalyze, Datadog) polls to track per-DB query
+/// counts, deadlocks, conflicts, and cache-hit ratios. SPG is
+/// single-database so the row set is always exactly one row,
+/// surfacing the global engine counters under the `spg` database
+/// name PG-targeted dashboards expect.
+///
+/// PG-canonical columns (subset that monitoring tools actually
+/// read; the full PG 18 view has 27 columns and the omitted ones
+/// are deprecated or PG-internal):
+///   * datid (BigInt) — database OID (16384)
+///   * datname (Text) — `spg`
+///   * numbackends (Int) — pgwire backend connection count
+///   * xact_commit / xact_rollback (BigInt) — committed /
+///     rolled-back transaction counters
+///   * blks_read / blks_hit (BigInt) — cold-tier reads /
+///     hot-tier hits (mirrors per-relation pg_statio
+///     aggregated up to DB)
+///   * tup_returned / tup_fetched (BigInt) — rows returned
+///     across every SELECT / rows physically read
+///   * tup_inserted / tup_updated / tup_deleted (BigInt) —
+///     write counters
+///   * conflicts / deadlocks (BigInt) — replication-conflict
+///     count + per-DB deadlock count (always 0 for SPG single-
+///     writer; shape-stable so monitoring queries don't break)
+///   * temp_files / temp_bytes (BigInt) — disk-spill counters
+///     (0 — SPG aggregate spill lands in v7.37.19 (19.15))
+///   * blk_read_time / blk_write_time (Float) — accumulated
+///     I/O wait time (0 until per-statement timing lands)
+pub(crate) fn synth_pg_stat_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("datid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("numbackends", DataType::Int, false),
+        ColumnSchema::new("xact_commit", DataType::BigInt, false),
+        ColumnSchema::new("xact_rollback", DataType::BigInt, false),
+        ColumnSchema::new("blks_read", DataType::BigInt, false),
+        ColumnSchema::new("blks_hit", DataType::BigInt, false),
+        ColumnSchema::new("tup_returned", DataType::BigInt, false),
+        ColumnSchema::new("tup_fetched", DataType::BigInt, false),
+        ColumnSchema::new("tup_inserted", DataType::BigInt, false),
+        ColumnSchema::new("tup_updated", DataType::BigInt, false),
+        ColumnSchema::new("tup_deleted", DataType::BigInt, false),
+        ColumnSchema::new("conflicts", DataType::BigInt, false),
+        ColumnSchema::new("deadlocks", DataType::BigInt, false),
+        ColumnSchema::new("temp_files", DataType::BigInt, false),
+        ColumnSchema::new("temp_bytes", DataType::BigInt, false),
+        ColumnSchema::new("blk_read_time", DataType::Float, false),
+        ColumnSchema::new("blk_write_time", DataType::Float, false),
+    ];
+    // Single-row, single-database; everything reads as 0 until
+    // per-counter wiring lands (the shape is stable so monitoring
+    // queries parse).
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(16384),
+        Value::text("spg"),
+        Value::Int(0),         // numbackends — wired from server crate
+        Value::BigInt(0),      // xact_commit
+        Value::BigInt(0),      // xact_rollback
+        Value::BigInt(0),      // blks_read
+        Value::BigInt(0),      // blks_hit
+        Value::BigInt(0),      // tup_returned
+        Value::BigInt(0),      // tup_fetched
+        Value::BigInt(0),      // tup_inserted
+        Value::BigInt(0),      // tup_updated
+        Value::BigInt(0),      // tup_deleted
+        Value::BigInt(0),      // conflicts (PG: replication-conflict count)
+        Value::BigInt(0),      // deadlocks (SPG single-writer; always 0)
+        Value::BigInt(0),      // temp_files (spill; pending 19.15)
+        Value::BigInt(0),      // temp_bytes
+        Value::Float(0.0),     // blk_read_time
+        Value::Float(0.0),     // blk_write_time
+    ])];
+    (schema, rows)
+}
+
 /// v7.37.21 (21.13-c) — synthesise `pg_catalog.pg_subscription`.
 /// One row per CREATE SUBSCRIPTION. Logical-replication tooling
 /// (debezium, the PG `pg_stat_subscription` family of views,

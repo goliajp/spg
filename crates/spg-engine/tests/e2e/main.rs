@@ -184,6 +184,7 @@ mod e2e_pg_replication_slots;
 mod e2e_pg_subscription_view;
 mod e2e_pg_range;
 mod e2e_pg_settings_view;
+mod e2e_pg_stat_database;
 mod e2e_pg_stat_statements;
 mod e2e_pg_statio_user_tables;
 mod e2e_pg_time;

@@ -398,6 +398,14 @@ impl Engine {
                     let (schema, rows) = crate::system_catalog::synth_pg_subscription(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.x-stat-db) — pg_catalog.pg_stat_database
+                // (one row for SPG's single database; counters are
+                // shape-stable 0 until wiring lands).
+                "__spg_pg_stat_database" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_database(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
