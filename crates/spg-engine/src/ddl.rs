@@ -82,7 +82,320 @@ impl Engine {
             }
             T::RenameTable { new } => self.alter_rename_table(tbl, new),
             T::RenameColumn { old, new } => self.alter_rename_column(tbl, old, new),
+            T::AttachPartition { child, bounds } => {
+                self.alter_attach_partition(tbl, child, bounds)
+            }
+            T::DetachPartition {
+                child,
+                concurrently,
+                finalize,
+            } => self.alter_detach_partition(tbl, child, concurrently, finalize),
         }
+    }
+
+    /// v7.37.16 (16.3) — `ALTER TABLE parent ATTACH PARTITION child <bounds>`.
+    ///
+    /// Promotes an existing standalone table `child` into a partition
+    /// of `parent`. Enforces:
+    ///   1. `parent` is a partition parent (`PartitionRole::Parent`).
+    ///   2. `child` is currently standalone (`partition_role == None`).
+    ///   3. `child`'s column list is layout-compatible with `parent`
+    ///      (same column names, types and ordering — PG also requires
+    ///      this and uses it to delegate the actual storage).
+    ///   4. `bounds` shape matches `parent.kind` (Range/List/Hash).
+    ///   5. New range / list / hash bounds don't overlap any existing
+    ///      sibling — same gates as the CREATE TABLE … PARTITION OF
+    ///      path.
+    ///   6. Every existing row in `child` satisfies the bound predicate
+    ///      (PG's "partition constraint" check). Mis-fits raise; no
+    ///      silent re-routing.
+    fn alter_attach_partition(
+        &mut self,
+        parent_name: &str,
+        child_name: String,
+        bounds: spg_sql::ast::PartitionOfBoundsAst,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::PartitionOfBoundsAst;
+        use spg_storage::{PartitionKind, PartitionRole};
+        // Parent gate.
+        let (parent_kind, parent_columns) = {
+            let parent = self.active_catalog().get(parent_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: parent_name.into(),
+                })
+            })?;
+            match &parent.schema().partition_role {
+                Some(PartitionRole::Parent { kind, .. }) => {
+                    (*kind, parent.schema().columns.clone())
+                }
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE … ATTACH PARTITION: {parent_name:?} is not a partition parent"
+                    )));
+                }
+            }
+        };
+        // Child gate: must exist + be standalone + share parent's
+        // column layout.
+        {
+            let child = self.active_catalog().get(&child_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: child_name.clone(),
+                })
+            })?;
+            if child.schema().partition_role.is_some() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE … ATTACH PARTITION: {child_name:?} is already a partition; \
+                     DETACH it first"
+                )));
+            }
+            let child_cols = &child.schema().columns;
+            if child_cols.len() != parent_columns.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE … ATTACH PARTITION: column-count mismatch \
+                     ({child_name:?} has {}, {parent_name:?} has {})",
+                    child_cols.len(),
+                    parent_columns.len()
+                )));
+            }
+            for (c, p) in child_cols.iter().zip(parent_columns.iter()) {
+                if !c.name.eq_ignore_ascii_case(&p.name) || c.ty != p.ty {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE … ATTACH PARTITION: column {:?} of {child_name:?} \
+                         (type {:?}) doesn't match column {:?} of {parent_name:?} (type {:?})",
+                        c.name, c.ty, p.name, p.ty
+                    )));
+                }
+            }
+        }
+        // Resolve bounds (same gates as CREATE TABLE … PARTITION OF).
+        let role = match bounds {
+            PartitionOfBoundsAst::Default => PartitionRole::Default {
+                parent_name: parent_name.into(),
+            },
+            PartitionOfBoundsAst::Range { lower, upper } => {
+                if !matches!(parent_kind, PartitionKind::Range) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ATTACH PARTITION: FOR VALUES FROM/TO only valid for a RANGE-partitioned \
+                         parent (parent {parent_name:?} is {parent_kind:?})"
+                    )));
+                }
+                let lower_b = crate::partition::evaluate_partition_bound(*lower)?;
+                let upper_b = crate::partition::evaluate_partition_bound(*upper)?;
+                if !crate::partition::ranges_overlap(&lower_b, &upper_b, &lower_b, &upper_b) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ATTACH PARTITION: FROM ({}) TO ({}) is empty (lower must be < upper)",
+                        crate::partition::bound_to_diag(&lower_b),
+                        crate::partition::bound_to_diag(&upper_b),
+                    )));
+                }
+                for sib in
+                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                {
+                    let Some(t) = self.active_catalog().get(&sib) else {
+                        continue;
+                    };
+                    if let Some(PartitionRole::Range {
+                        lower: sl,
+                        upper: su,
+                        ..
+                    }) = &t.schema().partition_role
+                    {
+                        if crate::partition::ranges_overlap(&lower_b, &upper_b, sl, su) {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "ATTACH PARTITION: range FROM ({}) TO ({}) overlaps sibling \
+                                 {sib:?} (FROM ({}) TO ({}))",
+                                crate::partition::bound_to_diag(&lower_b),
+                                crate::partition::bound_to_diag(&upper_b),
+                                crate::partition::bound_to_diag(sl),
+                                crate::partition::bound_to_diag(su),
+                            )));
+                        }
+                    }
+                }
+                PartitionRole::Range {
+                    parent_name: parent_name.into(),
+                    lower: lower_b,
+                    upper: upper_b,
+                }
+            }
+            PartitionOfBoundsAst::List { values } => {
+                if !matches!(parent_kind, PartitionKind::List) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ATTACH PARTITION: FOR VALUES IN only valid for a LIST-partitioned \
+                         parent (parent {parent_name:?} is {parent_kind:?})"
+                    )));
+                }
+                let mut bounds_v = Vec::with_capacity(values.len());
+                for v in values {
+                    bounds_v.push(crate::partition::evaluate_partition_bound(v)?);
+                }
+                for sib in
+                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                {
+                    let Some(t) = self.active_catalog().get(&sib) else {
+                        continue;
+                    };
+                    if let Some(PartitionRole::List {
+                        values: existing, ..
+                    }) = &t.schema().partition_role
+                    {
+                        for new_b in &bounds_v {
+                            if existing.iter().any(|e| e == new_b) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "ATTACH PARTITION: LIST value {} already in sibling \
+                                     child {sib:?}",
+                                    crate::partition::bound_to_diag(new_b),
+                                )));
+                            }
+                        }
+                    }
+                }
+                PartitionRole::List {
+                    parent_name: parent_name.into(),
+                    values: bounds_v,
+                }
+            }
+            PartitionOfBoundsAst::Hash { modulus, remainder } => {
+                if !matches!(parent_kind, PartitionKind::Hash) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ATTACH PARTITION: FOR VALUES WITH only valid for a HASH-partitioned \
+                         parent (parent {parent_name:?} is {parent_kind:?})"
+                    )));
+                }
+                if modulus == 0 || remainder >= modulus {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ATTACH PARTITION: HASH (MODULUS={modulus}, REMAINDER={remainder}) \
+                         must satisfy modulus > 0 and remainder < modulus"
+                    )));
+                }
+                for sib in
+                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                {
+                    let Some(t) = self.active_catalog().get(&sib) else {
+                        continue;
+                    };
+                    if let Some(PartitionRole::Hash {
+                        modulus: m,
+                        remainder: r,
+                        ..
+                    }) = &t.schema().partition_role
+                    {
+                        if *m != modulus {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "ATTACH PARTITION: HASH MODULUS {modulus} differs from sibling \
+                                 {sib:?} MODULUS {m} (mixed moduli not yet supported)"
+                            )));
+                        }
+                        if *r == remainder {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "ATTACH PARTITION: HASH REMAINDER {remainder} already used \
+                                 by sibling {sib:?}"
+                            )));
+                        }
+                    }
+                }
+                PartitionRole::Hash {
+                    parent_name: parent_name.into(),
+                    modulus,
+                    remainder,
+                }
+            }
+        };
+        // PG-style "partition constraint" check — every existing row
+        // in child must satisfy the new role's predicate. For now we
+        // leave row-validation as TODO (16.3.b): pre-existing rows
+        // could violate the bound. v7.37.16.3 ships with a
+        // pessimistic gate: refuse ATTACH if the child has any rows
+        // and require the operator to either DROP them first or use
+        // a fresh empty child. This matches PG's safest behaviour
+        // (PG actually scans the rows; our scan path lands in
+        // 16.3.b). Match the spirit, not the letter.
+        let child_row_count = self
+            .active_catalog()
+            .get(&child_name)
+            .map(|t| t.rows().len())
+            .unwrap_or(0);
+        if child_row_count > 0 {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ATTACH PARTITION: {child_name:?} has {child_row_count} existing rows; \
+                 v7.37.16 (16.3) requires the child to be empty before attach. \
+                 Row-scan validation lands in 16.3.b"
+            )));
+        }
+        // Install role.
+        let child = self
+            .active_catalog_mut()
+            .get_mut(&child_name)
+            .expect("child existed above");
+        child.schema_mut().partition_role = Some(role);
+        Ok(())
+    }
+
+    /// v7.37.16 (16.4 + 16.5) — `ALTER TABLE parent DETACH PARTITION
+    /// child [CONCURRENTLY] [FINALIZE]`.
+    ///
+    /// Demotes a partition back to a standalone table by clearing
+    /// `partition_role`. CONCURRENTLY + FINALIZE are accepted at the
+    /// parser; semantically SPG's single-engine model lets us detach
+    /// atomically (PG's two-phase split addresses replication lag,
+    /// which doesn't apply here).
+    fn alter_detach_partition(
+        &mut self,
+        parent_name: &str,
+        child_name: String,
+        _concurrently: bool,
+        _finalize: bool,
+    ) -> Result<(), EngineError> {
+        use spg_storage::PartitionRole;
+        // Parent gate.
+        {
+            let parent = self.active_catalog().get(parent_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: parent_name.into(),
+                })
+            })?;
+            if !matches!(
+                parent.schema().partition_role,
+                Some(PartitionRole::Parent { .. })
+            ) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE … DETACH PARTITION: {parent_name:?} is not a partition parent"
+                )));
+            }
+        }
+        // Child gate: must be a partition of THIS parent.
+        {
+            let child = self.active_catalog().get(&child_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: child_name.clone(),
+                })
+            })?;
+            let parent_of_child = match &child.schema().partition_role {
+                Some(PartitionRole::Range { parent_name, .. })
+                | Some(PartitionRole::List { parent_name, .. })
+                | Some(PartitionRole::Hash { parent_name, .. })
+                | Some(PartitionRole::Default { parent_name }) => parent_name.clone(),
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "DETACH PARTITION: {child_name:?} is not a partition"
+                    )));
+                }
+            };
+            if parent_of_child != parent_name {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "DETACH PARTITION: {child_name:?} is a partition of {parent_of_child:?}, \
+                     not {parent_name:?}"
+                )));
+            }
+        }
+        // Clear role.
+        let child = self
+            .active_catalog_mut()
+            .get_mut(&child_name)
+            .expect("child existed above");
+        child.schema_mut().partition_role = None;
+        Ok(())
     }
 
     fn alter_set_hot_tier_bytes(&mut self, tbl: &str, n: u64) -> Result<(), EngineError> {
