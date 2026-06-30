@@ -138,6 +138,11 @@ use core::fmt;
 // crates (spg-embedded → spg-sqlx) don't need a direct dep on
 // spg-sql for the prepare/bind handle.
 pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
+// v7.37.14 (A2.5-stub) — re-export the silent-FOR-UPDATE telemetry
+// helper through the engine surface so downstream wrappers
+// (spg-embedded / spg-embedded-tokio / spgctl) and their tests
+// don't need a direct `spg-sql` dep.
+pub use spg_sql::silent_for_update_count;
 use spg_sql::parser::ParseError;
 use spg_storage::{Catalog, ColumnSchema, Row, RowChange, StorageError};
 

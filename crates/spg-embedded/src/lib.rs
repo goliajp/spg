@@ -5840,6 +5840,52 @@ mod tests {
         );
     }
 
+    /// v7.37.14 (A2.5-stub TDD) — the parser silently absorbs
+    /// `SELECT ... FOR UPDATE` (and FOR SHARE / FOR KEY SHARE /
+    /// FOR NO KEY UPDATE) so existing client code paths
+    /// (mailrs / Rails / Django) keep loading. Pre-v7.37.14 there
+    /// was no way to surface "your workload widely uses FOR UPDATE
+    /// but it's currently a no-op"; the counter
+    /// `spg_engine::silent_for_update_count()` is the observability
+    /// hook so operators can gauge how much of the workload
+    /// depends on the advisory locks before v7.37.15 lands the
+    /// per-row tuple locking that actually honours them.
+    ///
+    /// Test: parse 4 clauses (FOR UPDATE + FOR SHARE OF + FOR KEY
+    /// SHARE + FOR NO KEY UPDATE), assert counter delta = 4.
+    #[test]
+    fn v7_37_14_silent_for_update_clauses_bump_counter() {
+        let dir = tmpdir();
+        let db_path = dir.join("for_update_telemetry_db");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE t (id BIGINT, name TEXT)")
+            .expect("ddl");
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .expect("seed");
+
+        let baseline = spg_engine::silent_for_update_count();
+
+        // Each statement contains exactly one FOR clause; the
+        // parser-side consume loop bumps the counter once per
+        // clause. Stack-clause statements (e.g. `FOR UPDATE OF a
+        // FOR SHARE OF b`) would bump twice.
+        db.execute("SELECT * FROM t FOR UPDATE").expect("fu");
+        db.execute("SELECT * FROM t FOR SHARE OF t").expect("fs");
+        db.execute("SELECT * FROM t FOR KEY SHARE").expect("fks");
+        db.execute("SELECT * FROM t FOR NO KEY UPDATE")
+            .expect("fnku");
+
+        let after = spg_engine::silent_for_update_count();
+        assert_eq!(
+            after - baseline,
+            4,
+            "4 FOR-clause statements must increment the counter by 4 \
+             (baseline {baseline}, after {after}); without this telemetry \
+             a workload that depends on advisory FOR UPDATE has no signal \
+             that the locks are not enforced pre-v7.37.15."
+        );
+    }
+
     /// v7.37.13 (A1.6 TDD red-then-green) — `freeze_oldest_to_cold`
     /// performs a `tmp + rename` of the cold-segment file but must
     /// also fsync the **parent directory** so a power loss after the
