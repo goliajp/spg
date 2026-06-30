@@ -1163,6 +1163,13 @@ impl Parser {
                 }
             }
             // v7.17.0 Phase 1.3 — REFRESH MATERIALIZED VIEW name [WITH [NO] DATA].
+            // v7.37.19 (19.8) — `CONCURRENTLY` modifier (PG 9.4+) parsed
+            // and accepted before the view name. SPG materialised
+            // views re-evaluate on read (always-fresh semantics), so
+            // the CONCURRENTLY-vs-serial distinction has no runtime
+            // effect — the refresh body does not block readers either
+            // way. Same accept-and-no-op pattern as DETACH PARTITION
+            // CONCURRENTLY (16.5).
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("refresh") => {
                 self.advance();
                 let nxt = self.peek().clone();
@@ -1181,6 +1188,12 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // Optional CONCURRENTLY noise word — consumed without
+                // changing semantics.
+                if matches!(self.peek(), Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("concurrently"))
+                {
+                    self.advance();
+                }
                 let name = self.expect_ident_like()?;
                 let with_data = self.parse_optional_with_data(true)?;
                 Ok(Statement::RefreshMaterializedView { name, with_data })

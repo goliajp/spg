@@ -101,6 +101,22 @@ fn drop_materialized_view_if_exists_silent() {
         .unwrap();
 }
 
+/// v7.37.19 (19.8) — REFRESH MATERIALIZED VIEW CONCURRENTLY parses
+/// and executes identically to the non-CONCURRENTLY form. SPG
+/// materialised views re-evaluate on read (always-fresh semantics),
+/// so the CONCURRENTLY-vs-serial distinction has no runtime effect.
+#[test]
+fn refresh_materialized_view_concurrently_parses() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+    e.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t")
+        .unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA")
+        .unwrap();
+}
+
 #[test]
 fn create_materialized_view_with_column_rename() {
     let mut e = Engine::new();
