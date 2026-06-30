@@ -30,10 +30,9 @@
 
 #![deny(missing_debug_implementations)]
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock};
 
 /// v7.37.13 (A1.1) — count of times the background self-wake task
 /// successfully invoked the checkpoint trigger on an idle AsyncDatabase.
@@ -130,50 +129,56 @@ pub use spg_embedded::{
 };
 pub use spg_engine::CatalogSnapshot;
 
-use tokio::sync::{RwLock, watch};
+// v7.37.14 (B2.4) — generic race-dedup primitive. Originally
+// inlined in this file for the v7.37.11 INFLIGHT_OPENS path;
+// extracted so future race shapes (index rebuild, partition
+// attach, ...) reuse the same watch-channel race-fix from
+// v7.37.12 instead of re-deriving it per site.
+pub mod race_guard;
+pub use race_guard::{RaceGuard, RaceLookup, RaceShared};
+
+use tokio::sync::RwLock;
 use tokio::task::JoinError;
 
-/// v7.37.11 (mailrs cascade 7 P0 #2) — process-wide registry of
-/// in-flight `AsyncDatabase::open_path` calls, keyed by canonical
+/// v7.37.11 (mailrs cascade 7 P0 #2) — process-wide deduplication
+/// of in-flight `AsyncDatabase::open_path` calls, keyed by canonical
 /// path. Concurrent open_path callers for the same path share the
-/// same `OpenPathShared` so they wait on ONE detached spawn_blocking
-/// instead of racing to construct overlapping `Database::open_path`
-/// invocations (the race that the v7.37.5 `ACTIVE_OPEN_PATHS`
-/// in-process registry was designed to refuse — but mailrs's
-/// spg-sqlx Pool kept retrying after each refusal). With this
-/// dedup, the second-arrival caller never enters Database::open_path;
-/// it just awaits the first caller's result over a watch channel.
+/// same shared inflight handle so they wait on ONE detached
+/// spawn_blocking instead of racing to construct overlapping
+/// `Database::open_path` invocations (the race that the v7.37.5
+/// `ACTIVE_OPEN_PATHS` in-process registry was designed to refuse —
+/// but mailrs's spg-sqlx Pool kept retrying after each refusal).
+/// With this dedup, the second-arrival caller never enters
+/// Database::open_path; it just awaits the first caller's result.
 ///
 /// v7.37.12 — replaced the original Notify+Mutex pair with a
-/// `tokio::sync::watch` channel. The Notify pattern had a
-/// theoretical (but on slow-open_path workloads, real) race: a
-/// late-arriving caller could subscribe to Notify *after* the
-/// spawn-blocking task fired `notify_waiters()` (which doesn't
-/// store a permit). The watch channel uses internal version marks
-/// so `changed().await` returns immediately if the value advanced
-/// between the receiver's last `borrow_and_update()` and the
-/// `.changed()` call — closing that race.
-struct OpenPathShared {
-    sender: watch::Sender<OpenPathState>,
+/// `tokio::sync::watch` channel to close a subscribe-after-publish
+/// race (the Notify variant didn't store a permit; a late receiver
+/// could miss `notify_waiters()`).
+///
+/// v7.37.14 (B2.4) — extracted to the generic [`RaceGuard`]
+/// primitive in `race_guard.rs`. The on-the-wire behaviour is
+/// identical; the bespoke `OpenPathShared` / `InflightLookup`
+/// types are gone. Future race-dedup shapes (index rebuild,
+/// partition attach, etc.) reuse the same primitive.
+static INFLIGHT_OPENS: RaceGuard<PathBuf, Result<AsyncDatabase, EngineError>> = RaceGuard::new();
+
+/// v7.37.12 — observability counters for the dedup path. Forwarded
+/// from the underlying `RaceGuard` counters so existing callers
+/// (`spgctl`, test harnesses) read the same atomic addresses they
+/// did before v7.37.14 — i.e. this is a 0-source-change
+/// observability migration, not just a refactor.
+pub fn open_path_dedup_first_count() -> u64 {
+    INFLIGHT_OPENS
+        .first_count
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[derive(Clone)]
-enum OpenPathState {
-    InFlight,
-    Done(Result<AsyncDatabase, EngineError>),
+pub fn open_path_dedup_existing_count() -> u64 {
+    INFLIGHT_OPENS
+        .existing_count
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
-
-static INFLIGHT_OPENS: OnceLock<Mutex<HashMap<PathBuf, Arc<OpenPathShared>>>> = OnceLock::new();
-
-/// v7.37.12 — observability counters for the v7.37.11 dedup path.
-/// Bumped on every `inflight_shared` lookup so an operator can
-/// confirm dedup is firing on real prod workloads without needing
-/// to attach a debugger. Public so external diagnostic binaries
-/// (e.g. spgctl or test harnesses) can read them.
-pub static OPEN_PATH_DEDUP_FIRST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static OPEN_PATH_DEDUP_EXISTING: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// v7.37.12 — when `SPG_OPEN_PATH_LOG=1` is set, every open_path
 /// call emits a single stderr line covering the dedup decision +
@@ -183,26 +188,6 @@ pub static OPEN_PATH_DEDUP_EXISTING: std::sync::atomic::AtomicU64 =
 /// pattern) can flip the flag without redeploying.
 fn open_path_log_enabled() -> bool {
     std::env::var_os("SPG_OPEN_PATH_LOG").is_some()
-}
-
-enum InflightLookup {
-    First(Arc<OpenPathShared>),
-    Existing(Arc<OpenPathShared>),
-}
-
-fn inflight_shared(canonical: &Path) -> InflightLookup {
-    let map = INFLIGHT_OPENS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = guard.get(canonical) {
-        OPEN_PATH_DEDUP_EXISTING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        InflightLookup::Existing(Arc::clone(s))
-    } else {
-        OPEN_PATH_DEDUP_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (sender, _) = watch::channel(OpenPathState::InFlight);
-        let s = Arc::new(OpenPathShared { sender });
-        guard.insert(canonical.to_path_buf(), Arc::clone(&s));
-        InflightLookup::First(s)
-    }
 }
 
 /// v7.34.1 (mailrs prod report bug B): drop the previous
@@ -342,10 +327,10 @@ impl AsyncDatabase {
         // caller seeds the shared entry; subsequent callers attach
         // before the result is published. On result publication, all
         // waiters wake; map entry is removed.
-        let shared = inflight_shared(&canonical);
-        let (is_first, shared) = match shared {
-            InflightLookup::First(s) => (true, s),
-            InflightLookup::Existing(s) => (false, s),
+        let lookup = INFLIGHT_OPENS.lookup(&canonical);
+        let (is_first, shared) = match lookup {
+            RaceLookup::First(s) => (true, s),
+            RaceLookup::Existing(s) => (false, s),
         };
         if log_enabled {
             eprintln!(
@@ -361,65 +346,38 @@ impl AsyncDatabase {
                 let result = Database::open_path(path).map(|db| Self {
                     inner: std::sync::Arc::new(tokio::sync::RwLock::new(db)),
                 });
-                // Publish result + wake all watchers atomically.
-                // watch::Sender::send is fail-safe: returns Err only
-                // when no receivers exist, which can't happen here
-                // since the spawn task itself holds a Sender that
-                // hasn't dropped.
-                let _ = shared2.sender.send(OpenPathState::Done(result));
-                // Drop the map entry so future open_paths spawn a
-                // fresh worker (the AsyncDatabase clones the inner
-                // Arc<RwLock>, so the shared entry's purpose ends
-                // once results are delivered).
-                if let Some(map) = INFLIGHT_OPENS.get() {
-                    let _ = map
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&canonical2);
-                }
+                // v7.37.14 — RaceGuard handles publish + map removal
+                // atomically; followers wake from the watch channel.
+                INFLIGHT_OPENS.publish_and_remove(&canonical2, &shared2, result);
             });
         }
-        let mut receiver = shared.sender.subscribe();
-        loop {
-            {
-                let state = receiver.borrow_and_update();
-                if let OpenPathState::Done(r) = &*state {
-                    if log_enabled {
-                        eprintln!(
-                            "[spg open_path] path={} role={} elapsed={:.3}s status={}",
-                            canonical.display(),
-                            if is_first { "first" } else { "existing" },
-                            start.elapsed().as_secs_f64(),
-                            if r.is_ok() { "ok" } else { "err" }
-                        );
-                    }
-                    // v7.37.13 (A1.1) — start the background self-wake
-                    // checkpoint timer on every successful open_path so
-                    // the on-disk snapshot advances on its own schedule
-                    // even if the calling app goes fully idle. The task
-                    // holds a Weak<RwLock<Database>>, so it auto-exits
-                    // when the last AsyncDatabase clone drops.
-                    if let Ok(db) = r {
-                        spawn_self_wake_checkpoint_task(std::sync::Arc::downgrade(&db.inner));
-                        return Ok(db.clone());
-                    }
-                    return r.clone();
-                }
+        // Both leader and followers await via the shared. The leader
+        // ends up reading its own published result (no special path).
+        if let Some(result) = shared.subscribe_done().await {
+            if log_enabled {
+                eprintln!(
+                    "[spg open_path] path={} role={} elapsed={:.3}s status={}",
+                    canonical.display(),
+                    if is_first { "first" } else { "existing" },
+                    start.elapsed().as_secs_f64(),
+                    if result.is_ok() { "ok" } else { "err" }
+                );
             }
-            // changed() is race-safe: returns immediately if the
-            // version mark advanced between our last
-            // borrow_and_update() and this call, so we never miss a
-            // send() that fired in that gap (the Notify+Mutex pair
-            // this replaces had exactly that race window).
-            if receiver.changed().await.is_err() {
-                // Sender dropped without sending Done — only
-                // possible if the OpenPathShared was racing
-                // dropped after a successful Done, which we'd
-                // have observed via borrow_and_update above.
-                // Treat as cancellation.
-                return Err(EngineError::Cancelled);
+            // v7.37.13 (A1.1) — start the background self-wake
+            // checkpoint timer on every successful open_path so the
+            // on-disk snapshot advances on its own schedule even if
+            // the calling app goes fully idle. The task holds a
+            // Weak<RwLock<Database>>, so it auto-exits when the last
+            // AsyncDatabase clone drops.
+            if let Ok(ref db) = result {
+                spawn_self_wake_checkpoint_task(std::sync::Arc::downgrade(&db.inner));
             }
+            return result;
         }
+        // Subscribe returned None → channel sender dropped without
+        // publishing Done. Should not happen in practice (the
+        // spawn_blocking always sends), but treat as cancellation.
+        Err(EngineError::Cancelled)
     }
 
     /// Execute a single SQL statement.
