@@ -457,6 +457,53 @@ fn execute_stmts(
                 let value = resolver(&substituted)?;
                 locals.insert(var.clone(), value);
             }
+            PlPgSqlStmt::While { condition, body } => {
+                // v7.37.20 (20.3) — WHILE <cond> LOOP iteration.
+                // Iteration count bounded by a generous budget so a
+                // mis-spelled condition can't lock the engine. The
+                // budget matches the v7.12.6 trigger-recursion cap
+                // shape (~1M iterations).
+                const WHILE_LOOP_BUDGET: u64 = 1_000_000;
+                let mut iter: u64 = 0;
+                loop {
+                    if iter >= WHILE_LOOP_BUDGET {
+                        return Err(TriggerError::RaiseException {
+                            function: ctx.function.into(),
+                            message: alloc::format!(
+                                "WHILE loop iteration budget {WHILE_LOOP_BUDGET} reached — likely runaway condition"
+                            ),
+                        });
+                    }
+                    let v = eval_with_new_old_and_locals(
+                        condition,
+                        current_new.as_ref(),
+                        old_row,
+                        locals,
+                        ctx.columns,
+                        ctx.table_name,
+                        ctx.params,
+                        ctx.default_text_search_config,
+                    )
+                    .map_err(|cause| TriggerError::EvalFailed {
+                        function: ctx.function.into(),
+                        cause,
+                    })?;
+                    if !matches!(v, spg_storage::Value::Bool(true)) {
+                        break;
+                    }
+                    // Re-enter the trigger body interpreter on `body`.
+                    // Recursive call shares the same `ctx`,
+                    // `current_new`, `old_row`, `locals`, `deferred`
+                    // so any Assign / RAISE / EmbeddedSql side effect
+                    // inside the loop propagates back the same way
+                    // the IF / ELSE arms do.
+                    match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
+                        BodyOutcome::FellThrough => {}
+                        early => return Ok(early),
+                    }
+                    iter += 1;
+                }
+            }
             PlPgSqlStmt::Assert { condition, message } => {
                 // v7.37.20 (20.14) — ASSERT <cond> [, <msg>]. If
                 // the condition evaluates to a falsy Value (NULL or

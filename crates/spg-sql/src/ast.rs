@@ -1043,6 +1043,15 @@ pub enum PlPgSqlStmt {
         condition: Expr,
         message: Option<Expr>,
     },
+    /// v7.37.20 (20.3) — `WHILE <condition> LOOP <body> END LOOP;`.
+    /// Iterate the body while condition evaluates truthy. Iteration
+    /// count is bounded by `WHILE_LOOP_BUDGET` to prevent runaway
+    /// loops; the executor errors out when reached. EXIT / CONTINUE
+    /// inside the body queue with 20.2.
+    While {
+        condition: Expr,
+        body: Vec<PlPgSqlStmt>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3583,6 +3592,13 @@ impl fmt::Display for PlPgSqlStmt {
                     write!(f, ", {m}")?;
                 }
                 Ok(())
+            }
+            Self::While { condition, body } => {
+                writeln!(f, "WHILE {condition} LOOP")?;
+                for s in body {
+                    writeln!(f, "  {s};")?;
+                }
+                f.write_str("END LOOP")
             }
         }
     }
