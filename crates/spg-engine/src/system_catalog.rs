@@ -370,15 +370,34 @@ fn pg_type_oid(ty: DataType) -> i64 {
 /// land in follow-up work — sqlx encoders don't query them at
 /// connect time.
 pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.37.24 (24.7) — widened from 8 to 16 PG-canonical columns.
+    // ORMs / monitoring tools query typbyval / typispreferred /
+    // typdelim / typisdefined to decide encoding strategies; the
+    // shape matches PG exactly so introspection round-trips
+    // succeed.
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("typname", DataType::Text, false),
+        ColumnSchema::new("typnamespace", DataType::BigInt, false),
+        ColumnSchema::new("typowner", DataType::BigInt, false),
         ColumnSchema::new("typlen", DataType::SmallInt, false),
+        ColumnSchema::new("typbyval", DataType::Bool, false),
         ColumnSchema::new("typtype", DataType::Text, false),
         ColumnSchema::new("typcategory", DataType::Text, false),
+        ColumnSchema::new("typispreferred", DataType::Bool, false),
+        ColumnSchema::new("typisdefined", DataType::Bool, false),
+        ColumnSchema::new("typdelim", DataType::Text, false),
+        ColumnSchema::new("typrelid", DataType::BigInt, false),
+        ColumnSchema::new("typsubscript", DataType::Text, false),
         ColumnSchema::new("typelem", DataType::BigInt, false),
         ColumnSchema::new("typarray", DataType::BigInt, false),
-        ColumnSchema::new("typnamespace", DataType::BigInt, false),
+        ColumnSchema::new("typalign", DataType::Text, false),
+        ColumnSchema::new("typstorage", DataType::Text, false),
+        ColumnSchema::new("typnotnull", DataType::Bool, false),
+        ColumnSchema::new("typbasetype", DataType::BigInt, false),
+        ColumnSchema::new("typtypmod", DataType::Int, false),
+        ColumnSchema::new("typndims", DataType::Int, false),
+        ColumnSchema::new("typcollation", DataType::BigInt, false),
     ];
     // (oid, name, len, type, cat, elem, array_oid). PG OID
     // numbers come straight from `pg_type.dat`.
@@ -459,29 +478,72 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         (3645, "_tsquery", 3615),
     ];
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(scalars.len() + arrays.len());
-    for &(oid, name, len, ty, cat, elem, arr) in scalars {
-        rows.push(Row::new(alloc::vec![
+    // Build a row from PG's type-attribute conventions:
+    //   typbyval        — fixed-width ∈ {1,2,4,8} (PG SQL_pass-by-value)
+    //   typdelim        — ',' for all built-ins
+    //   typalign        — 'c'/'s'/'i'/'d' from typlen
+    //   typstorage      — 'p' for fixed-width, 'x' (extended) for varlena
+    //   typispreferred  — true for canonical "preferred" type in category
+    //     (text in 'S', int4 in 'N', timestamptz in 'D' — same as
+    //     PG's typcategory preferred-conversion target)
+    let preferred_oids: &[i64] = &[16, 25, 23, 1184, 1700];
+    let build_row = |oid: i64,
+                     name: &str,
+                     len: i16,
+                     ty: &str,
+                     cat: &str,
+                     elem: i64,
+                     arr: i64,
+                     subscript: &str|
+     -> Row<'static> {
+        let typbyval = len > 0 && len <= 8;
+        let typalign = match len {
+            1 => "c",
+            2 => "s",
+            4 => "i",
+            _ => "d",
+        };
+        let typstorage = if len > 0 { "p" } else { "x" };
+        let typispreferred = preferred_oids.contains(&oid);
+        Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
+            Value::BigInt(2200), // typnamespace
+            Value::BigInt(10),   // typowner (postgres superuser OID)
             Value::SmallInt(len),
+            Value::Bool(typbyval),
             Value::text::<String>(ty.into()),
             Value::text::<String>(cat.into()),
+            Value::Bool(typispreferred),
+            Value::Bool(true),                       // typisdefined
+            Value::text::<String>(",".into()),       // typdelim
+            Value::BigInt(0),                        // typrelid (composite-type table OID)
+            Value::text::<String>(subscript.into()), // typsubscript
             Value::BigInt(elem),
             Value::BigInt(arr),
-            Value::BigInt(2200),
-        ]));
+            Value::text::<String>(typalign.into()),
+            Value::text::<String>(typstorage.into()),
+            Value::Bool(false), // typnotnull — base types are nullable
+            Value::BigInt(0),   // typbasetype (DOMAIN base; 0 for base types)
+            Value::Int(-1),     // typtypmod
+            Value::Int(0),      // typndims
+            Value::BigInt(0),   // typcollation — 0 (default)
+        ])
+    };
+    for &(oid, name, len, ty, cat, elem, arr) in scalars {
+        rows.push(build_row(oid, name, len, ty, cat, elem, arr, "-"));
     }
     for &(oid, name, elem) in arrays {
-        rows.push(Row::new(alloc::vec![
-            Value::BigInt(oid),
-            Value::text::<String>(name.into()),
-            Value::SmallInt(-1),
-            Value::text::<String>("b".into()),
-            Value::text::<String>("A".into()),
-            Value::BigInt(elem),
-            Value::BigInt(0),
-            Value::BigInt(2200),
-        ]));
+        rows.push(build_row(
+            oid,
+            name,
+            -1,
+            "b",
+            "A",
+            elem,
+            0,
+            "array_subscript_handler",
+        ));
     }
     (schema, rows)
 }
