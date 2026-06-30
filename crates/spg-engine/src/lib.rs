@@ -327,6 +327,17 @@ struct TxState {
     /// after it; `RELEASE <name>` discards the entry and everything
     /// after; COMMIT/ROLLBACK clears the whole stack.
     savepoints: Vec<(String, Catalog)>,
+    /// v7.37.15 (Phase E) — cached MVCC snapshot for REPEATABLE
+    /// READ / SERIALIZABLE. Captured at `exec_begin` time when the
+    /// session's `current_isolation_level` is RR/SER; read paths
+    /// inside the TX use this snapshot rather than calling
+    /// `Engine::current_snapshot` per statement, so a row that
+    /// becomes visible mid-tx (because another writer committed)
+    /// is NOT exposed to this tx — preserving RR's invariant.
+    ///
+    /// `None` for READ COMMITTED (default): each statement gets a
+    /// fresh snapshot via `current_snapshot()`.
+    cached_snapshot: Option<spg_storage::snapshot::Snapshot>,
 }
 
 /// v7.11.0 — frozen read-only view of the engine's committed state.
@@ -696,17 +707,33 @@ impl Engine {
         }
     }
 
-    /// v7.37.15 (Phase B / C) — current per-row visibility snapshot
-    /// for in-engine scans. Captures the live writer-version cursor
-    /// + active-writer set; readers built from this Snapshot see
-    /// committed state through the moment of capture and DO NOT
-    /// observe uncommitted writes still inside `active_writer_versions`.
+    /// v7.37.15 (Phase B / C / E) — current per-row visibility
+    /// snapshot for in-engine scans. Captures the live writer-
+    /// version cursor + active-writer set; readers built from this
+    /// Snapshot see committed state through the moment of capture
+    /// and DO NOT observe uncommitted writes still inside
+    /// `active_writer_versions`.
+    ///
+    /// Phase E: if there's an explicit transaction in flight under
+    /// REPEATABLE READ or SERIALIZABLE isolation, returns the
+    /// snapshot the tx cached at BEGIN time — every statement in
+    /// the tx sees the same coherent prior-committed view. READ
+    /// COMMITTED (the default) returns a fresh snapshot per call,
+    /// matching PG's per-statement visibility semantics.
     ///
     /// `oldest_active = version` when no writer is in flight (== no
     /// dead row could still be observed); else == min of active
     /// versions (vacuum-floor).
     #[must_use]
     pub fn current_snapshot(&self) -> spg_storage::snapshot::Snapshot {
+        // Phase E — if we're inside a RR/SER tx, return its
+        // cached snapshot so the whole tx sees one frozen view.
+        if let Some(tx_id) = self.current_tx
+            && let Some(state) = self.tx_catalogs.get(&tx_id)
+            && let Some(s) = state.cached_snapshot.as_ref()
+        {
+            return s.clone();
+        }
         let version = spg_storage::row_header::current_version();
         if self.active_writer_versions.is_empty() {
             // Hot path: no writer in flight. Snapshot::unbounded()

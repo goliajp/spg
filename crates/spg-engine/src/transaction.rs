@@ -15,11 +15,22 @@ impl Engine {
         if self.tx_catalogs.contains_key(&tx_id) {
             return Err(EngineError::TransactionAlreadyOpen);
         }
+        // v7.37.15 Phase E — cache an MVCC snapshot at BEGIN for
+        // REPEATABLE READ / SERIALIZABLE so the tx sees a frozen
+        // view across statements. READ COMMITTED (the default)
+        // gets None so every statement uses a fresh snapshot.
+        let cached_snapshot = match self.current_isolation_level {
+            spg_sql::ast::IsolationLevel::RepeatableRead
+            | spg_sql::ast::IsolationLevel::Serializable => Some(self.current_snapshot()),
+            spg_sql::ast::IsolationLevel::ReadUncommitted
+            | spg_sql::ast::IsolationLevel::ReadCommitted => None,
+        };
         self.tx_catalogs.insert(
             tx_id,
             TxState {
                 catalog: self.catalog.clone(),
                 savepoints: Vec::new(),
+                cached_snapshot,
             },
         );
         // v7.37.15 Phase C — allocate a writer version for the
