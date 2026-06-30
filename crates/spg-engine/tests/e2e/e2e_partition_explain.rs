@@ -134,6 +134,80 @@ fn explain_range_keeps_overlapping_children() {
     );
 }
 
+// v7.37.16 (16.12) — PG partition catalog scalar functions.
+
+fn one_text(e: &mut Engine, sql: &str) -> Option<String> {
+    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    match &rows[0].values[0] {
+        Value::Text(s) => Some(s.to_string()),
+        Value::Null => None,
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn pg_partition_root_walks_to_top_ancestor() {
+    let mut e = Engine::new();
+    e.execute(
+        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
+    )
+    .unwrap();
+    e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
+        .unwrap();
+
+    // Child's root walks up.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_root('cust_apac')"),
+        Some("cust".to_string())
+    );
+    // Parent's root is itself.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_root('cust')"),
+        Some("cust".to_string())
+    );
+    // Non-existent: NULL.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_root('does_not_exist')"),
+        None
+    );
+    // Plain table is its own root.
+    e.execute("CREATE TABLE plain (id BIGINT)").unwrap();
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_root('plain')"),
+        Some("plain".to_string())
+    );
+}
+
+#[test]
+fn pg_partition_ancestors_returns_leaf_to_root_chain() {
+    let mut e = Engine::new();
+    e.execute(
+        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
+    )
+    .unwrap();
+    e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
+        .unwrap();
+
+    // Leaf → root for a partition child.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_ancestors('cust_apac')"),
+        Some("cust_apac,cust".to_string())
+    );
+    // Parent returns just itself.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_ancestors('cust')"),
+        Some("cust".to_string())
+    );
+    // NULL input → NULL.
+    assert_eq!(
+        one_text(&mut e, "SELECT pg_partition_ancestors(NULL)"),
+        None
+    );
+}
+
 #[test]
 fn explain_hash_keeps_only_residue_class_child() {
     let mut e = Engine::new();
