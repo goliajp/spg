@@ -1302,6 +1302,12 @@ impl Engine {
         // reroute), so what remains must be genuinely unique.
         enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
+        // v7.37.15 Phase C — pre-fetch the writer version BEFORE
+        // the table mut borrow; otherwise the call below would
+        // need &mut self while `table` already holds it. Shared
+        // across every row this statement inserts (atomic commit
+        // at the tx boundary).
+        let xmin_for_stmt = self.writer_version_for_current_stmt();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1314,6 +1320,7 @@ impl Engine {
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
         let (returning_rows, deferred_embedded, affected) = insert_parsed_rows(
             table,
+            xmin_for_stmt,
             all_values,
             pending_updates,
             &before_insert_triggers,
@@ -2108,9 +2115,15 @@ fn parse_insert_rows(
 /// and emit deferred embedded SQL), then apply the queued ON CONFLICT
 /// DO UPDATE rewrites. Returns the RETURNING projection rows, the
 /// deferred trigger statements, and the affected-row count.
+// v7.37.15 Phase C — the `xmin` parameter below carries the writer
+// version every row in this batch stamps on its `xmin`. The caller
+// pre-fetches it via `Engine::writer_version_for_current_stmt` so
+// all rows in the same statement share xmin (atomic commit at the
+// tx boundary).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
+    xmin: u64,
     all_values: Vec<Vec<Value<'static>>>,
     pending_updates: Vec<(usize, Vec<Value<'static>>)>,
     before_insert_triggers: &[spg_storage::FunctionDef],
@@ -2166,16 +2179,10 @@ fn insert_parsed_rows(
         // v7.12.4 — clone for the AFTER trigger view; insert
         // moves the row into the table.
         let inserted = row.clone();
-        // v7.37.15 Phase C — stamp the row with the writer's
-        // version. This free function takes only `&mut table`
-        // so we can't reach Engine::writer_version_for_current_stmt;
-        // the caller funnel ensures we're called from an
-        // Engine-method context. Allocating per-row is correct
-        // for autocommit (the caller's autocommit shape) and
-        // safe for explicit tx (the version is < tx_writer_version
-        // for any subsequent statement, so the tx still hides
-        // these writes until COMMIT removes the lower version).
-        let xmin = spg_storage::row_header::next_version();
+        // v7.37.15 Phase C — every row in this insert statement
+        // shares the caller-supplied xmin so concurrent readers
+        // see all the rows commit together (autocommit) or stay
+        // hidden until the enclosing tx COMMIT (explicit tx).
         table.insert_with_xmin(row, xmin)?;
         affected += 1;
         // v7.12.4 — AFTER INSERT row-level triggers fire post-
