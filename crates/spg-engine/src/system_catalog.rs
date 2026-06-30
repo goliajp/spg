@@ -193,6 +193,47 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.24 (24.1) — synthesise `pg_catalog.pg_enum`. One row
+/// per (enum_type, label) pair. Tools targeting PG (sqlx ENUM
+/// codec, ORM enum mappers, pg_dump's `--enum-by-label` query)
+/// read this surface to reconstruct ENUM types at dump-time.
+///
+/// PG-canonical columns:
+///   * oid (BigInt) — per-label OID (synthetic, monotonic)
+///   * enumtypid (BigInt) — owning type OID (synthetic, one
+///     per CREATE TYPE)
+///   * enumsortorder (Float) — 1-based sort position within
+///     the enum (matches PG's float4 sort key shape)
+///   * enumlabel (Text) — the literal label
+pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("enumtypid", DataType::BigInt, false),
+        ColumnSchema::new("enumsortorder", DataType::Float, false),
+        ColumnSchema::new("enumlabel", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    // Synthetic OID bands: enum types start at 50_000; per-label
+    // OIDs start at 60_000. Keeps them disjoint from pg_type's
+    // user-space scalar OID band (which lives above 16384 but
+    // below the 50_000 mark we land enum types into).
+    let mut typid: i64 = 50_000;
+    let mut label_oid: i64 = 60_000;
+    for (_name, def) in cat.enum_types() {
+        typid = typid.saturating_add(1);
+        for (i, label) in def.labels.iter().enumerate() {
+            label_oid = label_oid.saturating_add(1);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(label_oid),
+                Value::BigInt(typid),
+                Value::Float((i + 1) as f64),
+                Value::text(label.clone()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.24 (24.9) — synthesise
 /// `information_schema.table_constraints`. PG-standard surface
 /// listing every PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK
