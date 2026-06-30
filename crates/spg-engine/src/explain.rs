@@ -263,22 +263,41 @@ pub(crate) fn explain_select(
         if let Some(alias) = &from.primary.alias {
             tag.push_str(&alloc::format!(" AS {alias}"));
         }
-        // Try to detect an index-seek opportunity on WHERE against
-        // the primary table — same heuristic the executor uses.
-        if let Some(w) = &stmt.where_
-            && let Some(table) = engine.active_catalog().get(&from.primary.name)
-        {
-            let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
-            let cols = &table.schema().columns;
-            if try_index_seek(w, cols, engine.active_catalog(), table, alias).is_some() {
-                tag.push_str(" [index seek]");
+        // v7.37.16 (16.10 [PG+]) — when the primary table is a
+        // partition parent, ask the planner which children survive
+        // the WHERE-clause prune pass and append that as an EXPLAIN
+        // annotation. PG only shows "Partitions removed: N"; we
+        // emit the kept children's actual names (which dashboards
+        // and dogfood-replay flagged as the missing piece).
+        if crate::partition::is_partition_parent(engine.active_catalog(), &from.primary.name) {
+            tag.push_str(" [partition parent]");
+            if let Some(kept) =
+                engine.explain_partition_kept_children(&from.primary.name, stmt)
+            {
+                tag.push_str(&alloc::format!(
+                    " kept=[{}]",
+                    kept.join(", ")
+                ));
+            }
+            out.push(tag);
+        } else {
+            // Try to detect an index-seek opportunity on WHERE against
+            // the primary table — same heuristic the executor uses.
+            if let Some(w) = &stmt.where_
+                && let Some(table) = engine.active_catalog().get(&from.primary.name)
+            {
+                let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
+                let cols = &table.schema().columns;
+                if try_index_seek(w, cols, engine.active_catalog(), table, alias).is_some() {
+                    tag.push_str(" [index seek]");
+                } else {
+                    tag.push_str(" [full scan]");
+                }
             } else {
                 tag.push_str(" [full scan]");
             }
-        } else {
-            tag.push_str(" [full scan]");
+            out.push(tag);
         }
-        out.push(tag);
         for j in &from.joins {
             let kind = match j.kind {
                 spg_sql::ast::JoinKind::Inner => "INNER JOIN",
