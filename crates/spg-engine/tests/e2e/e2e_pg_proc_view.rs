@@ -28,16 +28,18 @@ fn pg_proc_lists_now() {
 
 #[test]
 fn pg_proc_count_aggregate_is_aggregate_kind() {
+    // v7.37.24 (24.6) — every count() entry (0-arg + variadic)
+    // is an aggregate; check that ALL rows for proname='count'
+    // carry prokind='a'.
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT prokind FROM pg_catalog.pg_proc \
-             WHERE proname = 'count' AND pronargs = 0",
-        )
-        .unwrap(),
+        e.execute("SELECT prokind FROM pg_catalog.pg_proc WHERE proname = 'count'")
+            .unwrap(),
     );
-    assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::text("a"));
+    assert!(!r.is_empty(), "expected at least one count() row");
+    for row in &r {
+        assert_eq!(row[0], Value::text("a"), "count's prokind must be 'a'");
+    }
 }
 
 #[test]

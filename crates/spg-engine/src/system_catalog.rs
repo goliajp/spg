@@ -593,13 +593,33 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
 }
 
 pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.37.24 (24.6) — widened from 6 to 20 PG-canonical columns
+    // covering the function metadata that ORMs (Diesel, sea-orm)
+    // and pgAdmin's function browser query: prolang for language
+    // dispatch, prosrc as the body excerpt, proretset for SETOF,
+    // proisstrict for NULL-handling, provolatile / proparallel /
+    // procost for planner annotations.
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("proname", DataType::Text, false),
         ColumnSchema::new("pronamespace", DataType::BigInt, false),
+        ColumnSchema::new("proowner", DataType::BigInt, false),
+        ColumnSchema::new("prolang", DataType::BigInt, false),
+        ColumnSchema::new("procost", DataType::Float, false),
+        ColumnSchema::new("prorows", DataType::Float, false),
+        ColumnSchema::new("provariadic", DataType::BigInt, false),
         ColumnSchema::new("prokind", DataType::Text, false),
-        ColumnSchema::new("pronargs", DataType::Int, false),
+        ColumnSchema::new("prosecdef", DataType::Bool, false),
+        ColumnSchema::new("proleakproof", DataType::Bool, false),
+        ColumnSchema::new("proisstrict", DataType::Bool, false),
+        ColumnSchema::new("proretset", DataType::Bool, false),
+        ColumnSchema::new("provolatile", DataType::Text, false),
+        ColumnSchema::new("proparallel", DataType::Text, false),
+        ColumnSchema::new("pronargs", DataType::SmallInt, false),
+        ColumnSchema::new("pronargdefaults", DataType::SmallInt, false),
         ColumnSchema::new("prorettype", DataType::BigInt, false),
+        ColumnSchema::new("proargtypes", DataType::Text, false),
+        ColumnSchema::new("prosrc", DataType::Text, false),
     ];
     // (oid, name, kind, nargs, rettype). OIDs taken from PG's
     // pg_proc.dat for the common subset.
@@ -681,14 +701,74 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         (3109, "nth_value", "w", 2, 2283),
     ];
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
+    // PG conventions for SPG-internal builtins:
+    // - prolang = 12 (internal: built-in C function)
+    // - procost = 1 (default cost; planner uses for tie-breaking)
+    // - prorows = 0 for scalar functions, 1000 for set-returning
+    // - provariadic = 0 (no built-in below is VARIADIC by signature)
+    // - provolatile: 'i' immutable, 's' stable, 'v' volatile
+    //   (now/random/current_timestamp = 'v'; date_trunc = 'i'; etc.)
+    // - proparallel: 's' safe (default for pure functions),
+    //   'r' restricted, 'u' unsafe
+    // - proisstrict: most builtins are strict (NULL-on-NULL)
+    // - prosrc: PG's internal entry-point name; SPG uses the
+    //   function name itself as the body excerpt
+    let volatile_names: &[&str] = &[
+        "now",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "random",
+        "gen_random_uuid",
+        "uuid_generate_v4",
+        "current_database",
+        "current_user",
+        "session_user",
+        "current_schema",
+    ];
     for &(oid, name, kind, nargs, rettype) in funcs {
+        let provolatile: &str = if volatile_names.contains(&name) {
+            "v"
+        } else {
+            "i"
+        };
+        let prorows: f64 = match kind {
+            "a" | "w" => 1000.0,
+            _ => 0.0,
+        };
+        // proargtypes — PG int2vector encoding; we don't have the
+        // per-arg type list in the table, so synthesise N placeholder
+        // zeros. ORMs that need the real list will fall back to the
+        // pg_proc.dat columns of pg_proc-loaded extensions.
+        let arg_count = if nargs < 0 { 0 } else { nargs };
+        let mut argtypes = alloc::string::String::new();
+        for i in 0..arg_count {
+            if i > 0 {
+                argtypes.push(' ');
+            }
+            argtypes.push('0');
+        }
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
-            Value::BigInt(11),
+            Value::BigInt(11),         // pronamespace = pg_catalog
+            Value::BigInt(10),         // proowner
+            Value::BigInt(12),         // prolang = internal
+            Value::Float(1.0),         // procost
+            Value::Float(prorows),
+            Value::BigInt(0),          // provariadic
             Value::text::<String>(kind.into()),
-            Value::Int(nargs),
+            Value::Bool(false),        // prosecdef
+            Value::Bool(false),        // proleakproof
+            Value::Bool(true),         // proisstrict
+            Value::Bool(kind == "w"),  // proretset — window funcs return per-row sets
+            Value::text::<String>(provolatile.into()),
+            Value::text::<String>("s".into()), // proparallel = safe
+            Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
+            Value::SmallInt(0),        // pronargdefaults
             Value::BigInt(rettype),
+            Value::text(argtypes),
+            Value::text::<String>(name.into()), // prosrc
         ]));
     }
     (schema, rows)

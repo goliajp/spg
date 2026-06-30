@@ -166,6 +166,7 @@ mod e2e_pg_indexes_view;
 mod e2e_pg_money;
 mod e2e_pg_namespace_view;
 mod e2e_pg_proc_view;
+mod e2e_pg_proc_widened;
 mod e2e_pg_range;
 mod e2e_pg_settings_view;
 mod e2e_pg_stat_statements;
