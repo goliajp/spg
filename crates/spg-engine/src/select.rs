@@ -98,7 +98,14 @@ impl Engine {
                 owned.push(row.clone());
                 Ok(())
             };
-            for (i, row) in table.rows().iter().enumerate() {
+            // v7.37.15 Phase B — scan_visible filters rows by the
+            // engine's current snapshot. Phase B's `current_snapshot()`
+            // returns `Snapshot::unbounded()` so every row is visible,
+            // matching pre-v7.37.15 byte-for-byte. Phase C will wire
+            // real per-tx snapshots through this same callsite — no
+            // code change needed here when that lands.
+            let snap = self.current_snapshot();
+            for (i, row) in table.scan_visible(&snap) {
                 emit(row, i)?;
             }
             // v7.36 (cold-tier coverage) — window single-table path
