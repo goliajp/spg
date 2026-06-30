@@ -169,6 +169,7 @@ mod e2e_pg_class_widened;
 mod e2e_pg_constraint_view;
 mod e2e_pg_customer_parity;
 mod e2e_pg_database_roles_view;
+mod e2e_pg_enum_view;
 mod e2e_pg_hstore;
 mod e2e_pg_index_widened;
 mod e2e_pg_indexes_view;

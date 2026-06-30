@@ -369,6 +369,13 @@ impl Engine {
                     let (schema, rows) = synth_pg_namespace(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.24 (24.1) — pg_catalog.pg_enum (label list
+                // for ENUM types; sqlx / ORM enum codecs read this).
+                "__spg_pg_enum" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_enum(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
