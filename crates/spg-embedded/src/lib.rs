@@ -505,8 +505,16 @@ impl WalGroup {
                 let io_result: std::io::Result<()> = (|| {
                     let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
                     f.write_all(&batch)?;
-                    f.sync_data()
+                    wal_sync_data(&mut f)
                 })();
+                // v7.37.13 (A1.4) — apply the configured fsync-fail
+                // policy. The handler aborts on the default path
+                // (durability invariant) or returns Err only when
+                // SPG_DATA_SYNC_RETRY=on lets the caller see it.
+                let io_result = match io_result {
+                    Ok(()) => Ok(()),
+                    Err(e) => handle_wal_fsync_fail(e),
+                };
                 g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 g.leader_active = false;
                 leader_guard.armed = false; // normal completion — disarm
@@ -551,8 +559,13 @@ impl WalGroup {
         let io: std::io::Result<()> = (|| {
             let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
             f.write_all(&batch)?;
-            f.sync_data()
+            wal_sync_data(&mut f)
         })();
+        // v7.37.13 (A1.4) — same policy gate as the leader path.
+        let io = match io {
+            Ok(()) => Ok(()),
+            Err(e) => handle_wal_fsync_fail(e),
+        };
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match io {
             Ok(()) => {
@@ -1231,6 +1244,120 @@ fn fsync_dir(dir: &Path) {
 #[cfg(test)]
 pub(crate) static FSYNC_DIR_CALL_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+// v7.37.13 (A1.4 / A1.5) — fsync-failure policy.
+//
+// Default behaviour: a WAL fsync failure is a durability invariant
+// violation. The honest answer is to stop the process so the
+// supervisor restarts and replay re-establishes a consistent state
+// from the last good WAL boundary. Continuing on a poisoned WAL
+// (the pre-v7.37.13 behaviour) leaves every subsequent commit
+// claiming durability it does not have.
+//
+// Opt-out (A1.5): `SPG_DATA_SYNC_RETRY=on` keeps the old behaviour
+// (poison the WAL + surface Err on every later call). Operators
+// who already have a higher-level supervisor or who specifically
+// want a graceful failure path can flip this.
+//
+// Implementation notes:
+//   * The env var is read once and cached (OnceLock). Re-export of
+//     the var after process start is intentionally ignored — the
+//     durability policy is a process-lifetime invariant, not a
+//     runtime tunable.
+//   * The `#[cfg(test)] FSYNC_RETRY_OVERRIDE` atomic lets the test
+//     suite drive the policy without touching the env (which is
+//     not thread-safe across parallel tests on modern stdlib).
+//   * `FSYNC_FAIL_INJECT` is a one-shot test-only switch that
+//     forces the next WAL `sync_data` to return EIO so the retry
+//     path can be exercised without a real disk failure. Always
+//     consumed via `swap(false, ...)` so one injection fires once.
+
+/// v7.37.13 (A1.4) — true when the operator opted into the
+/// pre-v7.37.13 poison-and-return-Err behaviour. False (default)
+/// causes [`handle_wal_fsync_fail`] to `std::process::abort()`
+/// after logging.
+fn data_sync_retry_on() -> bool {
+    #[cfg(test)]
+    {
+        let v = FSYNC_RETRY_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if v == 1 {
+            return true;
+        }
+        if v == 0 {
+            return false;
+        }
+        // v < 0 → fall through to env-based reading.
+    }
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("SPG_DATA_SYNC_RETRY").as_deref() == Ok("on"))
+}
+
+/// v7.37.13 (A1.4) — central fsync-failure handler. Returns `Err`
+/// only when the operator opted in to the legacy retry path; the
+/// default aborts the process so durability invariants stay honest.
+fn handle_wal_fsync_fail(err: std::io::Error) -> std::io::Result<()> {
+    if data_sync_retry_on() {
+        return Err(err);
+    }
+    eprintln!(
+        "[spg] FATAL: WAL fsync failed: {err}. Aborting to honor durability \
+         invariant. Set SPG_DATA_SYNC_RETRY=on to disable this and continue \
+         on a poisoned WAL (caller will see Err on every subsequent commit)."
+    );
+    #[cfg(test)]
+    {
+        // Tests don't want the runner to die. Record the would-be
+        // abort and panic so catch_unwind / assert_panics can pick
+        // it up. Production callers never reach this branch (they
+        // hit the abort below).
+        FSYNC_PANIC_OBSERVED.store(true, std::sync::atomic::Ordering::Release);
+        panic!("test-mode wal-fsync abort: {err}");
+    }
+    #[cfg(not(test))]
+    {
+        std::process::abort();
+    }
+}
+
+/// v7.37.13 (A1.4) — `#[cfg(test)]` override for [`data_sync_retry_on`].
+///   -1 = use env (default, production path)
+///    0 = force OFF (= default policy, PANIC on fsync fail)
+///    1 = force ON  (= legacy retry path)
+#[cfg(test)]
+pub(crate) static FSYNC_RETRY_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// v7.37.13 (A1.4) — `#[cfg(test)]` one-shot fsync-failure injection.
+/// Set to `true` to force the next WAL `sync_data` to return EIO.
+/// Consumed atomically (swap(false)) so each set fires exactly once.
+#[cfg(test)]
+pub(crate) static FSYNC_FAIL_INJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// v7.37.13 (A1.4) — `#[cfg(test)]` witness: set to `true` when the
+/// default (PANIC) branch fires inside a test (we panic instead of
+/// abort under test cfg so the runner survives, then assert this).
+#[cfg(test)]
+pub(crate) static FSYNC_PANIC_OBSERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// v7.37.13 (A1.4) — `#[cfg(test)]` wrapper around `File::sync_data`
+/// that honours [`FSYNC_FAIL_INJECT`]. Tests flip the flag; the
+/// next call returns EIO. Release builds inline straight through
+/// `File::sync_data` (zero overhead, `#[inline(always)]`).
+#[cfg(test)]
+fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
+    if FSYNC_FAIL_INJECT.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Err(std::io::Error::other("injected fsync fail (test only)"));
+    }
+    f.sync_data()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
+    f.sync_data()
+}
 
 fn chunk_filename(unix_us: i64, leading_lsn: u64) -> String {
     // Negative timestamps shouldn't happen in practice (we sit
@@ -5030,6 +5157,82 @@ mod tests {
              the seg file and the catalog points at a path that does \
              not exist on restart (AUDIT-3-categories A1.6 / Top-6 P0 #4)."
         );
+    }
+
+    /// v7.37.13 (A1.4 / A1.5 TDD) — combined policy verification.
+    ///
+    /// Run as a SINGLE test because FSYNC_RETRY_OVERRIDE +
+    /// FSYNC_FAIL_INJECT are process-wide statics; running two
+    /// scenarios as separate `#[test]`s allows cargo's parallel
+    /// runner to interleave them and stomp each other's overrides.
+    ///
+    /// Phase 1 (retry path / A1.5):
+    ///   - Force FSYNC_RETRY_OVERRIDE = 1 (= SPG_DATA_SYNC_RETRY=on)
+    ///   - Arm inject
+    ///   - INSERT — expect graceful Err (legacy poison path), no panic
+    ///
+    /// Phase 2 (default abort path / A1.4):
+    ///   - Force FSYNC_RETRY_OVERRIDE = 0 (= default)
+    ///   - Disable async checkpoint paths so worker can't consume
+    ///     inject in a background thread
+    ///   - Arm inject
+    ///   - INSERT inside catch_unwind — expect panic + FSYNC_PANIC_OBSERVED
+    #[test]
+    fn v7_37_13_fsync_policy_retry_and_default_abort() {
+        // ===== Phase 1: retry path =====
+        let prev = FSYNC_RETRY_OVERRIDE.swap(1, std::sync::atomic::Ordering::AcqRel);
+        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
+        {
+            let dir = tmpdir();
+            let db_path = dir.join("retry_path_db");
+            let mut db = Database::open_path(&db_path).expect("open");
+            db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
+            FSYNC_FAIL_INJECT.store(true, std::sync::atomic::Ordering::Release);
+            let result = db.execute("INSERT INTO t VALUES (1)");
+            assert!(
+                result.is_err(),
+                "phase 1 (retry path): FSYNC_RETRY_OVERRIDE=1 + inject \
+                 must surface as a graceful Err (legacy poison path); \
+                 got {result:?}"
+            );
+        }
+
+        // ===== Phase 2: default abort path =====
+        FSYNC_RETRY_OVERRIDE.store(0, std::sync::atomic::Ordering::Release);
+        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
+        FSYNC_PANIC_OBSERVED.store(false, std::sync::atomic::Ordering::Release);
+        {
+            let dir = tmpdir();
+            let db_path = dir.join("abort_path_db");
+            let mut db = Database::open_path(&db_path).expect("open");
+            db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
+            // Disable both checkpoint trigger paths so the worker
+            // can't race by consuming inject in a background thread
+            // (a panic in worker would not reach our catch_unwind).
+            db.set_checkpoint_threshold_bytes(u64::MAX);
+            db.set_checkpoint_time_threshold(None);
+            db.checkpoint_wait().expect("drain pre-inject");
+
+            FSYNC_FAIL_INJECT.store(true, std::sync::atomic::Ordering::Release);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = db.execute("INSERT INTO t VALUES (1)");
+            }));
+
+            assert!(
+                outcome.is_err(),
+                "phase 2 (default policy): must panic (= abort in release) \
+                 on injected fsync failure; the call returned without panicking"
+            );
+            assert!(
+                FSYNC_PANIC_OBSERVED.load(std::sync::atomic::Ordering::Acquire),
+                "phase 2: panic fired but FSYNC_PANIC_OBSERVED witness was \
+                 not set — something else panicked, not handle_wal_fsync_fail"
+            );
+        }
+
+        // Restore so other tests see the prior policy.
+        FSYNC_RETRY_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+        FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
     }
 
     #[test]
