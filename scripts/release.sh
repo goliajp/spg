@@ -84,6 +84,29 @@ else
     echo "preflight gate: dogfood-replay SKIPPED (SKIP_DOGFOOD=1 set)"
 fi
 
+# v7.37.27 (27.7 + 27.12) — full G1-G5 release battery before
+# any artefact lands on crates.io or docker.io. The dogfood
+# preflight above catches prod-shape regressions; gate.sh all
+# closes the workspace / unit / e2e / gates / biz lattice that
+# G1-G5 cover (TESTING.md five categories). Setting SKIP_FULL=1
+# selects the v7.37.7-and-earlier behaviour for the rare case
+# where the operator already ran gate.sh all externally.
+if [[ "${SKIP_FULL:-0}" == 0 ]]; then
+    banner "preflight gate: gate.sh all (G1-G5)"
+    if ! scripts/gate.sh all; then
+        echo "preflight: gate.sh all FAILED — release blocked. \
+Re-run with \`SKIP_FULL=1 scripts/release.sh $VERSION\` only after \
+triaging the failure. Each category (lint / unit / e2e / gates / \
+biz / dogfood) maps to one of the G1-G5 release gates in \
+WIRE_FORMAT_PROMISE.md; a green release.sh means the wire-format \
+promise is intact." >&2
+        exit 1
+    fi
+    echo "preflight gate: gate.sh all PASS"
+else
+    echo "preflight gate: gate.sh all SKIPPED (SKIP_FULL=1 set)"
+fi
+
 if [[ "$SKIP_CRATES" == 0 ]]; then
     banner "crates.io publish × ${#CRATES[@]}"
     # v7.37.7 — crates.io's data-access policy now rejects bare-curl GETs
