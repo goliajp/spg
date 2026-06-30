@@ -116,6 +116,12 @@ fn bound_cmp(a: &PartitionBound, b: &PartitionBound) -> core::cmp::Ordering {
         (MaxValue, _) => Ordering::Greater,
         (_, MaxValue) => Ordering::Less,
         (TimestampTz(x), TimestampTz(y)) => x.cmp(y),
+        // v7.37.16 (16.6) — extended PartitionBound variants are
+        // Range/LIST-key reservations; not yet ordered against
+        // TIMESTAMPTZ. Treat as Equal so child-overlap detection
+        // is conservative (caller still uses MinValue/MaxValue for
+        // sentinels until each variant grows its own ordering pass).
+        _ => Ordering::Equal,
     }
 }
 
@@ -142,15 +148,30 @@ pub(crate) fn value_in_range(
     lower: &PartitionBound,
     upper: &PartitionBound,
 ) -> bool {
+    // v7.37.16 (16.6) — Range partitioning lower/upper currently only
+    // supports TIMESTAMPTZ bounds (v7.37.6-B intro). The other
+    // PartitionBound variants are reserved for LIST membership +
+    // future Range-on-numeric / Range-on-Date strategies; treat them
+    // here as "this bound doesn't constrain a TIMESTAMPTZ scan."
     let lower_ok = match lower {
         PartitionBound::MinValue => true,
         PartitionBound::MaxValue => false,
         PartitionBound::TimestampTz(m) => value_micros >= *m,
+        PartitionBound::BigInt(_)
+        | PartitionBound::Int(_)
+        | PartitionBound::SmallInt(_)
+        | PartitionBound::Date(_)
+        | PartitionBound::Text(_) => false,
     };
     let upper_ok = match upper {
         PartitionBound::MinValue => false,
         PartitionBound::MaxValue => true,
         PartitionBound::TimestampTz(m) => value_micros < *m,
+        PartitionBound::BigInt(_)
+        | PartitionBound::Int(_)
+        | PartitionBound::SmallInt(_)
+        | PartitionBound::Date(_)
+        | PartitionBound::Text(_) => false,
     };
     lower_ok && upper_ok
 }
@@ -161,6 +182,14 @@ pub(crate) fn bound_to_diag(b: &PartitionBound) -> String {
         PartitionBound::MinValue => "MINVALUE".to_string(),
         PartitionBound::MaxValue => "MAXVALUE".to_string(),
         PartitionBound::TimestampTz(m) => format!("'{m}'::timestamptz"),
+        // v7.37.16 (16.6) — diagnostic renderers for the extended
+        // bound types. These appear in EXPLAIN + error messages
+        // when describing LIST partitions or future Range-on-X.
+        PartitionBound::BigInt(n) => format!("{n}::bigint"),
+        PartitionBound::Int(n) => format!("{n}::integer"),
+        PartitionBound::SmallInt(n) => format!("{n}::smallint"),
+        PartitionBound::Date(d) => format!("{d}::date"),
+        PartitionBound::Text(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 

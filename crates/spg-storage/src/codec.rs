@@ -2374,6 +2374,9 @@ pub(crate) fn write_partition_role(out: &mut Vec<u8>, role: Option<&crate::Parti
             out.push(1);
             let kind_tag: u8 = match kind {
                 PartitionKind::Range => 0,
+                // v7.37.16 (16.1 / 16.2) — new partition strategies.
+                PartitionKind::List => 1,
+                PartitionKind::Hash => 2,
             };
             out.push(kind_tag);
             write_u16(
@@ -2418,6 +2421,31 @@ fn write_partition_bound(out: &mut Vec<u8>, bound: &crate::PartitionBound) {
             out.push(2);
             out.extend_from_slice(&micros.to_le_bytes());
         }
+        // v7.37.16 (16.6) — new type tags for extended PartitionBound
+        // variants. Round-trip-stable on disk so a v7.37.16 catalog
+        // restored on a later version still decodes correctly.
+        PartitionBound::BigInt(n) => {
+            out.push(3);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        PartitionBound::Int(n) => {
+            out.push(4);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        PartitionBound::SmallInt(n) => {
+            out.push(5);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        PartitionBound::Date(days) => {
+            out.push(6);
+            out.extend_from_slice(&days.to_le_bytes());
+        }
+        PartitionBound::Text(s) => {
+            out.push(7);
+            let bytes = s.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
     }
 }
 
@@ -2432,6 +2460,9 @@ pub(crate) fn read_partition_role(
             let kind_tag = cur.read_u8()?;
             let kind = match kind_tag {
                 0 => PartitionKind::Range,
+                // v7.37.16 (16.1 / 16.2) — round-trip the new strategies.
+                1 => PartitionKind::List,
+                2 => PartitionKind::Hash,
                 other => {
                     return Err(StorageError::Corrupt(format!(
                         "partition_role Parent: unknown kind tag {other}"
@@ -2481,6 +2512,21 @@ fn read_partition_bound(cur: &mut Cursor<'_>) -> Result<crate::PartitionBound, S
         0 => Ok(PartitionBound::MinValue),
         1 => Ok(PartitionBound::MaxValue),
         2 => Ok(PartitionBound::TimestampTz(cur.read_i64()?)),
+        // v7.37.16 (16.6) — extended PartitionBound variants.
+        // Tags 3..=7 added 2026-06-30; lower-tier (0..=2) untouched
+        // so pre-v7.37.16 catalogs decode unchanged.
+        3 => Ok(PartitionBound::BigInt(cur.read_i64()?)),
+        4 => Ok(PartitionBound::Int(cur.read_i32()?)),
+        5 => Ok(PartitionBound::SmallInt(cur.read_i16()?)),
+        6 => Ok(PartitionBound::Date(cur.read_i32()?)),
+        7 => {
+            let len = cur.read_u32()? as usize;
+            let bytes = cur.read_bytes(len)?;
+            let s = alloc::string::String::from_utf8(bytes.to_vec()).map_err(|e| {
+                StorageError::Corrupt(format!("partition_bound Text: invalid UTF-8: {e}"))
+            })?;
+            Ok(PartitionBound::Text(s))
+        }
         other => Err(StorageError::Corrupt(format!(
             "partition_bound: unknown tag {other}"
         ))),
@@ -2593,6 +2639,18 @@ impl<'a> Cursor<'a> {
     pub(crate) fn read_i32(&mut self) -> Result<i32, StorageError> {
         let s = self.take(4)?;
         Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    /// v7.37.16 (16.6) — i16 LE read for SMALLINT partition bound.
+    pub(crate) fn read_i16(&mut self) -> Result<i16, StorageError> {
+        let s = self.take(2)?;
+        Ok(i16::from_le_bytes([s[0], s[1]]))
+    }
+    /// v7.37.16 (16.6) — borrowing byte read for TEXT partition bound
+    /// (variable-length payload). Returns a `Vec<u8>` rather than a
+    /// borrow to avoid lifetime threading into the Result.
+    pub(crate) fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>, StorageError> {
+        let s = self.take(n)?;
+        Ok(s.to_vec())
     }
     /// v6.7.2 — u64 LE read for the per-table `hot_tier_bytes`
     /// catalog appendix.
