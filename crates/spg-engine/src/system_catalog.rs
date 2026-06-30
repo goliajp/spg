@@ -102,22 +102,100 @@ pub(crate) fn synth_information_schema_tables(
     (schema, rows)
 }
 
-/// v7.16.2 — synthesise `pg_catalog.pg_class`. Minimum shape
-/// for psql `\d` / ORM probes: `relname` + `relkind`. Each
-/// user table emits one row.
+/// v7.16.2 + v7.37.24 (24.8) — synthesise `pg_catalog.pg_class`.
+/// Widened to cover the columns dashboards / monitoring tools
+/// query (relkind, reltuples for size estimates, relnatts for
+/// column count, relhasindex flag, relpersistence, relispartition
+/// for partition awareness). PG18's pg_class has ~30 columns;
+/// the subset here is "every column an external tool actually
+/// reads against SPG" — additional columns land as we observe
+/// new tools query them.
 pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_storage::PartitionRole;
     let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("relname", DataType::Text, false),
-        ColumnSchema::new("relkind", DataType::Text, false),
         ColumnSchema::new("relnamespace", DataType::BigInt, false),
+        ColumnSchema::new("reltype", DataType::BigInt, false),
+        ColumnSchema::new("reloftype", DataType::BigInt, false),
+        ColumnSchema::new("relowner", DataType::BigInt, false),
+        ColumnSchema::new("relam", DataType::BigInt, false),
+        ColumnSchema::new("relfilenode", DataType::BigInt, false),
+        ColumnSchema::new("reltablespace", DataType::BigInt, false),
+        ColumnSchema::new("relpages", DataType::Int, false),
+        ColumnSchema::new("reltuples", DataType::Float, false),
+        ColumnSchema::new("relallvisible", DataType::Int, false),
+        ColumnSchema::new("reltoastrelid", DataType::BigInt, false),
+        ColumnSchema::new("relhasindex", DataType::Bool, false),
+        ColumnSchema::new("relisshared", DataType::Bool, false),
+        ColumnSchema::new("relpersistence", DataType::Text, false),
+        ColumnSchema::new("relkind", DataType::Text, false),
+        ColumnSchema::new("relnatts", DataType::SmallInt, false),
+        ColumnSchema::new("relchecks", DataType::SmallInt, false),
+        ColumnSchema::new("relhasrules", DataType::Bool, false),
+        ColumnSchema::new("relhastriggers", DataType::Bool, false),
+        ColumnSchema::new("relhassubclass", DataType::Bool, false),
+        ColumnSchema::new("relrowsecurity", DataType::Bool, false),
+        ColumnSchema::new("relforcerowsecurity", DataType::Bool, false),
+        ColumnSchema::new("relispopulated", DataType::Bool, false),
+        ColumnSchema::new("relreplident", DataType::Text, false),
+        ColumnSchema::new("relispartition", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
+    // PG starts user-relation OIDs above 16384.
+    let mut oid: i64 = 16384;
     for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let schema_ref = t.schema();
+        let relkind: &'static str = match &schema_ref.partition_role {
+            Some(PartitionRole::Parent { .. }) => "p", // partitioned table
+            _ => "r",                                   // regular table
+        };
+        let is_partition = matches!(
+            &schema_ref.partition_role,
+            Some(PartitionRole::Range { .. })
+                | Some(PartitionRole::List { .. })
+                | Some(PartitionRole::Hash { .. })
+                | Some(PartitionRole::Default { .. })
+        );
+        let relnatts = i16::try_from(schema_ref.columns.len()).unwrap_or(i16::MAX);
+        let reltuples = t.rows().len() as f64;
+        let has_index = !t.indices().is_empty();
+        let has_triggers = cat
+            .triggers()
+            .iter()
+            .any(|tr| tr.table.eq_ignore_ascii_case(&tname));
+        let has_checks = schema_ref.checks.len();
         rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
             Value::text(tname.clone()),
-            Value::text("r"),
-            Value::BigInt(2200), // PG's `public` namespace OID
+            Value::BigInt(2200), // public namespace
+            Value::BigInt(0),    // reltype (composite type OID; SPG no composite)
+            Value::BigInt(0),    // reloftype
+            Value::BigInt(10),   // relowner — PG postgres superuser OID
+            Value::BigInt(0),    // relam (table AM; 0 == default heap)
+            Value::BigInt(oid),  // relfilenode shares oid in SPG (no separate fork)
+            Value::BigInt(0),    // reltablespace (0 == default)
+            Value::Int(0),       // relpages (no shared-buffer accounting)
+            Value::Float(reltuples),
+            Value::Int(0),       // relallvisible — visibility map lands in 15.17
+            Value::BigInt(0),    // reltoastrelid (SPG no TOAST)
+            Value::Bool(has_index),
+            Value::Bool(false),  // relisshared
+            Value::text("p"),    // relpersistence — 'p' permanent
+            Value::text(relkind),
+            Value::SmallInt(relnatts),
+            Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
+            Value::Bool(false),  // relhasrules — SPG has no rule system
+            Value::Bool(has_triggers),
+            Value::Bool(false),  // relhassubclass
+            Value::Bool(false),  // relrowsecurity
+            Value::Bool(false),  // relforcerowsecurity
+            Value::Bool(true),   // relispopulated
+            Value::text("d"),    // relreplident — 'd' default
+            Value::Bool(is_partition),
         ]));
+        oid = oid.saturating_add(1);
     }
     (schema, rows)
 }

@@ -155,6 +155,7 @@ mod e2e_partition_explain;
 mod e2e_partition_pruning;
 mod e2e_per_table_budget;
 mod e2e_pg_array_2d;
+mod e2e_pg_class_widened;
 mod e2e_pg_constraint_view;
 mod e2e_pg_customer_parity;
 mod e2e_pg_database_roles_view;
