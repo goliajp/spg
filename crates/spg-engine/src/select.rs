@@ -1270,6 +1270,12 @@ impl Engine {
                 // v7.37.14 (B6.5) — PG-compatibility surface; row
                 // set is empty until v7.37.15 lands tuple locks.
                 "pg_locks" => return Ok(self.exec_pg_locks()),
+                // v7.37.15 (Phase F) — MVCC diagnostic view; per-
+                // process snapshot of the writer-version cursor +
+                // in-flight tx versions. Used by spgctl / dashboards
+                // to observe MVCC health (vacuum lag, in-flight
+                // tx count).
+                "spg_stat_mvcc" => return Ok(self.exec_spg_stat_mvcc()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
                 "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
                 "spg_table_ddl" => return Ok(self.exec_spg_table_ddl()),

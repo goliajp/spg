@@ -353,6 +353,36 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v7.37.15 (Phase F) — MVCC diagnostic view. Single-row
+    /// snapshot of the engine's per-row visibility state so
+    /// `spgctl` / monitoring can observe vacuum lag + in-flight
+    /// transaction count without reaching into engine internals.
+    ///
+    /// Columns:
+    /// - `current_version` — the live monotonic writer-version
+    ///   cursor (next allocated version comes after this).
+    /// - `active_writer_count` — number of writer versions in
+    ///   flight (= concurrent transactions). 0 means quiescent.
+    /// - `oldest_active_version` — floor of the active set;
+    ///   vacuum can reclaim any row whose `xmax < this`.
+    pub(crate) fn exec_spg_stat_mvcc(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("current_version", DataType::BigInt, false),
+            ColumnSchema::new("active_writer_count", DataType::Int, false),
+            ColumnSchema::new("oldest_active_version", DataType::BigInt, false),
+        ];
+        let cv = spg_storage::row_header::current_version() as i64;
+        let active = self.active_writer_versions.len() as i32;
+        let oldest =
+            self.active_writer_versions.iter().next().copied().unwrap_or(cv as u64) as i64;
+        let rows = alloc::vec![Row::new(alloc::vec![
+            Value::BigInt(cv),
+            Value::Int(active),
+            Value::BigInt(oldest),
+        ])];
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v7.37.14 (B6.5) — materialise `pg_locks` rows. PG exposes a
     /// detailed lock table (locktype / database / relation /
     /// virtualtransaction / pid / mode / granted / fastpath /
