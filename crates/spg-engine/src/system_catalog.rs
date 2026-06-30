@@ -102,6 +102,211 @@ pub(crate) fn synth_information_schema_tables(
     (schema, rows)
 }
 
+/// v7.37.24 (24.9) — synthesise `information_schema.schemata`.
+/// SQL-standard view listing every schema in the catalog. SPG
+/// is single-schema (`public`); pg_catalog + information_schema
+/// also list as standard PG namespaces. dump/migration tools
+/// (Liquibase, Flyway) query this at start-up to validate the
+/// target connection.
+pub(crate) fn synth_information_schema_schemata(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("catalog_name", DataType::Text, false),
+        ColumnSchema::new("schema_name", DataType::Text, false),
+        ColumnSchema::new("schema_owner", DataType::Text, false),
+        ColumnSchema::new("default_character_set_catalog", DataType::Text, true),
+        ColumnSchema::new("default_character_set_schema", DataType::Text, true),
+        ColumnSchema::new("default_character_set_name", DataType::Text, true),
+        ColumnSchema::new("sql_path", DataType::Text, true),
+    ];
+    let rows: Vec<Row<'static>> = alloc::vec![
+        Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text("admin"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]),
+        Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("pg_catalog"),
+            Value::text("admin"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]),
+        Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("information_schema"),
+            Value::text("admin"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]),
+    ];
+    (schema, rows)
+}
+
+/// v7.37.24 (24.9) — synthesise `information_schema.views`.
+/// PG-standard surface listing every view. SPG's view storage
+/// keeps the view definition on the catalog; this surfaces the
+/// `view_definition` (SQL text) per row, which is what pgAdmin
+/// and ORM introspection tools consume.
+pub(crate) fn synth_information_schema_views(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("view_definition", DataType::Text, true),
+        ColumnSchema::new("check_option", DataType::Text, false),
+        ColumnSchema::new("is_updatable", DataType::Text, false),
+        ColumnSchema::new("is_insertable_into", DataType::Text, false),
+        ColumnSchema::new("is_trigger_updatable", DataType::Text, false),
+        ColumnSchema::new("is_trigger_deletable", DataType::Text, false),
+        ColumnSchema::new("is_trigger_insertable_into", DataType::Text, false),
+    ];
+    let rows: Vec<Row<'static>> = cat
+        .views()
+        .iter()
+        .map(|(_, v)| {
+            Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(v.name.clone()),
+                Value::text(v.body.clone()),
+                Value::text("NONE"),
+                Value::text("NO"),  // is_updatable — view-update lands in 19.13
+                Value::text("NO"),  // is_insertable_into
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("NO"),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// v7.37.24 (24.9) — synthesise
+/// `information_schema.table_constraints`. PG-standard surface
+/// listing every PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK
+/// constraint. Migration tools (Liquibase, Alembic) compare
+/// before/after snapshots of this view to detect schema drift.
+pub(crate) fn synth_information_schema_table_constraints(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_catalog", DataType::Text, false),
+        ColumnSchema::new("constraint_schema", DataType::Text, false),
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("constraint_type", DataType::Text, false),
+        ColumnSchema::new("is_deferrable", DataType::Text, false),
+        ColumnSchema::new("initially_deferred", DataType::Text, false),
+        ColumnSchema::new("enforced", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        // Uniqueness constraints — both PK and UNIQUE forms.
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = if uc.is_primary_key {
+                alloc::format!("{tname}_pkey")
+            } else {
+                alloc::format!("{tname}_uniq{ci}")
+            };
+            let kind = if uc.is_primary_key {
+                "PRIMARY KEY"
+            } else {
+                "UNIQUE"
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(conname),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text(kind),
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("YES"),
+            ]));
+        }
+        // Single-column unique indices without a UC entry.
+        for idx in t.indices() {
+            if !idx.is_unique {
+                continue;
+            }
+            let already = t
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .any(|uc| uc.columns.len() == 1 && uc.columns[0] == idx.column_position);
+            if already {
+                continue;
+            }
+            let is_primary = idx.name.ends_with("_pkey");
+            let kind = if is_primary { "PRIMARY KEY" } else { "UNIQUE" };
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(idx.name.clone()),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text(kind),
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("YES"),
+            ]));
+        }
+        // Foreign keys.
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(conname),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text("FOREIGN KEY"),
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("YES"),
+            ]));
+        }
+        // CHECK constraints.
+        for (ci, _check) in t.schema().checks.iter().enumerate() {
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(alloc::format!("{tname}_check{ci}")),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text("CHECK"),
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("YES"),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.16.2 + v7.37.24 (24.8) — synthesise `pg_catalog.pg_class`.
 /// Widened to cover the columns dashboards / monitoring tools
 /// query (relkind, reltuples for size estimates, relnatts for
