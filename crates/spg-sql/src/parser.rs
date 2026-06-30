@@ -4618,6 +4618,15 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("alter") => {
                 self.advance();
+                // v7.37.18 (18.16) — `ALTER TABLE … ALTER CONSTRAINT
+                // <name> {DEFERRABLE|NOT DEFERRABLE} [INITIALLY
+                // {IMMEDIATE|DEFERRED}]`. SPG enforces constraints
+                // immediately; accept-and-no-op.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+                    self.advance();
+                    self.consume_until_statement_boundary();
+                    return Ok(Vec::new());
+                }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
                 }
