@@ -3089,6 +3089,33 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_if();
         }
+        // v7.37.20 (20.3) — WHILE <cond> LOOP <body> END LOOP.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("while"))
+        {
+            self.advance();
+            let condition = self.parse_expr(0)?;
+            let loop_kw = self.expect_ident_like()?;
+            if !loop_kw.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected LOOP after WHILE <condition>, got {loop_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            // Expect END LOOP.
+            let end_kw = self.expect_ident_like()?;
+            if !end_kw.eq_ignore_ascii_case("end") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after WHILE body, got {end_kw:?}"
+                )));
+            }
+            let loop_kw2 = self.expect_ident_like()?;
+            if !loop_kw2.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after WHILE body, got END {loop_kw2:?}"
+                )));
+            }
+            return Ok(PlPgSqlStmt::While { condition, body });
+        }
         // v7.12.6 — RAISE.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("raise"))
         {
