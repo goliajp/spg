@@ -4406,6 +4406,57 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
+            // v7.37.18 (18.18) — RESET ( option [, …] ). Inverse of
+            // SET (option = value, …). PG uses it to clear per-table
+            // storage params like fillfactor or autovacuum_*. SPG
+            // engine-manages those parameters; accept-and-no-op.
+            Token::Ident(s) if s.eq_ignore_ascii_case("reset") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.18) — OF <type_name> / NOT OF. Composite-
+            // type-of binding (PG 9.0+). SPG composite types
+            // (v7.37.5 ζ-B sub-commit) follow CREATE TYPE; ALTER
+            // TABLE OF is rare and inverse of CREATE TABLE OF.
+            // Accept-and-no-op until a customer dump round-trips it.
+            Token::Ident(s) if s.eq_ignore_ascii_case("of") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.18) — `NOT OF` lexes NOT as Token::Not
+            // (reserved keyword) rather than Token::Ident("not"),
+            // so it needs its own arm. Accept-and-no-op same as OF.
+            Token::Not => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.18) — FORCE / NO FORCE ROW LEVEL SECURITY
+            // (PG 9.5+). SPG doesn't enforce RLS at the engine layer
+            // yet (v7.41 roadmap); accept-and-no-op so RLS-aware
+            // dumps load straight through.
+            Token::Ident(s) if s.eq_ignore_ascii_case("force") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.18) — ENABLE/DISABLE ROW LEVEL SECURITY
+            // (PG 9.5+). The guard requires the next token to be
+            // `ROW` so the v7.37.18.12 ENABLE/DISABLE TRIGGER arm
+            // (further down) still matches its case unchanged.
+            Token::Ident(s)
+                if (s.eq_ignore_ascii_case("enable") || s.eq_ignore_ascii_case("disable"))
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(t)) if t.eq_ignore_ascii_case("row")
+                    ) =>
+            {
+                self.advance(); // ENABLE/DISABLE
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
                 // v7.14.0 — ADD CONSTRAINT <name> { FOREIGN KEY |
