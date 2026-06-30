@@ -265,3 +265,30 @@ fn v7_37_14_pg_blocking_pids_function_callable() {
         "pre-v7.37.15 pg_blocking_pids returns NULL (sentinel len = -1)"
     );
 }
+
+/// v7.37.15 (Phase F TDD) — `spg_stat_mvcc` exposes the engine's
+/// MVCC visibility state. Verifies the 3-column schema +
+/// single-row response.
+#[test]
+fn v7_37_15_spg_stat_mvcc_surface_queryable() {
+    let dir = unique_tmpdir("mvcc-view");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap(), "carol");
+
+    send_query(&mut s, "SELECT * FROM spg_stat_mvcc");
+    let msgs = read_until_ready(&mut s);
+    let rd = msgs.iter().find(|m| m.ty == b'T').expect("RowDescription");
+    let cell_count = u16::from_be_bytes([rd.body[0], rd.body[1]]) as usize;
+    assert_eq!(
+        cell_count, 3,
+        "spg_stat_mvcc has 3 columns (current_version, active_writer_count, oldest_active_version)"
+    );
+    let data_rows: Vec<&PgMessage> = msgs.iter().filter(|m| m.ty == b'D').collect();
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "spg_stat_mvcc returns exactly one row per call"
+    );
+}
