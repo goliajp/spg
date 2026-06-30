@@ -120,14 +120,16 @@ fn wait_event_is_idle_between_queries() {
         "expected ≥1 row, got {}",
         data_rows.len()
     );
-    // Every row's wait_event column (5th cell, index 4) should be
-    // empty string (idle) since no one is mid-query (the probe is
-    // mid-query but that's the SELECT path which is also idle
-    // post-engine.read).
+    // v7.37.14 (B6.3) — wait_event column is now index 5 (was 4
+    // pre-v7.37.14; the new `wait_event_type` lives at index 4 so
+    // we skip ONE more cell to reach wait_event). Every row's
+    // wait_event should be empty (idle) since no one is mid-query
+    // (the probe is mid-query but that's the SELECT path which is
+    // also idle post-engine.read).
     for dr in &data_rows {
-        // Skip cells 0..4 to land at cell 4 = wait_event.
+        // Skip cells 0..5 to land at cell 5 = wait_event.
         let mut off = 2;
-        for _ in 0..4 {
+        for _ in 0..5 {
             let len = i32::from_be_bytes([
                 dr.body[off],
                 dr.body[off + 1],

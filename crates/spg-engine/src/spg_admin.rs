@@ -316,11 +316,16 @@ impl Engine {
     /// empty result set when no provider is registered (the no_std
     /// embedded path with no pgwire layer).
     pub(crate) fn exec_spg_stat_activity(&self) -> QueryResult {
+        // v7.37.14 (B6.3) — column order matches PG's
+        // pg_stat_activity for `wait_event_type` immediately before
+        // `wait_event` so client-side projection by ordinal stays
+        // robust even before adopters update to named projection.
         let columns = alloc::vec![
             ColumnSchema::new("pid", DataType::Int, false),
             ColumnSchema::new("user", DataType::Text, false),
             ColumnSchema::new("started_at_us", DataType::BigInt, false),
             ColumnSchema::new("current_sql", DataType::Text, false),
+            ColumnSchema::new("wait_event_type", DataType::Text, false),
             ColumnSchema::new("wait_event", DataType::Text, false),
             ColumnSchema::new("elapsed_us", DataType::BigInt, false),
             ColumnSchema::new("in_transaction", DataType::Bool, false),
@@ -337,6 +342,7 @@ impl Engine {
                     Value::text(r.user),
                     Value::BigInt(r.started_at_us),
                     Value::text(r.current_sql),
+                    Value::text(r.wait_event_type),
                     Value::text(r.wait_event),
                     Value::BigInt(r.elapsed_us),
                     Value::Bool(r.in_transaction),
@@ -344,6 +350,36 @@ impl Engine {
                 ])
             })
             .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.37.14 (B6.5) — materialise `pg_locks` rows. PG exposes a
+    /// detailed lock table (locktype / database / relation /
+    /// virtualtransaction / pid / mode / granted / fastpath /
+    /// waitstart). SPG's single-writer + Arc-snapshot model means
+    /// the v7.37.14 row set is structurally empty most of the time
+    /// — there are no per-tuple locks to enumerate, and the global
+    /// engine RwLock is either held or not (no chain to walk).
+    /// v7.37.15 (per-row tuple lock implementation) populates rows
+    /// from the live LockTable; the SQL surface ships now so
+    /// adopters can already write monitoring queries / dashboards
+    /// against the stable column set.
+    pub(crate) fn exec_pg_locks(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("locktype", DataType::Text, false),
+            ColumnSchema::new("database", DataType::Text, false),
+            ColumnSchema::new("relation", DataType::Text, false),
+            ColumnSchema::new("virtualtransaction", DataType::Text, false),
+            ColumnSchema::new("pid", DataType::Int, false),
+            ColumnSchema::new("mode", DataType::Text, false),
+            ColumnSchema::new("granted", DataType::Bool, false),
+            ColumnSchema::new("fastpath", DataType::Bool, false),
+            ColumnSchema::new("waitstart_us", DataType::BigInt, false),
+        ];
+        // Empty row set until v7.37.15. Documented as the stable
+        // SQL surface — the row content fills in once tuple locks
+        // exist (B2.5 in AUDIT-3-categories).
+        let rows: Vec<Row<'static>> = Vec::new();
         QueryResult::Rows { columns, rows }
     }
 

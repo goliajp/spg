@@ -569,6 +569,12 @@ pub struct ActivityRow {
     pub user: String,
     pub started_at_us: i64,
     pub current_sql: String,
+    /// v7.37.14 (B6.3) — PG-style wait-event categorisation
+    /// ("Lock", "LWLock", "IPC", "IO", "Timeout", "Client",
+    /// "BufferPin", "Extension", ""). Empty string means idle.
+    /// Pair with `wait_event` to identify "what specifically is
+    /// the backend waiting on" the same way PG does.
+    pub wait_event_type: String,
     pub wait_event: String,
     pub elapsed_us: i64,
     pub in_transaction: bool,

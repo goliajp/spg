@@ -1260,6 +1260,9 @@ impl Engine {
                 // default behaviour (cumulative per query shape).
                 "pg_stat_statements" => return Ok(self.exec_spg_stat_query()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
+                // v7.37.14 (B6.5) — PG-compatibility surface; row
+                // set is empty until v7.37.15 lands tuple locks.
+                "pg_locks" => return Ok(self.exec_pg_locks()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
                 "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
                 "spg_table_ddl" => return Ok(self.exec_spg_table_ddl()),
