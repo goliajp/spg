@@ -193,6 +193,61 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.21 (21.13) — synthesise `pg_catalog.pg_replication_slots`.
+/// PG's slot table tracks each physical/logical replication
+/// stream's persistent LSN/restart-LSN position so a subscriber
+/// reconnecting after a network drop can resume rather than
+/// restart from the snapshot.
+///
+/// SPG's logical replication via MAGIC_SUB doesn't yet persist
+/// slot state across engine restarts — every subscriber connects
+/// fresh and walks the change-stream from the current LSN. The
+/// view ships the PG-canonical columns shape-stable (zero rows)
+/// so monitoring queries / dashboards (`SELECT * FROM
+/// pg_replication_slots WHERE active = true`) keep parsing
+/// against SPG.
+///
+/// PG-canonical columns:
+///   * slot_name (Text)
+///   * plugin (Text) — output-plugin name (`pgoutput` etc.)
+///   * slot_type (Text) — `physical` / `logical`
+///   * datoid (BigInt) — owning database OID
+///   * database (Text)
+///   * temporary (Bool)
+///   * active (Bool)
+///   * active_pid (Int)
+///   * xmin (BigInt) — oldest tx the slot needs
+///   * catalog_xmin (BigInt)
+///   * restart_lsn (Text) — PG LSN format ("X/YYYYYYYY")
+///   * confirmed_flush_lsn (Text)
+///   * wal_status (Text) — `reserved` / `extended` / `unreserved` / `lost`
+///   * safe_wal_size (BigInt) — bytes before the slot's WAL is reclaimed
+pub(crate) fn synth_pg_replication_slots(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("slot_name", DataType::Text, false),
+        ColumnSchema::new("plugin", DataType::Text, true),
+        ColumnSchema::new("slot_type", DataType::Text, false),
+        ColumnSchema::new("datoid", DataType::BigInt, true),
+        ColumnSchema::new("database", DataType::Text, true),
+        ColumnSchema::new("temporary", DataType::Bool, false),
+        ColumnSchema::new("active", DataType::Bool, false),
+        ColumnSchema::new("active_pid", DataType::Int, true),
+        ColumnSchema::new("xmin", DataType::BigInt, true),
+        ColumnSchema::new("catalog_xmin", DataType::BigInt, true),
+        ColumnSchema::new("restart_lsn", DataType::Text, true),
+        ColumnSchema::new("confirmed_flush_lsn", DataType::Text, true),
+        ColumnSchema::new("wal_status", DataType::Text, true),
+        ColumnSchema::new("safe_wal_size", DataType::BigInt, true),
+    ];
+    // Empty until SPG persists slot state across engine restarts
+    // (21.12 dependency). The shape is stable so dashboards keep
+    // parsing.
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
 /// v7.37.24 (24.3) — synthesise `information_schema.attributes`.
 /// PG-standard surface listing every field of every composite
 /// type. ORM enum/composite codecs and pg_dump use this to
