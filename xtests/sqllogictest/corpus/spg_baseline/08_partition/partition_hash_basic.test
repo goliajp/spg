@@ -1,0 +1,37 @@
+# v7.37.16 (16.2) — PARTITION BY HASH end-to-end through pgwire.
+
+statement ok
+CREATE TABLE orders (id BIGINT NOT NULL, amount BIGINT) PARTITION BY HASH (id)
+
+statement ok
+CREATE TABLE orders_0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0)
+
+statement ok
+CREATE TABLE orders_1 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 1)
+
+statement ok
+CREATE TABLE orders_2 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 2)
+
+statement ok
+CREATE TABLE orders_3 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 3)
+
+statement ok
+INSERT INTO orders VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500), (6, 600), (7, 700), (8, 800)
+
+# Every insert lands in some child + the parent UNION sees every row.
+query I
+SELECT COUNT(*) FROM orders
+----
+8
+
+# REMAINDER ≥ MODULUS is rejected at parse / DDL time.
+statement error
+CREATE TABLE orders_bad PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 4)
+
+# Duplicate REMAINDER on a sibling is rejected.
+statement error
+CREATE TABLE orders_dup PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0)
+
+# Mixed MODULUS within one parent rejected (16.2 single-modulus invariant).
+statement error
+CREATE TABLE orders_mix PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 0)

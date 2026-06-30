@@ -1,0 +1,61 @@
+# v7.37.16 (16.1) — PARTITION BY LIST end-to-end through the
+# pgwire surface. Mirrors the engine e2e suite but goes through
+# the server's extended-protocol path so dump/restore +
+# `psql --no-server` flows are also exercised.
+
+statement ok
+CREATE TABLE cust (id BIGINT NOT NULL, region TEXT NOT NULL) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp', 'kr', 'tw')
+
+statement ok
+CREATE TABLE cust_emea PARTITION OF cust FOR VALUES IN ('de', 'fr', 'uk')
+
+statement ok
+CREATE TABLE cust_default PARTITION OF cust DEFAULT
+
+statement ok
+INSERT INTO cust VALUES (1, 'jp'), (2, 'de'), (3, 'us')
+
+# Routing: each row lands in the right child.
+query I
+SELECT COUNT(*) FROM cust_apac
+----
+1
+
+query I
+SELECT COUNT(*) FROM cust_emea
+----
+1
+
+query I
+SELECT COUNT(*) FROM cust_default
+----
+1
+
+# Parent UNION returns every row.
+query I
+SELECT COUNT(*) FROM cust
+----
+3
+
+# Equality predicate prunes to the matching child (correctness:
+# must still return the same row regardless of pruning).
+query IT rowsort
+SELECT id, region FROM cust WHERE region = 'jp'
+----
+1
+jp
+
+# Default child still scanned when the equality literal lives
+# only there.
+query IT rowsort
+SELECT id, region FROM cust WHERE region = 'us'
+----
+3
+us
+
+# Duplicate LIST value across siblings is rejected.
+statement error
+CREATE TABLE cust_dup PARTITION OF cust FOR VALUES IN ('jp')
