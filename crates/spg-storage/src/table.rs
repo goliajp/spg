@@ -96,6 +96,54 @@ impl Table {
         Ok(())
     }
 
+    /// v7.37.15 (Phase D) — single-table vacuum pass. Walks the
+    /// header vec and physically removes any row whose delete
+    /// commit is older than `oldest_active_snapshot`. Returns the
+    /// number of reclaimable rows (with `dry_run == true`) or the
+    /// number actually reclaimed.
+    ///
+    /// `oldest_active_snapshot` is the floor of every live
+    /// snapshot's `version` — the engine maintains this; hosts
+    /// pass it through.
+    ///
+    /// Phase D ships the storage primitive. Hosts (spg-embedded /
+    /// spg-server) schedule the pass on their own thread.
+    pub fn vacuum(
+        &mut self,
+        oldest_active_snapshot: u64,
+        dry_run: bool,
+    ) -> crate::vacuum::VacuumReport {
+        let examined = self.headers.len() as u64;
+        // Collect the reclaimable positions in a first pass so the
+        // mutation can rebuild both the rows and the headers vec
+        // together (their lock-step invariant survives).
+        let to_reclaim: alloc::vec::Vec<usize> = (0..self.headers.len())
+            .filter(|&i| {
+                self.headers
+                    .get(i)
+                    .map(|h| crate::vacuum::is_reclaimable(h.xmax, oldest_active_snapshot))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if to_reclaim.is_empty() || dry_run {
+            return crate::vacuum::VacuumReport {
+                rows_reclaimed: to_reclaim.len() as u64,
+                rows_examined: examined,
+                per_table: alloc::vec::Vec::new(),
+            };
+        }
+        // Drive the existing per-position delete path so both rows
+        // and headers shrink together (it's the only mutator that
+        // already maintains the lock-step invariant).
+        let removed = self.delete_rows_no_index(&to_reclaim);
+        self.rebuild_indices();
+        crate::vacuum::VacuumReport {
+            rows_reclaimed: removed as u64,
+            rows_examined: examined,
+            per_table: alloc::vec::Vec::new(),
+        }
+    }
+
     /// v7.37.15 (Phase C) — mark the row at `position` as deleted
     /// by version `xmax`. The row stays physically present; later
     /// vacuum (Phase D) reclaims it once no live snapshot can
