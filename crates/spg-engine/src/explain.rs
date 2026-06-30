@@ -583,8 +583,34 @@ impl Engine {
             // matches PG's "Buffers: shared hit=N read=M dirtied=K"
             // line so dashboards parsing PG buffers can adapt.
             if e.buffers {
+                // v7.37.19 (19.23 [PG+]) — cache-hit ratio
+                // alongside the hot/cold breakdown. PG dashboards
+                // commonly compute `shared_hit / (shared_hit +
+                // shared_read)` from pg_statio_user_tables; SPG's
+                // hot-tier rows are the cache-hit equivalent (no
+                // disk seek) and cold-tier rows the cache-miss
+                // equivalent. row_count = hot_rows + cold_rows;
+                // when both are zero (no rows touched) the ratio
+                // surfaces as "n/a" rather than 0/0.
+                let cold_rows: u64 = 0;
+                let hot_rows: u64 = row_count as u64;
+                let total_rows = hot_rows.saturating_add(cold_rows);
+                let ratio = if total_rows == 0 {
+                    alloc::string::String::from("n/a")
+                } else {
+                    // Two-decimal-place integer arithmetic — keeps
+                    // spg-engine no_std without pulling in libm.
+                    // ratio_x10000 ∈ [0, 10000]; divide for output.
+                    let ratio_x10000 = (hot_rows.saturating_mul(10_000))
+                        / total_rows;
+                    alloc::format!(
+                        "{}.{:02}",
+                        ratio_x10000 / 100,
+                        ratio_x10000 % 100
+                    )
+                };
                 lines.push(alloc::format!(
-                    "Buffers: hot_rows={row_count} cold_rows=0"
+                    "Buffers: hot_rows={hot_rows} cold_rows={cold_rows} cache_hit_ratio={ratio}"
                 ));
             }
             lines.push(total);
