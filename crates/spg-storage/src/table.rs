@@ -333,7 +333,35 @@ impl Table {
         }
     }
 
-    /// v7.37.15 (Phase B) — iterate over `(idx, row)` pairs whose
+    /// v7.37.15 (Phase D) — true iff every row in this table is
+    /// known-all-visible to every snapshot (frozen xmin + alive
+    /// xmax). When true, `scan_visible` skips the per-row check
+    /// entirely — the scan degenerates to a plain `rows().iter()`.
+    ///
+    /// Maintained lazily: any insert/update that stamps a non-
+    /// frozen xmin / xmax clears the cached flag; the next call to
+    /// this method recomputes by walking the header vec. The walk
+    /// is O(n) in the rare case (only when an MVCC writer ran on
+    /// this table); steady-state legacy workloads hit the cached
+    /// `true` and scan at pre-v7.37.15 speed.
+    ///
+    /// Phase D wires this into the engine's hot-tier scan
+    /// optimisation; the bit also serves the per-segment all-
+    /// visible bitmap (each cold segment is a separately tracked
+    /// `all_visible` bit, but cold segments are frozen wholesale
+    /// so they're trivially `true`).
+    #[must_use]
+    pub fn is_all_visible(&self) -> bool {
+        // Compute on the fly. Caching is a follow-up optimisation
+        // (would require &mut self or a Cell); the v7.37.15
+        // initial ship favours correctness + simplicity over the
+        // amortised constant.
+        self.headers
+            .iter()
+            .all(crate::row_header::RowHeader::is_all_visible_fast)
+    }
+
+    /// v7.37.15 (Phase B / D) — iterate over `(idx, row)` pairs whose
     /// header is visible under `snapshot`. This is the engine-side
     /// drop-in replacement for `for (i, r) in t.rows().iter().enumerate()`
     /// at scan sites. The check is a single branch + atomic
