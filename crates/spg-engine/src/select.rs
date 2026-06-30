@@ -376,6 +376,15 @@ impl Engine {
                         crate::system_catalog::synth_pg_enum(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.21 (21.13) — pg_catalog.pg_replication_slots
+                // (shape-stable empty until 21.12 persists slot state).
+                "__spg_pg_replication_slots" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_replication_slots(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
