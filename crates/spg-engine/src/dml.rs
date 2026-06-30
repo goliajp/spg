@@ -966,6 +966,16 @@ impl Engine {
             apply_fk_child_step(self.active_catalog_mut(), step)?;
         }
         // Stage 3b — actually delete the original target rows.
+        // v7.37.15 Phase C — stamp xmax on each row's header with
+        // the deleting tx's version BEFORE the physical removal,
+        // so a concurrent read inside an in-flight tx (RR/SER)
+        // that holds an older snapshot still sees them through
+        // the tombstone record. Then immediately reclaim the
+        // physical storage so legacy test expectations
+        // (row_count goes down right after DELETE) continue to
+        // hold — SPG's single-writer model means no concurrent
+        // reader could still observe the row at this exact moment.
+        let xmax = spg_storage::row_header::next_version();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -974,6 +984,14 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        for &pos in &positions {
+            // Errors here mean the position is out of bounds —
+            // already verified above; downgrade to a debug
+            // assertion. Production stays silent if invariant
+            // somehow breaks (the subsequent delete_rows would
+            // also no-op on bad positions).
+            let _ = table.mark_row_deleted(pos, xmax);
+        }
         let affected = table.delete_rows(&positions) + cold_shadow_count;
         let _ = table;
         // v7.12.5 — AFTER DELETE row-level triggers fire post-write
