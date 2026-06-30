@@ -358,12 +358,9 @@ fn spg_value_to_psql_text(v: &spg_storage::Value<'_>) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => {
-            // Match PG's default-precision representation.
-            if f.fract() == 0.0 && f.abs() < 1e16 {
-                format!("{f}")
-            } else {
-                format!("{f}")
-            }
+            // Match PG's default-precision representation. (Both branches
+            // currently format the same way; kept as a single arm.)
+            format!("{f}")
         }
         Value::Text(s) => s.to_string(),
         other => format!("{other:?}"),

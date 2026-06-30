@@ -1596,7 +1596,7 @@ pub(crate) static FSYNC_PANIC_OBSERVED: std::sync::atomic::AtomicBool =
 /// is straight-through on every build. Kept as a named helper so
 /// future fsync-related policies (e.g. SPG_WAL_BARRIER mode) have
 /// a single chokepoint to hook.
-#[inline(always)]
+#[inline]
 fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
     f.sync_data()
 }
@@ -3214,8 +3214,9 @@ impl Database {
             // 60 s anyway because last_checkpoint_at hasn't moved").
             *p.last_checkpoint_at
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) =
-                std::time::Instant::now() - threshold.unwrap_or_default();
+                .unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now()
+                .checked_sub(threshold.unwrap_or_default())
+                .unwrap_or_else(std::time::Instant::now);
             *p.last_checkpoint_wal_len
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = 0;
@@ -3731,7 +3732,7 @@ impl Database {
                     let target = ewma.saturating_mul(30); // ~30 s of writes
                     drop(ewma);
                     // Bound: [1 MiB, 64 MiB] so we never go absurd.
-                    let bounded = target.max(1 * 1024 * 1024).min(64 * 1024 * 1024);
+                    let bounded = target.max(1024 * 1024).min(64 * 1024 * 1024);
                     p.checkpoint_threshold_bytes = bounded;
                 }
                 *p.last_checkpoint_at
@@ -6219,10 +6220,10 @@ mod tests {
             "EWMA must be non-zero after 5 trigger rounds (saw {ewma})"
         );
         // 1 MiB ≤ threshold ≤ 64 MiB per the documented bounds.
-        const ONE_MIB: u64 = 1 * 1024 * 1024;
+        const ONE_MIB: u64 = 1024 * 1024;
         const SIXTY_FOUR_MIB: u64 = 64 * 1024 * 1024;
         assert!(
-            threshold >= ONE_MIB && threshold <= SIXTY_FOUR_MIB,
+            (ONE_MIB..=SIXTY_FOUR_MIB).contains(&threshold),
             "adaptive threshold must land in [1 MiB, 64 MiB] (saw {threshold} bytes; \
              EWMA={ewma} B/s)"
         );
@@ -6261,7 +6262,7 @@ mod tests {
         db.checkpoint_wait().expect("drain");
 
         let threshold = db.checkpoint_threshold_bytes();
-        const ONE_MIB: u64 = 1 * 1024 * 1024;
+        const ONE_MIB: u64 = 1024 * 1024;
         assert!(
             threshold >= ONE_MIB,
             "adaptive recompute must clamp to [1 MiB, ...] floor even on \

@@ -50,9 +50,9 @@ fn apply_function_dispatch(
         // point, wake parked threads, or detach. Release builds
         // (feature off) reject the calls outright so a production
         // SPG can't be coerced into deadlocking.
-        "spg_injection_attach" => return spg_injection_attach(args),
-        "spg_injection_wakeup" => return spg_injection_wakeup(args),
-        "spg_injection_detach" => return spg_injection_detach(args),
+        "spg_injection_attach" => spg_injection_attach(args),
+        "spg_injection_wakeup" => spg_injection_wakeup(args),
+        "spg_injection_detach" => spg_injection_detach(args),
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {

@@ -430,8 +430,8 @@ mod active {
                 // clippy considers a non-binding let on a lock guard
                 // a footgun (the guard is dropped at end-of-stmt,
                 // which is the same here, but we make it explicit).
-                let _guard = cv.1.wait(g).expect("inject condvar poisoned");
-                drop(_guard);
+                let guard = cv.1.wait(g).expect("inject condvar poisoned");
+                drop(guard);
             }
             Action::Error(msg) => {
                 // Engine::execute boundary catches panics into

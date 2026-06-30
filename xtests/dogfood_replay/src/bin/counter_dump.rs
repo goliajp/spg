@@ -21,7 +21,7 @@
 //!   cargo run --release --bin spg-counter-dump --p spg-dogfood-replay -- \
 //!     mailrs-2026-06-22-class-c-dashboard-cte
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
