@@ -22,6 +22,22 @@ impl Engine {
                 savepoints: Vec::new(),
             },
         );
+        // v7.37.15 Phase C — allocate a writer version for the
+        // duration of this explicit transaction. Concurrent
+        // readers that build snapshots between now and COMMIT
+        // see this version in `in_progress`, so they don't
+        // observe the tx's uncommitted writes (when the tx's
+        // INSERT stamps `xmin = V`, snapshots taken before the
+        // exec_commit hides those rows). The version stays in
+        // `active_writer_versions` until exec_commit or
+        // exec_rollback fires.
+        let v = self.begin_writer_version();
+        // Stash the allocated version on the TxState so
+        // exec_commit / exec_rollback know which version to
+        // commit/discard. Reuse `next_tx_id` as a cheap registry —
+        // actual storage is on TxState but the lookup key is
+        // `tx_id`.
+        self.tx_writer_versions.insert(tx_id, v);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -45,6 +61,13 @@ impl Engine {
         // view, this thread is now the leader.
         crate::injection_point!("wal_group_commit_leader_chosen", &tx_id);
         self.catalog = state.catalog;
+        // v7.37.15 Phase C — mark the writer version this tx
+        // allocated as committed so subsequent reader snapshots
+        // observe the tx's writes. No-op if the registry never
+        // saw a begin (e.g. autocommit-only paths).
+        if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+            self.commit_writer_version(v);
+        }
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with
         // `state`).
@@ -58,6 +81,13 @@ impl Engine {
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
         if self.tx_catalogs.remove(&tx_id).is_none() {
             return Err(EngineError::NoActiveTransaction);
+        }
+        // v7.37.15 Phase C — release the writer version (treated
+        // as a commit for the in_progress set's purposes; the
+        // shadow catalog never made it into self.catalog so the
+        // rows the tx stamped never reached storage).
+        if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+            self.commit_writer_version(v);
         }
         // savepoints discarded with the TxState
         Ok(QueryResult::CommandOk {
