@@ -193,6 +193,105 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.24 (24.16) — synthesise `pg_catalog.pg_inherits`.
+/// PG's catalog table that walks the parent → child inheritance
+/// graph. pg_dump uses this to restore CREATE TABLE …
+/// PARTITION OF parent declarations; partition-aware monitoring
+/// dashboards walk it to map partition children back to parents.
+///
+/// PG-canonical columns:
+///   * inhrelid (BigInt) — child OID
+///   * inhparent (BigInt) — parent OID
+///   * inhseqno (Int) — 1-based order within parent
+///   * inhdetachpending (Bool) — false in SPG (DETACH is atomic)
+///
+/// SPG declarative partitioning (v7.37.6-B + v7.37.16) is the
+/// only inheritance source; legacy CREATE TABLE … INHERITS
+/// (v7.37.18 (18.9) accept-and-no-op) doesn't materialise here.
+pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_storage::PartitionRole;
+    let schema = alloc::vec![
+        ColumnSchema::new("inhrelid", DataType::BigInt, false),
+        ColumnSchema::new("inhparent", DataType::BigInt, false),
+        ColumnSchema::new("inhseqno", DataType::Int, false),
+        ColumnSchema::new("inhdetachpending", DataType::Bool, false),
+    ];
+    // Build name→OID map matching pg_class's 16384+ band.
+    let mut by_name: alloc::collections::BTreeMap<String, i64> =
+        alloc::collections::BTreeMap::new();
+    let mut oid: i64 = 16384;
+    for tname in cat.table_names() {
+        by_name.insert(tname.clone(), oid);
+        oid = oid.saturating_add(1);
+    }
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    // Track per-parent seqno so each child gets a unique 1-based
+    // index — matches PG's pg_inherits.inhseqno semantics.
+    let mut per_parent_seq: alloc::collections::BTreeMap<i64, i32> =
+        alloc::collections::BTreeMap::new();
+    for cname in cat.table_names() {
+        let Some(c) = cat.get(&cname) else { continue };
+        let parent_name = match &c.schema().partition_role {
+            Some(PartitionRole::Range { parent_name, .. })
+            | Some(PartitionRole::List { parent_name, .. })
+            | Some(PartitionRole::Hash { parent_name, .. })
+            | Some(PartitionRole::Default { parent_name }) => parent_name.clone(),
+            _ => continue,
+        };
+        let Some(&child_oid) = by_name.get(&cname) else {
+            continue;
+        };
+        let Some(&parent_oid) = by_name.get(&parent_name) else {
+            continue;
+        };
+        let seq = per_parent_seq
+            .entry(parent_oid)
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(child_oid),
+            Value::BigInt(parent_oid),
+            Value::Int(*seq),
+            Value::Bool(false),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.37.24 (24.17) — synthesise `pg_catalog.pg_depend`. PG's
+/// dependency-graph table that pg_dump walks to figure out
+/// drop order (drop dependent objects before their parents).
+/// SPG doesn't track per-object dependencies explicitly (the
+/// DROP-time enforcement is per-kind: FK → check parent table
+/// exists; INDEX → table exists; etc.), so the view ships
+/// empty with the PG-canonical column shape. pg_dump's
+/// dependency-walking query returns no rows → drop in declared
+/// order → still correct for SPG's hard-coded enforcement
+/// graph.
+///
+/// PG-canonical columns:
+///   * classid (BigInt) — pg_class OID for the dependent's catalog
+///   * objid (BigInt) — dependent OID
+///   * objsubid (Int) — column position for column-level deps
+///   * refclassid (BigInt) — pg_class OID for the referenced's catalog
+///   * refobjid (BigInt) — referenced OID
+///   * refobjsubid (Int)
+///   * deptype (Text) — single char: 'n' normal / 'a' auto /
+///     'i' internal / 'e' extension / 'p' pin
+pub(crate) fn synth_pg_depend(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("classid", DataType::BigInt, false),
+        ColumnSchema::new("objid", DataType::BigInt, false),
+        ColumnSchema::new("objsubid", DataType::Int, false),
+        ColumnSchema::new("refclassid", DataType::BigInt, false),
+        ColumnSchema::new("refobjid", DataType::BigInt, false),
+        ColumnSchema::new("refobjsubid", DataType::Int, false),
+        ColumnSchema::new("deptype", DataType::Text, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
 /// v7.37.23 (23.7-a) — synthesise `pg_catalog.pg_statistic_ext`.
 /// PG's extended-statistics catalog (one row per CREATE
 /// STATISTICS). SPG accepts CREATE STATISTICS as a parser

@@ -482,6 +482,21 @@ impl Engine {
                         crate::system_catalog::synth_pg_statistic(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.24 (24.16) — pg_catalog.pg_inherits
+                // (partition parent → child OID mapping).
+                "__spg_pg_inherits" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_inherits(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.24 (24.17) — pg_catalog.pg_depend
+                // (dependency graph; shape-stable empty since
+                // SPG's drop enforcement is per-kind, not per-object).
+                "__spg_pg_depend" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_depend(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.14) — pg_catalog.pg_collation.
                 "__spg_pg_collation" => {
                     let (schema, rows) =
