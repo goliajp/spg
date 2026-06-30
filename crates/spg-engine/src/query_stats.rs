@@ -26,6 +26,16 @@ pub struct QueryStat {
     pub total_us: u64,
     pub max_us: u64,
     pub last_seen_us: u64,
+    /// v7.37.22 (22.9) — cumulative row count produced / affected
+    /// across every execution of this normalised template. Matches
+    /// PG `pg_stat_statements.rows`. SELECT counts the result row
+    /// count; INSERT/UPDATE/DELETE count `affected`. Saturating add.
+    pub total_rows: u64,
+    /// v7.37.22 (22.9) — peak per-execution row count. Useful for
+    /// dashboards flagging templates whose worst case is a runaway
+    /// scan (e.g. a SELECT that usually returns 10 rows but
+    /// occasionally pulls 10M).
+    pub max_rows: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,7 +211,26 @@ impl QueryStats {
     ///
     /// v7.37.22 (22.6) — the sql key is normalised so distinct
     /// literal-bearing instances collapse to a single template.
+    ///
+    /// Row-count is reported via [`Self::record_with_rows`]; this
+    /// shim defaults to 0 for callers that don't yet plumb the
+    /// affected / produced row count through.
     pub fn record(&mut self, sql: &str, elapsed_us: u64, now_us: u64) {
+        self.record_with_rows(sql, elapsed_us, now_us, 0);
+    }
+
+    /// v7.37.22 (22.9) — full record path with row count tracking.
+    /// `rows` is the number of rows the executor produced
+    /// (SELECT result.len()) or affected (INSERT/UPDATE/DELETE
+    /// affected). Aggregates over the normalised template into
+    /// `total_rows` (cumulative) and `max_rows` (per-call peak).
+    pub fn record_with_rows(
+        &mut self,
+        sql: &str,
+        elapsed_us: u64,
+        now_us: u64,
+        rows: u64,
+    ) {
         let sql = &Self::normalize_sql(sql);
         let sql: &str = sql.as_str();
         if let Some(stat) = self.entries.get_mut(sql) {
@@ -209,6 +238,8 @@ impl QueryStats {
             stat.total_us = stat.total_us.saturating_add(elapsed_us);
             stat.max_us = stat.max_us.max(elapsed_us);
             stat.last_seen_us = now_us;
+            stat.total_rows = stat.total_rows.saturating_add(rows);
+            stat.max_rows = stat.max_rows.max(rows);
             // Promote to MRU in lru queue.
             if let Some(idx) = self.lru.iter().position(|k| k == sql) {
                 let key = self.lru.remove(idx).expect("idx from position");
@@ -229,6 +260,8 @@ impl QueryStats {
                 total_us: elapsed_us,
                 max_us: elapsed_us,
                 last_seen_us: now_us,
+                total_rows: rows,
+                max_rows: rows,
             },
         );
         self.lru.push_back(String::from(sql));
@@ -300,6 +333,31 @@ mod tests {
             ),
             "select * from t where id = $1"
         );
+    }
+
+    #[test]
+    fn record_with_rows_tracks_total_and_max() {
+        // v7.37.22 (22.9) — row count accumulates per template.
+        let mut qs = QueryStats::new();
+        qs.record_with_rows("SELECT * FROM t", 100, 1000, 5);
+        qs.record_with_rows("SELECT * FROM t", 200, 2000, 12);
+        qs.record_with_rows("SELECT * FROM t", 150, 3000, 3);
+        let s = qs.get("SELECT * FROM t").expect("present");
+        assert_eq!(s.exec_count, 3);
+        assert_eq!(s.total_rows, 5 + 12 + 3);
+        assert_eq!(s.max_rows, 12);
+    }
+
+    #[test]
+    fn record_zero_default_keeps_row_counters_at_zero() {
+        // The legacy `record(sql, elapsed, now)` shim should
+        // leave row counters at 0 — preserves backwards
+        // compatibility for callers that don't yet plumb rows.
+        let mut qs = QueryStats::new();
+        qs.record("SELECT 1", 100, 1000);
+        let s = qs.get("SELECT 1").expect("present");
+        assert_eq!(s.total_rows, 0);
+        assert_eq!(s.max_rows, 0);
     }
 
     #[test]

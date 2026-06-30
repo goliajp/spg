@@ -380,10 +380,18 @@ impl Engine {
         // no clock attached (no_std embedded callers).
         let start_us = self.clock.map(|f| f());
         let result = self.execute_stmt_with_cancel(stmt, cancel);
-        if let (Some(t0), Ok(_)) = (start_us, &result) {
+        if let (Some(t0), Ok(ok)) = (start_us, &result) {
             let now = self.clock.map_or(t0, |f| f());
             let elapsed = now.saturating_sub(t0).max(0) as u64;
-            self.query_stats.record(sql, elapsed, now as u64);
+            // v7.37.22 (22.9) — count rows produced (SELECT) or
+            // affected (INSERT/UPDATE/DELETE) so pg_stat_statements'
+            // `rows` column populates accurately.
+            let row_count: u64 = match ok {
+                QueryResult::Rows { rows, .. } => rows.len() as u64,
+                QueryResult::CommandOk { affected, .. } => *affected as u64,
+            };
+            self.query_stats
+                .record_with_rows(sql, elapsed, now as u64, row_count);
             // v6.5.6 — slow-query log: fire callback when elapsed
             // exceeds the configured floor.
             if let (Some(threshold), Some(logger)) =
