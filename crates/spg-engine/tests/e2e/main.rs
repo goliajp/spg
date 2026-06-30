@@ -275,6 +275,7 @@ mod e2e_unsigned;
 mod e2e_update_correlated;
 mod e2e_uuid;
 mod e2e_view;
+mod e2e_view_auto_updatable;
 mod e2e_window_in_join;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;

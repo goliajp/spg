@@ -8,6 +8,79 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{Expr, InsertStatement, SelectItem};
+
+/// v7.37.19 (19.13) — view auto-updatable redirect.
+///
+/// PG calls a view "simple-query" auto-updatable when its body has
+/// the shape `SELECT col1, col2, ... FROM base_table` with no
+/// joins / WHERE / GROUP BY / HAVING / DISTINCT / aggregates /
+/// unions / ORDER BY / LIMIT / OFFSET. SPG mirrors PG's rule.
+///
+/// When `view_name` matches such a view in the active catalog,
+/// returns `Some(base_table_name)` and the INSERT/UPDATE/DELETE
+/// dispatcher rewrites stmt.table to the base. Column lists are
+/// preserved as-is — the parsed view body has plain Column
+/// references with the same names as the base table's columns
+/// (column rename via the view's `columns:` field is rejected by
+/// the auto-updatable check), so no per-column mapping is needed.
+///
+/// Returns None when:
+///   - view_name is not a view (a real table → caller's existing path)
+///   - the view's body is not a simple-query shape
+///   - the view's `columns:` field is non-empty (column rename)
+fn view_redirect_to_simple_base(
+    catalog: &spg_storage::Catalog,
+    view_name: &str,
+) -> Option<String> {
+    let view = catalog.views().get(view_name)?;
+    // Column-rename views are NOT auto-updatable: PG-faithful behavior
+    // because the rename would need to be applied to caller's column
+    // list (a per-column map) and SPG doesn't ship that today.
+    if !view.columns.is_empty() {
+        return None;
+    }
+    let stmt = spg_sql::parser::parse_statement(&view.body).ok()?;
+    let select = match stmt {
+        spg_sql::ast::Statement::Select(s) => s,
+        _ => return None,
+    };
+    // simple-query shape: every reject clause must be empty / None.
+    if !select.ctes.is_empty()
+        || select.distinct
+        || select.where_.is_some()
+        || select.group_by.is_some()
+        || select.group_by_all
+        || select.having.is_some()
+        || !select.unions.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    // No joins.
+    if !from.joins.is_empty() {
+        return None;
+    }
+    // Primary table must be a plain TableRef (not unnest, not AS OF).
+    if from.primary.unnest_expr.is_some() || from.primary.as_of_segment.is_some() {
+        return None;
+    }
+    // Every projected item must be a bare column reference or
+    // wildcard. Aggregates / function calls / arithmetic = not simple.
+    for item in &select.items {
+        match item {
+            spg_sql::ast::SelectItem::Wildcard => {}
+            spg_sql::ast::SelectItem::Expr { expr, .. } => {
+                if !matches!(expr, spg_sql::ast::Expr::Column(_)) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(from.primary.name.clone())
+}
 use spg_storage::{ColumnSchema, Row, StorageError, Value};
 
 use crate::eval::{EvalContext, EvalError};
@@ -49,6 +122,12 @@ impl Engine {
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
+        }
+        // v7.37.19 (19.13) — auto-updatable view redirect.
+        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+            let mut rewritten = stmt.clone();
+            rewritten.table = base;
+            return self.exec_update_cancel(&rewritten, cancel);
         }
         // v7.12.5 — snapshot BEFORE/AFTER UPDATE row triggers + the
         // session FTS config before the table mut-borrow opens (the
@@ -758,6 +837,12 @@ impl Engine {
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
         }
+        // v7.37.19 (19.13) — auto-updatable view redirect.
+        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+            let mut rewritten = stmt.clone();
+            rewritten.table = base;
+            return self.exec_delete_cancel(&rewritten, cancel);
+        }
         // v7.12.5 — snapshot BEFORE/AFTER DELETE row triggers + the
         // session FTS config before the mut borrow (same shape as
         // INSERT / UPDATE).
@@ -1164,6 +1249,14 @@ impl Engine {
             for cell in tuple.iter_mut() {
                 self.resolve_sequence_calls_in_expr(cell)?;
             }
+        }
+        // v7.37.19 (19.13) — auto-updatable view redirect.
+        // INSERT INTO simple_view (cols) VALUES (...) rewrites to
+        // INSERT INTO base_table (cols) VALUES (...) when the view
+        // is a simple-query shape (SELECT col1, col2, ... FROM base
+        // with no joins / WHERE / GROUP BY / aggregates / etc).
+        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+            stmt.table = base;
         }
         // v7.37.6-B(sentori Epic 2 P0)— route INSERTs that target
         // a partition parent down to the matching child(`Range`
