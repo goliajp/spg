@@ -45,9 +45,9 @@ fn cardinality_null_array_returns_null() {
 #[test]
 fn cardinality_wrong_arg_count_errors() {
     let mut e = Engine::new();
-    let err = e.execute("SELECT cardinality(ARRAY[1], 2)").expect_err(
-        "cardinality takes exactly 1 arg, mismatch must surface",
-    );
+    let err = e
+        .execute("SELECT cardinality(ARRAY[1], 2)")
+        .expect_err("cardinality takes exactly 1 arg, mismatch must surface");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("cardinality"),

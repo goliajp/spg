@@ -117,7 +117,9 @@ fn spawn_self_wake_checkpoint_task(weak: std::sync::Weak<tokio::sync::RwLock<Dat
             tick = match threshold_opt {
                 None => SELF_WAKE_MAX_TICK,
                 Some(t) if t.is_zero() => SELF_WAKE_MAX_TICK,
-                Some(t) => (t / 2).max(core::time::Duration::from_millis(10)).min(SELF_WAKE_MAX_TICK),
+                Some(t) => (t / 2)
+                    .max(core::time::Duration::from_millis(10))
+                    .min(SELF_WAKE_MAX_TICK),
             };
         }
     });
@@ -865,9 +867,9 @@ mod dedup_tests {
         let mut handles = Vec::new();
         for _ in 0..16 {
             let p = path.clone();
-            handles.push(tokio::spawn(async move {
-                AsyncDatabase::open_path(p).await
-            }));
+            handles.push(tokio::spawn(
+                async move { AsyncDatabase::open_path(p).await },
+            ));
         }
         for (i, h) in handles.into_iter().enumerate() {
             let result = h.await.expect("join");

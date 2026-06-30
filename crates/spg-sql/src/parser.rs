@@ -3504,11 +3504,11 @@ impl Parser {
         let mut have_level = false;
         loop {
             // ISOLATION LEVEL …
-            let saw_isolation = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("isolation"));
+            let saw_isolation =
+                matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("isolation"));
             if saw_isolation {
                 self.advance(); // ISOLATION
-                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("level"))
-                {
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("level")) {
                     return Err(self.err(alloc::format!(
                         "expected LEVEL after ISOLATION, got {:?}",
                         self.peek()
@@ -3549,14 +3549,11 @@ impl Parser {
                         }
                     }
                     other => {
-                        return Err(self.err(alloc::format!(
-                            "unknown isolation level {other:?}"
-                        )));
+                        return Err(self.err(alloc::format!("unknown isolation level {other:?}")));
                     }
                 };
                 have_level = true;
-            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("read"))
-            {
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("read")) {
                 // READ ONLY | READ WRITE — parsed, not behaviorally honoured.
                 self.advance();
                 match self.peek().clone() {
@@ -3575,8 +3572,7 @@ impl Parser {
             } else if matches!(self.peek(), Token::Not) {
                 // NOT DEFERRABLE — `NOT` lexes as a reserved keyword.
                 self.advance();
-                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable"))
-                {
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
                     return Err(self.err(alloc::format!(
                         "expected DEFERRABLE after NOT, got {:?}",
                         self.peek()
@@ -8272,10 +8268,9 @@ impl Parser {
             } else if using_match {
                 self.advance();
                 if !matches!(self.peek(), Token::LParen) {
-                    return Err(self.err(format!(
-                        "expected '(' after USING, got {:?}",
-                        self.peek()
-                    )));
+                    return Err(
+                        self.err(format!("expected '(' after USING, got {:?}", self.peek()))
+                    );
                 }
                 self.advance();
                 let mut cols: Vec<String> = Vec::new();
@@ -8327,10 +8322,7 @@ impl Parser {
                             .clone()
                             .unwrap_or_else(|| primary.name.clone())
                     });
-                let right_qual = table
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| table.name.clone());
+                let right_qual = table.alias.clone().unwrap_or_else(|| table.name.clone());
                 let mut iter = cols.into_iter().map(|c| Expr::Binary {
                     lhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
                         qualifier: Some(left_qual.clone()),

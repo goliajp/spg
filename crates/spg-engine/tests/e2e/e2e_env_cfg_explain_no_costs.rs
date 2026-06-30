@@ -21,17 +21,13 @@ fn fake_clock() -> i64 {
 }
 
 fn explain_lines(engine: &mut Engine) -> Vec<String> {
-    engine
-        .execute("CREATE TABLE t (id INT NOT NULL)")
-        .unwrap();
+    engine.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     for i in 0..10 {
         engine
             .execute(&format!("INSERT INTO t VALUES ({i})"))
             .unwrap();
     }
-    let r = engine
-        .execute("EXPLAIN ANALYZE SELECT * FROM t")
-        .unwrap();
+    let r = engine.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     match r {
         QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -82,9 +78,7 @@ fn explain_no_costs_is_byte_equal_across_runs() {
     let mut a = Engine::new()
         .with_clock(fake_clock)
         .with_env_cfg(cfg.clone());
-    let mut b = Engine::new()
-        .with_clock(fake_clock)
-        .with_env_cfg(cfg);
+    let mut b = Engine::new().with_clock(fake_clock).with_env_cfg(cfg);
     let la = explain_lines(&mut a);
     let lb = explain_lines(&mut b);
     assert_eq!(

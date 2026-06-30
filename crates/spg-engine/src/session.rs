@@ -244,7 +244,10 @@ mod tests {
         #[test]
         fn statement_timeout_accepts_ms_suffix_via_string_set() {
             let mut e = Engine::new();
-            e.set_session_param("statement_timeout".into(), SetValue::String("1500ms".into()));
+            e.set_session_param(
+                "statement_timeout".into(),
+                SetValue::String("1500ms".into()),
+            );
             assert_eq!(e.session_statement_timeout_ms(), Some(1500));
         }
     }

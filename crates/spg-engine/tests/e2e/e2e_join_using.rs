@@ -16,7 +16,8 @@ fn build_engine() -> Engine {
         .unwrap();
     e.execute("INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z')")
         .unwrap();
-    e.execute("INSERT INTO b VALUES (1, 100), (2, 200)").unwrap();
+    e.execute("INSERT INTO b VALUES (1, 100), (2, 200)")
+        .unwrap();
     e
 }
 

@@ -102,12 +102,9 @@ pub(crate) fn apply_binary_by_ref(
     // Any NULL operand → NULL for the remaining ops.
     if l.is_null() || r.is_null() {
         match op {
-            BinOp::Eq
-            | BinOp::NotEq
-            | BinOp::Lt
-            | BinOp::LtEq
-            | BinOp::Gt
-            | BinOp::GtEq => return Ok(Some(Value::Null)),
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                return Ok(Some(Value::Null));
+            }
             _ => return Ok(None),
         }
     }
@@ -381,11 +378,12 @@ pub(crate) fn apply_binary_interval(
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL months overflows i32".into(),
                 })?;
-            let raw_days = i64::from(*lhs_days).checked_add(signed_days).ok_or(
-                EvalError::TypeMismatch {
-                    detail: "INTERVAL ± INTERVAL days overflows i64".into(),
-                },
-            )?;
+            let raw_days =
+                i64::from(*lhs_days)
+                    .checked_add(signed_days)
+                    .ok_or(EvalError::TypeMismatch {
+                        detail: "INTERVAL ± INTERVAL days overflows i64".into(),
+                    })?;
             let raw_micros = lhs_us
                 .checked_add(signed_micros)
                 .ok_or(EvalError::TypeMismatch {
@@ -404,7 +402,9 @@ pub(crate) fn apply_binary_interval(
             // days), and PG never merges them into the day count
             // implicitly.
             const US_PER_DAY: i64 = 86_400_000_000;
-            let total_us = raw_days.checked_mul(US_PER_DAY).and_then(|x| x.checked_add(raw_micros))
+            let total_us = raw_days
+                .checked_mul(US_PER_DAY)
+                .and_then(|x| x.checked_add(raw_micros))
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL day-micros normalise overflows i64".into(),
                 })?;
@@ -1022,11 +1022,7 @@ fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         l,
         r,
         |a, b| {
-            if b == 0 {
-                None
-            } else {
-                Some(a.rem_euclid(b))
-            }
+            if b == 0 { None } else { Some(a.rem_euclid(b)) }
         },
         // f64 fallback (when widening to Float happens inside arith);
         // f64's `%` is C `fmod` semantics, matching PG `%` on floats.

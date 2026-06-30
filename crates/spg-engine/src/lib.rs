@@ -117,11 +117,11 @@ pub use subquery::{
     BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
     BATCHED_SCALAR_KEYED_PROBE_COUNT, EXISTS_BATCH_FALL_THROUGH_COUNT, EXISTS_BATCH_FIRE_COUNT,
     EXISTS_PULLUP_BAIL_INNER_FROM, EXISTS_PULLUP_BAIL_INNER_SHAPE,
-    EXISTS_PULLUP_BAIL_MULTICOL_DISABLED, EXISTS_PULLUP_BAIL_NO_CORR,
-    EXISTS_PULLUP_BAIL_NO_WHERE, EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER,
-    EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING, EXISTS_PULLUP_CANDIDATE_COUNT,
-    EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE, PULLUP_LIMIT1_FIRE_COUNT,
-    SCALARSQ_PK_PROBE_FIRED, ScalarPkProbeFastPath, expr_tree_has_subquery,
+    EXISTS_PULLUP_BAIL_MULTICOL_DISABLED, EXISTS_PULLUP_BAIL_NO_CORR, EXISTS_PULLUP_BAIL_NO_WHERE,
+    EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER, EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING,
+    EXISTS_PULLUP_CANDIDATE_COUNT, EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE,
+    PULLUP_LIMIT1_FIRE_COUNT, SCALARSQ_PK_PROBE_FIRED, ScalarPkProbeFastPath,
+    expr_tree_has_subquery,
 };
 pub(crate) use subquery::{build_in_list_set, collect_scalar_subqueries, expr_has_subquery};
 pub use substitute::substitute_placeholders;
@@ -760,7 +760,7 @@ impl Engine {
                         crate::testkit::injection::InjectionStore::default(),
                     ),
                     redo_capture: false,
-            current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
+                    current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
                     last_redo: Vec::new(),
                 })
             }
@@ -861,9 +861,7 @@ impl Engine {
     /// query notice counts / detach actions without parsing SQL
     /// output. Only present when the feature is on.
     #[cfg(feature = "injection-points")]
-    pub fn injection_store(
-        &self,
-    ) -> alloc::sync::Arc<crate::testkit::injection::InjectionStore> {
+    pub fn injection_store(&self) -> alloc::sync::Arc<crate::testkit::injection::InjectionStore> {
         self.injection_store.clone()
     }
 

@@ -460,7 +460,11 @@ mod active {
 
     impl fmt::Display for InjectedError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "INJECTED ERROR at {}: {} (payload={})", self.name, self.msg, self.payload)
+            write!(
+                f,
+                "INJECTED ERROR at {}: {} (payload={})",
+                self.name, self.msg, self.payload
+            )
         }
     }
 
@@ -498,8 +502,8 @@ mod active {
 
 #[cfg(feature = "injection-points")]
 pub use active::{
-    enter_scope, current, parse_action, Action, InjectionGuard, InjectionStore, InjectedError,
-    __trigger,
+    __trigger, Action, InjectedError, InjectionGuard, InjectionStore, current, enter_scope,
+    parse_action,
 };
 
 // ---------------------------------------------------------------------------
@@ -553,10 +557,7 @@ mod tests {
             crate::injection_point!("test_notice", &());
         }
         assert_eq!(store.notice_count("test_notice"), 3);
-        assert_eq!(
-            store.notice_message("test_notice").as_deref(),
-            Some("tag")
-        );
+        assert_eq!(store.notice_message("test_notice").as_deref(), Some("tag"));
     }
 
     #[test]
@@ -588,7 +589,10 @@ mod tests {
         // No empty / whitespace names.
         for &p in REGISTERED_POINTS {
             assert!(!p.is_empty());
-            assert!(!p.chars().any(char::is_whitespace), "point name has whitespace: {p}");
+            assert!(
+                !p.chars().any(char::is_whitespace),
+                "point name has whitespace: {p}"
+            );
         }
     }
 }

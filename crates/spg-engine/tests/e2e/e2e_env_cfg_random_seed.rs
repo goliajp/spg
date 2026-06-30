@@ -7,8 +7,8 @@
 //! Acceptor: `crates/spg-engine/src/lib.rs` `Engine::rng_seed`.
 //! Index   : `xtests/sigil/test-mode-gucs.md`.
 
-use spg_engine::testkit::EnvConfig;
 use spg_engine::Engine;
+use spg_engine::testkit::EnvConfig;
 
 #[test]
 fn random_seed_is_byte_equal_with_same_seed() {

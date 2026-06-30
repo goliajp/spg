@@ -572,17 +572,15 @@ impl Engine {
                         .session_param("DateStyle")
                         .or_else(|| self.session_param("datestyle"))
                         .unwrap_or("ISO, MDY"),
-                    "client_encoding" => {
-                        self.session_param("client_encoding").unwrap_or("UTF8")
-                    }
+                    "client_encoding" => self.session_param("client_encoding").unwrap_or("UTF8"),
                     "standard_conforming_strings" => self
                         .session_param("standard_conforming_strings")
                         .unwrap_or("on"),
-                    "search_path" => self.session_param("search_path").unwrap_or("\"$user\", public"),
+                    "search_path" => self
+                        .session_param("search_path")
+                        .unwrap_or("\"$user\", public"),
                     "application_name" => self.session_param("application_name").unwrap_or(""),
-                    "statement_timeout" => {
-                        self.session_param("statement_timeout").unwrap_or("0")
-                    }
+                    "statement_timeout" => self.session_param("statement_timeout").unwrap_or("0"),
                     "default_transaction_isolation" => self
                         .session_param("default_transaction_isolation")
                         .unwrap_or("read committed"),

@@ -1520,7 +1520,8 @@ fn sql_injection_attach_notice_then_trigger_records() {
     // entry.
     e.execute("CREATE TABLE inj_t (a INT)").unwrap();
     e.execute("INSERT INTO inj_t VALUES (1), (2), (1)").unwrap();
-    e.execute("SELECT a, COUNT(*) FROM inj_t GROUP BY a").unwrap();
+    e.execute("SELECT a, COUNT(*) FROM inj_t GROUP BY a")
+        .unwrap();
 
     // The notice action records into the per-engine store. The
     // store is shared via Arc, so reading from the engine handle
@@ -1570,7 +1571,8 @@ fn inject_index_build_post_seal_fires_on_create_index() {
     e.execute("SELECT spg_injection_attach('index_build_post_seal', 'notice:index_sealed')")
         .expect("attach succeeds");
     e.execute("CREATE TABLE inj_ibps (id INT, v INT)").unwrap();
-    e.execute("CREATE INDEX inj_ibps_idx ON inj_ibps (v)").unwrap();
+    e.execute("CREATE INDEX inj_ibps_idx ON inj_ibps (v)")
+        .unwrap();
     let store = e.injection_store();
     assert!(
         store.notice_count("index_build_post_seal") >= 1,
@@ -1604,7 +1606,9 @@ fn inject_tx_commit_walgroup_leader_switch_fires_on_commit() {
         "tx_commit_walgroup_leader_switch did not fire under feature-on build"
     );
     assert_eq!(
-        store.notice_message("tx_commit_walgroup_leader_switch").as_deref(),
+        store
+            .notice_message("tx_commit_walgroup_leader_switch")
+            .as_deref(),
         Some("commit_pre")
     );
 }
@@ -1631,7 +1635,9 @@ fn inject_wal_group_commit_leader_chosen_fires_on_commit() {
         "wal_group_commit_leader_chosen did not fire under feature-on build"
     );
     assert_eq!(
-        store.notice_message("wal_group_commit_leader_chosen").as_deref(),
+        store
+            .notice_message("wal_group_commit_leader_chosen")
+            .as_deref(),
         Some("commit_post")
     );
 }
