@@ -32,6 +32,18 @@ impl Table {
         &self.headers
     }
 
+    /// v7.37.15 (Phase B TDD) — `#[cfg(test)]`-only mutable header
+    /// access for tests that need to simulate Phase C semantics
+    /// (writer-side xmin/xmax stamping) before the real stamping
+    /// API lands. Phase C will provide a writer-aware setter that
+    /// keeps headers + xact bookkeeping consistent.
+    #[cfg(test)]
+    pub(crate) fn headers_mut_for_test(
+        &mut self,
+    ) -> &mut PersistentVec<crate::row_header::RowHeader> {
+        &mut self.headers
+    }
+
     /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
     /// this table (engine call before a mutating statement when
     /// persistence is on). Idempotent; existing captured changes are kept.
@@ -162,6 +174,49 @@ impl Table {
 
     pub const fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// v7.37.15 (Phase B) — answer "is row at `idx` visible under
+    /// `snapshot`?" without exposing the header internals to the
+    /// engine. Callers in scan paths consult this BEFORE yielding
+    /// the row.
+    ///
+    /// Defensive: out-of-bounds `idx` and the (impossible, asserted)
+    /// length mismatch return `false`, mirroring "row is not there
+    /// so it's not visible." Production scans never see either.
+    ///
+    /// Phase A always returns `true` because every header is
+    /// `RowHeader::frozen()` and `Snapshot::unbounded()` accepts
+    /// every header. The full visibility behaviour engages once
+    /// Phase C writers start stamping real `xmin`/`xmax`.
+    #[must_use]
+    pub fn is_row_visible(&self, idx: usize, snapshot: &crate::snapshot::Snapshot) -> bool {
+        match self.headers.get(idx) {
+            Some(h) => snapshot.visible(h),
+            None => false,
+        }
+    }
+
+    /// v7.37.15 (Phase B) — iterate over `(idx, row)` pairs whose
+    /// header is visible under `snapshot`. This is the engine-side
+    /// drop-in replacement for `for (i, r) in t.rows().iter().enumerate()`
+    /// at scan sites. The check is a single branch + atomic
+    /// register read inside the snapshot path; with `Snapshot::unbounded`
+    /// the optimiser folds the gate away.
+    ///
+    /// `'a` lifetime on `snapshot` keeps the helper zero-cost in
+    /// the hot loop — no Arc bump, no allocation.
+    pub fn scan_visible<'a, 'b>(
+        &'a self,
+        snapshot: &'b crate::snapshot::Snapshot,
+    ) -> impl Iterator<Item = (usize, &'a Row<'static>)> + 'b
+    where
+        'a: 'b,
+    {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| self.is_row_visible(*i, snapshot))
     }
 
     /// v6.8.0 — exposed for the engine layer to patch

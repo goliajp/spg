@@ -2398,6 +2398,84 @@ fn v7_37_15_fresh_inserts_default_to_frozen_header() {
     );
 }
 
+/// v7.37.15 (Phase B TDD) — `Table::is_row_visible` and
+/// `scan_visible` return the full row set under the unbounded
+/// snapshot (preserves pre-v7.37.15 contract) and filter
+/// correctly under a snapshot that hides a specific tx.
+#[test]
+fn v7_37_15_phase_b_scan_visible_filters_correctly() {
+    use crate::snapshot::{InProgressSet, Snapshot};
+
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    for id in 0..5i64 {
+        t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+            .unwrap();
+    }
+
+    // Phase A: every header is frozen, so unbounded sees all 5.
+    let unbounded = Snapshot::unbounded();
+    let all: Vec<_> = t.scan_visible(&unbounded).collect();
+    assert_eq!(
+        all.len(),
+        5,
+        "unbounded snapshot must see every frozen row"
+    );
+    for i in 0..5 {
+        assert!(t.is_row_visible(i, &unbounded), "row {i} visible");
+    }
+
+    // Now simulate Phase C semantics: hand-rewrite a few headers
+    // to non-frozen states + a snapshot that hides one of them.
+    //
+    // (Reach through the test cfg into the underlying PersistentVec —
+    // Phase C will land the proper writer-side stamping API.)
+    let snap = Snapshot::new(
+        100,                       // version
+        InProgressSet::from_sorted(alloc::vec![50]), // tx 50 in flight
+        50,                        // oldest_active
+        0,                         // anonymous reader
+    );
+    // Direct-write a row header to xmin=50 (an in-flight tx); it
+    // becomes invisible to `snap`.
+    {
+        let header = t
+            .headers()
+            .get(0)
+            .expect("row 0 header exists");
+        // The PersistentVec set yields a fresh vec; reassign back
+        // via Table's existing test-friendly path (Phase C will
+        // add a writer-aware path; here we splice manually).
+        let in_flight = crate::row_header::RowHeader {
+            xmin: 50,
+            xmax: crate::row_header::XMAX_ALIVE,
+            flags: 0,
+        };
+        let _ = header; // currently frozen
+        // PersistentVec's `set` returns a fresh persistent vec
+        // with the slot replaced; assign back into the parallel
+        // field via the test-only mutator.
+        let new_headers = t
+            .headers_mut_for_test()
+            .set(0, in_flight)
+            .expect("row 0 exists");
+        *t.headers_mut_for_test() = new_headers;
+    }
+
+    let visible: Vec<_> = t.scan_visible(&snap).map(|(i, _)| i).collect();
+    assert!(
+        !visible.contains(&0),
+        "row 0 has xmin=50 (in-flight) — must be invisible to snap; \
+         visible set = {visible:?}"
+    );
+    assert_eq!(
+        visible.len(),
+        4,
+        "other 4 rows still frozen + alive; visible to snap"
+    );
+}
+
 /// Validation guard tests. Each must return `Err` and **not
 /// mutate the catalog** — the API is all-or-nothing.
 #[test]
