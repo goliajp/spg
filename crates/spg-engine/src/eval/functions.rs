@@ -1046,7 +1046,9 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone().into_owned())
+                    }
                     Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1120,7 +1122,9 @@ fn apply_function_dispatch(
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone().into_owned())
+                    }
                     Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1209,7 +1213,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone().into_owned())
+                }
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1234,7 +1240,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone().into_owned()),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone().into_owned())
+                }
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1560,7 +1568,11 @@ fn apply_function_dispatch(
         // `SELECT pg_catalog.set_config('search_path', '', false);`
         // and friends. SPG is single-schema; accept-as-no-op
         // returning either the new value or NULL.
-        "set_config" => Ok(args.get(1).cloned().map(Value::into_owned).unwrap_or(Value::Null)),
+        "set_config" => Ok(args
+            .get(1)
+            .cloned()
+            .map(Value::into_owned)
+            .unwrap_or(Value::Null)),
         "current_setting" => Ok(Value::text(String::new())),
         // PG `pg_catalog.*` discovery / cast helpers commonly
         // emitted by ORMs probing the server. Accept-as-no-op
@@ -1728,10 +1740,9 @@ fn spg_injection_attach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     }
     let name = expect_text_arg(args, 0, "spg_injection_attach")?;
     let action_str = expect_text_arg(args, 1, "spg_injection_attach")?;
-    let store =
-        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
-            detail: "spg_injection_attach: no engine injection scope active".into(),
-        })?;
+    let store = crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+        detail: "spg_injection_attach: no engine injection scope active".into(),
+    })?;
     let action = crate::testkit::injection::parse_action(action_str)
         .map_err(|detail| EvalError::TypeMismatch { detail })?;
     store.attach(name.to_string(), action);
@@ -1749,10 +1760,9 @@ fn spg_injection_wakeup(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         });
     }
     let name = expect_text_arg(args, 0, "spg_injection_wakeup")?;
-    let store =
-        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
-            detail: "spg_injection_wakeup: no engine injection scope active".into(),
-        })?;
+    let store = crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+        detail: "spg_injection_wakeup: no engine injection scope active".into(),
+    })?;
     store.wakeup(name);
     Ok(Value::Bool(true))
 }
@@ -1768,10 +1778,9 @@ fn spg_injection_detach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         });
     }
     let name = expect_text_arg(args, 0, "spg_injection_detach")?;
-    let store =
-        crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
-            detail: "spg_injection_detach: no engine injection scope active".into(),
-        })?;
+    let store = crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+        detail: "spg_injection_detach: no engine injection scope active".into(),
+    })?;
     store.detach(name);
     Ok(Value::Bool(true))
 }

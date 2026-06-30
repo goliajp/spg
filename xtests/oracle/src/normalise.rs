@@ -83,7 +83,9 @@ impl AdjustPipeline {
 /// test focuses on relative ordering, not absolute time.
 pub struct AdjustTimestamps;
 impl AdjustStep for AdjustTimestamps {
-    fn name(&self) -> &'static str { "timestamps" }
+    fn name(&self) -> &'static str {
+        "timestamps"
+    }
     fn apply(&self, lines: &mut Vec<String>) {
         // v7.38 P1 — strip `YYYY-MM-DD HH:MM:SS[.fff…]` patterns to
         // the placeholder `<TS>`. No regex dependency: hand-rolled
@@ -148,7 +150,9 @@ fn is_ts_prefix(s: &[u8]) -> bool {
 /// sequence column with `<SEQ>`.
 pub struct AdjustSeqs;
 impl AdjustStep for AdjustSeqs {
-    fn name(&self) -> &'static str { "seqs" }
+    fn name(&self) -> &'static str {
+        "seqs"
+    }
     fn apply(&self, _lines: &mut Vec<String>) {
         // TODO(v7.38 P1): consult fixture directive `# oracle: seqs col=id`
         // to know which column to placeholder.
@@ -162,7 +166,9 @@ impl AdjustStep for AdjustSeqs {
 /// MySQL/MariaDB which never see dollar quotes.
 pub struct AdjustDollarQuoted;
 impl AdjustStep for AdjustDollarQuoted {
-    fn name(&self) -> &'static str { "dollar-quoted" }
+    fn name(&self) -> &'static str {
+        "dollar-quoted"
+    }
     fn apply(&self, _lines: &mut Vec<String>) {
         // TODO(v7.38 P1).
     }
@@ -175,7 +181,9 @@ impl AdjustStep for AdjustDollarQuoted {
 /// cost-free plan text.
 pub struct AdjustExplainCosts;
 impl AdjustStep for AdjustExplainCosts {
-    fn name(&self) -> &'static str { "explain-costs" }
+    fn name(&self) -> &'static str {
+        "explain-costs"
+    }
     fn apply(&self, lines: &mut Vec<String>) {
         // v7.38 P1 — strip PG-flavoured `(cost=… rows=…)` and
         // `(actual time=… rows=… loops=…)` segments from EXPLAIN
@@ -214,7 +222,9 @@ fn strip_explain_costs(input: &str) -> String {
 /// notation for `|x| < 1e-3` so both sides converge.
 pub struct AdjustFloatRepr;
 impl AdjustStep for AdjustFloatRepr {
-    fn name(&self) -> &'static str { "float-repr" }
+    fn name(&self) -> &'static str {
+        "float-repr"
+    }
     fn apply(&self, _lines: &mut Vec<String>) {
         // TODO(v7.38 P1).
     }
@@ -225,7 +235,9 @@ impl AdjustStep for AdjustFloatRepr {
 /// equality.
 pub struct AdjustWhitespace;
 impl AdjustStep for AdjustWhitespace {
-    fn name(&self) -> &'static str { "whitespace" }
+    fn name(&self) -> &'static str {
+        "whitespace"
+    }
     fn apply(&self, lines: &mut Vec<String>) {
         for line in lines.iter_mut() {
             // Single safe transform — collapse internal whitespace.
@@ -240,7 +252,9 @@ impl AdjustStep for AdjustWhitespace {
 /// `NULL` so the textual diff doesn't trip on display style.
 pub struct AdjustNullDisplay;
 impl AdjustStep for AdjustNullDisplay {
-    fn name(&self) -> &'static str { "null-display" }
+    fn name(&self) -> &'static str {
+        "null-display"
+    }
     fn apply(&self, lines: &mut Vec<String>) {
         // v7.38 P1 — canonicalise NULL display variants to the
         // upper-case `NULL` token. Handles:
@@ -265,11 +279,7 @@ fn canonicalise_null_tokens(input: &str) -> String {
     let mut i = 0;
     'outer: while i < bytes.len() {
         // Try the lowercase / parenthesised forms in order of length.
-        for (pat, rep) in &[
-            ("(null)", "NULL"),
-            ("(NULL)", "NULL"),
-            ("null", "NULL"),
-        ] {
+        for (pat, rep) in &[("(null)", "NULL"), ("(NULL)", "NULL"), ("null", "NULL")] {
             if i + pat.len() <= bytes.len()
                 && &input[i..i + pat.len()] == *pat
                 // Word boundary check on both sides — don't rewrite
@@ -305,7 +315,9 @@ fn is_ident_char(b: u8) -> bool {
 /// `# oracle: ordered` (parsed by the runner — to land in P1).
 pub struct AdjustOrderingViaSort;
 impl AdjustStep for AdjustOrderingViaSort {
-    fn name(&self) -> &'static str { "ordering-via-sort" }
+    fn name(&self) -> &'static str {
+        "ordering-via-sort"
+    }
     fn apply(&self, lines: &mut Vec<String>) {
         lines.sort();
     }

@@ -664,11 +664,9 @@ where
                 // through to the owning path.
                 let n = stack.len();
                 if n >= 2 {
-                    if let Some(result) = super::apply_binary_by_ref(
-                        *op,
-                        &stack[n - 2],
-                        &stack[n - 1],
-                    )? {
+                    if let Some(result) =
+                        super::apply_binary_by_ref(*op, &stack[n - 2], &stack[n - 1])?
+                    {
                         stack.truncate(n - 2);
                         stack.push(result);
                         continue;
@@ -875,18 +873,15 @@ where
                             // back to owning apply_binary only if the
                             // by-ref path returns None (non-comparison
                             // op, which Eq never is).
-                            let eq_result = match super::apply_binary_by_ref(
-                                BinOp::Eq,
-                                op_v,
-                                &when_v,
-                            )? {
-                                Some(v) => v,
-                                None => apply_binary(
-                                    BinOp::Eq,
-                                    op_v.clone().into_owned(),
-                                    when_v.clone().into_owned(),
-                                )?,
-                            };
+                            let eq_result =
+                                match super::apply_binary_by_ref(BinOp::Eq, op_v, &when_v)? {
+                                    Some(v) => v,
+                                    None => apply_binary(
+                                        BinOp::Eq,
+                                        op_v.clone().into_owned(),
+                                        when_v.clone().into_owned(),
+                                    )?,
+                                };
                             matches!(eq_result, Value::Bool(true))
                         }
                     };
@@ -927,16 +922,13 @@ pub static STEP_VM_STEPS_TOTAL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_COLUMN_FIRE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-pub static STEP_VM_LIT_FIRE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_LIT_FIRE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_BINARY_FIRE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_FUNCTION_FIRE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-pub static STEP_VM_CAST_FIRE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CAST_FIRE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// v7.37.9 Round 3 — heap-alloc counters specifically for the T3
 /// structural attack's ROI estimate. Step::Column / Step::Lit hits

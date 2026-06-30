@@ -26,8 +26,20 @@ fn seed_and_query(engine: &mut Engine) -> Vec<Vec<Value<'static>>> {
     // Adversarial ordering: a TopK pivot vs a full sort must agree on
     // the top-K rows even when keys collide. Mix duplicates so the
     // `select_nth_unstable_by` partition has real choice to make.
-    let pairs: [(i32, i32); 12] =
-        [(0, 9), (1, 8), (2, 7), (3, 6), (4, 5), (5, 4), (6, 3), (7, 2), (8, 1), (9, 0), (10, 5), (11, 5)];
+    let pairs: [(i32, i32); 12] = [
+        (0, 9),
+        (1, 8),
+        (2, 7),
+        (3, 6),
+        (4, 5),
+        (5, 4),
+        (6, 3),
+        (7, 2),
+        (8, 1),
+        (9, 0),
+        (10, 5),
+        (11, 5),
+    ];
     for (id, k) in pairs {
         engine
             .execute(&format!("INSERT INTO m VALUES ({id}, {k})"))
@@ -42,8 +54,7 @@ fn seed_and_query(engine: &mut Engine) -> Vec<Vec<Value<'static>>> {
 #[test]
 fn disable_topk_produces_byte_equal_results() {
     let mut on = Engine::new(); // production: TopK on
-    let mut off = Engine::new()
-        .with_env_cfg(EnvConfig::builder().disable_topk(true).build());
+    let mut off = Engine::new().with_env_cfg(EnvConfig::builder().disable_topk(true).build());
 
     let on_rows = seed_and_query(&mut on);
     let off_rows = seed_and_query(&mut off);
@@ -58,8 +69,7 @@ fn disable_topk_produces_byte_equal_results() {
 fn disable_topk_full_sort_still_honours_limit() {
     // Sanity: even on the slow path the LIMIT trims to the declared
     // row count — disable_topk must not turn LIMIT into a no-op.
-    let mut off = Engine::new()
-        .with_env_cfg(EnvConfig::builder().disable_topk(true).build());
+    let mut off = Engine::new().with_env_cfg(EnvConfig::builder().disable_topk(true).build());
     let rows = seed_and_query(&mut off);
     assert_eq!(rows.len(), 3);
     // The top row by k DESC is id=0 (k=9).

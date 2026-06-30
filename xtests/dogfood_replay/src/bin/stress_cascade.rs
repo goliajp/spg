@@ -37,9 +37,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Concurrent stress harness for mailrs cascade SQL on a prod snapshot."
-)]
+#[command(about = "Concurrent stress harness for mailrs cascade SQL on a prod snapshot.")]
 struct Args {
     /// Path to the snapshot tarball (e.g. one of the mailrs fixtures).
     #[arg(long)]
@@ -159,9 +157,7 @@ fn locate_catalog(root: &Path) -> Result<PathBuf> {
         let entry = entry?;
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.ends_with(".spg")
-                && !name.ends_with(".spg.wal")
-                && !name.ends_with(".spg.lock")
+            if name.ends_with(".spg") && !name.ends_with(".spg.wal") && !name.ends_with(".spg.lock")
             {
                 return Ok(path);
             }
@@ -224,8 +220,7 @@ fn run_phase(
                     }
                 }
                 bar.wait();
-                let mut samples: Vec<(String, u128)> =
-                    Vec::with_capacity(iters * wl.queries.len());
+                let mut samples: Vec<(String, u128)> = Vec::with_capacity(iters * wl.queries.len());
                 for j in 0..iters {
                     let start_offset = wi.wrapping_add(j) % wl.queries.len();
                     for k in 0..wl.queries.len() {
@@ -377,8 +372,7 @@ fn main() -> Result<()> {
         spg_engine::EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER
             .load(std::sync::atomic::Ordering::Relaxed),
         spg_engine::EXISTS_PULLUP_BAIL_NO_CORR.load(std::sync::atomic::Ordering::Relaxed),
-        spg_engine::EXISTS_PULLUP_BAIL_MULTICOL_DISABLED
-            .load(std::sync::atomic::Ordering::Relaxed),
+        spg_engine::EXISTS_PULLUP_BAIL_MULTICOL_DISABLED.load(std::sync::atomic::Ordering::Relaxed),
         spg_engine::EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING
             .load(std::sync::atomic::Ordering::Relaxed),
     );

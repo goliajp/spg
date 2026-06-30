@@ -1020,7 +1020,10 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
     // this job returns.
     let total_us = job_start.elapsed().as_micros() as u64;
     let sync_us = sync_start.elapsed().as_micros() as u64;
-    let wal_bytes = job.wal.written_len().saturating_sub(snapshot_bytes_baseline);
+    let wal_bytes = job
+        .wal
+        .written_len()
+        .saturating_sub(snapshot_bytes_baseline);
     {
         let mut s = job.stats.lock().unwrap_or_else(|e| e.into_inner());
         s.total_count = s.total_count.saturating_add(1);
@@ -1311,9 +1314,7 @@ fn replay_wal_filtered(
             applied += 1;
             // v7.37.8 — emit heartbeat (operator visibility — see
             // CHANGELOG v7.37.8).
-            if heartbeat_ms > 0
-                && last_beat.elapsed().as_millis() as u64 >= heartbeat_ms
-            {
+            if heartbeat_ms > 0 && last_beat.elapsed().as_millis() as u64 >= heartbeat_ms {
                 eprintln!(
                     "[spg replay heartbeat] applied={applied}/{total_records} \
                      ({:.1}%, elapsed {:.1}s)",
@@ -2027,12 +2028,21 @@ fn parse_v6_record_body<'a>(
     let stored_crc = u32::from_le_bytes(wal_bytes[cur + 4..cur + 8].try_into().unwrap());
     let body_start = cur + 8;
     let type_byte = wal_bytes[body_start];
-    let prev_lsn =
-        u64::from_le_bytes(wal_bytes[body_start + 1..body_start + 9].try_into().unwrap());
-    let commit_lsn =
-        u64::from_le_bytes(wal_bytes[body_start + 9..body_start + 17].try_into().unwrap());
-    let commit_unix_us =
-        i64::from_le_bytes(wal_bytes[body_start + 17..body_start + 25].try_into().unwrap());
+    let prev_lsn = u64::from_le_bytes(
+        wal_bytes[body_start + 1..body_start + 9]
+            .try_into()
+            .unwrap(),
+    );
+    let commit_lsn = u64::from_le_bytes(
+        wal_bytes[body_start + 9..body_start + 17]
+            .try_into()
+            .unwrap(),
+    );
+    let commit_unix_us = i64::from_le_bytes(
+        wal_bytes[body_start + 17..body_start + 25]
+            .try_into()
+            .unwrap(),
+    );
     let scheme = wal_bytes[body_start + 25];
     let (blake3_extra, blake3_slice) = if scheme == WAL_V6_HASH_SCHEME_BLAKE3 {
         let start = body_start + 26;
@@ -2116,8 +2126,8 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
                             // checkpoint anchor — skip on replay
                         }
                         WAL_V5_TYPE_ROW_REDO => {
-                            let changes = spg_storage::decode_redo_log(view.payload)
-                                .map_err(|e| {
+                            let changes =
+                                spg_storage::decode_redo_log(view.payload).map_err(|e| {
                                     format!("WAL replay: v6 redo decode at offset {cur}: {e:?}")
                                 })?;
                             engine.apply_redo(&changes).map_err(|e| {
@@ -3202,9 +3212,13 @@ impl Database {
             // Reset bookkeeping so the next write evaluates against
             // a fresh window (avoids "set to 1 s then wait the old
             // 60 s anyway because last_checkpoint_at hasn't moved").
-            *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            *p.last_checkpoint_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
                 std::time::Instant::now() - threshold.unwrap_or_default();
-            *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            *p.last_checkpoint_wal_len
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = 0;
         }
     }
 
@@ -3372,15 +3386,14 @@ impl Database {
     /// [`CheckpointStats::percentiles`].
     #[must_use]
     pub fn checkpoint_stats(&self) -> CheckpointStats {
-        self.persistence.as_ref().map_or_else(
-            CheckpointStats::default,
-            |p| {
+        self.persistence
+            .as_ref()
+            .map_or_else(CheckpointStats::default, |p| {
                 p.checkpoint_stats
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
-            },
-        )
+            })
     }
 
     /// CoW-2 (v7.34) — block until the background checkpoint worker is
@@ -3503,10 +3516,7 @@ impl Database {
     /// any WAL chunk whose floor was past v7.37.8's SPG_WAL_ROW_REDO
     /// default-ON flip — exactly the failing-test shape in
     /// `crates/spgctl/src/main.rs::tests::pitr_restore_*`.
-    pub fn apply_redo(
-        &mut self,
-        changes: &[spg_storage::RowChange],
-    ) -> Result<(), EngineError> {
+    pub fn apply_redo(&mut self, changes: &[spg_storage::RowChange]) -> Result<(), EngineError> {
         self.engine.apply_redo(changes)
     }
 
@@ -3668,8 +3678,14 @@ impl Database {
             // the configured interval (default 60 s).
             let bytes_trigger = p.wal.written_len() >= p.checkpoint_threshold_bytes;
             let time_trigger = p.checkpoint_time_threshold.is_some_and(|threshold| {
-                let last = *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner());
-                let last_len = *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner());
+                let last = *p
+                    .last_checkpoint_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let last_len = *p
+                    .last_checkpoint_wal_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let now = std::time::Instant::now();
                 let written_now = p.wal.written_len();
                 // Only fire if we've actually accumulated writes since the
@@ -3691,14 +3707,15 @@ impl Database {
                 let new_at = std::time::Instant::now();
                 let now_len = p.wal.written_len();
                 if p.adaptive_threshold_enabled {
-                    let prev_at =
-                        *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner());
-                    let prev_len =
-                        *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner());
-                    let dt_secs = new_at
-                        .duration_since(prev_at)
-                        .as_secs_f64()
-                        .max(0.001);
+                    let prev_at = *p
+                        .last_checkpoint_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let prev_len = *p
+                        .last_checkpoint_wal_len
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let dt_secs = new_at.duration_since(prev_at).as_secs_f64().max(0.001);
                     let bytes_in_window = now_len.saturating_sub(prev_len);
                     let rate = (bytes_in_window as f64 / dt_secs) as u64;
                     let mut ewma = p
@@ -3717,8 +3734,12 @@ impl Database {
                     let bounded = target.max(1 * 1024 * 1024).min(64 * 1024 * 1024);
                     p.checkpoint_threshold_bytes = bounded;
                 }
-                *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner()) = new_at;
-                *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner()) = now_len;
+                *p.last_checkpoint_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = new_at;
+                *p.last_checkpoint_wal_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = now_len;
             }
         }
         Ok(ticket)
@@ -4551,9 +4572,8 @@ pub fn revert_wal_to_seq(
     // are V5 ROW_REDO; the PITR utility must understand them too.
     let mut engine = Engine::new();
     let mut applied = 0u64;
-    let records = parse_wal_records(&wal_bytes).map_err(|m| {
-        EngineError::Storage(spg_storage::StorageError::Corrupt(m))
-    })?;
+    let records = parse_wal_records(&wal_bytes)
+        .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
     for r in &records {
         if applied >= to_seq {
             break;
@@ -5902,9 +5922,7 @@ mod tests {
         // WalGroup since v7.37.13). FSYNC_FAIL_INJECT static no
         // longer exists; per-instance arm via db.arm_wal_fsync_fail_for_testing.
         static POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = POLICY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = POLICY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // ===== Phase 1: retry path =====
         let prev = FSYNC_RETRY_OVERRIDE.swap(1, std::sync::atomic::Ordering::AcqRel);
@@ -5981,7 +5999,11 @@ mod tests {
         assert_eq!(parsed.len(), 1, "exactly one record encoded");
         assert_eq!(parsed[0].commit_lsn, Some(42));
         assert_eq!(parsed[0].commit_unix_us, Some(1_700_000_000_000_000));
-        assert_eq!(parsed[0].prev_lsn, Some(41), "prev_lsn carried through parse");
+        assert_eq!(
+            parsed[0].prev_lsn,
+            Some(41),
+            "prev_lsn carried through parse"
+        );
         assert_eq!(parsed[0].sql, b"CREATE TABLE t (id INT)");
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
     }
@@ -6055,7 +6077,10 @@ mod tests {
         let payload_idx = flipped.len() - 3;
         flipped[payload_idx] ^= 0x01;
         let parsed_flipped = parse_wal_records(&flipped).expect("parse Ok with empty prefix");
-        assert!(parsed_flipped.is_empty(), "BLAKE3 mode rejects tampered payload");
+        assert!(
+            parsed_flipped.is_empty(),
+            "BLAKE3 mode rejects tampered payload"
+        );
 
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
     }
@@ -6181,7 +6206,8 @@ mod tests {
             std::thread::sleep(core::time::Duration::from_millis(75));
             // One more write inside the window to actually fire wal_after_ok
             // (the check is gated on a write event).
-            db.execute("INSERT INTO t VALUES (99, 'tick')").expect("trigger");
+            db.execute("INSERT INTO t VALUES (99, 'tick')")
+                .expect("trigger");
         }
         db.checkpoint_wait().expect("drain");
 
@@ -6301,19 +6327,46 @@ mod tests {
         );
         let mut chunk = Vec::new();
         // Record 1: chunk start — prev_lsn = 0 by convention
-        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (1)", 0, 10, 100));
+        chunk.extend_from_slice(&encode_v6_auto_commit(
+            "INSERT INTO t VALUES (1)",
+            0,
+            10,
+            100,
+        ));
         // Record 2: prev = 10 (the previous record's commit_lsn)
-        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (2)", 10, 11, 101));
+        chunk.extend_from_slice(&encode_v6_auto_commit(
+            "INSERT INTO t VALUES (2)",
+            10,
+            11,
+            101,
+        ));
         // Record 3: prev = 11
-        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (3)", 11, 12, 102));
+        chunk.extend_from_slice(&encode_v6_auto_commit(
+            "INSERT INTO t VALUES (3)",
+            11,
+            12,
+            102,
+        ));
 
         let parsed = parse_wal_records(&chunk).expect("parse chain");
         assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].prev_lsn, Some(0), "chunk-start record's prev is 0");
+        assert_eq!(
+            parsed[0].prev_lsn,
+            Some(0),
+            "chunk-start record's prev is 0"
+        );
         assert_eq!(parsed[0].commit_lsn, Some(10));
-        assert_eq!(parsed[1].prev_lsn, Some(10), "record 2 points back to record 1's LSN");
+        assert_eq!(
+            parsed[1].prev_lsn,
+            Some(10),
+            "record 2 points back to record 1's LSN"
+        );
         assert_eq!(parsed[1].commit_lsn, Some(11));
-        assert_eq!(parsed[2].prev_lsn, Some(11), "record 3 points back to record 2's LSN");
+        assert_eq!(
+            parsed[2].prev_lsn,
+            Some(11),
+            "record 3 points back to record 2's LSN"
+        );
         assert_eq!(parsed[2].commit_lsn, Some(12));
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
     }

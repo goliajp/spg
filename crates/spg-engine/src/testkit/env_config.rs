@@ -128,7 +128,9 @@ impl EnvConfig {
     /// engine without env vars).
     #[must_use]
     pub fn builder() -> EnvConfigBuilder {
-        EnvConfigBuilder { cfg: Self::default() }
+        EnvConfigBuilder {
+            cfg: Self::default(),
+        }
     }
 }
 

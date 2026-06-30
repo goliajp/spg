@@ -31,10 +31,10 @@ use anyhow::{Context, Result, bail};
 // minimal.
 #[path = "../engine_err.rs"]
 mod engine_err;
-#[path = "../snapshot.rs"]
-mod snapshot;
 #[path = "../fixture.rs"]
 mod fixture;
+#[path = "../snapshot.rs"]
+mod snapshot;
 
 use engine_err::ee;
 use fixture::{FixtureKind, load_fixture};
@@ -49,51 +49,165 @@ fn snapshot_counters() -> Vec<(&'static str, u64)> {
     use spg_engine as e;
     vec![
         // join.rs — anti-join fast path (NOT EXISTS lowering)
-        ("ANTI_JOIN_FAST_PATH_TRIED", e::ANTI_JOIN_FAST_PATH_TRIED.load(Relaxed)),
-        ("ANTI_JOIN_FAST_PATH_FIRED", e::ANTI_JOIN_FAST_PATH_FIRED.load(Relaxed)),
+        (
+            "ANTI_JOIN_FAST_PATH_TRIED",
+            e::ANTI_JOIN_FAST_PATH_TRIED.load(Relaxed),
+        ),
+        (
+            "ANTI_JOIN_FAST_PATH_FIRED",
+            e::ANTI_JOIN_FAST_PATH_FIRED.load(Relaxed),
+        ),
         // subquery.rs — pull-up + batched scalar paths
-        ("PULLUP_LIMIT1_FIRE_COUNT", e::subquery::PULLUP_LIMIT1_FIRE_COUNT.load(Relaxed)),
-        ("BATCHED_SCALAR_KEYED_FIRE_COUNT", e::subquery::BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Relaxed)),
-        ("BATCHED_SCALAR_KEYED_PROBE_COUNT", e::subquery::BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Relaxed)),
-        ("BATCHED_SCALAR_FALL_THROUGH_COUNT", e::subquery::BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Relaxed)),
+        (
+            "PULLUP_LIMIT1_FIRE_COUNT",
+            e::subquery::PULLUP_LIMIT1_FIRE_COUNT.load(Relaxed),
+        ),
+        (
+            "BATCHED_SCALAR_KEYED_FIRE_COUNT",
+            e::subquery::BATCHED_SCALAR_KEYED_FIRE_COUNT.load(Relaxed),
+        ),
+        (
+            "BATCHED_SCALAR_KEYED_PROBE_COUNT",
+            e::subquery::BATCHED_SCALAR_KEYED_PROBE_COUNT.load(Relaxed),
+        ),
+        (
+            "BATCHED_SCALAR_FALL_THROUGH_COUNT",
+            e::subquery::BATCHED_SCALAR_FALL_THROUGH_COUNT.load(Relaxed),
+        ),
         // subquery.rs — EXISTS pull-up: candidate + 7 bails + fire + batch
-        ("EXISTS_PULLUP_CANDIDATE_COUNT", e::subquery::EXISTS_PULLUP_CANDIDATE_COUNT.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_INNER_SHAPE", e::subquery::EXISTS_PULLUP_BAIL_INNER_SHAPE.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_INNER_FROM", e::subquery::EXISTS_PULLUP_BAIL_INNER_FROM.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_NO_WHERE", e::subquery::EXISTS_PULLUP_BAIL_NO_WHERE.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER", e::subquery::EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_NO_CORR", e::subquery::EXISTS_PULLUP_BAIL_NO_CORR.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_MULTICOL_DISABLED", e::subquery::EXISTS_PULLUP_BAIL_MULTICOL_DISABLED.load(Relaxed)),
-        ("EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING", e::subquery::EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING.load(Relaxed)),
-        ("EXISTS_PULLUP_FIRE_COUNT", e::subquery::EXISTS_PULLUP_FIRE_COUNT.load(Relaxed)),
-        ("EXISTS_BATCH_FIRE_COUNT", e::subquery::EXISTS_BATCH_FIRE_COUNT.load(Relaxed)),
-        ("EXISTS_BATCH_FALL_THROUGH_COUNT", e::subquery::EXISTS_BATCH_FALL_THROUGH_COUNT.load(Relaxed)),
+        (
+            "EXISTS_PULLUP_CANDIDATE_COUNT",
+            e::subquery::EXISTS_PULLUP_CANDIDATE_COUNT.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_INNER_SHAPE",
+            e::subquery::EXISTS_PULLUP_BAIL_INNER_SHAPE.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_INNER_FROM",
+            e::subquery::EXISTS_PULLUP_BAIL_INNER_FROM.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_NO_WHERE",
+            e::subquery::EXISTS_PULLUP_BAIL_NO_WHERE.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER",
+            e::subquery::EXISTS_PULLUP_BAIL_RESIDUAL_NOT_INNER.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_NO_CORR",
+            e::subquery::EXISTS_PULLUP_BAIL_NO_CORR.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_MULTICOL_DISABLED",
+            e::subquery::EXISTS_PULLUP_BAIL_MULTICOL_DISABLED.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING",
+            e::subquery::EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING.load(Relaxed),
+        ),
+        (
+            "EXISTS_PULLUP_FIRE_COUNT",
+            e::subquery::EXISTS_PULLUP_FIRE_COUNT.load(Relaxed),
+        ),
+        (
+            "EXISTS_BATCH_FIRE_COUNT",
+            e::subquery::EXISTS_BATCH_FIRE_COUNT.load(Relaxed),
+        ),
+        (
+            "EXISTS_BATCH_FALL_THROUGH_COUNT",
+            e::subquery::EXISTS_BATCH_FALL_THROUGH_COUNT.load(Relaxed),
+        ),
         // subquery.rs — SCALARSQ (docker-fair attack)
-        ("SCALARSQ_PK_PROBE_PLAN_FIRED", e::subquery::SCALARSQ_PK_PROBE_PLAN_FIRED.load(Relaxed)),
-        ("SCALARSQ_PK_PROBE_FIRED", e::subquery::SCALARSQ_PK_PROBE_FIRED.load(Relaxed)),
+        (
+            "SCALARSQ_PK_PROBE_PLAN_FIRED",
+            e::subquery::SCALARSQ_PK_PROBE_PLAN_FIRED.load(Relaxed),
+        ),
+        (
+            "SCALARSQ_PK_PROBE_FIRED",
+            e::subquery::SCALARSQ_PK_PROBE_FIRED.load(Relaxed),
+        ),
         // v7.37.9 Phase 0 — NEW counters this commit adds
-        ("REORDER_INNER_RUN_TRIED", e::reorder::REORDER_INNER_RUN_TRIED.load(Relaxed)),
-        ("REORDER_INNER_RUN_FIRED", e::reorder::REORDER_INNER_RUN_FIRED.load(Relaxed)),
-        ("DISTA_LITERAL_ARG2_CACHE_FIRE", e::aggregate::DISTA_LITERAL_ARG2_CACHE_FIRE.load(Relaxed)),
-        ("AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE", e::aggregate::AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE.load(Relaxed)),
+        (
+            "REORDER_INNER_RUN_TRIED",
+            e::reorder::REORDER_INNER_RUN_TRIED.load(Relaxed),
+        ),
+        (
+            "REORDER_INNER_RUN_FIRED",
+            e::reorder::REORDER_INNER_RUN_FIRED.load(Relaxed),
+        ),
+        (
+            "DISTA_LITERAL_ARG2_CACHE_FIRE",
+            e::aggregate::DISTA_LITERAL_ARG2_CACHE_FIRE.load(Relaxed),
+        ),
+        (
+            "AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE",
+            e::aggregate::AGGREGATE_ARRAY_AGG_ORDER_BY_FIRE.load(Relaxed),
+        ),
         // v7.37.9 Phase 1A-ext — per-row spec dispatch branches
-        ("AGG_PER_ROW_FAST_POS", e::aggregate::AGG_PER_ROW_FAST_POS.load(Relaxed)),
-        ("AGG_PER_ROW_COMPILED_HIT", e::aggregate::AGG_PER_ROW_COMPILED_HIT.load(Relaxed)),
-        ("AGG_PER_ROW_COMPILED_MISS", e::aggregate::AGG_PER_ROW_COMPILED_MISS.load(Relaxed)),
-        ("AGG_PER_ROW_EVAL_FALLBACK", e::aggregate::AGG_PER_ROW_EVAL_FALLBACK.load(Relaxed)),
-        ("AGG_PER_ROW_COUNT_STAR_SENTINEL", e::aggregate::AGG_PER_ROW_COUNT_STAR_SENTINEL.load(Relaxed)),
+        (
+            "AGG_PER_ROW_FAST_POS",
+            e::aggregate::AGG_PER_ROW_FAST_POS.load(Relaxed),
+        ),
+        (
+            "AGG_PER_ROW_COMPILED_HIT",
+            e::aggregate::AGG_PER_ROW_COMPILED_HIT.load(Relaxed),
+        ),
+        (
+            "AGG_PER_ROW_COMPILED_MISS",
+            e::aggregate::AGG_PER_ROW_COMPILED_MISS.load(Relaxed),
+        ),
+        (
+            "AGG_PER_ROW_EVAL_FALLBACK",
+            e::aggregate::AGG_PER_ROW_EVAL_FALLBACK.load(Relaxed),
+        ),
+        (
+            "AGG_PER_ROW_COUNT_STAR_SENTINEL",
+            e::aggregate::AGG_PER_ROW_COUNT_STAR_SENTINEL.load(Relaxed),
+        ),
         // v7.37.9 Phase 1A-ext-2 T1 — Step VM internal step-type counters
-        ("STEP_VM_CALL_COUNT", e::eval::compiled::STEP_VM_CALL_COUNT.load(Relaxed)),
-        ("STEP_VM_STEPS_TOTAL", e::eval::compiled::STEP_VM_STEPS_TOTAL.load(Relaxed)),
-        ("STEP_VM_COLUMN_FIRE", e::eval::compiled::STEP_VM_COLUMN_FIRE.load(Relaxed)),
-        ("STEP_VM_LIT_FIRE", e::eval::compiled::STEP_VM_LIT_FIRE.load(Relaxed)),
-        ("STEP_VM_BINARY_FIRE", e::eval::compiled::STEP_VM_BINARY_FIRE.load(Relaxed)),
-        ("STEP_VM_FUNCTION_FIRE", e::eval::compiled::STEP_VM_FUNCTION_FIRE.load(Relaxed)),
-        ("STEP_VM_CAST_FIRE", e::eval::compiled::STEP_VM_CAST_FIRE.load(Relaxed)),
-        ("STEP_VM_CASE_FIRE", e::eval::compiled::STEP_VM_CASE_FIRE.load(Relaxed)),
+        (
+            "STEP_VM_CALL_COUNT",
+            e::eval::compiled::STEP_VM_CALL_COUNT.load(Relaxed),
+        ),
+        (
+            "STEP_VM_STEPS_TOTAL",
+            e::eval::compiled::STEP_VM_STEPS_TOTAL.load(Relaxed),
+        ),
+        (
+            "STEP_VM_COLUMN_FIRE",
+            e::eval::compiled::STEP_VM_COLUMN_FIRE.load(Relaxed),
+        ),
+        (
+            "STEP_VM_LIT_FIRE",
+            e::eval::compiled::STEP_VM_LIT_FIRE.load(Relaxed),
+        ),
+        (
+            "STEP_VM_BINARY_FIRE",
+            e::eval::compiled::STEP_VM_BINARY_FIRE.load(Relaxed),
+        ),
+        (
+            "STEP_VM_FUNCTION_FIRE",
+            e::eval::compiled::STEP_VM_FUNCTION_FIRE.load(Relaxed),
+        ),
+        (
+            "STEP_VM_CAST_FIRE",
+            e::eval::compiled::STEP_VM_CAST_FIRE.load(Relaxed),
+        ),
+        (
+            "STEP_VM_CASE_FIRE",
+            e::eval::compiled::STEP_VM_CASE_FIRE.load(Relaxed),
+        ),
         // v7.37.9 Round 3 — heap-alloc per Step::Column / Step::Lit fire (T3 attack ROI)
-        ("STEP_VM_COLUMN_HEAP_ALLOC", e::eval::compiled::STEP_VM_COLUMN_HEAP_ALLOC.load(Relaxed)),
-        ("STEP_VM_LIT_HEAP_ALLOC", e::eval::compiled::STEP_VM_LIT_HEAP_ALLOC.load(Relaxed)),
+        (
+            "STEP_VM_COLUMN_HEAP_ALLOC",
+            e::eval::compiled::STEP_VM_COLUMN_HEAP_ALLOC.load(Relaxed),
+        ),
+        (
+            "STEP_VM_LIT_HEAP_ALLOC",
+            e::eval::compiled::STEP_VM_LIT_HEAP_ALLOC.load(Relaxed),
+        ),
     ]
 }
 
@@ -155,12 +269,11 @@ fn main() -> Result<()> {
             expected_sha256,
             ..
         } => {
-            bail!(
-                "snapshot SHA-256 mismatch: got {actual_sha256}, expected {expected_sha256}"
-            );
+            bail!("snapshot SHA-256 mismatch: got {actual_sha256}, expected {expected_sha256}");
         }
-        SnapshotState::Present { path, .. } => extract_snapshot(&path)
-            .with_context(|| format!("extract {}", path.display()))?,
+        SnapshotState::Present { path, .. } => {
+            extract_snapshot(&path).with_context(|| format!("extract {}", path.display()))?
+        }
     };
     eprintln!("snapshot OK: {}", extracted.catalog_path.display());
 
@@ -186,8 +299,11 @@ fn main() -> Result<()> {
         bail!("no SQL statements found in {}", sql_path.display());
     }
     let measure_sql = stmts.last().unwrap();
-    eprintln!("measure SQL: {} chars, {} statements before it",
-        measure_sql.len(), stmts.len() - 1);
+    eprintln!(
+        "measure SQL: {} chars, {} statements before it",
+        measure_sql.len(),
+        stmts.len() - 1
+    );
 
     // Warm-up: run once to populate plan cache + cold-tier OS cache.
     eprintln!("warm-up run...");
@@ -236,9 +352,13 @@ fn main() -> Result<()> {
     println!("  - PULLUP_LIMIT1_FIRE > 0 → correlated LIMIT 1 subquery fast path active");
     println!("  - EXISTS_PULLUP_FIRE > 0 → NOT EXISTS pull-up active (Class C ≥ 2 expected)");
     println!("  - SCALARSQ_PK_PROBE_FIRED > 0 → docker-fair SCALARSQ attack reaches this shape");
-    println!("  - DISTA_LITERAL_ARG2_CACHE_FIRE > 0 → string_agg(DISTINCT col, ',') hit the v7.37.43 fast path");
+    println!(
+        "  - DISTA_LITERAL_ARG2_CACHE_FIRE > 0 → string_agg(DISTINCT col, ',') hit the v7.37.43 fast path"
+    );
     println!("  - REORDER_INNER_RUN_FIRED > 0 → planner actually permuted the join order");
-    println!("  - ANY 'ZERO' marker = that attack did NOT recognise the mailrs shape (Phase 1 follow-up)");
+    println!(
+        "  - ANY 'ZERO' marker = that attack did NOT recognise the mailrs shape (Phase 1 follow-up)"
+    );
 
     Ok(())
 }

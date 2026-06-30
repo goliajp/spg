@@ -432,10 +432,7 @@ async fn run_one(
                 // re-executed on the blocking pool. Distinguishes "query
                 // cancelled mid-inline" from "fresh blocking-pool dispatch"
                 // for pool-stress and budget-tuning regressions.
-                spg_embedded::injection_point!(
-                    "spg_sqlx_inline_budget_cancel",
-                    &budget_ms
-                );
+                spg_embedded::injection_point!("spg_sqlx_inline_budget_cancel", &budget_ms);
                 let stmt = c.stmt.clone();
                 let params_owned: Vec<spg_embedded::Value> =
                     params.as_deref().unwrap_or(&[]).to_vec();

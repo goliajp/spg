@@ -8,7 +8,9 @@
 use spg_engine::{Engine, QueryResult, testkit::EnvConfig};
 
 fn build_engine(deterministic: bool) -> Engine {
-    let cfg = EnvConfig::builder().plan_deterministic(deterministic).build();
+    let cfg = EnvConfig::builder()
+        .plan_deterministic(deterministic)
+        .build();
     let mut e = Engine::new().with_env_cfg(cfg);
     // 3-table inner join — production reorder would normally swap
     // the smallest-stats side to be the driving table.
@@ -18,7 +20,8 @@ fn build_engine(deterministic: bool) -> Engine {
         .unwrap();
     e.execute("CREATE TABLE large (id INT NOT NULL PRIMARY KEY, k INT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO small VALUES (1, 1), (2, 2)").unwrap();
+    e.execute("INSERT INTO small VALUES (1, 1), (2, 2)")
+        .unwrap();
     for i in 1..=20 {
         e.execute(&format!("INSERT INTO medium VALUES ({i}, {i})"))
             .unwrap();
@@ -42,8 +45,7 @@ fn rowcount(r: QueryResult) -> usize {
 
 #[test]
 fn plan_deterministic_on_and_off_return_same_rows() {
-    let sql =
-        "SELECT large.id FROM large JOIN medium ON large.k = medium.k JOIN small ON medium.k = small.k ORDER BY large.id";
+    let sql = "SELECT large.id FROM large JOIN medium ON large.k = medium.k JOIN small ON medium.k = small.k ORDER BY large.id";
     let mut e_on = build_engine(true);
     let mut e_off = build_engine(false);
     let on_count = rowcount(e_on.execute(sql).unwrap());
