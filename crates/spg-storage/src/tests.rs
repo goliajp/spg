@@ -2652,6 +2652,44 @@ fn v7_37_15_phase_d_vacuum_all_aggregates_per_table() {
     assert_eq!(report.per_table[0].1, 1);
 }
 
+/// v7.37.15 (Phase D TDD) — `is_all_visible` returns true on a
+/// freshly-populated table (every insert defaults to frozen),
+/// flips to false the moment a non-frozen MVCC writer stamps
+/// any row, and recovers to true after vacuum reclaims the
+/// non-frozen rows.
+#[test]
+fn v7_37_15_phase_d_is_all_visible_tracks_mvcc_writers() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+
+    // Empty table is trivially all-visible.
+    assert!(t.is_all_visible());
+
+    // Legacy inserts (default frozen) keep the table all-visible.
+    for id in 0..3i64 {
+        t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+            .unwrap();
+    }
+    assert!(t.is_all_visible(), "frozen-only table is all-visible");
+
+    // An MVCC writer stamps a non-frozen xmin → flag flips.
+    t.insert_with_xmin(make_user_row(99, "mvcc"), 42).unwrap();
+    assert!(
+        !t.is_all_visible(),
+        "non-frozen xmin must clear all-visible"
+    );
+
+    // Vacuum out the MVCC row (set xmax + vacuum at a version
+    // past oldest_active).
+    t.mark_row_deleted(3, 50).unwrap();
+    let _ = t.vacuum(100, false);
+    assert!(
+        t.is_all_visible(),
+        "table is all-visible again after the MVCC row is reclaimed"
+    );
+}
+
 /// v7.37.15 (Phase C+D TDD) — end-to-end MVCC story across
 /// insert / delete / vacuum / snapshot:
 ///
