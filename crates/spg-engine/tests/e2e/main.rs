@@ -173,6 +173,7 @@ mod e2e_pg_statio_user_tables;
 mod e2e_pg_time;
 mod e2e_pg_timetz;
 mod e2e_pg_type_view;
+mod e2e_pg_type_widened;
 mod e2e_pg_typeof;
 mod e2e_pg_views_view;
 mod e2e_pgdump_compat;
