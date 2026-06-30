@@ -1287,6 +1287,75 @@ fn fsync_dir(dir: &Path) {
 pub(crate) static FSYNC_DIR_CALL_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// v7.37.13 (A1.7) — POSIX_FADV_DONTNEED on segment close.
+//
+// After a cold segment is written + renamed into the segments dir,
+// give the kernel a hint that the data won't be needed again soon
+// so it can evict the bytes from the page cache. Without this, a
+// long-running embedded process that freezes a steady trickle of
+// segments accumulates a stale page-cache footprint proportional to
+// the cold tier — which then competes with hot-tier reads for
+// memory and crowds out actually-useful pages.
+//
+// PG's equivalent posture: `pg_flush_data` + posix_fadvise on
+// FlushBuffer / FlushRelationBuffers. Same intent — kernel doesn't
+// know "this is cold storage", we have to tell it.
+//
+// Platform: posix_fadvise is Linux-only in the form we want. macOS
+// uses `F_RDADVISE` (no DONTNEED), Windows has no equivalent. The
+// non-Linux stub keeps the call site uniform; the test counter
+// bumps on both so tests pass on dev macOS while the production
+// fix actually fires on the Linux servers customers run.
+
+/// v7.37.13 (A1.7 TDD) — test-only call counter for [`fadvise_dontneed_file`].
+#[cfg(test)]
+pub(crate) static FADVISE_DONTNEED_CALL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // extern C posix_fadvise binding; isolated.
+unsafe extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+
+/// v7.37.13 (A1.7) — hint the kernel that the bytes of `path` won't
+/// be needed again soon (POSIX_FADV_DONTNEED). Best-effort: open
+/// errors and fadvise errors are both swallowed because the worst
+/// case is "page cache eviction is slightly delayed", which is
+/// strictly better than "freeze fails because hinting failed".
+#[cfg(target_os = "linux")]
+fn fadvise_dontneed_file(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    const POSIX_FADV_DONTNEED: i32 = 4;
+    if let Ok(f) = File::open(path) {
+        #[allow(unsafe_code)]
+        unsafe {
+            // Offset 0, length 0 = "the entire file".
+            posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(test)]
+    {
+        FADVISE_DONTNEED_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// v7.37.13 (A1.7) — no-op stub on platforms without
+/// POSIX_FADV_DONTNEED. Call sites stay uniform; the production
+/// Linux deployment is the one that actually benefits.
+#[cfg(not(target_os = "linux"))]
+fn fadvise_dontneed_file(_path: &Path) {
+    // macOS / Windows / BSD: no portable equivalent of
+    // POSIX_FADV_DONTNEED. Document and move on — the call site
+    // is reached the same way as on Linux so tests pass on dev
+    // workstations, the Linux build is the one that actually hints
+    // the kernel.
+    #[cfg(test)]
+    {
+        FADVISE_DONTNEED_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // v7.37.13 (A1.4 / A1.5) — fsync-failure policy.
 //
 // Default behaviour: a WAL fsync failure is a durability invariant
@@ -2938,6 +3007,13 @@ impl Database {
             // catalog pointing at a path the kernel claims does not
             // exist. Matches PG's `durable_rename` posture.
             fsync_dir(&p.cold_segments_dir);
+            // v7.37.13 (A1.7) — hint the kernel that the cold-segment
+            // bytes won't be needed again soon (POSIX_FADV_DONTNEED).
+            // Without this, a long-running process freezing a steady
+            // trickle of segments accumulates a stale page-cache
+            // footprint proportional to the cold tier — competing
+            // with hot-tier reads for memory.
+            fadvise_dontneed_file(&final_path);
             p.cold_segment_paths.insert(report.segment_id, final_path);
         }
         Ok(report)
@@ -5734,6 +5810,47 @@ mod tests {
         assert!(parsed_flipped.is_empty(), "BLAKE3 mode rejects tampered payload");
 
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.7 TDD) — `freeze_oldest_to_cold` must call
+    /// [`fadvise_dontneed_file`] on the newly-renamed segment so
+    /// the kernel evicts the just-written bytes from the page
+    /// cache. Without this, a long-running embedded process
+    /// accumulates a stale page-cache footprint proportional to
+    /// the cold tier — crowding out hot-tier reads. Matches PG's
+    /// pg_flush_data posture.
+    ///
+    /// Counter-based assertion (FADVISE_DONTNEED_CALL_COUNT) —
+    /// kernel-level page-cache eviction is unobservable from
+    /// userspace anyway, so the test verifies the CALL SITE was
+    /// reached. Passes uniformly on Linux (real syscall) and
+    /// macOS / Windows (no-op stub that still bumps the counter).
+    #[test]
+    fn v7_37_13_freeze_to_cold_fadvises_dontneed_on_segment() {
+        let dir = tmpdir();
+        let db_path = dir.join("fadvise_db");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)")
+            .expect("ddl");
+        db.execute("CREATE INDEX by_id ON users (id)").expect("ix");
+        for i in 0..200i64 {
+            db.execute(&format!("INSERT INTO users VALUES ({i}, 'u-{i}')"))
+                .expect("insert");
+        }
+        db.checkpoint().expect("seed checkpoint");
+
+        let baseline = FADVISE_DONTNEED_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        db.freeze_oldest_to_cold("users", "by_id", 100)
+            .expect("freeze");
+        let after = FADVISE_DONTNEED_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            after > baseline,
+            "freeze_oldest_to_cold must call fadvise_dontneed_file on the new \
+             cold segment (baseline {baseline}, after {after}); without this \
+             hint, a long-running process accumulates a stale page-cache \
+             footprint proportional to the cold tier (AUDIT-3-categories A1.7)."
+        );
     }
 
     /// v7.37.13 (A1.3 TDD) — every v6 record persists a prev_lsn
