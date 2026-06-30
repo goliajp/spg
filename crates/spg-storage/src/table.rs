@@ -14,12 +14,22 @@ impl Table {
         Self {
             schema,
             rows: PersistentVec::new(),
+            headers: PersistentVec::new(),
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
             cold_row_count_stale: false,
             redo_log: None,
         }
+    }
+
+    /// v7.37.15 (Phase A.2) — read-only access to the per-row
+    /// MVCC visibility headers. `headers().len() == rows().len()`
+    /// is the load-bearing invariant; Phase B scan paths consult
+    /// `headers()[idx]` to decide visibility.
+    #[must_use]
+    pub fn headers(&self) -> &PersistentVec<crate::row_header::RowHeader> {
+        &self.headers
     }
 
     /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
@@ -387,6 +397,17 @@ impl Table {
         // wrap where a Catalog snapshot exists, push_mut path-copies the
         // tail just like push() and the snapshot stays valid.
         self.rows.push_mut(row);
+        // v7.37.15 (Phase A.2) — keep `headers` lock-step with `rows`.
+        // Phase A defaults every new insert to RowHeader::frozen() so
+        // visibility checks against any snapshot return true; Phase C
+        // upgrades the inserter to stamp the writing tx's xmin.
+        self.headers
+            .push_mut(crate::row_header::RowHeader::frozen());
+        debug_assert_eq!(
+            self.rows.len(),
+            self.headers.len(),
+            "headers must stay in lock-step with rows after insert"
+        );
         // NSW updates after the push so the new row is visible to the
         // greedy search used during connect.
         let new_row_idx = self.rows.len() - 1;
@@ -1151,6 +1172,8 @@ impl Table {
     /// fast path. Indices are rebuilt (empty).
     pub fn truncate(&mut self) {
         self.rows = PersistentVec::new();
+        // v7.37.15 (Phase A.2) — keep headers lock-step.
+        self.headers = PersistentVec::new();
         self.hot_bytes = 0;
         self.rebuild_indices();
     }
@@ -1199,6 +1222,7 @@ impl Table {
             return 0;
         }
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        let mut new_headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
         let mut removed_bytes: u64 = 0;
         for (i, row) in self.rows.iter().enumerate() {
             if to_remove[i] {
@@ -1206,10 +1230,26 @@ impl Table {
                     removed_bytes.saturating_add(row_body_encoded_len(row, &self.schema) as u64);
             } else {
                 new_rows.push_mut(row.clone());
+                // v7.37.15 (Phase A.2) — keep headers lock-step.
+                // Phase C will stamp xmax with the deleting tx's
+                // id INSTEAD of physically dropping the row; Phase
+                // A.2 keeps physical-delete semantics so
+                // serialisation + WAL paths stay identical.
+                if let Some(h) = self.headers.get(i) {
+                    new_headers.push_mut(*h);
+                } else {
+                    new_headers.push_mut(crate::row_header::RowHeader::frozen());
+                }
             }
         }
         self.rows = new_rows;
+        self.headers = new_headers;
         self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
+        debug_assert_eq!(
+            self.rows.len(),
+            self.headers.len(),
+            "headers must stay in lock-step with rows after delete_rows_no_index"
+        );
         removed
     }
 
@@ -1233,8 +1273,25 @@ impl Table {
         new_rows: PersistentVec<Row<'static>>,
         new_hot_bytes: u64,
     ) {
+        // v7.37.15 (Phase A.2) — synthesise frozen headers for
+        // the replacement rows. Phase D's catalog snapshot format
+        // (bumped to V6) will start carrying headers verbatim,
+        // letting recovery preserve real xmin/xmax instead of
+        // freezing everything; until then frozen is the safe
+        // default for replay (all visible to every snapshot).
+        let mut new_headers: PersistentVec<crate::row_header::RowHeader> =
+            PersistentVec::new();
+        for _ in 0..new_rows.len() {
+            new_headers.push_mut(crate::row_header::RowHeader::frozen());
+        }
         self.rows = new_rows;
+        self.headers = new_headers;
         self.hot_bytes = new_hot_bytes;
+        debug_assert_eq!(
+            self.rows.len(),
+            self.headers.len(),
+            "headers must stay in lock-step with rows after set_rows_and_rebuild_indices"
+        );
         self.rebuild_indices();
     }
 
@@ -1257,6 +1314,18 @@ impl Table {
             .hot_bytes
             .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
         self.rows.push_mut(row);
+        // v7.37.15 (Phase A.2) — keep headers lock-step for the
+        // WAL replay path. Replay-time headers are frozen because
+        // pre-V6 envelopes carry no header info; Phase D will
+        // restore the original xmin/xmax once the V6 catalog
+        // format ships.
+        self.headers
+            .push_mut(crate::row_header::RowHeader::frozen());
+        debug_assert_eq!(
+            self.rows.len(),
+            self.headers.len(),
+            "headers must stay in lock-step with rows after insert_no_index"
+        );
         Ok(())
     }
 

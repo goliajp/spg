@@ -2457,6 +2457,24 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
 pub struct Table {
     schema: TableSchema,
     rows: PersistentVec<Row<'static>>,
+    /// v7.37.15 (Phase A.2) — per-row MVCC visibility headers
+    /// parallel to `rows`. `headers.len() == rows.len()` is the
+    /// load-bearing invariant; debug builds assert it on every
+    /// scan boundary, release builds rely on it from
+    /// disciplined insert / delete / update paths.
+    ///
+    /// Pre-v7.37.15-loaded tables (every row currently in the
+    /// fleet) start as `RowHeader::frozen()` — `is_all_visible_fast()`
+    /// returns `true`, so the per-row visibility gate Phase B
+    /// adds is a no-op against any snapshot.
+    ///
+    /// Headers are NOT yet serialised into the envelope at this
+    /// commit — on snapshot deserialize every row gets a fresh
+    /// `RowHeader::frozen()`. Phase D adds the visibility-map
+    /// + segment-freeze story which makes serialisation
+    /// meaningful; until then the on-disk story is "the catalog
+    /// is the set of visible rows."
+    headers: PersistentVec<row_header::RowHeader>,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the

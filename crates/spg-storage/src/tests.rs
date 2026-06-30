@@ -2316,6 +2316,88 @@ fn freeze_twice_preserves_prior_cold_locators() {
     }
 }
 
+/// v7.37.15 (Phase A.2 TDD) — `Table.headers` must stay
+/// lock-step with `Table.rows` across every mutating path.
+/// `headers.len() == rows.len()` is the load-bearing invariant
+/// for Phase B's per-row visibility gate (`headers[i]` indexes
+/// into the SAME row as `rows[i]`); if it ever drifts, scans
+/// see the wrong visibility decision.
+///
+/// Exercises insert / delete / truncate / freeze / WAL-replay
+/// shapes and checks the invariant after each.
+#[test]
+fn v7_37_15_headers_stay_lock_step_with_rows() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+
+    // Insert path.
+    for id in 0..10i64 {
+        t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+            .unwrap();
+    }
+    assert_eq!(t.row_count(), 10);
+    assert_eq!(
+        t.headers().len(),
+        t.rows().len(),
+        "headers in lock-step after 10 inserts"
+    );
+
+    // delete_rows path.
+    t.delete_rows(&[0, 2, 4]);
+    assert_eq!(t.row_count(), 7);
+    assert_eq!(
+        t.headers().len(),
+        t.rows().len(),
+        "headers in lock-step after delete_rows"
+    );
+
+    // insert_no_index (WAL replay path).
+    t.insert_no_index(make_user_row(100, "replay-100")).unwrap();
+    assert_eq!(t.row_count(), 8);
+    assert_eq!(
+        t.headers().len(),
+        t.rows().len(),
+        "headers in lock-step after insert_no_index"
+    );
+
+    // delete_rows_no_index (WAL replay path).
+    t.delete_rows_no_index(&[0, 1]);
+    assert_eq!(t.row_count(), 6);
+    assert_eq!(
+        t.headers().len(),
+        t.rows().len(),
+        "headers in lock-step after delete_rows_no_index"
+    );
+
+    // truncate path.
+    t.truncate();
+    assert_eq!(t.row_count(), 0);
+    assert_eq!(
+        t.headers().len(),
+        t.rows().len(),
+        "headers in lock-step after truncate"
+    );
+}
+
+/// v7.37.15 (Phase A.2 TDD) — fresh inserts default to
+/// `RowHeader::frozen()` so visibility-aware scans (Phase B)
+/// continue returning every row to every snapshot, preserving
+/// pre-v7.37.15 behaviour while the catalog isn't yet
+/// version-tracked.
+#[test]
+fn v7_37_15_fresh_inserts_default_to_frozen_header() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    t.insert(make_user_row(7, "alice")).unwrap();
+    let header = t.headers().get(0).expect("header for first row");
+    assert!(
+        header.is_all_visible_fast(),
+        "fresh insert must default to frozen + alive (got {header:?})"
+    );
+}
+
 /// Validation guard tests. Each must return `Err` and **not
 /// mutate the catalog** — the API is all-or-nothing.
 #[test]
