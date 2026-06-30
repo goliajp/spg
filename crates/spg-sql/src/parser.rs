@@ -4913,6 +4913,14 @@ impl Parser {
     /// token that isn't `FOR`.
     fn consume_optional_for_lock_clauses(&mut self) {
         while matches!(self.peek(), Token::For) {
+            // v7.37.14 (A2.5-stub) — record that this query asked
+            // for a row lock the parser is about to silently
+            // discard. Operators surface the count via
+            // `spg_sql::silent_for_update_count()` so they can
+            // gauge how much of the workload depends on advisory
+            // FOR UPDATE / FOR SHARE / FOR KEY SHARE semantics
+            // before v7.37.15's per-row tuple locking lands.
+            crate::record_silent_for_update_clause();
             self.advance(); // FOR
             // `NO KEY` prefix (PG) — `NO` is reserved-keyword-shaped
             // (`Token::Not` isn't it; PG `NO` lexes as Token::Ident).
