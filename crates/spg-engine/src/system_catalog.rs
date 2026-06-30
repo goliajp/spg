@@ -1183,30 +1183,100 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
 ///   * indisunique (Bool)
 ///   * indisprimary (Bool)
 pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.37.24 (24.8b-2) — widened from 5 to 19 PG-canonical
+    // columns. The PG-`pg_index` shape is what pgAdmin's index
+    // explorer + sqlx introspection query, so the columns
+    // dashboards walk are populated from live catalog state.
     let schema = alloc::vec![
         ColumnSchema::new("indexrelid", DataType::BigInt, false),
         ColumnSchema::new("indrelid", DataType::BigInt, false),
-        ColumnSchema::new("indnatts", DataType::Int, false),
+        ColumnSchema::new("indnatts", DataType::SmallInt, false),
+        ColumnSchema::new("indnkeyatts", DataType::SmallInt, false),
         ColumnSchema::new("indisunique", DataType::Bool, false),
+        ColumnSchema::new("indnullsnotdistinct", DataType::Bool, false),
         ColumnSchema::new("indisprimary", DataType::Bool, false),
+        ColumnSchema::new("indisexclusion", DataType::Bool, false),
+        ColumnSchema::new("indimmediate", DataType::Bool, false),
+        ColumnSchema::new("indisclustered", DataType::Bool, false),
+        ColumnSchema::new("indisvalid", DataType::Bool, false),
+        ColumnSchema::new("indcheckxmin", DataType::Bool, false),
+        ColumnSchema::new("indisready", DataType::Bool, false),
+        ColumnSchema::new("indislive", DataType::Bool, false),
+        ColumnSchema::new("indisreplident", DataType::Bool, false),
+        ColumnSchema::new("indkey", DataType::Text, false),
+        ColumnSchema::new("indcollation", DataType::Text, false),
+        ColumnSchema::new("indclass", DataType::Text, false),
+        ColumnSchema::new("indoption", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut idx_oid: i64 = 100_000;
-    for (table_idx, tname) in cat.table_names().iter().enumerate() {
+    // Build a name → user-relation OID map so indrelid matches
+    // pg_class.oid (synth_pg_class starts at 16384). Without
+    // this, joins between pg_index and pg_class fail.
+    let names = cat.table_names();
+    let mut table_oid: i64 = 16384;
+    let mut by_table: alloc::collections::BTreeMap<String, i64> =
+        alloc::collections::BTreeMap::new();
+    for tname in &names {
+        by_table.insert(tname.clone(), table_oid);
+        table_oid = table_oid.saturating_add(1);
+    }
+    for tname in &names {
         let Some(t) = cat.get(tname) else { continue };
+        let relid = *by_table.get(tname).unwrap_or(&0);
         for idx in t.indices() {
             idx_oid += 1;
-            #[allow(clippy::cast_possible_wrap)]
-            let nattrs = (1 + idx.extra_column_positions.len()) as i32;
-            // is_primary: SPG / PG flag the primary via the
-            // index name convention `<table>_pkey`.
+            let n_attrs_total = 1 + idx.extra_column_positions.len();
+            // Build PG's `indkey` int2vector — space-separated
+            // column positions, 1-based. SPG stores positions
+            // 0-based; add 1 to align with PG's attnum.
+            let mut indkey = alloc::string::String::new();
+            indkey.push_str(&alloc::format!("{}", idx.column_position + 1));
+            for extra in &idx.extra_column_positions {
+                indkey.push(' ');
+                indkey.push_str(&alloc::format!("{}", extra + 1));
+            }
+            // indclass: array of opclass OIDs, one per column.
+            // SPG uses default opclass for every column; PG would
+            // emit `1978 1978` for two int4 columns. We populate
+            // with placeholder 0s so the shape stays valid.
+            let mut indclass = alloc::string::String::new();
+            let mut indcollation = alloc::string::String::new();
+            let mut indoption = alloc::string::String::new();
+            for i in 0..n_attrs_total {
+                if i > 0 {
+                    indclass.push(' ');
+                    indcollation.push(' ');
+                    indoption.push(' ');
+                }
+                indclass.push('0');
+                indcollation.push('0');
+                indoption.push('0');
+            }
             let is_primary = idx.name.ends_with("_pkey");
+            let is_partial = idx.partial_predicate.is_some();
+            let is_expression = idx.expression.is_some();
+            let _ = (is_partial, is_expression);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
-                Value::BigInt((table_idx + 1) as i64),
-                Value::Int(nattrs),
+                Value::BigInt(relid),
+                Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
+                Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
                 Value::Bool(idx.is_unique),
+                Value::Bool(false), // indnullsnotdistinct — pending UniquenessConstraint plumb-through
                 Value::Bool(is_primary),
+                Value::Bool(false), // indisexclusion — EXCLUDE constraint
+                Value::Bool(true),  // indimmediate
+                Value::Bool(false), // indisclustered
+                Value::Bool(true),  // indisvalid
+                Value::Bool(false), // indcheckxmin
+                Value::Bool(true),  // indisready
+                Value::Bool(true),  // indislive
+                Value::Bool(false), // indisreplident
+                Value::text(indkey),
+                Value::text(indcollation),
+                Value::text(indclass),
+                Value::text(indoption),
             ]));
         }
     }
