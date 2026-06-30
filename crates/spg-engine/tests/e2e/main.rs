@@ -13,6 +13,7 @@ mod e2e_alter_column_default_notnull;
 mod e2e_alter_column_pg_dump_compat;
 mod e2e_alter_drop_constraint_kinds;
 mod e2e_alter_table_pg_dump_compat;
+mod e2e_alter_trigger_variants;
 mod e2e_array_agg_argmax;
 mod e2e_array_family;
 mod e2e_array_ops;
