@@ -85,13 +85,18 @@ fn explain_combines_costs_with_suggest() {
 
 #[test]
 fn explain_unknown_option_errors() {
+    // v7.37.22 (22.7) widened EXPLAIN to accept BUFFERS / TIMING /
+    // SETTINGS / WAL / VERBOSE / FORMAT / SUMMARY. The "unknown
+    // option" parse error now surfaces only on truly unrecognised
+    // keywords. Update the test to assert that a fabricated
+    // keyword still raises the option-list error.
     let mut e = build_engine();
     let err = e
-        .execute("EXPLAIN (BUFFERS) SELECT * FROM t")
-        .expect_err("BUFFERS is not implemented; must surface a parse error");
+        .execute("EXPLAIN (NONSENSE_KEYWORD) SELECT * FROM t")
+        .expect_err("unknown option must surface a parse error");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("EXPLAIN option") || msg.contains("BUFFERS"),
+        msg.contains("EXPLAIN option") || msg.contains("NONSENSE_KEYWORD"),
         "error should mention the unsupported option, got: {msg}"
     );
 }

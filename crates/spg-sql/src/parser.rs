@@ -512,6 +512,10 @@ impl Parser {
                 let mut analyze = false;
                 let mut suggest = false;
                 let mut costs_off = false;
+                let mut buffers = false;
+                let mut timing_off = false;
+                let mut settings = false;
+                let mut wal = false;
                 // v6.8.3 + v7.37.7 — `EXPLAIN (option [, option…])`
                 // syntax accepts SUGGEST + COSTS ON|OFF. Multiple
                 // options are comma-separated. Booleans default to ON
@@ -559,9 +563,111 @@ impl Parser {
                                 _ => true,
                             };
                             costs_off = !value;
+                        } else if opt.eq_ignore_ascii_case("analyze")
+                            || opt.eq_ignore_ascii_case("analyse")
+                        {
+                            // v7.37.22 — `EXPLAIN (ANALYZE [ON|OFF]) <S>`.
+                            // Same default-ON rule as ANALYZE keyword form.
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            analyze = value;
+                        } else if opt.eq_ignore_ascii_case("buffers") {
+                            // v7.37.22 — `BUFFERS [ON|OFF]`.
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            buffers = value;
+                        } else if opt.eq_ignore_ascii_case("timing") {
+                            // v7.37.22 — `TIMING [ON|OFF]`. OFF strips
+                            // the measured wall-clock annotation.
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            timing_off = !value;
+                        } else if opt.eq_ignore_ascii_case("settings") {
+                            settings = true;
+                        } else if opt.eq_ignore_ascii_case("wal") {
+                            wal = true;
+                        } else if opt.eq_ignore_ascii_case("verbose")
+                            || opt.eq_ignore_ascii_case("format")
+                            || opt.eq_ignore_ascii_case("summary")
+                        {
+                            // v7.37.22 — accept-but-no-op the remaining
+                            // PG options so EXPLAIN-using clients
+                            // (pgAdmin / DataGrip) don't see syntax
+                            // errors. FORMAT takes a value (text /
+                            // json / yaml / xml); skip the next token
+                            // if it's an ident.
+                            if opt.eq_ignore_ascii_case("format") {
+                                if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
+                                    self.advance();
+                                }
+                            } else {
+                                // VERBOSE / SUMMARY take optional ON/OFF;
+                                // consume if present.
+                                if matches!(self.peek(), Token::On) {
+                                    self.advance();
+                                } else if let Token::Ident(v) | Token::QuotedIdent(v) =
+                                    self.peek().clone()
+                                    && (v.eq_ignore_ascii_case("off")
+                                        || v.eq_ignore_ascii_case("true"))
+                                {
+                                    self.advance();
+                                    let _ = v;
+                                }
+                            }
                         } else {
                             return Err(self.err(format!(
-                                "unknown EXPLAIN option {opt:?}; v7.37.7 supports SUGGEST, COSTS"
+                                "unknown EXPLAIN option {opt:?}; supports ANALYZE, COSTS, BUFFERS, TIMING, SETTINGS, WAL, SUGGEST, VERBOSE, FORMAT, SUMMARY"
                             )));
                         }
                         if matches!(self.peek(), Token::Comma) {
@@ -592,6 +698,10 @@ impl Parser {
                     inner: Box::new(s),
                     suggest,
                     costs_off,
+                    buffers,
+                    timing_off,
+                    settings,
+                    wal,
                 }))
             }
             Token::Create => self.parse_create_stmt(),
