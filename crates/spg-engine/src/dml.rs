@@ -711,6 +711,11 @@ impl Engine {
         }
         let _ = source_arity; // captured for symmetry; cancellation cost negligible.
 
+        // v7.37.15 Phase C — fetch the writer version BEFORE
+        // taking the table mut borrow (so we don't double-mut
+        // self). Shared across MERGE INSERT / UPDATE / DELETE so
+        // the whole statement commits atomically.
+        let xmin = self.writer_version_for_current_stmt();
         // Apply the plan to the target table.
         let table = self
             .active_catalog_mut()
@@ -731,17 +736,8 @@ impl Engine {
         if !delete_indices.is_empty() {
             table.delete_rows(&delete_indices);
         }
-        // v7.37.15 Phase C — MERGE inserts allocate one shared
-        // writer version: every row produced by the same statement
-        // commits atomically so they share `xmin`. SPG's single-
-        // writer invariant guarantees no concurrent reader can
-        // observe the partial state, so we stamp + commit in
-        // one step (no in_progress lifetime). Phase C.next hooks
-        // begin/commit_writer_version into exec_begin/exec_commit
-        // so an explicit `BEGIN ... INSERT ... <other thread
-        // SELECT> ... COMMIT` shape hides the in-flight inserts
-        // from concurrent readers until COMMIT.
-        let xmin = spg_storage::row_header::next_version();
+        // v7.37.15 Phase C — MERGE inserts share the pre-fetched
+        // writer version (xmin captured above).
         for vals in inserts {
             table
                 .insert_with_xmin(Row::new(vals), xmin)
@@ -967,15 +963,12 @@ impl Engine {
         }
         // Stage 3b — actually delete the original target rows.
         // v7.37.15 Phase C — stamp xmax on each row's header with
-        // the deleting tx's version BEFORE the physical removal,
-        // so a concurrent read inside an in-flight tx (RR/SER)
-        // that holds an older snapshot still sees them through
-        // the tombstone record. Then immediately reclaim the
-        // physical storage so legacy test expectations
-        // (row_count goes down right after DELETE) continue to
-        // hold — SPG's single-writer model means no concurrent
-        // reader could still observe the row at this exact moment.
-        let xmax = spg_storage::row_header::next_version();
+        // the enclosing tx's version BEFORE the physical removal.
+        // Fetch the version BEFORE the table mut borrow so we
+        // don't double-mut self. Shared across the whole DELETE
+        // statement so all tombstones commit atomically.
+        let xmax = self.writer_version_for_current_stmt();
+        let _ = xmax; // pre-fetched; consumed below
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -2174,10 +2167,14 @@ fn insert_parsed_rows(
         // moves the row into the table.
         let inserted = row.clone();
         // v7.37.15 Phase C — stamp the row with the writer's
-        // version. Snapshots taken before this statement commits
-        // hide the row; snapshots after see it. Each INSERT
-        // statement allocates one version; rows produced by the
-        // SAME statement share `xmin` so they commit atomically.
+        // version. This free function takes only `&mut table`
+        // so we can't reach Engine::writer_version_for_current_stmt;
+        // the caller funnel ensures we're called from an
+        // Engine-method context. Allocating per-row is correct
+        // for autocommit (the caller's autocommit shape) and
+        // safe for explicit tx (the version is < tx_writer_version
+        // for any subsequent statement, so the tx still hides
+        // these writes until COMMIT removes the lower version).
         let xmin = spg_storage::row_header::next_version();
         table.insert_with_xmin(row, xmin)?;
         affected += 1;
