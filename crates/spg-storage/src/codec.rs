@@ -2409,6 +2409,36 @@ pub(crate) fn write_partition_role(out: &mut Vec<u8>, role: Option<&crate::Parti
             out.push(3);
             write_str(out, parent_name.as_str());
         }
+        // v7.37.16 (16.1) — LIST child role on disk: tag=4,
+        // parent_name + values count + each value via
+        // write_partition_bound (reuses BigInt/Int/SmallInt/Date/Text
+        // codec added in 16.6).
+        Some(PartitionRole::List {
+            parent_name,
+            values,
+        }) => {
+            out.push(4);
+            write_str(out, parent_name.as_str());
+            write_u16(
+                out,
+                u16::try_from(values.len()).expect("≤ 65k LIST partition values"),
+            );
+            for v in values {
+                write_partition_bound(out, v);
+            }
+        }
+        // v7.37.16 (16.2) — HASH child role on disk: tag=5,
+        // parent_name + u32 modulus + u32 remainder.
+        Some(PartitionRole::Hash {
+            parent_name,
+            modulus,
+            remainder,
+        }) => {
+            out.push(5);
+            write_str(out, parent_name.as_str());
+            out.extend_from_slice(&modulus.to_le_bytes());
+            out.extend_from_slice(&remainder.to_le_bytes());
+        }
     }
 }
 
@@ -2498,6 +2528,30 @@ pub(crate) fn read_partition_role(
         3 => {
             let parent_name = cur.read_str()?;
             Ok(Some(PartitionRole::Default { parent_name }))
+        }
+        // v7.37.16 (16.1) — LIST child role from disk.
+        4 => {
+            let parent_name = cur.read_str()?;
+            let n = cur.read_u16()? as usize;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                values.push(read_partition_bound(cur)?);
+            }
+            Ok(Some(PartitionRole::List {
+                parent_name,
+                values,
+            }))
+        }
+        // v7.37.16 (16.2) — HASH child role from disk.
+        5 => {
+            let parent_name = cur.read_str()?;
+            let modulus = cur.read_u32()?;
+            let remainder = cur.read_u32()?;
+            Ok(Some(PartitionRole::Hash {
+                parent_name,
+                modulus,
+                remainder,
+            }))
         }
         other => Err(StorageError::Corrupt(format!(
             "partition_role: unknown role tag {other}"

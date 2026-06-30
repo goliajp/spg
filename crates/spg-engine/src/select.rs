@@ -4102,6 +4102,14 @@ impl Engine {
                     has_default = true;
                     kept.push(child_name.clone());
                 }
+                // v7.37.16 (16.1/16.2) — LIST / HASH children: no
+                // TIMESTAMPTZ-Range pruning yet (planner pruning is
+                // 16.7-16.9). Always keep the child; correctness over
+                // planner micro-optimisation while the strategy
+                // matures.
+                Some(PartitionRole::List { .. }) | Some(PartitionRole::Hash { .. }) => {
+                    kept.push(child_name.clone());
+                }
                 _ => {}
             }
         }

@@ -1382,6 +1382,22 @@ pub enum PartitionRole {
         /// 半开区间上界(`<`,SQL `TO (upper)`).
         upper: PartitionBound,
     },
+    /// v7.37.16 (16.1) — LIST child:行属于本 child iff key ∈ values。
+    /// `values` 在 child 创建时从 SQL `FOR VALUES IN (lit, …)` 求值;
+    /// 跟 PG 一样,显式 NULL ∈ values 由 caller 单独处理(不在
+    /// PartitionBound 内表达 NULL)。
+    List {
+        parent_name: String,
+        values: Vec<PartitionBound>,
+    },
+    /// v7.37.16 (16.2) — HASH child:行属于本 child iff
+    /// `pg_compatible_hash(key) mod modulus == remainder`。
+    /// PG 强制 `0 ≤ remainder < modulus`;parser/DDL 层先 gate。
+    Hash {
+        parent_name: String,
+        modulus: u32,
+        remainder: u32,
+    },
     Default {
         parent_name: String,
     },

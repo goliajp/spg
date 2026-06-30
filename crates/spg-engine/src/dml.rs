@@ -1498,29 +1498,37 @@ impl Engine {
         // before any mutating call(per-child exec_insert below
         // takes &mut self).
         let parent_name = stmt.table.clone();
-        let (parent_columns, key_position): (Vec<spg_storage::ColumnSchema>, usize) = {
+        let (parent_columns, key_position, parent_kind): (
+            Vec<spg_storage::ColumnSchema>,
+            usize,
+            spg_storage::PartitionKind,
+        ) = {
             let parent = self.active_catalog().get(&parent_name).ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: parent_name.clone(),
                 })
             })?;
             let cols = parent.schema().columns.clone();
-            let key_position = match &parent.schema().partition_role {
+            let (key_position, kind) = match &parent.schema().partition_role {
                 Some(PartitionRole::Parent {
                     key_column_positions,
+                    kind,
                     ..
-                }) => *key_column_positions.first().ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!(
-                        "partition parent {parent_name:?} has empty key column list"
-                    ))
-                })?,
+                }) => (
+                    *key_column_positions.first().ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "partition parent {parent_name:?} has empty key column list"
+                        ))
+                    })?,
+                    *kind,
+                ),
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "INSERT routing: {parent_name:?} is not a partition parent"
                     )));
                 }
             };
-            (cols, key_position)
+            (cols, key_position, kind)
         };
         // Map the user's INSERT column list back to a parent-schema
         // position. Missing list means "every column in schema
@@ -1551,6 +1559,10 @@ impl Engine {
             spg_storage::PartitionBound,
             spg_storage::PartitionBound,
         )> = Vec::new();
+        // v7.37.16 (16.1) — LIST children: (name, accepted values).
+        let mut list_children: Vec<(String, Vec<spg_storage::PartitionBound>)> = Vec::new();
+        // v7.37.16 (16.2) — HASH children: (name, modulus, remainder).
+        let mut hash_children: Vec<(String, u32, u32)> = Vec::new();
         let mut default_child: Option<String> = None;
         for child_name in &children {
             let Some(child) = self.active_catalog().get(child_name) else {
@@ -1559,6 +1571,14 @@ impl Engine {
             match &child.schema().partition_role {
                 Some(PartitionRole::Range { lower, upper, .. }) => {
                     range_children.push((child_name.clone(), lower.clone(), upper.clone()));
+                }
+                Some(PartitionRole::List { values, .. }) => {
+                    list_children.push((child_name.clone(), values.clone()));
+                }
+                Some(PartitionRole::Hash {
+                    modulus, remainder, ..
+                }) => {
+                    hash_children.push((child_name.clone(), *modulus, *remainder));
                 }
                 Some(PartitionRole::Default { .. }) => {
                     default_child = Some(child_name.clone());
@@ -1582,40 +1602,80 @@ impl Engine {
             }
             let key_expr = tuple[tuple_key_index].clone();
             let key_value = literal_expr_to_value(key_expr)?;
-            let key_micros: i64 = match key_value {
-                Value::Timestamp(m) => m,
-                Value::Date(days) => i64::from(days) * 86_400i64 * 1_000_000i64,
-                Value::Text(ref s) => crate::eval::parse_timestamp_literal(s).ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!(
-                        "INSERT INTO {parent_name:?}: partition key text \
-                         literal {s:?} is not a TIMESTAMPTZ"
-                    ))
-                })?,
-                Value::Null => {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "INSERT INTO {parent_name:?}: partition key value is \
-                         NULL, but the partition key is NOT NULL"
-                    )));
+            if matches!(key_value, Value::Null) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "INSERT INTO {parent_name:?}: partition key value is \
+                     NULL, but the partition key is NOT NULL"
+                )));
+            }
+            let target = match parent_kind {
+                spg_storage::PartitionKind::Range => {
+                    let key_micros: i64 = match &key_value {
+                        Value::Timestamp(m) => *m,
+                        Value::Date(days) => i64::from(*days) * 86_400i64 * 1_000_000i64,
+                        Value::Text(s) => {
+                            crate::eval::parse_timestamp_literal(s).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "INSERT INTO {parent_name:?}: partition key text \
+                                     literal {s:?} is not a TIMESTAMPTZ"
+                                ))
+                            })?
+                        }
+                        other => {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "INSERT INTO {parent_name:?}: partition key value \
+                                 {other:?} is not a TIMESTAMPTZ"
+                            )));
+                        }
+                    };
+                    range_children
+                        .iter()
+                        .find(|(_, lo, hi)| crate::partition::value_in_range(key_micros, lo, hi))
+                        .map(|(name, _, _)| name.clone())
+                        .or_else(|| default_child.clone())
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "no partition of relation {parent_name:?} found for \
+                                 row with partition key value (no Range child matches \
+                                 and there is no DEFAULT partition)"
+                            ))
+                        })?
                 }
-                other => {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "INSERT INTO {parent_name:?}: partition key value \
-                         {other:?} is not a TIMESTAMPTZ"
-                    )));
+                // v7.37.16 (16.1) — LIST routing: pick the first
+                // child whose values contains the key.
+                spg_storage::PartitionKind::List => {
+                    list_children
+                    .iter()
+                    .find(|(_, values)| values.iter().any(|b| b.equals_value(&key_value)))
+                    .map(|(name, _)| name.clone())
+                    .or_else(|| default_child.clone())
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "no partition of relation {parent_name:?} found for \
+                             row with partition key value (no LIST child matches \
+                             and there is no DEFAULT partition)"
+                        ))
+                    })?
+                }
+                // v7.37.16 (16.2) — HASH routing: hash(key) mod
+                // modulus picks the child. All HASH siblings under
+                // a parent share a single modulus (DDL gate).
+                spg_storage::PartitionKind::Hash => {
+                    let h = crate::partition::pg_compatible_hash(&key_value);
+                    hash_children
+                        .iter()
+                        .find(|(_, m, r)| h.rem_euclid(u64::from(*m)) == u64::from(*r))
+                        .map(|(name, _, _)| name.clone())
+                        .or_else(|| default_child.clone())
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "no partition of relation {parent_name:?} found for \
+                                 row with partition key value (no HASH child matches \
+                                 and there is no DEFAULT partition)"
+                            ))
+                        })?
                 }
             };
-            let target = range_children
-                .iter()
-                .find(|(_, lo, hi)| crate::partition::value_in_range(key_micros, lo, hi))
-                .map(|(name, _, _)| name.clone())
-                .or_else(|| default_child.clone())
-                .ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!(
-                        "no partition of relation {parent_name:?} found for \
-                         row with partition key value(no Range child matches \
-                         and there is no DEFAULT partition)"
-                    ))
-                })?;
             buckets.entry(target).or_default().push(tuple);
         }
         let mut total_affected: usize = 0;

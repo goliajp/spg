@@ -275,18 +275,32 @@ fn second_default_child_rejected() {
 }
 
 /// The partition key column type is checked at parent-create time.
-/// v7.37.6-B locks RANGE on TIMESTAMPTZ; INT keys surface as an
-/// Unsupported error pointing at the type mismatch.
+/// v7.37.6-B locked RANGE on TIMESTAMPTZ; v7.37.16 (16.6) widens
+/// the accepted set to {TIMESTAMPTZ, TIMESTAMP, DATE, BIGINT,
+/// INTEGER, SMALLINT, TEXT/VARCHAR}. A type outside that set
+/// (e.g. a not-yet-implemented partition key type) still surfaces
+/// as an Unsupported error. JSONB is one such carve-out — PG
+/// doesn't accept JSONB as a partition key either.
 #[test]
-fn partition_key_must_be_timestamptz_at_v7_37_6_b() {
+fn partition_key_must_be_supported_type_at_v7_37_16() {
     let mut e = Engine::new();
+    // INTEGER is now an accepted partition-key type (16.6) so the
+    // earlier rejection no longer fires. Assert acceptance.
+    e.execute("CREATE TABLE accepted (id INT NOT NULL) PARTITION BY RANGE (id)")
+        .expect("INTEGER is an accepted partition key in v7.37.16");
+
+    // JSONB is intentionally not a supported partition key. The
+    // engine reports the type as unsupported.
     let err = e
-        .execute("CREATE TABLE wrong (id INT NOT NULL) PARTITION BY RANGE (id)")
-        .expect_err("expected non-TIMESTAMPTZ rejection");
+        .execute(
+            "CREATE TABLE rejected (id BIGINT NOT NULL, payload JSONB) \
+             PARTITION BY RANGE (payload)",
+        )
+        .expect_err("expected JSONB-key rejection");
     let msg = format!("{err}");
     assert!(
-        msg.contains("TIMESTAMPTZ"),
-        "expected TIMESTAMPTZ in error: {msg}"
+        msg.contains("not yet supported") || msg.contains("PARTITION BY"),
+        "expected partition-key type rejection: {msg}"
     );
 }
 

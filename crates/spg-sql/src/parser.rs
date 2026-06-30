@@ -5297,6 +5297,7 @@ impl Parser {
     }
 
     /// v7.37.6-B — after `PARTITION BY`, expect `RANGE (key_col [, ...])`.
+    /// v7.37.16 (16.1/16.2) — extended to LIST + HASH.
     fn parse_partition_by_tail(&mut self) -> Result<crate::ast::PartitionBySpec, ParseError> {
         use crate::ast::{PartitionBySpec, PartitionKindAst};
         let kind = match self.peek() {
@@ -5304,15 +5305,23 @@ impl Parser {
                 self.advance();
                 PartitionKindAst::Range
             }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("list") => {
+                self.advance();
+                PartitionKindAst::List
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("hash") => {
+                self.advance();
+                PartitionKindAst::Hash
+            }
             other => {
                 return Err(self.err(format!(
-                    "PARTITION BY: only RANGE is supported at v7.37.6-B, got {other:?}"
+                    "PARTITION BY: expected RANGE / LIST / HASH, got {other:?}"
                 )));
             }
         };
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(
-                "expected '(' after PARTITION BY RANGE, got {:?}",
+                "expected '(' after PARTITION BY <strategy>, got {:?}",
                 self.peek()
             )));
         }
@@ -5336,7 +5345,9 @@ impl Parser {
             }
         }
         if key_columns.is_empty() {
-            return Err(self.err("PARTITION BY RANGE requires at least one key column".to_string()));
+            return Err(self.err(
+                "PARTITION BY requires at least one key column".to_string(),
+            ));
         }
         Ok(PartitionBySpec { kind, key_columns })
     }
@@ -5373,23 +5384,135 @@ impl Parser {
                     );
                 }
                 self.advance();
-                if !matches!(self.peek(), Token::From) {
-                    return Err(self.err(format!(
-                        "expected FROM after FOR VALUES, got {:?}",
-                        self.peek()
-                    )));
+                // WITH is not a reserved Token in the lexer — it lexes
+                // as Token::Ident("with"). Disambiguate manually.
+                let want_with = matches!(
+                    self.peek(),
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with")
+                );
+                if want_with {
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after FOR VALUES WITH, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let (mut modulus, mut remainder): (Option<u32>, Option<u32>) = (None, None);
+                    loop {
+                        let key = self.expect_ident_like()?;
+                        let n = match self.peek().clone() {
+                            Token::Integer(v) if v >= 0 && v <= i64::from(u32::MAX) => {
+                                self.advance();
+                                v as u32
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "FOR VALUES WITH: expected unsigned integer literal, got {other:?}"
+                                )));
+                            }
+                        };
+                        match key.to_ascii_uppercase().as_str() {
+                            "MODULUS" => modulus = Some(n),
+                            "REMAINDER" => remainder = Some(n),
+                            other => {
+                                return Err(self.err(format!(
+                                    "FOR VALUES WITH: unknown key {other:?}; \
+                                     expected MODULUS or REMAINDER"
+                                )));
+                            }
+                        }
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                self.advance();
+                                break;
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected ',' or ')' in FOR VALUES WITH list, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    let modulus = modulus.ok_or_else(|| {
+                        self.err("FOR VALUES WITH: missing MODULUS".to_string())
+                    })?;
+                    let remainder = remainder.ok_or_else(|| {
+                        self.err("FOR VALUES WITH: missing REMAINDER".to_string())
+                    })?;
+                    if modulus == 0 {
+                        return Err(self.err(
+                            "FOR VALUES WITH: MODULUS must be > 0".to_string(),
+                        ));
+                    }
+                    if remainder >= modulus {
+                        return Err(self.err(format!(
+                            "FOR VALUES WITH: REMAINDER ({remainder}) \
+                             must be < MODULUS ({modulus})"
+                        )));
+                    }
+                    PartitionOfBoundsAst::Hash { modulus, remainder }
+                } else {
+                match self.peek() {
+                    Token::From => {
+                        self.advance();
+                        let lower = Box::new(self.parse_partition_bound_expr()?);
+                        if !matches!(self.peek(), Token::To) {
+                            return Err(self.err(format!(
+                                "expected TO after FROM (...), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let upper = Box::new(self.parse_partition_bound_expr()?);
+                        PartitionOfBoundsAst::Range { lower, upper }
+                    }
+                    // v7.37.16 (16.1) — FOR VALUES IN (lit [, lit, …])
+                    Token::In => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::LParen) {
+                            return Err(self.err(format!(
+                                "expected '(' after FOR VALUES IN, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let mut values = Vec::new();
+                        loop {
+                            values.push(self.parse_expr(0)?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.advance();
+                                }
+                                Token::RParen => {
+                                    self.advance();
+                                    break;
+                                }
+                                other => {
+                                    return Err(self.err(format!(
+                                        "expected ',' or ')' in FOR VALUES IN list, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        if values.is_empty() {
+                            return Err(self.err(
+                                "FOR VALUES IN requires at least one literal".to_string(),
+                            ));
+                        }
+                        PartitionOfBoundsAst::List { values }
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected FROM / IN / WITH after FOR VALUES, got {other:?}"
+                        )));
+                    }
                 }
-                self.advance();
-                let lower = Box::new(self.parse_partition_bound_expr()?);
-                if !matches!(self.peek(), Token::To) {
-                    return Err(self.err(format!(
-                        "expected TO after FROM (...), got {:?}",
-                        self.peek()
-                    )));
                 }
-                self.advance();
-                let upper = Box::new(self.parse_partition_bound_expr()?);
-                PartitionOfBoundsAst::Range { lower, upper }
             }
             other => {
                 return Err(self.err(format!(
@@ -11108,7 +11231,7 @@ mod tests {
                 assert!(lower.to_string().contains("2026-06-01"));
                 assert!(upper.to_string().contains("2026-07-01"));
             }
-            PartitionOfBoundsAst::Default => panic!("expected Range, got Default"),
+            other => panic!("expected Range, got {other:?}"),
         }
         // Display round-trip emits the FOR VALUES tail. `quote_ident`
         // skips quotes when not required, so the parent name appears
@@ -11138,6 +11261,91 @@ mod tests {
             t.to_string()
                 .contains("PARTITION OF events_partitioned DEFAULT"),
             "Display lost DEFAULT: {t}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_partition_by_list() {
+        // v7.37.16 (16.1) — `PARTITION BY LIST (key)` parent + a
+        // child with `FOR VALUES IN (lit, lit, …)`.
+        use crate::ast::{PartitionBySpec, PartitionKindAst, PartitionOfBoundsAst};
+        let parent = parse_statement(
+            "CREATE TABLE events_listed (region TEXT) PARTITION BY LIST (region)",
+        )
+        .unwrap();
+        let Statement::CreateTable(t) = parent else {
+            panic!("expected CreateTable");
+        };
+        let Some(PartitionBySpec { kind, ref key_columns }) = t.partition_by else {
+            panic!("expected PARTITION BY");
+        };
+        assert_eq!(kind, PartitionKindAst::List);
+        assert_eq!(*key_columns, vec!["region".to_string()]);
+        assert!(t.to_string().contains("PARTITION BY LIST (region)"));
+
+        let child = parse_statement(
+            "CREATE TABLE events_apac PARTITION OF events_listed \
+             FOR VALUES IN ('jp', 'kr', 'tw')",
+        )
+        .unwrap();
+        let Statement::CreateTable(c) = child else {
+            panic!("expected CreateTable");
+        };
+        let of = c.partition_of.as_ref().expect("expected PARTITION OF");
+        let PartitionOfBoundsAst::List { values } = &of.bounds else {
+            panic!("expected List bounds, got {:?}", of.bounds);
+        };
+        assert_eq!(values.len(), 3);
+        let disp = c.to_string();
+        assert!(disp.contains("FOR VALUES IN ("), "Display lost IN: {disp}");
+    }
+
+    #[test]
+    fn parse_create_table_partition_by_hash() {
+        // v7.37.16 (16.2) — `PARTITION BY HASH (key)` parent + a
+        // child with `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
+        use crate::ast::{PartitionBySpec, PartitionKindAst, PartitionOfBoundsAst};
+        let parent =
+            parse_statement("CREATE TABLE orders_h (id BIGINT) PARTITION BY HASH (id)").unwrap();
+        let Statement::CreateTable(t) = parent else {
+            panic!("expected CreateTable");
+        };
+        let Some(PartitionBySpec { kind, ref key_columns }) = t.partition_by else {
+            panic!("expected PARTITION BY");
+        };
+        assert_eq!(kind, PartitionKindAst::Hash);
+        assert_eq!(*key_columns, vec!["id".to_string()]);
+        assert!(t.to_string().contains("PARTITION BY HASH (id)"));
+
+        let child = parse_statement(
+            "CREATE TABLE orders_h_0 PARTITION OF orders_h \
+             FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+        )
+        .unwrap();
+        let Statement::CreateTable(c) = child else {
+            panic!("expected CreateTable");
+        };
+        let of = c.partition_of.as_ref().expect("expected PARTITION OF");
+        let PartitionOfBoundsAst::Hash { modulus, remainder } = of.bounds else {
+            panic!("expected Hash bounds");
+        };
+        assert_eq!(modulus, 4);
+        assert_eq!(remainder, 0);
+        let disp = c.to_string();
+        assert!(
+            disp.contains("FOR VALUES WITH (MODULUS 4, REMAINDER 0)"),
+            "Display lost HASH bounds: {disp}"
+        );
+
+        // Validation: REMAINDER ≥ MODULUS is rejected at parse time.
+        let bad = parse_statement(
+            "CREATE TABLE orders_h_bad PARTITION OF orders_h \
+             FOR VALUES WITH (MODULUS 4, REMAINDER 4)",
+        );
+        let msg = format!("{}", bad.unwrap_err());
+        assert!(
+            msg.contains("REMAINDER") && msg.contains("MODULUS"),
+            "expected REMAINDER/MODULUS validation error: {msg}"
         );
     }
 
