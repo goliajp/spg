@@ -861,11 +861,12 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
     //    WalGroup is thread-safe so a live commit can interleave — the
     //    marker's LSN, not its position in the chunk, anchors replay.
     let marker_ts = wall_clock_micros();
-    // v7.37.13 (A1.2) — v6 encoder uses CRC32C per A1.2; format
-    // version-bumps the checkpoint marker too so a v6 chunk is
-    // homogeneous (parser doesn't need to mix CRC32 + CRC32C
-    // verifications inside the same chunk).
-    let marker = encode_v6_checkpoint_marker(job.marker_lsn, marker_ts, &job.db_path);
+    // v7.37.13 (A1.2 + A1.3) — v6 encoder uses CRC32C; the prev_lsn
+    // for a checkpoint marker is the prior committed LSN (the
+    // marker itself does not advance commit_lsn — the snapshot was
+    // captured at marker_lsn).
+    let prev_lsn = job.marker_lsn.saturating_sub(1);
+    let marker = encode_v6_checkpoint_marker(prev_lsn, job.marker_lsn, marker_ts, &job.db_path);
     job.wal.enqueue(&marker);
     job.wal.flush_now()?;
     // 5. Rotate the active chunk. New commits land in the fresh chunk;
@@ -1714,41 +1715,60 @@ fn encode_v6_framed(
     out
 }
 
-/// v7.37.13 (A1.2) — v6 auto-commit SQL record. Wraps
-/// [`encode_v6_framed`] with the v5 type byte; the V6_FLAG bit in
-/// the length header lets the parser pick the right verification
-/// algorithm without a new type byte allocation.
-fn encode_v6_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+/// v7.37.13 (A1.2 / A1.3) — v6 auto-commit SQL record. `prev_lsn`
+/// is the commit_lsn of the previous v6 record in the same chunk
+/// (xl_prev equivalent). v7.37.13.7 wires real values from the
+/// monotonic `commit_lsn` counter; callers in wal_after_ok pass
+/// `commit_lsn.saturating_sub(1)` since the counter is +1 each
+/// record. The chain detects a torn boundary where two adjacent
+/// records' LSNs aren't contiguous.
+fn encode_v6_auto_commit(
+    sql: &str,
+    prev_lsn: u64,
+    commit_lsn: u64,
+    commit_unix_us: i64,
+) -> Vec<u8> {
     encode_v6_framed(
         WAL_V4_TYPE_AUTO_COMMIT_SQL,
         sql.as_bytes(),
-        0, // 13.7 wires the real prev_lsn; 13.5 always 0
+        prev_lsn,
         commit_lsn,
         commit_unix_us,
     )
 }
 
-fn encode_v6_tx_commit(script: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+fn encode_v6_tx_commit(
+    script: &str,
+    prev_lsn: u64,
+    commit_lsn: u64,
+    commit_unix_us: i64,
+) -> Vec<u8> {
     encode_v6_framed(
         WAL_V4_TYPE_TX_COMMIT_SQL,
         script.as_bytes(),
-        0,
+        prev_lsn,
         commit_lsn,
         commit_unix_us,
     )
 }
 
-fn encode_v6_row_redo(redo_bytes: &[u8], commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+fn encode_v6_row_redo(
+    redo_bytes: &[u8],
+    prev_lsn: u64,
+    commit_lsn: u64,
+    commit_unix_us: i64,
+) -> Vec<u8> {
     encode_v6_framed(
         WAL_V5_TYPE_ROW_REDO,
         redo_bytes,
-        0,
+        prev_lsn,
         commit_lsn,
         commit_unix_us,
     )
 }
 
 fn encode_v6_checkpoint_marker(
+    prev_lsn: u64,
     commit_lsn: u64,
     commit_unix_us: i64,
     db_path: &Path,
@@ -1764,7 +1784,7 @@ fn encode_v6_checkpoint_marker(
     encode_v6_framed(
         WAL_V4_TYPE_CHECKPOINT_MARKER,
         &payload,
-        0,
+        prev_lsn,
         commit_lsn,
         commit_unix_us,
     )
@@ -2033,6 +2053,11 @@ pub struct WalRecord<'a> {
     /// `None` for v3 or for v4 records explicitly written with
     /// `WAL_V4_NO_CLOCK` (sentinel for "no ClockFn at commit time").
     pub commit_unix_us: Option<i64>,
+    /// v7.37.13 (A1.3) — `Some(prev_lsn)` for v6 records (xl_prev
+    /// equivalent — the commit_lsn of the previous v6 record in
+    /// this chunk). `None` for v3 / v4 / v5 records, which do not
+    /// carry a prev-link.
+    pub prev_lsn: Option<u64>,
     /// SQL payload as borrowed bytes. Empty for durability markers.
     pub sql: &'a [u8],
 }
@@ -2075,6 +2100,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                         } else {
                             Some(view.commit_unix_us)
                         },
+                        prev_lsn: Some(view.prev_lsn),
                         sql: view.payload,
                     });
                     cur += total;
@@ -2107,6 +2133,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                 type_byte: WAL_V3_TYPE_AUTO_COMMIT_SQL,
                 commit_lsn: None,
                 commit_unix_us: None,
+                prev_lsn: None,
                 sql,
             });
             cur += header_len + rec_len;
@@ -2121,6 +2148,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                     type_byte,
                     commit_lsn: None,
                     commit_unix_us: None,
+                    prev_lsn: None,
                     sql,
                 });
                 cur += header_len + rec_len;
@@ -2131,6 +2159,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                     type_byte,
                     commit_lsn: None,
                     commit_unix_us: None,
+                    prev_lsn: None,
                     sql: &[],
                 });
                 cur += header_len + rec_len;
@@ -2178,6 +2207,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                     type_byte,
                     commit_lsn: Some(lsn),
                     commit_unix_us,
+                    prev_lsn: None,
                     sql: path_bytes,
                 });
                 cur += header_len + rec_len;
@@ -2209,6 +2239,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                     type_byte,
                     commit_lsn: Some(lsn),
                     commit_unix_us,
+                    prev_lsn: None,
                     sql,
                 });
                 cur += v4_total;
@@ -3261,7 +3292,12 @@ impl Database {
                 {
                     let script = buf.statements.join(";\n");
                     let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-                    record = Some(encode_v6_tx_commit(&script, lsn, wall_clock_micros()));
+                    record = Some(encode_v6_tx_commit(
+                        &script,
+                        lsn.saturating_sub(1),
+                        lsn,
+                        wall_clock_micros(),
+                    ));
                 }
             }
             Some(TxControl::Rollback) => {
@@ -3313,11 +3349,13 @@ impl Database {
                     } else {
                         Vec::new()
                     };
+                    let prev_lsn = lsn.saturating_sub(1);
                     record = Some(if redo.is_empty() {
-                        encode_v6_auto_commit(canonical, lsn, wall_clock_micros())
+                        encode_v6_auto_commit(canonical, prev_lsn, lsn, wall_clock_micros())
                     } else {
                         encode_v6_row_redo(
                             &spg_storage::encode_redo_log(&redo),
+                            prev_lsn,
                             lsn,
                             wall_clock_micros(),
                         )
@@ -5609,11 +5647,17 @@ mod tests {
             WAL_V6_HASH_SCHEME_CRC32C as i8,
             std::sync::atomic::Ordering::AcqRel,
         );
-        let bytes = encode_v6_auto_commit("CREATE TABLE t (id INT)", 42, 1_700_000_000_000_000);
+        let bytes = encode_v6_auto_commit(
+            "CREATE TABLE t (id INT)",
+            41, // prev_lsn (A1.3)
+            42, // commit_lsn
+            1_700_000_000_000_000,
+        );
         let parsed = parse_wal_records(&bytes).expect("parse");
         assert_eq!(parsed.len(), 1, "exactly one record encoded");
         assert_eq!(parsed[0].commit_lsn, Some(42));
         assert_eq!(parsed[0].commit_unix_us, Some(1_700_000_000_000_000));
+        assert_eq!(parsed[0].prev_lsn, Some(41), "prev_lsn carried through parse");
         assert_eq!(parsed[0].sql, b"CREATE TABLE t (id INT)");
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
     }
@@ -5630,7 +5674,7 @@ mod tests {
             WAL_V6_HASH_SCHEME_CRC32C as i8,
             std::sync::atomic::Ordering::AcqRel,
         );
-        let good = encode_v6_auto_commit("INSERT INTO t VALUES (1)", 7, 100);
+        let good = encode_v6_auto_commit("INSERT INTO t VALUES (1)", 6, 7, 100);
         let mut flipped = good.clone();
         // Flip a byte deep inside the payload (well past the header).
         let mid = flipped.len() / 2;
@@ -5658,7 +5702,7 @@ mod tests {
             WAL_V6_HASH_SCHEME_CRC32C as i8,
             std::sync::atomic::Ordering::AcqRel,
         );
-        let crc_only = encode_v6_auto_commit("SELECT 1", 7, 100);
+        let crc_only = encode_v6_auto_commit("SELECT 1", 6, 7, 100);
         let crc_only_len = crc_only.len();
         let crc_only_parsed = parse_wal_records(&crc_only).expect("parse crc-only");
         assert_eq!(crc_only_parsed.len(), 1);
@@ -5669,7 +5713,7 @@ mod tests {
             WAL_V6_HASH_SCHEME_BLAKE3 as i8,
             std::sync::atomic::Ordering::Release,
         );
-        let with_blake3 = encode_v6_auto_commit("SELECT 1", 7, 100);
+        let with_blake3 = encode_v6_auto_commit("SELECT 1", 6, 7, 100);
         assert_eq!(
             with_blake3.len(),
             crc_only_len + WAL_V6_BLAKE3_LEN,
@@ -5689,6 +5733,40 @@ mod tests {
         let parsed_flipped = parse_wal_records(&flipped).expect("parse Ok with empty prefix");
         assert!(parsed_flipped.is_empty(), "BLAKE3 mode rejects tampered payload");
 
+        WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.3 TDD) — every v6 record persists a prev_lsn
+    /// field; parse surfaces it on `WalRecord.prev_lsn` so PITR /
+    /// audit tooling can verify chunk-level LSN contiguity. Closes
+    /// AUDIT-3-categories.md A1.3 — matches PG xl_prev posture.
+    ///
+    /// Test: build a chunk of 3 v6 records with monotonic LSNs
+    /// (10, 11, 12), parse, assert prev chain is (0→10, 10→11,
+    /// 11→12). The prev_lsn=0 in record 1 = boundary "no prior
+    /// record" (the chunk just started).
+    #[test]
+    fn v7_37_13_v6_prev_lsn_chains_through_chunk() {
+        let prev = WAL_HASH_SCHEME_OVERRIDE.swap(
+            WAL_V6_HASH_SCHEME_CRC32C as i8,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let mut chunk = Vec::new();
+        // Record 1: chunk start — prev_lsn = 0 by convention
+        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (1)", 0, 10, 100));
+        // Record 2: prev = 10 (the previous record's commit_lsn)
+        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (2)", 10, 11, 101));
+        // Record 3: prev = 11
+        chunk.extend_from_slice(&encode_v6_auto_commit("INSERT INTO t VALUES (3)", 11, 12, 102));
+
+        let parsed = parse_wal_records(&chunk).expect("parse chain");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].prev_lsn, Some(0), "chunk-start record's prev is 0");
+        assert_eq!(parsed[0].commit_lsn, Some(10));
+        assert_eq!(parsed[1].prev_lsn, Some(10), "record 2 points back to record 1's LSN");
+        assert_eq!(parsed[1].commit_lsn, Some(11));
+        assert_eq!(parsed[2].prev_lsn, Some(11), "record 3 points back to record 2's LSN");
+        assert_eq!(parsed[2].commit_lsn, Some(12));
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
     }
 
