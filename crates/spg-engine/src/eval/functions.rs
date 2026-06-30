@@ -1699,6 +1699,81 @@ fn apply_function_dispatch(
             }
             Ok(Value::text::<String>(chain.join(",")))
         }
+        // v7.37.22 (22.4) — PG amcheck extension scalar surface.
+        // PG ships `bt_index_check(regclass)` (validate BTree
+        // structural invariants — sibling links, key ordering, leaf
+        // page consistency) and `verify_heapam(regclass)` (validate
+        // heap tuple visibility + dead-row consistency).
+        //
+        // SPG's storage model differs (PersistentVec rows + parallel
+        // RowHeader vec), so the checks are different — but the
+        // PG-compatible function names + return-NULL-on-success
+        // contract let monitoring queries against PG move over
+        // without changes.
+        //
+        // Each function takes a table name (TEXT) and returns NULL
+        // on a clean check or a TEXT message describing the first
+        // issue found.
+        "bt_index_check" | "spg_bt_index_check" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{}() takes 1 arg, got {}",
+                        name,
+                        args.len()
+                    ),
+                });
+            }
+            let table = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() arg must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            Ok(match crate::amcheck::check_btree_indices(cat, &table) {
+                Ok(()) => Value::Null,
+                Err(msg) => Value::text::<String>(msg),
+            })
+        }
+        "verify_heapam" | "spg_verify_heapam" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{}() takes 1 arg, got {}",
+                        name,
+                        args.len()
+                    ),
+                });
+            }
+            let table = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() arg must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            Ok(match crate::amcheck::check_heap_invariants(cat, &table) {
+                Ok(()) => Value::Null,
+                Err(msg) => Value::text::<String>(msg),
+            })
+        }
         // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
         // canonical PG lowercase type name. sqlx / SQLAlchemy /
         // Diesel emit this during describe; generic ORMs may
