@@ -142,8 +142,8 @@ pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
 // helper through the engine surface so downstream wrappers
 // (spg-embedded / spg-embedded-tokio / spgctl) and their tests
 // don't need a direct `spg-sql` dep.
-pub use spg_sql::silent_for_update_count;
 use spg_sql::parser::ParseError;
+pub use spg_sql::silent_for_update_count;
 use spg_storage::{Catalog, ColumnSchema, Row, RowChange, StorageError};
 
 use crate::eval::EvalError;

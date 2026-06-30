@@ -394,10 +394,10 @@ impl ConnState {
     /// product translation.
     pub(crate) fn wait_event_type_str(&self) -> &'static str {
         match self.wait_event.load(Ordering::Relaxed) {
-            1 => "Lock",        // write_lock — engine RwLock contention
-            2 => "IO",          // fsync — WAL durability stall
-            3 => "IPC",         // group_commit — leader/follower coordination
-            _ => "",            // idle / no wait
+            1 => "Lock", // write_lock — engine RwLock contention
+            2 => "IO",   // fsync — WAL durability stall
+            3 => "IPC",  // group_commit — leader/follower coordination
+            _ => "",     // idle / no wait
         }
     }
 }
