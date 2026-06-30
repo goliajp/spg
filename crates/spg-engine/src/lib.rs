@@ -426,6 +426,14 @@ pub struct Engine {
     /// constructor expects the input sorted for binary-search
     /// `contains` correctness.
     active_writer_versions: BTreeSet<u64>,
+    /// v7.37.15 (Phase C) — TxId → writer version registry. When
+    /// `exec_begin` opens an explicit transaction it allocates a
+    /// fresh writer version (via [`Self::begin_writer_version`])
+    /// and stashes the mapping here so the matching `exec_commit`
+    /// / `exec_rollback` can call
+    /// [`Self::commit_writer_version`] on the right entry. Empty
+    /// when no explicit transactions are open.
+    tx_writer_versions: BTreeMap<TxId, u64>,
     /// v7.22 (round-13 T3) — session string-literal dialect. `false`
     /// (default) = PG semantics (backslash literal, `''` escape);
     /// `true` = MySQL semantics (`\'` etc.). Flipped by the
@@ -638,6 +646,7 @@ impl Engine {
             backslash_escapes: false,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -771,6 +780,7 @@ impl Engine {
             backslash_escapes: false,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -845,6 +855,7 @@ impl Engine {
                     backslash_escapes: false,
                     next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            tx_writer_versions: BTreeMap::new(),
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
