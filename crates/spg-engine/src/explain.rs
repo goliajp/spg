@@ -93,7 +93,142 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
             ));
         }
     }
+    // v7.37.19 (19.21) — composite index opportunity detection.
+    // Walk the WHERE clause for AND-chained equality predicates on
+    // the same table. When ≥2 distinct columns of one table appear
+    // as `col = lit` inside a single AND chain, suggest a composite
+    // index covering them — PG's planner gains a real seek over
+    // separate single-column indices in this case.
+    let mut composite_eqs: alloc::collections::BTreeMap<
+        String,
+        alloc::collections::BTreeSet<String>,
+    > = alloc::collections::BTreeMap::new();
+    if let Some(w) = &stmt.where_ {
+        collect_and_eq_columns(w, &tables, cat, &mut composite_eqs);
+    }
+    for j in &from.joins {
+        if let Some(on) = &j.on {
+            collect_and_eq_columns(on, &tables, cat, &mut composite_eqs);
+        }
+    }
+    for (owner, cols) in composite_eqs {
+        if cols.len() < 2 {
+            continue;
+        }
+        let cols_vec: Vec<&String> = cols.iter().collect();
+        // Skip if an index or UNIQUE constraint already covers
+        // this column set (set-membership, not order — PG's
+        // planner uses any index whose key columns equal the
+        // predicate columns regardless of order for equality-only
+        // filters).
+        if let Some(tbl) = cat.get(&owner) {
+            let pos_to_name =
+                |pos: usize| tbl.schema().columns.get(pos).map(|c| c.name.clone());
+            let already_in_index = tbl.indices().iter().any(|i| {
+                if !matches!(i.kind, spg_storage::IndexKind::BTree(_)) {
+                    return false;
+                }
+                let mut all_cols: alloc::collections::BTreeSet<String> =
+                    alloc::collections::BTreeSet::new();
+                if let Some(n) = pos_to_name(i.column_position) {
+                    all_cols.insert(n);
+                }
+                for &extra in &i.extra_column_positions {
+                    if let Some(c) = pos_to_name(extra) {
+                        all_cols.insert(c);
+                    }
+                }
+                cols.iter().all(|c| all_cols.contains(c))
+            });
+            let already_in_uc = tbl
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .any(|uc| {
+                    let names: alloc::collections::BTreeSet<String> = uc
+                        .columns
+                        .iter()
+                        .filter_map(|&p| pos_to_name(p))
+                        .collect();
+                    cols.iter().all(|c| names.contains(c))
+                });
+            if already_in_index || already_in_uc {
+                continue;
+            }
+        }
+        let cols_csv: Vec<String> = cols_vec.iter().map(|s| (*s).clone()).collect();
+        let suffix = cols_csv.join("_");
+        let body = cols_csv.join(", ");
+        out.push(alloc::format!(
+            "SUGGEST: CREATE INDEX ix_{owner}_{suffix} ON {owner} ({body})"
+        ));
+    }
     out
+}
+
+/// v7.37.19 (19.21) — walk an AND-chain WHERE and collect
+/// (table, column) tuples for every equality predicate on a
+/// table-qualified column. Used to suggest composite indices
+/// when ≥2 columns of the same table appear in one AND chain.
+fn collect_and_eq_columns(
+    expr: &Expr,
+    tables: &[String],
+    cat: &spg_storage::Catalog,
+    out: &mut alloc::collections::BTreeMap<String, alloc::collections::BTreeSet<String>>,
+) {
+    let mut stack: Vec<&Expr> = alloc::vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::And,
+                rhs,
+            } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } => {
+                // Pick whichever side is a column ref. Owner is the
+                // explicit qualifier when present; otherwise the
+                // first FROM table that has a column of that name.
+                let resolve = |e: &Expr| -> Option<(String, String)> {
+                    if let Expr::Column(cn) = e {
+                        let owner: Option<String> = if let Some(q) = &cn.qualifier {
+                            tables.iter().find(|t| t == &q).cloned()
+                        } else {
+                            tables.iter().find_map(|t| {
+                                cat.get(t).and_then(|tbl| {
+                                    if tbl.schema().column_position(&cn.name).is_some() {
+                                        Some(t.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        };
+                        owner.map(|o| (o, cn.name.clone()))
+                    } else {
+                        None
+                    }
+                };
+                let lhs_col = resolve(lhs);
+                let rhs_col = resolve(rhs);
+                // Skip when both sides are columns (a JOIN-ON
+                // predicate, not a filter). Only single-column-eq-
+                // literal patterns help with a composite index.
+                if let (Some((t, c)), None) | (None, Some((t, c))) = (lhs_col, rhs_col) {
+                    let mut entry = out.remove(&t).unwrap_or_default();
+                    entry.insert(c);
+                    out.insert(t, entry);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Walks an `Expr` and pushes every `ColumnName` it references.
