@@ -3095,6 +3095,19 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_raise();
         }
+        // v7.37.20 (20.14) — ASSERT <cond> [, <msg>].
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("assert"))
+        {
+            self.advance();
+            let condition = self.parse_expr(0)?;
+            let message = if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                Some(self.parse_expr(0)?)
+            } else {
+                None
+            };
+            return Ok(PlPgSqlStmt::Assert { condition, message });
+        }
         // v7.16.2 — `SELECT <projection> INTO <var> [FROM …]`
         // plpgsql-specific shape (mailrs round-10 migrate-042).
         // PG's SELECT INTO at top-level SQL would CREATE a new

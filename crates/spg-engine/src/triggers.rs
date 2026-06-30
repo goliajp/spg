@@ -457,6 +457,52 @@ fn execute_stmts(
                 let value = resolver(&substituted)?;
                 locals.insert(var.clone(), value);
             }
+            PlPgSqlStmt::Assert { condition, message } => {
+                // v7.37.20 (20.14) — ASSERT <cond> [, <msg>]. If
+                // the condition evaluates to a falsy Value (NULL or
+                // BOOL(false)), raise the same EngineError shape as
+                // RAISE EXCEPTION. Otherwise no-op.
+                let v = eval_with_new_old_and_locals(
+                    condition,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let cond_holds = matches!(v, spg_storage::Value::Bool(true));
+                if !cond_holds {
+                    let msg_text = if let Some(m) = message {
+                        let mv = eval_with_new_old_and_locals(
+                            m,
+                            current_new.as_ref(),
+                            old_row,
+                            locals,
+                            ctx.columns,
+                            ctx.table_name,
+                            ctx.params,
+                            ctx.default_text_search_config,
+                        )
+                        .map_err(|cause| TriggerError::EvalFailed {
+                            function: ctx.function.into(),
+                            cause,
+                        })?;
+                        value_to_display_string(&mv)
+                    } else {
+                        alloc::string::String::from("assertion failed")
+                    };
+                    return Err(TriggerError::RaiseException {
+                        function: ctx.function.into(),
+                        message: msg_text,
+                    });
+                }
+            }
             PlPgSqlStmt::EmbeddedSql(boxed_stmt) => {
                 // v7.12.7 — substitute NEW/OLD/locals into every
                 // Expr field of the statement, then queue for
