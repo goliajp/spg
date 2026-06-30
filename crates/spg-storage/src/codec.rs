@@ -328,7 +328,21 @@ fn deserialize_rows(
         // encoder rather than the snapshot's row prefix layout.
         hot_bytes = hot_bytes.saturating_add(row_body_encoded_len(&row, &t.schema) as u64);
         t.rows.push_mut(row);
+        // v7.37.15 (Phase A.3) — keep headers lock-step with rows on
+        // snapshot restore. Pre-MVCC snapshots and current snapshots
+        // both load rows as RowHeader::frozen so every visibility
+        // check against any snapshot returns true. v7.37.15 Phase E
+        // will add a parallel `headers` stream in the snapshot codec
+        // to round-trip actual xmin / xmax per row; for now the
+        // load path mirrors the insert path's lock-step invariant.
+        t.headers
+            .push_mut(crate::row_header::RowHeader::frozen());
     }
+    debug_assert_eq!(
+        t.rows.len(),
+        t.headers.len(),
+        "headers must stay in lock-step with rows after snapshot restore"
+    );
     t.hot_bytes = hot_bytes;
     Ok(())
 }
