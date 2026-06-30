@@ -193,6 +193,67 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.21 (21.13-c) — synthesise `pg_catalog.pg_subscription`.
+/// One row per CREATE SUBSCRIPTION. Logical-replication tooling
+/// (debezium, the PG `pg_stat_subscription` family of views,
+/// pgwatch dashboards) reads this surface to inspect the
+/// per-subscription connection / publication list / enable
+/// state.
+///
+/// PG-canonical columns (subset; the full view has subconninfo
+/// that we omit because it carries the connection-string secret
+/// — same security default PG ships with revoking subconninfo
+/// for non-superusers):
+///   * oid (BigInt)
+///   * subdbid (BigInt) — owning database OID
+///   * subname (Text)
+///   * subowner (BigInt) — 10 (postgres superuser)
+///   * subenabled (Bool)
+///   * subconninfo (Text) — sanitised to `[redacted]` so
+///     dashboards don't accidentally leak credentials when
+///     scraping the catalog
+///   * subslotname (Text) — the receiver-side slot name
+///   * subpublications (Text[] flattened as comma-separated Text)
+///   * subbinary (Bool) — false (SPG uses text wire); flips
+///     when v7.38 adds binary subscriber wire
+///   * substream (Bool) — false (no streaming in-progress txs yet)
+pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("subdbid", DataType::BigInt, false),
+        ColumnSchema::new("subname", DataType::Text, false),
+        ColumnSchema::new("subowner", DataType::BigInt, false),
+        ColumnSchema::new("subenabled", DataType::Bool, false),
+        ColumnSchema::new("subconninfo", DataType::Text, false),
+        ColumnSchema::new("subslotname", DataType::Text, true),
+        ColumnSchema::new("subpublications", DataType::Text, false),
+        ColumnSchema::new("subbinary", DataType::Bool, false),
+        ColumnSchema::new("substream", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    // Subscription OID band starts at 80_000 (publications live
+    // at 70_000+, so the two stay disjoint for sub-publication
+    // join shapes).
+    let mut oid: i64 = 80_000;
+    for (name, sub) in eng.subscriptions().iter() {
+        oid = oid.saturating_add(1);
+        let pubs = sub.publications.join(",");
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::BigInt(16384), // subdbid (SPG single-db OID)
+            Value::text(name.clone()),
+            Value::BigInt(10),    // subowner
+            Value::Bool(sub.enabled),
+            Value::text("[redacted]"), // subconninfo
+            Value::Null,               // subslotname
+            Value::text(pubs),
+            Value::Bool(false),        // subbinary
+            Value::Bool(false),        // substream
+        ]));
+    }
+    (schema, rows)
+}
+
 /// v7.37.21 (21.13-b) — synthesise `pg_catalog.pg_publication`.
 /// One row per CREATE PUBLICATION declaration. Logical-replication
 /// subscribers query this at handshake to validate the publication

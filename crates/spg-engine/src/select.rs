@@ -391,6 +391,13 @@ impl Engine {
                     let (schema, rows) = crate::system_catalog::synth_pg_publication(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.21 (21.13-c) — pg_catalog.pg_subscription
+                // (one row per CREATE SUBSCRIPTION; subconninfo
+                // redacted so dashboards can't leak credentials).
+                "__spg_pg_subscription" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_subscription(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
                 // for pgAdmin / DataGrip "indexes per table" listings.
                 "__spg_pg_indexes" => {
