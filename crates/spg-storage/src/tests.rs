@@ -2582,6 +2582,76 @@ fn v7_37_15_phase_c_frozen_xmin_short_circuits_to_legacy_insert() {
     );
 }
 
+/// v7.37.15 (Phase D TDD) — `Table::vacuum` removes rows whose
+/// delete-commit predates `oldest_active_snapshot` and leaves
+/// rows still possibly visible to a live snapshot in place.
+#[test]
+fn v7_37_15_phase_d_vacuum_reclaims_only_safe_rows() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    // Insert 5 rows at writer version 10..15.
+    for id in 0..5i64 {
+        t.insert_with_xmin(make_user_row(id, &alloc::format!("u-{id}")), 10 + id as u64)
+            .unwrap();
+    }
+    // Delete row 1 at version 100, row 3 at version 200.
+    t.mark_row_deleted(1, 100).unwrap();
+    t.mark_row_deleted(3, 200).unwrap();
+    assert_eq!(t.row_count(), 5, "physical row count unchanged by delete");
+
+    // Dry-run with oldest_active = 150. Row 1 (xmax=100 < 150) is
+    // reclaimable; row 3 (xmax=200 > 150) is NOT — a reader at
+    // snapshot version 150 could still see it.
+    let dry = t.vacuum(150, true);
+    assert_eq!(dry.rows_reclaimed, 1, "dry-run counts safe-to-reclaim only");
+    assert_eq!(t.row_count(), 5, "dry-run does not mutate");
+
+    // Real pass. Row 1 reclaimed; the other 4 remain.
+    let real = t.vacuum(150, false);
+    assert_eq!(real.rows_reclaimed, 1);
+    assert_eq!(t.row_count(), 4);
+}
+
+/// v7.37.15 (Phase D TDD) — `Catalog::vacuum_all` aggregates per-
+/// table reports and only lists tables that had reclaimable rows.
+#[test]
+fn v7_37_15_phase_d_vacuum_all_aggregates_per_table() {
+    let mut cat = Catalog::new();
+    cat.create_table(bigint_pk_users_schema()).unwrap();
+    let users_schema = TableSchema::new(
+        "logs",
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("msg", DataType::Text, true),
+        ],
+    );
+    cat.create_table(users_schema).unwrap();
+
+    let u = cat.get_mut("users").unwrap();
+    u.insert_with_xmin(make_user_row(0, "alice"), 10).unwrap();
+    u.mark_row_deleted(0, 50).unwrap();
+
+    let l = cat.get_mut("logs").unwrap();
+    l.insert_with_xmin(
+        Row::new(vec![Value::BigInt(1), Value::text("hello")]),
+        20,
+    )
+    .unwrap();
+    // logs row stays alive — vacuum reclaims nothing here.
+
+    let report = cat.vacuum_all(100, false);
+    assert_eq!(report.rows_reclaimed, 1, "one row reclaimed across both tables");
+    assert_eq!(
+        report.per_table.len(),
+        1,
+        "only tables with reclaimed rows appear; got {:?}",
+        report.per_table
+    );
+    assert_eq!(report.per_table[0].0, "users");
+    assert_eq!(report.per_table[0].1, 1);
+}
+
 /// Validation guard tests. Each must return `Err` and **not
 /// mutate the catalog** — the API is all-or-nothing.
 #[test]

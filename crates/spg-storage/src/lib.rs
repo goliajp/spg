@@ -24,6 +24,7 @@ pub mod row_header;
 pub mod row_locator;
 pub mod segment;
 pub mod snapshot;
+pub mod vacuum;
 mod table;
 pub mod trgm;
 
@@ -2893,6 +2894,36 @@ impl SequenceDataType {
 }
 
 impl Catalog {
+    /// v7.37.15 (Phase D) — fleet-wide vacuum pass. Walks every
+    /// user table and reclaims rows whose delete-commit version is
+    /// older than `oldest_active_snapshot`. Returns an aggregated
+    /// report with per-table breakdown so hosts can emit metrics.
+    ///
+    /// `dry_run = true` reports the work without doing it. Use it
+    /// to estimate the cost before scheduling a real pass.
+    pub fn vacuum_all(
+        &mut self,
+        oldest_active_snapshot: u64,
+        dry_run: bool,
+    ) -> vacuum::VacuumReport {
+        let mut total = vacuum::VacuumReport::default();
+        // Snapshot the table names so we don't hold an immutable
+        // borrow during the get_mut loop.
+        let names: Vec<String> = self.tables.iter().map(|t| t.schema().name.clone()).collect();
+        for name in names {
+            let Some(t) = self.get_mut(&name) else {
+                continue;
+            };
+            let r = t.vacuum(oldest_active_snapshot, dry_run);
+            if r.rows_reclaimed > 0 {
+                total.per_table.push((name, r.rows_reclaimed));
+            }
+            total.rows_reclaimed += r.rows_reclaimed;
+            total.rows_examined += r.rows_examined;
+        }
+        total
+    }
+
     pub const fn new() -> Self {
         Self {
             tables: Vec::new(),
