@@ -674,6 +674,70 @@ struct CheckpointJob {
     /// Shared with `PersistenceCtx` so the worker's chunk rotation is
     /// visible to subsequent diag / Drop introspection.
     current_chunk_path: Arc<Mutex<PathBuf>>,
+    /// v7.37.13 (A1.9) — shared stats sink. Worker updates after
+    /// each successful checkpoint so Database::checkpoint_stats()
+    /// + future spg_stat_checkpoint observability see fresh timing.
+    stats: Arc<Mutex<CheckpointStats>>,
+}
+
+/// v7.37.13 (A1.9) — per-checkpoint instrumentation. PG-equivalent
+/// of `LogCheckpointEnd`, with [PG+] percentile buckets over a
+/// rolling window of recent checkpoints (PG just logs the latest).
+///
+/// All durations are microseconds. Fields below "last_*" describe
+/// the most recent checkpoint; "total_count" counts every
+/// successful checkpoint over the process lifetime. The
+/// `recent_total_us` deque holds up to [`CHECKPOINT_STATS_WINDOW`]
+/// total-duration samples for p50/p95/p99 computation.
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointStats {
+    /// Process-lifetime count of successful checkpoints. Failed
+    /// (poisoned, IO error) checkpoints do NOT advance this.
+    pub total_count: u64,
+    /// Snapshot serialize + tmp+rename duration (µs).
+    pub last_write_us: u64,
+    /// WAL flush_now + chunk rotation duration (µs).
+    pub last_sync_us: u64,
+    /// End-to-end checkpoint duration (µs) = write + manifest + sync + rotate.
+    pub last_total_us: u64,
+    /// Bytes of WAL that fell behind the marker (= WAL written
+    /// during this checkpoint, roughly).
+    pub last_wal_bytes: u64,
+    /// Snapshot bytes written to disk.
+    pub last_snapshot_bytes: u64,
+    /// Files synced as part of the checkpoint (snapshot + manifest
+    /// + WAL marker + dir fsyncs). Approximate — counts the major
+    /// disk touches, not every internal sync_data() call.
+    pub last_files_synced: u32,
+    /// [PG+] Rolling window of `last_total_us` for percentile
+    /// computation. Oldest at front, newest at back; bounded at
+    /// [`CHECKPOINT_STATS_WINDOW`].
+    pub recent_total_us: std::collections::VecDeque<u64>,
+}
+
+/// v7.37.13 (A1.9) — how many recent checkpoints we retain for
+/// percentile computation. PG logs only the latest; we keep enough
+/// to surface p99 over a window that's meaningful for short-term
+/// monitoring (~last hour at a typical 60 s checkpoint cadence).
+pub const CHECKPOINT_STATS_WINDOW: usize = 64;
+
+impl CheckpointStats {
+    /// [PG+] p50 / p95 / p99 of `recent_total_us`. Returns
+    /// `(p50, p95, p99)` in microseconds. If the window has fewer
+    /// than 3 samples each value is the last observed sample.
+    #[must_use]
+    pub fn percentiles(&self) -> (u64, u64, u64) {
+        if self.recent_total_us.is_empty() {
+            return (0, 0, 0);
+        }
+        let mut sorted: Vec<u64> = self.recent_total_us.iter().copied().collect();
+        sorted.sort_unstable();
+        let pick = |p: f64| -> u64 {
+            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[idx.min(sorted.len() - 1)]
+        };
+        (pick(0.50), pick(0.95), pick(0.99))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -792,9 +856,16 @@ fn checkpoint_worker_loop(state: &Arc<(Mutex<CheckpointState>, Condvar)>) {
 }
 
 fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
+    // v7.37.13 (A1.9) — measure each phase so checkpoint_stats() can
+    // report write_us / sync_us / total_us + the file-sync count.
+    let job_start = std::time::Instant::now();
+    let write_start = std::time::Instant::now();
+    let mut files_synced: u32 = 0;
+    let snapshot_bytes_baseline = job.wal.written_len();
     // 1. Serialize the captured snapshot. Heavy; this is the whole point
     //    of CoW — it runs off the engine borrow.
     let snapshot = job.snapshot.serialize();
+    let snapshot_bytes = snapshot.len() as u64;
     // 2. Snapshot tmp+rename. Atomic on POSIX; rename implicitly fsyncs
     //    the data the next directory walk sees.
     let tmp = {
@@ -808,12 +879,15 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         t
     };
     std::fs::write(&tmp, &snapshot).map_err(io_err)?;
+    files_synced += 1; // snapshot file
     // v7.38 P0 元机制 A — checkpoint CoW swap boundary. Pre fires after
     // the tmp file is written and fsynced (rename atomicity uses the
     // kernel's directory metadata sync) but BEFORE the rename. Tests
     // use this to race a concurrent read against an in-flight swap.
     spg_engine::injection_point!("checkpoint_cow_swap_pre", &tmp);
     std::fs::rename(&tmp, &job.db_path).map_err(io_err)?;
+    let write_us = write_start.elapsed().as_micros() as u64;
+    let sync_start = std::time::Instant::now();
     // v7.38 P0 元机制 A — post-rename: the new snapshot is the
     // authoritative on-disk image. Tests use this to inject a delay
     // before the manifest update (or simulate a crash here to verify
@@ -856,6 +930,7 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         };
         std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
         std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
+        files_synced += 1; // manifest file
     }
     // 4. Enqueue the v4 checkpoint marker carrying the captured LSN. The
     //    WalGroup is thread-safe so a live commit can interleave — the
@@ -869,6 +944,7 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
     let marker = encode_v6_checkpoint_marker(prev_lsn, job.marker_lsn, marker_ts, &job.db_path);
     job.wal.enqueue(&marker);
     job.wal.flush_now()?;
+    files_synced += 1; // WAL marker fsync via flush_now
     // 5. Rotate the active chunk. New commits land in the fresh chunk;
     //    pre-marker history stays addressable in the old chunk for PITR /
     //    retention. The shared `current_chunk_path` is updated under its
@@ -892,6 +968,30 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         *p = new_chunk_path;
     }
     job.wal.rotate_file(new_handle);
+    files_synced += 1; // WAL dir fsync (chunk rotation)
+
+    // v7.37.13 (A1.9) — publish per-checkpoint stats to the shared
+    // sink so Database::checkpoint_stats() + future
+    // spg_stat_checkpoint surface fresh timing immediately after
+    // this job returns.
+    let total_us = job_start.elapsed().as_micros() as u64;
+    let sync_us = sync_start.elapsed().as_micros() as u64;
+    let wal_bytes = job.wal.written_len().saturating_sub(snapshot_bytes_baseline);
+    {
+        let mut s = job.stats.lock().unwrap_or_else(|e| e.into_inner());
+        s.total_count = s.total_count.saturating_add(1);
+        s.last_write_us = write_us;
+        s.last_sync_us = sync_us;
+        s.last_total_us = total_us;
+        s.last_wal_bytes = wal_bytes;
+        s.last_snapshot_bytes = snapshot_bytes;
+        s.last_files_synced = files_synced;
+        if s.recent_total_us.len() >= CHECKPOINT_STATS_WINDOW {
+            s.recent_total_us.pop_front();
+        }
+        s.recent_total_us.push_back(total_us);
+    }
+
     Ok(())
 }
 
@@ -2492,6 +2592,11 @@ struct PersistenceCtx {
     /// checkpoint (caller-side time / bytes path). Initialised to 0
     /// (= "no data yet, hold the default").
     ewma_wal_rate_bytes_per_sec: Mutex<u64>,
+    /// v7.37.13 (A1.9) — checkpoint timing + percentile sink.
+    /// Shared with the checkpoint worker via CheckpointJob.stats
+    /// so the worker can publish per-job stats without going
+    /// through the Database write lock.
+    checkpoint_stats: Arc<Mutex<CheckpointStats>>,
     /// v7.37.10 (mailrs 06-23 cascade 7 P0 §"base catalog 17h 没更新")
     /// — time-based auto-checkpoint floor. The byte-threshold path
     /// (`checkpoint_threshold_bytes`, default 4 MiB) doesn't fire if
@@ -2930,6 +3035,8 @@ impl Database {
                 adaptive_threshold_enabled: std::env::var_os("SPG_EMBEDDED_CHECKPOINT_BYTES")
                     .is_none(),
                 ewma_wal_rate_bytes_per_sec: Mutex::new(0),
+                // v7.37.13 (A1.9) — fresh stats sink, shared with worker.
+                checkpoint_stats: Arc::new(Mutex::new(CheckpointStats::default())),
                 checkpoint_time_threshold: default_checkpoint_time_threshold(),
                 last_checkpoint_at: Mutex::new(std::time::Instant::now()),
                 last_checkpoint_wal_len: Mutex::new(0),
@@ -3216,6 +3323,25 @@ impl Database {
         })
     }
 
+    /// v7.37.13 (A1.9) — snapshot of the current checkpoint stats.
+    /// Returned by value (clone) so callers don't hold the mutex
+    /// across their own work. PG-equivalent of `LogCheckpointEnd`'s
+    /// data; SPG additionally exposes a rolling p50/p95/p99 over
+    /// the last [`CHECKPOINT_STATS_WINDOW`] checkpoints via
+    /// [`CheckpointStats::percentiles`].
+    #[must_use]
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        self.persistence.as_ref().map_or_else(
+            CheckpointStats::default,
+            |p| {
+                p.checkpoint_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            },
+        )
+    }
+
     /// CoW-2 (v7.34) — block until the background checkpoint worker is
     /// idle. Used by sync `checkpoint()` and by Drop to ensure the final
     /// snapshot is durable before the process exits.
@@ -3255,6 +3381,7 @@ impl Database {
                 .map(|(&id, path)| (id, path.clone()))
                 .collect(),
             current_chunk_path: Arc::clone(&p.current_chunk_path),
+            stats: Arc::clone(&p.checkpoint_stats),
         })
     }
 
@@ -5882,6 +6009,83 @@ mod tests {
         assert!(parsed_flipped.is_empty(), "BLAKE3 mode rejects tampered payload");
 
         WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.9 TDD) — checkpoint observability: after a
+    /// successful checkpoint, `Database::checkpoint_stats()`
+    /// reports per-job timing (write_us / sync_us / total_us +
+    /// bytes + files_synced) and the [PG+] p50/p95/p99 percentile
+    /// bucket. PG ships `LogCheckpointEnd` which logs the latest
+    /// only; SPG keeps a rolling window so monitoring sees recent
+    /// distribution, not a single-sample latest.
+    #[test]
+    fn v7_37_13_checkpoint_stats_record_timing_and_percentiles() {
+        let dir = tmpdir();
+        let db_path = dir.join("stats_db");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE t (id BIGINT, blob TEXT)")
+            .expect("ddl");
+
+        // Baseline: no checkpoints yet → total_count = 0, all
+        // last_* fields zero, percentiles (0, 0, 0).
+        let baseline = db.checkpoint_stats();
+        assert_eq!(baseline.total_count, 0);
+        assert_eq!(baseline.last_total_us, 0);
+        assert_eq!(baseline.percentiles(), (0, 0, 0));
+
+        // Trigger 5 explicit checkpoints with some data between
+        // so wal_bytes / snapshot_bytes are non-zero.
+        for round in 0..5 {
+            for i in 0..10 {
+                db.execute(&format!(
+                    "INSERT INTO t VALUES ({}, '{}')",
+                    round * 10 + i,
+                    "p".repeat(256)
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let stats = db.checkpoint_stats();
+        assert_eq!(
+            stats.total_count, 5,
+            "5 explicit checkpoints must increment total_count by 5"
+        );
+        // Last checkpoint timings are non-zero (cargo-test timing
+        // is ~10 µs minimum on modern hardware; we just assert > 0
+        // to avoid flakes on fast hosts).
+        assert!(
+            stats.last_total_us > 0,
+            "last_total_us should be non-zero after a checkpoint (saw {})",
+            stats.last_total_us
+        );
+        assert!(
+            stats.last_snapshot_bytes > 0,
+            "snapshot serialize produces bytes (saw {})",
+            stats.last_snapshot_bytes
+        );
+        assert!(
+            stats.last_files_synced >= 2,
+            "checkpoint syncs at least snapshot + WAL marker (saw {})",
+            stats.last_files_synced
+        );
+
+        // Percentile window populated.
+        let (p50, p95, p99) = stats.percentiles();
+        assert!(
+            p50 > 0 && p95 > 0 && p99 > 0,
+            "percentile bucket populated after 5 samples (p50={p50} p95={p95} p99={p99})"
+        );
+        assert!(
+            p50 <= p95 && p95 <= p99,
+            "percentiles must be monotone non-decreasing (p50={p50} p95={p95} p99={p99})"
+        );
+        assert!(
+            stats.recent_total_us.len() == 5,
+            "rolling window holds all 5 samples (≤ CHECKPOINT_STATS_WINDOW={})",
+            CHECKPOINT_STATS_WINDOW
+        );
     }
 
     /// v7.37.13 (A1.8 TDD [PG+]) — when adaptive mode is on (no env
