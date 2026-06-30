@@ -4057,6 +4057,85 @@ impl Engine {
     /// parent fall through to the regular(empty-rows)scan path,
     /// avoiding the infinite recursion that an empty-body CTE
     /// referencing the parent name would trigger.
+    /// v7.37.16 (16.10) — public helper invoked from explain.rs to
+    /// surface "which children survive the WHERE-clause prune" in
+    /// EXPLAIN output. Returns `None` when `parent_name` isn't
+    /// actually a partition parent; otherwise returns the list of
+    /// children the planner would scan (same algorithm as
+    /// [`Self::build_partition_parent_union_body`] but without the
+    /// SQL re-parse).
+    pub(crate) fn explain_partition_kept_children(
+        &self,
+        parent_name: &str,
+        outer: &SelectStatement,
+    ) -> Option<Vec<alloc::string::String>> {
+        use spg_storage::PartitionRole;
+        let cat = self.active_catalog();
+        let parent = cat.get(parent_name)?;
+        let (key_position, parent_kind) = match &parent.schema().partition_role {
+            Some(PartitionRole::Parent {
+                key_column_positions,
+                kind,
+                ..
+            }) => (*key_column_positions.first().unwrap_or(&0), *kind),
+            _ => return None,
+        };
+        let key_col_name = parent.schema().columns[key_position].name.clone();
+        let (lo_bound, hi_bound) = match outer.where_.as_ref() {
+            Some(expr) => extract_key_range(expr, &key_col_name),
+            None => (None, None),
+        };
+        let eq_value: Option<spg_storage::Value<'static>> = match outer.where_.as_ref() {
+            Some(expr) => extract_key_eq_value(expr, &key_col_name),
+            None => None,
+        };
+        let children = crate::partition::children_of_parent(cat, parent_name);
+        let mut kept: Vec<alloc::string::String> = Vec::new();
+        let mut default_child: Option<alloc::string::String> = None;
+        for child_name in &children {
+            let Some(child) = cat.get(child_name) else {
+                continue;
+            };
+            match &child.schema().partition_role {
+                Some(PartitionRole::Range { lower, upper, .. }) => {
+                    if range_satisfies_filter(lower, upper, lo_bound.as_ref(), hi_bound.as_ref()) {
+                        kept.push(child_name.clone());
+                    }
+                }
+                Some(PartitionRole::List { values, .. }) => match &eq_value {
+                    Some(v) => {
+                        if values.iter().any(|b| b.equals_value(v)) {
+                            kept.push(child_name.clone());
+                        }
+                    }
+                    None => kept.push(child_name.clone()),
+                },
+                Some(PartitionRole::Hash {
+                    modulus, remainder, ..
+                }) => match &eq_value {
+                    Some(v) => {
+                        let h = crate::partition::pg_compatible_hash(v);
+                        if h.rem_euclid(u64::from(*modulus)) == u64::from(*remainder) {
+                            kept.push(child_name.clone());
+                        }
+                    }
+                    None => kept.push(child_name.clone()),
+                },
+                Some(PartitionRole::Default { .. }) => {
+                    default_child = Some(child_name.clone());
+                }
+                _ => {}
+            }
+        }
+        let _ = parent_kind;
+        if let Some(d) = default_child {
+            if kept.is_empty() || eq_value.is_none() {
+                kept.push(d);
+            }
+        }
+        Some(kept)
+    }
+
     fn build_partition_parent_union_body(
         &self,
         parent_name: &str,
