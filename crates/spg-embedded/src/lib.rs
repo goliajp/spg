@@ -1213,7 +1213,24 @@ fn fsync_dir(dir: &Path) {
     if let Ok(f) = File::open(dir) {
         let _ = f.sync_all();
     }
+    #[cfg(test)]
+    {
+        // v7.37.13 (A1.6 TDD) — count call sites so tests can verify
+        // that durability-critical paths (segment rename, WAL chunk
+        // rotation, ...) actually reach this helper. The counter is
+        // gated to `cfg(test)` so release builds carry zero overhead.
+        FSYNC_DIR_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
+
+/// v7.37.13 (A1.6 TDD) — test-only call counter for [`fsync_dir`].
+/// Tests that need to assert "this path durably fsynced its parent
+/// directory" read this before and after the exercise and check the
+/// delta. Not exported outside the test cfg; release builds don't
+/// even allocate the static.
+#[cfg(test)]
+pub(crate) static FSYNC_DIR_CALL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn chunk_filename(unix_us: i64, leading_lsn: u64) -> String {
     // Negative timestamps shouldn't happen in practice (we sit
@@ -2405,6 +2422,15 @@ impl Database {
                 .join(format!("seg_{}.spg.tmp", report.segment_id));
             std::fs::write(&tmp_path, &report.segment_bytes).map_err(io_err)?;
             std::fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            // v7.37.13 (A1.6) — fsync the parent directory so the
+            // rename's directory entry is durable. `std::fs::rename`
+            // makes the new name visible to this process but does not
+            // by itself flush the directory inode; a power loss
+            // between rename() and the next checkpoint's catalog
+            // fsync would lose the seg_<id>.spg entry and leave the
+            // catalog pointing at a path the kernel claims does not
+            // exist. Matches PG's `durable_rename` posture.
+            fsync_dir(&p.cold_segments_dir);
             p.cold_segment_paths.insert(report.segment_id, final_path);
         }
         Ok(report)
@@ -4920,6 +4946,63 @@ mod tests {
             new_mtime, baseline_mtime,
             "with time threshold disabled + bytes effectively-disabled, base.spg \
              mtime should NOT advance on writes"
+        );
+    }
+
+    /// v7.37.13 (A1.6 TDD red-then-green) — `freeze_oldest_to_cold`
+    /// performs a `tmp + rename` of the cold-segment file but must
+    /// also fsync the **parent directory** so a power loss after the
+    /// rename does not lose the directory entry that names the new
+    /// segment. Without this, the seg file inode persists but the
+    /// directory entry is gone on restart, and the catalog points at
+    /// a path the kernel claims does not exist.
+    ///
+    /// This is `AUDIT-3-categories.md` A1.6 / Top-6 P0 #4 — a real
+    /// data-loss path until v7.37.13 closes it. Matches PG's
+    /// `durable_rename` posture (rename + fsync_dir).
+    ///
+    /// TDD invariant: the test reads [`FSYNC_DIR_CALL_COUNT`] before
+    /// and after `freeze_oldest_to_cold`, asserts the delta is at
+    /// least one (the call site this fix adds). A future regression
+    /// that removes the `fsync_dir(...)` line will turn the delta
+    /// back to zero and re-redden this test.
+    #[test]
+    fn v7_37_13_freeze_to_cold_fsyncs_cold_segments_dir() {
+        let dir = tmpdir();
+        // open_path derives `cold_segments_dir = {parent}/{stem}.spg/segments`
+        // (see L2076-2084). Using a `.spg`-suffixed db_path collides
+        // (`{stem}.spg` would be both the db file and the parent of
+        // segments/, triggering ENOTDIR on mkdir). Pick a bare stem
+        // so the segments tree lives at `<stem>.spg/segments` next to
+        // the db file.
+        let db_path = dir.join("freeze_fsync_db");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)")
+            .expect("ddl");
+        db.execute("CREATE INDEX by_id ON users (id)").expect("ix");
+        for i in 0..200i64 {
+            db.execute(&format!("INSERT INTO users VALUES ({i}, 'u-{i}')"))
+                .expect("insert");
+        }
+        // Seed a checkpoint so any FSYNC_DIR_CALL_COUNT bumps from
+        // the open / checkpoint / WAL-chunk-rotation paths are
+        // captured into `baseline` — the assertion measures only
+        // the delta produced by `freeze_oldest_to_cold`.
+        db.checkpoint().expect("seed checkpoint");
+
+        let baseline = FSYNC_DIR_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        db.freeze_oldest_to_cold("users", "by_id", 100)
+            .expect("freeze");
+        let after = FSYNC_DIR_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            after > baseline,
+            "freeze_oldest_to_cold must fsync the cold_segments_dir \
+             after the tmp->final rename (baseline {baseline}, after \
+             {after}); without this fsync, a crash between the rename \
+             and the next checkpoint loses the directory entry naming \
+             the seg file and the catalog points at a path that does \
+             not exist on restart (AUDIT-3-categories A1.6 / Top-6 P0 #4)."
         );
     }
 
