@@ -10,3 +10,6 @@
 .claude/
 /dist/
 /references/
+
+# PG / 上游 source 树参考(每个开发者本地 clone,不 commit)
+references/

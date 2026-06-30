@@ -2420,6 +2420,28 @@ impl Database {
         }
     }
 
+    /// v7.37.13 — test-friendly setter for the time-based
+    /// checkpoint threshold (env-var equivalent
+    /// `SPG_EMBEDDED_CHECKPOINT_SECONDS`). `None` disables the
+    /// timer; `Some(d)` sets the interval. No-op when the database
+    /// is in-memory.
+    ///
+    /// Resets the bookkeeping (`last_checkpoint_at` /
+    /// `last_checkpoint_wal_len`) so the next write after this call
+    /// can fire the time trigger immediately (no need to wait the
+    /// full new interval again).
+    pub fn set_checkpoint_time_threshold(&mut self, threshold: Option<core::time::Duration>) {
+        if let Some(p) = &mut self.persistence {
+            p.checkpoint_time_threshold = threshold;
+            // Reset bookkeeping so the next write evaluates against
+            // a fresh window (avoids "set to 1 s then wait the old
+            // 60 s anyway because last_checkpoint_at hasn't moved").
+            *p.last_checkpoint_at.lock().unwrap_or_else(|e| e.into_inner()) =
+                std::time::Instant::now() - threshold.unwrap_or_default();
+            *p.last_checkpoint_wal_len.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
+    }
+
     /// v7.31 (memory campaign, round-26 ask 1/ask 4) — per-bucket
     /// memory snapshot for the embedding host. Poll it from prod to
     /// see where resident bytes live (rows / representation /
@@ -2526,6 +2548,14 @@ impl Database {
             Some(w) => w.wait(),
             None => Ok(()),
         }
+    }
+
+    /// v7.37.13 — public façade over [`Self::wait_checkpoint`] for
+    /// test code that needs to drain the async checkpoint worker.
+    /// Production callers use the synchronous [`Self::checkpoint`]
+    /// which already drains internally.
+    pub fn checkpoint_wait(&self) -> Result<(), EngineError> {
+        self.wait_checkpoint()
     }
 
     /// CoW-2 (v7.34) — capture a checkpoint job under `&mut self` (or
@@ -4801,6 +4831,96 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// v7.37.13 — directly tests the v7.37.10 time-based
+    /// auto-checkpoint claim that mailrs's 2026-06-24 prod report
+    /// proved was UNVERIFIED before shipping.
+    ///
+    /// Setup: open a path, set a short time threshold (200 ms),
+    /// write rows over a 600 ms window, verify base.spg mtime
+    /// advanced AT LEAST ONCE — i.e. the time path actually fired
+    /// trigger_checkpoint AND the worker successfully wrote a new
+    /// snapshot.
+    ///
+    /// This test would have caught my v7.37.10 ship-with-no-verify
+    /// failure mode if it existed at that time. Adding it now as
+    /// part of v7.37.13's honest-fix-the-fix work.
+    #[test]
+    fn v7_37_10_time_based_checkpoint_actually_fires() {
+        let dir = tmpdir();
+        let db_path = dir.join("ckpt.spg");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
+        // Force initial checkpoint so base.spg exists with a known
+        // mtime to compare against.
+        db.checkpoint().expect("seed checkpoint");
+        let baseline_mtime = std::fs::metadata(&db_path)
+            .expect("base mtime")
+            .modified()
+            .expect("modified");
+
+        // Tighten the time threshold to 200 ms so the test runs
+        // fast. Default 60 s would make this test multi-minute.
+        db.set_checkpoint_time_threshold(Some(core::time::Duration::from_millis(200)));
+
+        // Wait > threshold so the next write trips the trigger.
+        std::thread::sleep(core::time::Duration::from_millis(250));
+
+        // ONE write after the time threshold elapses — the trigger
+        // should fire on this call.
+        db.execute("INSERT INTO t VALUES (1)").expect("insert");
+
+        // Drain the async worker so the snapshot lands before we
+        // check mtime.
+        db.checkpoint_wait().expect("wait async checkpoint");
+
+        let new_mtime = std::fs::metadata(&db_path)
+            .expect("base mtime after")
+            .modified()
+            .expect("modified after");
+        assert!(
+            new_mtime > baseline_mtime,
+            "base.spg mtime did NOT advance after time-trigger window + write \
+             (baseline {baseline_mtime:?}, after {new_mtime:?}); this is the \
+             exact failure mailrs observed in prod 2026-06-24"
+        );
+    }
+
+    /// Companion: with the timer DISABLED
+    /// (`SPG_EMBEDDED_CHECKPOINT_SECONDS=0` semantically), writes
+    /// alone do NOT advance the base mtime — only the byte-threshold
+    /// path does (and that's not exercised here). Verifies the
+    /// disable knob actually disables.
+    #[test]
+    fn time_based_checkpoint_can_be_disabled() {
+        let dir = tmpdir();
+        let db_path = dir.join("ckpt.spg");
+        let mut db = Database::open_path(&db_path).expect("open");
+        db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
+        db.checkpoint().expect("seed checkpoint");
+        let baseline_mtime = std::fs::metadata(&db_path)
+            .expect("base mtime")
+            .modified()
+            .expect("modified");
+
+        db.set_checkpoint_time_threshold(None);
+        // Tighten bytes to a huge value too, so neither path fires.
+        db.set_checkpoint_threshold_bytes(u64::MAX);
+
+        std::thread::sleep(core::time::Duration::from_millis(250));
+        db.execute("INSERT INTO t VALUES (1)").expect("insert");
+        db.checkpoint_wait().expect("wait async");
+
+        let new_mtime = std::fs::metadata(&db_path)
+            .expect("base mtime after")
+            .modified()
+            .expect("modified after");
+        assert_eq!(
+            new_mtime, baseline_mtime,
+            "with time threshold disabled + bytes effectively-disabled, base.spg \
+             mtime should NOT advance on writes"
+        );
     }
 
     #[test]
