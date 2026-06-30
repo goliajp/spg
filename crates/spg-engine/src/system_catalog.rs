@@ -193,6 +193,95 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.20) — synthesise `pg_catalog.pg_stat_progress_vacuum`.
+/// PG's per-VACUUM-in-progress view that monitoring dashboards
+/// poll while a long-running vacuum is active. SPG's vacuum
+/// daemon lands with v7.37.15 (Phase D); the view ships
+/// shape-stable empty so monitoring queries don't break.
+///
+/// PG-canonical columns:
+///   * pid (Int)
+///   * datid (BigInt) — database OID
+///   * datname (Text)
+///   * relid (BigInt) — table being vacuumed
+///   * phase (Text) — 'initializing' / 'scanning heap' / etc.
+///   * heap_blks_total / heap_blks_scanned / heap_blks_vacuumed (BigInt)
+///   * index_vacuum_count (BigInt)
+///   * max_dead_tuples / num_dead_tuples (BigInt)
+pub(crate) fn synth_pg_stat_progress_vacuum(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("datid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("phase", DataType::Text, false),
+        ColumnSchema::new("heap_blks_total", DataType::BigInt, false),
+        ColumnSchema::new("heap_blks_scanned", DataType::BigInt, false),
+        ColumnSchema::new("heap_blks_vacuumed", DataType::BigInt, false),
+        ColumnSchema::new("index_vacuum_count", DataType::BigInt, false),
+        ColumnSchema::new("max_dead_tuples", DataType::BigInt, false),
+        ColumnSchema::new("num_dead_tuples", DataType::BigInt, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
+/// v7.37.22 (22.21) — synthesise `pg_catalog.pg_stat_progress_create_index`.
+/// PG's per-CREATE-INDEX-in-progress view. SPG's CREATE INDEX
+/// is synchronous and finishes inside the wire path; the view
+/// shape-stable empties so monitoring queries match PG's
+/// "no active build" case.
+pub(crate) fn synth_pg_stat_progress_create_index(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("datid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("index_relid", DataType::BigInt, false),
+        ColumnSchema::new("command", DataType::Text, false),
+        ColumnSchema::new("phase", DataType::Text, false),
+        ColumnSchema::new("lockers_total", DataType::BigInt, false),
+        ColumnSchema::new("lockers_done", DataType::BigInt, false),
+        ColumnSchema::new("current_locker_pid", DataType::Int, false),
+        ColumnSchema::new("blocks_total", DataType::BigInt, false),
+        ColumnSchema::new("blocks_done", DataType::BigInt, false),
+        ColumnSchema::new("tuples_total", DataType::BigInt, false),
+        ColumnSchema::new("tuples_done", DataType::BigInt, false),
+        ColumnSchema::new("partitions_total", DataType::BigInt, false),
+        ColumnSchema::new("partitions_done", DataType::BigInt, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
+/// v7.37.22 (22.22) — synthesise
+/// `pg_catalog.pg_stat_progress_analyze`. Empty until v7.37.22
+/// (22.3) autoanalyze_pass wires per-table progress reporting.
+pub(crate) fn synth_pg_stat_progress_analyze(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("datid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("phase", DataType::Text, false),
+        ColumnSchema::new("sample_blks_total", DataType::BigInt, false),
+        ColumnSchema::new("sample_blks_scanned", DataType::BigInt, false),
+        ColumnSchema::new("ext_stats_total", DataType::BigInt, false),
+        ColumnSchema::new("ext_stats_computed", DataType::BigInt, false),
+        ColumnSchema::new("child_tables_total", DataType::BigInt, false),
+        ColumnSchema::new("child_tables_done", DataType::BigInt, false),
+        ColumnSchema::new("current_child_table_relid", DataType::BigInt, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
 /// v7.37.24 (24.16) — synthesise `pg_catalog.pg_inherits`.
 /// PG's catalog table that walks the parent → child inheritance
 /// graph. pg_dump uses this to restore CREATE TABLE …

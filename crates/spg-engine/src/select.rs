@@ -482,6 +482,30 @@ impl Engine {
                         crate::system_catalog::synth_pg_statistic(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.20) — pg_catalog.pg_stat_progress_vacuum.
+                "__spg_pg_stat_progress_vacuum" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_progress_vacuum(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.22 (22.21) — pg_catalog.pg_stat_progress_create_index.
+                "__spg_pg_stat_progress_create_index" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_progress_create_index(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.22 (22.22) — pg_catalog.pg_stat_progress_analyze.
+                "__spg_pg_stat_progress_analyze" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_progress_analyze(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.16) — pg_catalog.pg_inherits
                 // (partition parent → child OID mapping).
                 "__spg_pg_inherits" => {
