@@ -193,6 +193,82 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.16) — synthesise `pg_catalog.pg_stat_bgwriter`.
+/// PG dashboards poll this single-row view to track background-
+/// writer dirty-page churn. SPG's freezer / flusher does the
+/// equivalent work; this view reports SPG's freezer-side
+/// counters under PG-canonical column names.
+///
+/// PG-canonical columns:
+///   * checkpoints_timed (BigInt)
+///   * checkpoints_req (BigInt)
+///   * checkpoint_write_time / checkpoint_sync_time (Float, ms)
+///   * buffers_checkpoint / buffers_clean / buffers_backend /
+///     buffers_backend_fsync / buffers_alloc (BigInt)
+///   * maxwritten_clean (BigInt)
+///   * stats_reset (TIMESTAMPTZ)
+pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("checkpoints_timed", DataType::BigInt, false),
+        ColumnSchema::new("checkpoints_req", DataType::BigInt, false),
+        ColumnSchema::new("checkpoint_write_time", DataType::Float, false),
+        ColumnSchema::new("checkpoint_sync_time", DataType::Float, false),
+        ColumnSchema::new("buffers_checkpoint", DataType::BigInt, false),
+        ColumnSchema::new("buffers_clean", DataType::BigInt, false),
+        ColumnSchema::new("maxwritten_clean", DataType::BigInt, false),
+        ColumnSchema::new("buffers_backend", DataType::BigInt, false),
+        ColumnSchema::new("buffers_backend_fsync", DataType::BigInt, false),
+        ColumnSchema::new("buffers_alloc", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(0), // checkpoints_timed
+        Value::BigInt(0), // checkpoints_req
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::Null,
+    ])];
+    (schema, rows)
+}
+
+/// v7.37.23 (23.6-b) — synthesise `pg_catalog.pg_tablespace`.
+/// SPG is single-tablespace (see TABLESPACES.md). The view ships
+/// the two PG-standard rows (`pg_default` + `pg_global`) so
+/// tools that join against `pg_tablespace.oid` for placement
+/// queries don't get an empty join result.
+pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("spcname", DataType::Text, false),
+        ColumnSchema::new("spcowner", DataType::BigInt, false),
+        ColumnSchema::new("spcacl", DataType::Text, true),
+        ColumnSchema::new("spcoptions", DataType::Text, true),
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(1663),
+            Value::text("pg_default"),
+            Value::BigInt(10),
+            Value::Null,
+            Value::Null,
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(1664),
+            Value::text("pg_global"),
+            Value::BigInt(10),
+            Value::Null,
+            Value::Null,
+        ]),
+    ];
+    (schema, rows)
+}
+
 /// v7.37.22 (22.15) — synthesise `pg_catalog.pg_stat_user_indexes`.
 /// PG monitoring tools poll this to flag unused indexes (idx_scan
 /// = 0 over the scrape window) as drop candidates. Per-index
