@@ -193,6 +193,92 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.18) — synthesise `pg_catalog.pg_stat_io` (PG 16+).
+/// One row per (backend_type, object, context) combo. Modern
+/// pgwatch / pganalyze dashboards prefer this surface over the
+/// older pg_statio_* views. SPG ships the column shape with a
+/// single aggregate row so the view doesn't return empty; per-
+/// backend wiring lands when v7.37.15 MVCC + spg-server's
+/// per-connection accounting are both in place.
+///
+/// PG-canonical columns:
+///   * backend_type (Text) — 'client backend' / 'background writer' / etc.
+///   * object (Text) — 'relation' / 'temp relation'
+///   * context (Text) — 'normal' / 'vacuum' / 'bulkread' / 'bulkwrite'
+///   * reads / read_time / writes / write_time / writebacks /
+///     writeback_time / extends / extend_time / op_bytes /
+///     hits / evictions / reuses / fsyncs / fsync_time (BigInt/Float)
+///   * stats_reset (TIMESTAMPTZ)
+pub(crate) fn synth_pg_stat_io(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("backend_type", DataType::Text, false),
+        ColumnSchema::new("object", DataType::Text, false),
+        ColumnSchema::new("context", DataType::Text, false),
+        ColumnSchema::new("reads", DataType::BigInt, false),
+        ColumnSchema::new("read_time", DataType::Float, false),
+        ColumnSchema::new("writes", DataType::BigInt, false),
+        ColumnSchema::new("write_time", DataType::Float, false),
+        ColumnSchema::new("writebacks", DataType::BigInt, false),
+        ColumnSchema::new("writeback_time", DataType::Float, false),
+        ColumnSchema::new("extends", DataType::BigInt, false),
+        ColumnSchema::new("extend_time", DataType::Float, false),
+        ColumnSchema::new("op_bytes", DataType::BigInt, false),
+        ColumnSchema::new("hits", DataType::BigInt, false),
+        ColumnSchema::new("evictions", DataType::BigInt, false),
+        ColumnSchema::new("reuses", DataType::BigInt, false),
+        ColumnSchema::new("fsyncs", DataType::BigInt, false),
+        ColumnSchema::new("fsync_time", DataType::Float, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    // Single aggregate row to keep the SELECT non-empty;
+    // dashboards' SUM(reads) / AVG(read_time) queries return 0
+    // rather than NULL.
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::text("client backend"),
+        Value::text("relation"),
+        Value::text("normal"),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::BigInt(8192), // PG-canonical default
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::Null,
+    ])];
+    (schema, rows)
+}
+
+/// v7.37.22 (22.19) — synthesise `pg_catalog.pg_stat_user_functions`.
+/// PG's per-function call-count + timing scrape view. SPG hasn't
+/// surfaced per-function call counters yet; the view ships
+/// empty so monitoring `SELECT funcname FROM
+/// pg_stat_user_functions WHERE calls > 100` queries return
+/// no rows (vs returning a parse error). Per-function wiring
+/// lands when PL/pgSQL (v7.37.20) ships and the call-site
+/// counter exists.
+pub(crate) fn synth_pg_stat_user_functions(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("funcid", DataType::BigInt, false),
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("funcname", DataType::Text, false),
+        ColumnSchema::new("calls", DataType::BigInt, false),
+        ColumnSchema::new("total_time", DataType::Float, false),
+        ColumnSchema::new("self_time", DataType::Float, false),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
 /// v7.37.24 (24.13) — synthesise `pg_catalog.pg_am`.
 /// PG index/table access methods (heap, btree, hash, gist,
 /// gin, spgist, brin). pg_dump queries this to validate the AM
