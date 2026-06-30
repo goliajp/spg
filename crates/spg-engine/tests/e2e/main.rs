@@ -96,6 +96,7 @@ mod e2e_index_advisor;
 mod e2e_inet_contains;
 mod e2e_inet_types;
 mod e2e_info_mysql_views;
+mod e2e_information_schema_added;
 mod e2e_inline_column_constraints;
 mod e2e_inline_pk;
 mod e2e_insert_select;
