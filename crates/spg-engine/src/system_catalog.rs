@@ -200,33 +200,157 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     (schema, rows)
 }
 
-/// v7.16.2 — synthesise `pg_catalog.pg_attribute`. Minimum
-/// shape: `attrelid` (text — SPG has no OID), `attname`,
-/// `attnum`, `atttypid` (text), `attnotnull`.
+/// v7.16.2 + v7.37.24 (24.8b) — synthesise `pg_catalog.pg_attribute`.
+/// Widened from 5 to 16 PG-canonical columns to cover what
+/// dashboard / ORM-introspection tools query: column type id +
+/// length + nullability + default-presence + identity/generated
+/// + array dimensions + collation. Tools doing
+/// `SELECT * FROM pg_attribute WHERE attrelid = …::regclass`
+/// see the same shape they'd see against PG.
 pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("attrelid", DataType::Text, false),
+        ColumnSchema::new("attrelid", DataType::BigInt, false),
         ColumnSchema::new("attname", DataType::Text, false),
-        ColumnSchema::new("attnum", DataType::Int, false),
-        ColumnSchema::new("atttypid", DataType::Text, false),
+        ColumnSchema::new("atttypid", DataType::BigInt, false),
+        ColumnSchema::new("attstattarget", DataType::Int, false),
+        ColumnSchema::new("attlen", DataType::SmallInt, false),
+        ColumnSchema::new("attnum", DataType::SmallInt, false),
+        ColumnSchema::new("attndims", DataType::Int, false),
+        ColumnSchema::new("atttypmod", DataType::Int, false),
+        ColumnSchema::new("attbyval", DataType::Bool, false),
+        ColumnSchema::new("attstorage", DataType::Text, false),
+        ColumnSchema::new("attalign", DataType::Text, false),
         ColumnSchema::new("attnotnull", DataType::Bool, false),
+        ColumnSchema::new("atthasdef", DataType::Bool, false),
+        ColumnSchema::new("attidentity", DataType::Text, false),
+        ColumnSchema::new("attgenerated", DataType::Text, false),
+        ColumnSchema::new("attisdropped", DataType::Bool, false),
+        ColumnSchema::new("attislocal", DataType::Bool, false),
+        ColumnSchema::new("attinhcount", DataType::Int, false),
+        ColumnSchema::new("attcollation", DataType::BigInt, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut attrelid: i64 = 16384;
     for tname in cat.table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+        let Some(t) = cat.get(&tname) else {
+            attrelid = attrelid.saturating_add(1);
+            continue;
+        };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
-            let ordinal = (i + 1) as i32;
+            let attnum = (i + 1) as i16;
+            // PG: typlen — fixed-width width in bytes; -1 for var-length.
+            let typlen: i16 = match col.ty {
+                DataType::Bool => 1,
+                DataType::SmallInt => 2,
+                DataType::Int => 4,
+                DataType::BigInt | DataType::Float | DataType::Timestamp | DataType::Timestamptz => 8,
+                DataType::Date => 4,
+                _ => -1,
+            };
+            // attndims — number of array dimensions. Most array
+            // types are 1-D in SPG; jagged / 2-D arrays report 2.
+            let attndims: i32 = match col.ty {
+                DataType::TextArray
+                | DataType::IntArray
+                | DataType::BigIntArray
+                | DataType::SmallIntArray
+                | DataType::FloatArray
+                | DataType::BoolArray
+                | DataType::DateArray
+                | DataType::TimestampArray
+                | DataType::TimestamptzArray
+                | DataType::UuidArray
+                | DataType::BytesArray
+                | DataType::NumericArray
+                | DataType::JsonArray => 1,
+                DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => 2,
+                _ => 0,
+            };
+            // attstorage — 'p' plain (fixed-width), 'e' external,
+            // 'm' main-or-toast, 'x' extended (default for varlena).
+            // SPG's hot tier stores everything in-line; PG-style
+            // approximation: fixed-width = 'p', variable = 'x'.
+            let attstorage = if typlen > 0 { "p" } else { "x" };
+            // attalign — 'c' char, 's' short, 'i' int, 'd' double.
+            let attalign = match typlen {
+                1 => "c",
+                2 => "s",
+                4 => "i",
+                _ => "d",
+            };
+            let has_default = col.default.is_some() || col.runtime_default.is_some();
+            // attidentity — '' (none), 'a' ALWAYS, 'd' BY DEFAULT.
+            // SPG treats auto_increment as identity-default.
+            let attidentity = if col.auto_increment { "d" } else { "" };
             rows.push(Row::new(alloc::vec![
-                Value::text(tname.clone()),
+                Value::BigInt(attrelid),
                 Value::text(col.name.clone()),
-                Value::Int(ordinal),
-                Value::text(pg_data_type_text(col.ty)),
+                Value::BigInt(pg_type_oid(col.ty)),
+                Value::Int(-1),         // attstattarget — -1 = use system default
+                Value::SmallInt(typlen),
+                Value::SmallInt(attnum),
+                Value::Int(attndims),
+                Value::Int(-1),         // atttypmod — -1 = no modifier
+                Value::Bool(typlen > 0 && typlen <= 8),
+                Value::text(attstorage),
+                Value::text(attalign),
                 Value::Bool(!col.nullable),
+                Value::Bool(has_default),
+                Value::text(attidentity),
+                Value::text(""),        // attgenerated — '' (not stored generated)
+                Value::Bool(false),     // attisdropped
+                Value::Bool(true),      // attislocal — true (not inherited)
+                Value::Int(0),          // attinhcount
+                Value::BigInt(0),       // attcollation — 0 (default)
             ]));
         }
+        attrelid = attrelid.saturating_add(1);
     }
     (schema, rows)
+}
+
+/// PG type OID lookup for the SPG DataType set. Used by
+/// `synth_pg_attribute`'s `atttypid` column.
+fn pg_type_oid(ty: DataType) -> i64 {
+    match ty {
+        DataType::Bool => 16,
+        DataType::Bytes => 17,
+        DataType::SmallInt => 21,
+        DataType::Int => 23,
+        DataType::BigInt => 20,
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 25,
+        DataType::Float => 701,
+        DataType::Numeric { .. } => 1700,
+        DataType::Date => 1082,
+        DataType::Time => 1083,
+        DataType::TimeTz => 1266,
+        DataType::Timestamp => 1114,
+        DataType::Timestamptz => 1184,
+        DataType::Interval => 1186,
+        DataType::Uuid => 2950,
+        DataType::Json => 114,
+        DataType::Jsonb => 3802,
+        DataType::TextArray => 1009,
+        DataType::IntArray => 1007,
+        DataType::BigIntArray => 1016,
+        DataType::SmallIntArray => 1005,
+        DataType::FloatArray => 1022,
+        DataType::BoolArray => 1000,
+        DataType::DateArray => 1182,
+        DataType::TimestampArray => 1115,
+        DataType::TimestamptzArray => 1185,
+        DataType::UuidArray => 2951,
+        DataType::BytesArray => 1001,
+        DataType::NumericArray => 1231,
+        DataType::JsonArray => 199,
+        // 2-D arrays use the same element-array OID as 1-D —
+        // PG distinguishes dimensions via attndims, not OID.
+        DataType::IntArray2D => 1007,
+        DataType::BigIntArray2D => 1016,
+        DataType::TextArray2D => 1009,
+        _ => 0,
+    }
 }
 
 /// v7.17.0 Phase 3.P0-50 — synthesise `pg_catalog.pg_type`. The
