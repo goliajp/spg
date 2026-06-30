@@ -193,6 +193,51 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.24 (24.3) — synthesise `information_schema.attributes`.
+/// PG-standard surface listing every field of every composite
+/// type. ORM enum/composite codecs and pg_dump use this to
+/// reconstruct composite-type declarations at dump-time.
+///
+/// PG-canonical columns (subset; full SQL-standard shape is ~28
+/// columns, we ship the ones tools actually read at startup):
+///   * udt_catalog / udt_schema / udt_name — the composite type
+///   * attribute_name — field name
+///   * ordinal_position — 1-based field position
+///   * data_type — PG-canonical type name of the field
+///   * is_nullable — always 'YES' (composite fields default to
+///     nullable per SQL-standard; field-level NOT NULL would
+///     need a richer CompositeDef)
+pub(crate) fn synth_information_schema_attributes(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("udt_catalog", DataType::Text, false),
+        ColumnSchema::new("udt_schema", DataType::Text, false),
+        ColumnSchema::new("udt_name", DataType::Text, false),
+        ColumnSchema::new("attribute_name", DataType::Text, false),
+        ColumnSchema::new("ordinal_position", DataType::Int, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("is_nullable", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (_name, def) in cat.composite_types() {
+        for (i, (field_name, field_type)) in def.fields.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(def.name.clone()),
+                Value::text(field_name.clone()),
+                Value::Int(ordinal),
+                Value::text(pg_data_type_text(*field_type)),
+                Value::text("YES"),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.24 (24.2) — synthesise `information_schema.domains`.
 /// One row per DOMAIN type. PG-targeting tools (Liquibase /
 /// Alembic migrations) query this surface to round-trip DOMAIN
