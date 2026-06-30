@@ -1197,6 +1197,12 @@ pub struct PartitionBySpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionKindAst {
     Range,
+    /// v7.37.16 (16.1) — `PARTITION BY LIST (key)`. Child uses
+    /// `FOR VALUES IN (lit, lit, …)`.
+    List,
+    /// v7.37.16 (16.2) — `PARTITION BY HASH (key)`. Child uses
+    /// `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
+    Hash,
 }
 
 /// v7.37.6-B — `PARTITION OF <parent> <bounds>` child suffix.
@@ -1218,6 +1224,17 @@ pub enum PartitionOfBoundsAst {
     Range {
         lower: Box<Expr>,
         upper: Box<Expr>,
+    },
+    /// v7.37.16 (16.1) — `FOR VALUES IN (lit [, lit, …])`. Each
+    /// expr resolves to a typed literal at child-create time.
+    List {
+        values: Vec<Expr>,
+    },
+    /// v7.37.16 (16.2) — `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
+    /// PG enforces `0 ≤ r < m`; m must be positive.
+    Hash {
+        modulus: u32,
+        remainder: u32,
     },
     Default,
 }
@@ -3600,6 +3617,23 @@ impl fmt::Display for CreateTableStatement {
                 PartitionOfBoundsAst::Range { lower, upper } => {
                     write!(f, "FOR VALUES FROM ({}) TO ({})", *lower, *upper)
                 }
+                PartitionOfBoundsAst::List { values } => {
+                    f.write_str("FOR VALUES IN (")?;
+                    for (i, v) in values.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}", v)?;
+                    }
+                    f.write_str(")")
+                }
+                PartitionOfBoundsAst::Hash { modulus, remainder } => {
+                    write!(
+                        f,
+                        "FOR VALUES WITH (MODULUS {}, REMAINDER {})",
+                        modulus, remainder
+                    )
+                }
                 PartitionOfBoundsAst::Default => f.write_str("DEFAULT"),
             };
         }
@@ -3634,6 +3668,8 @@ impl fmt::Display for CreateTableStatement {
             f.write_str(" PARTITION BY ")?;
             match spec.kind {
                 PartitionKindAst::Range => f.write_str("RANGE ")?,
+                PartitionKindAst::List => f.write_str("LIST ")?,
+                PartitionKindAst::Hash => f.write_str("HASH ")?,
             }
             f.write_str("(")?;
             for (i, col) in spec.key_columns.iter().enumerate() {

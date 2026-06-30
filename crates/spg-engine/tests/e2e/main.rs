@@ -147,6 +147,7 @@ mod e2e_on_conflict_update;
 mod e2e_on_update_current_timestamp;
 mod e2e_order_by_multi;
 mod e2e_partial_index;
+mod e2e_partition_by_list_hash;
 mod e2e_partition_by_range;
 mod e2e_per_table_budget;
 mod e2e_pg_array_2d;

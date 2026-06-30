@@ -41,6 +41,8 @@ pub(crate) fn children_of_parent(catalog: &Catalog, parent: &str) -> Vec<String>
         match &t.schema().partition_role {
             Some(PartitionRole::Range { parent_name, .. })
             | Some(PartitionRole::Default { parent_name })
+            | Some(PartitionRole::List { parent_name, .. })
+            | Some(PartitionRole::Hash { parent_name, .. })
                 if parent_name == parent =>
             {
                 out.push(name);
@@ -77,27 +79,22 @@ pub(crate) fn evaluate_partition_bound(expr: Expr) -> Result<PartitionBound, Eng
         // TIMESTAMP and TIMESTAMPTZ share `Value::Timestamp(i64)` —
         // they only differ via `DataType` at the column level.
         Value::Timestamp(micros) => Ok(PartitionBound::TimestampTz(micros)),
-        Value::Date(days) => {
-            // PG-style: a DATE as a TIMESTAMPTZ bound expands to
-            // midnight UTC of that day, in microseconds.
-            let micros = i64::from(days) * 86_400i64 * 1_000_000i64;
-            Ok(PartitionBound::TimestampTz(micros))
-        }
+        Value::Date(days) => Ok(PartitionBound::Date(days)),
+        Value::BigInt(n) => Ok(PartitionBound::BigInt(n)),
+        Value::Int(n) => Ok(PartitionBound::Int(n)),
+        Value::SmallInt(n) => Ok(PartitionBound::SmallInt(n)),
         Value::Text(s) => {
-            // Text literal that didn't fold through the parser's typed
-            // path(common after a placeholder substitution). Reuse
-            // the same TIMESTAMPTZ parser the regular Value path uses;
-            // surface a parser miss as Unsupported.
+            // Text literal: ambiguous — could be a TIMESTAMPTZ
+            // string-folded literal (Range tail), or a literal TEXT
+            // value (LIST tail). Try TIMESTAMPTZ parse first; if it
+            // fails, fall through to TEXT membership.
             match crate::eval::parse_timestamp_literal(&s) {
                 Some(micros) => Ok(PartitionBound::TimestampTz(micros)),
-                None => Err(EngineError::Unsupported(format!(
-                    "PARTITION OF: bound literal {s:?} not recognised \
-                     as a TIMESTAMPTZ"
-                ))),
+                None => Ok(PartitionBound::Text(s.into_owned())),
             }
         }
         other => Err(EngineError::Unsupported(format!(
-            "PARTITION OF: bound must be TIMESTAMPTZ literal or \
+            "PARTITION OF: bound must be a typed literal or \
              MINVALUE/MAXVALUE, got {other:?}"
         ))),
     }
@@ -174,6 +171,86 @@ pub(crate) fn value_in_range(
         | PartitionBound::Text(_) => false,
     };
     lower_ok && upper_ok
+}
+
+/// v7.37.16 (16.2) — PG-compatible-ish hash for a typed
+/// [`Value`]. PG uses a per-type `hashfn` (e.g. `hashint4`,
+/// `hashint8`, `hashtext`) that ultimately funnel through
+/// `hash_any_extended` and produce a `uint64`. We don't yet
+/// implement those exact opclass hashes — we use a stable
+/// `fnv1a-64` over a type-tagged byte-canonicalisation of the
+/// `Value` so:
+///   1. the same value always lands in the same bucket within a
+///      single SPG cluster (routing determinism), and
+///   2. dump/restore round-trip stays exact (the bucket choice is
+///      a pure function of catalog state + value, no `getpid()` /
+///      `hash_seed` non-determinism).
+///
+/// We will swap this for PG's per-type `hashfn` family in
+/// v7.37.16.13 when full PG hash compatibility (binary equality
+/// with PG-issued `pg_dump --format=c` HASH partitions) becomes
+/// load-bearing for a customer. For now this is "good enough
+/// HASH routing" + a TODO bookmark.
+#[allow(dead_code)] // wired by routing path; tests call via the public route.
+pub(crate) fn pg_compatible_hash(value: &Value<'_>) -> u64 {
+    // FNV-1a 64-bit (RFC reference constants — deterministic
+    // across hosts + endianness).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    // Type-tag first so two values of different types never alias
+    // even when their byte layout happens to coincide.
+    match value {
+        Value::Null => feed(&[0u8]),
+        Value::Bool(b) => {
+            feed(&[1u8]);
+            feed(&[u8::from(*b)]);
+        }
+        Value::SmallInt(n) => {
+            feed(&[2u8]);
+            feed(&n.to_le_bytes());
+        }
+        Value::Int(n) => {
+            feed(&[3u8]);
+            feed(&n.to_le_bytes());
+        }
+        Value::BigInt(n) => {
+            feed(&[4u8]);
+            feed(&n.to_le_bytes());
+        }
+        Value::Float(f) => {
+            feed(&[6u8]);
+            feed(&f.to_bits().to_le_bytes());
+        }
+        Value::Text(s) => {
+            feed(&[7u8]);
+            feed(s.as_bytes());
+        }
+        Value::Date(d) => {
+            feed(&[8u8]);
+            feed(&d.to_le_bytes());
+        }
+        Value::Timestamp(m) => {
+            feed(&[9u8]);
+            feed(&m.to_le_bytes());
+        }
+        // Anything else (Bytea, Numeric, UUID, JSON, Vector,
+        // Interval, Time, Array, …) folds through its Debug form
+        // for now — same determinism guarantee, lower binary
+        // compatibility with PG. v7.37.16.13 will replace per
+        // type.
+        other => {
+            feed(&[255u8]);
+            feed(format!("{other:?}").as_bytes());
+        }
+    }
+    h
 }
 
 /// Render a [`PartitionBound`] for diagnostic / error messages.

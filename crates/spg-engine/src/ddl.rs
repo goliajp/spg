@@ -1328,6 +1328,8 @@ impl Engine {
         if let Some(by) = stmt.partition_by {
             let kind = match by.kind {
                 PartitionKindAst::Range => PartitionKind::Range,
+                PartitionKindAst::List => PartitionKind::List,
+                PartitionKindAst::Hash => PartitionKind::Hash,
             };
             let mut key_column_positions = Vec::with_capacity(by.key_columns.len());
             for col_name in &by.key_columns {
@@ -1340,11 +1342,31 @@ impl Engine {
                             "PARTITION BY: key column {col_name:?} not in column list"
                         ))
                     })?;
-                if !matches!(schema.columns[pos].ty, DataType::Timestamptz) {
+                // v7.37.16 (16.1/16.2/16.6) — accept the typed PG
+                // builtins per partition strategy:
+                //   RANGE → TIMESTAMPTZ / TIMESTAMP / DATE / BIGINT
+                //           / INTEGER / SMALLINT
+                //   LIST  → BIGINT / INTEGER / SMALLINT / DATE / TEXT
+                //   HASH  → BIGINT / INTEGER / SMALLINT / TEXT / DATE
+                //           / TIMESTAMPTZ
+                let key_ty = &schema.columns[pos].ty;
+                let key_ok = matches!(
+                    key_ty,
+                    DataType::Timestamptz
+                        | DataType::Timestamp
+                        | DataType::Date
+                        | DataType::BigInt
+                        | DataType::Int
+                        | DataType::SmallInt
+                        | DataType::Text
+                        | DataType::Varchar(_)
+                );
+                if !key_ok {
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "PARTITION BY: key column {col_name:?} must be TIMESTAMPTZ \
-                         at v7.37.6-B (got {:?})",
-                        schema.columns[pos].ty
+                        "PARTITION BY {:?}: key column {col_name:?} type {key_ty:?} \
+                         is not yet supported (16.1/16.2/16.6 accept TIMESTAMPTZ, \
+                         TIMESTAMP, DATE, BIGINT, INTEGER, SMALLINT, TEXT/VARCHAR)",
+                        kind,
                     )));
                 }
                 key_column_positions.push(pos);
@@ -1460,6 +1482,102 @@ impl Engine {
                     parent_name: spec.parent_name.clone(),
                     lower: lower_b,
                     upper: upper_b,
+                }
+            }
+            // v7.37.16 (16.1) — LIST child create.
+            PartitionOfBoundsAst::List { values } => {
+                if !matches!(parent_kind, PartitionKind::List) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION OF: FOR VALUES IN (...) only valid for \
+                         a LIST-partitioned parent (parent {:?} is {:?})",
+                        spec.parent_name,
+                        parent_kind,
+                    )));
+                }
+                let mut bounds = Vec::with_capacity(values.len());
+                for v in values {
+                    bounds.push(crate::partition::evaluate_partition_bound(v)?);
+                }
+                // Reject duplicate values across siblings (PG raises
+                // "is already specified in partition X" at create
+                // time so the dispatch never sees ambiguity).
+                let siblings =
+                    crate::partition::children_of_parent(self.active_catalog(), &spec.parent_name);
+                for sib in &siblings {
+                    let Some(t) = self.active_catalog().get(sib) else {
+                        continue;
+                    };
+                    if let Some(PartitionRole::List {
+                        values: existing, ..
+                    }) = &t.schema().partition_role
+                    {
+                        for new_b in &bounds {
+                            if existing.iter().any(|e| e == new_b) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "PARTITION OF: LIST value {} already in \
+                                     sibling child {sib:?}",
+                                    crate::partition::bound_to_diag(new_b),
+                                )));
+                            }
+                        }
+                    }
+                }
+                PartitionRole::List {
+                    parent_name: spec.parent_name.clone(),
+                    values: bounds,
+                }
+            }
+            // v7.37.16 (16.2) — HASH child create.
+            PartitionOfBoundsAst::Hash { modulus, remainder } => {
+                if !matches!(parent_kind, PartitionKind::Hash) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION OF: FOR VALUES WITH (MODULUS, REMAINDER) only \
+                         valid for a HASH-partitioned parent (parent {:?} is {:?})",
+                        spec.parent_name,
+                        parent_kind,
+                    )));
+                }
+                if modulus == 0 || remainder >= modulus {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION OF HASH: invalid (MODULUS={modulus}, REMAINDER={remainder}); \
+                         require modulus > 0 and remainder < modulus",
+                    )));
+                }
+                // Reject duplicate (modulus, remainder) and partial overlap
+                // (different modulus / same residue class) — PG handles
+                // multi-modulus by requiring divisibility; we keep it
+                // simple and demand modulus equality across HASH siblings.
+                let siblings =
+                    crate::partition::children_of_parent(self.active_catalog(), &spec.parent_name);
+                for sib in &siblings {
+                    let Some(t) = self.active_catalog().get(sib) else {
+                        continue;
+                    };
+                    if let Some(PartitionRole::Hash {
+                        modulus: m,
+                        remainder: r,
+                        ..
+                    }) = &t.schema().partition_role
+                    {
+                        if *m != modulus {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "PARTITION OF HASH: MODULUS {modulus} differs from \
+                                 sibling {sib:?} MODULUS {m} (mixed moduli not yet \
+                                 supported in v7.37.16.2)",
+                            )));
+                        }
+                        if *r == remainder {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "PARTITION OF HASH: REMAINDER {remainder} already \
+                                 used by sibling {sib:?}",
+                            )));
+                        }
+                    }
+                }
+                PartitionRole::Hash {
+                    parent_name: spec.parent_name.clone(),
+                    modulus,
+                    remainder,
                 }
             }
         };
