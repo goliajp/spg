@@ -129,7 +129,7 @@ use substitute::*;
 use system_catalog::*;
 use window::*;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -409,6 +409,23 @@ pub struct Engine {
     /// Monotonic counter for `alloc_tx_id`. Starts at 1 — slot 0 is
     /// reserved for `IMPLICIT_TX`.
     next_tx_id: u64,
+    /// v7.37.15 (Phase C) — versions allocated by in-flight
+    /// writers. Snapshot construction folds this into the
+    /// `Snapshot.in_progress` set so concurrent readers (or readers
+    /// inside an older snapshot's REPEATABLE READ) don't see
+    /// uncommitted writes.
+    ///
+    /// SPG's single-writer invariant means at most one writer
+    /// version sits here at any moment (the one currently
+    /// executing inside the engine write lock). The set survives
+    /// engine clones because tx-commit removes versions before the
+    /// `Engine::snapshot_data` returns, so a snapshot taken after
+    /// commit observes an empty set.
+    ///
+    /// `BTreeSet` (not Vec) so iteration is sorted — Snapshot
+    /// constructor expects the input sorted for binary-search
+    /// `contains` correctness.
+    active_writer_versions: BTreeSet<u64>,
     /// v7.22 (round-13 T3) — session string-literal dialect. `false`
     /// (default) = PG semantics (backslash literal, `''` escape);
     /// `true` = MySQL semantics (`\'` etc.). Flipped by the
@@ -620,6 +637,7 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             next_tx_id: 1,
+            active_writer_versions: BTreeSet::new(),
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -669,23 +687,61 @@ impl Engine {
         }
     }
 
-    /// v7.37.15 (Phase B) — current per-row visibility snapshot for
-    /// in-engine scans. Returns [`Snapshot::unbounded`] until Phase C
-    /// wires per-transaction version tracking through the engine
-    /// (writer assigns xmin on commit, reader builds a per-statement
-    /// or per-transaction snapshot from the live version counter +
-    /// active-tx bitmap).
+    /// v7.37.15 (Phase B / C) — current per-row visibility snapshot
+    /// for in-engine scans. Captures the live writer-version cursor
+    /// + active-writer set; readers built from this Snapshot see
+    /// committed state through the moment of capture and DO NOT
+    /// observe uncommitted writes still inside `active_writer_versions`.
     ///
-    /// Engine-internal scan paths consult this when calling
-    /// `Table::scan_visible(&snap)`. The `unbounded` default makes
-    /// every row visible — preserving the pre-v7.37.15 behaviour
-    /// exactly during the gradual retrofit.
+    /// `oldest_active = version` when no writer is in flight (== no
+    /// dead row could still be observed); else == min of active
+    /// versions (vacuum-floor).
     #[must_use]
     pub fn current_snapshot(&self) -> spg_storage::snapshot::Snapshot {
-        // Phase B placeholder. Phase C will track active tx + the
-        // version counter on the engine; this getter then returns
-        // the engine's live snapshot for new readers.
-        spg_storage::snapshot::Snapshot::unbounded()
+        let version = spg_storage::row_header::current_version();
+        if self.active_writer_versions.is_empty() {
+            // Hot path: no writer in flight. Snapshot::unbounded()
+            // would also work, but pinning to the live cursor
+            // means the snapshot's oldest_active is accurate
+            // (= version) so subsequent vacuum can advance.
+            return spg_storage::snapshot::Snapshot::new(
+                version,
+                spg_storage::snapshot::InProgressSet::empty(),
+                version,
+                0,
+            );
+        }
+        let sorted: alloc::vec::Vec<u64> =
+            self.active_writer_versions.iter().copied().collect();
+        let oldest = *sorted.first().unwrap_or(&version);
+        spg_storage::snapshot::Snapshot::new(
+            version,
+            spg_storage::snapshot::InProgressSet::from_sorted(sorted),
+            oldest,
+            0,
+        )
+    }
+
+    /// v7.37.15 (Phase C) — allocate the next writer version AND
+    /// add it to the in-flight set so concurrent snapshots hide
+    /// the resulting writes until [`Self::commit_writer_version`]
+    /// removes the entry. Returns the allocated version so the
+    /// writer can stamp it on `xmin` / `xmax`.
+    pub fn begin_writer_version(&mut self) -> u64 {
+        let v = spg_storage::row_header::next_version();
+        self.active_writer_versions.insert(v);
+        v
+    }
+
+    /// v7.37.15 (Phase C) — mark a previously-allocated writer
+    /// version as committed. Subsequent snapshots stop including
+    /// it in `in_progress`, so the writes the version stamped
+    /// become visible to new readers.
+    ///
+    /// No-op if the version was never allocated; matches PG's
+    /// idempotent `TransactionIdCommitTree` semantics.
+    pub fn commit_writer_version(&mut self, v: u64) {
+        self.active_writer_versions.remove(&v);
     }
 
     /// v7.37.15 (Phase C) — allocate a fresh version number for
@@ -714,6 +770,7 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             next_tx_id: 1,
+            active_writer_versions: BTreeSet::new(),
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -787,6 +844,7 @@ impl Engine {
                     current_tx: None,
                     backslash_escapes: false,
                     next_tx_id: 1,
+            active_writer_versions: BTreeSet::new(),
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
