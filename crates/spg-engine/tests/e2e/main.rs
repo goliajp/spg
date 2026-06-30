@@ -10,6 +10,7 @@ mod e2e;
 mod e2e_agg_subquery_pullup;
 mod e2e_alter_add_column;
 mod e2e_alter_column_default_notnull;
+mod e2e_alter_table_pg_dump_compat;
 mod e2e_array_agg_argmax;
 mod e2e_array_family;
 mod e2e_array_ops;

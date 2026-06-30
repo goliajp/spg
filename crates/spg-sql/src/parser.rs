@@ -4308,21 +4308,103 @@ impl Parser {
         match self.peek() {
             Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
                 self.advance();
+                // v7.37.18 (18.7-18.15) — SET ( option = value, … )
+                // storage parameters: paren-prefixed; consume.
+                if matches!(self.peek(), Token::LParen) {
+                    self.consume_until_statement_boundary();
+                    return Ok(Vec::new());
+                }
                 let setting = self.expect_ident_like()?;
-                if !setting.eq_ignore_ascii_case("hot_tier_bytes") {
-                    return Err(self.err(alloc::format!(
-                        "ALTER TABLE SET: unknown setting {setting:?}; supported: hot_tier_bytes"
-                    )));
+                if setting.eq_ignore_ascii_case("hot_tier_bytes") {
+                    if !matches!(self.peek(), Token::Eq) {
+                        return Err(self.err(alloc::format!(
+                            "expected '=' after hot_tier_bytes, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let n = self.expect_u64_literal()?;
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::SetHotTierBytes(n)]);
                 }
-                if !matches!(self.peek(), Token::Eq) {
-                    return Err(self.err(alloc::format!(
-                        "expected '=' after hot_tier_bytes, got {:?}",
-                        self.peek()
-                    )));
+                // v7.37.18 (18.7 / 18.8 / 18.11 / 18.13 / 18.14) —
+                // accept-and-no-op for ALTER TABLE SET <subject>
+                // forms that pg_dump emits but SPG either treats
+                // as N/A (single-tenant, single-owner, no shared
+                // tablespaces) or accepts the dump-side declaration
+                // without runtime effect:
+                //   SET SCHEMA <name>            (18.11)
+                //   SET TABLESPACE <name>        (18.8)
+                //   SET LOGGED / UNLOGGED        (18.7 alt-form)
+                //   SET WITHOUT CLUSTER          (18.13)
+                //   SET WITHOUT OIDS             (PG legacy)
+                //   SET (option = value, …)      (storage parameters)
+                //   SET REPLICA IDENTITY {…}     (18.14)
+                if setting.eq_ignore_ascii_case("schema")
+                    || setting.eq_ignore_ascii_case("tablespace")
+                    || setting.eq_ignore_ascii_case("logged")
+                    || setting.eq_ignore_ascii_case("unlogged")
+                    || setting.eq_ignore_ascii_case("without")
+                {
+                    self.consume_until_statement_boundary();
+                    return Ok(Vec::new());
                 }
+                if setting.eq_ignore_ascii_case("replica") {
+                    // SET REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX <name>}
+                    self.consume_until_statement_boundary();
+                    return Ok(Vec::new());
+                }
+                // SET (option=value, …) — storage parameters.
+                if matches!(self.peek(), Token::LParen) {
+                    self.consume_until_statement_boundary();
+                    return Ok(Vec::new());
+                }
+                Err(self.err(alloc::format!(
+                    "ALTER TABLE SET: unknown setting {setting:?}; supported: \
+                     hot_tier_bytes / SCHEMA / TABLESPACE / LOGGED / UNLOGGED / \
+                     WITHOUT CLUSTER / WITHOUT OIDS / REPLICA IDENTITY / (storage_params)"
+                )))
+            }
+            // v7.37.18 (18.9) — ALTER TABLE INHERIT / NO INHERIT.
+            // SPG doesn't support PG-style inheritance (declarative
+            // partitioning v7.37.16 covers the common case); accept
+            // and ignore.
+            Token::Ident(s) if s.eq_ignore_ascii_case("inherit") => {
                 self.advance();
-                let n = self.expect_u64_literal()?;
-                Ok(alloc::vec![crate::ast::AlterTableTarget::SetHotTierBytes(n)])
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("no") => {
+                // `NO INHERIT <parent>`
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.10) — ALTER TABLE OWNER TO <user>. SPG
+            // is single-owner; accept-and-no-op.
+            Token::Ident(s) if s.eq_ignore_ascii_case("owner") => {
+                self.advance();
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                }
+                let _ = self.expect_ident_like().ok();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.13) — ALTER TABLE CLUSTER ON <index>.
+            // PG sets a hint; SPG doesn't have clustered storage.
+            // Accept-and-no-op.
+            Token::Ident(s) if s.eq_ignore_ascii_case("cluster") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.37.18 (18.15) — ALTER TABLE VALIDATE CONSTRAINT
+            // <name>. SPG validates inline at ADD CONSTRAINT time
+            // (no NOT VALID / VALIDATE separation), so VALIDATE is
+            // an accept-and-no-op for pg_dump round-trip.
+            Token::Ident(s) if s.eq_ignore_ascii_case("validate") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
