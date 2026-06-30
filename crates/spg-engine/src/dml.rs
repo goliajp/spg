@@ -731,8 +731,16 @@ impl Engine {
         if !delete_indices.is_empty() {
             table.delete_rows(&delete_indices);
         }
+        // v7.37.15 Phase C — MERGE inserts allocate one shared
+        // writer version: every row produced by the same statement
+        // commits atomically so they share `xmin`. Snapshots taken
+        // before the statement commits hide every inserted row;
+        // snapshots after see them all.
+        let xmin = spg_storage::row_header::next_version();
         for vals in inserts {
-            table.insert(Row::new(vals)).map_err(EngineError::Storage)?;
+            table
+                .insert_with_xmin(Row::new(vals), xmin)
+                .map_err(EngineError::Storage)?;
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -2142,7 +2150,13 @@ fn insert_parsed_rows(
         // v7.12.4 — clone for the AFTER trigger view; insert
         // moves the row into the table.
         let inserted = row.clone();
-        table.insert(row)?;
+        // v7.37.15 Phase C — stamp the row with the writer's
+        // version. Snapshots taken before this statement commits
+        // hide the row; snapshots after see it. Each INSERT
+        // statement allocates one version; rows produced by the
+        // SAME statement share `xmin` so they commit atomically.
+        let xmin = spg_storage::row_header::next_version();
+        table.insert_with_xmin(row, xmin)?;
         affected += 1;
         // v7.12.4 — AFTER INSERT row-level triggers fire post-
         // write. Return value is ignored (PG semantics); we
