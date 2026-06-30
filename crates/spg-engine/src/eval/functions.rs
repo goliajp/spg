@@ -1630,6 +1630,75 @@ fn apply_function_dispatch(
         // written today against this surface keep working when
         // v7.37.15 starts populating real chains.
         "pg_blocking_pids" => Ok(Value::Null),
+        // v7.37.16 (16.12) — PG partition catalog scalar functions.
+        // PG `pg_partition_root(regclass)` returns the top-most
+        // ancestor of a partition. SPG's catalog only knows table
+        // names (not OIDs), so we take TEXT; a non-existent name
+        // or non-partition table returns NULL (matches PG).
+        "pg_partition_root" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "pg_partition_root() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let name = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_partition_root() arg must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            Ok(match crate::partition_walks::root_of(cat, &name) {
+                Some(root) => Value::text::<String>(root),
+                None => Value::Null,
+            })
+        }
+        // PG `pg_partition_ancestors(regclass)` is set-returning;
+        // SPG's scalar form returns a comma-separated TEXT (no SRF
+        // surface yet). The ordered chain from leaf → root mirrors
+        // PG's row order; same semantics for a non-partition table
+        // (single-row containing the input name).
+        "pg_partition_ancestors" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "pg_partition_ancestors() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let name = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_partition_ancestors() arg must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let chain = crate::partition_walks::ancestors_of(cat, &name);
+            if chain.is_empty() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::text::<String>(chain.join(",")))
+        }
         // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
         // canonical PG lowercase type name. sqlx / SQLAlchemy /
         // Diesel emit this during describe; generic ORMs may

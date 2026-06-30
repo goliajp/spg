@@ -130,6 +130,13 @@ impl Engine {
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
+            // v7.37.16 (16.12) — thread the read-only catalog so
+            // builtins like pg_partition_root can walk partition
+            // roles. Other EvalContext call sites (scan paths,
+            // joinfold, aggregate) continue to construct without
+            // catalog access; catalog-aware builtins return NULL
+            // there per documented contract.
+            .with_catalog(&self.catalog)
     }
 }
 

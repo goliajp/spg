@@ -109,6 +109,16 @@ pub struct EvalContext<'a> {
     /// eval owning a catalog reference. When `None`, sequence
     /// functions return an error (read-only contexts).
     pub sequence_resolver: Option<&'a SequenceResolver<'a>>,
+    /// v7.37.16 (16.12) — read-only catalog reference for
+    /// builtins that need catalog walks (e.g. `pg_partition_root`,
+    /// `pg_partition_ancestors`). `None` falls through to the
+    /// "no catalog available" branch which returns NULL — same
+    /// shape PG returns for a non-existent OID. Most evaluation
+    /// sites don't need catalog access (row scans, projections);
+    /// they construct contexts with `catalog: None` and the
+    /// engine populates `Some(&self.catalog)` only at the engine's
+    /// top-level entry points where the borrow is unambiguous.
+    pub catalog: Option<&'a spg_storage::Catalog>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -137,7 +147,17 @@ impl<'a> EvalContext<'a> {
             params: &[],
             default_text_search_config: None,
             sequence_resolver: None,
+            catalog: None,
         }
+    }
+
+    /// v7.37.16 (16.12) — attach a read-only catalog reference
+    /// so builtins like `pg_partition_root` can walk partition
+    /// roles. Defaults to None (NULL semantics).
+    #[must_use]
+    pub const fn with_catalog(mut self, catalog: &'a spg_storage::Catalog) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// v7.17.0 — attach a sequence resolver. The engine wraps a
