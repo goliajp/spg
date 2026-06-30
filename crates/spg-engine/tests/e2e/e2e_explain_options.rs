@@ -105,6 +105,85 @@ fn explain_combined_options_compose() {
     assert!(!plan.contains("elapsed="), "TIMING OFF wins: {plan}");
 }
 
+// v7.37.23 (23.5) — EXPLAIN (FORMAT json / xml / yaml).
+
+#[test]
+fn explain_format_json_wraps_plan_in_array_of_lines() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    let plan = plan_text(&mut e, "EXPLAIN (FORMAT json) SELECT * FROM t");
+    let plan = plan.trim_end();
+    assert!(plan.starts_with('['), "JSON must open with [: {plan}");
+    assert!(plan.ends_with(']'), "JSON must close with ]: {plan}");
+    assert!(
+        plan.contains("\"Plan Line\""),
+        "JSON object key missing: {plan}"
+    );
+    assert!(plan.contains("TableScan"), "plan body missing: {plan}");
+}
+
+#[test]
+fn explain_format_xml_wraps_plan_in_explain_element() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    let plan = plan_text(&mut e, "EXPLAIN (FORMAT xml) SELECT * FROM t");
+    let plan = plan.trim_end();
+    assert!(
+        plan.starts_with("<explain"),
+        "XML must open with <explain: {plan}"
+    );
+    assert!(
+        plan.ends_with("</explain>"),
+        "XML must close: {plan}"
+    );
+    assert!(plan.contains("<line>"), "line element missing: {plan}");
+}
+
+#[test]
+fn explain_format_yaml_emits_list_items() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    let plan = plan_text(&mut e, "EXPLAIN (FORMAT yaml) SELECT * FROM t");
+    assert!(
+        plan.starts_with("- Plan:"),
+        "YAML must start with `- Plan:`: {plan}"
+    );
+    assert!(plan.contains("  - "), "no nested list item: {plan}");
+}
+
+#[test]
+fn explain_format_text_default_unchanged() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    let plan = plan_text(&mut e, "EXPLAIN (FORMAT text) SELECT * FROM t");
+    assert!(
+        plan.contains("TableScan"),
+        "TEXT format body broken: {plan}"
+    );
+    // TEXT format emits one row per line; JSON would be a single
+    // row whose body starts with `[`. Confirm we have multiple
+    // lines (i.e. multiple rows joined by `\n` in our plan_text
+    // helper).
+    assert!(
+        plan.matches('\n').count() >= 2,
+        "TEXT format must emit multiple rows: {plan}"
+    );
+}
+
+#[test]
+fn explain_format_unknown_rejected() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    let err = e
+        .execute("EXPLAIN (FORMAT lisp) SELECT * FROM t")
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("FORMAT") || msg.contains("lisp"),
+        "expected unknown-format error: {msg}"
+    );
+}
+
 #[test]
 fn explain_accepts_pg_format_and_verbose_aliases() {
     // VERBOSE, FORMAT text, SUMMARY are accepted but treated as
