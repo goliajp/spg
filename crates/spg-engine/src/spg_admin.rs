@@ -18,6 +18,25 @@ use crate::{
 };
 use crate::{query_stats, statistics};
 
+/// v7.37.16 (16.11) — render a PartitionBound for the
+/// `spg_partition_health.bound_desc` column. Mirrors
+/// `crate::partition::bound_to_diag` but lives here so this
+/// crate's `spg_admin` module doesn't need to depend on the
+/// engine-private partition helpers.
+fn partition_bound_diag(b: &spg_storage::PartitionBound) -> String {
+    use spg_storage::PartitionBound;
+    match b {
+        PartitionBound::MinValue => "MINVALUE".into(),
+        PartitionBound::MaxValue => "MAXVALUE".into(),
+        PartitionBound::TimestampTz(m) => alloc::format!("'{m}'::timestamptz"),
+        PartitionBound::BigInt(n) => alloc::format!("{n}::bigint"),
+        PartitionBound::Int(n) => alloc::format!("{n}::integer"),
+        PartitionBound::SmallInt(n) => alloc::format!("{n}::smallint"),
+        PartitionBound::Date(d) => alloc::format!("{d}::date"),
+        PartitionBound::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
 impl Engine {
     /// v6.2.0 — materialise `spg_statistic` rows. One row per
     /// `(table, column)` pair tracked in `Statistics`, with
@@ -380,6 +399,113 @@ impl Engine {
             Value::Int(active),
             Value::BigInt(oldest),
         ])];
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.37.16 (16.11 [PG+]) — materialise `spg_partition_health`
+    /// rows: one row per partition (Range / List / Hash / Default /
+    /// Parent), plus a "row_count" / "bound" diag column so dashboard
+    /// queries can size a partitioned table at a glance without
+    /// joining catalog tables. PG provides `pg_partitioned_table` +
+    /// `pg_inherits` + per-child `pg_class.reltuples`; SPG bundles
+    /// them into one easy view because dogfood / sentori dashboards
+    /// kept reaching for it.
+    ///
+    /// Columns:
+    ///   parent_name TEXT NOT NULL      -- parent table name, or
+    ///                                     the partition name itself
+    ///                                     when role == 'Parent'
+    ///   partition_name TEXT NOT NULL   -- the partition (or
+    ///                                     parent) name
+    ///   role TEXT NOT NULL             -- 'Parent' | 'Range'
+    ///                                     | 'List' | 'Hash'
+    ///                                     | 'Default'
+    ///   row_count BIGINT NOT NULL      -- live row count
+    ///   bound_desc TEXT NOT NULL       -- human-readable bound for
+    ///                                     diagnostics ('' for
+    ///                                     Parent + DEFAULT)
+    pub(crate) fn exec_spg_partition_health(&self) -> QueryResult {
+        use spg_storage::PartitionRole;
+        let columns = alloc::vec![
+            ColumnSchema::new("parent_name", DataType::Text, false),
+            ColumnSchema::new("partition_name", DataType::Text, false),
+            ColumnSchema::new("role", DataType::Text, false),
+            ColumnSchema::new("row_count", DataType::BigInt, false),
+            ColumnSchema::new("bound_desc", DataType::Text, false),
+        ];
+        let mut rows: Vec<Row<'static>> = Vec::new();
+        for name in self.catalog.table_names() {
+            let Some(t) = self.catalog.get(&name) else {
+                continue;
+            };
+            let role = match &t.schema().partition_role {
+                None => continue,
+                Some(r) => r,
+            };
+            let row_count = t.rows().len() as i64;
+            let (parent, role_str, bound) = match role {
+                PartitionRole::Parent { kind, .. } => {
+                    let kind_str = match kind {
+                        spg_storage::PartitionKind::Range => "RANGE",
+                        spg_storage::PartitionKind::List => "LIST",
+                        spg_storage::PartitionKind::Hash => "HASH",
+                    };
+                    (
+                        name.clone(),
+                        alloc::string::String::from("Parent"),
+                        alloc::format!("PARTITION BY {kind_str}"),
+                    )
+                }
+                PartitionRole::Range {
+                    parent_name,
+                    lower,
+                    upper,
+                } => (
+                    parent_name.clone(),
+                    alloc::string::String::from("Range"),
+                    alloc::format!(
+                        "FROM ({}) TO ({})",
+                        partition_bound_diag(lower),
+                        partition_bound_diag(upper)
+                    ),
+                ),
+                PartitionRole::List {
+                    parent_name,
+                    values,
+                } => {
+                    let mut diag = alloc::string::String::from("IN (");
+                    for (i, v) in values.iter().enumerate() {
+                        if i > 0 {
+                            diag.push_str(", ");
+                        }
+                        diag.push_str(&partition_bound_diag(v));
+                    }
+                    diag.push(')');
+                    (parent_name.clone(), alloc::string::String::from("List"), diag)
+                }
+                PartitionRole::Hash {
+                    parent_name,
+                    modulus,
+                    remainder,
+                } => (
+                    parent_name.clone(),
+                    alloc::string::String::from("Hash"),
+                    alloc::format!("WITH (MODULUS {modulus}, REMAINDER {remainder})"),
+                ),
+                PartitionRole::Default { parent_name } => (
+                    parent_name.clone(),
+                    alloc::string::String::from("Default"),
+                    alloc::string::String::new(),
+                ),
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::Text(alloc::borrow::Cow::Owned(parent)),
+                Value::Text(alloc::borrow::Cow::Owned(name)),
+                Value::Text(alloc::borrow::Cow::Owned(role_str)),
+                Value::BigInt(row_count),
+                Value::Text(alloc::borrow::Cow::Owned(bound)),
+            ]));
+        }
         QueryResult::Rows { columns, rows }
     }
 
