@@ -193,6 +193,99 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.24 (24.13) — synthesise `pg_catalog.pg_am`.
+/// PG index/table access methods (heap, btree, hash, gist,
+/// gin, spgist, brin). pg_dump queries this to validate the AM
+/// for each index it emits; ORMs that follow `pg_class.relam`
+/// FK to learn how to query an index also read it. SPG ships
+/// 2 AMs today: `heap` (the table AM) and `btree` (the only
+/// real index AM; nsw / bloom / brin live as engine-private
+/// index kinds — they surface as `btree` via pg_class to keep
+/// the join shape stable).
+pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("amname", DataType::Text, false),
+        ColumnSchema::new("amhandler", DataType::BigInt, false),
+        ColumnSchema::new("amtype", DataType::Text, false), // 't' table / 'i' index
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(2),
+            Value::text("heap"),
+            Value::BigInt(0),
+            Value::text("t"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(403),
+            Value::text("btree"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+    ];
+    (schema, rows)
+}
+
+/// v7.37.24 (24.14) — synthesise `pg_catalog.pg_collation`.
+/// PG's collation list. ORMs that bind TEXT columns to a
+/// language-specific collation read this at handshake to map
+/// names → OIDs. SPG ships the three PG-standard collations
+/// (`default` / `C` / `POSIX`) — every TEXT column uses
+/// `default` so column-level COLLATE clauses parse but don't
+/// alter sort order. v7.37.x doesn't yet support per-locale
+/// ICU collations; the view shape lets monitoring queries +
+/// pg_dump's COLLATE-restoration query both resolve.
+pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("collname", DataType::Text, false),
+        ColumnSchema::new("collnamespace", DataType::BigInt, false),
+        ColumnSchema::new("collowner", DataType::BigInt, false),
+        ColumnSchema::new("collprovider", DataType::Text, false), // 'b'/'c'/'i'
+        ColumnSchema::new("collisdeterministic", DataType::Bool, false),
+        ColumnSchema::new("collencoding", DataType::Int, false),
+        ColumnSchema::new("collcollate", DataType::Text, true),
+        ColumnSchema::new("collctype", DataType::Text, true),
+    ];
+    // PG hard-codes OIDs 100 = default, 950 = C, 951 = POSIX.
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(100),
+            Value::text("default"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::text("d"),
+            Value::Bool(true),
+            Value::Int(-1),
+            Value::Null,
+            Value::Null,
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(950),
+            Value::text("C"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::text("c"),
+            Value::Bool(true),
+            Value::Int(-1),
+            Value::text("C"),
+            Value::text("C"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(951),
+            Value::text("POSIX"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::text("c"),
+            Value::Bool(true),
+            Value::Int(-1),
+            Value::text("POSIX"),
+            Value::text("POSIX"),
+        ]),
+    ];
+    (schema, rows)
+}
+
 /// v7.37.22 (22.17) — synthesise `pg_catalog.pg_stat_archiver`.
 /// PG monitoring tools poll this single-row view to track WAL
 /// archival progress. SPG uses in-process WAL pubsub (see

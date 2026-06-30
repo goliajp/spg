@@ -448,6 +448,18 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.24 (24.13) — pg_catalog.pg_am.
+                "__spg_pg_am" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_am(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.24 (24.14) — pg_catalog.pg_collation.
+                "__spg_pg_collation" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_collation(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.23 (23.6-b) — pg_catalog.pg_tablespace.
                 "__spg_pg_tablespace" => {
                     let (schema, rows) =
