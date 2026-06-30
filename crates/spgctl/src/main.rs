@@ -58,6 +58,92 @@ fn main() {
         Some("version") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
         }
+        // v7.37.23 (23.2) — psql meta-command equivalents:
+        //   \d  / describe          — list relations  (tables + views + indexes + sequences)
+        //   \dt / describe-tables   — list tables only
+        //   \di / describe-indexes  — list indexes
+        //   \dv / describe-views    — list views
+        //   \df / describe-functions— list functions
+        //   \du / describe-roles    — list roles / users
+        //   \l  / describe-databases— list databases
+        //   \dn / describe-schemas  — list schemas
+        // Each verb dispatches a canned SQL query against the server over
+        // the existing TCP path so the operator gets the same one-line
+        // shape as psql without spinning up a REPL (23.1) first. Useful
+        // in pipelines and CI gates.
+        Some(verb)
+            if matches!(
+                verb,
+                "\\d" | "\\dt"
+                    | "\\di"
+                    | "\\dv"
+                    | "\\df"
+                    | "\\du"
+                    | "\\l"
+                    | "\\dn"
+                    | "describe"
+                    | "describe-tables"
+                    | "describe-indexes"
+                    | "describe-views"
+                    | "describe-functions"
+                    | "describe-roles"
+                    | "describe-databases"
+                    | "describe-schemas"
+            ) =>
+        {
+            let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
+            let sql = match verb {
+                "\\d" | "describe" => {
+                    "SELECT relname AS name, relkind AS kind, relnamespace AS schema_oid \
+                     FROM pg_catalog.pg_class \
+                     WHERE relkind IN ('r','v','i','S','m','p') \
+                     ORDER BY relkind, relname"
+                }
+                "\\dt" | "describe-tables" => {
+                    "SELECT relname AS name, relnatts AS columns, reltuples AS rows \
+                     FROM pg_catalog.pg_class \
+                     WHERE relkind IN ('r','p') \
+                     ORDER BY relname"
+                }
+                "\\di" | "describe-indexes" => {
+                    "SELECT relname AS name, relnatts AS columns \
+                     FROM pg_catalog.pg_class \
+                     WHERE relkind = 'i' \
+                     ORDER BY relname"
+                }
+                "\\dv" | "describe-views" => {
+                    "SELECT relname AS name, relnatts AS columns \
+                     FROM pg_catalog.pg_class \
+                     WHERE relkind IN ('v','m') \
+                     ORDER BY relname"
+                }
+                "\\df" | "describe-functions" => {
+                    "SELECT proname AS name, pronargs AS args, provolatile AS volatility \
+                     FROM pg_catalog.pg_proc \
+                     ORDER BY proname"
+                }
+                "\\du" | "describe-roles" => {
+                    "SELECT rolname AS name, rolsuper AS superuser, rolcanlogin AS can_login \
+                     FROM pg_catalog.pg_roles \
+                     ORDER BY rolname"
+                }
+                "\\l" | "describe-databases" => {
+                    "SELECT datname AS name, datcollate AS collate, datctype AS ctype \
+                     FROM pg_catalog.pg_database \
+                     ORDER BY datname"
+                }
+                "\\dn" | "describe-schemas" => {
+                    "SELECT nspname AS name, nspowner AS owner_oid \
+                     FROM pg_catalog.pg_namespace \
+                     ORDER BY nspname"
+                }
+                _ => unreachable!(),
+            };
+            match query(&addr, sql) {
+                Ok(()) => {}
+                Err(e) => die(&format!("{verb}: {e}"), 1),
+            }
+        }
         // v7.37.22 (22.10) — `spg top` polls `pg_stat_statements` over the
         // existing pgwire/SPG-wire-compatible TCP path every `--interval`
         // seconds (default 2) and prints the top-`--limit` queries
