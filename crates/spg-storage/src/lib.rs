@@ -1387,21 +1387,63 @@ pub enum PartitionRole {
     },
 }
 
-/// v7.37.6-B — 分区策略(v7.37.6-B 只 Range;留 enum 给将来 List/Hash)。
+/// v7.37.6-B — 分区策略。
+///
+/// - `Range`:半开区间 `[lower, upper)`(v7.37.6-B 初始)
+/// - `List` (v7.37.16):枚举集合 — 行属于 partition iff key ∈ children list
+/// - `Hash` (v7.37.16):`hash(key) mod modulus == remainder`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionKind {
     Range,
+    List,
+    Hash,
 }
 
-/// v7.37.6-B — partition 边界 literal。v7.37.6-B 锁 TIMESTAMPTZ
-/// (i64 microseconds since epoch — 与 `Value::Timestamptz` 同存储);
-/// `MinValue` / `MaxValue` 对应 SQL `MINVALUE` / `MAXVALUE`(sentori
-/// 不依赖,但 zero cost 留口)。后续 phase 扩 DateInt / Int8 等。
+/// v7.37.6-B — partition 边界 literal。
+///
+/// v7.37.6-B 仅 `TimestampTz`(i64 microseconds since epoch);
+/// v7.37.16 (16.6) 加全 PG 内建可比类型,匹配 `Value` 的对应 variant
+/// 以避免 LIST membership 比较时的类型转换。
+///
+/// `MinValue` / `MaxValue` 对应 SQL `MINVALUE` / `MAXVALUE`,仅
+/// Range 策略有意义(LIST 无 minvalue/maxvalue 概念,HASH 不
+/// 使用 PartitionBound)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionBound {
     MinValue,
     MaxValue,
     TimestampTz(i64),
+    /// v7.37.16 (16.6) — BIGINT partition key.
+    BigInt(i64),
+    /// v7.37.16 (16.6) — INTEGER partition key (also covers
+    /// `SERIAL` since SPG decomposes it to INTEGER + sequence).
+    Int(i32),
+    /// v7.37.16 (16.6) — SMALLINT partition key.
+    SmallInt(i16),
+    /// v7.37.16 (16.6) — DATE partition key. Stored as days
+    /// since the Unix epoch (matches `Value::Date`).
+    Date(i32),
+    /// v7.37.16 (16.6) — TEXT / VARCHAR partition key.
+    Text(alloc::string::String),
+}
+
+impl PartitionBound {
+    /// v7.37.16 (16.6) — true iff this bound's underlying value
+    /// equals `other`'s. Used for LIST partition membership
+    /// checks. Returns false for `MinValue` / `MaxValue`
+    /// (sentinels — never literal equality).
+    #[must_use]
+    pub fn equals_value(&self, other: &Value<'_>) -> bool {
+        match (self, other) {
+            (PartitionBound::TimestampTz(a), Value::Timestamp(b)) => a == b,
+            (PartitionBound::BigInt(a), Value::BigInt(b)) => a == b,
+            (PartitionBound::Int(a), Value::Int(b)) => a == b,
+            (PartitionBound::SmallInt(a), Value::SmallInt(b)) => a == b,
+            (PartitionBound::Date(a), Value::Date(b)) => a == b,
+            (PartitionBound::Text(a), Value::Text(b)) => a.as_str() == b.as_ref(),
+            _ => false,
+        }
+    }
 }
 
 /// v7.9.19 — composite UNIQUE / PRIMARY KEY constraint persisted

@@ -4364,6 +4364,14 @@ fn range_satisfies_filter(
                     return false;
                 }
             }
+            // v7.37.16 (16.6) — non-TIMESTAMPTZ bounds aren't
+            // matched against TIMESTAMPTZ filters here; keep child
+            // (conservative: don't prune).
+            PartitionBound::BigInt(_)
+            | PartitionBound::Int(_)
+            | PartitionBound::SmallInt(_)
+            | PartitionBound::Date(_)
+            | PartitionBound::Text(_) => {}
         }
     }
     if let Some(hi) = filter_hi {
@@ -4383,6 +4391,11 @@ fn range_satisfies_filter(
                     return false;
                 }
             }
+            PartitionBound::BigInt(_)
+            | PartitionBound::Int(_)
+            | PartitionBound::SmallInt(_)
+            | PartitionBound::Date(_)
+            | PartitionBound::Text(_) => {}
         }
     }
     true
