@@ -32,7 +32,96 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// v7.37.13 (A1.1) — count of times the background self-wake task
+/// successfully invoked the checkpoint trigger on an idle AsyncDatabase.
+///
+/// Process-wide because the task is per-`AsyncDatabase::open_path`
+/// and there can be many. Tests use [`self_wake_fire_count`] as a
+/// witness that the timer actually ticked — relying on base.spg
+/// mtime alone would false-pass when the caller-side time trigger
+/// (v7.37.10) fires on the test's setup SQL.
+static SELF_WAKE_FIRE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// v7.37.13 (A1.1) — snapshot of the process-wide self-wake fire
+/// counter. Tests read this before / after a quiescent window and
+/// assert the delta is positive, witnessing that the timer ticked.
+///
+/// Production code has no reason to read this; it's an observability
+/// hook for tests (and `spgctl`-style diagnostics, future).
+#[must_use]
+pub fn self_wake_fire_count() -> u64 {
+    SELF_WAKE_FIRE_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// v7.37.13 (A1.1) — minimum self-wake tick interval. The task
+/// sleeps at most this long between checks; if the configured
+/// `checkpoint_time_threshold` is smaller, the tick uses half the
+/// threshold so it can fire near the deadline rather than after.
+const SELF_WAKE_MAX_TICK: core::time::Duration = core::time::Duration::from_millis(500);
+
+/// v7.37.13 (A1.1) — background self-wake checkpoint loop. Spawned
+/// once per successful `AsyncDatabase::open_path`. Holds a Weak to
+/// the inner `RwLock<Database>` so it exits the moment the last
+/// `AsyncDatabase` clone drops (no leak, no shutdown channel).
+///
+/// On each tick:
+///   1. Upgrade the Weak. None → all `AsyncDatabase` clones dropped → exit.
+///   2. `blocking_read` the Database (snapshot path needs `&self`).
+///   3. Read the configured threshold. None / Some(ZERO) → exit
+///      (operator opted out via `SPG_EMBEDDED_CHECKPOINT_SECONDS=0`).
+///   4. Invoke `maybe_trigger_checkpoint` — the helper is idempotent
+///      (skips if a checkpoint is already pending / in flight, and
+///      the engine's own dedup gate skips if there's nothing new
+///      to flush since the last snapshot).
+///   5. Bump `SELF_WAKE_FIRE_COUNT` (witness for tests / diagnostics).
+///   6. Sleep min(threshold/2, SELF_WAKE_MAX_TICK).
+///
+/// The whole loop runs on tokio's worker pool (`spawn`), not
+/// `spawn_blocking` — the read-lock + Arc-bump-and-enqueue path is
+/// microseconds, well under the inline-work threshold. The heavy
+/// snapshot serialization happens in the checkpoint worker
+/// (separate std::thread already), not here.
+fn spawn_self_wake_checkpoint_task(weak: std::sync::Weak<tokio::sync::RwLock<Database>>) {
+    tokio::spawn(async move {
+        let mut tick = SELF_WAKE_MAX_TICK;
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(arc) = weak.upgrade() else {
+                // All AsyncDatabase clones dropped → exit cleanly.
+                return;
+            };
+            // Hold the read lock for the briefest possible window —
+            // snapshot_checkpoint_job is an Arc bump + cheap clones,
+            // the actual disk work runs on the checkpoint worker
+            // thread off this borrow. Use async read() so we don't
+            // block the tokio worker (blocking_read would panic with
+            // "Cannot block the current thread from within a runtime").
+            let threshold_opt = {
+                let g = arc.read().await;
+                let t = g.checkpoint_time_threshold();
+                // Skip the trigger when the operator disabled the
+                // path (Some(ZERO) means "fire ASAP"; truly disabled
+                // is None).
+                if t.is_some() {
+                    let _ = g.maybe_trigger_checkpoint();
+                    SELF_WAKE_FIRE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                t
+            };
+            drop(arc);
+            // Adapt the next tick to the configured threshold so a
+            // small threshold doesn't have to wait the 500 ms cap.
+            tick = match threshold_opt {
+                None => SELF_WAKE_MAX_TICK,
+                Some(t) if t.is_zero() => SELF_WAKE_MAX_TICK,
+                Some(t) => (t / 2).max(core::time::Duration::from_millis(10)).min(SELF_WAKE_MAX_TICK),
+            };
+        }
+    });
+}
 
 pub use spg_embedded::{
     ColumnSchema, DataType, Database, EngineError, ParsedStatement, QueryResult, Statement, Value,
@@ -302,6 +391,16 @@ impl AsyncDatabase {
                             if r.is_ok() { "ok" } else { "err" }
                         );
                     }
+                    // v7.37.13 (A1.1) — start the background self-wake
+                    // checkpoint timer on every successful open_path so
+                    // the on-disk snapshot advances on its own schedule
+                    // even if the calling app goes fully idle. The task
+                    // holds a Weak<RwLock<Database>>, so it auto-exits
+                    // when the last AsyncDatabase clone drops.
+                    if let Ok(db) = r {
+                        spawn_self_wake_checkpoint_task(std::sync::Arc::downgrade(&db.inner));
+                        return Ok(db.clone());
+                    }
                     return r.clone();
                 }
             }
@@ -548,6 +647,40 @@ impl AsyncDatabase {
         })
         .await
         .flatten_blocking()
+    }
+
+    /// v7.37.13 — async façade over the sync
+    /// [`spg_embedded::Database::checkpoint_wait`]. Drains the
+    /// background checkpoint worker (waits until any pending /
+    /// in-flight async checkpoint completes), surfaces sticky
+    /// errors, returns. Used by the v7.37.13 self-wake timer tests
+    /// to assert that the worker actually wrote a new snapshot.
+    pub async fn checkpoint_wait(&self) -> Result<(), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_read();
+            guard.checkpoint_wait()
+        })
+        .await
+        .flatten_blocking()
+    }
+
+    /// v7.37.13 — async façade over
+    /// [`spg_embedded::Database::set_checkpoint_time_threshold`]
+    /// for tests. Setting `None` disables the time path; setting
+    /// `Some(d)` overrides the env-var default
+    /// (`SPG_EMBEDDED_CHECKPOINT_SECONDS`). Production callers
+    /// normally don't need this — the env var is the supported
+    /// configuration channel; the setter exists so tests can drop
+    /// the 60 s default to sub-second values without waiting a
+    /// real minute per case.
+    pub async fn set_checkpoint_time_threshold(&self, threshold: Option<core::time::Duration>) {
+        let inner = Arc::clone(&self.inner);
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_write();
+            guard.set_checkpoint_time_threshold(threshold);
+        })
+        .await;
     }
 
     /// v7.20 P3 — inline snapshot clone for the read fan-out hot

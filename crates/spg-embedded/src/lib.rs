@@ -2544,7 +2544,7 @@ impl Database {
     /// Sticky errors from a prior async run surface here (via
     /// `try_enqueue`), so a failed background checkpoint still reaches
     /// the caller eventually rather than vanishing.
-    fn trigger_checkpoint(&mut self) -> Result<(), EngineError> {
+    fn trigger_checkpoint(&self) -> Result<(), EngineError> {
         if self.persistence.is_none() {
             return Ok(());
         }
@@ -2560,6 +2560,32 @@ impl Database {
         };
         let _accepted = worker.try_enqueue(job)?;
         Ok(())
+    }
+
+    /// v7.37.13 (A1.1) — public façade over the sync
+    /// [`Self::trigger_checkpoint`] so async wrappers
+    /// (`spg-embedded-tokio::AsyncDatabase`) can drive a self-wake
+    /// timer without owning `&mut Database`. The underlying
+    /// implementation is `&self`-pure (snapshot_checkpoint_job +
+    /// worker.try_enqueue both go through Arc-shared state); this
+    /// wrapper just gives an externally-callable name.
+    ///
+    /// Returns `Ok(())` on a successful enqueue OR a deduplicated
+    /// skip (worker already busy); surfaces sticky errors from the
+    /// last worker run so a failed background checkpoint reaches
+    /// the caller.
+    pub fn maybe_trigger_checkpoint(&self) -> Result<(), EngineError> {
+        self.trigger_checkpoint()
+    }
+
+    /// v7.37.13 (A1.1) — current checkpoint time threshold, or
+    /// `None` if disabled. Self-wake timers read this to schedule
+    /// their ticks at the right cadence.
+    #[must_use]
+    pub fn checkpoint_time_threshold(&self) -> Option<core::time::Duration> {
+        self.persistence
+            .as_ref()
+            .and_then(|p| p.checkpoint_time_threshold)
     }
 
     /// CoW-2 (v7.34) — block until the background checkpoint worker is
