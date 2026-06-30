@@ -3502,14 +3502,70 @@ impl Parser {
     /// FOR-clause. Requires at least one entry; empty list is a
     /// parse error (PG behaviour). Quoted idents are accepted; the
     /// names round-trip through `Display` as `quote_ident(name)`.
+    ///
+    /// v7.37.21 (21.2 + 21.3) — accept-and-discard the per-table
+    /// `(col_list) WHERE (predicate)` modifiers PG 15+ emits in
+    /// pg_dump output. SPG's publication state today is per-table
+    /// only (matching the pre-PG-15 surface); the col list + WHERE
+    /// are parsed so dumps load through and the table name reaches
+    /// `PublicationScope::ForTables`, but the filter is not enforced
+    /// at publish time. Re-open when a customer dogfood gate
+    /// requires per-row-filter or column-subset publish semantics
+    /// (which gates on persistent slot state landing first, 21.12).
     fn parse_publication_table_list(&mut self) -> Result<Vec<String>, ParseError> {
-        let first = self.expect_ident_like()?;
+        let first = self.parse_publication_table_entry()?;
         let mut out = alloc::vec![first];
         while matches!(self.peek(), Token::Comma) {
             self.advance();
-            out.push(self.expect_ident_like()?);
+            out.push(self.parse_publication_table_entry()?);
         }
         Ok(out)
+    }
+
+    /// One table entry inside a FOR TABLE clause:
+    ///     tab_name [ (col, col, …) ] [ WHERE (predicate) ]
+    /// Returns just the table name; the column list + WHERE predicate
+    /// are consumed and discarded per the parse-accept-discard
+    /// commitment above.
+    fn parse_publication_table_entry(&mut self) -> Result<String, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Optional column list — `(col, col, …)`.
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            // Empty parens are a PG error too; require ≥ 1 column.
+            let _ = self.expect_ident_like()?;
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                let _ = self.expect_ident_like()?;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' to close publication column list, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        // Optional row filter — `WHERE (predicate)`.
+        if matches!(self.peek(), Token::Where) {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected '(' after WHERE in publication row filter, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let _ = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' to close publication WHERE filter, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        Ok(name)
     }
 
     /// v6.1.4 — `CREATE SUBSCRIPTION <name>
