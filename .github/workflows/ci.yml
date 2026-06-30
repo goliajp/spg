@@ -140,6 +140,20 @@ jobs:
             echo "::endgroup::"
           done
 
+  sqllogictest:
+    name: biz (sqllogictest)
+    runs-on: ubuntu-latest
+    # v7.37.27 (27.1) — biz-tier sqllogictest conformance corpus
+    # rounds out the five-category CI matrix (lint / unit / e2e /
+    # gates / biz). dump_compat + data_compat sub-tasks need a
+    # PostgreSQL service container; they ride in their own job
+    # below when wired. sqllogictest is pure SPG so it lives here.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo run -p sqllogictest --release
+        run: cargo run -p sqllogictest --release --locked
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
