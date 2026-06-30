@@ -43,6 +43,7 @@ mod e2e_deferrable;
 mod e2e_delimiter;
 mod e2e_do_block;
 mod e2e_plpgsql_assert;
+mod e2e_plpgsql_perform;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

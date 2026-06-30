@@ -3108,6 +3108,33 @@ impl Parser {
             };
             return Ok(PlPgSqlStmt::Assert { condition, message });
         }
+        // v7.37.20 (20.12) — PERFORM <select>. Per PG docs:
+        //   "PERFORM is equivalent to SELECT but discards the
+        //    result." Side effects (function calls, RAISE inside
+        //    SQL functions, etc.) still execute. We desugar to
+        //    `SELECT <body>` and wrap in EmbeddedSql so the engine's
+        //    existing embedded-statement path handles execution +
+        //    result-discard cleanly. The result is naturally
+        //    discarded because EmbeddedSql doesn't propagate row
+        //    sets back to the plpgsql interpreter.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("perform"))
+        {
+            self.advance();
+            // Splice a synthetic Token::Select into the stream at
+            // the current position so parse_select_stmt parses the
+            // remainder as a normal SELECT body. Token-stream
+            // surgery mirrors the try_parse_plpgsql_select_into
+            // pattern used for SELECT … INTO desugaring.
+            self.tokens.insert(self.pos, Token::Select);
+            let select = self.parse_select_stmt()?;
+            let Statement::Select(s) = select else {
+                return Err(self.err(alloc::format!(
+                    "expected SELECT body after PERFORM, got {:?}",
+                    self.peek()
+                )));
+            };
+            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(Statement::Select(s))));
+        }
         // v7.16.2 — `SELECT <projection> INTO <var> [FROM …]`
         // plpgsql-specific shape (mailrs round-10 migrate-042).
         // PG's SELECT INTO at top-level SQL would CREATE a new
