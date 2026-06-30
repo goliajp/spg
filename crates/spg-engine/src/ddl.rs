@@ -596,6 +596,10 @@ impl Engine {
         Ok(())
     }
 
+    /// v7.13.2 / v7.37.18 (18.17 widened) — DROP CONSTRAINT for
+    /// FK + PK/UNIQUE + CHECK. Originally FK-only; widened to
+    /// match PG's behaviour where `ALTER TABLE t DROP CONSTRAINT
+    /// t_pkey` removes a PRIMARY KEY just like it would an FK.
     fn alter_drop_foreign_key(
         &mut self,
         tbl: &str,
@@ -605,17 +609,54 @@ impl Engine {
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
+        // 1) Try foreign keys.
         let fks = &mut table.schema_mut().foreign_keys;
-        let before = fks.len();
+        let fk_before = fks.len();
         fks.retain(|f| f.name.as_ref() != Some(&name));
-        if fks.len() == before && !if_exists {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER TABLE DROP CONSTRAINT: no FK named {name:?} on {:?}",
-                tbl
-            )));
+        if fks.len() != fk_before {
+            return Ok(());
         }
-        // v7.13.2 mailrs round-6 S7: IF EXISTS silences the miss.
-        Ok(())
+        // 2) Try PK / UNIQUE constraints. SPG names PK as
+        //    `<table>_pkey` and UNIQUE as `<table>_uniqN` (the
+        //    same naming pg_constraint uses), so the lookup is
+        //    by reconstructing the candidate names.
+        let pkey_name = alloc::format!("{tbl}_pkey");
+        let ucs = &mut table.schema_mut().uniqueness_constraints;
+        let uc_before = ucs.len();
+        if name == pkey_name {
+            ucs.retain(|uc| !uc.is_primary_key);
+        } else if let Some(idx) = name
+            .strip_prefix(&alloc::format!("{tbl}_uniq"))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if idx < ucs.len() {
+                ucs.remove(idx);
+            }
+        }
+        if ucs.len() != uc_before {
+            return Ok(());
+        }
+        // 3) CHECK constraints. SPG synthesises names as
+        //    `<table>_check<i>` in pg_constraint.
+        // (Single-column UNIQUE indices that don't have a UC
+        // entry need to go through `DROP INDEX <name>` instead —
+        // the indices storage is a slice not a Vec.)
+        if let Some(rest) = name.strip_prefix(&alloc::format!("{tbl}_check"))
+            && let Ok(idx) = rest.parse::<usize>()
+        {
+            let checks = &mut table.schema_mut().checks;
+            if idx < checks.len() {
+                checks.remove(idx);
+                return Ok(());
+            }
+        }
+        // Nothing matched; respect IF EXISTS.
+        if if_exists {
+            return Ok(());
+        }
+        Err(EngineError::Unsupported(alloc::format!(
+            "ALTER TABLE DROP CONSTRAINT: no constraint named {name:?} on {tbl:?}"
+        )))
     }
 
     fn alter_add_column(
