@@ -23,6 +23,7 @@ extern crate alloc;
 
 pub mod base64;
 pub mod crc32;
+pub mod crc32c;
 pub mod hmac;
 pub mod lzss;
 pub mod pbkdf2;

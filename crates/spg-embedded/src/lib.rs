@@ -257,6 +257,43 @@ const WAL_V4_TYPE_TX_COMMIT_SQL: u8 = 0x12;
 /// O(records × catalog_rows) statement-replay that hung the mailrs P0.
 const WAL_V5_TYPE_ROW_REDO: u8 = 0x13;
 
+// v7.37.13 (A1.2 / A1.3 / A1.6) — WAL record format v6.
+//
+// Differences vs v5:
+//   - CRC slot holds CRC-32C (Castagnoli, PG-equivalent since 9.3)
+//     instead of IEEE CRC-32. Better Hamming distance on long
+//     records; modern CPUs have a hardware instruction
+//     (SSE4.2 / ARMv8) — software fallback for now.            [A1.2]
+//   - 8-byte `prev_lsn` field (xl_prev equivalent) detects a torn
+//     chunk where two adjacent records' LSNs aren't contiguous.
+//     v7.37.13.5 always writes 0; v7.37.13.7 populates it.       [A1.3]
+//   - 1-byte `hash_scheme`. Default 0 (CRC32C only). 1 means a
+//     32-byte BLAKE3 of the payload follows. Opt-in via
+//     `SPG_WAL_HASH=blake3` for operators who want cryptographic
+//     integrity of the WAL bytes on top of bit-flip protection. [A1.6]
+//   - Type bytes are REUSED from v5 (0x10..=0x13). The v6 envelope
+//     is distinguished from v5 strictly by the V6_FLAG bit in the
+//     length header, so the parser stays one branch deep.
+//
+// On-disk layout of a v6 record:
+//   [4B u32 LE  payload_len | V2_SENTINEL | V3_FLAG | V6_FLAG]
+//   [4B u32 LE  crc32c]                                          // of body below
+//   [1B        type_byte]
+//   [8B u64 LE prev_lsn]
+//   [8B u64 LE commit_lsn]
+//   [8B i64 LE commit_unix_us]
+//   [1B        hash_scheme]
+//   [32B       blake3]                if hash_scheme == 1
+//   [payload]
+//
+// Backward compat: v3 / v4 / v5 records still parse via the
+// existing branches; v6 is only chosen for NEW writes.
+const WAL_V6_FLAG: u32 = 0x2000_0000;
+const WAL_V6_EXTRA_HEADER: usize = 8 /*prev_lsn*/ + 8 /*commit_lsn*/ + 8 /*commit_unix_us*/ + 1 /*hash_scheme*/;
+const WAL_V6_HASH_SCHEME_CRC32C: u8 = 0;
+const WAL_V6_HASH_SCHEME_BLAKE3: u8 = 1;
+const WAL_V6_BLAKE3_LEN: usize = 32;
+
 /// v7.1 — auto-checkpoint threshold. Once the WAL grows past
 /// this many bytes, the next successful `execute()` call ends
 /// with a `checkpoint()` so the WAL stays bounded. Tunable via
@@ -824,7 +861,11 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
     //    WalGroup is thread-safe so a live commit can interleave — the
     //    marker's LSN, not its position in the chunk, anchors replay.
     let marker_ts = wall_clock_micros();
-    let marker = encode_v4_checkpoint_marker(job.marker_lsn, marker_ts, &job.db_path);
+    // v7.37.13 (A1.2) — v6 encoder uses CRC32C per A1.2; format
+    // version-bumps the checkpoint marker too so a v6 chunk is
+    // homogeneous (parser doesn't need to mix CRC32 + CRC32C
+    // verifications inside the same chunk).
+    let marker = encode_v6_checkpoint_marker(job.marker_lsn, marker_ts, &job.db_path);
     job.wal.enqueue(&marker);
     job.wal.flush_now()?;
     // 5. Rotate the active chunk. New commits land in the fresh chunk;
@@ -1600,6 +1641,234 @@ fn encode_v4_framed(
     out
 }
 
+/// v7.37.13 (A1.6) — cached lookup of `SPG_WAL_HASH`. `crc32c`
+/// (default) → [`WAL_V6_HASH_SCHEME_CRC32C`]; `blake3` → BLAKE3.
+/// Any other value falls back to default. Process-wide cache — the
+/// hash scheme is a wire-format invariant, not a runtime tunable.
+fn wal_hash_scheme() -> u8 {
+    #[cfg(test)]
+    {
+        let v = WAL_HASH_SCHEME_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if v == 0 || v == 1 {
+            return v as u8;
+        }
+    }
+    static CACHED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("SPG_WAL_HASH").as_deref() {
+        Ok("blake3") => WAL_V6_HASH_SCHEME_BLAKE3,
+        _ => WAL_V6_HASH_SCHEME_CRC32C,
+    })
+}
+
+/// v7.37.13 (A1.6) — `#[cfg(test)]` override for [`wal_hash_scheme`].
+///   -1 = use env (default)
+///    0 = force CRC32C-only
+///    1 = force BLAKE3
+#[cfg(test)]
+pub(crate) static WAL_HASH_SCHEME_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// v7.37.13 (A1.2 + A1.3 + A1.6) — encode a v6 WAL record.
+///
+/// Layout: see the doc comment on [`WAL_V6_FLAG`].
+///
+/// `prev_lsn` is the commit_lsn of the previous v6 record in the
+/// same chunk (xl_prev equivalent). v7.37.13.5 callers always pass
+/// 0 — the field is reserved so 13.7 can populate it without
+/// another format bump.
+fn encode_v6_framed(
+    type_byte: u8,
+    payload: &[u8],
+    prev_lsn: u64,
+    commit_lsn: u64,
+    commit_unix_us: i64,
+) -> Vec<u8> {
+    let scheme = wal_hash_scheme();
+    let blake3_extra = if scheme == WAL_V6_HASH_SCHEME_BLAKE3 {
+        WAL_V6_BLAKE3_LEN
+    } else {
+        0
+    };
+    let body_len = 1 /*type*/ + WAL_V6_EXTRA_HEADER + blake3_extra + payload.len();
+
+    let mut body = Vec::with_capacity(body_len);
+    body.push(type_byte);
+    body.extend_from_slice(&prev_lsn.to_le_bytes());
+    body.extend_from_slice(&commit_lsn.to_le_bytes());
+    body.extend_from_slice(&commit_unix_us.to_le_bytes());
+    body.push(scheme);
+    if scheme == WAL_V6_HASH_SCHEME_BLAKE3 {
+        let h = spg_crypto::hash(payload);
+        body.extend_from_slice(&h);
+    }
+    body.extend_from_slice(payload);
+
+    let crc = spg_crypto::crc32c::crc32c(&body);
+    let header =
+        ((payload.len() as u32) | WAL_V2_SENTINEL | WAL_V3_FLAG | WAL_V6_FLAG).to_le_bytes();
+
+    let mut out = Vec::with_capacity(4 + 4 + body_len);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// v7.37.13 (A1.2) — v6 auto-commit SQL record. Wraps
+/// [`encode_v6_framed`] with the v5 type byte; the V6_FLAG bit in
+/// the length header lets the parser pick the right verification
+/// algorithm without a new type byte allocation.
+fn encode_v6_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v6_framed(
+        WAL_V4_TYPE_AUTO_COMMIT_SQL,
+        sql.as_bytes(),
+        0, // 13.7 wires the real prev_lsn; 13.5 always 0
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+fn encode_v6_tx_commit(script: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v6_framed(
+        WAL_V4_TYPE_TX_COMMIT_SQL,
+        script.as_bytes(),
+        0,
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+fn encode_v6_row_redo(redo_bytes: &[u8], commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v6_framed(
+        WAL_V5_TYPE_ROW_REDO,
+        redo_bytes,
+        0,
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+fn encode_v6_checkpoint_marker(
+    commit_lsn: u64,
+    commit_unix_us: i64,
+    db_path: &Path,
+) -> Vec<u8> {
+    // Same payload as encode_v4_checkpoint_marker: lsn + ts + path.
+    let path_bytes = db_path.to_string_lossy();
+    let path_len = path_bytes.len() as u16;
+    let mut payload = Vec::with_capacity(8 + 8 + 2 + path_bytes.len());
+    payload.extend_from_slice(&commit_lsn.to_le_bytes());
+    payload.extend_from_slice(&commit_unix_us.to_le_bytes());
+    payload.extend_from_slice(&path_len.to_le_bytes());
+    payload.extend_from_slice(path_bytes.as_bytes());
+    encode_v6_framed(
+        WAL_V4_TYPE_CHECKPOINT_MARKER,
+        &payload,
+        0,
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+/// v7.37.13 (A1.2) — parsed view of a v6 record body. Returned by
+/// [`parse_v6_record_body`] for use by both the replay loop and the
+/// public `parse_wal_records` iterator. The caller has already
+/// validated CRC, so all bytes here are trusted.
+#[derive(Debug)]
+struct V6RecordView<'a> {
+    type_byte: u8,
+    #[allow(dead_code)]
+    prev_lsn: u64,
+    commit_lsn: u64,
+    commit_unix_us: i64,
+    payload: &'a [u8],
+}
+
+/// v7.37.13 (A1.2 + A1.3 + A1.6) — decode one v6 record from the
+/// raw byte stream at offset `cur`. On success returns the parsed
+/// view + the total number of bytes consumed (including the 8-byte
+/// frame header). Errors on:
+///   - truncated header / body (short record)
+///   - CRC mismatch (= corruption / bit flip)
+///   - unknown hash_scheme
+///   - BLAKE3 mismatch (if scheme=BLAKE3 and payload digest differs)
+fn parse_v6_record_body<'a>(
+    wal_bytes: &'a [u8],
+    cur: usize,
+    rec_len: usize,
+) -> Result<(V6RecordView<'a>, usize), String> {
+    // After the 4-byte length header and 4-byte CRC:
+    //   1 type + 8 prev + 8 lsn + 8 ts + 1 scheme + [32 blake3] + payload
+    let min_body = 1 + WAL_V6_EXTRA_HEADER + rec_len;
+    if wal_bytes.len() < cur + 4 + 4 + min_body {
+        return Err(format!(
+            "WAL parse: v6 record at offset {cur} truncated header"
+        ));
+    }
+    let stored_crc = u32::from_le_bytes(wal_bytes[cur + 4..cur + 8].try_into().unwrap());
+    let body_start = cur + 8;
+    let type_byte = wal_bytes[body_start];
+    let prev_lsn =
+        u64::from_le_bytes(wal_bytes[body_start + 1..body_start + 9].try_into().unwrap());
+    let commit_lsn =
+        u64::from_le_bytes(wal_bytes[body_start + 9..body_start + 17].try_into().unwrap());
+    let commit_unix_us =
+        i64::from_le_bytes(wal_bytes[body_start + 17..body_start + 25].try_into().unwrap());
+    let scheme = wal_bytes[body_start + 25];
+    let (blake3_extra, blake3_slice) = if scheme == WAL_V6_HASH_SCHEME_BLAKE3 {
+        let start = body_start + 26;
+        let end = start + WAL_V6_BLAKE3_LEN;
+        if wal_bytes.len() < end + rec_len {
+            return Err(format!(
+                "WAL parse: v6 BLAKE3 record at offset {cur} truncated"
+            ));
+        }
+        (WAL_V6_BLAKE3_LEN, Some(&wal_bytes[start..end]))
+    } else if scheme == WAL_V6_HASH_SCHEME_CRC32C {
+        (0usize, None)
+    } else {
+        return Err(format!(
+            "WAL parse: v6 record at offset {cur} has unknown hash_scheme {scheme:#04x}"
+        ));
+    };
+    let payload_start = body_start + 26 + blake3_extra;
+    let payload_end = payload_start + rec_len;
+    if wal_bytes.len() < payload_end {
+        return Err(format!(
+            "WAL parse: v6 record at offset {cur} truncated payload"
+        ));
+    }
+    let body_end = payload_end;
+    let body = &wal_bytes[body_start..body_end];
+    let computed_crc = spg_crypto::crc32c::crc32c(body);
+    if computed_crc != stored_crc {
+        return Err(format!(
+            "WAL parse: v6 CRC32C mismatch at offset {cur} (stored {stored_crc:#010x}, \
+             computed {computed_crc:#010x}) — record corrupted by bit flip or torn write"
+        ));
+    }
+    let payload = &wal_bytes[payload_start..payload_end];
+    if let Some(blake3_bytes) = blake3_slice {
+        let computed_b3 = spg_crypto::hash(payload);
+        if computed_b3.as_slice() != blake3_bytes {
+            return Err(format!(
+                "WAL parse: v6 BLAKE3 mismatch at offset {cur} (payload digest differs)"
+            ));
+        }
+    }
+    let total = 4 + 4 + 1 + WAL_V6_EXTRA_HEADER + blake3_extra + rec_len;
+    Ok((
+        V6RecordView {
+            type_byte,
+            prev_lsn,
+            commit_lsn,
+            commit_unix_us,
+            payload,
+        },
+        total,
+    ))
+}
+
 /// v7.1 — decode + apply every record in `wal_bytes` to `engine`.
 /// Returns the count of records successfully applied. A truncated
 /// trailing record (mid-write torn) is dropped silently — the
@@ -1615,6 +1884,56 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
         let raw_len = u32::from_le_bytes(wal_bytes[cur..cur + 4].try_into().unwrap());
         let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
         let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+        let is_v6 = is_v3 && (raw_len & WAL_V6_FLAG != 0);
+        // v7.37.13 (A1.2) — v6 records mask out the V6_FLAG bit too.
+        if is_v6 {
+            let len_mask = !(WAL_V2_SENTINEL | WAL_V3_FLAG | WAL_V6_FLAG);
+            let rec_len = (raw_len & len_mask) as usize;
+            match parse_v6_record_body(wal_bytes, cur, rec_len) {
+                Err(e) => return Err(e),
+                Ok((view, total)) => {
+                    match view.type_byte {
+                        WAL_V4_TYPE_CHECKPOINT_MARKER => {
+                            // checkpoint anchor — skip on replay
+                        }
+                        WAL_V5_TYPE_ROW_REDO => {
+                            let changes = spg_storage::decode_redo_log(view.payload)
+                                .map_err(|e| {
+                                    format!("WAL replay: v6 redo decode at offset {cur}: {e:?}")
+                                })?;
+                            engine.apply_redo(&changes).map_err(|e| {
+                                format!("WAL replay: v6 apply_redo at offset {cur}: {e:?}")
+                            })?;
+                            applied += 1;
+                        }
+                        WAL_V4_TYPE_AUTO_COMMIT_SQL | WAL_V4_TYPE_TX_COMMIT_SQL => {
+                            let sql = std::str::from_utf8(view.payload).map_err(|e| {
+                                format!("WAL replay: v6 non-UTF-8 SQL at offset {cur}: {e}")
+                            })?;
+                            for stmt in split_statements(sql) {
+                                engine.execute(stmt).map_err(|e| {
+                                    format!(
+                                        "WAL replay: v6 apply {stmt:?} at offset {cur} rejected: {e:?}"
+                                    )
+                                })?;
+                            }
+                            applied += 1;
+                        }
+                        other => {
+                            return Err(format!(
+                                "WAL replay: v6 unknown type byte {other:#04x} at offset {cur}"
+                            ));
+                        }
+                    }
+                    // Silence dead_code on view.prev_lsn / commit_lsn /
+                    // commit_unix_us — they're surfaced for 13.7 +
+                    // PITR tooling, not used in basic replay yet.
+                    let _ = (view.prev_lsn, view.commit_lsn, view.commit_unix_us);
+                    cur += total;
+                    continue;
+                }
+            }
+        }
         let len_mask = if is_v3 {
             !(WAL_V2_SENTINEL | WAL_V3_FLAG)
         } else {
@@ -1733,6 +2052,36 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
         let raw_len = u32::from_le_bytes(wal_bytes[cur..cur + 4].try_into().unwrap());
         let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
         let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+        let is_v6 = is_v3 && (raw_len & WAL_V6_FLAG != 0);
+        // v7.37.13 (A1.2) — v6 envelope: parser dispatches on
+        // V6_FLAG before falling through to the v3/v4/v5 paths.
+        if is_v6 {
+            let len_mask = !(WAL_V2_SENTINEL | WAL_V3_FLAG | WAL_V6_FLAG);
+            let rec_len = (raw_len & len_mask) as usize;
+            match parse_v6_record_body(wal_bytes, cur, rec_len) {
+                Err(_) => {
+                    // Torn / corrupt tail — same recovery story as
+                    // the v3/v4/v5 paths: stop iterating, the caller
+                    // sees an intact prefix.
+                    break;
+                }
+                Ok((view, total)) => {
+                    out.push(WalRecord {
+                        offset: cur,
+                        type_byte: view.type_byte,
+                        commit_lsn: Some(view.commit_lsn),
+                        commit_unix_us: if view.commit_unix_us == WAL_V4_NO_CLOCK {
+                            None
+                        } else {
+                            Some(view.commit_unix_us)
+                        },
+                        sql: view.payload,
+                    });
+                    cur += total;
+                    continue;
+                }
+            }
+        }
         let len_mask = if is_v3 {
             !(WAL_V2_SENTINEL | WAL_V3_FLAG)
         } else {
@@ -2912,7 +3261,7 @@ impl Database {
                 {
                     let script = buf.statements.join(";\n");
                     let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-                    record = Some(encode_v4_tx_commit(&script, lsn, wall_clock_micros()));
+                    record = Some(encode_v6_tx_commit(&script, lsn, wall_clock_micros()));
                 }
             }
             Some(TxControl::Rollback) => {
@@ -2965,9 +3314,9 @@ impl Database {
                         Vec::new()
                     };
                     record = Some(if redo.is_empty() {
-                        encode_v4_auto_commit(canonical, lsn, wall_clock_micros())
+                        encode_v6_auto_commit(canonical, lsn, wall_clock_micros())
                     } else {
-                        encode_v5_row_redo(
+                        encode_v6_row_redo(
                             &spg_storage::encode_redo_log(&redo),
                             lsn,
                             wall_clock_micros(),
@@ -3905,6 +4254,20 @@ fn decode_wal_record(tail: &[u8]) -> Result<(Vec<u8>, usize), EngineError> {
     let raw_len = u32::from_le_bytes(tail[..4].try_into().unwrap());
     let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
     let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+    let is_v6 = is_v3 && (raw_len & WAL_V6_FLAG != 0);
+    // v7.37.13 (A1.2) — v6 dispatch via the shared parser.
+    if is_v6 {
+        let len_mask = !(WAL_V2_SENTINEL | WAL_V3_FLAG | WAL_V6_FLAG);
+        let rec_len = (raw_len & len_mask) as usize;
+        match parse_v6_record_body(tail, 0, rec_len) {
+            Err(e) => {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(e)));
+            }
+            Ok((view, total)) => {
+                return Ok((view.payload.to_vec(), total));
+            }
+        }
+    }
     let len_mask = if is_v3 {
         !(WAL_V2_SENTINEL | WAL_V3_FLAG)
     } else {
@@ -5233,6 +5596,113 @@ mod tests {
         // Restore so other tests see the prior policy.
         FSYNC_RETRY_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
         FSYNC_FAIL_INJECT.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.2 TDD) — v6 record round-trips through the
+    /// encode + parse pair with the default CRC32C scheme. Covers
+    /// the basic "write something, read it back" invariant before
+    /// the bit-flip detection test below.
+    #[test]
+    fn v7_37_13_v6_wal_round_trip_crc32c() {
+        // Force scheme to CRC32C so the encoder is deterministic.
+        let prev = WAL_HASH_SCHEME_OVERRIDE.swap(
+            WAL_V6_HASH_SCHEME_CRC32C as i8,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let bytes = encode_v6_auto_commit("CREATE TABLE t (id INT)", 42, 1_700_000_000_000_000);
+        let parsed = parse_wal_records(&bytes).expect("parse");
+        assert_eq!(parsed.len(), 1, "exactly one record encoded");
+        assert_eq!(parsed[0].commit_lsn, Some(42));
+        assert_eq!(parsed[0].commit_unix_us, Some(1_700_000_000_000_000));
+        assert_eq!(parsed[0].sql, b"CREATE TABLE t (id INT)");
+        WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.2 TDD) — flipping any byte inside a v6 record
+    /// makes the CRC32C verification fail; the parser silently
+    /// terminates iteration (same recovery story as the v3/v4/v5
+    /// paths), so the corrupted record is NOT surfaced to callers
+    /// pretending to be a valid write. Closes A1.2 — matches PG's
+    /// per-record CRC32C posture since 9.3.
+    #[test]
+    fn v7_37_13_v6_crc32c_detects_bit_flip() {
+        let prev = WAL_HASH_SCHEME_OVERRIDE.swap(
+            WAL_V6_HASH_SCHEME_CRC32C as i8,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let good = encode_v6_auto_commit("INSERT INTO t VALUES (1)", 7, 100);
+        let mut flipped = good.clone();
+        // Flip a byte deep inside the payload (well past the header).
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0x01;
+        let parsed = parse_wal_records(&flipped).expect("parse returns Ok with empty prefix");
+        assert!(
+            parsed.is_empty(),
+            "bit-flip in v6 payload must NOT surface as a valid record \
+             (got {parsed:?}); CRC32C verification at parse_v6_record_body \
+             should reject and terminate iteration"
+        );
+        WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.6 TDD [PG+]) — with `SPG_WAL_HASH=blake3` (or
+    /// the test-only override = 1) the encoder writes a v6 record
+    /// with hash_scheme=1 + a 32-byte BLAKE3 of the payload appended;
+    /// the parser verifies BOTH the CRC32C AND the BLAKE3. The
+    /// resulting record is 32 bytes longer than the CRC32C-only
+    /// form, and round-trips identically.
+    #[test]
+    fn v7_37_13_v6_blake3_round_trip_and_layout() {
+        // Phase 1: encode with CRC32C, capture length baseline.
+        let prev = WAL_HASH_SCHEME_OVERRIDE.swap(
+            WAL_V6_HASH_SCHEME_CRC32C as i8,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let crc_only = encode_v6_auto_commit("SELECT 1", 7, 100);
+        let crc_only_len = crc_only.len();
+        let crc_only_parsed = parse_wal_records(&crc_only).expect("parse crc-only");
+        assert_eq!(crc_only_parsed.len(), 1);
+
+        // Phase 2: switch to BLAKE3 mode, re-encode, verify the
+        // 32-byte hash tail is present + round-trip works.
+        WAL_HASH_SCHEME_OVERRIDE.store(
+            WAL_V6_HASH_SCHEME_BLAKE3 as i8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let with_blake3 = encode_v6_auto_commit("SELECT 1", 7, 100);
+        assert_eq!(
+            with_blake3.len(),
+            crc_only_len + WAL_V6_BLAKE3_LEN,
+            "BLAKE3 mode adds exactly {WAL_V6_BLAKE3_LEN} bytes vs CRC32C-only"
+        );
+        let parsed = parse_wal_records(&with_blake3).expect("parse blake3");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sql, b"SELECT 1");
+        assert_eq!(parsed[0].commit_lsn, Some(7));
+
+        // Phase 3: tamper with payload byte, verify BLAKE3 path
+        // also rejects (CRC32C also would, but BLAKE3 adds
+        // cryptographic integrity).
+        let mut flipped = with_blake3.clone();
+        let payload_idx = flipped.len() - 3;
+        flipped[payload_idx] ^= 0x01;
+        let parsed_flipped = parse_wal_records(&flipped).expect("parse Ok with empty prefix");
+        assert!(parsed_flipped.is_empty(), "BLAKE3 mode rejects tampered payload");
+
+        WAL_HASH_SCHEME_OVERRIDE.store(prev, std::sync::atomic::Ordering::Release);
+    }
+
+    /// v7.37.13 (A1.2 backward compat) — v5 records on disk MUST
+    /// still parse with the legacy IEEE CRC32 path. The v6 dispatch
+    /// adds a branch, not a breakage; existing dbs that boot up
+    /// with v3/v4/v5 records in their WAL recover identically.
+    #[test]
+    fn v7_37_13_v5_wal_still_parses_after_v6_dispatch_added() {
+        let v5_bytes = encode_v4_auto_commit("CREATE TABLE legacy (x INT)", 1, 0);
+        let parsed = parse_wal_records(&v5_bytes).expect("v5 parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sql, b"CREATE TABLE legacy (x INT)");
+        assert_eq!(parsed[0].commit_lsn, Some(1));
     }
 
     #[test]
