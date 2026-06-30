@@ -433,9 +433,10 @@ pub enum SetValue {
 /// today every level reads as effective READ COMMITTED (which is
 /// also how PG treats READ UNCOMMITTED — it silently upgrades to
 /// READ COMMITTED). Default = `ReadCommitted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
     ReadUncommitted,
+    #[default]
     ReadCommitted,
     RepeatableRead,
     Serializable,
@@ -458,12 +459,6 @@ impl IsolationLevel {
 impl core::fmt::Display for IsolationLevel {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_pg_str())
-    }
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        Self::ReadCommitted
     }
 }
 
