@@ -355,10 +355,25 @@ fn main() {
         Some("verify-pitr") => {
             let mut dir: Option<String> = None;
             let mut write_missing = false;
+            // v7.37.21 (21.18) — continuous-mode:
+            //   --watch <secs>   re-run every N seconds until SIGINT
+            //   --max-runs <N>   cap the run count (default = ∞)
+            // A single FAIL inside the watch loop logs + continues
+            // rather than exiting; the trailing summary tells the
+            // operator how many runs failed. exit 1 if any run
+            // failed across the whole watch.
+            let mut watch_secs: Option<u64> = None;
+            let mut max_runs: Option<u64> = None;
             while let Some(a) = args.next() {
                 match a.as_str() {
                     "--dir" => dir = args.next(),
                     "--write-missing-checksums" => write_missing = true,
+                    "--watch" => {
+                        watch_secs = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    "--max-runs" => {
+                        max_runs = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
                     other => {
                         die(&format!("unknown verify-pitr arg: {other}"), 2);
                         return;
@@ -369,14 +384,46 @@ fn main() {
                 die("usage: spg verify-pitr --dir <backup_dir>", 2);
                 return;
             };
-            match verify_pitr(&dir, write_missing) {
-                Ok(report) => {
-                    println!("{}", report.render());
-                    if !report.is_clean() {
-                        process::exit(1);
+            if let Some(secs) = watch_secs {
+                let secs = secs.max(1);
+                let mut run_idx: u64 = 0;
+                let mut fail_count: u64 = 0;
+                let cap = max_runs.unwrap_or(u64::MAX);
+                while run_idx < cap {
+                    run_idx += 1;
+                    eprintln!("[watch run {run_idx}] verify-pitr --dir {dir}");
+                    match verify_pitr(&dir, write_missing) {
+                        Ok(report) => {
+                            println!("{}", report.render());
+                            if !report.is_clean() {
+                                fail_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("verify-pitr: {e}");
+                            fail_count += 1;
+                        }
+                    }
+                    if run_idx < cap {
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
                 }
-                Err(e) => die(&format!("verify-pitr: {e}"), 2),
+                eprintln!(
+                    "[watch summary] runs={run_idx} failed={fail_count}"
+                );
+                if fail_count > 0 {
+                    process::exit(1);
+                }
+            } else {
+                match verify_pitr(&dir, write_missing) {
+                    Ok(report) => {
+                        println!("{}", report.render());
+                        if !report.is_clean() {
+                            process::exit(1);
+                        }
+                    }
+                    Err(e) => die(&format!("verify-pitr: {e}"), 2),
+                }
             }
         }
         // v7.18 PITR P4 — `spg backup-pitr --src <db_path>
