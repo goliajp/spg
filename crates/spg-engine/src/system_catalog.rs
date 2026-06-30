@@ -193,6 +193,78 @@ pub(crate) fn synth_information_schema_views(
     (schema, rows)
 }
 
+/// v7.37.22 (22.17) — synthesise `pg_catalog.pg_stat_archiver`.
+/// PG monitoring tools poll this single-row view to track WAL
+/// archival progress. SPG uses in-process WAL pubsub (see
+/// 21.14 carve-out in v7.37.x-complete-roadmap.md), so the
+/// archive-side counters stay 0; the view ships shape-stable
+/// so dashboards keep parsing.
+///
+/// PG-canonical columns:
+///   * archived_count (BigInt) — successfully archived files
+///   * last_archived_wal (Text) — name of last archived file
+///   * last_archived_time (TIMESTAMPTZ)
+///   * failed_count (BigInt) — failed archive attempts
+///   * last_failed_wal (Text)
+///   * last_failed_time (TIMESTAMPTZ)
+///   * stats_reset (TIMESTAMPTZ)
+pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("archived_count", DataType::BigInt, false),
+        ColumnSchema::new("last_archived_wal", DataType::Text, true),
+        ColumnSchema::new("last_archived_time", DataType::Timestamptz, true),
+        ColumnSchema::new("failed_count", DataType::BigInt, false),
+        ColumnSchema::new("last_failed_wal", DataType::Text, true),
+        ColumnSchema::new("last_failed_time", DataType::Timestamptz, true),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(0),
+        Value::Null,
+        Value::Null,
+        Value::BigInt(0),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ])];
+    (schema, rows)
+}
+
+/// v7.37.21 (21.13-d) — synthesise `pg_catalog.pg_stat_replication`.
+/// One row per active streaming subscriber. SPG's MAGIC_SUB uses
+/// in-process change-stream channels rather than a separate WAL
+/// sender process; the view shape-stable empties for now and the
+/// row set lights up when v7.37.21 wires sender-side state.
+///
+/// PG-canonical columns (subset that monitoring tools poll):
+///   * pid (Int)
+///   * usename (Text)
+///   * application_name (Text)
+///   * client_addr (Text) — PG renders as inet; SPG renders as text
+///   * state (Text) — 'startup' / 'catchup' / 'streaming' / 'backup'
+///   * sent_lsn / write_lsn / flush_lsn / replay_lsn (Text, PG LSN format)
+///   * sync_state (Text) — 'async' / 'potential' / 'sync' / 'quorum'
+///   * reply_time (TIMESTAMPTZ)
+pub(crate) fn synth_pg_stat_replication(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("usename", DataType::Text, true),
+        ColumnSchema::new("application_name", DataType::Text, true),
+        ColumnSchema::new("client_addr", DataType::Text, true),
+        ColumnSchema::new("state", DataType::Text, false),
+        ColumnSchema::new("sent_lsn", DataType::Text, true),
+        ColumnSchema::new("write_lsn", DataType::Text, true),
+        ColumnSchema::new("flush_lsn", DataType::Text, true),
+        ColumnSchema::new("replay_lsn", DataType::Text, true),
+        ColumnSchema::new("sync_state", DataType::Text, false),
+        ColumnSchema::new("reply_time", DataType::Timestamptz, true),
+    ];
+    let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
 /// v7.37.22 (22.16) — synthesise `pg_catalog.pg_stat_bgwriter`.
 /// PG dashboards poll this single-row view to track background-
 /// writer dirty-page churn. SPG's freezer / flusher does the

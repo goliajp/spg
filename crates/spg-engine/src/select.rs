@@ -432,6 +432,22 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.22 (22.17) — pg_catalog.pg_stat_archiver.
+                "__spg_pg_stat_archiver" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_archiver(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37.21 (21.13-d) — pg_catalog.pg_stat_replication.
+                "__spg_pg_stat_replication" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_replication(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.23 (23.6-b) — pg_catalog.pg_tablespace.
                 "__spg_pg_tablespace" => {
                     let (schema, rows) =
