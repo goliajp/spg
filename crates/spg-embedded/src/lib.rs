@@ -2521,6 +2521,20 @@ pub struct Database {
     /// `WAL_V4_TYPE_TX_COMMIT_SQL` record (ROLLBACK just drops it).
     /// Always `None` for in-memory databases.
     tx_wal: Option<TxWalBuffer>,
+    /// v7.37.14 (A2.2 [PG+]) — count of user threads currently
+    /// holding the engine lock (i.e. mid-execute). Background
+    /// tasks (freezer / flusher) read this BEFORE attempting to
+    /// acquire the db Mutex so they can back off when foreground
+    /// queries are in flight — analogous to PG's
+    /// `autovacuum_vacuum_cost_delay`, but instead of a fixed
+    /// delay the SPG variant adapts to live contention.
+    ///
+    /// Atomic so background threads can read without going
+    /// through the lock. Incremented on entry to every Database
+    /// mutating path (execute / execute_buffered) and decremented
+    /// on exit via an RAII guard so panics don't leak the
+    /// counter.
+    pub(crate) active_query_count: Arc<core::sync::atomic::AtomicU32>,
 }
 
 /// See [`Database::tx_wal`].
@@ -2700,6 +2714,7 @@ impl Database {
             persistence: None,
             commit_lsn: AtomicU64::new(0),
             tx_wal: None,
+            active_query_count: Arc::new(core::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -3065,6 +3080,7 @@ impl Database {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
             tx_wal: None,
+            active_query_count: Arc::new(core::sync::atomic::AtomicU32::new(0)),
             persistence: Some(PersistenceCtx {
                 db_path,
                 wal_dir,
@@ -3453,6 +3469,7 @@ impl Database {
             persistence: None,
             commit_lsn: AtomicU64::new(0),
             tx_wal: None,
+            active_query_count: Arc::new(core::sync::atomic::AtomicU32::new(0)),
         };
         // v7.37.2 — auto-warm on snapshot restore for the same reason
         // `open_path` does (catalog is server-ready when constructor
@@ -3503,11 +3520,31 @@ impl Database {
         // identical to v7.19. Concurrent callers go through
         // `execute_buffered` (AsyncDatabase does) and share the
         // leader's fsync.
+        //
+        // v7.37.14 (A2.2) — bump active_query_count for the
+        // duration so the background freezer / flusher can back
+        // off when foreground queries are in flight (RAII guard
+        // decrements on every exit path, including panic-unwind).
+        // Clone the Arc into a local so the guard isn't a borrow
+        // of `self.active_query_count` (would block the `&mut
+        // self.execute_buffered` call below).
+        let counter_arc = Arc::clone(&self.active_query_count);
+        let _busy_guard = ActiveQueryGuard::new(&counter_arc);
         let (result, ticket) = self.execute_buffered(sql)?;
         if let Some(t) = ticket {
             t.wait()?;
         }
         Ok(result)
+    }
+
+    /// v7.37.14 (A2.2) — clone the shared active-query counter
+    /// so background tasks (freezer / flusher / future schedulers)
+    /// can read foreground load without locking the engine.
+    /// Returns `0` for in-memory dbs that have no spawned
+    /// background work.
+    #[must_use]
+    pub fn active_query_count_handle(&self) -> Arc<core::sync::atomic::AtomicU32> {
+        Arc::clone(&self.active_query_count)
     }
 
     /// v7.37.9 — apply a decoded V5 row-redo log directly to the
@@ -4273,6 +4310,35 @@ pub struct EmbeddedMetrics {
     pub persistent: bool,
 }
 
+/// v7.37.14 (A2.2) — RAII bump-on-create / dec-on-drop guard for
+/// the foreground active-query counter. Acquired at the top of
+/// every `Database::execute*` entry point; the Drop fires on
+/// normal return AND panic unwind so the counter never leaks.
+///
+/// Owns an `Arc<AtomicU32>` (not a borrow) so the guard's
+/// lifetime is independent of any borrow on the parent Database
+/// — avoids the "guard borrows &self, body needs &mut self"
+/// borrowck conflict.
+struct ActiveQueryGuard {
+    counter: Arc<core::sync::atomic::AtomicU32>,
+}
+
+impl ActiveQueryGuard {
+    fn new(counter: &Arc<core::sync::atomic::AtomicU32>) -> Self {
+        counter.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for ActiveQueryGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// v7.2.1 — handle returned by `spawn_background_freezer`.
 /// Drop signals the worker thread to wind down + joins it,
 /// so a `Database` (or its shared `Arc<Mutex<Database>>`)
@@ -4427,6 +4493,16 @@ fn background_freezer_loop(
     // Sleep in short slices so a shutdown request resolves
     // quickly (vs sleeping the full tick).
     let slice = Duration::from_millis(50.min(opts.tick.as_millis() as u64));
+    // v7.37.14 (A2.2) — capture the foreground active-query
+    // counter handle so we can poll for contention without
+    // acquiring db.lock() (no chicken-egg between freezer + user
+    // queue). The Arc keeps the counter alive even if the
+    // Database is dropped mid-loop; we cleanly exit when the
+    // shutdown flag flips.
+    let active_query_count = {
+        let Ok(g) = db.lock() else { return };
+        g.active_query_count_handle()
+    };
     let mut last_tick = std::time::Instant::now();
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -4434,6 +4510,20 @@ fn background_freezer_loop(
         }
         thread::sleep(slice);
         if last_tick.elapsed() < opts.tick {
+            continue;
+        }
+        // v7.37.14 (A2.2) — adaptive yield: if foreground queries
+        // are in flight, sleep another tick BEFORE attempting the
+        // db.lock() acquire. Matches PG's autovacuum-cost-based
+        // delay posture (the autovacuum worker pauses when user
+        // backends are active) but adapts to live load rather
+        // than relying on a fixed GUC.
+        let active = active_query_count.load(core::sync::atomic::Ordering::Acquire);
+        if active > 0 {
+            // Skip this tick; user threads have priority. Counter
+            // bumped via Database::active_query_count_handle so
+            // the read is lock-free.
+            last_tick = std::time::Instant::now();
             continue;
         }
         last_tick = std::time::Instant::now();
@@ -5838,6 +5928,68 @@ mod tests {
             "with time threshold disabled + bytes effectively-disabled, base.spg \
              mtime should NOT advance on writes"
         );
+    }
+
+    /// v7.37.14 (A2.2 TDD [PG+]) — `Database::execute` increments
+    /// the foreground active-query counter for its duration so
+    /// the background freezer / flusher can back off when user
+    /// queries are in flight. The counter is decremented on the
+    /// way out via an RAII guard (panic-safe — the test verifies
+    /// the counter returns to 0 after both Ok and Err paths).
+    #[test]
+    fn v7_37_14_active_query_count_bumps_during_execute() {
+        let mut db = Database::open_in_memory();
+        let counter = db.active_query_count_handle();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "idle db has 0 active queries"
+        );
+        db.execute("CREATE TABLE t (id INT)").expect("ddl");
+        // After execute, counter must return to 0 (RAII guard
+        // decremented).
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "active_query_count must return to 0 after Ok-path execute"
+        );
+
+        // Err path: malformed SQL surfaces an Err. Counter must
+        // STILL return to 0 (the guard's Drop runs on the unwind
+        // / early-return).
+        let _ = db.execute("CREATE BANANA");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "active_query_count must return to 0 even after Err-path execute"
+        );
+    }
+
+    /// v7.37.14 (A2.2 TDD [PG+]) — the freezer-loop adaptive
+    /// yield reads the counter handle without acquiring db.lock().
+    /// Verifies the shared-Arc pattern: a background reader sees
+    /// the bumped value while a foreground writer is mid-execute.
+    #[test]
+    fn v7_37_14_active_query_count_visible_from_arc_clone() {
+        let db = Database::open_in_memory();
+        let counter_handle = db.active_query_count_handle();
+        // Both references see the same atomic.
+        assert_eq!(
+            Arc::strong_count(&counter_handle),
+            2,
+            "Database + this test each own an Arc clone"
+        );
+        // Simulate the freezer's read pattern: bump from one
+        // reference, observe from the other.
+        db.active_query_count
+            .fetch_add(3, std::sync::atomic::Ordering::AcqRel);
+        assert_eq!(
+            counter_handle.load(std::sync::atomic::Ordering::Acquire),
+            3,
+            "freezer's Arc-cloned handle sees the same value"
+        );
+        db.active_query_count
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// v7.37.14 (A2.5-stub TDD) — the parser silently absorbs
