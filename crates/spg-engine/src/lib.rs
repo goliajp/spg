@@ -138,6 +138,12 @@ use core::fmt;
 // crates (spg-embedded → spg-sqlx) don't need a direct dep on
 // spg-sql for the prepare/bind handle.
 pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
+// v7.37.15 Phase B — re-export the visibility primitives for engine
+// callers so the per-row MVCC types live behind one stable name
+// (`spg_engine::Snapshot` / `spg_engine::RowHeader`) instead of every
+// caller threading through `spg_storage::snapshot::*` directly.
+pub use spg_storage::row_header::{RowHeader, XMAX_ALIVE, XMIN_FROZEN};
+pub use spg_storage::snapshot::{InProgressSet, Snapshot};
 // v7.37.14 (A2.5-stub) — re-export the silent-FOR-UPDATE telemetry
 // helper through the engine surface so downstream wrappers
 // (spg-embedded / spg-embedded-tokio / spgctl) and their tests
@@ -661,6 +667,25 @@ impl Engine {
             clock: self.clock,
             max_query_rows: self.max_query_rows,
         }
+    }
+
+    /// v7.37.15 (Phase B) — current per-row visibility snapshot for
+    /// in-engine scans. Returns [`Snapshot::unbounded`] until Phase C
+    /// wires per-transaction version tracking through the engine
+    /// (writer assigns xmin on commit, reader builds a per-statement
+    /// or per-transaction snapshot from the live version counter +
+    /// active-tx bitmap).
+    ///
+    /// Engine-internal scan paths consult this when calling
+    /// `Table::scan_visible(&snap)`. The `unbounded` default makes
+    /// every row visible — preserving the pre-v7.37.15 behaviour
+    /// exactly during the gradual retrofit.
+    #[must_use]
+    pub fn current_snapshot(&self) -> spg_storage::snapshot::Snapshot {
+        // Phase B placeholder. Phase C will track active tx + the
+        // version counter on the engine; this getter then returns
+        // the engine's live snapshot for new readers.
+        spg_storage::snapshot::Snapshot::unbounded()
     }
 
     /// Construct an engine restored from a previously-snapshotted catalog
