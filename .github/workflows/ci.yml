@@ -106,7 +106,7 @@ jobs:
         run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
 
   perf_gate:
-    name: perf_gate (release)
+    name: perf_gate (release / ${{ matrix.crate }})
     runs-on: ubuntu-latest
     # Every crate's perf_gate target is wrapped in
     # `#![cfg(not(debug_assertions))]`, so the workspace-wide debug
@@ -121,6 +121,13 @@ jobs:
     # spg-server joined the loop. Fast tier runs here; the
     # `#[ignore]`d full tier is `scripts/gate.sh gates --full`.
     #
+    # v7.37.27 (27.8 — pipeline governance batch 2) — fan the 8-crate
+    # serial loop out across one runner per crate via matrix. Same
+    # gate semantics (any matrix leg failing reds the gate), but
+    # wall-clock drops from sum-of-8 to max-of-8. `fail-fast: false`
+    # so we see every failing gate in the first run instead of
+    # bailing after the first one.
+    #
     # Same gate policy as prod_ready / slo_smoke: integration / release
     # lines. Skipped on plain feature/bugfix pushes.
     if: |
@@ -128,17 +135,25 @@ jobs:
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - spg-audit
+          - spg-crypto
+          - spg-engine
+          - spg-sql
+          - spg-storage
+          - spg-wire
+          - spgctl
+          - spg-server
     steps:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --release perf_gate × crates
+      - name: cargo test --release perf_gate -p ${{ matrix.crate }}
         run: |
           set -euo pipefail
-          for crate in spg-audit spg-crypto spg-engine spg-sql spg-storage spg-wire spgctl spg-server; do
-            echo "::group::perf_gate ${crate}"
-            cargo test --release -p "${crate}" --test perf_gate --locked -- --test-threads=1 --nocapture
-            echo "::endgroup::"
-          done
+          cargo test --release -p "${{ matrix.crate }}" --test perf_gate --locked -- --test-threads=1 --nocapture
 
   sqllogictest:
     name: biz (sqllogictest)
