@@ -864,23 +864,73 @@ pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///   * conkey (Text) — comma-separated column names
 ///   * confkey (Text) — comma-separated parent column names (FK only)
 pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.37.24 (24.8b-3) — widened from 6 to 17 PG-canonical
+    // columns. Key change: conrelid + confrelid are now BigInt
+    // OIDs (joinable with pg_class.oid). Tools depending on
+    // `SELECT … FROM pg_constraint c JOIN pg_class p ON
+    // c.conrelid = p.oid` (ORM relationship-graph builders) now
+    // resolve rows correctly.
     let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("conname", DataType::Text, false),
+        ColumnSchema::new("connamespace", DataType::BigInt, false),
         ColumnSchema::new("contype", DataType::Text, false),
-        ColumnSchema::new("conrelid", DataType::Text, false),
-        ColumnSchema::new("confrelid", DataType::Text, false),
+        ColumnSchema::new("condeferrable", DataType::Bool, false),
+        ColumnSchema::new("condeferred", DataType::Bool, false),
+        ColumnSchema::new("convalidated", DataType::Bool, false),
+        ColumnSchema::new("conrelid", DataType::BigInt, false),
+        ColumnSchema::new("contypid", DataType::BigInt, false),
+        ColumnSchema::new("conindid", DataType::BigInt, false),
+        ColumnSchema::new("conparentid", DataType::BigInt, false),
+        ColumnSchema::new("confrelid", DataType::BigInt, false),
+        ColumnSchema::new("confupdtype", DataType::Text, false),
+        ColumnSchema::new("confdeltype", DataType::Text, false),
+        ColumnSchema::new("confmatchtype", DataType::Text, false),
+        ColumnSchema::new("conislocal", DataType::Bool, false),
+        ColumnSchema::new("coninhcount", DataType::Int, false),
+        ColumnSchema::new("connoinherit", DataType::Bool, false),
         ColumnSchema::new("conkey", DataType::Text, false),
         ColumnSchema::new("confkey", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    // Build the same name → oid map pg_class uses (start at 16384).
+    let names = cat.table_names();
+    let mut by_table: alloc::collections::BTreeMap<String, i64> =
+        alloc::collections::BTreeMap::new();
+    let mut next_oid: i64 = 16384;
+    for tname in &names {
+        by_table.insert(tname.clone(), next_oid);
+        next_oid = next_oid.saturating_add(1);
+    }
+    // Constraint OIDs live in their own monotonically-increasing
+    // band (PG starts above 65536 for catalog-touch artefacts).
+    let mut con_oid: i64 = 65536;
+    let mut next_con_oid = || -> i64 {
+        let v = con_oid;
+        con_oid += 1;
+        v
+    };
+    for tname in &names {
+        let Some(t) = cat.get(tname) else { continue };
+        let conrelid = *by_table.get(tname).unwrap_or(&0);
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
             cols.get(pos)
                 .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
         };
-        // Uniqueness constraints (composite UNIQUE / PRIMARY KEY).
+        // Helper to build PG's int2vector `conkey` body
+        // (1-based, space-separated attnums).
+        let conkey_vec = |positions: &[usize]| -> String {
+            let mut s = String::new();
+            for (i, p) in positions.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&alloc::format!("{}", p + 1));
+            }
+            s
+        };
+        // Uniqueness constraints.
         for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
             let kind = if uc.is_primary_key { "p" } else { "u" };
             let conname = if uc.is_primary_key {
@@ -888,30 +938,46 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             } else {
                 alloc::format!("{}_uniq{ci}", tname)
             };
-            let conkey: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
+            let conkey = conkey_vec(&uc.columns);
+            let conkey_names: Vec<String> =
+                uc.columns.iter().map(|&p| col_name_at(p)).collect();
+            // Hybrid: PG's `conkey` is int2vector; expose the
+            // int2vector form so the canonical PG query path
+            // works, but include the names as a comma list in
+            // the same string (`"1 2 [name1,name2]"`) so the
+            // existing SPG dashboards that depended on the name
+            // form still read sensibly. Pure-int form lands
+            // when SPG ships proper int2vector support.
+            let conkey_display =
+                alloc::format!("{conkey} [{}]", conkey_names.join(","));
             rows.push(Row::new(alloc::vec![
+                Value::BigInt(next_con_oid()),
                 Value::text(conname),
+                Value::BigInt(2200),
                 Value::text::<String>(kind.into()),
-                Value::text(tname.clone()),
-                Value::text(String::new()),
-                Value::text(conkey.join(",")),
+                Value::Bool(false), // condeferrable
+                Value::Bool(false), // condeferred
+                Value::Bool(true),  // convalidated
+                Value::BigInt(conrelid),
+                Value::BigInt(0),   // contypid
+                Value::BigInt(0),   // conindid — pending UC↔index plumb-through
+                Value::BigInt(0),   // conparentid
+                Value::BigInt(0),   // confrelid (not an FK)
+                Value::text(" "),   // confupdtype
+                Value::text(" "),   // confdeltype
+                Value::text(" "),   // confmatchtype
+                Value::Bool(true),  // conislocal
+                Value::Int(0),      // coninhcount
+                Value::Bool(true),  // connoinherit
+                Value::text(conkey_display),
                 Value::text(String::new()),
             ]));
         }
-        // Single-column PK / UNIQUE indexes that have no
-        // matching entry in `uniqueness_constraints` (the engine
-        // creates only the BTree index for the bare-column case;
-        // composite forms ride the UC path above).
+        // Single-column unique indices that don't have a UC entry.
         for idx in t.indices() {
             if !idx.is_unique {
                 continue;
             }
-            let is_primary = idx.name.ends_with("_pkey");
-            let conname = idx.name.clone();
-            let kind = if is_primary { "p" } else { "u" };
-            let col_name = col_name_at(idx.column_position);
-            // Skip if already emitted via the UC loop above (same
-            // tuple shape — single-column).
             let already = t
                 .schema()
                 .uniqueness_constraints
@@ -920,12 +986,32 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             if already {
                 continue;
             }
+            let is_primary = idx.name.ends_with("_pkey");
+            let kind = if is_primary { "p" } else { "u" };
+            let positions = alloc::vec![idx.column_position];
+            let conkey = conkey_vec(&positions);
+            let col_name = col_name_at(idx.column_position);
+            let conkey_display = alloc::format!("{conkey} [{col_name}]");
             rows.push(Row::new(alloc::vec![
-                Value::text(conname),
+                Value::BigInt(next_con_oid()),
+                Value::text(idx.name.clone()),
+                Value::BigInt(2200),
                 Value::text::<String>(kind.into()),
-                Value::text(tname.clone()),
-                Value::text(String::new()),
-                Value::text(col_name),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::BigInt(conrelid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(" "),
+                Value::text(" "),
+                Value::text(" "),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(true),
+                Value::text(conkey_display),
                 Value::text(String::new()),
             ]));
         }
@@ -935,10 +1021,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 .name
                 .clone()
                 .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
-            let conkey: Vec<String> = fk.local_columns.iter().map(|&p| col_name_at(p)).collect();
-            // Parent column names: look up the parent table's
-            // schema if it exists; otherwise emit positions.
-            let confkey: Vec<String> = if let Some(parent) = cat.get(&fk.parent_table) {
+            let confrelid = by_table.get(&fk.parent_table).copied().unwrap_or(0);
+            let conkey = conkey_vec(&fk.local_columns);
+            let confkey = conkey_vec(&fk.parent_columns);
+            let conkey_names: Vec<String> =
+                fk.local_columns.iter().map(|&p| col_name_at(p)).collect();
+            let confkey_names: Vec<String> = if let Some(parent) = cat.get(&fk.parent_table) {
                 fk.parent_columns
                     .iter()
                     .map(|&p| {
@@ -955,17 +1043,49 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                     .map(|p| alloc::format!("col{p}"))
                     .collect()
             };
+            // confupdtype / confdeltype: 'a' no action, 'r' restrict,
+            // 'c' cascade, 'n' set null, 'd' set default. SPG's
+            // ForeignKey action enum already mirrors this.
+            let upd_action = fk_action_char(&fk.on_update);
+            let del_action = fk_action_char(&fk.on_delete);
             rows.push(Row::new(alloc::vec![
+                Value::BigInt(next_con_oid()),
                 Value::text(conname),
+                Value::BigInt(2200),
                 Value::text("f"),
-                Value::text(tname.clone()),
-                Value::text(fk.parent_table.clone()),
-                Value::text(conkey.join(",")),
-                Value::text(confkey.join(",")),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::BigInt(conrelid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(confrelid),
+                Value::text::<String>(upd_action.into()),
+                Value::text::<String>(del_action.into()),
+                Value::text("s"), // confmatchtype: 's' SIMPLE (default)
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(true),
+                Value::text(alloc::format!("{conkey} [{}]", conkey_names.join(","))),
+                Value::text(alloc::format!("{confkey} [{}]", confkey_names.join(","))),
             ]));
         }
     }
     (schema, rows)
+}
+
+/// v7.37.24 (24.8b-3) — map SPG's FK ReferentialAction onto
+/// PG's `confupdtype` / `confdeltype` single-char encoding.
+fn fk_action_char(action: &spg_storage::FkAction) -> &'static str {
+    use spg_storage::FkAction as A;
+    match action {
+        A::NoAction => "a",
+        A::Restrict => "r",
+        A::Cascade => "c",
+        A::SetNull => "n",
+        A::SetDefault => "d",
+    }
 }
 
 /// v7.17.0 Phase 3.P0-55 — synthesise `pg_catalog.pg_database`.

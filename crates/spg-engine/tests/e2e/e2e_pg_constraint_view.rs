@@ -1,4 +1,8 @@
-//! v7.17.0 Phase 3.P0-54 — pg_catalog.pg_constraint view.
+//! v7.17.0 Phase 3.P0-54 + v7.37.24 (24.8b-3) — pg_constraint view.
+//! Widened to 20 PG-canonical columns; conrelid + confrelid are
+//! now BigInt OIDs (joinable with pg_class.oid). conkey / confkey
+//! are PG int2vector strings with the column names appended in
+//! square brackets for human readability.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -18,13 +22,19 @@ fn pg_constraint_lists_primary_key() {
     let r = rows(
         e.execute(
             "SELECT contype, conkey FROM pg_catalog.pg_constraint \
-             WHERE conrelid = 't' AND contype = 'p'",
+             WHERE contype = 'p'",
         )
         .unwrap(),
     );
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::text("p"));
-    assert_eq!(r[0][1], Value::text("id"));
+    // conkey is now `<1-based int2vector> [name1,name2,…]`.
+    if let Value::Text(s) = &r[0][1] {
+        assert!(s.starts_with("1 ["), "conkey shape: {s:?}");
+        assert!(s.contains("id"), "conkey must include `id`: {s:?}");
+    } else {
+        panic!("conkey wrong type");
+    }
 }
 
 #[test]
@@ -46,10 +56,31 @@ fn pg_constraint_lists_foreign_key() {
     );
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::text("f"));
-    assert_eq!(r[0][1], Value::text("children"));
-    assert_eq!(r[0][2], Value::text("parents"));
-    assert_eq!(r[0][3], Value::text("parent_id"));
-    assert_eq!(r[0][4], Value::text("id"));
+    // conrelid + confrelid are now BigInt OIDs that match
+    // pg_class.oid for the respective tables.
+    let cls = rows(e.execute("SELECT oid, relname FROM pg_catalog.pg_class").unwrap());
+    let oid_of = |t: &str| -> i64 {
+        cls.iter()
+            .find(|row| matches!(&row[1], Value::Text(s) if s.as_ref() == t))
+            .map(|row| match row[0] {
+                Value::BigInt(o) => o,
+                _ => panic!(),
+            })
+            .unwrap_or_else(|| panic!("no pg_class row for {t}"))
+    };
+    assert_eq!(r[0][1], Value::BigInt(oid_of("children")));
+    assert_eq!(r[0][2], Value::BigInt(oid_of("parents")));
+    // conkey / confkey shapes — PG int2vector + name suffix.
+    for (idx, (want_pos, want_name)) in [(3, ("2", "parent_id")), (4, ("1", "id"))].iter() {
+        if let Value::Text(s) = &r[0][*idx] {
+            assert!(
+                s.starts_with(*want_pos) && s.contains(*want_name),
+                "col {idx} shape (got {s:?}, expected pos {want_pos} name {want_name})"
+            );
+        } else {
+            panic!("col {idx} wrong type");
+        }
+    }
 }
 
 #[test]
@@ -60,11 +91,71 @@ fn pg_constraint_lists_composite_unique() {
     let r = rows(
         e.execute(
             "SELECT contype, conkey FROM pg_catalog.pg_constraint \
-             WHERE conrelid = 't' AND contype = 'u'",
+             WHERE contype = 'u'",
         )
         .unwrap(),
     );
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::text("u"));
-    assert_eq!(r[0][1], Value::text("a,b"));
+    if let Value::Text(s) = &r[0][1] {
+        // Two columns: `1 2 [a,b]`.
+        assert!(s.starts_with("1 2 ["), "conkey shape: {s:?}");
+        assert!(s.contains("a") && s.contains("b"), "names: {s:?}");
+    } else {
+        panic!("conkey wrong type");
+    }
+}
+
+#[test]
+fn pg_constraint_emits_pg_canonical_column_set() {
+    let mut e = Engine::new();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_constraint").unwrap();
+    let QueryResult::Rows { columns, .. } = r else {
+        panic!("Rows");
+    };
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    for must in [
+        "oid",
+        "conname",
+        "connamespace",
+        "contype",
+        "condeferrable",
+        "convalidated",
+        "conrelid",
+        "conindid",
+        "confrelid",
+        "confupdtype",
+        "confdeltype",
+        "confmatchtype",
+        "conislocal",
+        "conkey",
+        "confkey",
+    ] {
+        assert!(
+            names.contains(&must),
+            "pg_constraint missing column {must}, got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn pg_constraint_fk_action_chars_match_pg() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    e.execute(
+        "CREATE TABLE c (id INT NOT NULL, pid INT NOT NULL, \
+         FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE ON UPDATE SET NULL)",
+    )
+    .unwrap();
+    let r = rows(
+        e.execute(
+            "SELECT confupdtype, confdeltype FROM pg_catalog.pg_constraint WHERE contype = 'f'",
+        )
+        .unwrap(),
+    );
+    assert!(!r.is_empty());
+    // ON UPDATE SET NULL → 'n'; ON DELETE CASCADE → 'c'.
+    assert_eq!(r[0][0], Value::text("n"));
+    assert_eq!(r[0][1], Value::text("c"));
 }
