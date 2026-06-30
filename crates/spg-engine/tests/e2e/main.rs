@@ -60,6 +60,7 @@ mod e2e_exists_decorrelation;
 mod e2e_explain_analyze;
 mod e2e_explain_costs_off;
 mod e2e_explain_options;
+mod e2e_explain_suggest_composite;
 mod e2e_expression_index;
 mod e2e_fetch_with_ties;
 mod e2e_filter_clause;
