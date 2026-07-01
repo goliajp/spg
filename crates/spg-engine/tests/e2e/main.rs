@@ -156,6 +156,7 @@ mod e2e_pg_stat_scan_probes;
 mod e2e_crc32;
 mod e2e_bytea_bitops;
 mod e2e_current_setting;
+mod e2e_extension_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
