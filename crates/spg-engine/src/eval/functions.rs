@@ -407,6 +407,126 @@ fn apply_function_dispatch(
             let bit = (b[byte_idx] >> bit_off) & 1;
             Ok(Value::Int(i32::from(bit)))
         }
+        // v7.37.17 (17.6 siblings) — set_byte(bytea, index, val) /
+        // set_bit(bytea, bit_index, val). Complements get_byte /
+        // get_bit; returns modified bytea copy.
+        "set_byte" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("set_byte() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let b = match &args[0] {
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "set_byte(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let idx = match &args[1] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "set_byte(): index must be integer".into(),
+                    });
+                }
+            };
+            let val = match &args[2] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "set_byte(): value must be integer".into(),
+                    });
+                }
+            };
+            if idx < 0 || (idx as usize) >= b.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "set_byte(): index {idx} out of range 0..{}",
+                        b.len()
+                    ),
+                });
+            }
+            if !(0..=255).contains(&val) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("set_byte(): value {val} not in 0..=255"),
+                });
+            }
+            let mut out = b.to_vec();
+            out[idx as usize] = val as u8;
+            Ok(Value::Bytes(out.into()))
+        }
+        "set_bit" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("set_bit() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let b = match &args[0] {
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "set_bit(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let bit_idx = match &args[1] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "set_bit(): index must be integer".into(),
+                    });
+                }
+            };
+            let val = match &args[2] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "set_bit(): value must be integer".into(),
+                    });
+                }
+            };
+            if bit_idx < 0 || (bit_idx as usize) >= b.len() * 8 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "set_bit(): index {bit_idx} out of range 0..{}",
+                        b.len() * 8
+                    ),
+                });
+            }
+            if val != 0 && val != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("set_bit(): value {val} must be 0 or 1"),
+                });
+            }
+            let mut out = b.to_vec();
+            let byte_idx = (bit_idx as usize) / 8;
+            let bit_off = (bit_idx as usize) % 8;
+            let mask = 1u8 << bit_off;
+            if val == 1 {
+                out[byte_idx] |= mask;
+            } else {
+                out[byte_idx] &= !mask;
+            }
+            Ok(Value::Bytes(out.into()))
+        }
         // v7.37.17 (17.6 siblings) — index-property probes that
         // psql \d output + monitoring exporters emit.
         //
