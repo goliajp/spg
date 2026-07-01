@@ -608,6 +608,53 @@ fn execute_stmts(
                     return Ok(BodyOutcome::Break);
                 }
             }
+            PlPgSqlStmt::ExecuteDynamic { sql } => {
+                // v7.37.20 (20.13) — EXECUTE <string_expr>. Evaluate
+                // the expression at runtime to obtain a SQL string,
+                // parse it, and queue for post-body execution the
+                // same way EmbeddedSql does. USING <params> for
+                // placeholder binding queues with v7.40 PL/pgSQL
+                // epic.
+                let v = eval_with_new_old_and_locals(
+                    sql,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let sql_text = match v {
+                    spg_storage::Value::Text(s) => s.into_owned(),
+                    other => {
+                        return Err(TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::format!(
+                                "EXECUTE <expr>: expression must evaluate to TEXT, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                let parsed = spg_sql::parser::parse_statement(&sql_text).map_err(|e| {
+                    TriggerError::UnparseableBody {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "EXECUTE {sql_text:?}: parse failed: {}",
+                            e.message
+                        ),
+                    }
+                })?;
+                deferred.push(DeferredEmbeddedStmt {
+                    function: ctx.function.into(),
+                    stmt: parsed,
+                });
+            }
             PlPgSqlStmt::Continue { when } => {
                 // v7.37.20 (20.2) — CONTINUE [WHEN <cond>]. Same shape
                 // as EXIT but signals BodyOutcome::Continue.

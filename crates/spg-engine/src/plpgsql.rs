@@ -173,6 +173,9 @@ impl Engine {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }
                 }
+                PlPgSqlStmt::ExecuteDynamic { sql } => {
+                    self.resolve_expr_subqueries(sql, cancel)?;
+                }
                 PlPgSqlStmt::EmbeddedSql(_) => {
                     // Embedded SQL goes back through execute_stmt
                     // _with_cancel which runs the SELECT-side
