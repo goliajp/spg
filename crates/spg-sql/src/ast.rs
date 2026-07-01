@@ -1102,6 +1102,20 @@ pub enum PlPgSqlStmt {
     /// through the engine like an EmbeddedSql. USING <param_list>
     /// for placeholder binding queues with v7.40 PL/pgSQL epic.
     ExecuteDynamic { sql: Expr },
+    /// v7.37.20 (20.5) — `FOR <var> IN <select_body> LOOP <body>
+    /// END LOOP;`. Runs the SELECT once, iterates the resulting
+    /// rows, binds the first column of each row to `var` as a
+    /// scalar Value, then runs the body per iteration. EXIT /
+    /// CONTINUE / ASSERT / RAISE etc. propagate through the
+    /// enclosing loop's BodyOutcome discipline the same way
+    /// FOR range and WHILE do. Full record-binding (var as
+    /// composite carrying all columns) queues with v7.40 record
+    /// type infrastructure.
+    ForQuery {
+        var: String,
+        query: Box<SelectStatement>,
+        body: Vec<PlPgSqlStmt>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3689,6 +3703,13 @@ impl fmt::Display for PlPgSqlStmt {
                 Ok(())
             }
             Self::ExecuteDynamic { sql } => write!(f, "EXECUTE {sql}"),
+            Self::ForQuery { var, query, body } => {
+                writeln!(f, "FOR {var} IN ({query}) LOOP")?;
+                for s in body {
+                    writeln!(f, "  {s};")?;
+                }
+                f.write_str("END LOOP")
+            }
         }
     }
 }

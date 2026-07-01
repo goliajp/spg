@@ -228,6 +228,7 @@ pub fn fire_row_trigger(
         default_text_search_config,
         is_after,
         select_into_resolver: None,
+        for_query_resolver: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -284,6 +285,10 @@ struct BodyCtx<'a> {
     /// fresh value). `None` for trigger paths where SelectInto
     /// isn't yet supported.
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    /// v7.37.20 (20.5) — synchronous SELECT-to-rows resolver used
+    /// by `FOR <var> IN <SELECT> LOOP`. Provided by the DO block
+    /// executor; runs the SELECT once and returns every row.
+    for_query_resolver: Option<&'a ForQueryResolver<'a>>,
 }
 
 /// v7.16.2 — callback shape the DO-block executor registers
@@ -291,6 +296,16 @@ struct BodyCtx<'a> {
 /// the engine, returns the first row's first column.
 pub type SelectIntoResolver<'a> =
     dyn Fn(&spg_sql::ast::Statement) -> Result<Value<'static>, TriggerError> + 'a;
+
+/// v7.37.20 (20.5) — callback shape the DO-block executor registers
+/// on `BodyCtx` for FOR-IN-SELECT loops. Runs the supplied SELECT
+/// statement against the engine and returns every row's values.
+pub type ForQueryResolver<'a> = dyn Fn(
+        &spg_sql::ast::Statement,
+    ) -> Result<
+        alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+        TriggerError,
+    > + 'a;
 
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
@@ -620,6 +635,47 @@ fn execute_stmts(
                     return Ok(BodyOutcome::Break);
                 }
             }
+            PlPgSqlStmt::ForQuery { var, query, body } => {
+                // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
+                // Runs the SELECT once via the DO block's registered
+                // resolver, iterates rows, binds the first cell of
+                // each row to `var` as a scalar Value. Full record
+                // binding (var carrying all columns) queues with
+                // v7.40 record type infrastructure.
+                let resolver = ctx.for_query_resolver.ok_or_else(|| {
+                    TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "FOR <var> IN <SELECT> LOOP: only supported inside DO blocks in v7.37.20 (trigger paths queue with v7.40)"
+                        ),
+                    }
+                })?;
+                let mut stmt = spg_sql::ast::Statement::Select((**query).clone());
+                substitute_trigger_context_in_statement(
+                    &mut stmt,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let rows = resolver(&stmt)?;
+                for row_values in rows {
+                    let first_cell = row_values
+                        .into_iter()
+                        .next()
+                        .unwrap_or(spg_storage::Value::Null);
+                    locals.insert(var.clone(), first_cell);
+                    match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
+                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
+                        BodyOutcome::Break => break,
+                        early => return Ok(early),
+                    }
+                }
+            }
             PlPgSqlStmt::ExecuteDynamic { sql } => {
                 // v7.37.20 (20.13) — EXECUTE <string_expr>. Evaluate
                 // the expression at runtime to obtain a SQL string,
@@ -842,6 +898,7 @@ pub fn execute_do_block_top_level<'a>(
     block: &spg_sql::ast::PlPgSqlBlock,
     default_text_search_config: Option<&'a str>,
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    for_query_resolver: Option<&'a ForQueryResolver<'a>>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
     let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
     let empty_cols: &[ColumnSchema] = &[];
@@ -864,6 +921,7 @@ pub fn execute_do_block_top_level<'a>(
         default_text_search_config,
         is_after: false,
         select_into_resolver,
+        for_query_resolver,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
