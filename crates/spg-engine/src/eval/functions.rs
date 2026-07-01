@@ -3377,6 +3377,46 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG 15+ unicode_version() and
+        // icu_unicode_version(). Return the Unicode version Rust's
+        // std char tables track — matches what unistr / normalize
+        // / lower / upper end up computing against.
+        "unicode_version" | "icu_unicode_version" => {
+            // Rust's std::char is at Unicode 15.0 as of Rust 1.85+;
+            // pin to that so callers get a real answer. Real
+            // introspection thread with libicu when ICU support
+            // lands.
+            Ok(Value::text::<String>("15.0".into()))
+        }
+        // pg_char_to_encoding / pg_encoding_max_length — the
+        // encoding introspection pair. pg_encoding_max_length
+        // returns the max bytes for a codepoint under the encoding
+        // (4 for UTF-8).
+        "pg_encoding_max_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_encoding_max_length() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                // UTF8 is encoding id 6; SPG only speaks UTF8.
+                Value::Int(6) | Value::BigInt(6) => Ok(Value::Int(4)),
+                Value::Int(_) | Value::BigInt(_) => Ok(Value::Int(4)),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "pg_encoding_max_length() needs int encoding id, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // pg_get_multixact_members(oid) — returns a set; scalar
+        // surface NULL. pg_xact_commit_timestamp already handled.
+        "pg_get_multixact_members" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — PG 16+ unistr(text) processes
         // Unicode escape sequences in the input. Recognizes:
         //   \\        → literal backslash
