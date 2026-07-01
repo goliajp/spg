@@ -2998,10 +2998,21 @@ impl Parser {
                 return Ok(out);
             }
             let name = self.expect_ident_like()?;
-            let ty_token = self.expect_ident_like()?;
-            let ty = match map_type_ident_to_column_type_name(&ty_token) {
-                Some(t) => FunctionArgType::Typed(t),
-                None => FunctionArgType::Raw(ty_token),
+            // v7.37.20 (20.7) — type inference: if the next token is
+            // `:=` or `=` (no explicit type), infer from the default
+            // expression. Otherwise the ident that follows is the
+            // declared type.
+            let ty = if matches!(self.peek(), Token::ColonEq | Token::Eq) {
+                // Sentinel: `FunctionArgType::Raw("_infer_")` tells the
+                // downstream declaration walker to type the local by
+                // the runtime type of the default expression.
+                FunctionArgType::Raw("_infer_".into())
+            } else {
+                let ty_token = self.expect_ident_like()?;
+                match map_type_ident_to_column_type_name(&ty_token) {
+                    Some(t) => FunctionArgType::Typed(t),
+                    None => FunctionArgType::Raw(ty_token),
+                }
             };
             let default = match self.peek() {
                 Token::ColonEq => {
