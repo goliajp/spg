@@ -4350,7 +4350,72 @@ fn apply_function_dispatch(
         // queries; format a byte count as a human-readable string.
         // For now return empty text so the SELECT succeeds; real
         // formatting queues with a size-utils bump.
-        "pg_size_pretty" => Ok(Value::text::<String>("0 bytes".into())),
+        // v7.37.17 (17.6 siblings) — real pg_size_pretty(bigint).
+        // Convert byte count into a human-readable string using
+        // 1024-boundaries. Matches PG's decision-point table:
+        //   [0, 10 KB)     → "N bytes"
+        //   [10 KB, 10 MB) → "N kB"
+        //   [10 MB, 10 GB) → "N MB"
+        //   [10 GB, 10 TB) → "N GB"
+        //   [10 TB, ∞)     → "N TB"
+        // Rounds to nearest integer at each unit boundary.
+        "pg_size_pretty" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_size_pretty() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let n: i64 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                Value::Numeric { scaled, scale } => {
+                    let ten_pow = 10i128.pow(*scale as u32);
+                    (*scaled as i128 / ten_pow) as i64
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_size_pretty(): needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let (mut val, mut unit) = (n as f64, "bytes");
+            const KB: f64 = 1024.0;
+            const CROSSOVER: f64 = 10.0 * KB; // 10 kB threshold
+            if val.abs() >= CROSSOVER {
+                val /= KB;
+                unit = "kB";
+                if val.abs() >= CROSSOVER {
+                    val /= KB;
+                    unit = "MB";
+                    if val.abs() >= CROSSOVER {
+                        val /= KB;
+                        unit = "GB";
+                        if val.abs() >= CROSSOVER {
+                            val /= KB;
+                            unit = "TB";
+                            if val.abs() >= CROSSOVER {
+                                val /= KB;
+                                unit = "PB";
+                            }
+                        }
+                    }
+                }
+            }
+            let s = if unit == "bytes" {
+                alloc::format!("{n} bytes")
+            } else {
+                alloc::format!("{} {unit}", val.round() as i64)
+            };
+            Ok(Value::text(s))
+        }
         // pg_database_size / pg_relation_size / pg_total_relation_size:
         // monitoring dashboards + Postgres exporter emit these.
         // Return 0 — SPG doesn't yet track per-relation on-disk
