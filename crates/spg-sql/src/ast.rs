@@ -1072,6 +1072,11 @@ pub enum PlPgSqlStmt {
     /// condition is truthy). Bubbles up as BodyOutcome::Break which
     /// the enclosing loop catches. Outside a loop it's a no-op.
     Exit { when: Option<Expr> },
+    /// v7.37.20 (20.2) — `CONTINUE [WHEN <condition>];` inside a
+    /// loop. Same shape as EXIT but bubbles up as BodyOutcome::Continue
+    /// which the enclosing loop catches, skipping the remainder of
+    /// the body and jumping to the next iteration.
+    Continue { when: Option<Expr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3646,6 +3651,13 @@ impl fmt::Display for PlPgSqlStmt {
             }
             Self::Exit { when } => {
                 f.write_str("EXIT")?;
+                if let Some(c) = when {
+                    write!(f, " WHEN {c}")?;
+                }
+                Ok(())
+            }
+            Self::Continue { when } => {
+                f.write_str("CONTINUE")?;
                 if let Some(c) = when {
                     write!(f, " WHEN {c}")?;
                 }

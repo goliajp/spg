@@ -168,6 +168,11 @@ impl Engine {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }
                 }
+                PlPgSqlStmt::Continue { when } => {
+                    if let Some(cond) = when {
+                        self.resolve_expr_subqueries(cond, cancel)?;
+                    }
+                }
                 PlPgSqlStmt::EmbeddedSql(_) => {
                     // Embedded SQL goes back through execute_stmt
                     // _with_cancel which runs the SELECT-side
