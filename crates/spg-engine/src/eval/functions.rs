@@ -6147,6 +6147,22 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_stat_statements support
+        // functions. Callers emit these to reset stats + probe
+        // the module's status. SETOF probes → NULL, reset ops
+        // → NULL (void).
+        "pg_stat_statements_info"
+        | "pg_stat_statements_reset"
+        | "pg_stat_statements_reset_shared_memory_stats" => Ok(Value::Null),
+        // pg_stat_statements returns a large row per statement.
+        // Scalar-surface NULL.
+        "pg_stat_statements" => Ok(Value::Null),
+        // pg_get_shmem_allocations — shared-memory allocation view
+        // helper.
+        "pg_get_shmem_allocations" => Ok(Value::Null),
+        // pg_config — returns the compile-time config settings.
+        // Already handled above via NULL; keep alt name.
+        "pg_config_env" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — extension introspection.
         // These SETOF functions are used by psql \dx + ORMs to
         // discover available extensions. Scalar-surface NULL so
