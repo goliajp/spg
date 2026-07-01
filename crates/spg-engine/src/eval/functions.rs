@@ -231,6 +231,58 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — pg_column_size(v) returns the
+        // storage size of a value in bytes. Real implementation for
+        // the value types SPG carries in-line (int / bigint / float /
+        // text / bytea / bool / null); the value tree doesn't yet
+        // carry TOAST length so composite/array types get their
+        // ser bytes size approximation via alloc::format.
+        "pg_column_size" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pg_column_size() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let size = match &args[0] {
+                Value::Null => 0i32,
+                Value::Bool(_) => 1,
+                Value::SmallInt(_) => 2,
+                Value::Int(_) => 4,
+                Value::BigInt(_) => 8,
+                Value::Float(_) => 8,
+                Value::Text(s) => {
+                    // PG includes the 4-byte length header for varlena.
+                    (s.len() as i32).saturating_add(4)
+                }
+                Value::Bytes(b) => (b.len() as i32).saturating_add(4),
+                other => {
+                    // Fallback: format the value to estimate byte size
+                    // (composite / array / range).
+                    let s = alloc::format!("{other:?}");
+                    (s.len() as i32).saturating_add(4)
+                }
+            };
+            Ok(Value::Int(size))
+        }
+        // v7.37.17 (17.6 siblings) — pg_column_compression(v) — was
+        // added in PG 14. SPG doesn't yet run per-column compression;
+        // pg_dump / monitoring queries commonly emit this alongside
+        // pg_column_size. Returns 'p' (plain) for text-like values,
+        // NULL for others.
+        "pg_column_compression" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_column_compression() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Text(_) | Value::Bytes(_) => Ok(Value::text::<String>("plain".into())),
+                _ => Ok(Value::Null),
+            }
+        }
         // v7.37.17 (17.6 siblings) — pg_relation_filepath /
         // pg_relation_filenode probes used by monitoring exporters.
         // SPG uses a segment-id + tier scheme, not PG's on-disk
