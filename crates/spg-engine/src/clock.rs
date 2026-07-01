@@ -262,10 +262,32 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
             Some(ClockShape::Timestamp)
         }
         12 if name.eq_ignore_ascii_case("current_date") => Some(ClockShape::Date),
+        // v7.37.17 (17.6 siblings) — PG's clock family. localtime /
+        // localtimestamp (parenless) fold into current_timestamp
+        // for the drop-in model. transaction_timestamp / statement_
+        // _timestamp / clock_timestamp all return current_timestamp
+        // — SPG runs everything in a single unified clock.
+        9 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("localtime") => {
+            Some(ClockShape::Timestamp)
+        }
         14 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("unix_timestamp") => {
             Some(ClockShape::UnixSeconds)
         }
+        15 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("clock_timestamp") => {
+            Some(ClockShape::Timestamp)
+        }
         17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::Timestamp),
+        14 if name.eq_ignore_ascii_case("localtimestamp") => Some(ClockShape::Timestamp),
+        19 if kind == ClockSite::Fn
+            && name.eq_ignore_ascii_case("statement_timestamp") =>
+        {
+            Some(ClockShape::Timestamp)
+        }
+        21 if kind == ClockSite::Fn
+            && name.eq_ignore_ascii_case("transaction_timestamp") =>
+        {
+            Some(ClockShape::Timestamp)
+        }
         _ => None,
     };
     let shape = shape?;
