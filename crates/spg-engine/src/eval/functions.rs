@@ -567,6 +567,72 @@ fn apply_function_dispatch(
         // activity view. Return NULL for the scalar surface;
         // real callers use the pg_stat_activity view.
         "pg_stat_get_activity" | "pg_stat_get_backend_activity" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_bgwriter_* +
+        // pg_stat_get_wal_* + pg_stat_get_archiver families.
+        // Aggregate cluster-wide counter probes emitted by
+        // postgres_exporter's default scrape.
+        "pg_stat_get_bgwriter_timed_checkpoints"
+        | "pg_stat_get_bgwriter_requested_checkpoints"
+        | "pg_stat_get_bgwriter_buf_written_checkpoints"
+        | "pg_stat_get_bgwriter_buf_written_clean"
+        | "pg_stat_get_bgwriter_maxwritten_clean"
+        | "pg_stat_get_buf_written_backend"
+        | "pg_stat_get_buf_fsync_backend"
+        | "pg_stat_get_buf_alloc"
+        | "pg_stat_get_checkpoint_write_time"
+        | "pg_stat_get_checkpoint_sync_time"
+        | "pg_stat_get_wal_records"
+        | "pg_stat_get_wal_fpi"
+        | "pg_stat_get_wal_bytes"
+        | "pg_stat_get_wal_buffers_full"
+        | "pg_stat_get_wal_write"
+        | "pg_stat_get_wal_sync"
+        | "pg_stat_get_wal_write_time"
+        | "pg_stat_get_wal_sync_time"
+        | "pg_stat_get_archiver_archived_count"
+        | "pg_stat_get_archiver_failed_count"
+        | "pg_stat_get_analyze_count"
+        | "pg_stat_get_autoanalyze_count"
+        | "pg_stat_get_vacuum_count"
+        | "pg_stat_get_autovacuum_count"
+        | "pg_stat_get_live_tuples"
+        | "pg_stat_get_dead_tuples"
+        | "pg_stat_get_mod_since_analyze"
+        | "pg_stat_get_ins_since_vacuum"
+        | "pg_stat_get_tuples_inserted"
+        | "pg_stat_get_tuples_updated"
+        | "pg_stat_get_tuples_deleted"
+        | "pg_stat_get_tuples_hot_updated"
+        | "pg_stat_get_tuples_newpage_updated"
+        | "pg_stat_get_numscans"
+        | "pg_stat_get_tuples_returned"
+        | "pg_stat_get_tuples_fetched"
+        | "pg_stat_get_blocks_fetched"
+        | "pg_stat_get_blocks_hit"
+        | "pg_stat_get_xact_tuples_inserted"
+        | "pg_stat_get_xact_tuples_updated"
+        | "pg_stat_get_xact_tuples_deleted"
+        | "pg_stat_get_xact_tuples_hot_updated"
+        | "pg_stat_get_xact_tuples_newpage_updated"
+        | "pg_stat_get_xact_numscans"
+        | "pg_stat_get_xact_tuples_returned"
+        | "pg_stat_get_xact_tuples_fetched"
+        | "pg_stat_get_xact_blocks_fetched"
+        | "pg_stat_get_xact_blocks_hit" => Ok(Value::BigInt(0)),
+        // Timestamp-shaped ones.
+        "pg_stat_get_bgwriter_stat_reset_time"
+        | "pg_stat_get_archiver_last_archived_time"
+        | "pg_stat_get_archiver_last_failed_time"
+        | "pg_stat_get_archiver_stat_reset_time"
+        | "pg_stat_get_last_analyze_time"
+        | "pg_stat_get_last_autoanalyze_time"
+        | "pg_stat_get_last_vacuum_time"
+        | "pg_stat_get_last_autovacuum_time" => Ok(Value::Null),
+        // Text-shaped ones.
+        "pg_stat_get_archiver_last_archived_wal"
+        | "pg_stat_get_archiver_last_failed_wal" => {
+            Ok(Value::text::<String>(String::new()))
+        }
         // v7.37.17 (17.6 siblings) — pg_stat_get_db_* family.
         // Per-database counter probes; postgres_exporter emits
         // these in the "high cardinality" scrape mode. Return
