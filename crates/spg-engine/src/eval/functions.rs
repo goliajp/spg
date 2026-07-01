@@ -6082,6 +6082,68 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — CRC32 / CRC32C (Castagnoli).
+        // Not built into PG but common in dblink/foreign-data
+        // migration scripts and audit-log query helpers. Real
+        // implementation via table-free polynomial.
+        "crc32" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("crc32() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let bytes: &[u8] = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "crc32() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // IEEE 802.3 polynomial 0xEDB88320.
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for byte in bytes.iter() {
+                crc ^= *byte as u32;
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            Ok(Value::BigInt(!crc as i64))
+        }
+        "crc32c" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("crc32c() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let bytes: &[u8] = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "crc32c() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Castagnoli polynomial 0x82F63B78.
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for byte in bytes.iter() {
+                crc ^= *byte as u32;
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0x82F6_3B78 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            Ok(Value::BigInt(!crc as i64))
+        }
         // v7.37.17 (17.6 siblings) — pg_stat_get_all_indexes /
         // _all_sequences family. Aggregate per-relation stats used
         // by monitoring exporters — return 0 counter.
