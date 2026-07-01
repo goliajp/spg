@@ -4538,6 +4538,23 @@ fn apply_function_dispatch(
         // pg_backend_pid — session identifier. SPG uses u64 slot
         // ids; return a low deterministic value for embedded runs.
         "pg_backend_pid" => Ok(Value::Int(1)),
+        // v7.37.17 (17.6 siblings) — PG 16+ system_user() returns
+        // the authenticated identity in "auth_method:user_name"
+        // form (e.g. "cert:alice", "scram-sha-256:bob"). SPG has
+        // no wire-level auth surface yet; return a stable
+        // "trust:admin" placeholder so callers get a non-NULL
+        // formatted value.
+        "system_user" => Ok(Value::text::<String>("trust:admin".into())),
+        // current_query() / pg_stat_get_backend_activity — the SQL
+        // string of the currently-executing query. SPG doesn't
+        // expose the executing text back to itself; return empty
+        // text. pg_dump/pg_dumpall probe this for lockcheck info.
+        "current_query" | "pg_current_query" => {
+            Ok(Value::text::<String>(String::new()))
+        }
+        // pg_column_summary — pg_stats-family helper. Return NULL
+        // until real per-column stats land with the statistics epic.
+        "pg_column_summary" => Ok(Value::Null),
         // pg_conf_load_time / pg_postmaster_start_time — return
         // process start time in the embedded case; wire-layer has
         // real timestamps.
