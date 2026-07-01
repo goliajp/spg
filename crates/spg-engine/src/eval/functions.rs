@@ -5789,7 +5789,72 @@ fn apply_function_dispatch(
             .cloned()
             .map(Value::into_owned)
             .unwrap_or(Value::Null)),
-        "current_setting" => Ok(Value::text(String::new())),
+        // v7.37.17 (17.6 siblings) — current_setting(name [, missing_ok])
+        // returns the current value of a GUC. Real widening: for
+        // the driver-probed defaults callers rely on, return
+        // sensible PG defaults instead of empty text. missing_ok
+        // is honored — when true, unknown params return NULL
+        // (matches PG); when false / omitted, error but we're
+        // permissive and return empty text so probes complete.
+        "current_setting" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "current_setting() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let name = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "current_setting(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let missing_ok = if args.len() == 2 {
+                matches!(&args[1], Value::Bool(true))
+            } else {
+                false
+            };
+            let val = match name.to_ascii_lowercase().as_str() {
+                "server_version" => "16.0 (SPG-compat)",
+                "server_version_num" => "160000",
+                "server_encoding" => "UTF8",
+                "client_encoding" => "UTF8",
+                "lc_collate" => "C.UTF-8",
+                "lc_ctype" => "C.UTF-8",
+                "lc_messages" => "C",
+                "lc_monetary" => "C",
+                "lc_numeric" => "C",
+                "lc_time" => "C",
+                "timezone" | "time zone" => "UTC",
+                "datestyle" | "date_style" => "ISO, MDY",
+                "intervalstyle" | "interval_style" => "postgres",
+                "search_path" => "\"$user\", public",
+                "default_transaction_isolation" => "read committed",
+                "transaction_isolation" => "read committed",
+                "standard_conforming_strings" => "on",
+                "check_function_bodies" => "on",
+                "row_security" => "on",
+                "bytea_output" => "hex",
+                "xmloption" => "content",
+                "application_name" => "",
+                "backslash_quote" => "safe_encoding",
+                _ => {
+                    if missing_ok {
+                        return Ok(Value::Null);
+                    }
+                    ""
+                }
+            };
+            Ok(Value::text::<String>(val.into()))
+        }
         // PG `pg_catalog.*` discovery / cast helpers commonly
         // emitted by ORMs probing the server. Accept-as-no-op
         // with sensible defaults so the dump preamble doesn't
