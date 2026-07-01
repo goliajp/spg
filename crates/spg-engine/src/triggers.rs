@@ -242,7 +242,7 @@ pub fn fire_row_trigger(
         // Body fell off without an explicit RETURN. PL/pgSQL
         // default is `RETURN NULL`; we mirror — the BEFORE
         // trigger then skips the row.
-        BodyOutcome::FellThrough => TriggerOutcome::Skip,
+        BodyOutcome::FellThrough | BodyOutcome::Break => TriggerOutcome::Skip,
     };
     Ok((outcome, deferred))
 }
@@ -254,6 +254,11 @@ pub fn fire_row_trigger(
 enum BodyOutcome {
     Return(ReturnTarget),
     FellThrough,
+    /// v7.37.20 (20.2) — `EXIT [WHEN <cond>];` bubbled up through
+    /// the current loop body's execute_stmts. WHILE / FOR / bare
+    /// LOOP catch this at their iteration point and break; any
+    /// non-loop caller treats it as a benign no-op.
+    Break,
 }
 
 /// Shared parameters every body-stmt evaluation needs. Bundled so
@@ -378,6 +383,7 @@ fn execute_stmts(
                         matched = true;
                         match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                             BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
+                            BodyOutcome::Break => return Ok(BodyOutcome::Break),
                             BodyOutcome::FellThrough => {}
                         }
                         break;
@@ -386,6 +392,7 @@ fn execute_stmts(
                 if !matched && !else_branch.is_empty() {
                     match execute_stmts(else_branch, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
+                        BodyOutcome::Break => return Ok(BodyOutcome::Break),
                         BodyOutcome::FellThrough => {}
                     }
                 }
@@ -541,6 +548,55 @@ fn execute_stmts(
                     }
                     i = i.saturating_add(step);
                     iter += 1;
+                }
+            }
+            PlPgSqlStmt::Loop { body } => {
+                // v7.37.20 (20.2) — bare LOOP: iterate body until an
+                // EXIT bubbles up, or the budget is exhausted.
+                const LOOP_BUDGET: u64 = 1_000_000;
+                let mut iter: u64 = 0;
+                loop {
+                    if iter >= LOOP_BUDGET {
+                        return Err(TriggerError::RaiseException {
+                            function: ctx.function.into(),
+                            message: alloc::format!(
+                                "LOOP iteration budget {LOOP_BUDGET} reached"
+                            ),
+                        });
+                    }
+                    match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Break => break,
+                        early => return Ok(early),
+                    }
+                    iter += 1;
+                }
+            }
+            PlPgSqlStmt::Exit { when } => {
+                // v7.37.20 (20.2) — EXIT [WHEN <cond>]. Unconditional
+                // exit or conditional (only breaks when truthy).
+                let should_break = match when {
+                    None => true,
+                    Some(cond) => {
+                        let v = eval_with_new_old_and_locals(
+                            cond,
+                            current_new.as_ref(),
+                            old_row,
+                            locals,
+                            ctx.columns,
+                            ctx.table_name,
+                            ctx.params,
+                            ctx.default_text_search_config,
+                        )
+                        .map_err(|cause| TriggerError::EvalFailed {
+                            function: ctx.function.into(),
+                            cause,
+                        })?;
+                        matches!(v, spg_storage::Value::Bool(true))
+                    }
+                };
+                if should_break {
+                    return Ok(BodyOutcome::Break);
                 }
             }
             PlPgSqlStmt::While { condition, body } => {
