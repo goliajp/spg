@@ -3377,6 +3377,58 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG 16+ pg_input_is_valid(
+        // text, type_name) probes whether a text value can be
+        // parsed as the given type. Real implementation attempts
+        // the cast and reports success.
+        "pg_input_is_valid" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_input_is_valid() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let (input, ty) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(s), Value::Text(t)) => (s.to_string(), t.to_ascii_lowercase()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "pg_input_is_valid(): both args must be text".into(),
+                    });
+                }
+            };
+            // Cover the common builtin types the ORM crowd probes.
+            let ok = match ty.as_str() {
+                "integer" | "int" | "int4" => input.trim().parse::<i32>().is_ok(),
+                "smallint" | "int2" => input.trim().parse::<i16>().is_ok(),
+                "bigint" | "int8" => input.trim().parse::<i64>().is_ok(),
+                "real" | "float4" | "double precision" | "float8" => {
+                    input.trim().parse::<f64>().is_ok()
+                }
+                "boolean" | "bool" => {
+                    matches!(
+                        input.trim().to_ascii_lowercase().as_str(),
+                        "t" | "true" | "yes" | "on" | "1" |
+                        "f" | "false" | "no" | "off" | "0"
+                    )
+                }
+                "text" | "varchar" | "character varying" | "char" | "bpchar" => true,
+                "numeric" | "decimal" => {
+                    let t = input.trim();
+                    !t.is_empty()
+                        && t.chars()
+                            .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+                }
+                _ => true, // Unknown type — best-effort.
+            };
+            Ok(Value::Bool(ok))
+        }
+        // pg_input_error_info(text, type_name) returns error text
+        // if invalid; NULL if valid. SPG returns NULL always for
+        // now (real error surfaces after v7.38 type-cast overhaul).
+        "pg_input_error_info" | "pg_input_error_message" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — PG 15+ unicode_version() and
         // icu_unicode_version(). Return the Unicode version Rust's
         // std char tables track — matches what unistr / normalize
