@@ -4477,6 +4477,23 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.37.17 (17.6 siblings) — PG 14+ pg_wait_for_backend_termination
+        // waits (up to timeout ms) for a specific backend to
+        // terminate. SPG has no separate backends yet — the
+        // function returns immediately with true. pgpool-II and
+        // patroni emit this during failover coordination.
+        "pg_wait_for_backend_termination" => Ok(Value::Bool(true)),
+        // pg_isolation_test_session_is_blocked / pg_safe_snapshot_blocking_pids
+        // — regress-test helpers used by PG's isolation tests. SPG
+        // has no session-blocking model yet; return NULL / false.
+        "pg_isolation_test_session_is_blocked" => Ok(Value::Bool(false)),
+        "pg_safe_snapshot_blocking_pids" => Ok(Value::Null),
+        // pg_stat_get_backend_activity_started_at etc — variants of
+        // the activity_start probe (alt spellings by tooling).
+        "pg_stat_get_backend_activity_started_at" => Ok(Value::Null),
+        // pg_terminate_backend can take (int, int) too (PG 14+
+        // with timeout arg). Original arm handles the 1-arg form.
+        "pg_terminate_backend_with_timeout" => Ok(Value::Bool(true)),
         // v7.37.17 (17.6 siblings) — PG 17+ overload `random(min, max)`
         // returns a random value in [min, max]. Both int and numeric
         // widths are common. Also supports random_int(min, max) alias.

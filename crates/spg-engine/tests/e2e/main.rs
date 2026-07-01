@@ -146,6 +146,7 @@ mod e2e_random_normal;
 mod e2e_to_number;
 mod e2e_setseed;
 mod e2e_random_int;
+mod e2e_backend_control_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
