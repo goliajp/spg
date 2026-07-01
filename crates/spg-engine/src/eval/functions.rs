@@ -3169,6 +3169,86 @@ fn apply_function_dispatch(
             Ok(Value::Timestamp(binned))
         }
         "date_part" => date_part(args),
+        // v7.37.17 (17.6 siblings) — PG 16+ `date_add(ts, interval)`
+        // and `date_subtract(ts, interval)`. Same as `ts + interval`
+        // and `ts - interval` but as explicit function form (some
+        // ORM query builders emit these).
+        "date_add" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("date_add() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Timestamp(t), Value::Interval { months, days, micros }) => {
+                    let m = i64::from(*months);
+                    let d = i64::from(*days);
+                    let extra = m
+                        .saturating_mul(30 * 86_400_000_000)
+                        + d.saturating_mul(86_400_000_000)
+                        + micros;
+                    Ok(Value::Timestamp(t.saturating_add(extra)))
+                }
+                (Value::Date(d), Value::Interval { months, days, micros }) => {
+                    let base_us = i64::from(*d).saturating_mul(86_400_000_000);
+                    let m = i64::from(*months);
+                    let dd = i64::from(*days);
+                    let extra = m
+                        .saturating_mul(30 * 86_400_000_000)
+                        + dd.saturating_mul(86_400_000_000)
+                        + micros;
+                    Ok(Value::Timestamp(base_us.saturating_add(extra)))
+                }
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "date_add() needs (timestamp|date, interval), got ({:?}, {:?})",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
+        "date_subtract" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("date_subtract() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Timestamp(t), Value::Interval { months, days, micros }) => {
+                    let m = i64::from(*months);
+                    let d = i64::from(*days);
+                    let extra = m
+                        .saturating_mul(30 * 86_400_000_000)
+                        + d.saturating_mul(86_400_000_000)
+                        + micros;
+                    Ok(Value::Timestamp(t.saturating_sub(extra)))
+                }
+                (Value::Date(d), Value::Interval { months, days, micros }) => {
+                    let base_us = i64::from(*d).saturating_mul(86_400_000_000);
+                    let m = i64::from(*months);
+                    let dd = i64::from(*days);
+                    let extra = m
+                        .saturating_mul(30 * 86_400_000_000)
+                        + dd.saturating_mul(86_400_000_000)
+                        + micros;
+                    Ok(Value::Timestamp(base_us.saturating_sub(extra)))
+                }
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "date_subtract() needs (timestamp|date, interval), got ({:?}, {:?})",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
         "age" => age(args),
         "to_char" => to_char(args),
         // v7.37.17 (17.6 siblings) — fuzzystrmatch soundex(text)
