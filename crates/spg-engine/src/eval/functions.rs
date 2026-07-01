@@ -572,6 +572,108 @@ fn apply_function_dispatch(
         "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
             Ok(Value::Null)
         }
+        // v7.37.17 (17.6 siblings) — jsonb_strip_nulls(jsonb)
+        // removes null-valued keys from object members (recurses
+        // into nested objects + arrays). Array items are preserved
+        // even if null (matches PG semantics).
+        "jsonb_strip_nulls" | "json_strip_nulls" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => {
+                    let mut parsed =
+                        crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
+                            detail: format!("{name}(): JSON parse failed: {e}"),
+                        })?;
+                    fn strip(v: &mut crate::json::JsonValue) {
+                        match v {
+                            crate::json::JsonValue::Object(members) => {
+                                members.retain(
+                                    |(_, val)| !matches!(val, crate::json::JsonValue::Null),
+                                );
+                                for (_, val) in members.iter_mut() {
+                                    strip(val);
+                                }
+                            }
+                            crate::json::JsonValue::Array(items) => {
+                                for it in items.iter_mut() {
+                                    strip(it);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    strip(&mut parsed);
+                    fn write_json(v: &crate::json::JsonValue, out: &mut alloc::string::String) {
+                        use core::fmt::Write;
+                        match v {
+                            crate::json::JsonValue::Null => out.push_str("null"),
+                            crate::json::JsonValue::Bool(true) => out.push_str("true"),
+                            crate::json::JsonValue::Bool(false) => out.push_str("false"),
+                            crate::json::JsonValue::Number(x) => {
+                                let _ = write!(out, "{x}");
+                            }
+                            crate::json::JsonValue::NumberText(s) => out.push_str(s),
+                            crate::json::JsonValue::String(s) => {
+                                out.push('"');
+                                for c in s.chars() {
+                                    match c {
+                                        '"' => out.push_str("\\\""),
+                                        '\\' => out.push_str("\\\\"),
+                                        '\n' => out.push_str("\\n"),
+                                        '\r' => out.push_str("\\r"),
+                                        '\t' => out.push_str("\\t"),
+                                        c if (c as u32) < 0x20 => {
+                                            let _ = write!(out, "\\u{:04x}", c as u32);
+                                        }
+                                        c => out.push(c),
+                                    }
+                                }
+                                out.push('"');
+                            }
+                            crate::json::JsonValue::Array(items) => {
+                                out.push('[');
+                                for (i, it) in items.iter().enumerate() {
+                                    if i > 0 {
+                                        out.push(',');
+                                    }
+                                    write_json(it, out);
+                                }
+                                out.push(']');
+                            }
+                            crate::json::JsonValue::Object(entries) => {
+                                out.push('{');
+                                for (i, (k, val)) in entries.iter().enumerate() {
+                                    if i > 0 {
+                                        out.push(',');
+                                    }
+                                    write_json(
+                                        &crate::json::JsonValue::String(k.clone()),
+                                        out,
+                                    );
+                                    out.push(':');
+                                    write_json(val, out);
+                                }
+                                out.push('}');
+                            }
+                        }
+                    }
+                    let mut out = alloc::string::String::new();
+                    write_json(&parsed, &mut out);
+                    Ok(Value::json(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() needs jsonb, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — jsonb_pretty(jsonb) returns
         // pretty-printed JSON text. Walks the parsed tree and
         // re-emits with 2-space indent + newlines between object /
