@@ -982,6 +982,116 @@ fn apply_function_dispatch(
             let n = i32::try_from(len).unwrap_or(i32::MAX);
             Ok(Value::Int(n))
         }
+        // v7.37.17 (17.6 siblings) — array_upper / array_lower /
+        // array_ndims / array_dims. PG models multi-dim arrays with
+        // per-dim lower/upper bounds; SPG v7.11 only models 1-D
+        // arrays so:
+        //   array_ndims(arr) → 1 if non-empty, NULL if empty
+        //   array_lower(arr, 1) → 1 (PG default), NULL for other dims
+        //   array_upper(arr, 1) → length, NULL for other dims
+        //   array_dims(arr)  → '[1:N]' text or NULL for empty
+        "array_upper" | "array_lower" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let len = match &args[0] {
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() first arg must be an array, got {:?}",
+                            args[0].data_type()
+                        ),
+                    });
+                }
+            };
+            let dim: i64 = match args[1] {
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                Value::SmallInt(n) => i64::from(n),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() second arg must be integer, got {:?}",
+                            args[1].data_type()
+                        ),
+                    });
+                }
+            };
+            if dim != 1 || len == 0 {
+                return Ok(Value::Null);
+            }
+            let result = if name == "array_lower" {
+                1
+            } else {
+                i32::try_from(len).unwrap_or(i32::MAX)
+            };
+            Ok(Value::Int(result))
+        }
+        "array_ndims" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_ndims() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::TextArray(items) => Ok(if items.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Int(1)
+                }),
+                Value::IntArray(items) => Ok(if items.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Int(1)
+                }),
+                Value::BigIntArray(items) => Ok(if items.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Int(1)
+                }),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_ndims() needs array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "array_dims" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_dims() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let len = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_dims() needs array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if len == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::text(alloc::format!("[1:{}]", len)))
+            }
+        }
         // v7.11.6 — `array_position(arr, val)` returns 1-based
         // index of the first element of `arr` equal to `val`, or
         // NULL if not found. PG NULL semantics: NULL array → NULL;
