@@ -231,6 +231,23 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — to_hex(int|bigint) — PG's
+        // integer-to-hex-string conversion. Returns TEXT.
+        "to_hex" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("to_hex() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::text(alloc::format!("{:x}", *n as u32))),
+                Value::BigInt(n) => Ok(Value::text(alloc::format!("{:x}", *n as u64))),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("to_hex() needs int/bigint, got {:?}", other.data_type()),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG's built-in md5(text|bytea)
         // returns the 32-char lowercase hex digest text (matches
         // PG default), NOT the raw bytes like sha256 does. This is

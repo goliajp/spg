@@ -81,6 +81,7 @@ mod e2e_pg_sleep_and_wal_probes;
 mod e2e_pg_settings_widened;
 mod e2e_bit_length;
 mod e2e_hash_funcs;
+mod e2e_to_hex;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
