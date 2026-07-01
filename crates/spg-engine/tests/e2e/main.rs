@@ -130,6 +130,7 @@ mod e2e_difference;
 mod e2e_stat_snapshot_timestamp;
 mod e2e_pg_stat_get_db;
 mod e2e_pg_stat_get_bgwriter_wal;
+mod e2e_parse_ident;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

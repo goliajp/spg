@@ -3377,6 +3377,116 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG 9.6+ `parse_ident(qualname
+        // [, strict_mode])` splits a qualified identifier
+        // 'schema.table' into a text array ['schema', 'table'].
+        // Handles double-quoted parts (preserving embedded dots +
+        // case) and PG's rule that a trailing garbage tail is
+        // rejected in strict mode (default true).
+        "parse_ident" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("parse_ident() takes 1 or 2 args, got {}", args.len()),
+                });
+            }
+            let s: alloc::string::String = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "parse_ident(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let strict = if args.len() == 2 {
+                match &args[1] {
+                    Value::Null => true,
+                    Value::Bool(b) => *b,
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "parse_ident(): strict flag must be bool".into(),
+                        });
+                    }
+                }
+            } else {
+                true
+            };
+            let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
+                alloc::vec::Vec::new();
+            let bytes: alloc::vec::Vec<char> = s.chars().collect();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                while i < bytes.len() && bytes[i].is_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                if bytes[i] == '"' {
+                    // Quoted identifier: preserve as-is between
+                    // matching quotes; "" is an escaped quote.
+                    i += 1;
+                    let mut piece = alloc::string::String::new();
+                    while i < bytes.len() {
+                        if bytes[i] == '"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == '"' {
+                                piece.push('"');
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        } else {
+                            piece.push(bytes[i]);
+                            i += 1;
+                        }
+                    }
+                    out.push(Some(piece));
+                } else if bytes[i].is_alphabetic() || bytes[i] == '_' {
+                    let mut piece = alloc::string::String::new();
+                    while i < bytes.len()
+                        && (bytes[i].is_alphanumeric() || bytes[i] == '_' || bytes[i] == '$')
+                    {
+                        // Downcase per PG's default lower-fold.
+                        for c in bytes[i].to_lowercase() {
+                            piece.push(c);
+                        }
+                        i += 1;
+                    }
+                    out.push(Some(piece));
+                } else {
+                    // Garbage char.
+                    if strict {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "parse_ident(): unexpected character {:?} in {s:?}",
+                                bytes[i]
+                            ),
+                        });
+                    } else {
+                        break;
+                    }
+                }
+                // Look for a separator.
+                while i < bytes.len() && bytes[i].is_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == '.' {
+                    i += 1;
+                } else if strict && i < bytes.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "parse_ident(): trailing garbage {:?}",
+                            &s[i..]
+                        ),
+                    });
+                }
+            }
+            Ok(Value::TextArray(out))
+        }
         // v7.37.17 (17.6 siblings) — PG's `pg_size_bytes(text)`
         // parses a human-readable size string ("2MB", "1.5 GB",
         // "512 kB") into a BigInt byte count. Inverse of
