@@ -3089,6 +3089,67 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_if();
         }
+        // v7.37.20 (20.4) — FOR <var> IN [REVERSE] <start>..<end> LOOP.
+        // FOR is a reserved keyword token (Token::For).
+        if matches!(self.peek(), Token::For)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::In))
+        {
+            self.advance(); // FOR
+            let var = self.expect_ident_like()?;
+            if !matches!(self.peek(), Token::In) {
+                return Err(self.err(alloc::format!(
+                    "expected IN after FOR <var>, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let reverse = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("reverse")
+            );
+            if reverse {
+                self.advance();
+            }
+            let start = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::DotDot) {
+                return Err(self.err(alloc::format!(
+                    "expected '..' between FOR loop bounds, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let end = self.parse_expr(0)?;
+            let loop_kw = self.expect_ident_like()?;
+            if !loop_kw.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected LOOP after FOR <var> IN start..end, got {loop_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            let end_kw = self.expect_ident_like()?;
+            if !end_kw.eq_ignore_ascii_case("end") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR body, got {end_kw:?}"
+                )));
+            }
+            let loop_kw2 = self.expect_ident_like()?;
+            if !loop_kw2.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR body, got END {loop_kw2:?}"
+                )));
+            }
+            return Ok(PlPgSqlStmt::ForRange {
+                var,
+                start,
+                end,
+                reverse,
+                body,
+            });
+        }
         // v7.37.20 (20.3) — WHILE <cond> LOOP <body> END LOOP.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("while"))
         {

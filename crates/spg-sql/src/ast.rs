@@ -1052,6 +1052,17 @@ pub enum PlPgSqlStmt {
         condition: Expr,
         body: Vec<PlPgSqlStmt>,
     },
+    /// v7.37.20 (20.4) — `FOR <var> IN [REVERSE] <start>..<end> LOOP
+    /// <body> END LOOP;`. Integer iteration; `var` is BigInt-valued;
+    /// bounds inclusive on both sides. REVERSE walks backward.
+    /// Iteration budget guards runaway.
+    ForRange {
+        var: String,
+        start: Expr,
+        end: Expr,
+        reverse: bool,
+        body: Vec<PlPgSqlStmt>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3595,6 +3606,23 @@ impl fmt::Display for PlPgSqlStmt {
             }
             Self::While { condition, body } => {
                 writeln!(f, "WHILE {condition} LOOP")?;
+                for s in body {
+                    writeln!(f, "  {s};")?;
+                }
+                f.write_str("END LOOP")
+            }
+            Self::ForRange {
+                var,
+                start,
+                end,
+                reverse,
+                body,
+            } => {
+                write!(f, "FOR {var} IN ")?;
+                if *reverse {
+                    f.write_str("REVERSE ")?;
+                }
+                writeln!(f, "{start}..{end} LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }

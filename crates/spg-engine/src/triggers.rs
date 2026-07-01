@@ -457,6 +457,92 @@ fn execute_stmts(
                 let value = resolver(&substituted)?;
                 locals.insert(var.clone(), value);
             }
+            PlPgSqlStmt::ForRange {
+                var,
+                start,
+                end,
+                reverse,
+                body,
+            } => {
+                // v7.37.20 (20.4) — FOR <var> IN [REVERSE] <s>..<e> LOOP.
+                const FOR_RANGE_BUDGET: i64 = 1_000_000;
+                let s_v = eval_with_new_old_and_locals(
+                    start,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let e_v = eval_with_new_old_and_locals(
+                    end,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let to_i64 =
+                    |v: &spg_storage::Value<'static>| -> Result<i64, TriggerError> {
+                        match v {
+                            spg_storage::Value::Int(n) => Ok(i64::from(*n)),
+                            spg_storage::Value::BigInt(n) => Ok(*n),
+                            spg_storage::Value::SmallInt(n) => Ok(i64::from(*n)),
+                            other => Err(TriggerError::UnsupportedConstruct {
+                                function: ctx.function.into(),
+                                detail: alloc::format!(
+                                    "FOR <var> IN start..end: bounds must be integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            }),
+                        }
+                    };
+                let s = to_i64(&s_v)?;
+                let e = to_i64(&e_v)?;
+                // PG's `FOR i IN REVERSE 5..1` iterates 5, 4, 3, 2, 1 —
+                // the first bound is the start, the second is the end,
+                // step is -1.
+                let (lo, hi, step): (i64, i64, i64) = if *reverse {
+                    (s, e, -1)
+                } else {
+                    (s, e, 1)
+                };
+                let mut i = lo;
+                let mut iter: i64 = 0;
+                loop {
+                    if iter >= FOR_RANGE_BUDGET {
+                        return Err(TriggerError::RaiseException {
+                            function: ctx.function.into(),
+                            message: alloc::format!(
+                                "FOR loop iteration budget {FOR_RANGE_BUDGET} reached"
+                            ),
+                        });
+                    }
+                    let cont = if *reverse { i >= hi } else { i <= hi };
+                    if !cont {
+                        break;
+                    }
+                    locals.insert(var.clone(), spg_storage::Value::BigInt(i));
+                    match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
+                        BodyOutcome::FellThrough => {}
+                        early => return Ok(early),
+                    }
+                    i = i.saturating_add(step);
+                    iter += 1;
+                }
+            }
             PlPgSqlStmt::While { condition, body } => {
                 // v7.37.20 (20.3) — WHILE <cond> LOOP iteration.
                 // Iteration count bounded by a generous budget so a
