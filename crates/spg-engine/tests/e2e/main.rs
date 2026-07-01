@@ -111,6 +111,7 @@ mod e2e_array_shuffle_sample;
 mod e2e_pg_stat_reset;
 mod e2e_wal_utility_probes;
 mod e2e_snapshot_export_probes;
+mod e2e_interval_justify;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

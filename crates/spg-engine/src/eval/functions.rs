@@ -640,6 +640,100 @@ fn apply_function_dispatch(
             out.push_str(closer);
             Ok(Value::json(out))
         }
+        // v7.37.17 (17.6 siblings) — Interval canonicalizers.
+        // PG's `justify_days`, `justify_hours`, `justify_interval`
+        // normalize an interval's {months, days, micros} tuple:
+        //
+        //   justify_days(interval)     : days ≥ 30 → months += days/30
+        //   justify_hours(interval)    : micros ≥ 24h → days += micros/24h
+        //   justify_interval(interval) : both, iteratively
+        //
+        // Only the +wrap direction; negative slots stay signed in PG,
+        // so we mirror that. NULL passthrough.
+        "justify_days" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("justify_days() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval { months, days, micros } => {
+                    let extra_months: i32 = days.div_euclid(30);
+                    let leftover_days: i32 = days.rem_euclid(30);
+                    Ok(Value::Interval {
+                        months: months + extra_months,
+                        days: leftover_days,
+                        micros: *micros,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "justify_days() needs interval, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "justify_hours" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("justify_hours() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval { months, days, micros } => {
+                    const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+                    let extra_days_i64 = micros.div_euclid(DAY_US);
+                    let leftover_micros = micros.rem_euclid(DAY_US);
+                    let extra_days: i32 =
+                        i32::try_from(extra_days_i64).unwrap_or(i32::MAX);
+                    Ok(Value::Interval {
+                        months: *months,
+                        days: days + extra_days,
+                        micros: leftover_micros,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "justify_hours() needs interval, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "justify_interval" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("justify_interval() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval { months, days, micros } => {
+                    const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+                    let extra_days_i64 = micros.div_euclid(DAY_US);
+                    let leftover_micros = micros.rem_euclid(DAY_US);
+                    let extra_days: i32 =
+                        i32::try_from(extra_days_i64).unwrap_or(i32::MAX);
+                    let total_days = days + extra_days;
+                    let extra_months: i32 = total_days.div_euclid(30);
+                    let leftover_days: i32 = total_days.rem_euclid(30);
+                    Ok(Value::Interval {
+                        months: months + extra_months,
+                        days: leftover_days,
+                        micros: leftover_micros,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "justify_interval() needs interval, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — snapshot export / import
         // family. SPG doesn't yet ship a snapshot text serializer
         // (queues with v7.38 MVCC Phase C); return NULL / true so
