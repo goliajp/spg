@@ -5367,6 +5367,28 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(0))
         }
+        // v7.37.17 (17.6 siblings) — PG 18 casefold(text): Unicode
+        // case folding for caseless matching. Rust's char-level
+        // to_lowercase applies the full Unicode lowercase mapping
+        // (ß → ss requires the special foldings which str::
+        // to_lowercase also handles).
+        "casefold" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("casefold() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::text(s.to_lowercase())),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "casefold() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "lpad" => string_pad(args, true, "lpad"),
         "rpad" => string_pad(args, false, "rpad"),
         // v7.37.17 (17.6 siblings) — PG reverse(text) inverts the

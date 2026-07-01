@@ -169,6 +169,7 @@ mod e2e_jsonb_path_exists;
 mod e2e_jsonb_concat_delete;
 mod e2e_jsonb_delete_path;
 mod e2e_div_erf;
+mod e2e_casefold;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
