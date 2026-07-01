@@ -3180,6 +3180,115 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_if();
         }
+        // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
+        //
+        // Two syntactic forms:
+        //   FOR var IN SELECT ... ORDER BY ... LOOP ...
+        //   FOR var IN (SELECT ...) LOOP ...
+        //
+        // Bare-SELECT form: to keep parse_select_stmt from swallowing
+        // the trailing `LOOP` keyword as a table alias, we prescan
+        // forward to find LOOP at paren depth 0, splice a fake
+        // Semicolon at that position (so SELECT parses cleanly),
+        // then re-splice LOOP back in.
+        //
+        // Paren-wrapped form: parse `(` `SELECT ...` `)` then expect
+        // LOOP directly — no scan required.
+        if matches!(self.peek(), Token::For)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::In))
+            && (matches!(self.tokens.get(self.pos + 3), Some(Token::Select))
+                || matches!(self.tokens.get(self.pos + 3), Some(Token::LParen)))
+        {
+            self.advance(); // FOR
+            let var = self.expect_ident_like()?;
+            // IN
+            self.advance();
+            let query = if matches!(self.peek(), Token::LParen) {
+                // Paren-wrapped SELECT.
+                self.advance();
+                let inner = self.parse_select_stmt()?;
+                let Statement::Select(q) = inner else {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT inside (…), got {:?}",
+                        self.peek()
+                    )));
+                };
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after FOR-IN-SELECT body, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                q
+            } else {
+                // Bare SELECT: prescan to find the LOOP boundary.
+                let mut depth: i32 = 0;
+                let mut loop_pos: Option<usize> = None;
+                let mut scan = self.pos;
+                while scan < self.tokens.len() {
+                    match self.tokens.get(scan) {
+                        Some(Token::LParen) => depth += 1,
+                        Some(Token::RParen) => depth -= 1,
+                        Some(Token::Ident(s) | Token::QuotedIdent(s))
+                            if depth == 0 && s.eq_ignore_ascii_case("loop") =>
+                        {
+                            loop_pos = Some(scan);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    scan += 1;
+                }
+                let loop_pos = loop_pos.ok_or_else(|| {
+                    self.err(alloc::format!(
+                        "FOR <var> IN <SELECT> ... LOOP: no LOOP keyword found"
+                    ))
+                })?;
+                // Swap the LOOP token with a synthetic Semicolon so
+                // parse_select_stmt stops there, then restore afterward.
+                let saved_loop = self.tokens[loop_pos].clone();
+                self.tokens[loop_pos] = Token::Semicolon;
+                let parse_result = self.parse_select_stmt();
+                self.tokens[loop_pos] = saved_loop;
+                let inner = parse_result?;
+                let Statement::Select(q) = inner else {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT after FOR <var> IN, got {:?}",
+                        self.peek()
+                    )));
+                };
+                q
+            };
+            let loop_kw = self.expect_ident_like()?;
+            if !loop_kw.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected LOOP after FOR <var> IN <SELECT>, got {loop_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            let end_kw = self.expect_ident_like()?;
+            if !end_kw.eq_ignore_ascii_case("end") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR IN SELECT body, got {end_kw:?}"
+                )));
+            }
+            let loop_kw2 = self.expect_ident_like()?;
+            if !loop_kw2.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR IN SELECT body, got END {loop_kw2:?}"
+                )));
+            }
+            return Ok(PlPgSqlStmt::ForQuery {
+                var,
+                query: Box::new(query),
+                body,
+            });
+        }
         // v7.37.20 (20.4) — FOR <var> IN [REVERSE] <start>..<end> LOOP.
         // FOR is a reserved keyword token (Token::For).
         if matches!(self.peek(), Token::For)

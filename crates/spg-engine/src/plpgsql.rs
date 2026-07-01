@@ -70,11 +70,38 @@ impl Engine {
                     }),
                 }
             };
-        let collected =
-            triggers::execute_do_block_top_level(&body, dts.as_deref(), Some(&resolver_fn))
-                .map_err(|e| {
-                    EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}")))
+        // v7.37.20 (20.5) — FOR IN SELECT resolver: run the SELECT
+        // once, return every row's values.
+        let for_query_fn = |stmt: &spg_sql::ast::Statement| -> Result<
+            alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            triggers::TriggerError,
+        > {
+            let mut eng = engine_cell.borrow_mut();
+            let r = eng
+                .execute_stmt_with_cancel(stmt.clone(), CancelToken::none())
+                .map_err(|e| triggers::TriggerError::EvalFailed {
+                    function: "DO".into(),
+                    cause: eval::EvalError::TypeMismatch {
+                        detail: alloc::format!("FOR IN SELECT failed: {e}"),
+                    },
                 })?;
+            match r {
+                QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
+                _ => Err(triggers::TriggerError::EvalFailed {
+                    function: "DO".into(),
+                    cause: eval::EvalError::TypeMismatch {
+                        detail: "FOR IN body must be a SELECT".into(),
+                    },
+                }),
+            }
+        };
+        let collected = triggers::execute_do_block_top_level(
+            &body,
+            dts.as_deref(),
+            Some(&resolver_fn),
+            Some(&for_query_fn),
+        )
+        .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
         // engine_cell goes out of scope here, releasing the &mut self borrow
         // Run each embedded statement against the engine. The
         // statements were already substitute-walked for NEW/OLD/
@@ -175,6 +202,10 @@ impl Engine {
                 }
                 PlPgSqlStmt::ExecuteDynamic { sql } => {
                     self.resolve_expr_subqueries(sql, cancel)?;
+                }
+                PlPgSqlStmt::ForQuery { query, body, .. } => {
+                    self.resolve_select_subqueries(query, cancel)?;
+                    self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
                 PlPgSqlStmt::EmbeddedSql(_) => {
                     // Embedded SQL goes back through execute_stmt
