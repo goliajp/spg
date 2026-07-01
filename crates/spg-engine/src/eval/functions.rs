@@ -3377,6 +3377,68 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG 11+ starts_with(str, prefix)
+        // — the `^@` operator's function form. Also ends_with which
+        // PG doesn't ship but many drivers still emit against
+        // Amazon RDS / CockroachDB compat.
+        "starts_with" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("starts_with() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Text(s), Value::Text(p)) => Ok(Value::Bool(s.starts_with(p.as_ref()))),
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "starts_with() needs (text, text), got ({:?}, {:?})",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
+        "ends_with" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("ends_with() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Text(s), Value::Text(p)) => Ok(Value::Bool(s.ends_with(p.as_ref()))),
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ends_with() needs (text, text), got ({:?}, {:?})",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
+        // string_agg is aggregate, handled elsewhere. text_starts_with
+        // is a PG internal alias for starts_with.
+        "text_starts_with" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("text_starts_with() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Text(s), Value::Text(p)) => Ok(Value::Bool(s.starts_with(p.as_ref()))),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "text_starts_with(): both args must be text".into(),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG 9.6+ `parse_ident(qualname
         // [, strict_mode])` splits a qualified identifier
         // 'schema.table' into a text array ['schema', 'table'].
