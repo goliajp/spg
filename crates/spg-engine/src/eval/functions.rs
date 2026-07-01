@@ -1919,6 +1919,99 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — array_positions(arr, val)
+        // returns an IntArray of all 1-based indices where val
+        // occurs in arr. NULL if arr is NULL. Empty array if not
+        // found. Matches PG semantics.
+        "array_positions" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_positions() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut hits: alloc::vec::Vec<Option<i32>> = alloc::vec::Vec::new();
+            match (&args[0], &args[1]) {
+                (Value::TextArray(items), Value::Text(needle)) => {
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(s) = item
+                            && s == needle
+                        {
+                            hits.push(Some(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                }
+                (Value::IntArray(items), needle_v)
+                    if matches!(
+                        needle_v,
+                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
+                    ) =>
+                {
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => unreachable!(),
+                    };
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(n) = item
+                            && i64::from(*n) == needle
+                        {
+                            hits.push(Some(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                }
+                (Value::BigIntArray(items), needle_v)
+                    if matches!(
+                        needle_v,
+                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
+                    ) =>
+                {
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => unreachable!(),
+                    };
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(n) = item
+                            && *n == needle
+                        {
+                            hits.push(Some(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                }
+                (
+                    arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)),
+                    other,
+                ) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_positions() needle type {:?} doesn't match array {:?}",
+                            other.data_type(),
+                            arr.data_type()
+                        ),
+                    });
+                }
+                (other, _) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_positions() first arg must be an array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            }
+            Ok(Value::IntArray(hits))
+        }
         // v7.11.15 — `substring(s, start)` / `substring(s, start, length)`
         // for both TEXT and BYTEA. PG semantics: `start` is 1-based;
         // values ≤ 0 clamp into the string (i.e. effective start is
