@@ -62,6 +62,7 @@ mod e2e_reindex_pg_dump_compat;
 mod e2e_maintenance_pg_dump_compat;
 mod e2e_session_state_pg_dump_compat;
 mod e2e_set_constraints_pg_dump_compat;
+mod e2e_role_cleanup_pg_dump_compat;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
