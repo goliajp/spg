@@ -3057,6 +3057,13 @@ impl Parser {
             // `:=` or `=` (no explicit type), infer from the default
             // expression. Otherwise the ident that follows is the
             // declared type.
+            //
+            // v7.37.20 (20.8) — `<table>.<col>%TYPE` / `<table>%ROWTYPE`
+            // (PG-standard). SPG parse-accepts and treats identically
+            // to inference — the eventual runtime value determines
+            // the local's type, which is faithful to how SPG handles
+            // untyped locals today (see 20.7). Full compile-time
+            // catalog lookup queues with v7.40 PL/pgSQL epic.
             let ty = if matches!(self.peek(), Token::ColonEq | Token::Eq) {
                 // Sentinel: `FunctionArgType::Raw("_infer_")` tells the
                 // downstream declaration walker to type the local by
@@ -3064,9 +3071,23 @@ impl Parser {
                 FunctionArgType::Raw("_infer_".into())
             } else {
                 let ty_token = self.expect_ident_like()?;
-                match map_type_ident_to_column_type_name(&ty_token) {
-                    Some(t) => FunctionArgType::Typed(t),
-                    None => FunctionArgType::Raw(ty_token),
+                // Detect `<ident>[.<ident>][%TYPE | %ROWTYPE]`:
+                // consume optional `.<ident>` qualifier + `%<KW>`
+                // suffix. Both qualifier and suffix map to _infer_.
+                if matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                if matches!(self.peek(), Token::Percent) {
+                    self.advance();
+                    // Consume the trailing TYPE / ROWTYPE ident.
+                    let _ = self.expect_ident_like()?;
+                    FunctionArgType::Raw("_infer_".into())
+                } else {
+                    match map_type_ident_to_column_type_name(&ty_token) {
+                        Some(t) => FunctionArgType::Typed(t),
+                        None => FunctionArgType::Raw(ty_token),
+                    }
                 }
             };
             let default = match self.peek() {
