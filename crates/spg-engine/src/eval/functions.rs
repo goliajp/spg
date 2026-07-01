@@ -6147,6 +6147,18 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — PG 9.6+ num_nulls / num_nonnulls
+        // variadic helpers. Count NULL / non-NULL args. Common in
+        // CHECK constraints validating "exactly one of these
+        // columns is set".
+        "num_nulls" => {
+            let n = args.iter().filter(|v| matches!(v, Value::Null)).count();
+            Ok(Value::Int(n as i32))
+        }
+        "num_nonnulls" => {
+            let n = args.iter().filter(|v| !matches!(v, Value::Null)).count();
+            Ok(Value::Int(n as i32))
+        }
         // v7.37.17 (17.6 siblings) — pg_lsn operator support fns.
         // These accept text-form LSN strings (SPG doesn't have a
         // pg_lsn type yet; text is the wire format PG uses too).
