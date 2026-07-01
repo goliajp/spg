@@ -49,6 +49,49 @@ not gated on those).
   NOT OF / FORCE RLS / ENABLE/DISABLE ROW LEVEL SECURITY all
   accept-and-no-op.
 
+### Real DML / SQL statements shipped (v7.37.17 autorun slice)
+
+- `TRUNCATE [TABLE] [ONLY] <name>[, ...]
+                     [RESTART IDENTITY | CONTINUE IDENTITY]
+                     [CASCADE | RESTRICT]` — clears rows via
+  Table::truncate(); RESTART IDENTITY parsed but SequenceDef restart
+  queues with v7.38.
+- `SHOW ALL` returns 13-row `(name, setting, description)` inventory.
+- `SHOW <param>` PG-default fallback for 13 GUCs drivers commonly
+  probe (lock_timeout / idle_in_transaction_session_timeout /
+  transaction_timeout / statement_timeout / client_min_messages /
+  default_tablespace / default_table_access_method / row_security /
+  check_function_bodies / xmloption / work_mem /
+  maintenance_work_mem / max_connections / shared_buffers /
+  effective_cache_size / etc.) — pg_settings row shape widened to
+  match.
+
+### Real scalar functions shipped (v7.37.17 autorun slice)
+
+Real implementations, not stubs:
+- Hashing: `md5(text|bytea)` → 32-char hex TEXT (PG spec);
+  `sha1` / `sha224` / `sha256` / `sha384` / `sha512` → raw Bytes.
+  RustCrypto's md-5 promoted to direct spg-engine dep; sha1/sha2
+  were already there.
+- Math: `ln` / `log` (1-arg + 2-arg log(base, x)) / `log10` /
+  `exp` / `cbrt` (sign-preserving) / `pi()` / `gcd` / `lcm` /
+  `radians` / `degrees` — reuses internal f64_ln / f64_exp
+  primitives.
+- Length: `bit_length(text|bytea)` → byte × 8.
+- String: `reverse(text)` (multi-byte-safe); `chr(int)` /
+  `ascii(text)` (Unicode-aware, e.g. `chr(20013) = '中'`);
+  `initcap(text)` (word boundary = non-alphanumeric transition);
+  `quote_ident` / `quote_literal` / `quote_nullable` (with real
+  escape semantics).
+- Conversion: `to_hex(int|bigint)` (int wraps as u32, bigint as
+  u64 — matches PG's `to_hex(-1) = 'ffffffff'`).
+- Session identity: `current_catalog` / `current_role` (SQL:2003
+  synonyms); parenless bare `SELECT current_user` etc. now works
+  embedded (was pgwire-canned-only).
+- Clock family: `statement_timestamp` / `transaction_timestamp` /
+  `clock_timestamp` / `localtime` / `localtimestamp()` (with
+  parens) all fold to the engine clock at rewrite time.
+
 ### PG scalar function inventory (v7.37.17 autorun slice)
 
 The `eval/functions.rs` dispatcher now covers ~60 more scalar
