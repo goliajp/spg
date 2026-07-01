@@ -242,7 +242,9 @@ pub fn fire_row_trigger(
         // Body fell off without an explicit RETURN. PL/pgSQL
         // default is `RETURN NULL`; we mirror — the BEFORE
         // trigger then skips the row.
-        BodyOutcome::FellThrough | BodyOutcome::Break => TriggerOutcome::Skip,
+        BodyOutcome::FellThrough | BodyOutcome::Break | BodyOutcome::Continue => {
+            TriggerOutcome::Skip
+        }
     };
     Ok((outcome, deferred))
 }
@@ -259,6 +261,10 @@ enum BodyOutcome {
     /// LOOP catch this at their iteration point and break; any
     /// non-loop caller treats it as a benign no-op.
     Break,
+    /// v7.37.20 (20.2) — `CONTINUE [WHEN <cond>];` bubbled up
+    /// through the current loop body. WHILE / FOR / bare LOOP
+    /// catch this and jump to the next iteration.
+    Continue,
 }
 
 /// Shared parameters every body-stmt evaluation needs. Bundled so
@@ -384,6 +390,7 @@ fn execute_stmts(
                         match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                             BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
                             BodyOutcome::Break => return Ok(BodyOutcome::Break),
+                            BodyOutcome::Continue => return Ok(BodyOutcome::Continue),
                             BodyOutcome::FellThrough => {}
                         }
                         break;
@@ -393,6 +400,7 @@ fn execute_stmts(
                     match execute_stmts(else_branch, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
                         BodyOutcome::Break => return Ok(BodyOutcome::Break),
+                        BodyOutcome::Continue => return Ok(BodyOutcome::Continue),
                         BodyOutcome::FellThrough => {}
                     }
                 }
@@ -543,7 +551,8 @@ fn execute_stmts(
                     }
                     locals.insert(var.clone(), spg_storage::Value::BigInt(i));
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
+                        BodyOutcome::Break => break,
                         early => return Ok(early),
                     }
                     i = i.saturating_add(step);
@@ -565,7 +574,7 @@ fn execute_stmts(
                         });
                     }
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
                         early => return Ok(early),
                     }
@@ -597,6 +606,33 @@ fn execute_stmts(
                 };
                 if should_break {
                     return Ok(BodyOutcome::Break);
+                }
+            }
+            PlPgSqlStmt::Continue { when } => {
+                // v7.37.20 (20.2) — CONTINUE [WHEN <cond>]. Same shape
+                // as EXIT but signals BodyOutcome::Continue.
+                let should_continue = match when {
+                    None => true,
+                    Some(cond) => {
+                        let v = eval_with_new_old_and_locals(
+                            cond,
+                            current_new.as_ref(),
+                            old_row,
+                            locals,
+                            ctx.columns,
+                            ctx.table_name,
+                            ctx.params,
+                            ctx.default_text_search_config,
+                        )
+                        .map_err(|cause| TriggerError::EvalFailed {
+                            function: ctx.function.into(),
+                            cause,
+                        })?;
+                        matches!(v, spg_storage::Value::Bool(true))
+                    }
+                };
+                if should_continue {
+                    return Ok(BodyOutcome::Continue);
                 }
             }
             PlPgSqlStmt::While { condition, body } => {
@@ -640,7 +676,8 @@ fn execute_stmts(
                     // inside the loop propagates back the same way
                     // the IF / ELSE arms do.
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
+                        BodyOutcome::Break => break,
                         early => return Ok(early),
                     }
                     iter += 1;

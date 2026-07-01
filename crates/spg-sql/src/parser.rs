@@ -3182,6 +3182,19 @@ impl Parser {
             };
             return Ok(PlPgSqlStmt::Exit { when });
         }
+        // v7.37.20 (20.2) — `CONTINUE [WHEN <cond>]` inside a loop.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("continue"))
+        {
+            self.advance();
+            let when = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when"))
+            {
+                self.advance();
+                Some(self.parse_expr(0)?)
+            } else {
+                None
+            };
+            return Ok(PlPgSqlStmt::Continue { when });
+        }
         // v7.37.20 (20.3) — WHILE <cond> LOOP <body> END LOOP.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("while"))
         {
