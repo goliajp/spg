@@ -99,6 +99,7 @@ mod e2e_jsonb_object_keys;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
+mod e2e_xact_id_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

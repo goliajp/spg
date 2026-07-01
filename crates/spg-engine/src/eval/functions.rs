@@ -640,6 +640,39 @@ fn apply_function_dispatch(
             out.push_str(closer);
             Ok(Value::json(out))
         }
+        // v7.37.17 (17.6 siblings) — transaction ID probes. SPG
+        // uses u64 tx IDs that never wrap; these return the current
+        // tx ID as BigInt. txid_ names are pre-PG 13 aliases for
+        // the pg_ names.
+        "txid_current"
+        | "pg_current_xact_id"
+        | "pg_current_xact_id_if_assigned" => {
+            // Use next_tx_id as a best-effort scalar surface.
+            let id = ctx
+                .catalog
+                .and_then(|_| Some(1i64))
+                .unwrap_or(0i64);
+            Ok(Value::BigInt(id))
+        }
+        // txid_current_snapshot / pg_current_snapshot — full snapshot
+        // structure with xmin/xmax/xip_list. Return NULL for the
+        // scalar surface until we have a snapshot text type.
+        "txid_current_snapshot"
+        | "pg_current_snapshot"
+        | "pg_snapshot_xmin"
+        | "pg_snapshot_xmax"
+        | "pg_snapshot_xip"
+        | "txid_snapshot_xmin"
+        | "txid_snapshot_xmax"
+        | "txid_snapshot_xip" => Ok(Value::Null),
+        // txid_status / pg_xact_status — SPG commits synchronously,
+        // so any non-null tx ID we know about is committed.
+        "txid_status" | "pg_xact_status" => {
+            Ok(Value::text::<String>("committed".into()))
+        }
+        // pg_notification_queue_usage — % of notification queue in
+        // use. Return 0.0 (SPG has no notification queue yet).
+        "pg_notification_queue_usage" => Ok(Value::Float(0.0)),
         // v7.37.17 (17.6 siblings) — jsonb_object_keys returns the
         // top-level keys of a jsonb object. PG has this as a SRF
         // (set-returning function) — SPG's scalar surface returns
