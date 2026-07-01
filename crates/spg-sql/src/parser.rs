@@ -77,6 +77,13 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             | "discard"
             | "deallocate"
             | "security"
+            // v7.37.17 (17.6 siblings) — PG role-cleanup statements
+            // pg_dump / pg_dumpall emit around DROP ROLE:
+            //   REASSIGN OWNED BY <role> [, ...] TO <newrole>
+            //   DROP OWNED BY <role> [, ...] [CASCADE | RESTRICT]
+            // Both operate on the role's owned objects; SPG has no
+            // role-owner model, so accept-and-no-op.
+            | "reassign"
     )
 }
 
@@ -925,6 +932,17 @@ impl Parser {
             Token::Drop => {
                 self.advance();
                 match self.peek() {
+                    // v7.37.17 (17.6 sibling) — DROP OWNED BY <role>
+                    // [, ...] [CASCADE | RESTRICT]. pg_dumpall emits
+                    // around DROP ROLE cleanup. SPG has no role-owner
+                    // model, so consume to boundary as a no-op.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("owned") =>
+                    {
+                        self.advance();
+                        self.consume_until_statement_boundary();
+                        return Ok(Statement::Empty);
+                    }
                     Token::Publication => {
                         self.advance();
                         let name = self.expect_ident_or_string()?;
