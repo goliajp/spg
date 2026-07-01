@@ -3377,6 +3377,93 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG 16+ unistr(text) processes
+        // Unicode escape sequences in the input. Recognizes:
+        //   \\        → literal backslash
+        //   \XXXX     → hex codepoint (4 hex digits)
+        //   \+XXXXXX  → hex codepoint (6 hex digits)
+        //   \uXXXX    → hex codepoint (4 hex digits, alt syntax)
+        //   \UXXXXXXXX → hex codepoint (8 hex digits, alt syntax)
+        "unistr" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("unistr() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let s: alloc::string::String = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unistr(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let chars: alloc::vec::Vec<char> = s.chars().collect();
+            let mut out = alloc::string::String::new();
+            let mut i = 0usize;
+            while i < chars.len() {
+                let c = chars[i];
+                if c != '\\' {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                // Backslash escape.
+                if i + 1 >= chars.len() {
+                    // Trailing backslash — error.
+                    return Err(EvalError::TypeMismatch {
+                        detail: "unistr(): trailing backslash".into(),
+                    });
+                }
+                let next = chars[i + 1];
+                if next == '\\' {
+                    out.push('\\');
+                    i += 2;
+                    continue;
+                }
+                let (hex_len, start): (usize, usize) = if next == '+' {
+                    (6, i + 2)
+                } else if next == 'u' {
+                    (4, i + 2)
+                } else if next == 'U' {
+                    (8, i + 2)
+                } else if next.is_ascii_hexdigit() {
+                    (4, i + 1)
+                } else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unistr(): unrecognized escape \\{next}"
+                        ),
+                    });
+                };
+                if start + hex_len > chars.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "unistr(): short hex escape".into(),
+                    });
+                }
+                let hex: alloc::string::String =
+                    chars[start..start + hex_len].iter().collect();
+                let code = u32::from_str_radix(&hex, 16).map_err(|_| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unistr(): invalid hex {hex:?}"
+                        ),
+                    }
+                })?;
+                let ch = char::from_u32(code).ok_or(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "unistr(): {code:#x} is not a valid Unicode scalar"
+                    ),
+                })?;
+                out.push(ch);
+                i = start + hex_len;
+            }
+            Ok(Value::text(out))
+        }
         // v7.37.17 (17.6 siblings) — PG 11+ starts_with(str, prefix)
         // — the `^@` operator's function form. Also ends_with which
         // PG doesn't ship but many drivers still emit against
