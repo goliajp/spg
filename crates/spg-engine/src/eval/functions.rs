@@ -4477,6 +4477,41 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.37.17 (17.6 siblings) — setseed(f) reseeds the PRNG.
+        // PG accepts f ∈ [-1, 1]; SPG allows the full f64 range
+        // for simplicity. Returns void (NULL). Deterministic
+        // repro tests rely on this.
+        "setseed" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("setseed() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let seed = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "setseed() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if seed < -1.0 || seed > 1.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "setseed(): seed {seed} out of range [-1, 1]"
+                    ),
+                });
+            }
+            super::math::prng_seed(seed);
+            Ok(Value::Null)
+        }
         // v7.17.0 — PG `gen_random_uuid()` (built-in, no extension)
         // and the historical uuid-ossp `uuid_generate_v4()` alias.
         // Both produce a RFC 4122 v4 (random) UUID. This is the
