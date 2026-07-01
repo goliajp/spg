@@ -3457,6 +3457,25 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — pg_backup_start / pg_backup_stop
+        // (PG 15+) and pg_start_backup / pg_stop_backup (PG < 15
+        // legacy names). Used by wal-g / pgbackrest / native
+        // basebackup workflows. Return text '0/0' (LSN form) so
+        // callers get valid text data — real backup surface will
+        // return actual WAL positions once replication ships.
+        "pg_backup_start"
+        | "pg_start_backup" => Ok(Value::text::<String>("0/0".into())),
+        "pg_backup_stop"
+        | "pg_stop_backup" => Ok(Value::text::<String>("0/0".into())),
+        // pg_is_in_backup — returns bool whether a backup is in
+        // progress. SPG has no in-progress backup surface, so
+        // always false.
+        "pg_is_in_backup" => Ok(Value::Bool(false)),
+        // pg_create_restore_point returns the LSN at which a
+        // restore-point label was recorded. Return '0/0'.
+        "pg_create_restore_point" => Ok(Value::text::<String>("0/0".into())),
+        // pg_backup_labels probes basebackup-metadata; return NULL.
+        "pg_backup_label" | "pg_backup_labels" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — `pg_bytes_pretty` alias for
         // pg_size_pretty (some monitoring tools emit either name).
         "pg_bytes_pretty" => {
