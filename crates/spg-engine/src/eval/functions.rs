@@ -3457,6 +3457,68 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — `pg_bytes_pretty` alias for
+        // pg_size_pretty (some monitoring tools emit either name).
+        "pg_bytes_pretty" => {
+            // Delegate to pg_size_pretty by re-dispatching the same
+            // arm inline.
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_bytes_pretty() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let n: i64 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_bytes_pretty(): needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let (mut val, mut unit) = (n as f64, "bytes");
+            const KB: f64 = 1024.0;
+            const CROSSOVER: f64 = 10.0 * KB;
+            if val.abs() >= CROSSOVER {
+                val /= KB;
+                unit = "kB";
+                if val.abs() >= CROSSOVER {
+                    val /= KB;
+                    unit = "MB";
+                    if val.abs() >= CROSSOVER {
+                        val /= KB;
+                        unit = "GB";
+                        if val.abs() >= CROSSOVER {
+                            val /= KB;
+                            unit = "TB";
+                            if val.abs() >= CROSSOVER {
+                                val /= KB;
+                                unit = "PB";
+                            }
+                        }
+                    }
+                }
+            }
+            let s = if unit == "bytes" {
+                alloc::format!("{n} bytes")
+            } else {
+                alloc::format!("{} {unit}", val.round() as i64)
+            };
+            Ok(Value::text(s))
+        }
+        // v7.37.17 (17.6 siblings) — `pg_object_size(regclass)` /
+        // `pg_object_size(oid)` — table + index size sum. Same
+        // shape as pg_total_relation_size; ORM introspection
+        // often emits this alias.
+        "pg_object_size" | "pg_relation_size_pretty" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — PG's internal hash operator
         // support functions. These map a value to a 32-bit hash
         // used by hash indexes + hash join. Use Rust's DefaultHasher
