@@ -640,6 +640,37 @@ fn apply_function_dispatch(
             out.push_str(closer);
             Ok(Value::json(out))
         }
+        // v7.37.17 (17.6 siblings) — WAL utility probes. SPG uses
+        // seq_no not PG-style LSN; return NULL until seq_no ↔ LSN
+        // mapping ships with the replication-protocol RFC.
+        //
+        //   pg_walfile_name(lsn)         → NULL
+        //   pg_walfile_name_offset(lsn)  → NULL
+        //   pg_split_walfile_name(name)  → NULL
+        //   pg_ls_slru()                 → NULL
+        //   pg_ls_replslotdir()          → NULL
+        //   pg_promote(...)              → true (accept-and-no-op —
+        //                                    SPG is single-writer)
+        //   pg_reload_conf()             → true (SPG config is
+        //                                       CLI/env-only, no
+        //                                       reload semantics)
+        //   pg_rotate_logfile()          → true (no-op)
+        //   pg_rotate_logfile_v2()       → true
+        //   pg_switch_wal()              → NULL (returns LSN of
+        //                                       switched location)
+        "pg_walfile_name"
+        | "pg_walfile_name_offset"
+        | "pg_split_walfile_name"
+        | "pg_ls_slru"
+        | "pg_ls_replslotdir"
+        | "pg_switch_wal"
+        | "pg_control_system"
+        | "pg_control_recovery"
+        | "pg_control_checkpoint"
+        | "pg_control_init" => Ok(Value::Null),
+        "pg_promote" | "pg_reload_conf" | "pg_rotate_logfile" | "pg_rotate_logfile_v2" => {
+            Ok(Value::Bool(true))
+        }
         // v7.37.17 (17.6 siblings) — pg_stat_reset* family. Returns
         // void (NULL) — monitoring / admin dashboards call these on
         // schedule to reset counters. SPG's counters are session-
