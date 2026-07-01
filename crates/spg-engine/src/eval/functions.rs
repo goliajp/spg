@@ -780,6 +780,35 @@ fn apply_function_dispatch(
         "pg_promote" | "pg_reload_conf" | "pg_rotate_logfile" | "pg_rotate_logfile_v2" => {
             Ok(Value::Bool(true))
         }
+        // v7.37.17 (17.6 siblings) — logging / config-file probes.
+        // psql \d + tools query these. SPG uses stderr for logs and
+        // env/CLI for config, so return NULL / empty text.
+        "pg_current_logfile" => Ok(Value::text::<String>(String::new())),
+        "pg_hba_file_rules" | "pg_ident_file_mappings" | "pg_config" => {
+            Ok(Value::Null)
+        }
+        // Replication-origin family — pg_recvlogical / pglogical
+        // probe. SPG has no logical replication yet.
+        "pg_replication_origin_advance"
+        | "pg_replication_origin_create"
+        | "pg_replication_origin_drop"
+        | "pg_replication_origin_oid"
+        | "pg_replication_origin_progress"
+        | "pg_replication_origin_session_is_setup"
+        | "pg_replication_origin_session_progress"
+        | "pg_replication_origin_session_reset"
+        | "pg_replication_origin_session_setup"
+        | "pg_replication_origin_xact_reset"
+        | "pg_replication_origin_xact_setup"
+        | "pg_show_replication_origin_status" => Ok(Value::Null),
+        // Replication-slot admin. These are usually functions that
+        // return SETOF records; scalar-surface NULL is fine.
+        "pg_create_physical_replication_slot"
+        | "pg_create_logical_replication_slot"
+        | "pg_copy_physical_replication_slot"
+        | "pg_copy_logical_replication_slot"
+        | "pg_drop_replication_slot"
+        | "pg_replication_slot_advance" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_stat_reset* family. Returns
         // void (NULL) — monitoring / admin dashboards call these on
         // schedule to reset counters. SPG's counters are session-
