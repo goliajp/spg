@@ -74,3 +74,29 @@ fn hash_null_input_returns_null() {
         );
     }
 }
+
+#[test]
+fn md5_returns_hex_text_matching_known_vector() {
+    let mut e = Engine::new();
+    // md5("") = d41d8cd98f00b204e9800998ecf8427e
+    let v = first(&mut e, "SELECT md5('')");
+    match &v {
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "d41d8cd98f00b204e9800998ecf8427e"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+    // md5("abc") = 900150983cd24fb0d6963f7d28e17f72
+    let v = first(&mut e, "SELECT md5('abc')");
+    match &v {
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "900150983cd24fb0d6963f7d28e17f72"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+}
+
+#[test]
+fn md5_null_returns_null() {
+    let mut e = Engine::new();
+    assert!(matches!(
+        first(&mut e, "SELECT md5(NULL::text)"),
+        spg_storage::Value::Null
+    ));
+}
