@@ -49,6 +49,44 @@ not gated on those).
   NOT OF / FORCE RLS / ENABLE/DISABLE ROW LEVEL SECURITY all
   accept-and-no-op.
 
+### pg_dump / pg_dumpall wider parse-accept (v7.37.17 autorun slice)
+
+The parser now accepts the following top-level shapes that pg_dump
+and pg_dumpall emit as ownership / cleanup / maintenance
+scaffolding. All are consumed to boundary and Empty-returned
+except TRUNCATE (which is a real DML operation and clears rows):
+
+- Maintenance: VACUUM / CLUSTER / REINDEX / CHECKPOINT / LOCK
+- Session / channel: LISTEN / NOTIFY / UNLISTEN / DISCARD /
+  DEALLOCATE / SECURITY LABEL
+- Isolation / constraints: SET CONSTRAINTS / SET SESSION
+  CHARACTERISTICS AS TRANSACTION
+- Role cleanup: REASSIGN OWNED / DROP OWNED
+- DDL objects (accept-and-no-op): ALTER wider (SYSTEM, USER,
+  TABLESPACE, COLLATION, AGGREGATE, LANGUAGE, OPERATOR,
+  CONVERSION, STATISTICS, SERVER, FOREIGN, TEXT SEARCH,
+  EVENT TRIGGER, LARGE OBJECT) + DROP wider (23 more targets:
+  EXTENSION, TYPE, DOMAIN, AGGREGATE, OPERATOR, CAST, COLLATION,
+  LANGUAGE, CONVERSION, TEXT SEARCH, FOREIGN *, SERVER,
+  MATERIALIZED VIEW, EVENT TRIGGER, TABLESPACE, RULE, POLICY,
+  LARGE OBJECT, ROLE, ACCESS METHOD, STATISTICS, PROCEDURE,
+  ROUTINE) + CREATE wider (TEXT SEARCH, SERVER, TABLESPACE,
+  ACCESS METHOD, LARGE OBJECT)
+- Modifiers: CREATE INDEX CONCURRENTLY (v7.39 will honor the
+  restartable-scan semantics)
+- Session-identity: SHOW ALL returns curated (name, setting,
+  description) inventory; CURRENT_CATALOG / CURRENT_ROLE
+  SQL:2003 synonyms for CURRENT_DATABASE / CURRENT_USER;
+  bare `SELECT current_user` (parenless) works in embedded
+- Prepared statements: SQL-level PREPARE / EXECUTE parse-accept
+  for drivers that emit them (extended-query protocol remains
+  canonical)
+
+TRUNCATE is real: TRUNCATE [TABLE] [ONLY] <name>[, ...]
+[RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]
+clears rows across all named tables; CASCADE walk + RESTART
+IDENTITY reset queue with v7.38.
+
 ### PL/pgSQL surface (v7.37.20 slice, autorun-shipped)
 
 The DO block and trigger body executor now cover a substantial
