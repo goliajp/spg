@@ -231,6 +231,80 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — PG cryptographic hash functions.
+        // sha1 is already in the dep graph (users.rs MySQL auth);
+        // sha2 provides sha224/sha256/sha384/sha512. Hex output
+        // matches PG's `encode(digest(x, 'sha256'), 'hex')` shape
+        // that PostgreSQL 15+ built-in `sha256(x)` uses.
+        "sha1" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("sha1() takes 1 arg, got {}", args.len()),
+                });
+            }
+            use sha1::{Digest, Sha1};
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let mut h = Sha1::new();
+                    h.update(s.as_bytes());
+                    Ok(Value::Bytes(h.finalize().to_vec().into()))
+                }
+                Value::Bytes(b) => {
+                    let mut h = Sha1::new();
+                    h.update(b.as_ref());
+                    Ok(Value::Bytes(h.finalize().to_vec().into()))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("sha1() needs text or bytea, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        "sha224" | "sha256" | "sha384" | "sha512" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+            let input: &[u8] = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let out: alloc::vec::Vec<u8> = match name {
+                "sha224" => {
+                    let mut h = Sha224::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha256" => {
+                    let mut h = Sha256::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha384" => {
+                    let mut h = Sha384::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha512" => {
+                    let mut h = Sha512::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                _ => unreachable!(),
+            };
+            Ok(Value::Bytes(out.into()))
+        }
         // v7.37.17 (17.6 siblings) — SQL:2003 BIT_LENGTH(x) is
         // OCTET_LENGTH(x) * 8. Uses the same input-type accepting
         // rules — TEXT (UTF-8 bytes) or BYTEA.
