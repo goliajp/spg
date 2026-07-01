@@ -58,6 +58,7 @@ mod e2e_plpgsql_for_query;
 mod e2e_plpgsql_for_execute;
 mod e2e_plpgsql_return_query;
 mod e2e_create_index_concurrently;
+mod e2e_reindex_pg_dump_compat;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
