@@ -1746,6 +1746,32 @@ fn apply_function_dispatch(
         | "pg_advisory_unlock"
         | "pg_advisory_unlock_shared" => Ok(Value::Bool(true)),
         "pg_advisory_unlock_all" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_sleep / pg_sleep_for /
+        // pg_sleep_until. Return void (NULL) without actually
+        // sleeping. Tests that use pg_sleep to trigger cache
+        // eviction / stat rollup are typically doing it as a
+        // shape marker; SPG's stats are synchronous so a real
+        // sleep isn't useful. Preserves parse-through for
+        // migration scripts + regression tests.
+        "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => Ok(Value::Null),
+        // pg_xact_commit_timestamp(xid) — commit-timestamp
+        // extension probe (typically off by default). Return NULL.
+        "pg_xact_commit_timestamp" | "pg_last_committed_xact" => Ok(Value::Null),
+        // pg_current_wal_lsn / pg_current_wal_flush_lsn /
+        // pg_current_wal_insert_lsn — return NULL (SPG's WAL
+        // uses seq_no instead of PG-style LSN bytes; the real
+        // mapping queues with the replication-protocol RFC).
+        "pg_current_wal_lsn"
+        | "pg_current_wal_flush_lsn"
+        | "pg_current_wal_insert_lsn"
+        | "pg_last_wal_receive_lsn"
+        | "pg_last_wal_replay_lsn" => Ok(Value::Null),
+        // pg_last_xact_replay_timestamp — replica lag probe.
+        "pg_last_xact_replay_timestamp" => Ok(Value::Null),
+        // Range comparison helpers.
+        "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => Ok(Value::Bool(false)),
+        // Container empty check for ranges.
+        "isempty" => Ok(Value::Bool(false)),
         // v7.37.14 (B6.5) — PG `pg_blocking_pids(pid)` returns the
         // array of pids currently blocking `pid`. SPG's single-
         // writer + Arc-snapshot model means there is no per-tuple
