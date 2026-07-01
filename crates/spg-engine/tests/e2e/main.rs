@@ -127,6 +127,7 @@ mod e2e_session_identity_probes;
 mod e2e_levenshtein;
 mod e2e_soundex;
 mod e2e_difference;
+mod e2e_stat_snapshot_timestamp;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

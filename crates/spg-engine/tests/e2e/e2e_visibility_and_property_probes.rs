@@ -64,12 +64,18 @@ fn publication_and_stat_probes() {
         "pg_get_publication_tables('pub')",
         "pg_stat_get_activity(1)",
         "pg_stat_get_backend_activity(1)",
-        "pg_stat_get_snapshot_timestamp()",
     ] {
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),
             "SELECT {f} should be NULL"
         );
+    }
+    // v7.37.17 (17.6 siblings) — pg_stat_get_snapshot_timestamp
+    // upgraded from NULL to a real Timestamp for stats-freshness
+    // monitoring dashboards. Verify shape only.
+    match first(&mut e, "SELECT pg_stat_get_snapshot_timestamp()") {
+        spg_storage::Value::Timestamp(_) => {}
+        other => panic!("expected Timestamp, got {other:?}"),
     }
 }
