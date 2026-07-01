@@ -231,6 +231,81 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — jsonb_typeof / json_typeof
+        // returns PG's canonical type-name text for a jsonb/json
+        // value: 'object' / 'array' / 'string' / 'number' /
+        // 'boolean' / 'null'. Return NULL for SQL NULL input
+        // (not JSON null — that returns text 'null').
+        "jsonb_typeof" | "json_typeof" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => {
+                    let trimmed = s.trim_start();
+                    let type_name = if let Some(first) = trimmed.chars().next() {
+                        match first {
+                            '{' => "object",
+                            '[' => "array",
+                            '"' => "string",
+                            't' | 'f' => "boolean",
+                            'n' => "null",
+                            '-' | '0'..='9' => "number",
+                            _ => "null",
+                        }
+                    } else {
+                        "null"
+                    };
+                    Ok(Value::text(alloc::string::String::from(type_name)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() needs jsonb/json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — jsonb_array_length /
+        // json_array_length returns the element count of a JSON
+        // array. Errors on non-array input (matches PG). NULL
+        // passthrough.
+        "jsonb_array_length" | "json_array_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: format!("{name}(): JSON parse failed: {e}"),
+                        }
+                    })?;
+                    match parsed {
+                        crate::json::JsonValue::Array(arr) => {
+                            Ok(Value::Int(arr.len() as i32))
+                        }
+                        _ => Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "{name}(): expected JSON array, got other JSON type"
+                            ),
+                        }),
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() needs jsonb/json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — pg_column_size(v) returns the
         // storage size of a value in bytes. Real implementation for
         // the value types SPG carries in-line (int / bigint / float /
