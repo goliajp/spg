@@ -4809,6 +4809,123 @@ fn apply_function_dispatch(
             }
             Ok(Value::Uuid(gen_random_uuid_bytes()))
         }
+        // v7.37.17 (17.6 siblings) — uuid-ossp namespace constants
+        // + uuid_generate_v5 (SHA-1 name-based) + v3 (MD5).
+        "uuid_nil" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("uuid_nil() takes 0 args, got {}", args.len()),
+                });
+            }
+            Ok(Value::Uuid([0u8; 16]))
+        }
+        "uuid_ns_dns" => Ok(Value::Uuid([
+            0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ])),
+        "uuid_ns_url" => Ok(Value::Uuid([
+            0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ])),
+        "uuid_ns_oid" => Ok(Value::Uuid([
+            0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ])),
+        "uuid_ns_x500" => Ok(Value::Uuid([
+            0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ])),
+        // uuid_generate_v5(namespace, name) — SHA-1 name-based UUID.
+        // Deterministic: same (ns, name) always yields the same UUID.
+        "uuid_generate_v5" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "uuid_generate_v5() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let ns = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Uuid(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "uuid_generate_v5(): namespace must be uuid, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let name = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "uuid_generate_v5(): name must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(ns);
+            h.update(name.as_bytes());
+            let digest = h.finalize();
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&digest[..16]);
+            b[6] = (b[6] & 0x0F) | 0x50; // version 5
+            b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+            Ok(Value::Uuid(b))
+        }
+        // uuid_generate_v3(namespace, name) — MD5 name-based UUID.
+        "uuid_generate_v3" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "uuid_generate_v3() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let ns = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Uuid(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "uuid_generate_v3(): namespace must be uuid, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let name = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "uuid_generate_v3(): name must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(ns);
+            h.update(name.as_bytes());
+            let digest = h.finalize();
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&digest);
+            b[6] = (b[6] & 0x0F) | 0x30; // version 3
+            b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+            Ok(Value::Uuid(b))
+        }
         // v7.37.17 (17.6 siblings) — PG 18 uuidv7() — time-ordered
         // UUID v7 (RFC 9562). 48-bit millis-since-epoch prefix +
         // random tail; sorts by generation time, making it the
