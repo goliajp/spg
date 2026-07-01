@@ -567,6 +567,44 @@ fn apply_function_dispatch(
         // activity view. Return NULL for the scalar surface;
         // real callers use the pg_stat_activity view.
         "pg_stat_get_activity" | "pg_stat_get_backend_activity" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_db_* family.
+        // Per-database counter probes; postgres_exporter emits
+        // these in the "high cardinality" scrape mode. Return
+        // 0 (or NULL for timestamp-shaped ones) so scrapes
+        // succeed with zero-baseline metrics.
+        "pg_stat_get_db_xact_commit"
+        | "pg_stat_get_db_xact_rollback"
+        | "pg_stat_get_db_blocks_fetched"
+        | "pg_stat_get_db_blocks_hit"
+        | "pg_stat_get_db_tuples_returned"
+        | "pg_stat_get_db_tuples_fetched"
+        | "pg_stat_get_db_tuples_inserted"
+        | "pg_stat_get_db_tuples_updated"
+        | "pg_stat_get_db_tuples_deleted"
+        | "pg_stat_get_db_conflict_all"
+        | "pg_stat_get_db_conflict_tablespace"
+        | "pg_stat_get_db_conflict_lock"
+        | "pg_stat_get_db_conflict_snapshot"
+        | "pg_stat_get_db_conflict_bufferpin"
+        | "pg_stat_get_db_conflict_startup_deadlock"
+        | "pg_stat_get_db_conflict_logicalslot"
+        | "pg_stat_get_db_deadlocks"
+        | "pg_stat_get_db_checksum_failures"
+        | "pg_stat_get_db_active_time"
+        | "pg_stat_get_db_idle_in_transaction_time"
+        | "pg_stat_get_db_session_time"
+        | "pg_stat_get_db_sessions"
+        | "pg_stat_get_db_sessions_abandoned"
+        | "pg_stat_get_db_sessions_fatal"
+        | "pg_stat_get_db_sessions_killed"
+        | "pg_stat_get_db_temp_bytes"
+        | "pg_stat_get_db_temp_files"
+        | "pg_stat_get_db_numbackends"
+        | "pg_stat_get_db_blk_read_time"
+        | "pg_stat_get_db_blk_write_time" => Ok(Value::BigInt(0)),
+        // Timestamp-shaped db-stat probes.
+        "pg_stat_get_db_stat_reset_time"
+        | "pg_stat_get_db_checksum_last_failure" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_stat_get_snapshot_timestamp
         // returns the timestamp when the stats snapshot was taken.
         // Monitoring dashboards + postgres_exporter check this to
