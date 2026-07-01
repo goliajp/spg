@@ -4330,7 +4330,58 @@ fn apply_function_dispatch(
         // with sensible defaults so the dump preamble doesn't
         // fail. `pg_get_serial_sequence` returns NULL (no
         // sequence — SPG has AUTO_INCREMENT instead).
-        "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
+        "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_get_serial_sequence returns
+        // the OID name of the underlying sequence for an implicit
+        // SERIAL / BIGSERIAL column. ORMs (SQLAlchemy, Django,
+        // ActiveRecord) call it to detect auto-increment columns.
+        // Real impl: parse `(schema.)?table` + column string, and
+        // synthesize the PG-conventional sequence name form
+        // `public.table_column_seq`. SPG uses AUTO_INCREMENT rather
+        // than named sequences, so this returns a synthetic name
+        // that at least never NULLs out.
+        "pg_get_serial_sequence" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_get_serial_sequence() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let table = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_get_serial_sequence(): table must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let col = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_get_serial_sequence(): column must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Strip any leading "schema." from table part.
+            let table_short = table
+                .rsplit_once('.')
+                .map(|(_schema, t)| t)
+                .unwrap_or(&table);
+            Ok(Value::text(alloc::format!(
+                "public.{table_short}_{col}_seq"
+            )))
+        }
         // v7.37.17 (17.6 siblings) — additional pg_catalog probe
         // helpers that ORMs / migration tools emit. All return
         // NULL / empty text where PG would return real DDL text.

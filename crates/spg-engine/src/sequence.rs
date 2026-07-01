@@ -113,12 +113,23 @@ impl Engine {
                         }
                     };
                     if let (Some(t), Some(c)) = (lit(&args[0]), lit(&args[1])) {
-                        let is_serial = self.active_catalog().get(&t).is_some_and(|tb| {
-                            tb.schema()
-                                .columns
-                                .iter()
-                                .any(|col| col.name == c && col.auto_increment)
-                        });
+                        let table_opt = self.active_catalog().get(&t);
+                        // v7.37.17 (17.6 siblings) — if the table isn't
+                        // in the active catalog, leave the call alone
+                        // so the scalar arm in eval::functions handles
+                        // it (returns the synthetic sequence name).
+                        // ORMs (SQLAlchemy, Django) call this against
+                        // arbitrary tables at introspection time — we
+                        // want to answer with a plausible sequence
+                        // name rather than NULL.
+                        let Some(tb_ref) = table_opt else {
+                            return Ok(());
+                        };
+                        let is_serial = tb_ref
+                            .schema()
+                            .columns
+                            .iter()
+                            .any(|col| col.name == c && col.auto_increment);
                         *expr = if is_serial {
                             Expr::Literal(spg_sql::ast::Literal::String(alloc::format!(
                                 "public.{t}_{c}_seq"
