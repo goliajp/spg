@@ -1505,6 +1505,113 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — pgcrypto hmac(data, key, algo)
+        // returns keyed-hash MAC. Uses RustCrypto's `hmac` crate
+        // with the sha1/sha2 backends already in the dep graph.
+        "hmac" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hmac() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let input: &[u8] = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "hmac(): data must be text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let key: &[u8] = match &args[1] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "hmac(): key must be text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let algo = match &args[2] {
+                Value::Text(s) => s.to_ascii_lowercase(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "hmac(): type must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            use hmac::{Hmac, Mac};
+            let out: alloc::vec::Vec<u8> = match algo.as_str() {
+                "md5" => {
+                    type H = Hmac<md5::Md5>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                "sha1" => {
+                    type H = Hmac<sha1::Sha1>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                "sha224" => {
+                    type H = Hmac<sha2::Sha224>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                "sha256" => {
+                    type H = Hmac<sha2::Sha256>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                "sha384" => {
+                    type H = Hmac<sha2::Sha384>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                "sha512" => {
+                    type H = Hmac<sha2::Sha512>;
+                    let mut m = H::new_from_slice(key).map_err(|_| EvalError::TypeMismatch {
+                        detail: "hmac(): invalid key length".into(),
+                    })?;
+                    m.update(input);
+                    m.finalize().into_bytes().to_vec()
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "hmac(): unsupported algorithm {other:?}; use md5/sha1/sha224/sha256/sha384/sha512"
+                        ),
+                    });
+                }
+            };
+            Ok(Value::Bytes(out.into()))
+        }
         // v7.37.17 (17.6 siblings) — pgcrypto digest(data, type)
         // returns the hash of data using the named algorithm. This
         // is PG's pgcrypto extension surface but many apps + ORMs

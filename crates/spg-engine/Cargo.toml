@@ -31,6 +31,10 @@ sha2        = { version = "0.10", default-features = false }
 # lock graph transitively (via `sqlx-postgres` etc.), so no new
 # vendored surface — just a direct dep now.
 md-5        = { version = "0.10", default-features = false }
+# v7.37.17 (17.6 siblings) — pgcrypto's hmac(data, key, algo) —
+# uses RustCrypto's `hmac` (already transitively in the lock graph
+# via sqlx-postgres) with the sha1/sha2/md-5 backends we ship.
+hmac        = { version = "0.12", default-features = false }
 
 [features]
 # v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
