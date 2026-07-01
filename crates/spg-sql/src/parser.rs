@@ -1557,6 +1557,25 @@ impl Parser {
                     }
                     return Ok(Statement::Empty);
                 }
+                // v7.37.17 (17.6 sibling) — PG `SET ROLE
+                // { NONE | DEFAULT | <role_name> }`. pg_dump preamble
+                // uses this to switch to the object owner before
+                // recreating tables. SPG has no role system so this
+                // is a no-op.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("role"))
+                {
+                    self.advance(); // ROLE
+                    match self.peek().clone() {
+                        Token::Default
+                        | Token::String(_)
+                        | Token::Ident(_)
+                        | Token::QuotedIdent(_) => {
+                            self.advance();
+                        }
+                        _ => {}
+                    }
+                    return Ok(Statement::Empty);
+                }
                 // v7.37.17 (17.6 sibling) — PG `SET SESSION
                 // CHARACTERISTICS AS TRANSACTION <mode>` (per PG
                 // ISO SQL surface). pg_dump prepends this to fix
