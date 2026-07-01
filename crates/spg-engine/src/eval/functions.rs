@@ -231,6 +231,40 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — PG's built-in md5(text|bytea)
+        // returns the 32-char lowercase hex digest text (matches
+        // PG default), NOT the raw bytes like sha256 does. This is
+        // the historical PG spec: md5() is text-in / text-out.
+        "md5" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("md5() takes 1 arg, got {}", args.len()),
+                });
+            }
+            use md5::{Digest, Md5};
+            let input: &[u8] = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "md5() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut h = Md5::new();
+            h.update(input);
+            let digest = h.finalize();
+            let mut hex = alloc::string::String::with_capacity(32);
+            for b in digest.iter() {
+                use core::fmt::Write;
+                let _ = write!(hex, "{b:02x}");
+            }
+            Ok(Value::text(hex))
+        }
         // v7.37.17 (17.6 siblings) — PG cryptographic hash functions.
         // sha1 is already in the dep graph (users.rs MySQL auth);
         // sha2 provides sha224/sha256/sha384/sha512. Hex output

@@ -26,6 +26,11 @@ sha1        = { version = "0.10", default-features = false }
 # v7.17.0 Phase 3.P0-72 — `caching_sha2_password` auth verifier
 # stores SHA256(SHA256(password)) per user.
 sha2        = { version = "0.10", default-features = false }
+# v7.37.17 (17.6 siblings) — PG built-in md5() function. RustCrypto's
+# `md-5` is the standard no_std-friendly MD5 impl; already in the
+# lock graph transitively (via `sqlx-postgres` etc.), so no new
+# vendored surface — just a direct dep now.
+md-5        = { version = "0.10", default-features = false }
 
 [features]
 # v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
