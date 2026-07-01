@@ -231,6 +231,234 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — PG math functions.
+        //
+        // ln(x)     — natural log
+        // log(x)    — log base 10 (PG default)
+        // log10(x)  — explicit log base 10
+        // log(b, x) — log base b (two-arg form)
+        // exp(x)    — e^x
+        // cbrt(x)   — cube root
+        // pi()      — π
+        // gcd(a, b) — greatest common divisor (BIGINT)
+        // lcm(a, b) — least common multiple (BIGINT)
+        // radians(x) / degrees(x)
+        "ln" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("ln() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("ln() needs numeric, got {:?}", v.data_type()),
+                    })?;
+                    if x <= 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "ln(): input must be > 0".into(),
+                        });
+                    }
+                    Ok(Value::Float(f64_ln(x)))
+                }
+            }
+        }
+        "log" | "log10" => {
+            let arg_count = args.len();
+            if arg_count == 1 {
+                match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    v => {
+                        let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                            detail: alloc::format!("{name}() needs numeric, got {:?}", v.data_type()),
+                        })?;
+                        if x <= 0.0 {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!("{name}(): input must be > 0"),
+                            });
+                        }
+                        // log10(x) = ln(x) / ln(10).
+                        Ok(Value::Float(f64_ln(x) / f64_ln(10.0)))
+                    }
+                }
+            } else if arg_count == 2 {
+                if args.iter().any(|v| matches!(v, Value::Null)) {
+                    return Ok(Value::Null);
+                }
+                let b = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "log(base, x) needs numeric base".into(),
+                })?;
+                let x = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "log(base, x) needs numeric x".into(),
+                })?;
+                if b <= 0.0 || b == 1.0 || x <= 0.0 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "log(): base must be > 0 and != 1, x must be > 0".into(),
+                    });
+                }
+                Ok(Value::Float(f64_ln(x) / f64_ln(b)))
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 or 2 args, got {arg_count}"),
+                })
+            }
+        }
+        "exp" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("exp() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("exp() needs numeric, got {:?}", v.data_type()),
+                    })?;
+                    Ok(Value::Float(f64_exp(x)))
+                }
+            }
+        }
+        "cbrt" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("cbrt() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("cbrt() needs numeric, got {:?}", v.data_type()),
+                    })?;
+                    // cbrt(x) = sign(x) * (|x|)^(1/3). Preserve sign
+                    // for negative inputs (matches PG).
+                    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+                    let mag = if x < 0.0 { -x } else { x };
+                    // (|x|)^(1/3) via exp(ln(|x|)/3). Zero short-circuit.
+                    let mag_cbrt = if mag == 0.0 {
+                        0.0
+                    } else {
+                        f64_exp(f64_ln(mag) / 3.0)
+                    };
+                    Ok(Value::Float(sign * mag_cbrt))
+                }
+            }
+        }
+        "pi" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pi() takes no args, got {}", args.len()),
+                });
+            }
+            Ok(Value::Float(core::f64::consts::PI))
+        }
+        "gcd" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("gcd() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn to_i64(v: &Value<'_>) -> Result<i64, EvalError> {
+                match v {
+                    Value::Int(n) => Ok(*n as i64),
+                    Value::BigInt(n) => Ok(*n),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "gcd/lcm need integer inputs, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let mut a = to_i64(&args[0])?.unsigned_abs();
+            let mut b = to_i64(&args[1])?.unsigned_abs();
+            while b != 0 {
+                let t = b;
+                b = a % b;
+                a = t;
+            }
+            Ok(Value::BigInt(a as i64))
+        }
+        "lcm" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("lcm() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn to_i64(v: &Value<'_>) -> Result<i64, EvalError> {
+                match v {
+                    Value::Int(n) => Ok(*n as i64),
+                    Value::BigInt(n) => Ok(*n),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "lcm() needs integer inputs, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let a = to_i64(&args[0])?.unsigned_abs();
+            let b = to_i64(&args[1])?.unsigned_abs();
+            if a == 0 || b == 0 {
+                return Ok(Value::BigInt(0));
+            }
+            let mut x = a;
+            let mut y = b;
+            while y != 0 {
+                let t = y;
+                y = x % y;
+                x = t;
+            }
+            let g = x;
+            let lcm = (a / g).saturating_mul(b);
+            Ok(Value::BigInt(lcm as i64))
+        }
+        "radians" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("radians() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "radians() needs numeric, got {:?}",
+                            v.data_type()
+                        ),
+                    })?;
+                    Ok(Value::Float(x * core::f64::consts::PI / 180.0))
+                }
+            }
+        }
+        "degrees" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("degrees() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "degrees() needs numeric, got {:?}",
+                            v.data_type()
+                        ),
+                    })?;
+                    Ok(Value::Float(x * 180.0 / core::f64::consts::PI))
+                }
+            }
+        }
         // v7.37.17 (17.6 siblings) — to_hex(int|bigint) — PG's
         // integer-to-hex-string conversion. Returns TEXT.
         "to_hex" => {
