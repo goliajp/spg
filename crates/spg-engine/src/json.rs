@@ -1328,6 +1328,74 @@ pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     Ok(Value::json(root.to_json_text()))
 }
 
+/// v7.37.17 (17.6 siblings) — `jsonb_delete_path(doc, path[])` —
+/// function form of the `#-` operator. Removes the value at the
+/// nested path; missing path leaves the doc unchanged.
+pub fn delete_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "jsonb_delete_path() takes 2 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let doc_text = json_text_arg(&args[0], "jsonb_delete_path", "target")?;
+    let path = path_text_arg(&args[1], "jsonb_delete_path")?;
+    let mut root = parse(doc_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_delete_path(): invalid JSON target — {e}"),
+    })?;
+    delete_at_path(&mut root, &path);
+    Ok(Value::json(root.to_json_text()))
+}
+
+fn delete_at_path(node: &mut JsonValue, path: &[String]) {
+    if path.is_empty() {
+        return;
+    }
+    let step = &path[0];
+    if path.len() == 1 {
+        // Terminal step — remove here.
+        match node {
+            JsonValue::Object(entries) => {
+                entries.retain(|(k, _)| k != step);
+            }
+            JsonValue::Array(items) => {
+                if let Ok(idx) = step.parse::<i64>() {
+                    let len = items.len() as i64;
+                    let real = if idx >= 0 { idx } else { len + idx };
+                    if real >= 0 && real < len {
+                        items.remove(real as usize);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Navigate deeper.
+    match node {
+        JsonValue::Object(entries) => {
+            if let Some((_, child)) = entries.iter_mut().find(|(k, _)| k == step) {
+                delete_at_path(child, &path[1..]);
+            }
+        }
+        JsonValue::Array(items) => {
+            if let Ok(idx) = step.parse::<i64>() {
+                let len = items.len() as i64;
+                let real = if idx >= 0 { idx } else { len + idx };
+                if real >= 0 && real < len {
+                    delete_at_path(&mut items[real as usize], &path[1..]);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn set_at_path(node: &mut JsonValue, path: &[String], new_val: JsonValue, create_missing: bool) {
     if path.is_empty() {
         *node = new_val;
