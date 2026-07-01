@@ -4491,7 +4491,21 @@ fn apply_function_dispatch(
         | "has_database_privilege"
         | "has_language_privilege"
         | "has_tablespace_privilege"
-        | "has_type_privilege" => Ok(Value::Bool(true)),
+        | "has_type_privilege"
+        // v7.37.17 (17.6 siblings) — round out the privilege
+        // family. `has_any_column_privilege(obj, priv)` is a
+        // sibling of has_column_privilege used by ORMs to detect
+        // "can the current role touch this table at all?".
+        // `has_server_privilege` / `has_foreign_data_wrapper_privilege`
+        // are for foreign-data callers; SPG has no FDW yet so
+        // return true. `has_parameter_privilege` (PG 15+) probes
+        // ALTER SYSTEM permission on a GUC. `pg_has_role` is the
+        // role-membership check used by RBAC-aware tooling.
+        | "has_any_column_privilege"
+        | "has_server_privilege"
+        | "has_foreign_data_wrapper_privilege"
+        | "has_parameter_privilege"
+        | "pg_has_role" => Ok(Value::Bool(true)),
         // pg_backend_pid — session identifier. SPG uses u64 slot
         // ids; return a low deterministic value for embedded runs.
         "pg_backend_pid" => Ok(Value::Int(1)),
