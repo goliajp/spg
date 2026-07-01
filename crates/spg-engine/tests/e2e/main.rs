@@ -76,6 +76,7 @@ mod e2e_set_role_pg_dump_compat;
 mod e2e_load_call_pg_dump_compat;
 mod e2e_pg_catalog_probe_funcs;
 mod e2e_quote_and_meta_funcs;
+mod e2e_clock_family;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
