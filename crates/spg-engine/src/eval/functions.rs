@@ -567,10 +567,15 @@ fn apply_function_dispatch(
         // activity view. Return NULL for the scalar surface;
         // real callers use the pg_stat_activity view.
         "pg_stat_get_activity" | "pg_stat_get_backend_activity" => Ok(Value::Null),
-        // pg_stat_get_snapshot_timestamp — timestamp of stats
-        // snapshot. Return NULL.
+        // v7.37.17 (17.6 siblings) — pg_stat_get_snapshot_timestamp
+        // returns the timestamp when the stats snapshot was taken.
+        // Monitoring dashboards + postgres_exporter check this to
+        // detect frozen stats. Return the 2020-01-01 anchor
+        // consistent with pg_backend_start_time; v7.38 wall-clock
+        // plumbing replaces this with a real per-scrape timestamp.
         "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
-            Ok(Value::Null)
+            const ANCHOR_2020_UTC: i64 = 1_577_836_800_000_000;
+            Ok(Value::Timestamp(ANCHOR_2020_UTC))
         }
         // v7.37.17 (17.6 siblings) — array_to_json(arr [, pretty])
         // returns JSON text representation of an array. `pretty`
