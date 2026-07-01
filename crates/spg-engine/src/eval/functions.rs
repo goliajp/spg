@@ -3377,6 +3377,87 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — XML surface stubs. Real XML
+        // support (xmlparse/xmlelement/xmlserialize/xpath) threads
+        // with the xml2/xml crate epic; scalar surface accept-then-
+        // NULL preserves parse-through.
+        "xmlcomment" => {
+            // `xmlcomment(text)` wraps text in <!-- --> and returns
+            // it as an xml value. Trivial to implement without a
+            // real xml type — return a text-shaped result.
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("xmlcomment() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    if s.contains("--") {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "xmlcomment(): argument must not contain '--'".into(),
+                        });
+                    }
+                    Ok(Value::text(alloc::format!("<!--{s}-->")))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "xmlcomment(): needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // xml_is_well_formed / _document / _content check syntax
+        // of a text-form XML fragment. SPG doesn't ship a real
+        // XML parser yet — use a defensive heuristic that returns
+        // true only when the input is empty or looks like XML
+        // (starts with '<'). Real xml crate integration is queued
+        // with the XML epic.
+        "xml_is_well_formed"
+        | "xml_is_well_formed_document"
+        | "xml_is_well_formed_content" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "xml_is_well_formed() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        return Ok(Value::Bool(true));
+                    }
+                    if !t.starts_with('<') || !t.ends_with('>') {
+                        return Ok(Value::Bool(false));
+                    }
+                    // Rough count-tag balance check. Not a real
+                    // parser, but rejects obvious garbage.
+                    let opens = t.matches('<').count();
+                    let closes = t.matches('>').count();
+                    Ok(Value::Bool(opens == closes))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "xml_is_well_formed(): needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // xpath / xpath_exists / xmlexists — SETOF or bool result.
+        // Return NULL / false until real parser lands.
+        "xpath" | "xmlexists" => Ok(Value::Null),
+        "xpath_exists" => Ok(Value::Bool(false)),
+        // xmlagg is aggregate; xmlparse / xmlserialize / xmlelement
+        // are parser-level constructs (special-case in AST). This
+        // arm covers only their scalar synonyms if any driver
+        // emits them.
+        "xmlconcat" | "xml" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — replication-slot + subscription
         // + progress-info stat probes emitted by postgres_exporter
         // and Prometheus replication-lag scrapes.
