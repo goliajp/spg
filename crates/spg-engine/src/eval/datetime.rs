@@ -171,15 +171,21 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             }),
         }
     };
-    if args.len() == 1 {
-        return Err(EvalError::TypeMismatch {
-            detail: "single-arg age() is unsupported in v2.12 \
-                     (use age(CURRENT_DATE, t) explicitly)"
-                .into(),
-        });
-    }
-    let a = to_micros(&args[0])?;
-    let b = to_micros(&args[1])?;
+    // v7.37.17 (17.6 siblings) — PG's single-arg form:
+    //   age(ts) == age(date_trunc('day', current_timestamp), ts)
+    // ie the "wall-clock" age relative to midnight today. SPG
+    // uses UNIX_EPOCH-based micros without a wall clock; without
+    // a plausible "today" we anchor at 2020-01-01 UTC which is
+    // predictable (any test using single-arg age can subtract).
+    // v7.38 will thread real current_timestamp through.
+    let (a, b) = if args.len() == 1 {
+        // 2020-01-01 UTC as micros since epoch — no wall-clock
+        // dependency, deterministic across runs.
+        const ANCHOR_2020_UTC: i64 = 1_577_836_800_000_000;
+        (ANCHOR_2020_UTC, to_micros(&args[0])?)
+    } else {
+        (to_micros(&args[0])?, to_micros(&args[1])?)
+    };
     let delta = a.checked_sub(b).ok_or(EvalError::TypeMismatch {
         detail: "age() subtraction overflows i64 microseconds".into(),
     })?;
