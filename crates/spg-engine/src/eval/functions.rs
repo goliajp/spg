@@ -6147,6 +6147,21 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — extension introspection.
+        // These SETOF functions are used by psql \dx + ORMs to
+        // discover available extensions. Scalar-surface NULL so
+        // scalar-context callers get parse-through.
+        "pg_available_extensions"
+        | "pg_available_extension_versions"
+        | "pg_extension_update_paths"
+        | "pg_extension_config_dump"
+        | "pg_visible_in_snapshot_txid" => Ok(Value::Null),
+        // pg_load_extension is used by CREATE EXTENSION machinery.
+        // Return void.
+        "pg_load_extension" => Ok(Value::Null),
+        // pg_extension_check_version returns the installed version
+        // of an extension by name. SPG has no extensions yet.
+        "pg_extension_check_version" | "extension_version" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — bytea bitwise ops. Not built
         // into PG (bit strings have varbit ops) but common in
         // custom crypto/token pipelines that emit bytea XOR for
