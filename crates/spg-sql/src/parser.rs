@@ -67,6 +67,16 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // about the terminator, so consume DELIMITER lines
             // as Empty.
             | "delimiter"
+            // v7.37.17 (17.6 siblings) — additional PG maintenance /
+            // session-state statements pg_dump + application startup
+            // scripts emit. SPG has no matching session-state to
+            // discard (no prepared-plan cache surface, no temp
+            // sequences), no matching security-label / storage-
+            // option to apply, no separate CREATE/DROP CAST that
+            // affects execution.
+            | "discard"
+            | "deallocate"
+            | "security"
     )
 }
 
