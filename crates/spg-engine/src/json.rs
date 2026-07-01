@@ -1134,6 +1134,100 @@ fn render_numeric(scaled: i128, scale: u8) -> String {
 /// `json_build_object(k, v, k, v, …)` — variadic, even-length.
 /// NULL key → error (PG: "argument cannot be null"). Values encoded
 /// via `value_to_json_text`. Returns Value::Json.
+/// v7.37.17 (17.6 siblings) — `jsonb_concat(a, b)` — function form
+/// of the `||` operator. Object + object merges keys (right wins on
+/// duplicates); array + array appends; array + scalar appends the
+/// scalar; scalar + scalar makes a 2-element array (PG semantics).
+pub fn concat(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
+    let (a_src, b_src) = match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Json(a) | Value::Text(a), Value::Json(b) | Value::Text(b)) => {
+            (a.as_ref(), b.as_ref())
+        }
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "jsonb_concat() expects (JSON, JSON)".into(),
+            });
+        }
+    };
+    let a = parse(a_src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON lhs for concat: {e}"),
+    })?;
+    let b = parse(b_src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON rhs for concat: {e}"),
+    })?;
+    let merged = match (a, b) {
+        (JsonValue::Object(mut ea), JsonValue::Object(eb)) => {
+            // Right side wins on duplicate keys.
+            for (k, v) in eb {
+                if let Some(slot) = ea.iter_mut().find(|(ek, _)| *ek == k) {
+                    slot.1 = v;
+                } else {
+                    ea.push((k, v));
+                }
+            }
+            JsonValue::Object(ea)
+        }
+        (JsonValue::Array(mut ia), JsonValue::Array(ib)) => {
+            ia.extend(ib);
+            JsonValue::Array(ia)
+        }
+        (JsonValue::Array(mut ia), scalar) => {
+            ia.push(scalar);
+            JsonValue::Array(ia)
+        }
+        (scalar, JsonValue::Array(ib)) => {
+            let mut out = alloc::vec![scalar];
+            out.extend(ib);
+            JsonValue::Array(out)
+        }
+        (sa, sb) => JsonValue::Array(alloc::vec![sa, sb]),
+    };
+    Ok(Value::json(merged.to_json_text()))
+}
+
+/// v7.37.17 (17.6 siblings) — `jsonb_delete(doc, key)` — function
+/// form of the `-` operator. Removes an object key or an array
+/// element (by text match for objects, by index for arrays).
+pub fn delete_key(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
+    let src = match lhs {
+        Value::Null => return Ok(Value::Null),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "jsonb_delete() expects JSON lhs".into(),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON for delete: {e}"),
+    })?;
+    let out = match (doc, rhs) {
+        (_, Value::Null) => return Ok(Value::Null),
+        (JsonValue::Object(entries), Value::Text(key)) => {
+            let filtered: Vec<(String, JsonValue)> = entries
+                .into_iter()
+                .filter(|(k, _)| k != key.as_ref())
+                .collect();
+            JsonValue::Object(filtered)
+        }
+        (JsonValue::Array(items), Value::Int(idx)) => {
+            let n = *idx;
+            let len = items.len() as i64;
+            let real = if n >= 0 { i64::from(n) } else { len + i64::from(n) };
+            let filtered: Vec<JsonValue> = items
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i as i64 != real)
+                .map(|(_, v)| v)
+                .collect();
+            JsonValue::Array(filtered)
+        }
+        (other, _) => other,
+    };
+    Ok(Value::json(out.to_json_text()))
+}
+
 pub fn build_object(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !args.len().is_multiple_of(2) {
         return Err(EvalError::TypeMismatch {

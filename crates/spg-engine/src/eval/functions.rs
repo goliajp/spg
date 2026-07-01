@@ -5696,6 +5696,24 @@ fn apply_function_dispatch(
         "jsonb_set" | "json_set" => crate::json::set(args),
         "jsonb_insert" | "json_insert" => crate::json::insert(args),
         // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
+        // v7.37.17 (17.6 siblings) — jsonb_concat / jsonb_delete —
+        // function forms of || and - operators.
+        "jsonb_concat" | "json_concat" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("jsonb_concat() takes 2 args, got {}", args.len()),
+                });
+            }
+            crate::json::concat(&args[0], &args[1])
+        }
+        "jsonb_delete" | "json_delete" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("jsonb_delete() takes 2 args, got {}", args.len()),
+                });
+            }
+            crate::json::delete_key(&args[0], &args[1])
+        }
         // v7.37.17 (17.6 siblings) — jsonb_path_exists(doc, path)
         // returns whether the JSONPath matches at least one item.
         // jsonb_path_match(doc, path) evaluates a boolean-predicate
