@@ -6147,6 +6147,28 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — SPG-specific introspection.
+        // These aren't PG functions but SPG operators emit them
+        // from spgctl / monitoring dashboards.
+        "spg_version" => Ok(Value::text::<String>(
+            alloc::format!("SPG {}", env!("CARGO_PKG_VERSION")),
+        )),
+        "spg_build_time" => {
+            // Static build-time embedding.
+            Ok(Value::text::<String>("2026-07".into()))
+        }
+        "spg_edition" => {
+            Ok(Value::text::<String>("embedded".into()))
+        }
+        "spg_uptime_seconds" => {
+            // Wall-clock uptime queues with v7.38 wall-clock
+            // plumbing; return 0 for now.
+            Ok(Value::BigInt(0))
+        }
+        // Alias set for PG-name compat.
+        "pg_current_edition" => {
+            Ok(Value::text::<String>("SPG-compat".into()))
+        }
         // v7.37.17 (17.6 siblings) — pg_stat_statements support
         // functions. Callers emit these to reset stats + probe
         // the module's status. SETOF probes → NULL, reset ops
