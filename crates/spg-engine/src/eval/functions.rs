@@ -6082,6 +6082,26 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_function_* family.
+        // Per-function invocation stats for track_function_calls
+        // observability. Real per-function tracking threads with
+        // v7.38 observability epic.
+        "pg_stat_get_function_calls"
+        | "pg_stat_get_function_total_time"
+        | "pg_stat_get_function_self_time"
+        | "pg_stat_get_xact_function_calls"
+        | "pg_stat_get_xact_function_total_time"
+        | "pg_stat_get_xact_function_self_time" => Ok(Value::BigInt(0)),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_slru_blks_zeroed /
+        // _blks_hit / _blks_read family. Buffer stats. All 0.
+        "pg_stat_get_slru_blks_zeroed"
+        | "pg_stat_get_slru_blks_hit"
+        | "pg_stat_get_slru_blks_read"
+        | "pg_stat_get_slru_blks_written"
+        | "pg_stat_get_slru_blks_exists"
+        | "pg_stat_get_slru_flushes"
+        | "pg_stat_get_slru_truncates"
+        | "pg_stat_get_slru_stat_reset_time" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — pg_lock_status / pg_locks
         // sibling probes. Return NULL until real lock tracking
         // threads with v7.38 MVCC.
