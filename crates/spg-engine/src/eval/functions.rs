@@ -4477,6 +4477,69 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.37.17 (17.6 siblings) — PG 17+ overload `random(min, max)`
+        // returns a random value in [min, max]. Both int and numeric
+        // widths are common. Also supports random_int(min, max) alias.
+        "random_int" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("random_int() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (lo, hi): (i64, i64) = match (&args[0], &args[1]) {
+                (Value::Int(a), Value::Int(b)) => (i64::from(*a), i64::from(*b)),
+                (Value::BigInt(a), Value::BigInt(b)) => (*a, *b),
+                (Value::SmallInt(a), Value::SmallInt(b)) => {
+                    (i64::from(*a), i64::from(*b))
+                }
+                (a, b)
+                    if matches!(
+                        a,
+                        Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)
+                    ) && matches!(
+                        b,
+                        Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)
+                    ) =>
+                {
+                    // Mixed-width — widen both to i64.
+                    let l = match a {
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        Value::SmallInt(n) => i64::from(*n),
+                        _ => unreachable!(),
+                    };
+                    let h = match b {
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        Value::SmallInt(n) => i64::from(*n),
+                        _ => unreachable!(),
+                    };
+                    (l, h)
+                }
+                (a, b) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "random_int() needs integer args, got ({:?}, {:?})",
+                            a.data_type(),
+                            b.data_type()
+                        ),
+                    });
+                }
+            };
+            if lo > hi {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "random_int(): min ({lo}) > max ({hi})"
+                    ),
+                });
+            }
+            let range = (hi - lo + 1) as u64;
+            let r = super::math::prng_next_u64() % range;
+            Ok(Value::BigInt(lo + r as i64))
+        }
         // v7.37.17 (17.6 siblings) — setseed(f) reseeds the PRNG.
         // PG accepts f ∈ [-1, 1]; SPG allows the full f64 range
         // for simplicity. Returns void (NULL). Deterministic
