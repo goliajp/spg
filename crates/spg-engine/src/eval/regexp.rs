@@ -534,3 +534,63 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
     }
     Ok(Value::TextArray(out))
 }
+
+/// v7.37.17 (17.6 siblings) — PG 15+ `regexp_count(source, pattern)`
+/// returns the number of matches. Optional third arg for start
+/// position (1-based); optional fourth for flags (currently
+/// ignored — SPG's re engine has no case-insensitive flag).
+pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regexp_count() takes 2-4 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    let start_1based = if args.len() >= 3 {
+        match &args[2] {
+            Value::Null => return Ok(Value::Null),
+            Value::Int(n) => *n as i64,
+            Value::BigInt(n) => *n,
+            _ => {
+                return Err(EvalError::TypeMismatch {
+                    detail: "regexp_count(): start must be integer".into(),
+                });
+            }
+        }
+    } else {
+        1
+    };
+    if start_1based < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: "regexp_count(): start must be >= 1".into(),
+        });
+    }
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut count: i64 = 0;
+    let mut from = (start_1based - 1) as usize;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                count += 1;
+                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                from = step;
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Value::BigInt(count))
+}
