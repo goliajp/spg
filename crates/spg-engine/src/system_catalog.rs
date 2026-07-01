@@ -2664,18 +2664,53 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ("client_encoding", "UTF8", "Client Connection Defaults"),
         ("DateStyle", "ISO, MDY", "Client Connection Defaults"),
         ("TimeZone", "UTC", "Client Connection Defaults"),
+        ("IntervalStyle", "postgres", "Client Connection Defaults"),
         ("standard_conforming_strings", "on", "Compatibility"),
         ("integer_datetimes", "on", "Compatibility"),
         ("max_connections", "100", "Connections and Authentication"),
+        // v7.37.17 (17.6 siblings) — parity with the SHOW <param>
+        // PG-default fallbacks so `SELECT setting FROM pg_settings
+        // WHERE name = 'lock_timeout'` and `SHOW lock_timeout`
+        // return the same value (matches PG semantics + keeps
+        // pgpool / pgbouncer / postgres_exporter probes happy).
+        ("lock_timeout", "0", "Client Connection Defaults"),
+        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults"),
+        ("transaction_timeout", "0", "Client Connection Defaults"),
+        ("statement_timeout", "0", "Client Connection Defaults"),
+        ("client_min_messages", "notice", "Client Connection Defaults"),
+        ("default_tablespace", "", "Client Connection Defaults"),
+        ("default_table_access_method", "heap", "Client Connection Defaults"),
+        ("row_security", "on", "Client Connection Defaults"),
+        ("check_function_bodies", "on", "Client Connection Defaults"),
+        ("xmloption", "content", "Client Connection Defaults"),
+        ("work_mem", "4MB", "Resource Usage / Memory"),
+        ("maintenance_work_mem", "64MB", "Resource Usage / Memory"),
+        ("shared_buffers", "128MB", "Resource Usage / Memory"),
+        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants"),
+        ("search_path", "\"$user\", public", "Client Connection Defaults"),
+        ("application_name", "", "Reporting and Logging"),
+        ("default_transaction_isolation", "read committed", "Client Connection Defaults"),
     ];
+    // v7.37.17 (17.6 siblings) — pg_settings row shape now honors
+    // session-set overrides on the default row itself (not just as
+    // extra rows), so `SELECT setting FROM pg_settings WHERE name =
+    // 'lock_timeout'` returns whatever the session most recently
+    // SET. Matches PG semantics.
     for &(name, val, cat) in defaults {
+        let effective = engine
+            .session_params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| val.into());
         rows.push(Row::new(alloc::vec![
             Value::text::<String>(name.into()),
-            Value::text::<String>(val.into()),
+            Value::text(effective),
             Value::text::<String>(cat.into()),
         ]));
     }
-    // Session-set params override the static defaults.
+    // Session-set params NOT in the canonical defaults get their
+    // own rows under the Session category.
     for (k, v) in &engine.session_params {
         if !defaults
             .iter()
