@@ -898,6 +898,24 @@ pub fn execute_do_block_top_level<'a>(
                                 .contains(&c.to_ascii_lowercase())
                     });
                     if matches {
+                        // v7.37.20 (20.16) — GET STACKED DIAGNOSTICS
+                        // groundwork: expose the caught exception's
+                        // message as the `sqlerrm` local variable so
+                        // the handler body (and any `GET STACKED
+                        // DIAGNOSTICS var := SQLERRM` follow-up)
+                        // can read it. `sqlstate` gets a placeholder
+                        // 'P0001' — SPG's unspecified user-defined
+                        // error code (matches PG's default for
+                        // RAISE EXCEPTION without ERRCODE) until a
+                        // v7.40 error-code table lands.
+                        locals.insert(
+                            "sqlerrm".into(),
+                            Value::text(message.clone()),
+                        );
+                        locals.insert(
+                            "sqlstate".into(),
+                            Value::text(alloc::string::String::from("P0001")),
+                        );
                         // Run the handler body; ignore its outcome
                         // (an exception handler that itself raises
                         // propagates as the new error).
