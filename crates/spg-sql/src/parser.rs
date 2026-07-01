@@ -7412,6 +7412,19 @@ impl Parser {
         // Caller consumed CREATE (and the optional UNIQUE); we're on INDEX.
         debug_assert!(matches!(self.peek(), Token::Index));
         self.advance();
+        // v7.37.17 (17.6 partial) — CONCURRENTLY noise word (PG 8.2+).
+        // SPG's CREATE INDEX is synchronous end-to-end today (real
+        // CONCURRENTLY variant with restartable scans queues with
+        // v7.39 indexes epic), so the modifier has no runtime effect
+        // — same accept-and-no-op shape as v7.37.16.5 DETACH
+        // PARTITION CONCURRENTLY and v7.37.19.8 REFRESH MATERIALIZED
+        // VIEW CONCURRENTLY.
+        if matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("concurrently")
+        ) {
+            self.advance();
+        }
         let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident_like()?;
         if !matches!(self.peek(), Token::On) {
