@@ -1213,6 +1213,65 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Statement::Empty)
             }
+            // v7.37.17 (17.6 sibling) — VACUUM [(OPTION [, ...])]
+            // [FULL] [FREEZE] [VERBOSE] [ANALYZE] [<table> [(cols)]].
+            // SPG has no MVCC bloat today (Phase D visibility map
+            // queues with v7.38); the freezer collapses hot-tier
+            // rows into cold segments automatically. VACUUM is a
+            // no-op — pg_dump maintenance scripts and Discourse's
+            // periodic-maintenance path both emit it.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("vacuum") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
+            // v7.37.17 (17.6 sibling) — CLUSTER [VERBOSE] <table>
+            // [USING <index>] / CLUSTER (VERBOSE) <table> USING
+            // <index>. PG stores rows in physical order matching
+            // an index; SPG's hot-tier is append-only + cold-tier
+            // is segment-frozen, so clustering has no persistent
+            // effect. Accept-and-no-op for pg_dump compat.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("cluster") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
+            // v7.37.17 (17.6 sibling) — LISTEN / NOTIFY / UNLISTEN.
+            // PG's async notification channels. SPG has no LISTEN/
+            // NOTIFY delivery machinery yet; accept the syntax so
+            // pg_dump / migration scripts that reference channels
+            // don't fail at parse. Notifications get dropped on
+            // the floor at execute time (Statement::Empty).
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("listen")
+                    || s.eq_ignore_ascii_case("notify")
+                    || s.eq_ignore_ascii_case("unlisten") =>
+            {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
+            // v7.37.17 (17.6 sibling) — LOCK [TABLE] [ONLY] <table>
+            // [IN <mode> MODE] [NOWAIT]. SPG's engine holds a
+            // process-wide write lock today; explicit LOCK has no
+            // effect. Accept-and-no-op for pg_dump / migration
+            // compat.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lock") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
+            // v7.37.17 (17.6 sibling) — CHECKPOINT. Forces a WAL
+            // durability marker + snapshot in PG. SPG has WAL
+            // checkpointing on a byte / time schedule (v7.37.10
+            // 60s / 4 MiB defaults); explicit CHECKPOINT is a
+            // no-op today (an internal `SPG_FORCE_CHECKPOINT`
+            // path could tie into this on future customer demand).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("checkpoint") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
                 self.advance();
                 self.parse_delete_after_keyword()
