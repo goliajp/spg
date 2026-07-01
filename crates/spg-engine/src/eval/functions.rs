@@ -5532,6 +5532,51 @@ fn apply_function_dispatch(
             Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
         "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        // v7.37.17 (17.6 siblings) — json_extract_path(json,
+        // VARIADIC path...) + _text variants. Function form of the
+        // #> / #>> operators. Delegates to the same path_walk used
+        // by the operators, converting the variadic tail into the
+        // '{a,b}' text-array form path_walk expects.
+        "json_extract_path"
+        | "jsonb_extract_path"
+        | "json_extract_path_text"
+        | "jsonb_extract_path_text" => {
+            if args.len() < 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() takes at least 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut path = alloc::string::String::from("{");
+            for (i, step) in args[1..].iter().enumerate() {
+                if i > 0 {
+                    path.push(',');
+                }
+                match step {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(s) => path.push_str(s),
+                    Value::Int(n) => path.push_str(&alloc::format!("{n}")),
+                    Value::BigInt(n) => path.push_str(&alloc::format!("{n}")),
+                    Value::SmallInt(n) => path.push_str(&alloc::format!("{n}")),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): path elements must be text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            }
+            path.push('}');
+            let as_text = name.ends_with("_text");
+            crate::json::path_walk(&args[0], &Value::text(path), as_text)
+        }
         // v7.37.17 (17.6 siblings) — json_object(text[]) /
         // jsonb_object(text[]) build an object from a flat array
         // of alternating key/value pairs. 2-array form
