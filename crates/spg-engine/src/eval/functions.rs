@@ -4906,6 +4906,78 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(f64_exp(y * f64_ln(x))))
         }
+        // v7.37.17 (17.6 siblings) — div(y, x) — integer quotient
+        // (truncated division). PG's div works on numeric; SPG
+        // dispatches int/bigint/float.
+        "div" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("div() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Int(a), Value::Int(b)) => {
+                    if *b == 0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "div(): division by zero".into(),
+                        });
+                    }
+                    Ok(Value::Int(a.wrapping_div(*b)))
+                }
+                (Value::BigInt(a), Value::BigInt(b)) => {
+                    if *b == 0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "div(): division by zero".into(),
+                        });
+                    }
+                    Ok(Value::BigInt(a.wrapping_div(*b)))
+                }
+                (a, b) => {
+                    // Widen mixed numeric to f64, truncate.
+                    let x = value_to_f64(a).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "div() needs numeric args".into(),
+                    })?;
+                    let y = value_to_f64(b).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "div() needs numeric args".into(),
+                    })?;
+                    if y == 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "div(): division by zero".into(),
+                        });
+                    }
+                    Ok(Value::BigInt((x / y) as i64))
+                }
+            }
+        }
+        // v7.37.17 (17.6 siblings) — PG 17+ erf(x) / erfc(x) — the
+        // Gauss error function + complement, via libm.
+        "erf" | "erfc" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let x = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let r = if name == "erf" { libm::erf(x) } else { libm::erfc(x) };
+            Ok(Value::Float(r))
+        }
         "mod" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
