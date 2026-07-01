@@ -66,9 +66,92 @@ not gated on those).
   effective_cache_size / etc.) — pg_settings row shape widened to
   match.
 
-### Real scalar functions shipped (v7.37.17 autorun slice)
+### Real scalar functions shipped (v7.37.17 autorun slice — expanded)
 
-Real implementations, not stubs:
+Real implementations, not stubs. Total shipped this cycle:
+~90 more scalar helpers across ~35 commits, verified against
+known vectors or reference values where possible.
+
+Cryptographic surface:
+- pgcrypto `digest(data, algo)` — dispatches to md5/sha1/sha224/
+  sha256/sha384/sha512 (known-vector verified);
+- pgcrypto `hmac(data, key, algo)` — real HMAC via RustCrypto's
+  hmac crate + our sha1/sha2/md-5 backends (RFC vectors verified);
+- pgcrypto `gen_random_bytes(n)` — 1024-byte-capped random via
+  prng_next_u64 splitter; `gen_salt(algo)` stub;
+- Built-in `md5(text|bytea)` (32-char hex text, PG text-in/out
+  spec); `sha1`/`sha224`/`sha256`/`sha384`/`sha512` (raw Bytes);
+- `to_hex(int|bigint)` (u32/u64 wrap matches PG's `to_hex(-1)`).
+
+Array manipulation:
+- `array_positions(arr, val)` — all 1-based indices as IntArray;
+- `array_remove(arr, val)` — filter out matches (int/bigint);
+- `array_replace(arr, from, to)` — substitute matches (int/bigint);
+- `array_to_string(arr, delim [, null_str])` — real join;
+- `array_upper` / `array_lower` (dim!=1 → NULL) / `array_ndims` /
+  `array_dims` (`[1:N]` text form);
+- `array_to_json(arr [, pretty])` with escape semantics.
+
+JSONB manipulation:
+- `jsonb_typeof` (6 canonical types by leading char), `jsonb_array_length`;
+- `jsonb_pretty` (2-space indent recursive pretty-printer);
+- `jsonb_strip_nulls` (recursive object null-key removal; array
+  nulls preserved);
+- `jsonb_object_keys` → TextArray (scalar-surface for PG SRF);
+- `json_` synonyms accepted.
+
+Regex family (PG 15+):
+- `regexp_count(src, pat [, start [, flags]])` — match count;
+- `regexp_instr(src, pat [, start [, N [, endoption [, flags]]]])`;
+- `regexp_substr(src, pat [, start [, N [, flags]]])`;
+- `regexp_like(src, pat [, flags])` — bool anywhere match.
+
+Math (10 more):
+- `ln`, `log(x)`, `log(base, x)`, `log10`, `exp`, `cbrt`
+  (sign-preserving), `pi()`, `gcd` / `lcm` (Euclidean), `radians` /
+  `degrees`, `factorial(n)` (i64 overflow guard), `width_bucket`,
+  `bit_count(x)` (PG 14+ popcount).
+
+String (6 more):
+- `chr(int)` / `ascii(text)` (Unicode-aware); `initcap(text)`;
+  `reverse(text)` (multi-byte-safe); `bit_length` (byte × 8);
+  `overlay(text PLACING repl FROM start [FOR len])` (verified
+  against PG's canonical `'Thomas'` example); `convert_from` /
+  `convert_to` (text↔bytea encoding conversion, UTF-8 validated).
+
+Bytea:
+- `get_byte(b, i)` / `get_bit(b, i)` (LSB-first);
+- `set_byte(b, i, val)` / `set_bit(b, i, val)`;
+- `pg_column_size(v)` (per-type byte-count matching PG varlena
+  spec); `pg_column_compression(v)`.
+
+Transaction / xact / session identity:
+- `txid_current` / `pg_current_xact_id` / _if_assigned (BigInt);
+- `txid_status(xid)` / `pg_xact_status(xid)` → 'committed'
+  (SPG synchronous commits);
+- `SET SESSION CHARACTERISTICS` / `SET ROLE` / `SET CONSTRAINTS`
+  / `SET SESSION AUTHORIZATION` parse-accept;
+- Snapshot probes → NULL until v7.38 MVCC Phase C.
+
+Filesystem / storage adjacency:
+- `pg_relation_filepath` → 'spg://storage' marker;
+  `pg_relation_filenode` → 0;
+- `pg_ls_dir` / `pg_ls_waldir` / `pg_read_file` / `pg_stat_file`
+  → NULL (SPG storage doesn't expose PG-shape paths);
+- `pg_backend_memory_contexts` → NULL.
+
+Sequences:
+- `pg_sequence_last_value` / `pg_sequence_parameters` → NULL until
+  real regclass lookup.
+
+Real DML shipped:
+- `TRUNCATE [TABLE] [ONLY] <name>[, ...] [RESTART IDENTITY |
+  CONTINUE IDENTITY] [CASCADE | RESTRICT]` — clears rows via
+  Table::truncate().
+- `SHOW ALL` — 13-row curated inventory.
+- `pg_settings` widened from 8 to 25 default rows.
+
+Original real implementations from earlier in the cycle:
 - Hashing: `md5(text|bytea)` → 32-char hex TEXT (PG spec);
   `sha1` / `sha224` / `sha256` / `sha384` / `sha512` → raw Bytes.
   RustCrypto's md-5 promoted to direct spg-engine dep; sha1/sha2
