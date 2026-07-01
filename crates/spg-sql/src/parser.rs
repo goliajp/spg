@@ -1410,6 +1410,19 @@ impl Parser {
                     }
                     return Ok(Statement::Empty);
                 }
+                // v7.37.17 (17.6 sibling) — PG `SET CONSTRAINTS
+                // { ALL | <name>[, ...] } { DEFERRED | IMMEDIATE }`.
+                // pg_dump emits this to control the deferrability of
+                // FK / UNIQUE constraints across a bulk restore. SPG
+                // has no deferrable-constraint machinery today; the
+                // FK checker is strict-immediate. Accept-and-no-op
+                // for pg_dump round-trip compatibility.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraints"))
+                {
+                    self.advance(); // CONSTRAINTS
+                    self.consume_until_statement_boundary();
+                    return Ok(Statement::Empty);
+                }
                 // v7.16.2 — PG `SET [SESSION] AUTHORIZATION
                 // { DEFAULT | '<role>' | <ident> }` (mailrs
                 // round-10 A.1). pg_dump preamble emits the
