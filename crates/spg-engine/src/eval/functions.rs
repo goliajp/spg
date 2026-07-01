@@ -3377,6 +3377,42 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — enum introspection stubs.
+        // Real semantics thread with the enum type system in
+        // v7.40. Callers get parse-through NULL so ORM
+        // introspection queries don't crash.
+        "enum_first" | "enum_last" | "enum_range" | "enum_range_between" => {
+            Ok(Value::Null)
+        }
+        // v7.37.17 (17.6 siblings) — object identifier text
+        // conversion. `to_regclass_text` and `regclass_to_text`
+        // both accept an OID or regclass and return the text form.
+        // SPG uses table names as regclass keys, so the round-trip
+        // is trivial when input is TEXT.
+        "regclass_to_text" | "regnamespace_to_text" | "regrole_to_text"
+        | "regtype_to_text" | "regoper_to_text" | "regoperator_to_text"
+        | "regproc_to_text" | "regprocedure_to_text" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "regclass_to_text() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::text(s.to_string())),
+                Value::Int(n) => Ok(Value::text(alloc::format!("{n}"))),
+                Value::BigInt(n) => Ok(Value::text(alloc::format!("{n}"))),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "regclass_to_text(): needs text or int, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — XML surface stubs. Real XML
         // support (xmlparse/xmlelement/xmlserialize/xpath) threads
         // with the xml2/xml crate epic; scalar surface accept-then-
