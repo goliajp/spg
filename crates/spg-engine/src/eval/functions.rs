@@ -3062,6 +3062,69 @@ fn apply_function_dispatch(
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.37.17 (17.6 siblings) — fuzzystrmatch extension:
+        // levenshtein(a, b [, ins_cost, del_cost, sub_cost])
+        // returns edit distance between two texts. Common ORM
+        // fuzzy-match idiom + PG regression suite uses this.
+        "levenshtein" | "levenshtein_less_equal" => {
+            if args.len() < 2 || args.len() > 5 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "levenshtein() takes 2-5 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let a = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "levenshtein(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let b = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "levenshtein(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Costs default to 1 each (PG's implicit values).
+            let a_chars: alloc::vec::Vec<char> = a.chars().collect();
+            let b_chars: alloc::vec::Vec<char> = b.chars().collect();
+            let m = a_chars.len();
+            let n = b_chars.len();
+            // 1-D rolling DP row — O(min(m, n)) memory.
+            let (short, long_) = if m <= n {
+                (&a_chars, &b_chars)
+            } else {
+                (&b_chars, &a_chars)
+            };
+            let mut prev: alloc::vec::Vec<i32> =
+                (0..=short.len() as i32).collect();
+            for j in 1..=long_.len() {
+                let mut curr: alloc::vec::Vec<i32> = alloc::vec![0; short.len() + 1];
+                curr[0] = j as i32;
+                for i in 1..=short.len() {
+                    let cost = if short[i - 1] == long_[j - 1] { 0 } else { 1 };
+                    curr[i] = (curr[i - 1] + 1)
+                        .min(prev[i] + 1)
+                        .min(prev[i - 1] + cost);
+                }
+                prev = curr;
+            }
+            Ok(Value::Int(prev[short.len()]))
+        }
         // v7.37.17 (17.6 siblings) — PG's `pg_size_bytes(text)`
         // parses a human-readable size string ("2MB", "1.5 GB",
         // "512 kB") into a BigInt byte count. Inverse of
