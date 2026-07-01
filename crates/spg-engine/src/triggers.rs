@@ -871,14 +871,51 @@ pub fn execute_do_block_top_level<'a>(
     // ignore the return target (RETURN inside DO is a no-op
     // by PG semantics: the block's outer scope has no return
     // contract).
-    let _ = execute_stmts(
+    //
+    // v7.37.20 (20.10) — EXCEPTION handlers wrap the body walk.
+    // A TriggerError::RaiseException that matches an
+    // `EXCEPTION WHEN ...` arm redirects to that arm's body
+    // and swallows the error. `OTHERS` matches everything;
+    // named conditions must match the RAISE'd message prefix
+    // (SPG's simple substring model until a v7.40 error-code
+    // table lands).
+    let body_result = execute_stmts(
         &block.statements,
         &mut current_new,
         None,
         &mut locals,
         &ctx,
         &mut deferred,
-    )?;
+    );
+    if let Err(err) = body_result {
+        if !block.exception_handlers.is_empty() {
+            if let TriggerError::RaiseException { message, .. } = &err {
+                for handler in &block.exception_handlers {
+                    let matches = handler.conditions.iter().any(|c| {
+                        c.eq_ignore_ascii_case("others")
+                            || message
+                                .to_ascii_lowercase()
+                                .contains(&c.to_ascii_lowercase())
+                    });
+                    if matches {
+                        // Run the handler body; ignore its outcome
+                        // (an exception handler that itself raises
+                        // propagates as the new error).
+                        let _ = execute_stmts(
+                            &handler.body,
+                            &mut current_new,
+                            None,
+                            &mut locals,
+                            &ctx,
+                            &mut deferred,
+                        )?;
+                        return Ok(deferred.into_iter().map(|d| d.stmt).collect());
+                    }
+                }
+            }
+        }
+        return Err(err);
+    }
     Ok(deferred.into_iter().map(|d| d.stmt).collect())
 }
 

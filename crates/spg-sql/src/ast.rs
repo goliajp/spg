@@ -969,6 +969,25 @@ pub struct PlPgSqlBlock {
     /// earlier-declared locals in its init expression.
     pub declarations: Vec<PlPgSqlDeclare>,
     pub statements: Vec<PlPgSqlStmt>,
+    /// v7.37.20 (20.10) — `EXCEPTION WHEN <cond> [OR <cond>...] THEN
+    /// <body>` handlers appended to the block. Empty when no
+    /// EXCEPTION clause is present. When a body statement raises
+    /// (via RAISE EXCEPTION, ASSERT falsy, or a runtime error),
+    /// handlers are tried in order; the first matching condition
+    /// runs its body and the block terminates cleanly. `OTHERS`
+    /// matches any exception. Unhandled exceptions propagate.
+    pub exception_handlers: Vec<ExceptionHandler>,
+}
+
+/// v7.37.20 (20.10) — one `WHEN <cond> [OR <cond>...] THEN <body>`
+/// arm inside an EXCEPTION block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptionHandler {
+    /// Condition names (`OTHERS`, `unique_violation`, etc.). Multiple
+    /// conditions joined by `OR` share one handler body.
+    pub conditions: Vec<String>,
+    /// Statements to run when a matching exception is caught.
+    pub body: Vec<PlPgSqlStmt>,
 }
 
 /// v7.12.6 — single `DECLARE` entry: variable name + declared
