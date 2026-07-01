@@ -6082,6 +6082,33 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_wal / pg_stat_get_io
+        // aggregate probes (PG 14+ / 16+). Both are SETOF probes;
+        // scalar-surface NULL.
+        "pg_stat_get_wal"
+        | "pg_stat_get_io"
+        | "pg_stat_get_activity_start_time"
+        | "pg_stat_get_backend_query_start"
+        | "pg_stat_get_backend_leader_pid"
+        | "pg_stat_get_backend_pid_by_activity_start" => Ok(Value::Null),
+        // pg_get_backend_memory_contexts / pg_backend_memory_contexts
+        // covered separately as _memory_contexts.
+        //
+        // v7.37.17 (17.6 siblings) — pg_stat_get_recovery_prefetch:
+        // recovery-prefetch tuning stats (PG 15+).
+        "pg_stat_get_recovery_prefetch"
+        | "pg_stat_get_recovery_prefetch_reset_time" => Ok(Value::BigInt(0)),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_checkpointer_*:
+        // separate checkpointer stats view (PG 17+).
+        "pg_stat_get_checkpointer_num_timed"
+        | "pg_stat_get_checkpointer_num_requested"
+        | "pg_stat_get_checkpointer_restartpoints_timed"
+        | "pg_stat_get_checkpointer_restartpoints_requested"
+        | "pg_stat_get_checkpointer_restartpoints_performed"
+        | "pg_stat_get_checkpointer_write_time"
+        | "pg_stat_get_checkpointer_sync_time"
+        | "pg_stat_get_checkpointer_buffers_written"
+        | "pg_stat_get_checkpointer_stat_reset_time" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — pg_stat_get_function_* family.
         // Per-function invocation stats for track_function_calls
         // observability. Real per-function tracking threads with
