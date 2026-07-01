@@ -577,6 +577,45 @@ impl Engine {
             //    pg_settings (which lists every recognised name).
             Statement::ShowParameter(name) => {
                 use spg_storage::{ColumnSchema, DataType, Row, Value};
+                // v7.37.17 (17.6 sibling) — `SHOW ALL` returns a
+                // (name, setting, description) triple for every
+                // parameter SPG knows about. PG's shape is the same.
+                // Emitting a fixed curated inventory here keeps the
+                // client shape stable without wire-tapping every
+                // per-session parameter.
+                if name.eq_ignore_ascii_case("all") {
+                    let params: &[(&str, &str, &str)] = &[
+                        ("server_version", "16.0 (spg)", "Reports the server version."),
+                        ("server_encoding", "UTF8", "Sets the server's encoding."),
+                        ("client_encoding", "UTF8", "Sets the client's encoding."),
+                        ("is_superuser", "on", "Reports superuser status."),
+                        ("TimeZone", "UTC", "Sets the time zone for displaying and interpreting timestamps."),
+                        ("DateStyle", "ISO, MDY", "Sets the display format for date/time values."),
+                        ("IntervalStyle", "postgres", "Sets the display format for interval values."),
+                        ("search_path", "\"$user\", public", "Sets the schema search order."),
+                        ("standard_conforming_strings", "on", "Causes '...' strings to treat backslashes literally."),
+                        ("statement_timeout", "0", "Sets the maximum allowed duration of any statement."),
+                        ("application_name", "", "Sets the application name for status displays."),
+                        ("transaction_isolation", self.current_isolation_level.as_pg_str(), "Sets the current transaction's isolation level."),
+                        ("default_transaction_isolation", "read committed", "Sets the transaction isolation level of each new transaction."),
+                    ];
+                    let cols = alloc::vec![
+                        ColumnSchema::new("name", DataType::Text, false),
+                        ColumnSchema::new("setting", DataType::Text, false),
+                        ColumnSchema::new("description", DataType::Text, false),
+                    ];
+                    let rows: Vec<Row> = params
+                        .iter()
+                        .map(|(n, v, d)| {
+                            Row::new(alloc::vec![
+                                Value::text(alloc::string::String::from(*n)),
+                                Value::text(alloc::string::String::from(*v)),
+                                Value::text(alloc::string::String::from(*d)),
+                            ])
+                        })
+                        .collect();
+                    return Ok(QueryResult::Rows { columns: cols, rows });
+                }
                 let owned;
                 let value: &str = match name.as_str() {
                     "transaction_isolation" => self.current_isolation_level.as_pg_str(),
