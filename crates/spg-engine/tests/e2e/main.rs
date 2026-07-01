@@ -107,6 +107,7 @@ mod e2e_array_to_string;
 mod e2e_pgcrypto_digest;
 mod e2e_pgcrypto_hmac;
 mod e2e_pgcrypto_random;
+mod e2e_array_shuffle_sample;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

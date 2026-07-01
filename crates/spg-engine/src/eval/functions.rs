@@ -2215,6 +2215,133 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — PG 16+ array_shuffle(arr)
+        // returns a randomly-permuted copy. Fisher-Yates using the
+        // internal prng_next_u64 splitter.
+        "array_shuffle" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_shuffle() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::IntArray(items) => {
+                    let mut out: alloc::vec::Vec<Option<i32>> = items.clone();
+                    let n = out.len();
+                    for i in (1..n).rev() {
+                        let j = (super::math::prng_next_u64() as usize)
+                            % (i + 1);
+                        out.swap(i, j);
+                    }
+                    Ok(Value::IntArray(out))
+                }
+                Value::BigIntArray(items) => {
+                    let mut out: alloc::vec::Vec<Option<i64>> = items.clone();
+                    let n = out.len();
+                    for i in (1..n).rev() {
+                        let j = (super::math::prng_next_u64() as usize)
+                            % (i + 1);
+                        out.swap(i, j);
+                    }
+                    Ok(Value::BigIntArray(out))
+                }
+                Value::TextArray(items) => {
+                    let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
+                        items.clone();
+                    let n = out.len();
+                    for i in (1..n).rev() {
+                        let j = (super::math::prng_next_u64() as usize)
+                            % (i + 1);
+                        out.swap(i, j);
+                    }
+                    Ok(Value::TextArray(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_shuffle() needs array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — PG 16+ array_sample(arr, n)
+        // returns a random subset of n items from arr (partial
+        // Fisher-Yates — pick n distinct indices).
+        "array_sample" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_sample() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let n = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_sample(): n must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n < 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_sample(): {n} is negative"
+                    ),
+                });
+            }
+            let n = n as usize;
+            match &args[0] {
+                Value::IntArray(items) => {
+                    let take = n.min(items.len());
+                    let mut src: alloc::vec::Vec<Option<i32>> = items.clone();
+                    let src_n = src.len();
+                    for i in 0..take {
+                        let j = i + (super::math::prng_next_u64() as usize)
+                            % (src_n - i);
+                        src.swap(i, j);
+                    }
+                    Ok(Value::IntArray(src[..take].to_vec()))
+                }
+                Value::BigIntArray(items) => {
+                    let take = n.min(items.len());
+                    let mut src: alloc::vec::Vec<Option<i64>> = items.clone();
+                    let src_n = src.len();
+                    for i in 0..take {
+                        let j = i + (super::math::prng_next_u64() as usize)
+                            % (src_n - i);
+                        src.swap(i, j);
+                    }
+                    Ok(Value::BigIntArray(src[..take].to_vec()))
+                }
+                Value::TextArray(items) => {
+                    let take = n.min(items.len());
+                    let mut src: alloc::vec::Vec<Option<alloc::string::String>> =
+                        items.clone();
+                    let src_n = src.len();
+                    for i in 0..take {
+                        let j = i + (super::math::prng_next_u64() as usize)
+                            % (src_n - i);
+                        src.swap(i, j);
+                    }
+                    Ok(Value::TextArray(src[..take].to_vec()))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_sample() needs array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — array_remove(arr, val) returns
         // the array with every occurrence of val removed. NULL
         // passthrough on NULL array. NULL needle removes NULL items.
