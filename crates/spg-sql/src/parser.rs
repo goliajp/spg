@@ -96,6 +96,18 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // extended-query flow.
             | "prepare"
             | "execute"
+            // v7.37.17 (17.6 sibling) — LOAD '<library>'. pg_dump
+            // + extension scripts use LOAD to preload shared
+            // libraries. SPG doesn't have a shared-library extension
+            // point today (extensions ship as first-class crates
+            // linked at build time); accept as a no-op.
+            | "load"
+            // v7.37.17 (17.6 sibling) — CALL <procedure>(<args>).
+            // PG 11+ procedure call syntax. SPG's stored-procedure
+            // surface is v7.40 PL/pgSQL epic; accept as a no-op so
+            // migrations that reference stored procs don't stall at
+            // parse.
+            | "call"
     )
 }
 
