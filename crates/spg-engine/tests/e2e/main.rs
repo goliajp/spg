@@ -139,6 +139,7 @@ mod e2e_stat_repl_subscription;
 mod e2e_xml_probes;
 mod e2e_enum_and_reg_to_text;
 mod e2e_date_add_subtract;
+mod e2e_pg_hash_ops;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

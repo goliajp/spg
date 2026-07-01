@@ -3457,6 +3457,109 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — PG's internal hash operator
+        // support functions. These map a value to a 32-bit hash
+        // used by hash indexes + hash join. Use Rust's DefaultHasher
+        // for a deterministic-per-run answer.
+        "hashint4" | "hashint2" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hashint4() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => {
+                    // Inline stable u32 avalanche mix (splitmix-style).
+                    let mut state = *n as u32;
+                    state = state.wrapping_add(0x9e37_79b1);
+                    state = state.wrapping_mul(0x517c_c1b7);
+                    state ^= state >> 16;
+                    Ok(Value::Int(state as i32))
+                }
+                Value::SmallInt(n) => Ok(Value::Int((*n as i32).wrapping_mul(0x9e37_79b1u32 as i32))),
+                Value::BigInt(n) => Ok(Value::Int(*n as i32)),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "hashint4() needs integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "hashint8" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hashint8() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::BigInt(n) => {
+                    // XOR-fold 64-bit into 32-bit for PG hash-index compat.
+                    let hi = (*n >> 32) as i32;
+                    let lo = *n as i32;
+                    Ok(Value::Int(hi ^ lo))
+                }
+                Value::Int(n) => Ok(Value::Int(*n)),
+                Value::SmallInt(n) => Ok(Value::Int(*n as i32)),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "hashint8() needs integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "hashtext" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hashtext() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    // FNV-1a 32-bit — stable, no dep on stdlib RNG.
+                    let mut h: u32 = 0x811c_9dc5;
+                    for b in s.as_bytes() {
+                        h ^= *b as u32;
+                        h = h.wrapping_mul(0x0100_0193);
+                    }
+                    Ok(Value::Int(h as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "hashtext() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "hashbytea" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hashbytea() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Bytes(b) => {
+                    let mut h: u32 = 0x811c_9dc5;
+                    for byte in b.iter() {
+                        h ^= *byte as u32;
+                        h = h.wrapping_mul(0x0100_0193);
+                    }
+                    Ok(Value::Int(h as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "hashbytea() needs bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — enum introspection stubs.
         // Real semantics thread with the enum type system in
         // v7.40. Callers get parse-through NULL so ORM
