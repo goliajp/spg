@@ -6082,6 +6082,25 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_stat_get_all_indexes /
+        // _all_sequences family. Aggregate per-relation stats used
+        // by monitoring exporters — return 0 counter.
+        "pg_stat_get_last_scan"
+        | "pg_stat_get_last_idx_scan"
+        | "pg_stat_get_lastscan"
+        | "pg_stat_get_lastidxscan" => Ok(Value::Null),
+        // pg_stat_get_backend_userid variant (with real userid arg).
+        // Already covered above; keep alt spelling.
+        "pg_stat_get_backend_role" => Ok(Value::Null),
+        // pg_stat_get_seq_scan_pos / _tid_scan — pg 17+ new counters
+        // for scan-position tracking.
+        "pg_stat_get_seq_scan_pos" | "pg_stat_get_tid_scan_pos" => {
+            Ok(Value::BigInt(0))
+        }
+        // pg_stat_get_seq_tup_read / _idx_tup_fetch — tuple accessors
+        // for per-table stat views.
+        "pg_stat_get_seq_tup_read" | "pg_stat_get_idx_tup_fetch" | "pg_stat_get_idx_tup_read"
+        | "pg_stat_get_idx_scan" | "pg_stat_get_seq_scan" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — pg_stat_get_wal / pg_stat_get_io
         // aggregate probes (PG 14+ / 16+). Both are SETOF probes;
         // scalar-surface NULL.
