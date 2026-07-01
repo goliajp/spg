@@ -51,6 +51,19 @@ pub(super) fn prng_next_u64() -> u64 {
     }
 }
 
+/// v7.37.17 (17.6 siblings) — Reseed the PRNG. PG's setseed(f)
+/// accepts a value in [-1, 1] and uses it as the seed source.
+/// We map that range into 64 bits deterministically.
+pub(super) fn prng_seed(seed: f64) {
+    use core::sync::atomic::Ordering;
+    // Map [-1, 1] → u64. Use the raw f64 bit pattern so any
+    // value in the range produces a distinct state. Force
+    // non-zero so the xorshift doesn't get stuck.
+    let bits = seed.to_bits();
+    let state = if bits == 0 { 0x2545_F491_4F6C_DD1D } else { bits };
+    PRNG_STATE.store(state, Ordering::Relaxed);
+}
+
 /// Advance the PRNG and return a uniform double in [0, 1).
 pub(super) fn prng_next_f64() -> f64 {
     // 53 bits of randomness mapped to [0, 1).
