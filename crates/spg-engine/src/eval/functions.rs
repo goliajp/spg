@@ -1505,6 +1505,81 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — pgcrypto gen_random_bytes(n)
+        // returns n cryptographically-random bytes. SPG uses the
+        // internal prng_next_u64() splitter (same underlying
+        // pool used by random() and gen_random_uuid()) which is
+        // seeded from wall-clock on Engine construction and is
+        // fine for auth-token style usage. Real system-entropy
+        // hardening queues with the crypto epic.
+        "gen_random_bytes" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "gen_random_bytes() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let n = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "gen_random_bytes(): needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n < 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "gen_random_bytes(): {n} is negative"
+                    ),
+                });
+            }
+            // PG's gen_random_bytes caps at 1024 bytes. Match that.
+            if n > 1024 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "gen_random_bytes(): {n} exceeds cap of 1024 bytes"
+                    ),
+                });
+            }
+            let n = n as usize;
+            let mut buf = alloc::vec::Vec::with_capacity(n);
+            while buf.len() < n {
+                let word = super::math::prng_next_u64();
+                for b in word.to_le_bytes() {
+                    if buf.len() < n {
+                        buf.push(b);
+                    }
+                }
+            }
+            Ok(Value::Bytes(buf.into()))
+        }
+        // pgcrypto gen_salt(algo [, iter]) returns a random salt
+        // for the crypt() function. SPG doesn't yet ship crypt()
+        // (bcrypt/blowfish support queues with the crypto epic);
+        // return a stub-shape 22-char text so ORMs that call it
+        // don't error at parse time.
+        "gen_salt" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "gen_salt() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::text::<String>(
+                "spg_gen_salt_stub_22chr".into(),
+            ))
+        }
         // v7.37.17 (17.6 siblings) — pgcrypto hmac(data, key, algo)
         // returns keyed-hash MAC. Uses RustCrypto's `hmac` crate
         // with the sha1/sha2 backends already in the dep graph.
