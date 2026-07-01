@@ -1613,6 +1613,36 @@ fn apply_function_dispatch(
             };
             Ok(Value::Bytes(out.into()))
         }
+        // v7.37.17 (17.6 siblings) — PG 14+ bit_count(x) counts
+        // the 1-bits (popcount) in a bytea or integer input.
+        "bit_count" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("bit_count() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(n) => Ok(Value::BigInt(
+                    (*n as i16).count_ones() as i64
+                )),
+                Value::Int(n) => Ok(Value::BigInt(n.count_ones() as i64)),
+                Value::BigInt(n) => Ok(Value::BigInt(n.count_ones() as i64)),
+                Value::Bytes(b) => {
+                    let mut c: i64 = 0;
+                    for byte in b.iter() {
+                        c += byte.count_ones() as i64;
+                    }
+                    Ok(Value::BigInt(c))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "bit_count() needs integer or bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — SQL:2003 BIT_LENGTH(x) is
         // OCTET_LENGTH(x) * 8. Uses the same input-type accepting
         // rules — TEXT (UTF-8 bytes) or BYTEA.
