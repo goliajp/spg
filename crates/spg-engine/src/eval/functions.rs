@@ -640,6 +640,21 @@ fn apply_function_dispatch(
             out.push_str(closer);
             Ok(Value::json(out))
         }
+        // v7.37.17 (17.6 siblings) — snapshot export / import
+        // family. SPG doesn't yet ship a snapshot text serializer
+        // (queues with v7.38 MVCC Phase C); return NULL / true so
+        // callers can defensively probe.
+        "pg_export_snapshot" | "pg_snapshot" => Ok(Value::Null),
+        // pg_import_snapshot / pg_import_serialized_snapshot don't
+        // return anything meaningful in scalar form.
+        "pg_import_snapshot" | "pg_import_serialized_snapshot" => Ok(Value::Null),
+        // pg_visible_in_snapshot(xid, snapshot) — visibility probe
+        // used by pg_visibility. Under SPG's synchronous commit +
+        // no MVCC-yet model, any tx we know about is visible.
+        "pg_visible_in_snapshot" => Ok(Value::Bool(true)),
+        // pg_last_xid — returns the last committed xid. Similar
+        // shape to txid_current; use next_tx_id.
+        "pg_last_xid" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — WAL utility probes. SPG uses
         // seq_no not PG-style LSN; return NULL until seq_no ↔ LSN
         // mapping ships with the replication-protocol RFC.
