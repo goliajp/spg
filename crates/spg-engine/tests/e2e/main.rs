@@ -150,6 +150,7 @@ mod e2e_backend_control_probes;
 mod e2e_trig;
 mod e2e_replay_control_probes;
 mod e2e_pg_lock_status;
+mod e2e_function_and_slru_stats;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
