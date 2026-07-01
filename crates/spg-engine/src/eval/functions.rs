@@ -6082,6 +6082,16 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_lock_status / pg_locks
+        // sibling probes. Return NULL until real lock tracking
+        // threads with v7.38 MVCC.
+        "pg_lock_status" => Ok(Value::Null),
+        // pg_stat_get_progress_command emits the command name for
+        // an in-progress background operation. NULL when idle.
+        "pg_stat_get_progress_command"
+        | "pg_stat_get_progress_relid"
+        | "pg_stat_get_progress_datid"
+        | "pg_stat_get_progress_pid" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — recovery-control probes.
         // Streaming-replica orchestration tools (patroni, repmgr)
         // emit these.
