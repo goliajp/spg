@@ -572,6 +572,47 @@ fn apply_function_dispatch(
         "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
             Ok(Value::Null)
         }
+        // v7.37.17 (17.6 siblings) — jsonb_object_keys returns the
+        // top-level keys of a jsonb object. PG has this as a SRF
+        // (set-returning function) — SPG's scalar surface returns
+        // TextArray. Errors on non-object input (matches PG). Empty
+        // object → empty array.
+        "jsonb_object_keys" | "json_object_keys" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => {
+                    let parsed =
+                        crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
+                            detail: format!("{name}(): JSON parse failed: {e}"),
+                        })?;
+                    match parsed {
+                        crate::json::JsonValue::Object(members) => {
+                            let keys: alloc::vec::Vec<Option<alloc::string::String>> = members
+                                .into_iter()
+                                .map(|(k, _)| Some(k))
+                                .collect();
+                            Ok(Value::TextArray(keys))
+                        }
+                        _ => Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "{name}(): expected JSON object, got other JSON type"
+                            ),
+                        }),
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() needs jsonb, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — jsonb_strip_nulls(jsonb)
         // removes null-valued keys from object members (recurses
         // into nested objects + arrays). Array items are preserved
