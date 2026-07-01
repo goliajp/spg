@@ -2763,6 +2763,118 @@ fn apply_function_dispatch(
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
+        // v7.37.17 (17.6 siblings) — convert_from / convert_to
+        // handle text ↔ bytea encoding conversion. SPG stores text
+        // as UTF-8 always so both simply reinterpret the bytes.
+        //
+        //   convert_from(bytea, 'UTF8') → text
+        //   convert_to(text, 'UTF8')    → bytea
+        //
+        // Any encoding name other than 'UTF8' / 'SQL_ASCII' errors;
+        // real transcoding queues with the collation/encoding epic.
+        "convert_from" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "convert_from() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let b = match &args[0] {
+                Value::Bytes(b) => b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert_from(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let enc = match &args[1] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert_from(): encoding must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let enc_up = enc.to_ascii_uppercase();
+            if enc_up != "UTF8"
+                && enc_up != "UTF-8"
+                && enc_up != "SQL_ASCII"
+                && enc_up != "LATIN1"
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1"
+                    ),
+                });
+            }
+            let s = match core::str::from_utf8(b) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert_from(): input is not valid UTF-8: {e}"
+                        ),
+                    });
+                }
+            };
+            Ok(Value::text(alloc::string::String::from(s)))
+        }
+        "convert_to" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("convert_to() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert_to(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let enc = match &args[1] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert_to(): encoding must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let enc_up = enc.to_ascii_uppercase();
+            if enc_up != "UTF8"
+                && enc_up != "UTF-8"
+                && enc_up != "SQL_ASCII"
+                && enc_up != "LATIN1"
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1"
+                    ),
+                });
+            }
+            Ok(Value::Bytes(s.into_bytes().into()))
+        }
         "error_on_null" => error_on_null(args),
         // v7.12.1 — PG full-text search lexer / tsquery builders.
         // mailrs G-CRIT-3 acceptance path: `to_tsvector('english',
