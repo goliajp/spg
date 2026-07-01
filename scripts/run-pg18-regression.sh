@@ -46,11 +46,15 @@ SKIP_PATTERNS=(
   "gist.sql"                   # 17.2 GiST AM not shipped yet
   "spgist.sql"                 # 17.3 SPGiST AM not shipped yet
   "stats_ext.sql"              # 23.7 CREATE STATISTICS parse-and-ignore + 24.15 empty view
-  "matview.sql"                # 19.6-8 CREATE/REFRESH MATERIALIZED VIEW not shipped
-  "groupingsets.sql"           # 19.1-3 GROUPING SETS / ROLLUP / CUBE not shipped
-  "json_table.sql"             # 19.4 JSON_TABLE syntax not shipped
-  "xml.sql"                    # XML scalar shipped; XMLTABLE syntax (19.5) not
-  "plpgsql.sql"                # 20.x PL/pgSQL subset; full surface queues for v7.37.20
+  "matview.sql"                # 19.7-8 CREATE/REFRESH MATERIALIZED VIEW shipped;
+                               # regression exercises schema catalog columns SPG doesn't yet ship
+  "groupingsets.sql"           # 19.1-3 GROUPING SETS / ROLLUP / CUBE queued for v7.39
+  "json_table.sql"             # 19.4 JSON_TABLE syntax queued for v7.39
+  "xml.sql"                    # XML scalar shipped; XMLTABLE syntax (19.5) queued for v7.39
+  "plpgsql.sql"                # Substantial 20.x surface shipped (LOOP/WHILE/FOR/EXCEPTION/
+                               # PERFORM/EXECUTE/ASSERT/DECLARE-infer/%TYPE/FOUND/etc.);
+                               # regression tests use RECORD types + cursors + RETURN NEXT
+                               # accumulator which queue for v7.40
   "rowsecurity.sql"            # ALTER TABLE RLS arms accept-and-no-op; enforcement = v7.41
   "rules.sql"                  # PG RULE system is a deprecated surface; SPG triggers cover
   "inherit.sql"                # ALTER TABLE INHERIT accept-and-no-op; declarative partitions cover
