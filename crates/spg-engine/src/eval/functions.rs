@@ -231,6 +231,109 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — chr(int) / ascii(text) /
+        // initcap(text). PG-standard string builders.
+        "chr" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("chr() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => {
+                    let code = u32::try_from(*n).map_err(|_| EvalError::TypeMismatch {
+                        detail: alloc::format!("chr(): {n} out of range"),
+                    })?;
+                    let ch = char::from_u32(code).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("chr(): {code} is not a valid Unicode code point"),
+                    })?;
+                    let mut s = alloc::string::String::new();
+                    s.push(ch);
+                    Ok(Value::text(s))
+                }
+                Value::BigInt(n) => {
+                    let code = u32::try_from(*n).map_err(|_| EvalError::TypeMismatch {
+                        detail: alloc::format!("chr(): {n} out of range"),
+                    })?;
+                    let ch = char::from_u32(code).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("chr(): {code} is not a valid Unicode code point"),
+                    })?;
+                    let mut s = alloc::string::String::new();
+                    s.push(ch);
+                    Ok(Value::text(s))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "chr() needs integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "ascii" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("ascii() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let ch = s.chars().next().ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "ascii(): empty string has no first character".into(),
+                    })?;
+                    Ok(Value::Int(ch as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ascii() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "initcap" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("initcap() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    // PG semantics: capitalize first char of every
+                    // word, lowercase the rest. Word boundary = any
+                    // non-alphanumeric transition.
+                    let mut out = alloc::string::String::with_capacity(s.len());
+                    let mut at_word_start = true;
+                    for ch in s.chars() {
+                        if ch.is_alphanumeric() {
+                            if at_word_start {
+                                for c in ch.to_uppercase() {
+                                    out.push(c);
+                                }
+                                at_word_start = false;
+                            } else {
+                                for c in ch.to_lowercase() {
+                                    out.push(c);
+                                }
+                            }
+                        } else {
+                            out.push(ch);
+                            at_word_start = true;
+                        }
+                    }
+                    Ok(Value::text(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "initcap() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG math functions.
         //
         // ln(x)     — natural log
