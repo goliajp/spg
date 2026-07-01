@@ -2997,8 +2997,11 @@ fn apply_function_dispatch(
         "regexp_matches" => regexp_matches(args),
         "regexp_replace" => regexp_replace(args),
         "regexp_split_to_array" => regexp_split_to_array(args),
-        // v7.37.17 (17.6 siblings) — PG 15+ regexp_count.
+        // v7.37.17 (17.6 siblings) — PG 15+ regexp family.
         "regexp_count" => super::regexp::regexp_count(args),
+        "regexp_instr" => super::regexp::regexp_instr(args),
+        "regexp_substr" => super::regexp::regexp_substr(args),
+        "regexp_like" => super::regexp::regexp_like(args),
         // v7.17.0 Phase 3.P0-28 — PG JSON builder family.
         // to_json / to_jsonb coerce any value to JSON text (NULL
         // becomes the JSON literal 'null', not SQL NULL).

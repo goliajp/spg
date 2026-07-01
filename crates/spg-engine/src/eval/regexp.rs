@@ -535,6 +535,192 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
     Ok(Value::TextArray(out))
 }
 
+/// v7.37.17 (17.6 siblings) — PG 15+ `regexp_instr(source, pattern
+/// [, start [, N [, endoption [, flags]]]])` returns the 1-based
+/// index of the start (or end, if `endoption=1`) of the Nth match.
+/// Returns 0 if no match.
+pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 || args.len() > 6 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regexp_instr() takes 2-6 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    fn int_arg(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
+        match v {
+            Value::Null => Ok(None),
+            Value::SmallInt(n) => Ok(Some(i64::from(*n))),
+            Value::Int(n) => Ok(Some(i64::from(*n))),
+            Value::BigInt(n) => Ok(Some(*n)),
+            _ => Err(EvalError::TypeMismatch {
+                detail: "regexp_instr(): integer arg required".into(),
+            }),
+        }
+    }
+    let start_1based = if args.len() >= 3 {
+        match int_arg(&args[2])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        1
+    };
+    let nth = if args.len() >= 4 {
+        match int_arg(&args[3])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        1
+    };
+    let endoption = if args.len() >= 5 {
+        match int_arg(&args[4])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        0
+    };
+    if start_1based < 1 || nth < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: "regexp_instr(): start and N must be >= 1".into(),
+        });
+    }
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut from = (start_1based - 1) as usize;
+    let mut hits = 0i64;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                hits += 1;
+                if hits == nth {
+                    let idx = if endoption == 1 { e_pos } else { s_pos };
+                    return Ok(Value::Int((idx + 1) as i32));
+                }
+                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                from = step;
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Value::Int(0))
+}
+
+/// v7.37.17 (17.6 siblings) — PG 15+ `regexp_substr(source, pattern
+/// [, start [, N [, flags]]])` returns the Nth match as TEXT.
+/// Returns NULL if no match.
+pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 || args.len() > 5 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regexp_substr() takes 2-5 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    fn int_arg(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
+        match v {
+            Value::Null => Ok(None),
+            Value::SmallInt(n) => Ok(Some(i64::from(*n))),
+            Value::Int(n) => Ok(Some(i64::from(*n))),
+            Value::BigInt(n) => Ok(Some(*n)),
+            _ => Err(EvalError::TypeMismatch {
+                detail: "regexp_substr(): integer arg required".into(),
+            }),
+        }
+    }
+    let start_1based = if args.len() >= 3 {
+        match int_arg(&args[2])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        1
+    };
+    let nth = if args.len() >= 4 {
+        match int_arg(&args[3])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        1
+    };
+    if start_1based < 1 || nth < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: "regexp_substr(): start and N must be >= 1".into(),
+        });
+    }
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut from = (start_1based - 1) as usize;
+    let mut hits = 0i64;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                hits += 1;
+                if hits == nth {
+                    let substr: String = chars[s_pos..e_pos].iter().collect();
+                    return Ok(Value::text(substr));
+                }
+                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                from = step;
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Value::Null)
+}
+
+/// v7.37.17 (17.6 siblings) — PG 15+ `regexp_like(source, pattern
+/// [, flags])` returns TRUE if the pattern matches anywhere in
+/// source; FALSE otherwise.
+pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regexp_like() takes 2 or 3 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    Ok(Value::Bool(re_find(&node, &chars, 0).is_some()))
+}
+
 /// v7.37.17 (17.6 siblings) — PG 15+ `regexp_count(source, pattern)`
 /// returns the number of matches. Optional third arg for start
 /// position (1-based); optional fourth for flags (currently
