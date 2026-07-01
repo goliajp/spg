@@ -1202,6 +1202,17 @@ impl Parser {
                 self.advance();
                 self.parse_update_after_keyword()
             }
+            // v7.37.17 (17.6 sibling) — REINDEX [(OPTION [, ...])]
+            // [CONCURRENTLY] { INDEX | TABLE | SCHEMA | DATABASE |
+            // SYSTEM } [IF EXISTS] <name>. SPG rebuilds indexes as
+            // rows change so the index tree is always up-to-date;
+            // REINDEX is a strict no-op. Accept the whole statement
+            // shape to boundary for pg_dump round-trip compatibility.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("reindex") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Statement::Empty)
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
                 self.advance();
                 self.parse_delete_after_keyword()
