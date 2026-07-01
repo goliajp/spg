@@ -231,6 +231,33 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — pg_relation_filepath /
+        // pg_relation_filenode probes used by monitoring exporters.
+        // SPG uses a segment-id + tier scheme, not PG's on-disk
+        // filepath — the returned value is a virtual "spg://<name>"
+        // marker so exporters can display something (real filepath
+        // would leak the segment store to callers, which is not
+        // meaningful outside the engine).
+        "pg_relation_filepath" => Ok(Value::text::<String>("spg://storage".into())),
+        "pg_relation_filenode" => Ok(Value::BigInt(0)),
+        // v7.37.17 (17.6 siblings) — pg_get_backend_memory_contexts()
+        // / pg_backend_memory_contexts() — return NULL (no memory
+        // context tree exposed today). Monitoring queries typically
+        // fall back gracefully.
+        "pg_get_backend_memory_contexts" | "pg_backend_memory_contexts" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_ls_dir / pg_ls_waldir /
+        // pg_read_file / pg_read_binary_file — filesystem probes.
+        // SPG doesn't expose the underlying store as PG-shaped paths;
+        // return NULL. Admin tools that call these get a NULL back
+        // instead of an "unknown function" error.
+        "pg_ls_dir"
+        | "pg_ls_waldir"
+        | "pg_ls_logdir"
+        | "pg_ls_tmpdir"
+        | "pg_ls_archive_statusdir"
+        | "pg_read_file"
+        | "pg_read_binary_file"
+        | "pg_stat_file" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — chr(int) / ascii(text) /
         // initcap(text). PG-standard string builders.
         "chr" => {

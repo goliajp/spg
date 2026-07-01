@@ -85,6 +85,7 @@ mod e2e_to_hex;
 mod e2e_math_funcs;
 mod e2e_chr_ascii_initcap;
 mod e2e_reverse;
+mod e2e_pg_filesystem_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
