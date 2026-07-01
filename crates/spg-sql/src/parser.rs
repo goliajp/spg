@@ -1428,6 +1428,20 @@ impl Parser {
                     }
                     return Ok(Statement::Empty);
                 }
+                // v7.37.17 (17.6 sibling) — PG `SET SESSION
+                // CHARACTERISTICS AS TRANSACTION <mode>` (per PG
+                // ISO SQL surface). pg_dump prepends this to fix
+                // the isolation level for the restore session. SPG
+                // defaults to READ COMMITTED and doesn't yet honor
+                // session-set isolation across statements — accept
+                // and no-op. SET (LOCAL/SESSION) TRANSACTION AS ...
+                // per-tx form is handled elsewhere.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("characteristics"))
+                {
+                    self.advance(); // CHARACTERISTICS
+                    self.consume_until_statement_boundary();
+                    return Ok(Statement::Empty);
+                }
                 // v7.37.17 (17.6 sibling) — PG `SET CONSTRAINTS
                 // { ALL | <name>[, ...] } { DEFERRED | IMMEDIATE }`.
                 // pg_dump emits this to control the deferrability of
