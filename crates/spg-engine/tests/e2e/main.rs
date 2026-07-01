@@ -121,6 +121,7 @@ mod e2e_pg_backend_start_time;
 mod e2e_pg_wal_lsn;
 mod e2e_similar_to_escape;
 mod e2e_pg_get_serial_sequence;
+mod e2e_more_privilege_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
