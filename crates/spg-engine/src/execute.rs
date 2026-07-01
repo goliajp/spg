@@ -646,6 +646,47 @@ impl Engine {
                         .session_param("IntervalStyle")
                         .or_else(|| self.session_param("intervalstyle"))
                         .unwrap_or("postgres"),
+                    // v7.37.17 (17.6 siblings) — PG defaults for
+                    // parameters SPG doesn't yet honor at the engine
+                    // level. Drivers probe these with SHOW right
+                    // after a matching SET to verify the SET worked;
+                    // reporting the PG default keeps drivers happy
+                    // without having to plumb every param into
+                    // engine state.
+                    "lock_timeout" => self.session_param("lock_timeout").unwrap_or("0"),
+                    "idle_in_transaction_session_timeout" => self
+                        .session_param("idle_in_transaction_session_timeout")
+                        .unwrap_or("0"),
+                    "transaction_timeout" => self
+                        .session_param("transaction_timeout")
+                        .unwrap_or("0"),
+                    "client_min_messages" => self
+                        .session_param("client_min_messages")
+                        .unwrap_or("notice"),
+                    "default_tablespace" => self
+                        .session_param("default_tablespace")
+                        .unwrap_or(""),
+                    "default_table_access_method" => self
+                        .session_param("default_table_access_method")
+                        .unwrap_or("heap"),
+                    "row_security" => self.session_param("row_security").unwrap_or("on"),
+                    "check_function_bodies" => self
+                        .session_param("check_function_bodies")
+                        .unwrap_or("on"),
+                    "xmloption" => self.session_param("xmloption").unwrap_or("content"),
+                    "work_mem" => self.session_param("work_mem").unwrap_or("4MB"),
+                    "maintenance_work_mem" => self
+                        .session_param("maintenance_work_mem")
+                        .unwrap_or("64MB"),
+                    "max_connections" => {
+                        self.session_param("max_connections").unwrap_or("100")
+                    }
+                    "shared_buffers" => {
+                        self.session_param("shared_buffers").unwrap_or("128MB")
+                    }
+                    "effective_cache_size" => self
+                        .session_param("effective_cache_size")
+                        .unwrap_or("4GB"),
                     other => {
                         // Fall through to session_params for any user-set
                         // override that didn't fall into a named bucket.
