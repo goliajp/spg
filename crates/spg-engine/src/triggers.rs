@@ -635,6 +635,72 @@ fn execute_stmts(
                     return Ok(BodyOutcome::Break);
                 }
             }
+            PlPgSqlStmt::ForExecute {
+                var,
+                sql_expr,
+                body,
+            } => {
+                // v7.37.20 (20.6) — FOR <var> IN EXECUTE <expr> LOOP.
+                // Evaluate the expression at runtime to obtain a SQL
+                // string, parse it, run through the for_query_resolver,
+                // iterate rows same way ForQuery does.
+                let resolver = ctx.for_query_resolver.ok_or_else(|| {
+                    TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "FOR <var> IN EXECUTE <expr> LOOP: only supported inside DO blocks"
+                        ),
+                    }
+                })?;
+                let v = eval_with_new_old_and_locals(
+                    sql_expr,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let sql_text = match v {
+                    spg_storage::Value::Text(s) => s.into_owned(),
+                    other => {
+                        return Err(TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::format!(
+                                "FOR IN EXECUTE: expression must evaluate to TEXT, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                let stmt = spg_sql::parser::parse_statement(&sql_text).map_err(|e| {
+                    TriggerError::UnparseableBody {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "FOR IN EXECUTE {sql_text:?}: parse failed: {}",
+                            e.message
+                        ),
+                    }
+                })?;
+                let rows = resolver(&stmt)?;
+                for row_values in rows {
+                    let first_cell = row_values
+                        .into_iter()
+                        .next()
+                        .unwrap_or(spg_storage::Value::Null);
+                    locals.insert(var.clone(), first_cell);
+                    match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
+                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
+                        BodyOutcome::Break => break,
+                        early => return Ok(early),
+                    }
+                }
+            }
             PlPgSqlStmt::ForQuery { var, query, body } => {
                 // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
                 // Runs the SELECT once via the DO block's registered

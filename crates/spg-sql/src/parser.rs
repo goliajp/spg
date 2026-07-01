@@ -3180,6 +3180,78 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_if();
         }
+        // v7.37.20 (20.6) — FOR <var> IN EXECUTE <string_expr> LOOP.
+        // Detected by peeking that token pos+3 is Ident("execute").
+        if matches!(self.peek(), Token::For)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::In))
+            && matches!(
+                self.tokens.get(self.pos + 3),
+                Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("execute")
+            )
+        {
+            self.advance(); // FOR
+            let var = self.expect_ident_like()?;
+            self.advance(); // IN
+            self.advance(); // EXECUTE
+            // Prescan for LOOP at paren depth 0 so parse_expr stops
+            // before the LOOP keyword (same trick as the bare-SELECT
+            // ForQuery arm).
+            let mut depth: i32 = 0;
+            let mut loop_pos: Option<usize> = None;
+            let mut scan = self.pos;
+            while scan < self.tokens.len() {
+                match self.tokens.get(scan) {
+                    Some(Token::LParen) => depth += 1,
+                    Some(Token::RParen) => depth -= 1,
+                    Some(Token::Ident(s) | Token::QuotedIdent(s))
+                        if depth == 0 && s.eq_ignore_ascii_case("loop") =>
+                    {
+                        loop_pos = Some(scan);
+                        break;
+                    }
+                    _ => {}
+                }
+                scan += 1;
+            }
+            let loop_pos = loop_pos.ok_or_else(|| {
+                self.err(alloc::format!(
+                    "FOR <var> IN EXECUTE <expr> ... LOOP: no LOOP keyword found"
+                ))
+            })?;
+            let saved_loop = self.tokens[loop_pos].clone();
+            self.tokens[loop_pos] = Token::Semicolon;
+            let expr_result = self.parse_expr(0);
+            self.tokens[loop_pos] = saved_loop;
+            let sql_expr = expr_result?;
+            let loop_kw = self.expect_ident_like()?;
+            if !loop_kw.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected LOOP after FOR <var> IN EXECUTE <expr>, got {loop_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            let end_kw = self.expect_ident_like()?;
+            if !end_kw.eq_ignore_ascii_case("end") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR IN EXECUTE body, got {end_kw:?}"
+                )));
+            }
+            let loop_kw2 = self.expect_ident_like()?;
+            if !loop_kw2.eq_ignore_ascii_case("loop") {
+                return Err(self.err(alloc::format!(
+                    "expected END LOOP after FOR IN EXECUTE body, got END {loop_kw2:?}"
+                )));
+            }
+            return Ok(PlPgSqlStmt::ForExecute {
+                var,
+                sql_expr,
+                body,
+            });
+        }
         // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
         //
         // Two syntactic forms:
