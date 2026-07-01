@@ -4477,6 +4477,140 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.37.17 (17.6 siblings) — trig family via libm. Real
+        // sin/cos/tan/asin/acos/atan/atan2/sinh/cosh/tanh + arch
+        // hyperbolic variants. All accept f64; NULL passthrough.
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let x: f64 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let r = match name {
+                "sin" => libm::sin(x),
+                "cos" => libm::cos(x),
+                "tan" => libm::tan(x),
+                "asin" => libm::asin(x),
+                "acos" => libm::acos(x),
+                "atan" => libm::atan(x),
+                "sinh" => libm::sinh(x),
+                "cosh" => libm::cosh(x),
+                "tanh" => libm::tanh(x),
+                "asinh" => libm::asinh(x),
+                "acosh" => libm::acosh(x),
+                "atanh" => libm::atanh(x),
+                _ => unreachable!(),
+            };
+            Ok(Value::Float(r))
+        }
+        // atan2(y, x) takes 2 args.
+        "atan2" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("atan2() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
+                match v {
+                    Value::Float(f) => Ok(*f),
+                    Value::Int(n) => Ok(f64::from(*n)),
+                    Value::SmallInt(n) => Ok(f64::from(*n)),
+                    Value::BigInt(n) => Ok(*n as f64),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "atan2(): needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let y = as_f64(&args[0])?;
+            let x = as_f64(&args[1])?;
+            Ok(Value::Float(libm::atan2(y, x)))
+        }
+        // sind/cosd/tand/asind/acosd/atand — PG's degree-input trig
+        // variants (multiply/divide by π/180).
+        "sind" | "cosd" | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" => {
+            const D2R: f64 = core::f64::consts::PI / 180.0;
+            const R2D: f64 = 180.0 / core::f64::consts::PI;
+            if name == "atan2d" {
+                if args.len() != 2 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("atan2d() takes 2 args, got {}", args.len()),
+                    });
+                }
+                if args.iter().any(|v| matches!(v, Value::Null)) {
+                    return Ok(Value::Null);
+                }
+                fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
+                    match v {
+                        Value::Float(f) => Ok(*f),
+                        Value::Int(n) => Ok(f64::from(*n)),
+                        Value::SmallInt(n) => Ok(f64::from(*n)),
+                        Value::BigInt(n) => Ok(*n as f64),
+                        other => Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "atan2d(): needs numeric, got {:?}",
+                                other.data_type()
+                            ),
+                        }),
+                    }
+                }
+                let y = as_f64(&args[0])?;
+                let x = as_f64(&args[1])?;
+                return Ok(Value::Float(libm::atan2(y, x) * R2D));
+            }
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let x: f64 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let r = match name {
+                "sind" => libm::sin(x * D2R),
+                "cosd" => libm::cos(x * D2R),
+                "tand" => libm::tan(x * D2R),
+                "cotd" => 1.0 / libm::tan(x * D2R),
+                "asind" => libm::asin(x) * R2D,
+                "acosd" => libm::acos(x) * R2D,
+                "atand" => libm::atan(x) * R2D,
+                _ => unreachable!(),
+            };
+            Ok(Value::Float(r))
+        }
         // v7.37.17 (17.6 siblings) — PG 14+ pg_wait_for_backend_termination
         // waits (up to timeout ms) for a specific backend to
         // terminate. SPG has no separate backends yet — the
