@@ -96,6 +96,11 @@ pub enum Token {
     Comma,
     Semicolon,
     Dot,
+    /// v7.37.20 (20.4) — `..` range operator, used by PL/pgSQL
+    /// `FOR i IN 1..10 LOOP` bounds. Emitted by the lexer as a
+    /// single token so parse_expr doesn't have to distinguish
+    /// range-`.` from struct-field-`.`.
+    DotDot,
     /// v7.17.0 Phase 2.6 — standalone `@` punctuation. Emitted when
     /// `@` is NOT followed by an ident-start byte (i.e. the
     /// `@VAR` / `@@VAR` SessionVar path doesn't match). Lets the
@@ -506,7 +511,19 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b']' => single(&mut out, Token::RBracket, &mut i),
             b',' => single(&mut out, Token::Comma, &mut i),
             b';' => single(&mut out, Token::Semicolon, &mut i),
-            b'.' => single(&mut out, Token::Dot, &mut i),
+            b'.' => {
+                // v7.37.20 (20.4) — `..` range operator for PL/pgSQL
+                // FOR LOOP bounds emits a single Token::DotDot so the
+                // range parser sees one atomic token instead of two
+                // consecutive Dots (which parse_expr couldn't reliably
+                // distinguish from struct-field access after an atom).
+                if peek_eq(bytes, i + 1, b'.') {
+                    out.push(Token::DotDot);
+                    i += 2;
+                } else {
+                    single(&mut out, Token::Dot, &mut i);
+                }
+            }
             b'=' => single(&mut out, Token::Eq, &mut i),
             b'<' => {
                 if peek_eq(bytes, i + 1, b'=') && peek_eq(bytes, i + 2, b'>') {
@@ -1216,7 +1233,13 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
-    if i < bytes.len() && bytes[i] == b'.' {
+    // v7.37.20 (20.4) — do NOT consume `.` when it's part of a `..`
+    // range operator; leave both dots for the top-level dispatcher
+    // which will emit a single Token::DotDot.
+    if i < bytes.len()
+        && bytes[i] == b'.'
+        && !(i + 1 < bytes.len() && bytes[i + 1] == b'.')
+    {
         is_float = true;
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
