@@ -104,6 +104,7 @@ mod e2e_array_positions;
 mod e2e_array_remove_replace;
 mod e2e_bit_count;
 mod e2e_array_to_string;
+mod e2e_pgcrypto_digest;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
