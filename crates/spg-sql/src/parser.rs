@@ -1861,6 +1861,15 @@ impl Parser {
                         | "statistics"
                         | "event"
                         | "foreign"
+                        // v7.37.17 (17.6 siblings) — additional CREATE
+                        // targets pg_dump / operator install scripts
+                        // may emit that SPG has no matching machinery
+                        // for. Consume + Empty-return.
+                        | "text"
+                        | "server"
+                        | "tablespace"
+                        | "access"
+                        | "large"
                 ) =>
             {
                 self.consume_until_statement_boundary();
