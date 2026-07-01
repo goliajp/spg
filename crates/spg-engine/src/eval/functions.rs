@@ -6147,6 +6147,88 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — PG 13+ numeric scale helpers.
+        //   scale(numeric)      — declared scale of the value
+        //   min_scale(numeric)  — minimum scale to represent exactly
+        //   trim_scale(numeric) — value with trailing zeroes removed
+        "scale" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("scale() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Numeric { scale, .. } => Ok(Value::Int(i32::from(*scale))),
+                Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_) => {
+                    Ok(Value::Int(0))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "scale() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "min_scale" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("min_scale() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Numeric { scaled, scale } => {
+                    // Strip trailing zeroes off the scaled integer to
+                    // find the minimal scale.
+                    let mut s = *scale as i32;
+                    let mut v = *scaled;
+                    while s > 0 && v % 10 == 0 {
+                        v /= 10;
+                        s -= 1;
+                    }
+                    Ok(Value::Int(s))
+                }
+                Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_) => {
+                    Ok(Value::Int(0))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "min_scale() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "trim_scale" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("trim_scale() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Numeric { scaled, scale } => {
+                    let mut s = *scale;
+                    let mut v = *scaled;
+                    while s > 0 && v % 10 == 0 {
+                        v /= 10;
+                        s -= 1;
+                    }
+                    Ok(Value::Numeric { scaled: v, scale: s })
+                }
+                v @ (Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)) => {
+                    Ok(v.clone().into_owned())
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "trim_scale() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG 9.6+ num_nulls / num_nonnulls
         // variadic helpers. Count NULL / non-NULL args. Common in
         // CHECK constraints validating "exactly one of these
