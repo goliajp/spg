@@ -1276,6 +1276,71 @@ impl Parser {
                 self.advance();
                 self.parse_update_after_keyword()
             }
+            // v7.37.17 (17.6 sibling) — TRUNCATE [TABLE] [ONLY]
+            // <name> [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+            // [CASCADE | RESTRICT]. Clears every row from each named
+            // table. Parses at the top level; the engine dispatcher
+            // walks Statement::Truncate.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("truncate") => {
+                self.advance();
+                // Optional TABLE noise word (PG accepts both).
+                if matches!(self.peek(), Token::Table) {
+                    self.advance();
+                } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table"))
+                {
+                    self.advance();
+                }
+                // Optional ONLY qualifier (skip partitions). SPG's
+                // declarative partitions are always truncated
+                // together, so it's an accepted no-op.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("only"))
+                {
+                    self.advance();
+                }
+                // Table names (comma-separated).
+                let mut tables = Vec::new();
+                loop {
+                    tables.push(self.expect_ident_like()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                // Optional RESTART IDENTITY / CONTINUE IDENTITY.
+                let mut restart_identity = false;
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("restart"))
+                {
+                    self.advance();
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("identity"))
+                    {
+                        self.advance();
+                        restart_identity = true;
+                    }
+                } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("continue"))
+                {
+                    self.advance();
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("identity"))
+                    {
+                        self.advance();
+                    }
+                }
+                // Optional CASCADE / RESTRICT.
+                let mut cascade = false;
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("cascade"))
+                {
+                    self.advance();
+                    cascade = true;
+                } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("restrict"))
+                {
+                    self.advance();
+                }
+                Ok(Statement::Truncate {
+                    tables,
+                    restart_identity,
+                    cascade,
+                })
+            }
             // v7.37.17 (17.6 sibling) — REINDEX [(OPTION [, ...])]
             // [CONCURRENTLY] { INDEX | TABLE | SCHEMA | DATABASE |
             // SYSTEM } [IF EXISTS] <name>. SPG rebuilds indexes as

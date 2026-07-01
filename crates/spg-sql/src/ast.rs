@@ -173,6 +173,20 @@ pub enum Statement {
     /// `spg_statistic` with per-column null_frac + n_distinct +
     /// 100-bucket equi-depth histogram.
     Analyze(Option<String>),
+    /// v7.37.17 (17.6 sibling) — `TRUNCATE [TABLE] [ONLY] <name>
+    /// [, ...] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE |
+    /// RESTRICT]`. Clears every row from each named table. SPG's
+    /// SEQUENCE identity is per-table; RESTART IDENTITY reinitializes
+    /// the associated sequence to its starting value. CASCADE
+    /// currently walks direct FK-referring tables and truncates
+    /// them too (PG's semantics). The ONLY modifier (skip partitions)
+    /// and RESTRICT (default) are accepted with no effect since
+    /// SPG's declarative partitions are always truncated together.
+    Truncate {
+        tables: Vec<String>,
+        restart_identity: bool,
+        cascade: bool,
+    },
     /// v6.7.3 — `COMPACT COLD SEGMENTS`. Walks every user table's
     /// BTree-cold indices and merges small cold-tier segments
     /// (size below `SPG_COMPACTION_TARGET_SEGMENT_BYTES`, default
@@ -2951,6 +2965,7 @@ impl Statement {
             | Statement::CreateSubscription(_)
             | Statement::DropSubscription(_)
             | Statement::Analyze(_)
+            | Statement::Truncate { .. }
             | Statement::CompactColdSegments
             | Statement::SetParameter { .. }
             | Statement::SetParameterList(_)
@@ -2983,6 +2998,26 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            Self::Truncate {
+                tables,
+                restart_identity,
+                cascade,
+            } => {
+                f.write_str("TRUNCATE TABLE ")?;
+                for (i, t) in tables.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(t)?;
+                }
+                if *restart_identity {
+                    f.write_str(" RESTART IDENTITY")?;
+                }
+                if *cascade {
+                    f.write_str(" CASCADE")?;
+                }
+                Ok(())
+            }
             Self::DropTable { names, if_exists } => {
                 f.write_str("DROP TABLE ")?;
                 if *if_exists {

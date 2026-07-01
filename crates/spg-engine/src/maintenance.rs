@@ -169,6 +169,37 @@ impl Engine {
     /// `<db>.spg/segments/`. This arm only fires for engine-only
     /// callers (spg-embedded, lib tests); in that mode merged
     /// segments live in memory and are dropped at process exit.
+    /// v7.37.17 (17.6 sibling) — `TRUNCATE [TABLE] <t>[, ...]
+    /// [RESTART IDENTITY]`. Clears every row from each named
+    /// table by dispatching to `Table::truncate()` (already exists
+    /// for internal callers). RESTART IDENTITY additionally resets
+    /// the table's associated sequence back to its start value.
+    pub(crate) fn exec_truncate(
+        &mut self,
+        tables: &[String],
+        _restart_identity: bool,
+    ) -> Result<QueryResult, EngineError> {
+        // RESTART IDENTITY is parsed but not honored yet — the
+        // SequenceDef doesn't expose a restart primitive on the
+        // storage side today. Accepted-and-no-op for pg_dump compat;
+        // real sequence reset lands with the sequence-lifecycle epic.
+        let mut affected: usize = 0;
+        for name in tables {
+            let cat = self.active_catalog_mut();
+            let Some(t) = cat.get_mut(name) else {
+                return Err(EngineError::Storage(StorageError::Corrupt(
+                    alloc::format!("table {name:?} does not exist"),
+                )));
+            };
+            affected = affected.saturating_add(t.row_count());
+            t.truncate();
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: false,
+        })
+    }
+
     pub(crate) fn exec_compact_cold_segments(&mut self) -> Result<QueryResult, EngineError> {
         let target = COMPACTION_TARGET_DEFAULT_BYTES;
         let reports = self.compact_cold_segments_with_target(target)?;

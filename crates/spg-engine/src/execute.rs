@@ -522,6 +522,17 @@ impl Engine {
             )),
             // v6.2.0 — ANALYZE recomputes per-column histograms.
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
+            // v7.37.17 (17.6 sibling) — TRUNCATE [TABLE] <t>[, ...]
+            // [RESTART IDENTITY] [CASCADE]. Clears every row from
+            // each named table. CASCADE currently accepts the syntax
+            // + records the flag; the FK-referring cascade walk lands
+            // when FK-cascade delete surface gets extended to
+            // multi-relation batching (v7.38).
+            Statement::Truncate {
+                tables,
+                restart_identity,
+                cascade: _,
+            } => self.exec_truncate(tables.as_slice(), restart_identity),
             // v6.7.3 — COMPACT COLD SEGMENTS.
             Statement::CompactColdSegments => self.exec_compact_cold_segments(),
             // v7.12.1 — SET / RESET session parameter. Engine
