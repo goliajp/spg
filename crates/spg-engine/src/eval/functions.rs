@@ -1505,6 +1505,90 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — pgcrypto digest(data, type)
+        // returns the hash of data using the named algorithm. This
+        // is PG's pgcrypto extension surface but many apps + ORMs
+        // use it via the built-in sha functions we already ship.
+        // Recognize the standard pgcrypto names.
+        "digest" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("digest() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let input: &[u8] = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "digest(): data must be text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let algo = match &args[1] {
+                Value::Text(s) => s.to_ascii_lowercase(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "digest(): type must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let out: alloc::vec::Vec<u8> = match algo.as_str() {
+                "md5" => {
+                    use md5::{Digest, Md5};
+                    let mut h = Md5::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha1" => {
+                    use sha1::{Digest, Sha1};
+                    let mut h = Sha1::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha224" => {
+                    use sha2::{Digest, Sha224};
+                    let mut h = Sha224::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha256" => {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha384" => {
+                    use sha2::{Digest, Sha384};
+                    let mut h = Sha384::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                "sha512" => {
+                    use sha2::{Digest, Sha512};
+                    let mut h = Sha512::new();
+                    h.update(input);
+                    h.finalize().to_vec()
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "digest(): unsupported algorithm {other:?}; use md5/sha1/sha224/sha256/sha384/sha512"
+                        ),
+                    });
+                }
+            };
+            Ok(Value::Bytes(out.into()))
+        }
         // v7.37.17 (17.6 siblings) — PG's built-in md5(text|bytea)
         // returns the 32-char lowercase hex digest text (matches
         // PG default), NOT the raw bytes like sha256 does. This is
@@ -3958,6 +4042,18 @@ fn apply_function_dispatch(
         // `lastval()` (no-arg session memory) still degrades to
         // NULL pending a Phase 1.1b session tracker.
         "lastval" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — pg_sequence_last_value(regclass)
+        // returns the sequence's most-recent value or NULL if not
+        // yet advanced. SPG's sequence surface doesn't yet expose
+        // this via regclass name → BigInt lookup; return NULL for
+        // parse-through (monitoring queries that emit this get a
+        // graceful NULL instead of "unknown function").
+        "pg_sequence_last_value" => Ok(Value::Null),
+        // pg_sequence_parameters(oid) returns a row with (start,
+        // minimum, maximum, increment, cycle, cache, data_type).
+        // Scalar surface returns NULL; the real row-shape is only
+        // useful through the pg_sequence catalog view.
+        "pg_sequence_parameters" => Ok(Value::Null),
         // v7.15.0 — pg_trgm: similarity, show_trgm. Match PG
         // semantics: similarity returns Jaccard of trigram sets;
         // show_trgm returns the trigram set as TEXT[]. NULL on
