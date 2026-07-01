@@ -310,6 +310,113 @@ fn apply_function_dispatch(
         | "pg_read_file"
         | "pg_read_binary_file"
         | "pg_stat_file" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — factorial(smallint | int | bigint)
+        // returns n! as BIGINT. Overflows at n=20 for i64 — errors
+        // beyond that. Negative n = error (matches PG).
+        "factorial" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("factorial() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let n = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "factorial() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n < 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("factorial(): {n} is negative"),
+                });
+            }
+            if n > 20 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("factorial({n}): result overflows BIGINT"),
+                });
+            }
+            let mut r: i64 = 1;
+            for k in 2..=n {
+                r = r.saturating_mul(k);
+            }
+            Ok(Value::BigInt(r))
+        }
+        // v7.37.17 (17.6 siblings) — width_bucket(operand, low,
+        // high, count) returns the bucket number that a value would
+        // fall in given a histogram of `count` equal-width buckets
+        // over [low, high]. Values < low return 0; values >= high
+        // return count+1 (matches PG semantics).
+        "width_bucket" => {
+            if args.len() != 4 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "width_bucket() takes 4 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let op = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "width_bucket(): operand must be numeric".into(),
+            })?;
+            let low = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "width_bucket(): low must be numeric".into(),
+            })?;
+            let high = value_to_f64(&args[2]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "width_bucket(): high must be numeric".into(),
+            })?;
+            let count = match &args[3] {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "width_bucket(): count must be integer".into(),
+                    });
+                }
+            };
+            if count <= 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "width_bucket(): count must be > 0".into(),
+                });
+            }
+            if low == high {
+                return Err(EvalError::TypeMismatch {
+                    detail: "width_bucket(): low must differ from high".into(),
+                });
+            }
+            // PG allows low > high by inverting the direction; we
+            // do the same via a simple compare-and-scale.
+            let (lo, hi, ascending) = if low < high {
+                (low, high, true)
+            } else {
+                (high, low, false)
+            };
+            if op < lo {
+                return Ok(Value::Int(if ascending { 0 } else { count as i32 + 1 }));
+            }
+            if op >= hi {
+                return Ok(Value::Int(if ascending { count as i32 + 1 } else { 0 }));
+            }
+            let frac = (op - lo) / (hi - lo);
+            let bucket = (frac * (count as f64)) as i64 + 1;
+            let bucket = if ascending {
+                bucket
+            } else {
+                count - bucket + 1
+            };
+            Ok(Value::Int(bucket as i32))
+        }
         // v7.37.17 (17.6 siblings) — chr(int) / ascii(text) /
         // initcap(text). PG-standard string builders.
         "chr" => {
