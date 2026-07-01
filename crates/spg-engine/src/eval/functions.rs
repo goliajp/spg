@@ -3494,6 +3494,79 @@ fn apply_function_dispatch(
         // of array_to_string. PG semantics: NULL text → NULL,
         // '' → empty array, NULL delim → one element per char.
         "string_to_array" => fn_string_to_array(args),
+        // v7.37.17 (17.6 siblings) — PG's built-in
+        // `array_to_string(arr, delimiter [, null_string])` joins
+        // array elements with delimiter; NULL elements are dropped
+        // unless null_string is given (then they're replaced).
+        "array_to_string" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_to_string() takes 2 or 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let delim = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_to_string(): delimiter must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let null_replacement = match args.get(2) {
+                None | Some(Value::Null) => None,
+                Some(Value::Text(s)) => Some(s.to_string()),
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_to_string(): null_string must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let pieces: alloc::vec::Vec<alloc::string::String> = match &args[0] {
+                Value::IntArray(items) => items
+                    .iter()
+                    .filter_map(|o| match o {
+                        Some(n) => Some(alloc::format!("{n}")),
+                        None => null_replacement.clone(),
+                    })
+                    .collect(),
+                Value::BigIntArray(items) => items
+                    .iter()
+                    .filter_map(|o| match o {
+                        Some(n) => Some(alloc::format!("{n}")),
+                        None => null_replacement.clone(),
+                    })
+                    .collect(),
+                Value::TextArray(items) => items
+                    .iter()
+                    .filter_map(|o| match o {
+                        Some(s) => Some(s.clone()),
+                        None => null_replacement.clone(),
+                    })
+                    .collect(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_to_string(): first arg must be array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            Ok(Value::text(pieces.join(&delim)))
+        }
         "plainto_tsquery" => fts_plainto_tsquery(args, ctx),
         "phraseto_tsquery" => fts_phraseto_tsquery(args, ctx),
         "websearch_to_tsquery" => fts_websearch_to_tsquery(args, ctx),
