@@ -231,6 +231,37 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — SQL:2003 BIT_LENGTH(x) is
+        // OCTET_LENGTH(x) * 8. Uses the same input-type accepting
+        // rules — TEXT (UTF-8 bytes) or BYTEA.
+        "bit_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("bit_length() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let bytes = s.len();
+                    let bits = bytes.saturating_mul(8);
+                    let n = i32::try_from(bits).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                Value::Bytes(b) => {
+                    let bytes = b.len();
+                    let bits = bytes.saturating_mul(8);
+                    let n = i32::try_from(bits).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "bit_length() needs text or bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.11.6 — `array_length(arr, dim)` returns the element
         // count of `arr` along dimension `dim`. v7.11 only models
         // single-dimension arrays so dim must be 1 (otherwise NULL,
