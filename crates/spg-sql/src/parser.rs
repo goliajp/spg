@@ -84,6 +84,18 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // Both operate on the role's owned objects; SPG has no
             // role-owner model, so accept-and-no-op.
             | "reassign"
+            // v7.37.17 (17.6 siblings) — PG's SQL-level prepared
+            // statement surface. PREPARE / EXECUTE / DEALLOCATE
+            // (already listed above) are runtime prepared-statement
+            // primitives; PG-JDBC + ORMs emit them in some paths.
+            // SPG's extended-query protocol handles per-connection
+            // named plans directly, but the SQL-level surface itself
+            // has no matching machinery. Accept-and-no-op so drivers
+            // that fall back to SQL PREPARE don't break — real
+            // execution of the target query still happens via the
+            // extended-query flow.
+            | "prepare"
+            | "execute"
     )
 }
 

@@ -69,6 +69,7 @@ mod e2e_drop_wider_pg_dump_compat;
 mod e2e_create_wider_pg_dump_compat;
 mod e2e_truncate;
 mod e2e_show_all;
+mod e2e_prepare_execute_pg_dump_compat;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
