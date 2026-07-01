@@ -2963,6 +2963,73 @@ fn apply_function_dispatch(
             Ok(Value::Null)
         }
         "date_trunc" => date_trunc(args),
+        // v7.37.17 (17.6 siblings) — PG 14+ date_bin(stride, ts, origin)
+        // "bins" ts to the nearest lower multiple of stride from
+        // origin. Real implementation: compute integer micros
+        // between ts and origin, divide by stride, multiply back,
+        // add to origin.
+        "date_bin" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("date_bin() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            // stride: Interval (months=0 or reject — PG rejects
+            // month-strides because months aren't a fixed length).
+            let stride_us: i64 = match &args[0] {
+                Value::Interval { months, days, micros } => {
+                    if *months != 0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "date_bin(): stride with months not supported".into(),
+                        });
+                    }
+                    const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+                    i64::from(*days) * DAY_US + micros
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "date_bin(): stride must be interval, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if stride_us <= 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "date_bin(): stride must be positive".into(),
+                });
+            }
+            let ts_us = match &args[1] {
+                Value::Timestamp(t) => *t,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "date_bin(): ts must be timestamp, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let origin_us = match &args[2] {
+                Value::Timestamp(t) => *t,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "date_bin(): origin must be timestamp, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let delta = ts_us - origin_us;
+            let bins = delta.div_euclid(stride_us);
+            let binned = origin_us + bins * stride_us;
+            Ok(Value::Timestamp(binned))
+        }
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
