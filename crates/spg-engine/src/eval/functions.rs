@@ -4447,7 +4447,31 @@ fn apply_function_dispatch(
         // pg_conf_load_time / pg_postmaster_start_time — return
         // process start time in the embedded case; wire-layer has
         // real timestamps.
-        "pg_conf_load_time" | "pg_postmaster_start_time" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — return a fixed 2020-01-01 UTC
+        // timestamp so monitoring exporters that emit these get a
+        // valid timestamp (real per-session/per-cluster start time
+        // threads with v7.38 wall-clock plumbing).
+        "pg_conf_load_time"
+        | "pg_postmaster_start_time"
+        | "pg_backend_start_time"
+        | "pg_stat_get_backend_start" => {
+            const ANCHOR_2020_UTC: i64 = 1_577_836_800_000_000;
+            Ok(Value::Timestamp(ANCHOR_2020_UTC))
+        }
+        // pg_stat_get_backend_activity/state/wait_event etc. —
+        // per-backend probes. Return NULL until v7.38 backend
+        // tracking.
+        "pg_stat_get_backend_activity_start"
+        | "pg_stat_get_backend_client_addr"
+        | "pg_stat_get_backend_client_port"
+        | "pg_stat_get_backend_dbid"
+        | "pg_stat_get_backend_pid"
+        | "pg_stat_get_backend_userid"
+        | "pg_stat_get_backend_wait_event"
+        | "pg_stat_get_backend_wait_event_type"
+        | "pg_stat_get_backend_xact_start"
+        | "pg_stat_get_backend_subxact"
+        | "pg_stat_get_backend_idset" => Ok(Value::Null),
         // pg_notify(channel, payload) — LISTEN/NOTIFY delivery.
         // SPG has no async notification channel yet; accept + return
         // void (NULL).
