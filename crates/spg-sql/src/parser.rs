@@ -1184,6 +1184,52 @@ impl Parser {
                         }
                         Ok(Statement::DropSequence { names, if_exists })
                     }
+                    // v7.37.17 (17.6 siblings) — DROP <target> for
+                    // targets SPG doesn't natively track. pg_dump
+                    // emits DROP EXTENSION / DROP TYPE / DROP DOMAIN
+                    // / DROP AGGREGATE / DROP OPERATOR / DROP CAST /
+                    // DROP COLLATION / DROP LANGUAGE / DROP CONVERSION
+                    // / DROP TEXT SEARCH / DROP FOREIGN * / DROP
+                    // SERVER / DROP MATERIALIZED VIEW / DROP EVENT
+                    // TRIGGER / DROP TABLESPACE / DROP RULE / DROP
+                    // POLICY / DROP LARGE OBJECT / DROP ROLE / DROP
+                    // ACCESS METHOD / DROP OPERATOR CLASS/FAMILY /
+                    // etc. — accept + Empty-return so pg_dump tails
+                    // load through. Materialized-view drop dispatches
+                    // to the existing DropTable path when the token
+                    // is Materialized-View-shaped (elsewhere in
+                    // this parser).
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "extension"
+                                | "type"
+                                | "domain"
+                                | "aggregate"
+                                | "operator"
+                                | "cast"
+                                | "collation"
+                                | "language"
+                                | "conversion"
+                                | "text"
+                                | "foreign"
+                                | "server"
+                                | "materialized"
+                                | "event"
+                                | "tablespace"
+                                | "rule"
+                                | "policy"
+                                | "large"
+                                | "role"
+                                | "access"
+                                | "statistics"
+                                | "procedure"
+                                | "routine"
+                        ) =>
+                    {
+                        self.consume_until_statement_boundary();
+                        Ok(Statement::Empty)
+                    }
                     other => Err(self.err(format!(
                         "expected TABLE / INDEX / SCHEMA / SEQUENCE / USER / PUBLICATION / \
                          SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
