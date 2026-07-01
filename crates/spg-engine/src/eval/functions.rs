@@ -6082,6 +6082,108 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — bytea bitwise ops. Not built
+        // into PG (bit strings have varbit ops) but common in
+        // custom crypto/token pipelines that emit bytea XOR for
+        // simple stream-cipher / mask ops.
+        "bytea_xor" | "byteaxor" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "bytea_xor() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Bytes(a), Value::Bytes(b)) => {
+                    if a.len() != b.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "bytea_xor(): length mismatch {} vs {}",
+                                a.len(),
+                                b.len()
+                            ),
+                        });
+                    }
+                    let out: alloc::vec::Vec<u8> = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| x ^ y)
+                        .collect();
+                    Ok(Value::Bytes(out.into()))
+                }
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "bytea_xor(): needs (bytea, bytea), got ({:?}, {:?})",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
+        // bytea_and / bytea_or — similar shape.
+        "bytea_and" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("bytea_and() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Bytes(a), Value::Bytes(b)) => {
+                    if a.len() != b.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "bytea_and(): length mismatch {} vs {}",
+                                a.len(),
+                                b.len()
+                            ),
+                        });
+                    }
+                    let out: alloc::vec::Vec<u8> = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| x & y)
+                        .collect();
+                    Ok(Value::Bytes(out.into()))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "bytea_and(): needs (bytea, bytea)".into(),
+                }),
+            }
+        }
+        "bytea_or" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("bytea_or() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Bytes(a), Value::Bytes(b)) => {
+                    if a.len() != b.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "bytea_or(): length mismatch {} vs {}",
+                                a.len(),
+                                b.len()
+                            ),
+                        });
+                    }
+                    let out: alloc::vec::Vec<u8> = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| x | y)
+                        .collect();
+                    Ok(Value::Bytes(out.into()))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "bytea_or(): needs (bytea, bytea)".into(),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — CRC32 / CRC32C (Castagnoli).
         // Not built into PG but common in dblink/foreign-data
         // migration scripts and audit-log query helpers. Real
