@@ -3033,6 +3033,51 @@ fn apply_function_dispatch(
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.37.17 (17.6 siblings) — PG's `to_timestamp(double)`
+        // converts a Unix epoch (seconds since 1970-01-01 UTC) to a
+        // `timestamp with time zone`. SPG uses micros-since-epoch
+        // internally, so this is just a scale-and-round.
+        "to_timestamp" => {
+            if args.len() != 1 {
+                // 2-arg form is `to_timestamp(text, fmt)` which is
+                // format-parsing — that's a separate epic.
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "to_timestamp() takes 1 arg (numeric epoch), got {}; the 2-arg text-format form isn't shipped yet",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Timestamp(
+                    i64::from(*n).saturating_mul(1_000_000),
+                )),
+                Value::BigInt(n) => Ok(Value::Timestamp(
+                    n.saturating_mul(1_000_000),
+                )),
+                Value::SmallInt(n) => Ok(Value::Timestamp(
+                    i64::from(*n).saturating_mul(1_000_000),
+                )),
+                Value::Float(f) => {
+                    let us = (*f * 1_000_000.0).round() as i64;
+                    Ok(Value::Timestamp(us))
+                }
+                Value::Numeric { scaled, scale } => {
+                    // scaled / 10^scale = seconds. Multiply by 1e6.
+                    let ten_pow = 10i128.pow(*scale as u32);
+                    let us_i128 = *scaled as i128 * 1_000_000 / ten_pow;
+                    let us = i64::try_from(us_i128).unwrap_or(i64::MAX);
+                    Ok(Value::Timestamp(us))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "to_timestamp(): needs numeric epoch, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.17.0 Phase 3.P0-29 — MySQL time aliases. WordPress,
         // Laravel, mysql-connector-python emit these constantly.
         // `unix_timestamp()` (bare) is folded by clock_replacement_for
