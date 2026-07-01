@@ -4537,7 +4537,65 @@ fn apply_function_dispatch(
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
         // pg_wal_lsn_diff — WAL byte-position arithmetic. Return 0
         // until real LSN types land.
-        "pg_wal_lsn_diff" => Ok(Value::BigInt(0)),
+        // v7.37.17 (17.6 siblings) — real pg_wal_lsn_diff(a, b)
+        // parses PG-format LSN strings ("hex/hex") and returns the
+        // byte-count difference (a - b). SPG's WAL uses seq_no
+        // internally, but ORM callers pass literal LSN text.
+        "pg_wal_lsn_diff" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_wal_lsn_diff() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            fn lsn_bytes(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
+                let s = match v {
+                    Value::Null => return Ok(None),
+                    Value::Text(s) => s.to_string(),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "pg_wal_lsn_diff(): args must be text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                let (hi, lo) = s.split_once('/').ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_wal_lsn_diff(): bad LSN {s:?}, expected 'hex/hex'"
+                        ),
+                    }
+                })?;
+                let hi_u32 = u32::from_str_radix(hi, 16).map_err(|_| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_wal_lsn_diff(): bad LSN high {hi:?}"
+                        ),
+                    }
+                })?;
+                let lo_u32 = u32::from_str_radix(lo, 16).map_err(|_| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_wal_lsn_diff(): bad LSN low {lo:?}"
+                        ),
+                    }
+                })?;
+                Ok(Some(((hi_u32 as i64) << 32) | lo_u32 as i64))
+            }
+            let a = match lsn_bytes(&args[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let b = match lsn_bytes(&args[1])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            Ok(Value::BigInt(a - b))
+        }
         "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
@@ -4601,11 +4659,17 @@ fn apply_function_dispatch(
         // pg_current_wal_insert_lsn — return NULL (SPG's WAL
         // uses seq_no instead of PG-style LSN bytes; the real
         // mapping queues with the replication-protocol RFC).
+        // v7.37.17 (17.6 siblings) — return the PG text-form LSN
+        // "0/0" instead of NULL. postgres_exporter / pgpool-II /
+        // orchestrators expect a text value even from a fresh
+        // instance, so NULL causes false-positive alerts. Real
+        // seq_no ↔ LSN mapping threads with the replication-
+        // protocol RFC.
         "pg_current_wal_lsn"
         | "pg_current_wal_flush_lsn"
         | "pg_current_wal_insert_lsn"
         | "pg_last_wal_receive_lsn"
-        | "pg_last_wal_replay_lsn" => Ok(Value::Null),
+        | "pg_last_wal_replay_lsn" => Ok(Value::text::<String>("0/0".into())),
         // pg_last_xact_replay_timestamp — replica lag probe.
         "pg_last_xact_replay_timestamp" => Ok(Value::Null),
         // Range comparison helpers.
