@@ -93,6 +93,7 @@ mod e2e_jsonb_typeof_array_length;
 mod e2e_visibility_and_property_probes;
 mod e2e_overlay_and_bit_ops;
 mod e2e_convert_from_to;
+mod e2e_jsonb_pretty;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

@@ -572,6 +572,86 @@ fn apply_function_dispatch(
         "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
             Ok(Value::Null)
         }
+        // v7.37.17 (17.6 siblings) — jsonb_pretty(jsonb) returns
+        // pretty-printed JSON text. Walks the parsed tree and
+        // re-emits with 2-space indent + newlines between object /
+        // array members.
+        "jsonb_pretty" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("jsonb_pretty() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
+                        detail: format!("jsonb_pretty(): JSON parse failed: {e}"),
+                    })?;
+                    fn pretty(v: &crate::json::JsonValue, indent: usize) -> alloc::string::String {
+                        use alloc::string::String;
+                        let pad = "  ".repeat(indent);
+                        let pad_next = "  ".repeat(indent + 1);
+                        match v {
+                            crate::json::JsonValue::Null => "null".into(),
+                            crate::json::JsonValue::Bool(b) => {
+                                if *b { "true".into() } else { "false".into() }
+                            }
+                            crate::json::JsonValue::Number(n) => alloc::format!("{n}"),
+                            crate::json::JsonValue::NumberText(s) => s.clone(),
+                            crate::json::JsonValue::String(s) => {
+                                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                                alloc::format!("\"{escaped}\"")
+                            }
+                            crate::json::JsonValue::Array(items) => {
+                                if items.is_empty() {
+                                    return "[]".into();
+                                }
+                                let mut out = String::from("[\n");
+                                for (i, item) in items.iter().enumerate() {
+                                    out.push_str(&pad_next);
+                                    out.push_str(&pretty(item, indent + 1));
+                                    if i + 1 < items.len() {
+                                        out.push(',');
+                                    }
+                                    out.push('\n');
+                                }
+                                out.push_str(&pad);
+                                out.push(']');
+                                out
+                            }
+                            crate::json::JsonValue::Object(members) => {
+                                if members.is_empty() {
+                                    return "{}".into();
+                                }
+                                let mut out = String::from("{\n");
+                                for (i, (k, v)) in members.iter().enumerate() {
+                                    let key_escaped =
+                                        k.replace('\\', "\\\\").replace('"', "\\\"");
+                                    out.push_str(&pad_next);
+                                    out.push_str(&alloc::format!("\"{key_escaped}\": "));
+                                    out.push_str(&pretty(v, indent + 1));
+                                    if i + 1 < members.len() {
+                                        out.push(',');
+                                    }
+                                    out.push('\n');
+                                }
+                                out.push_str(&pad);
+                                out.push('}');
+                                out
+                            }
+                        }
+                    }
+                    Ok(Value::text(pretty(&parsed, 0)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_pretty() needs jsonb, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — jsonb_typeof / json_typeof
         // returns PG's canonical type-name text for a jsonb/json
         // value: 'object' / 'array' / 'string' / 'number' /
