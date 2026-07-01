@@ -640,6 +640,25 @@ fn apply_function_dispatch(
             out.push_str(closer);
             Ok(Value::json(out))
         }
+        // v7.37.17 (17.6 siblings) — pg_stat_reset* family. Returns
+        // void (NULL) — monitoring / admin dashboards call these on
+        // schedule to reset counters. SPG's counters are session-
+        // scoped and reset on Engine::new() today; a real reset arm
+        // that clears query_stats + storage counters queues with
+        // v7.38 observability epic.
+        "pg_stat_reset"
+        | "pg_stat_reset_shared"
+        | "pg_stat_reset_single_table_counters"
+        | "pg_stat_reset_single_function_counters"
+        | "pg_stat_reset_slru"
+        | "pg_stat_reset_replication_slot"
+        | "pg_stat_reset_subscription_stats" => Ok(Value::Null),
+        // pg_stat_clear_snapshot — clear the per-session stats
+        // snapshot. Same treatment: return void.
+        "pg_stat_clear_snapshot" => Ok(Value::Null),
+        // pg_stat_force_next_flush — force next stats flush to
+        // shared memory. SPG's stats are synchronous; no-op.
+        "pg_stat_force_next_flush" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — transaction ID probes. SPG
         // uses u64 tx IDs that never wrap; these return the current
         // tx ID as BigInt. txid_ names are pre-PG 13 aliases for
