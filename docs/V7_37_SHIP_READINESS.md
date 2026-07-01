@@ -49,6 +49,30 @@ not gated on those).
   NOT OF / FORCE RLS / ENABLE/DISABLE ROW LEVEL SECURITY all
   accept-and-no-op.
 
+### PL/pgSQL surface (v7.37.20 slice, autorun-shipped)
+
+The DO block and trigger body executor now cover a substantial
+chunk of PL/pgSQL:
+
+- Control flow: IF / ELSIF / ELSE / END IF (v7.12.6); bare LOOP +
+  EXIT [WHEN] + CONTINUE [WHEN]; WHILE LOOP; FOR i IN start..end
+  LOOP (via Token::DotDot); FOR var IN SELECT LOOP (scalar-column
+  binding via for_query_resolver); FOR var IN EXECUTE LOOP
+  (runtime-computed SELECT).
+- Diagnostics: RAISE NOTICE/WARNING/INFO/LOG/DEBUG/EXCEPTION with
+  `%` positional substitution; ASSERT <cond> [, <msg>];
+  EXCEPTION WHEN <cond> [OR <cond>]* THEN <handler> catches
+  RaiseException (OTHERS + named condition substring match);
+  sqlerrm + sqlstate locals auto-populated inside handlers.
+- Data: DECLARE with type inference (`DECLARE x := 42;`);
+  %TYPE / %ROWTYPE parse-accept; SELECT INTO with FOUND local
+  auto-set; PERFORM <select>; EXECUTE <string_expr>; RETURN NEW /
+  OLD / NULL / <expr>; RETURN QUERY <select>; RETURN QUERY
+  EXECUTE <string>.
+
+Cursors, RETURN NEXT accumulator, RECORD types, and full
+PG-canonical GET DIAGNOSTICS syntax queue with v7.40.
+
 ### Observability + operator surface
 
 - `spg_stat_activity` with `application_name` + `wait_event_type` +
