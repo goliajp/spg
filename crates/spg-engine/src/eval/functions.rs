@@ -572,6 +572,74 @@ fn apply_function_dispatch(
         "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
             Ok(Value::Null)
         }
+        // v7.37.17 (17.6 siblings) — array_to_json(arr [, pretty])
+        // returns JSON text representation of an array. `pretty`
+        // when true adds newlines between elements. Multi-dim arrays
+        // queue with v7.40 array-model widening.
+        "array_to_json" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_to_json() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+            let sep = if pretty { ",\n " } else { "," };
+            let opener = if pretty { "[\n " } else { "[" };
+            let closer = if pretty { "\n]" } else { "]" };
+            let mut out = alloc::string::String::from(opener);
+            let items = match &args[0] {
+                Value::TextArray(items) => {
+                    let strs: alloc::vec::Vec<alloc::string::String> = items
+                        .iter()
+                        .map(|o| match o {
+                            None => alloc::string::String::from("null"),
+                            Some(s) => {
+                                let escaped =
+                                    s.replace('\\', "\\\\").replace('"', "\\\"");
+                                alloc::format!("\"{escaped}\"")
+                            }
+                        })
+                        .collect();
+                    strs
+                }
+                Value::IntArray(items) => items
+                    .iter()
+                    .map(|n| match n {
+                        None => alloc::string::String::from("null"),
+                        Some(x) => alloc::format!("{x}"),
+                    })
+                    .collect(),
+                Value::BigIntArray(items) => items
+                    .iter()
+                    .map(|n| match n {
+                        None => alloc::string::String::from("null"),
+                        Some(x) => alloc::format!("{x}"),
+                    })
+                    .collect(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_to_json(): needs array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(sep);
+                }
+                out.push_str(item);
+            }
+            out.push_str(closer);
+            Ok(Value::json(out))
+        }
         // v7.37.17 (17.6 siblings) — jsonb_object_keys returns the
         // top-level keys of a jsonb object. PG has this as a SRF
         // (set-returning function) — SPG's scalar surface returns
