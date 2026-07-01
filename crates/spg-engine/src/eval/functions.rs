@@ -3251,6 +3251,63 @@ fn apply_function_dispatch(
         }
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.37.17 (17.6 siblings) — PG's `to_number(text, fmt)`
+        // parses a formatted numeric string. Real implementation
+        // strips the format-marker characters ($, ',', ' ', 'D',
+        // 'G') and parses the residue as a float. The `fmt` arg
+        // is used for validation-shape but the parse is
+        // permissive since many callers pass '9G999D99' style
+        // masks that we can safely ignore.
+        "to_number" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("to_number() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let raw = match &args[0] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "to_number(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let _fmt = match &args[1] {
+                Value::Text(s) => s.to_string(),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "to_number(): fmt must be text".into(),
+                    });
+                }
+            };
+            // Strip locale + presentation chars.
+            let cleaned: alloc::string::String = raw
+                .chars()
+                .filter(|c| {
+                    c.is_ascii_digit()
+                        || matches!(*c, '.' | '-' | '+' | 'e' | 'E')
+                })
+                .collect();
+            if cleaned.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "to_number(): could not parse {raw:?}"
+                    ),
+                });
+            }
+            let parsed: f64 = cleaned.parse().map_err(|_| EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "to_number(): could not parse {cleaned:?}"
+                ),
+            })?;
+            Ok(Value::Float(parsed))
+        }
         // v7.37.17 (17.6 siblings) — fuzzystrmatch soundex(text)
         // returns the 4-char Soundex code (Russell / Odell 1918
         // classic). PG's fuzzystrmatch extension emits this. Used
