@@ -4426,6 +4426,75 @@ fn apply_function_dispatch(
         // function Django / Rails / Hibernate emit in `id UUID
         // PRIMARY KEY DEFAULT gen_random_uuid()`, the modern
         // default PK pattern.
+        // v7.37.17 (17.6 siblings) — PG 16+ random_normal(mean,
+        // stddev) uses Box-Muller to produce a normally-
+        // distributed random number. Real implementation using
+        // the internal prng.
+        "random_normal" => {
+            if args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "random_normal() takes 0-2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let mean = if args.is_empty() {
+                0.0
+            } else {
+                match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Float(f) => *f,
+                    Value::Int(n) => f64::from(*n),
+                    Value::SmallInt(n) => f64::from(*n),
+                    Value::BigInt(n) => *n as f64,
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "random_normal(): mean must be numeric, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            };
+            let stddev = if args.len() < 2 {
+                1.0
+            } else {
+                match &args[1] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Float(f) => *f,
+                    Value::Int(n) => f64::from(*n),
+                    Value::SmallInt(n) => f64::from(*n),
+                    Value::BigInt(n) => *n as f64,
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "random_normal(): stddev must be numeric, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            };
+            // Marsaglia polar method (avoids no_std cos/sin):
+            // Pick u, v uniform in [-1, 1] until s = u²+v² ∈ (0, 1);
+            // then z = u * sqrt(-2 ln s / s).
+            let mut z = 0.0f64;
+            for _ in 0..16 {
+                let u = 2.0 * super::math::prng_next_f64() - 1.0;
+                let v = 2.0 * super::math::prng_next_f64() - 1.0;
+                let s = u * u + v * v;
+                if s > 0.0 && s < 1.0 {
+                    let factor = super::math::f64_sqrt(
+                        -2.0 * super::math::f64_ln(s) / s,
+                    );
+                    z = u * factor;
+                    break;
+                }
+            }
+            Ok(Value::Float(mean + stddev * z))
+        }
         "gen_random_uuid" | "uuid_generate_v4" => {
             if !args.is_empty() {
                 return Err(EvalError::TypeMismatch {
