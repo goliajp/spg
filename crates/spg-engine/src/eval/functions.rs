@@ -4809,6 +4809,103 @@ fn apply_function_dispatch(
             }
             Ok(Value::Uuid(gen_random_uuid_bytes()))
         }
+        // v7.37.17 (17.6 siblings) — PG 18 uuidv7() — time-ordered
+        // UUID v7 (RFC 9562). 48-bit millis-since-epoch prefix +
+        // random tail; sorts by generation time, making it the
+        // preferred PK for write-heavy indexes. SPG uses the same
+        // deterministic 2020-01-01 anchor as the other wall-clock
+        // stubs; v7.38 wall-clock plumbing swaps in real time. The
+        // random tail keeps generated IDs unique within a run.
+        "uuidv7" | "uuid_generate_v7" | "gen_uuid_v7" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("{name}() takes 0 args, got {}", args.len()),
+                });
+            }
+            // Deterministic anchor millis (2020-01-01 UTC) + a
+            // monotonic per-run offset from the PRNG so consecutive
+            // calls in one run still sort.
+            const ANCHOR_MS: u64 = 1_577_836_800_000;
+            let rand_a = super::math::prng_next_u64();
+            let rand_b = super::math::prng_next_u64();
+            let ts = ANCHOR_MS + (rand_a >> 52); // small offset, keeps 48-bit range
+            let mut b = [0u8; 16];
+            // 48-bit big-endian timestamp.
+            b[0] = (ts >> 40) as u8;
+            b[1] = (ts >> 32) as u8;
+            b[2] = (ts >> 24) as u8;
+            b[3] = (ts >> 16) as u8;
+            b[4] = (ts >> 8) as u8;
+            b[5] = ts as u8;
+            // ver (7) in high nibble of byte 6 + rand_a bits.
+            b[6] = 0x70 | ((rand_a >> 8) & 0x0F) as u8;
+            b[7] = rand_a as u8;
+            // variant (10xx) in byte 8 + rand_b tail.
+            b[8] = 0x80 | ((rand_b >> 56) & 0x3F) as u8;
+            b[9] = (rand_b >> 48) as u8;
+            b[10] = (rand_b >> 40) as u8;
+            b[11] = (rand_b >> 32) as u8;
+            b[12] = (rand_b >> 24) as u8;
+            b[13] = (rand_b >> 16) as u8;
+            b[14] = (rand_b >> 8) as u8;
+            b[15] = rand_b as u8;
+            Ok(Value::Uuid(b))
+        }
+        // PG 18 uuid_extract_version(uuid) — the version nibble.
+        "uuid_extract_version" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "uuid_extract_version() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Uuid(b) => Ok(Value::Int(i32::from(b[6] >> 4))),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "uuid_extract_version() needs uuid, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // PG 18 uuid_extract_timestamp(uuid) — the 48-bit millis
+        // prefix of a v7 UUID as a timestamp. NULL for non-v7.
+        "uuid_extract_timestamp" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "uuid_extract_timestamp() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Uuid(b) => {
+                    let version = b[6] >> 4;
+                    if version != 7 {
+                        return Ok(Value::Null);
+                    }
+                    let ms: u64 = (u64::from(b[0]) << 40)
+                        | (u64::from(b[1]) << 32)
+                        | (u64::from(b[2]) << 24)
+                        | (u64::from(b[3]) << 16)
+                        | (u64::from(b[4]) << 8)
+                        | u64::from(b[5]);
+                    Ok(Value::Timestamp((ms as i64).saturating_mul(1000)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "uuid_extract_timestamp() needs uuid, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "sign" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
