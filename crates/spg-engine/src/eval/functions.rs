@@ -231,6 +231,182 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — SQL:2003 OVERLAY(string PLACING
+        // replacement FROM start [FOR length]). Splices `replacement`
+        // into `string` at 1-based `start`, replacing `length` chars
+        // (or replacement.len() chars if `length` is omitted).
+        //
+        // Real implementation, multi-byte-safe via chars().
+        "overlay" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("overlay() takes 3 or 4 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = match &args[0] {
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "overlay(): source must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let placing = match &args[1] {
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "overlay(): replacement must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let start = match &args[2] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "overlay(): start must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if start < 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "overlay(): start must be >= 1".into(),
+                });
+            }
+            let placing_char_count = placing.chars().count();
+            let length = if args.len() == 4 {
+                match &args[3] {
+                    Value::Int(n) => *n as i64,
+                    Value::BigInt(n) => *n,
+                    Value::SmallInt(n) => i64::from(*n),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "overlay(): length must be integer, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            } else {
+                placing_char_count as i64
+            };
+            let start_idx = (start - 1) as usize;
+            let end_idx = start_idx.saturating_add(length.max(0) as usize);
+            let mut out = alloc::string::String::new();
+            for (i, ch) in s.chars().enumerate() {
+                if i < start_idx {
+                    out.push(ch);
+                } else if i == start_idx {
+                    out.push_str(placing);
+                }
+                if i >= end_idx {
+                    out.push(ch);
+                }
+            }
+            // Handle start_idx at end of source.
+            if start_idx >= s.chars().count() {
+                out.push_str(placing);
+            }
+            Ok(Value::text(out))
+        }
+        // v7.37.17 (17.6 siblings) — set_bit / get_bit / set_byte /
+        // get_byte for bytea manipulation. PG-standard low-level
+        // byte / bit access.
+        "get_byte" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("get_byte() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let b = match &args[0] {
+                Value::Bytes(b) => b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "get_byte(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let idx = match &args[1] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "get_byte(): index must be integer".into(),
+                    });
+                }
+            };
+            if idx < 0 || (idx as usize) >= b.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "get_byte(): index {idx} out of range 0..{}",
+                        b.len()
+                    ),
+                });
+            }
+            Ok(Value::Int(i32::from(b[idx as usize])))
+        }
+        "get_bit" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("get_bit() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let b = match &args[0] {
+                Value::Bytes(b) => b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "get_bit(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let bit_idx = match &args[1] {
+                Value::Int(n) => *n as i64,
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "get_bit(): index must be integer".into(),
+                    });
+                }
+            };
+            if bit_idx < 0 || (bit_idx as usize) >= b.len() * 8 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "get_bit(): index {bit_idx} out of range 0..{}",
+                        b.len() * 8
+                    ),
+                });
+            }
+            let byte_idx = (bit_idx as usize) / 8;
+            let bit_off = (bit_idx as usize) % 8;
+            let bit = (b[byte_idx] >> bit_off) & 1;
+            Ok(Value::Int(i32::from(bit)))
+        }
         // v7.37.17 (17.6 siblings) — index-property probes that
         // psql \d output + monitoring exporters emit.
         //
