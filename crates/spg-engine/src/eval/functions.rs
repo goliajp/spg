@@ -231,6 +231,51 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — index-property probes that
+        // psql \d output + monitoring exporters emit.
+        //
+        //   pg_index_has_property(indexoid, name)       → bool
+        //   pg_indexam_has_property(amoid, name)        → bool
+        //   pg_index_column_has_property(indexoid, col, name) → bool
+        //
+        // SPG's BTree AM supports all standard properties (ordered
+        // + scan / bitmapscan / search); custom AMs (Hash/GiST etc.)
+        // land with v7.39 indexes epic. Returning true here matches
+        // BTree's PG behavior for the common property queries
+        // ("returnable", "orderable", "search_array", etc.).
+        "pg_index_has_property"
+        | "pg_indexam_has_property"
+        | "pg_index_column_has_property" => Ok(Value::Bool(true)),
+        // v7.37.17 (17.6 siblings) — schema-visibility probes.
+        // SPG uses a single `public` namespace, so anything the caller
+        // can reference is visible. psql \d + ORMs check these.
+        "pg_type_is_visible"
+        | "pg_table_is_visible"
+        | "pg_function_is_visible"
+        | "pg_operator_is_visible"
+        | "pg_opclass_is_visible"
+        | "pg_ts_config_is_visible"
+        | "pg_ts_dict_is_visible"
+        | "pg_ts_parser_is_visible"
+        | "pg_ts_template_is_visible" => Ok(Value::Bool(true)),
+        // pg_get_serial_sequence is already handled above; keep
+        // this location as the anchor for the visibility family.
+        //
+        // pg_relation_is_publishable / pg_get_publication_tables —
+        // logical-decoding auxiliary probes. Return true / NULL
+        // (SPG's publication surface handles the real lookup;
+        // these are the wire-protocol-agnostic scalar aliases).
+        "pg_relation_is_publishable" => Ok(Value::Bool(true)),
+        "pg_get_publication_tables" => Ok(Value::Null),
+        // pg_stat_get_activity(pid) — returns a row from the
+        // activity view. Return NULL for the scalar surface;
+        // real callers use the pg_stat_activity view.
+        "pg_stat_get_activity" | "pg_stat_get_backend_activity" => Ok(Value::Null),
+        // pg_stat_get_snapshot_timestamp — timestamp of stats
+        // snapshot. Return NULL.
+        "pg_stat_get_snapshot_timestamp" | "pg_stat_get_stat_snapshot_timestamp" => {
+            Ok(Value::Null)
+        }
         // v7.37.17 (17.6 siblings) — jsonb_typeof / json_typeof
         // returns PG's canonical type-name text for a jsonb/json
         // value: 'object' / 'array' / 'string' / 'number' /

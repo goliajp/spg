@@ -90,6 +90,7 @@ mod e2e_pg_column_size;
 mod e2e_factorial_width_bucket;
 mod e2e_array_dims;
 mod e2e_jsonb_typeof_array_length;
+mod e2e_visibility_and_property_probes;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
