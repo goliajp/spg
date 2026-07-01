@@ -163,6 +163,7 @@ mod e2e_pg_lsn_ops;
 mod e2e_num_nulls;
 mod e2e_numeric_scale;
 mod e2e_normalize;
+mod e2e_json_object;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

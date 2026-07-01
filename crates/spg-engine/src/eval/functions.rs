@@ -5532,6 +5532,121 @@ fn apply_function_dispatch(
             Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
         "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        // v7.37.17 (17.6 siblings) — json_object(text[]) /
+        // jsonb_object(text[]) build an object from a flat array
+        // of alternating key/value pairs. 2-array form
+        // json_object(keys, values) also supported.
+        "json_object" | "jsonb_object" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_object() takes 1 or 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn escape_into(s: &str, out: &mut alloc::string::String) {
+                out.push('"');
+                for c in s.chars() {
+                    match c {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        c if (c as u32) < 0x20 => {
+                            out.push_str(&alloc::format!("\\u{:04x}", c as u32));
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+            }
+            let mut out = alloc::string::String::from("{");
+            if args.len() == 1 {
+                // Flat array: [k1, v1, k2, v2, ...]
+                let items = match &args[0] {
+                    Value::TextArray(items) => items,
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "json_object(): needs text[], got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                if items.len() % 2 != 0 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "json_object(): array must have even length, got {}",
+                            items.len()
+                        ),
+                    });
+                }
+                let mut first = true;
+                for pair in items.chunks_exact(2) {
+                    let Some(key) = &pair[0] else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "json_object(): key cannot be NULL".into(),
+                        });
+                    };
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    escape_into(key, &mut out);
+                    out.push(':');
+                    match &pair[1] {
+                        Some(v) => escape_into(v, &mut out),
+                        None => out.push_str("null"),
+                    }
+                }
+            } else {
+                // 2-array form: keys[], values[].
+                let (keys, values) = match (&args[0], &args[1]) {
+                    (Value::TextArray(k), Value::TextArray(v)) => (k, v),
+                    (a, b) => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "json_object(): needs (text[], text[]), got ({:?}, {:?})",
+                                a.data_type(),
+                                b.data_type()
+                            ),
+                        });
+                    }
+                };
+                if keys.len() != values.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "json_object(): key/value arrays differ in length ({} vs {})",
+                            keys.len(),
+                            values.len()
+                        ),
+                    });
+                }
+                let mut first = true;
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    let Some(key) = k else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "json_object(): key cannot be NULL".into(),
+                        });
+                    };
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    escape_into(key, &mut out);
+                    out.push(':');
+                    match v {
+                        Some(val) => escape_into(val, &mut out),
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            out.push('}');
+            Ok(Value::json(out))
+        }
         "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
         "jsonb_set" | "json_set" => crate::json::set(args),
         "jsonb_insert" | "json_insert" => crate::json::insert(args),
