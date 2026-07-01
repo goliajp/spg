@@ -1639,6 +1639,65 @@ fn apply_function_dispatch(
         // pg_cancel_backend / pg_terminate_backend — admin-level
         // signal helpers. Return true (as if the cancel took effect).
         "pg_cancel_backend" | "pg_terminate_backend" => Ok(Value::Bool(true)),
+        // v7.37.17 (17.6 siblings) — string / catalog helpers.
+        // quote_ident wraps a bare identifier in "…" if it needs
+        // quoting; quote_literal / quote_nullable wrap string values
+        // in '…' (or NULL for null). Basic implementations that
+        // don't check the identifier-safe character class — always
+        // quote to be safe.
+        "quote_ident" => match args.first() {
+            Some(Value::Text(s)) => {
+                let escaped = s.replace('"', "\"\"");
+                Ok(Value::text(alloc::format!("\"{escaped}\"")))
+            }
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => Ok(Value::text(alloc::format!("\"{other:?}\""))),
+        },
+        "quote_literal" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(Value::Text(s)) => {
+                let escaped = s.replace('\'', "''");
+                Ok(Value::text(alloc::format!("'{escaped}'")))
+            }
+            Some(other) => Ok(Value::text(alloc::format!("'{other:?}'"))),
+        },
+        "quote_nullable" => match args.first() {
+            None | Some(Value::Null) => Ok(Value::text::<String>("NULL".into())),
+            Some(Value::Text(s)) => {
+                let escaped = s.replace('\'', "''");
+                Ok(Value::text(alloc::format!("'{escaped}'")))
+            }
+            Some(other) => Ok(Value::text(alloc::format!("'{other:?}'"))),
+        },
+        // format_type(type_oid[, typmod]) — returns the canonical
+        // display name of a type. Real implementation walks the
+        // pg_type oid map; for parse-through we return NULL when
+        // the oid is unknown.
+        "format_type" => Ok(Value::text::<String>("unknown".into())),
+        // obj_description / col_description / shobj_description —
+        // COMMENT ON reader helpers. SPG doesn't yet retain
+        // comments in the catalog; return NULL.
+        "obj_description" | "col_description" | "shobj_description" => Ok(Value::Null),
+        // to_regclass / to_regtype / to_regnamespace / to_regproc:
+        // string → oid lookup. Return NULL until the OID reverse-
+        // resolver is wired (queues with system_catalog v7.40
+        // widening).
+        "to_regclass"
+        | "to_regtype"
+        | "to_regnamespace"
+        | "to_regproc"
+        | "to_regprocedure"
+        | "to_regoperator"
+        | "to_regrole" => Ok(Value::Null),
+        // pg_client_encoding — SPG always speaks UTF8.
+        "pg_client_encoding" => Ok(Value::text::<String>("UTF8".into())),
+        // pg_is_in_recovery / pg_is_wal_replay_paused — replication /
+        // recovery status probes. SPG is primary-only in the drop-in
+        // model.
+        "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // pg_wal_lsn_diff — WAL byte-position arithmetic. Return 0
+        // until real LSN types land.
+        "pg_wal_lsn_diff" => Ok(Value::BigInt(0)),
         "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
