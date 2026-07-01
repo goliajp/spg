@@ -49,6 +49,73 @@ not gated on those).
   NOT OF / FORCE RLS / ENABLE/DISABLE ROW LEVEL SECURITY all
   accept-and-no-op.
 
+### PG scalar function inventory (v7.37.17 autorun slice)
+
+The `eval/functions.rs` dispatcher now covers ~60 more scalar
+helpers common ORMs (Diesel / sqlx / GORM), monitoring exporters
+(postgres_exporter / pgwatch2), and pg_dump preambles emit.
+Sensible defaults so `SELECT` succeeds instead of returning
+"unknown function":
+
+- DDL reconstruction: `pg_get_viewdef`, `pg_get_functiondef`,
+  `pg_get_triggerdef`, `pg_get_ruledef`, `pg_get_expr`,
+  `pg_get_partkeydef`, `pg_get_statisticsobjdef`,
+  `pg_get_userbyid`
+- Size / encoding: `pg_size_pretty`, `pg_database_size`,
+  `pg_relation_size`, `pg_total_relation_size`, `pg_table_size`,
+  `pg_indexes_size`, `pg_encoding_to_char`, `pg_char_to_encoding`,
+  `pg_client_encoding`
+- String / quoting: `quote_ident`, `quote_literal`,
+  `quote_nullable` (real quoting semantics — double-quote / single-
+  quote escape, NULL → `'NULL'`)
+- Type / catalog OID: `format_type`, `obj_description`,
+  `col_description`, `shobj_description`, `to_regclass`,
+  `to_regtype`, `to_regnamespace`, `to_regproc`, `to_regprocedure`,
+  `to_regoperator`, `to_regrole`
+- Permission probes: `has_table_privilege` / `has_column_privilege`
+  / `has_schema_privilege` / `has_function_privilege` /
+  `has_sequence_privilege` / `has_database_privilege` /
+  `has_language_privilege` / `has_tablespace_privilege` /
+  `has_type_privilege` — all return `true` under SPG's single-
+  user model
+- Admin / signal: `pg_backend_pid`, `pg_conf_load_time`,
+  `pg_postmaster_start_time`, `pg_notify`, `pg_cancel_backend`,
+  `pg_terminate_backend`
+- Clock family: `statement_timestamp`, `transaction_timestamp`,
+  `clock_timestamp`, `localtime`, `localtimestamp` — all fold to
+  the engine clock at rewrite time
+- Session identity: `current_catalog`, `current_role`,
+  `current_user` / `session_user` (parenless-keyword) — plus
+  `SELECT current_user` (bare) now works in the embedded engine
+  (was pgwire-canned-only)
+- Recovery / WAL: `pg_current_wal_lsn` / `_flush_lsn` /
+  `_insert_lsn`, `pg_last_wal_receive_lsn`, `pg_last_wal_replay_lsn`,
+  `pg_last_xact_replay_timestamp`, `pg_xact_commit_timestamp`,
+  `pg_last_committed_xact`, `pg_is_in_recovery`,
+  `pg_is_wal_replay_paused`, `pg_wal_lsn_diff`
+- Sleep: `pg_sleep` / `pg_sleep_for` / `pg_sleep_until` (no actual
+  delay — parse-through for tests using them as shape markers)
+- Range: `lower_inc` / `upper_inc` / `lower_inf` / `upper_inf` /
+  `isempty`
+
+### `SHOW <param>` / `pg_settings` widened (v7.37.17 autorun slice)
+
+Both surfaces now report PG-shape defaults for common GUCs
+drivers probe before / after SET:
+
+  `lock_timeout` / `idle_in_transaction_session_timeout` /
+  `transaction_timeout` / `statement_timeout` /
+  `client_min_messages` / `default_tablespace` /
+  `default_table_access_method` / `row_security` /
+  `check_function_bodies` / `xmloption` / `work_mem` /
+  `maintenance_work_mem` / `shared_buffers` /
+  `effective_cache_size` / `search_path` / `application_name` /
+  `default_transaction_isolation` / `IntervalStyle`
+
+`SHOW ALL` returns the 13-row canonical inventory as
+`(name, setting, description)` triples. Session-set overrides
+update the default row (not just as extra rows) in pg_settings.
+
 ### pg_dump / pg_dumpall wider parse-accept (v7.37.17 autorun slice)
 
 The parser now accepts the following top-level shapes that pg_dump
