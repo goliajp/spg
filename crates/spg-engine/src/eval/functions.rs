@@ -1780,6 +1780,28 @@ fn apply_function_dispatch(
         }
         "lpad" => string_pad(args, true, "lpad"),
         "rpad" => string_pad(args, false, "rpad"),
+        // v7.37.17 (17.6 siblings) — PG reverse(text) inverts the
+        // char sequence. Multi-byte-safe via chars() iterator.
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("reverse() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let reversed: alloc::string::String = s.chars().rev().collect();
+                    Ok(Value::text(reversed))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "reverse() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "repeat" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
