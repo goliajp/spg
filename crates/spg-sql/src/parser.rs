@@ -825,6 +825,12 @@ impl Parser {
                     // v7.17.0 Phase 3.P0-60 — INDEX is a reserved
                     // keyword too; let SHOW INDEX FROM parse.
                     Token::Index => "index".to_string(),
+                    // v7.37.17 (17.6 sibling) — SHOW ALL. ALL is
+                    // reserved (used in aggregate function calls);
+                    // recognise it here so the parser dispatches
+                    // to ShowParameter("all") — the engine returns
+                    // the curated parameter inventory.
+                    Token::All => "all".to_string(),
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
                         return Err(self.err(format!(
