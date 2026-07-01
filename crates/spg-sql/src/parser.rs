@@ -11665,7 +11665,25 @@ impl Parser {
         let lc = first.to_ascii_lowercase();
         if matches!(
             lc.as_str(),
-            "current_date" | "current_time" | "current_timestamp" | "localtimestamp" | "localtime"
+            "current_date"
+                | "current_time"
+                | "current_timestamp"
+                | "localtimestamp"
+                | "localtime"
+                // v7.37.17 (17.6 siblings) — session-identity SQL-
+                // standard parenless keywords. current_user /
+                // session_user / user were already caught by the
+                // pgwire canned-response shortcut but bare-select
+                // in the embedded engine went through Expr::Column
+                // and errored. Adding them here so the parser
+                // resolves to a synthetic FunctionCall that reuses
+                // the existing eval/functions.rs dispatch.
+                | "current_user"
+                | "session_user"
+                | "current_role"
+                | "current_catalog"
+                | "current_schema"
+                | "current_database"
         ) {
             return Ok(Expr::FunctionCall {
                 name: lc,
