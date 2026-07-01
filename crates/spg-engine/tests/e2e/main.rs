@@ -116,6 +116,7 @@ mod e2e_date_bin;
 mod e2e_to_timestamp;
 mod e2e_pg_size_bytes;
 mod e2e_pg_size_pretty_real;
+mod e2e_age_single_arg;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
