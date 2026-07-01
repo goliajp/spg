@@ -3033,6 +3033,82 @@ fn apply_function_dispatch(
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.37.17 (17.6 siblings) — PG's `pg_size_bytes(text)`
+        // parses a human-readable size string ("2MB", "1.5 GB",
+        // "512 kB") into a BigInt byte count. Inverse of
+        // pg_size_pretty. Matches PG's unit table:
+        //   bytes / B         → 1
+        //   kB                → 1024
+        //   MB                → 1024^2
+        //   GB                → 1024^3
+        //   TB                → 1024^4
+        //   PB                → 1024^5
+        // No unit → bytes.
+        "pg_size_bytes" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pg_size_bytes() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let raw: alloc::string::String = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_size_bytes() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "pg_size_bytes(): empty input".into(),
+                });
+            }
+            // Split into numeric prefix + unit suffix. The unit is
+            // whatever trailing alphabetic run is at the end.
+            let split_at = trimmed.trim_end().rfind(|c: char| {
+                c.is_ascii_digit() || c == '.' || c == '-' || c == '+'
+            });
+            let (num_str, unit_raw) = match split_at {
+                Some(i) => trimmed.split_at(i + 1),
+                None => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_size_bytes(): could not parse {trimmed:?}"
+                        ),
+                    });
+                }
+            };
+            let num: f64 = num_str.trim().parse().map_err(|_| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "pg_size_bytes(): could not parse numeric part {num_str:?}"
+                    ),
+                }
+            })?;
+            let unit = unit_raw.trim().to_ascii_lowercase();
+            let mul: i64 = match unit.as_str() {
+                "" | "bytes" | "byte" | "b" => 1,
+                "kb" | "kib" => 1024,
+                "mb" | "mib" => 1024_i64.pow(2),
+                "gb" | "gib" => 1024_i64.pow(3),
+                "tb" | "tib" => 1024_i64.pow(4),
+                "pb" | "pib" => 1024_i64.pow(5),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_size_bytes(): unknown unit {other:?}"
+                        ),
+                    });
+                }
+            };
+            let bytes = (num * mul as f64).round() as i64;
+            Ok(Value::BigInt(bytes))
+        }
         // v7.37.17 (17.6 siblings) — PG's `to_timestamp(double)`
         // converts a Unix epoch (seconds since 1970-01-01 UTC) to a
         // `timestamp with time zone`. SPG uses micros-since-epoch
