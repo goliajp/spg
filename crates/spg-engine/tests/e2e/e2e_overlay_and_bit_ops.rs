@@ -56,6 +56,33 @@ fn get_byte_returns_byte_value() {
 }
 
 #[test]
+fn set_byte_returns_modified_bytea() {
+    let mut e = Engine::new();
+    // set_byte('abc', 0, 122) → 'zbc' (122 = 'z')
+    match first(&mut e, "SELECT set_byte('abc'::bytea, 0, 122)") {
+        spg_storage::Value::Bytes(b) => {
+            assert_eq!(b.as_ref(), &[122u8, 98, 99][..]);
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn set_bit_roundtrips_with_get_bit() {
+    let mut e = Engine::new();
+    // set_bit('A' (0x41 = 0b01000001), 7, 1) sets the MSB → 0xC1 = 193
+    match first(&mut e, "SELECT get_byte(set_bit('A'::bytea, 7, 1), 0)") {
+        spg_storage::Value::Int(0xC1) => {}
+        other => panic!("got {other:?}"),
+    }
+    // set_bit('A', 0, 0) clears the LSB → 0x40 = 64 = '@'
+    match first(&mut e, "SELECT get_byte(set_bit('A'::bytea, 0, 0), 0)") {
+        spg_storage::Value::Int(0x40) => {}
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
 fn get_bit_returns_bit() {
     let mut e = Engine::new();
     // 'A' = 0x41 = 0b01000001
