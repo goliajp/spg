@@ -3886,6 +3886,40 @@ impl Parser {
             }
             _ => {}
         }
+        // v7.37.20 (20.11) — RETURN QUERY <select> / RETURN QUERY
+        // EXECUTE <expr>. In a DO block context RETURN QUERY has no
+        // caller-visible effect (blocks don't return sets), so we
+        // desugar it identically to PERFORM: parse the SELECT (or
+        // EXECUTE dynamic) as embedded SQL that runs for side
+        // effects and discards the result. RETURN NEXT <expr>
+        // (single-row accumulator) queues with v7.40 SETOF function
+        // infrastructure.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("query"))
+        {
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("execute"))
+            {
+                self.advance();
+                let sql = self.parse_expr(0)?;
+                return Ok(PlPgSqlStmt::ExecuteDynamic { sql });
+            }
+            // Bare RETURN QUERY <select>. If the current token is
+            // not already SELECT (e.g., the user wrote `RETURN QUERY
+            // <projection> FROM ...` in a shorthand — rare but PG
+            // accepts a bare projection here), splice one in. Same
+            // trick as PERFORM.
+            if !matches!(self.peek(), Token::Select) {
+                self.tokens.insert(self.pos, Token::Select);
+            }
+            let select = self.parse_select_stmt()?;
+            let Statement::Select(s) = select else {
+                return Err(self.err(alloc::format!(
+                    "expected SELECT body after RETURN QUERY, got {:?}",
+                    self.peek()
+                )));
+            };
+            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(Statement::Select(s))));
+        }
         // Fall through: parse a full expression.
         let e = self.parse_expr(0)?;
         Ok(PlPgSqlStmt::Return(ReturnTarget::Expr(e)))
