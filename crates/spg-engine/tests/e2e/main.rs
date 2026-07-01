@@ -46,6 +46,7 @@ mod e2e_plpgsql_assert;
 mod e2e_plpgsql_perform;
 mod e2e_plpgsql_while;
 mod e2e_plpgsql_for_range;
+mod e2e_plpgsql_loop_exit;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

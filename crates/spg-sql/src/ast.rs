@@ -1063,6 +1063,15 @@ pub enum PlPgSqlStmt {
         reverse: bool,
         body: Vec<PlPgSqlStmt>,
     },
+    /// v7.37.20 (20.2) — bare `LOOP <body> END LOOP;`. Runs the body
+    /// repeatedly; only `EXIT [WHEN <cond>]` breaks out. Iteration
+    /// budget guards runaway.
+    Loop { body: Vec<PlPgSqlStmt> },
+    /// v7.37.20 (20.2) — `EXIT [WHEN <condition>];` inside a loop.
+    /// Unconditional (no WHEN) or conditional (only breaks when
+    /// condition is truthy). Bubbles up as BodyOutcome::Break which
+    /// the enclosing loop catches. Outside a loop it's a no-op.
+    Exit { when: Option<Expr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3627,6 +3636,20 @@ impl fmt::Display for PlPgSqlStmt {
                     writeln!(f, "  {s};")?;
                 }
                 f.write_str("END LOOP")
+            }
+            Self::Loop { body } => {
+                writeln!(f, "LOOP")?;
+                for s in body {
+                    writeln!(f, "  {s};")?;
+                }
+                f.write_str("END LOOP")
+            }
+            Self::Exit { when } => {
+                f.write_str("EXIT")?;
+                if let Some(c) = when {
+                    write!(f, " WHEN {c}")?;
+                }
+                Ok(())
             }
         }
     }
