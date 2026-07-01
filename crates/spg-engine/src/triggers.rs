@@ -470,6 +470,18 @@ fn execute_stmts(
                         ),
                     })?;
                 let value = resolver(&substituted)?;
+                // v7.37.20 (20.15) — the PL/pgSQL FOUND special
+                // variable is auto-set after each SQL-executing
+                // statement. For SELECT INTO: `true` when the query
+                // returned a row (value != Null), `false` otherwise.
+                // The variable name is spelled lower-case per PG
+                // convention; SPG's local map is case-preserving,
+                // so callers reading `found` see this update.
+                let found_after_select_into = !matches!(value, spg_storage::Value::Null);
+                locals.insert(
+                    "found".into(),
+                    spg_storage::Value::Bool(found_after_select_into),
+                );
                 locals.insert(var.clone(), value);
             }
             PlPgSqlStmt::ForRange {
