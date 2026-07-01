@@ -207,6 +207,12 @@ impl Engine {
                     self.resolve_select_subqueries(query, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
+                PlPgSqlStmt::ForExecute {
+                    sql_expr, body, ..
+                } => {
+                    self.resolve_expr_subqueries(sql_expr, cancel)?;
+                    self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
+                }
                 PlPgSqlStmt::EmbeddedSql(_) => {
                     // Embedded SQL goes back through execute_stmt
                     // _with_cancel which runs the SELECT-side

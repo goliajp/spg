@@ -1116,6 +1116,16 @@ pub enum PlPgSqlStmt {
         query: Box<SelectStatement>,
         body: Vec<PlPgSqlStmt>,
     },
+    /// v7.37.20 (20.6) — `FOR <var> IN EXECUTE <string_expr> LOOP
+    /// <body> END LOOP;`. Same shape as ForQuery but the SELECT is
+    /// computed at runtime from a text expression, parsed on the
+    /// fly, then iterated. Enables dynamic queries where the
+    /// projection / FROM / WHERE clauses depend on runtime values.
+    ForExecute {
+        var: String,
+        sql_expr: Expr,
+        body: Vec<PlPgSqlStmt>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3705,6 +3715,17 @@ impl fmt::Display for PlPgSqlStmt {
             Self::ExecuteDynamic { sql } => write!(f, "EXECUTE {sql}"),
             Self::ForQuery { var, query, body } => {
                 writeln!(f, "FOR {var} IN ({query}) LOOP")?;
+                for s in body {
+                    writeln!(f, "  {s};")?;
+                }
+                f.write_str("END LOOP")
+            }
+            Self::ForExecute {
+                var,
+                sql_expr,
+                body,
+            } => {
+                writeln!(f, "FOR {var} IN EXECUTE {sql_expr} LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
