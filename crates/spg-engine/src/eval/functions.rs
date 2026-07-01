@@ -6147,6 +6147,95 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — pg_lsn operator support fns.
+        // These accept text-form LSN strings (SPG doesn't have a
+        // pg_lsn type yet; text is the wire format PG uses too).
+        "pg_lsn_larger" | "pg_lsn_smaller" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            fn as_lsn(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
+                let s = match v {
+                    Value::Null => return Ok(None),
+                    Value::Text(s) => s.to_string(),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "pg_lsn_*(): args must be text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                let (hi, lo) = s.split_once('/').ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_lsn_*(): bad LSN {s:?}"
+                        ),
+                    }
+                })?;
+                let hi_u = u32::from_str_radix(hi, 16).map_err(|_| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_lsn_*(): bad LSN high {hi:?}"
+                        ),
+                    }
+                })?;
+                let lo_u = u32::from_str_radix(lo, 16).map_err(|_| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_lsn_*(): bad LSN low {lo:?}"
+                        ),
+                    }
+                })?;
+                Ok(Some(((hi_u as i64) << 32) | lo_u as i64))
+            }
+            let a = match as_lsn(&args[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let b = match as_lsn(&args[1])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let picked = if name == "pg_lsn_larger" {
+                a.max(b)
+            } else {
+                a.min(b)
+            };
+            let hi = ((picked >> 32) & 0xFFFF_FFFF) as u32;
+            let lo = (picked & 0xFFFF_FFFF) as u32;
+            Ok(Value::text::<String>(alloc::format!("{hi:X}/{lo:X}")))
+        }
+        // pg_lsn_hash returns a hash for the LSN (for hash indexes).
+        "pg_lsn_hash" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pg_lsn_hash() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let s = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "pg_lsn_hash(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Same FNV-1a hasher as hashtext.
+            let mut h: u32 = 0x811c_9dc5;
+            for b in s.as_bytes() {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            Ok(Value::Int(h as i32))
+        }
         // v7.37.17 (17.6 siblings) — SPG-specific introspection.
         // These aren't PG functions but SPG operators emit them
         // from spgctl / monitoring dashboards.
