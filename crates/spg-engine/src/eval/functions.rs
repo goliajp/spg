@@ -1591,6 +1591,16 @@ fn apply_function_dispatch(
         "current_database" | "database" => Ok(Value::text("spg")),
         "current_schema" => Ok(Value::text::<String>("public".into())),
         "current_user" | "session_user" | "user" => Ok(Value::text::<String>("admin".into())),
+        // v7.37.17 (17.6 siblings) — SQL:2003 spelling variants.
+        // CURRENT_CATALOG is the SQL-standard synonym for
+        // CURRENT_DATABASE; CURRENT_ROLE is the SQL-standard synonym
+        // for CURRENT_USER. pg_dump uses them in a few places
+        // (SECURITY LABEL FOR / event-trigger owner assignment)
+        // and PG psql accepts both. Mirror CURRENT_DATABASE /
+        // CURRENT_USER so drivers that emit the SQL-standard names
+        // don't get "unknown function" errors.
+        "current_catalog" => Ok(Value::text("spg")),
+        "current_role" => Ok(Value::text::<String>("admin".into())),
         // v7.37.43-T4 — PG advisory locks. SPG is single-writer +
         // single-process; the engine holds its own exclusive RwLock
         // on the write path, so there's no concurrent-writer race
