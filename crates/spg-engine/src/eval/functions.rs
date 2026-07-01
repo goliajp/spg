@@ -1919,6 +1919,159 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — array_remove(arr, val) returns
+        // the array with every occurrence of val removed. NULL
+        // passthrough on NULL array. NULL needle removes NULL items.
+        "array_remove" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_remove() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::IntArray(items), needle_v) => {
+                    if matches!(needle_v, Value::Null) {
+                        let out: alloc::vec::Vec<Option<i32>> =
+                            items.iter().filter(|o| o.is_some()).copied().collect();
+                        return Ok(Value::IntArray(out));
+                    }
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "array_remove(): needle type {:?} doesn't match IntArray",
+                                    needle_v.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let out: alloc::vec::Vec<Option<i32>> = items
+                        .iter()
+                        .filter(|o| o.map(i64::from) != Some(needle))
+                        .copied()
+                        .collect();
+                    Ok(Value::IntArray(out))
+                }
+                (Value::BigIntArray(items), needle_v) => {
+                    if matches!(needle_v, Value::Null) {
+                        let out: alloc::vec::Vec<Option<i64>> =
+                            items.iter().filter(|o| o.is_some()).copied().collect();
+                        return Ok(Value::BigIntArray(out));
+                    }
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "array_remove(): needle type {:?} doesn't match BigIntArray",
+                                    needle_v.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let out: alloc::vec::Vec<Option<i64>> = items
+                        .iter()
+                        .filter(|o| **o != Some(needle))
+                        .copied()
+                        .collect();
+                    Ok(Value::BigIntArray(out))
+                }
+                (other, _) => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_remove() first arg must be array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — array_replace(arr, from, to)
+        // returns the array with every occurrence of `from` replaced
+        // with `to`. NULL passthrough on NULL array. NULL from
+        // replaces NULL items with to.
+        "array_replace" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_replace() takes 3 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1], &args[2]) {
+                (Value::IntArray(items), from_v, to_v) => {
+                    let from = match from_v {
+                        Value::Null => None,
+                        Value::Int(n) => Some(*n),
+                        Value::SmallInt(n) => Some(i32::from(*n)),
+                        Value::BigInt(n) => i32::try_from(*n).ok(),
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "array_replace(): from must be integer".into(),
+                            });
+                        }
+                    };
+                    let to = match to_v {
+                        Value::Null => None,
+                        Value::Int(n) => Some(*n),
+                        Value::SmallInt(n) => Some(i32::from(*n)),
+                        Value::BigInt(n) => i32::try_from(*n).ok(),
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "array_replace(): to must be integer".into(),
+                            });
+                        }
+                    };
+                    let out: alloc::vec::Vec<Option<i32>> = items
+                        .iter()
+                        .map(|o| if *o == from { to } else { *o })
+                        .collect();
+                    Ok(Value::IntArray(out))
+                }
+                (Value::BigIntArray(items), from_v, to_v) => {
+                    let from = match from_v {
+                        Value::Null => None,
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "array_replace(): from must be integer".into(),
+                            });
+                        }
+                    };
+                    let to = match to_v {
+                        Value::Null => None,
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "array_replace(): to must be integer".into(),
+                            });
+                        }
+                    };
+                    let out: alloc::vec::Vec<Option<i64>> = items
+                        .iter()
+                        .map(|o| if *o == from { to } else { *o })
+                        .collect();
+                    Ok(Value::BigIntArray(out))
+                }
+                (other, _, _) => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_replace() first arg must be array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — array_positions(arr, val)
         // returns an IntArray of all 1-based indices where val
         // occurs in arr. NULL if arr is NULL. Empty array if not
