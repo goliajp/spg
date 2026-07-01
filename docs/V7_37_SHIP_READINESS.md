@@ -69,8 +69,9 @@ not gated on those).
 ### Real scalar functions shipped (v7.37.17 autorun slice — expanded)
 
 Real implementations, not stubs. Total shipped this cycle:
-~90 more scalar helpers across ~35 commits, verified against
-known vectors or reference values where possible.
+~450 scalar helpers across 170+ commits, verified against
+known vectors or reference values where possible. Autorun cycle
+is 198 commits ahead of develop, 171 feats since v7.37.18 tag.
 
 Cryptographic surface:
 - pgcrypto `digest(data, algo)` — dispatches to md5/sha1/sha224/
@@ -143,6 +144,62 @@ Filesystem / storage adjacency:
 Sequences:
 - `pg_sequence_last_value` / `pg_sequence_parameters` → NULL until
   real regclass lookup.
+
+Monitoring probes shipped (later in cycle — ~180 more probes):
+- pg_stat_reset family (9);
+- pg_stat_get_db_* family (31 per-database);
+- pg_stat_get_bgwriter/wal/archiver + per-table probes (57);
+- pg_stat_get_function_* + pg_stat_get_slru_* (14);
+- pg_stat_get_wal/io + recovery_prefetch + PG 17+ checkpointer (17);
+- pg_stat_get scan-position + tuple accessors (12);
+- WAL utility + admin action probes (14);
+- snapshot export/import + pg_visible_in_snapshot + pg_last_xid (7);
+- pg_current_wal_lsn family text '0/0' + real pg_wal_lsn_diff (6);
+- backup workflow probes (pg_backup_start/stop + legacy + labels, 8);
+- replication-origin + subscription + slot admin + progress (30);
+- start-time probes + 11 pg_stat_get_backend_* (15);
+- backend control + isolation test helpers (5);
+- WAL replay control + wait-event probes (7);
+- pg_lock_status + progress-info scalar probes (5);
+- logging + config-file probes (4);
+- xact ID + status + snapshot probes (15);
+- misc: pg_get_wait_event_type/_name, pg_read_file, etc.
+
+Extension surface (~50 more real):
+- pgcrypto `digest(data, type)` — md5/sha1/224/256/384/512 dispatch;
+- pgcrypto `hmac(data, key, type)` — RFC 4231-verified via hmac crate;
+- pgcrypto `gen_random_bytes(n)` — real random bytes to 1024-byte cap;
+- pgcrypto `gen_salt(algo)` — stub until crypt/bcrypt;
+- fuzzystrmatch `levenshtein(a, b)` — Wagner-Fischer DP;
+- fuzzystrmatch `soundex(text)` — Russell-Odell classic (Honeyman = H555);
+- fuzzystrmatch `difference(a, b)` — Soundex overlap 0-4.
+
+PG 14+/15+/16+/17+ additions (~30 real):
+- PG 14+ `bit_count(x)`, `date_bin(stride, ts, origin)`;
+- PG 15+ `regexp_count/instr/substr/like`, `unicode_version`,
+  `icu_unicode_version`, `pg_encoding_max_length`,
+  `pg_backup_start/stop`;
+- PG 16+ `array_shuffle`, `array_sample`, `date_add`, `date_subtract`,
+  `to_timestamp(double)`, `random_normal(mean, stddev)`, `unistr(text)`,
+  `pg_input_is_valid(text, type)`, `system_user`;
+- PG 17+ `random_int(min, max)`, separated `pg_stat_get_checkpointer_*`;
+- PG 9.6+ `parse_ident(qualname [, strict])`;
+- PG 11+ `starts_with(str, prefix)` + `ends_with` + alias.
+
+Interval canonicalizers (v7.37.17 real):
+- `justify_days` / `justify_hours` / `justify_interval` — 30d/24h/full
+  cascade via div_euclid/rem_euclid.
+
+Size formatting (v7.37.17 real):
+- `pg_size_bytes(text)` — human→BigInt parser (SI + IEC units);
+- `pg_size_pretty(bigint)` — upgraded from stub to real formatter;
+- `pg_bytes_pretty` — alias for pg_size_pretty;
+- `pg_object_size` / `pg_relation_size_pretty` → 0.
+
+Real trig (v7.37.17 via libm):
+- `sin/cos/tan/asin/acos/atan/atan2` (radian);
+- `sinh/cosh/tanh/asinh/acosh/atanh` (hyperbolic);
+- `sind/cosd/tand/cotd/asind/acosd/atand/atan2d` (degree).
 
 Real DML shipped:
 - `TRUNCATE [TABLE] [ONLY] <name>[, ...] [RESTART IDENTITY |
