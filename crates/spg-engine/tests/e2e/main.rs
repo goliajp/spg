@@ -159,6 +159,7 @@ mod e2e_current_setting;
 mod e2e_extension_probes;
 mod e2e_pg_stat_statements_support;
 mod e2e_spg_version;
+mod e2e_pg_lsn_ops;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
