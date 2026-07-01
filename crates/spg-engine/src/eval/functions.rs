@@ -6082,6 +6082,25 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — recovery-control probes.
+        // Streaming-replica orchestration tools (patroni, repmgr)
+        // emit these.
+        "pg_wal_replay_pause"
+        | "pg_wal_replay_resume"
+        | "pg_xlog_replay_pause"   // pre-PG 10 name
+        | "pg_xlog_replay_resume" => Ok(Value::Null),
+        "pg_get_wal_replay_pause_state" => {
+            Ok(Value::text::<String>("not paused".into()))
+        }
+        // pg_stat_get_progress_info takes a text arg naming the
+        // progress view (VACUUM/CLUSTER/CREATE_INDEX/ANALYZE/
+        // BASEBACKUP/COPY). Already handled above via NULL; keep
+        // the alt spelling for pg_stat_get_progress_info_start.
+        "pg_stat_get_progress_info_start" => Ok(Value::Null),
+        // pg_get_wait_event_type / _name — resolve wait event to
+        // its category / description. Return the text.
+        "pg_get_wait_event_type" => Ok(Value::text::<String>("Client".into())),
+        "pg_get_wait_event_name" => Ok(Value::text::<String>("Idle".into())),
         // pg_wal_lsn_diff — WAL byte-position arithmetic. Return 0
         // until real LSN types land.
         // v7.37.17 (17.6 siblings) — real pg_wal_lsn_diff(a, b)
