@@ -51,6 +51,7 @@ mod e2e_plpgsql_continue;
 mod e2e_plpgsql_execute_dynamic;
 mod e2e_plpgsql_declare_infer;
 mod e2e_plpgsql_found;
+mod e2e_plpgsql_exception;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

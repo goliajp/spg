@@ -2982,10 +2982,65 @@ impl Parser {
         }
         self.advance();
         let statements = self.parse_plpgsql_stmt_list_until_end()?;
+        // v7.37.20 (20.10) — optional EXCEPTION clause between the
+        // body's last statement and the trailing END. When present
+        // it's a series of `WHEN <cond> [OR <cond>]* THEN <body>`
+        // arms terminated by END.
+        let exception_handlers = if matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exception")
+        ) {
+            self.advance();
+            self.parse_plpgsql_exception_handlers()?
+        } else {
+            Vec::new()
+        };
         Ok(PlPgSqlBlock {
             declarations,
             statements,
+            exception_handlers,
         })
+    }
+
+    /// v7.37.20 (20.10) — parse EXCEPTION handlers `WHEN <cond>
+    /// [OR <cond>]* THEN <body>` sequence up to the trailing END.
+    fn parse_plpgsql_exception_handlers(
+        &mut self,
+    ) -> Result<Vec<crate::ast::ExceptionHandler>, ParseError> {
+        let mut out: Vec<crate::ast::ExceptionHandler> = Vec::new();
+        loop {
+            // Stop at END — the block-level trailing END LOOP / END;
+            // is handled by the caller.
+            if matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end")
+            ) {
+                return Ok(out);
+            }
+            // WHEN <cond> [OR <cond>]* THEN <body>
+            if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when"))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected WHEN or END inside EXCEPTION clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut conditions: Vec<String> = Vec::new();
+            conditions.push(self.expect_ident_like()?);
+            while matches!(self.peek(), Token::Or) {
+                self.advance();
+                conditions.push(self.expect_ident_like()?);
+            }
+            let then_kw = self.expect_ident_like()?;
+            if !then_kw.eq_ignore_ascii_case("then") {
+                return Err(self.err(alloc::format!(
+                    "expected THEN after WHEN condition list, got {then_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            out.push(crate::ast::ExceptionHandler { conditions, body });
+        }
     }
 
     /// v7.12.6 — parse the `DECLARE ... [var TYPE [:= init];]+`
@@ -3051,7 +3106,7 @@ impl Parser {
             while matches!(self.peek(), Token::Semicolon) {
                 self.advance();
             }
-            // END / ELSE / ELSIF — handled by the caller.
+            // END / ELSE / ELSIF / EXCEPTION — handled by the caller.
             if matches!(
                 self.peek(),
                 Token::Ident(s) | Token::QuotedIdent(s)
@@ -3059,6 +3114,8 @@ impl Parser {
                         || s.eq_ignore_ascii_case("else")
                         || s.eq_ignore_ascii_case("elsif")
                         || s.eq_ignore_ascii_case("elseif")
+                        || s.eq_ignore_ascii_case("exception")
+                        || s.eq_ignore_ascii_case("when")
             ) {
                 return Ok(statements);
             }
@@ -3074,7 +3131,9 @@ impl Parser {
                     if s.eq_ignore_ascii_case("end")
                         || s.eq_ignore_ascii_case("else")
                         || s.eq_ignore_ascii_case("elsif")
-                        || s.eq_ignore_ascii_case("elseif") =>
+                        || s.eq_ignore_ascii_case("elseif")
+                        || s.eq_ignore_ascii_case("exception")
+                        || s.eq_ignore_ascii_case("when") =>
                 {
                     // Final statement of the block without `;`.
                 }
