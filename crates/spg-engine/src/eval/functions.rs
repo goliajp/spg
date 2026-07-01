@@ -4597,6 +4597,86 @@ fn apply_function_dispatch(
             Ok(Value::BigInt(a - b))
         }
         "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
+        // v7.37.17 (17.6 siblings) — PG's `similar_to_escape(pattern
+        // [, escape])` converts a SQL-standard SIMILAR TO pattern
+        // to a POSIX regex string. The conversion table:
+        //   %       → .*
+        //   _       → .
+        //   [       → [
+        //   ]       → ]
+        //   |       → |
+        //   +*?{}() → same (already regex metachar)
+        //   any other char → escaped literal
+        // Result is wrapped in ^...$ so it matches the whole
+        // string, matching PG's SIMILAR TO whole-string semantics.
+        "similar_to_escape" | "similar_escape" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "similar_to_escape() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let pat = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "similar_to_escape(): pattern must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let esc: Option<char> = if args.len() == 2 {
+                match &args[1] {
+                    Value::Null => None,
+                    Value::Text(s) => {
+                        let mut chars = s.chars();
+                        chars.next()
+                    }
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "similar_to_escape(): escape must be text".into(),
+                        });
+                    }
+                }
+            } else {
+                Some('\\')
+            };
+            let mut out = alloc::string::String::from("^");
+            let mut iter = pat.chars();
+            while let Some(c) = iter.next() {
+                if Some(c) == esc {
+                    match iter.next() {
+                        Some(next) => {
+                            out.push('\\');
+                            out.push(next);
+                        }
+                        None => out.push('\\'),
+                    }
+                    continue;
+                }
+                match c {
+                    '%' => out.push_str(".*"),
+                    '_' => out.push('.'),
+                    '[' | ']' | '(' | ')' | '|' | '+' | '*' | '?' | '{' | '}' => {
+                        out.push(c);
+                    }
+                    // POSIX regex metachars that SIMILAR TO doesn't
+                    // treat as special — escape them.
+                    '.' | '^' | '$' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    _ => out.push(c),
+                }
+            }
+            out.push('$');
+            Ok(Value::text(out))
+        }
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
         // (`WHERE schemaname = current_schema()`, `SELECT *,
