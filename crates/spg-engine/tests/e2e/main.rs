@@ -96,6 +96,7 @@ mod e2e_convert_from_to;
 mod e2e_jsonb_pretty;
 mod e2e_jsonb_strip_nulls;
 mod e2e_jsonb_object_keys;
+mod e2e_array_to_json;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
