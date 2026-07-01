@@ -3062,6 +3062,71 @@ fn apply_function_dispatch(
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.37.17 (17.6 siblings) — fuzzystrmatch soundex(text)
+        // returns the 4-char Soundex code (Russell / Odell 1918
+        // classic). PG's fuzzystrmatch extension emits this. Used
+        // by name-search / duplicate-detection ORM queries and by
+        // pg_trgm's alt-search paths.
+        "soundex" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("soundex() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let s = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "soundex(): needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            fn code(c: char) -> Option<char> {
+                match c.to_ascii_uppercase() {
+                    'B' | 'F' | 'P' | 'V' => Some('1'),
+                    'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some('2'),
+                    'D' | 'T' => Some('3'),
+                    'L' => Some('4'),
+                    'M' | 'N' => Some('5'),
+                    'R' => Some('6'),
+                    _ => None,
+                }
+            }
+            let mut chars = s.chars().filter(|c| c.is_ascii_alphabetic()).peekable();
+            let mut out = alloc::string::String::new();
+            let Some(first) = chars.next() else {
+                return Ok(Value::text::<String>("".into()));
+            };
+            out.push(first.to_ascii_uppercase());
+            let mut last_code = code(first);
+            for c in chars {
+                let cur = code(c);
+                if cur.is_some() && cur != last_code {
+                    out.push(cur.unwrap());
+                    if out.len() >= 4 {
+                        break;
+                    }
+                }
+                if cur.is_some() {
+                    last_code = cur;
+                } else {
+                    // Vowels + h + w — do NOT reset last_code so
+                    // classic PG matches ('HERMAN' → 'H655', not
+                    // 'H6555').
+                    if !matches!(c.to_ascii_uppercase(), 'H' | 'W') {
+                        last_code = None;
+                    }
+                }
+            }
+            while out.len() < 4 {
+                out.push('0');
+            }
+            Ok(Value::text(out))
+        }
         // v7.37.17 (17.6 siblings) — fuzzystrmatch extension:
         // levenshtein(a, b [, ins_cost, del_cost, sub_cost])
         // returns edit distance between two texts. Common ORM

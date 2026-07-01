@@ -125,6 +125,7 @@ mod e2e_more_privilege_probes;
 mod e2e_logging_replication_probes;
 mod e2e_session_identity_probes;
 mod e2e_levenshtein;
+mod e2e_soundex;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
