@@ -1580,6 +1580,65 @@ fn apply_function_dispatch(
         // fail. `pg_get_serial_sequence` returns NULL (no
         // sequence — SPG has AUTO_INCREMENT instead).
         "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
+        // v7.37.17 (17.6 siblings) — additional pg_catalog probe
+        // helpers that ORMs / migration tools emit. All return
+        // NULL / empty text where PG would return real DDL text.
+        // Full DDL reconstruction queues with the get_ddl surface
+        // in v7.40 that reuses spgctl's DDL round-tripper.
+        "pg_get_viewdef"
+        | "pg_get_functiondef"
+        | "pg_get_triggerdef"
+        | "pg_get_ruledef"
+        | "pg_get_expr"
+        | "pg_get_partkeydef"
+        | "pg_get_statisticsobjdef" => Ok(Value::Null),
+        // pg_get_userbyid always returns "admin" — SPG's single-user
+        // model; matches CURRENT_USER default.
+        "pg_get_userbyid" => Ok(Value::text::<String>("admin".into())),
+        // pg_size_pretty(bigint) — commonly used by monitoring
+        // queries; format a byte count as a human-readable string.
+        // For now return empty text so the SELECT succeeds; real
+        // formatting queues with a size-utils bump.
+        "pg_size_pretty" => Ok(Value::text::<String>("0 bytes".into())),
+        // pg_database_size / pg_relation_size / pg_total_relation_size:
+        // monitoring dashboards + Postgres exporter emit these.
+        // Return 0 — SPG doesn't yet track per-relation on-disk
+        // size across hot + cold tiers with the same shape.
+        "pg_database_size"
+        | "pg_relation_size"
+        | "pg_total_relation_size"
+        | "pg_table_size"
+        | "pg_indexes_size" => Ok(Value::BigInt(0)),
+        // pg_encoding_to_char / pg_char_to_encoding — the encoding
+        // lookup pair. SPG always speaks UTF8 (encoding id 6).
+        "pg_encoding_to_char" => Ok(Value::text::<String>("UTF8".into())),
+        "pg_char_to_encoding" => Ok(Value::Int(6)),
+        // has_table_privilege / has_column_privilege / has_schema_privilege:
+        // permission probes ORMs emit before generating DDL. SPG
+        // is single-user, so grant everything.
+        "has_table_privilege"
+        | "has_column_privilege"
+        | "has_schema_privilege"
+        | "has_function_privilege"
+        | "has_sequence_privilege"
+        | "has_database_privilege"
+        | "has_language_privilege"
+        | "has_tablespace_privilege"
+        | "has_type_privilege" => Ok(Value::Bool(true)),
+        // pg_backend_pid — session identifier. SPG uses u64 slot
+        // ids; return a low deterministic value for embedded runs.
+        "pg_backend_pid" => Ok(Value::Int(1)),
+        // pg_conf_load_time / pg_postmaster_start_time — return
+        // process start time in the embedded case; wire-layer has
+        // real timestamps.
+        "pg_conf_load_time" | "pg_postmaster_start_time" => Ok(Value::Null),
+        // pg_notify(channel, payload) — LISTEN/NOTIFY delivery.
+        // SPG has no async notification channel yet; accept + return
+        // void (NULL).
+        "pg_notify" => Ok(Value::Null),
+        // pg_cancel_backend / pg_terminate_backend — admin-level
+        // signal helpers. Return true (as if the cancel took effect).
+        "pg_cancel_backend" | "pg_terminate_backend" => Ok(Value::Bool(true)),
         "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
