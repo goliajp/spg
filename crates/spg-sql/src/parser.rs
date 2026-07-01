@@ -4860,6 +4860,26 @@ impl Parser {
                         | "policy"
                         | "publication"
                         | "subscription"
+                        // v7.37.17 (17.6 siblings) — additional ALTER
+                        // targets pg_dump / pg_dumpall / operator DB
+                        // migration scripts commonly emit. SPG has
+                        // no matching machinery for any of these; the
+                        // parser accepts + Empty-returns so pg_dump
+                        // tail statements don't stall.
+                        | "system"
+                        | "user"
+                        | "tablespace"
+                        | "collation"
+                        | "aggregate"
+                        | "language"
+                        | "operator"
+                        | "conversion"
+                        | "statistics"
+                        | "server"
+                        | "foreign"
+                        | "text"
+                        | "event"
+                        | "large"
                 ) =>
             {
                 self.consume_until_statement_boundary();
