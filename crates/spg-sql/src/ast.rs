@@ -1077,6 +1077,12 @@ pub enum PlPgSqlStmt {
     /// which the enclosing loop catches, skipping the remainder of
     /// the body and jumping to the next iteration.
     Continue { when: Option<Expr> },
+    /// v7.37.20 (20.13) — `EXECUTE <string_expr>;` runs a runtime-
+    /// computed SQL statement. The expression is evaluated to a
+    /// text value, the resulting string is parsed and dispatched
+    /// through the engine like an EmbeddedSql. USING <param_list>
+    /// for placeholder binding queues with v7.40 PL/pgSQL epic.
+    ExecuteDynamic { sql: Expr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3663,6 +3669,7 @@ impl fmt::Display for PlPgSqlStmt {
                 }
                 Ok(())
             }
+            Self::ExecuteDynamic { sql } => write!(f, "EXECUTE {sql}"),
         }
     }
 }

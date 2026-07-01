@@ -3182,6 +3182,18 @@ impl Parser {
             };
             return Ok(PlPgSqlStmt::Exit { when });
         }
+        // v7.37.20 (20.13) — `EXECUTE <string_expr>`. Dispatches an
+        // already-parsed Statement or a runtime-computed SQL string.
+        // The disambiguator vs the extended-query-protocol `EXECUTE
+        // <stmt_name>` (which is a top-level Statement, not a
+        // plpgsql line) is that inside a DO block / trigger body the
+        // EXECUTE keyword ALWAYS refers to dynamic SQL.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("execute"))
+        {
+            self.advance();
+            let sql = self.parse_expr(0)?;
+            return Ok(PlPgSqlStmt::ExecuteDynamic { sql });
+        }
         // v7.37.20 (20.2) — `CONTINUE [WHEN <cond>]` inside a loop.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("continue"))
         {
