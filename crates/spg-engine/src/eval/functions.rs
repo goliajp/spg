@@ -3377,6 +3377,20 @@ fn apply_function_dispatch(
             }
             Ok(Value::Int(prev[short.len()]))
         }
+        // v7.37.17 (17.6 siblings) — replication-slot + subscription
+        // + progress-info stat probes emitted by postgres_exporter
+        // and Prometheus replication-lag scrapes.
+        "pg_stat_get_replication_slot"
+        | "pg_stat_get_subscription"
+        | "pg_stat_get_subscription_stats"
+        | "pg_stat_get_slru"
+        | "pg_stat_get_progress_info" => Ok(Value::Null),
+        // pg_stat_get_wal_senders / _receivers — return NULL for
+        // scalar surface; row surface via pg_stat_replication view.
+        "pg_stat_get_wal_senders" | "pg_stat_get_wal_receivers" => Ok(Value::Null),
+        // pg_stat_get_backend_client_addr fallback (v7.37.17 slice
+        // handled parent; keep alt name too).
+        "pg_stat_get_client_addr" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — PG 16+ pg_input_is_valid(
         // text, type_name) probes whether a text value can be
         // parsed as the given type. Real implementation attempts
