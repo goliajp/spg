@@ -6147,6 +6147,63 @@ fn apply_function_dispatch(
         // recovery status probes. SPG is primary-only in the drop-in
         // model.
         "pg_is_in_recovery" | "pg_is_wal_replay_paused" => Ok(Value::Bool(false)),
+        // v7.37.17 (17.6 siblings) — PG 13+ normalize(text [, form])
+        // + is_normalized(text [, form]). Real Unicode normalization
+        // via the unicode-normalization crate. Forms: NFC (default),
+        // NFD, NFKC, NFKD.
+        "normalize" | "is_normalized" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 or 2 args, got {}", args.len()),
+                });
+            }
+            let s = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let form = if args.len() == 2 {
+                match &args[1] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(f) => f.to_ascii_uppercase(),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): form must be text"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                alloc::string::String::from("NFC")
+            };
+            use unicode_normalization::UnicodeNormalization;
+            let normalized: alloc::string::String = match form.as_str() {
+                "NFC" => s.nfc().collect(),
+                "NFD" => s.nfd().collect(),
+                "NFKC" => s.nfkc().collect(),
+                "NFKD" => s.nfkd().collect(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}(): unknown form {other:?}; use NFC/NFD/NFKC/NFKD"
+                        ),
+                    });
+                }
+            };
+            if name == "normalize" {
+                Ok(Value::text(normalized))
+            } else {
+                Ok(Value::Bool(normalized == s))
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG 13+ numeric scale helpers.
         //   scale(numeric)      — declared scale of the value
         //   min_scale(numeric)  — minimum scale to represent exactly

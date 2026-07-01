@@ -39,6 +39,9 @@ hmac        = { version = "0.12", default-features = false }
 # `libm` is pure-Rust no_std C math library port, already
 # transitively in the workspace via wasmtime/other crates.
 libm        = { version = "0.2", default-features = false }
+# v7.37.17 (17.6 siblings) — PG 13+ normalize(text, form) Unicode
+# normalization. Already transitively in the lock graph.
+unicode-normalization = { version = "0.1", default-features = false }
 
 [features]
 # v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
