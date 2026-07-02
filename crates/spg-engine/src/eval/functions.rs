@@ -3753,6 +3753,142 @@ fn apply_function_dispatch(
                 _ => unreachable!(),
             }
         }
+        // MySQL quote(str) — single-quoted literal with backslash
+        // escaping; SQL NULL renders as the word NULL (no quotes).
+        "quote" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("quote() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::text::<String>("NULL".into())),
+                Value::Text(s) => {
+                    let mut out = alloc::string::String::with_capacity(s.len() + 2);
+                    out.push('\'');
+                    for c in s.chars() {
+                        match c {
+                            '\'' => out.push_str("\\'"),
+                            '\\' => out.push_str("\\\\"),
+                            '\0' => out.push_str("\\0"),
+                            '\u{1a}' => out.push_str("\\Z"),
+                            other => out.push(other),
+                        }
+                    }
+                    out.push('\'');
+                    Ok(Value::text(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "quote() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL export_set(bits, on, off[, separator[, n_bits]]) —
+        // one on/off string per bit, LSB first.
+        "export_set" => {
+            if !(3..=5).contains(&args.len()) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "export_set() takes 3-5 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let bits = match &args[0] {
+                Value::Int(n) => *n as i64 as u64,
+                Value::BigInt(n) => *n as u64,
+                Value::SmallInt(n) => *n as i64 as u64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "export_set() bits must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let text_of = |v: &Value<'_>, what: &str| -> Result<alloc::string::String, EvalError> {
+                match v {
+                    Value::Text(s) => Ok(s.as_ref().into()),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "export_set() {what} must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            let on = text_of(&args[1], "on")?;
+            let off = text_of(&args[2], "off")?;
+            let sep = match args.get(3) {
+                Some(v) => text_of(v, "separator")?,
+                None => ",".into(),
+            };
+            let n_bits = match args.get(4) {
+                Some(Value::Int(n)) => (*n).clamp(0, 64) as u32,
+                Some(Value::BigInt(n)) => (*n).clamp(0, 64) as u32,
+                Some(Value::SmallInt(n)) => i32::from(*n).clamp(0, 64) as u32,
+                None => 64,
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "export_set() n_bits must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut parts = alloc::vec::Vec::with_capacity(n_bits as usize);
+            for i in 0..n_bits {
+                parts.push(if bits & (1u64 << i) != 0 {
+                    on.clone()
+                } else {
+                    off.clone()
+                });
+            }
+            Ok(Value::text(parts.join(&sep)))
+        }
+        // MySQL make_set(bits, str1, str2, ...) — the strings whose
+        // bit is set, comma-joined; NULL members skipped.
+        "make_set" => {
+            if args.len() < 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "make_set() takes 2+ args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let bits = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => *n as i64 as u64,
+                Value::BigInt(n) => *n as u64,
+                Value::SmallInt(n) => *n as i64 as u64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "make_set() bits must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+            for (i, member) in args[1..].iter().enumerate() {
+                if bits & (1u64 << i) != 0 {
+                    if let Value::Text(s) = member {
+                        parts.push(s.as_ref());
+                    }
+                }
+            }
+            Ok(Value::text(parts.join(",")))
+        }
         // MySQL bare date-component accessors — day / dayofmonth /
         // month / year / weekday / week. The single most common
         // MySQL report shape (`SELECT MONTH(created_at) ...`).
@@ -7107,7 +7243,8 @@ fn apply_function_dispatch(
                 }
             }
         }
-        "trunc" => {
+        // "truncate" is the MySQL name for 2-arg trunc.
+        "trunc" | "truncate" => {
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
