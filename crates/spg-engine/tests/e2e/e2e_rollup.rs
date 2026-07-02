@@ -126,3 +126,42 @@ fn grouping_sets_explicit_list() {
             && as_i64(&r[2]) == 3
     }));
 }
+
+#[test]
+fn grouping_marker_bitmask() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE gm (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("INSERT INTO gm VALUES ('x', 'p', 1), ('y', 'q', 2)")
+        .unwrap();
+    // grouping(a, b): detail rows 0, per-a subtotal 1 (b dropped),
+    // grand total 3 (both dropped).
+    let got = rows(
+        &mut e,
+        "SELECT a, b, SUM(v), grouping(a, b) FROM gm \
+         GROUP BY ROLLUP(a, b) ORDER BY 4, 1 NULLS LAST",
+    );
+    assert_eq!(got.len(), 5); // 2 detail + 2 per-a + 1 grand.
+    assert_eq!(as_i64(&got[0][3]), 0);
+    assert_eq!(as_i64(&got[1][3]), 0);
+    assert_eq!(as_i64(&got[2][3]), 1);
+    assert_eq!(as_i64(&got[3][3]), 1);
+    assert_eq!(as_i64(&got[4][3]), 3);
+}
+
+#[test]
+fn grouping_in_case_labels_subtotals() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE gl (k TEXT, v INT)").unwrap();
+    e.execute("INSERT INTO gl VALUES ('x', 1), ('y', 2)").unwrap();
+    let got = rows(
+        &mut e,
+        "SELECT CASE WHEN grouping(k) = 1 THEN 'TOTAL' ELSE k END, SUM(v) \
+         FROM gl GROUP BY ROLLUP(k) ORDER BY 2",
+    );
+    assert_eq!(got.len(), 3);
+    // The grand-total row is labelled instead of NULL.
+    assert!(got.iter().any(|r| {
+        matches!(&r[0], spg_storage::Value::Text(s) if s == "TOTAL")
+            && as_i64(&r[1]) == 3
+    }));
+}

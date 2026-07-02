@@ -6565,6 +6565,64 @@ impl Parser {
     /// just `[DISTINCT] items [FROM] [WHERE] [GROUP BY]`. Returned with
     /// `unions` empty and `order_by` / `limit` `None`; the top-level
     /// `parse_select_stmt` is responsible for filling those in.
+    /// v7.37.17 (17.6 siblings) — rewrite every `grouping(keys…)`
+    /// call in the expression tree to the per-set integer bitmask
+    /// (PG semantics: one bit per argument, MSB first; 1 = the key
+    /// is dropped in this grouping set). Runs during the ROLLUP /
+    /// CUBE / GROUPING SETS expansion, where the set is known.
+    fn substitute_grouping_calls(expr: &mut Expr, dropped: &[Expr]) {
+        if let Expr::FunctionCall { name, args } = expr
+            && name.eq_ignore_ascii_case("grouping")
+        {
+            let mut mask: i64 = 0;
+            for a in args.iter() {
+                mask <<= 1;
+                if dropped.iter().any(|d| d == a) {
+                    mask |= 1;
+                }
+            }
+            *expr = Expr::Literal(Literal::Integer(mask));
+            return;
+        }
+        // Generic recursion over the common expression shapes the
+        // SELECT list uses; anything without child expressions is
+        // left alone.
+        match expr {
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::substitute_grouping_calls(a, dropped);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::substitute_grouping_calls(lhs, dropped);
+                Self::substitute_grouping_calls(rhs, dropped);
+            }
+            Expr::Unary { expr: inner, .. } => {
+                Self::substitute_grouping_calls(inner, dropped);
+            }
+            Expr::Cast { expr: inner, .. } => {
+                Self::substitute_grouping_calls(inner, dropped);
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(op) = operand {
+                    Self::substitute_grouping_calls(op, dropped);
+                }
+                for (w, t) in branches {
+                    Self::substitute_grouping_calls(w, dropped);
+                    Self::substitute_grouping_calls(t, dropped);
+                }
+                if let Some(e) = else_branch {
+                    Self::substitute_grouping_calls(e, dropped);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn parse_bare_select(&mut self) -> Result<SelectStatement, ParseError> {
         // v7.37.17 (17.6 siblings) — parenthesized set-operation
         // group: `( <select chain> )` usable anywhere a query block
@@ -6906,21 +6964,32 @@ impl Parser {
                 } else {
                     Some(set.clone())
                 };
+                let dropped_owned: Vec<Expr> = dropped.iter().map(|d| (*d).clone()).collect();
                 for item in &mut peer.items {
-                    if let SelectItem::Expr { expr, .. } = item
-                        && dropped.iter().any(|d| *d == expr)
-                    {
-                        *expr = Expr::Literal(Literal::Null);
+                    if let SelectItem::Expr { expr, .. } = item {
+                        if dropped.iter().any(|d| *d == expr) {
+                            *expr = Expr::Literal(Literal::Null);
+                        } else {
+                            Self::substitute_grouping_calls(expr, &dropped_owned);
+                        }
                     }
+                }
+                if let Some(h) = &mut peer.having {
+                    Self::substitute_grouping_calls(h, &dropped_owned);
                 }
                 stmt.unions.push((UnionKind::All, peer));
             }
             for item in &mut stmt.items {
-                if let SelectItem::Expr { expr, .. } = item
-                    && head_dropped.iter().any(|d| d == expr)
-                {
-                    *expr = Expr::Literal(Literal::Null);
+                if let SelectItem::Expr { expr, .. } = item {
+                    if head_dropped.iter().any(|d| d == expr) {
+                        *expr = Expr::Literal(Literal::Null);
+                    } else {
+                        Self::substitute_grouping_calls(expr, &head_dropped);
+                    }
                 }
+            }
+            if let Some(h) = &mut stmt.having {
+                Self::substitute_grouping_calls(h, &head_dropped);
             }
         }
         Ok(stmt)
