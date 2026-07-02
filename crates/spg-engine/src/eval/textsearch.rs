@@ -902,3 +902,82 @@ pub(super) fn fts_ts_headline(
     flush(&mut word, &mut out);
     Ok(Value::text(out))
 }
+
+/// v7.37.17 (17.6 siblings) — `ts_rewrite(query, target,
+/// substitute)`: replaces every occurrence of the `target` subtree
+/// inside `query` with `substitute` — the synonym-expansion
+/// primitive (`ts_rewrite('a & b', 'a', 'foo|bar')`). Structural
+/// subtree equality; the SELECT-driven catalog form
+/// (`ts_rewrite(query, 'SELECT t, s FROM aliases')`) is not
+/// supported — it needs a query-in-function executor.
+pub(super) fn fts_ts_rewrite(
+    args: &[Value<'_>],
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "ts_rewrite() takes 3 args (query, target, substitute), got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let config = match ctx.default_text_search_config {
+        Some(name_str) => {
+            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::Simple)
+        }
+        None => crate::fts::TsConfig::Simple,
+    };
+    let as_query = |v: &Value<'_>, which: &str| -> Result<spg_storage::TsQueryAst, EvalError> {
+        match v {
+            Value::TsQuery(q) => Ok(q.clone()),
+            // Unknown string literals resolve through the tsquery
+            // input parser, as in PG.
+            Value::Text(s) => crate::fts::to_tsquery(config, s),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "ts_rewrite() {which} must be tsquery, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        }
+    };
+    let query = as_query(&args[0], "query")?;
+    let target = as_query(&args[1], "target")?;
+    let substitute = as_query(&args[2], "substitute")?;
+    fn rewrite(
+        node: &spg_storage::TsQueryAst,
+        target: &spg_storage::TsQueryAst,
+        substitute: &spg_storage::TsQueryAst,
+    ) -> spg_storage::TsQueryAst {
+        if node == target {
+            return substitute.clone();
+        }
+        use spg_storage::TsQueryAst as A;
+        match node {
+            A::Term { .. } => node.clone(),
+            A::And(l, r) => A::And(
+                Box::new(rewrite(l, target, substitute)),
+                Box::new(rewrite(r, target, substitute)),
+            ),
+            A::Or(l, r) => A::Or(
+                Box::new(rewrite(l, target, substitute)),
+                Box::new(rewrite(r, target, substitute)),
+            ),
+            A::Not(x) => A::Not(Box::new(rewrite(x, target, substitute))),
+            A::Phrase {
+                left,
+                right,
+                distance,
+            } => A::Phrase {
+                left: Box::new(rewrite(left, target, substitute)),
+                right: Box::new(rewrite(right, target, substitute)),
+                distance: *distance,
+            },
+        }
+    }
+    Ok(Value::TsQuery(rewrite(&query, &target, &substitute)))
+}

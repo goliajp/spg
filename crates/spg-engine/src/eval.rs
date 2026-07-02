@@ -78,8 +78,8 @@ pub use textsearch::{
 };
 use textsearch::{
     fts_phraseto_tsquery, fts_plainto_tsquery, fts_setweight, fts_to_tsquery, fts_to_tsvector,
-    fts_ts_headline, fts_ts_rank, fts_ts_rank_cd, fts_websearch_to_tsquery, ts_match,
-    tsvector_concat,
+    fts_ts_headline, fts_ts_rank, fts_ts_rank_cd, fts_ts_rewrite, fts_websearch_to_tsquery,
+    ts_match, tsvector_concat,
 };
 pub use values::gen_random_uuid_bytes;
 use values::{value_cmp_for_min_max, value_to_f64, value_to_text, values_equal_for_nullif};
