@@ -154,6 +154,8 @@ pub fn is_aggregate_name(name: &str) -> bool {
             | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
             // v7.32 (round-29) — JSON aggregates.
             | "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
+            // SQL:2016 standard spellings (PG 16+ accepts both).
+            | "json_arrayagg" | "json_objectagg"
     )
 }
 
@@ -183,6 +185,7 @@ fn agg_uses_second_arg(name: &str) -> bool {
     name == "string_agg"
         || name == "json_object_agg"
         || name == "jsonb_object_agg"
+        || name == "json_objectagg"
         || is_regression_name(name)
 }
 
@@ -278,8 +281,10 @@ fn classify_agg_name(name: &str) -> AggKind {
         "bit_and" => AggKind::BitAnd,
         "bit_or" => AggKind::BitOr,
         "bit_xor" => AggKind::BitXor,
-        "json_agg" | "jsonb_agg" => AggKind::JsonAgg,
-        "json_object_agg" | "jsonb_object_agg" => AggKind::JsonObjectAgg,
+        "json_agg" | "jsonb_agg" | "json_arrayagg" => AggKind::JsonAgg,
+        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => {
+            AggKind::JsonObjectAgg
+        }
         n if is_within_group_name(n) => AggKind::WithinGroup,
         n if is_regression_name(n) => AggKind::Regression,
         other => panic!("classify_agg_name: unknown aggregate {other}"),
@@ -2393,14 +2398,16 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 | "stddev" | "stddev_samp" | "stddev_pop"
                 | "variance" | "var_samp" | "var_pop"
                 | "bit_and" | "bit_or" | "bit_xor"
-                | "json_agg" | "jsonb_agg" | "group_concat" | "xmlagg" => Some(1),
+                | "json_agg" | "jsonb_agg" | "group_concat" | "xmlagg"
+                | "json_arrayagg" => Some(1),
                 // v7.32 (round-29) — two-argument aggregates: string_agg,
                 // the regression family f(Y, X), and json_object_agg.
                 "string_agg"
                 | "covar_pop" | "covar_samp" | "corr"
                 | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
                 | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
-                | "json_object_agg" | "jsonb_object_agg" => Some(2),
+                | "json_object_agg" | "jsonb_object_agg"
+                | "json_objectagg" => Some(2),
                 _ => None,
             };
             if let Some(want) = expected
@@ -3127,7 +3134,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — json_agg / jsonb_agg: a JSON array of every
         // collected element in row order; empty set → SQL NULL.
-        "json_agg" | "jsonb_agg" => {
+        "json_agg" | "jsonb_agg" | "json_arrayagg" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
@@ -3143,7 +3150,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — json_object_agg: a JSON object built from
         // the parallel key (`items`) / value (`aux_items`) streams.
-        "json_object_agg" | "jsonb_object_agg" => {
+        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
@@ -3355,7 +3362,8 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // v7.32 (round-29) — hypothetical-set distribution functions.
         "percent_rank" | "cume_dist" => DataType::Float,
         // v7.32 (round-29) — JSON aggregates return JSON.
-        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" => DataType::Json,
+        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
+        | "json_arrayagg" | "json_objectagg" => DataType::Json,
         // min/max, percentile_disc, mode, and anything pass-through:
         // the argument's shape (for ordered-set aggs `spec.arg` is the
         // WITHIN GROUP value expression).
