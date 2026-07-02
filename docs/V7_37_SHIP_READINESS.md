@@ -69,9 +69,57 @@ not gated on those).
 ### Real scalar functions shipped (v7.37.17 autorun slice — expanded)
 
 Real implementations, not stubs. Total shipped this cycle:
-~450 scalar helpers across 170+ commits, verified against
-known vectors or reference values where possible. Autorun cycle
-is 198 commits ahead of develop, 171 feats since v7.37.18 tag.
+~560 scalar helpers across 220+ commits, verified against
+known vectors or reference values where possible (MySQL and
+PG doc vectors, openssl cross-checks, RFC test vectors).
+
+Late-cycle additions (tasks #251-#279) on top of the sections
+below:
+
+- **Regex engine backtracking fix** — quantifier matching was
+  greedy-without-backtracking (self-documented v7.17 stop-gap);
+  'bar.*que' failed against 'foobarbequebaz'. New re_match_seq
+  backtracking sequence matcher corrects the whole regexp
+  family. + `regexp_match` (PG 10+ singular form).
+- **pgcrypto real crypt()** — FreeBSD md5crypt ('$1$'), vector
+  verified against `openssl passwd -1`; gen_salt('md5') real
+  random salt; armor/dearmor real RFC 4880 ASCII armor with
+  CRC-24; bcrypt/DES/PGP-encryption error honestly.
+- **to_date / to_timestamp(text, fmt)** — real format-template
+  parser (YYYY/MM/DD/HH24/HH12/MI/SS/MS/US + MON/MONTH + AM/PM);
+  to_date previously had NO implementation.
+- **MySQL-compat surface (7 batches)** — locate/instr/
+  substring_index/find_in_set/elt/field/space; hex/unhex/conv/
+  bin/oct/ord + mid/lcase/ucase; dayname/monthname/dayofweek/
+  dayofyear/weekofyear/last_day/datediff/strcmp; quarter/
+  to_days/from_days/makedate/yearweek; time_to_sec/sec_to_time/
+  maketime/addtime/subtime/timediff/microsecond; day/month/
+  year/hour/minute/second/weekday/week + period_add/period_diff;
+  quote/export_set/make_set/truncate; rand/connection_id/
+  uuid_short/is_uuid + session probes. All MySQL doc vectors.
+- **Operator↔function-name pairing** — json_object_field /
+  json_array_element (+_text, jsonb_ twins, 8 names) for -> ->>;
+  jsonb_exists/_any/_all/contains/contained for ? ?| ?& @> <@;
+  textcat/byteacat for ||; 24 *_larger/*_smaller MAX/MIN
+  internals.
+- **FTS completion** — ts_delete/ts_filter/tsquery_phrase;
+  tsvector_to_array/array_to_tsvector/get_current_ts_config/
+  ts_lexize; json(b)_to_tsvector.
+- **Correctness fixes** — range bound predicates (lower_inc
+  etc.) upgraded from wrong constant-false stubs to real
+  text-form parsing + range_merge; age(xid) overload unblocks
+  wraparound monitoring (was a type error).
+- **Misc real** — cash_words (number-to-English), to_ascii
+  (NFD accent strip), inet_merge (common-prefix), macaddr8_set7bit,
+  xmltext/xmlconcat, jsonb_set_lax (all 4 null treatments),
+  acldefault/makeaclitem, cot/log2, uuidv7 + uuid v3/v5,
+  normalize/is_normalized, num_nulls/num_nonnulls, scale/
+  min_scale/trim_scale, current_schemas, getdatabaseencoding.
+- **Probe batches** — pageinspect (27 names), pgstattuple,
+  pg_prewarm, logical decoding consumers, binary_upgrade_*,
+  event-trigger readers, SRF metadata readers (pg_get_keywords,
+  pg_timezone_names, ...), collation versioning (aligned with
+  Unicode 15.0, single provider = no mismatch warnings).
 
 Cryptographic surface:
 - pgcrypto `digest(data, algo)` — dispatches to md5/sha1/sha224/
