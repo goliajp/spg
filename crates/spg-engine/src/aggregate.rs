@@ -123,6 +123,10 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // aggregate".
             | "string_agg"
             | "array_agg"
+            // PG 16+ — any_value: an arbitrary non-NULL value from
+            // the group (SPG: the first seen, deterministic for
+            // ordered input).
+            | "any_value"
             // v7.17.0 — boolean aggregates. `every` is SQL-standard
             // alias for `bool_and`.
             | "bool_and"
@@ -226,6 +230,8 @@ enum AggKind {
     Avg,
     Min,
     Max,
+    /// PG 16+ any_value — first non-NULL value seen.
+    AnyValue,
     StringAgg,
     ArrayAgg,
     BoolAnd,
@@ -257,6 +263,7 @@ fn classify_agg_name(name: &str) -> AggKind {
         "avg" => AggKind::Avg,
         "min" => AggKind::Min,
         "max" => AggKind::Max,
+        "any_value" => AggKind::AnyValue,
         "string_agg" => AggKind::StringAgg,
         "array_agg" => AggKind::ArrayAgg,
         "bool_and" => AggKind::BoolAnd,
@@ -1465,6 +1472,14 @@ fn accumulate_groups(
                             }
                         }
                     }
+                    AggKind::AnyValue => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            if st.extreme.is_none() {
+                                st.extreme = Some(arg_ref.clone().into_owned());
+                            }
+                        }
+                    }
                     AggKind::CountStar => {
                         entry.1[i].count += 1;
                     }
@@ -1773,6 +1788,14 @@ fn accumulate_groups(
                                 Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
                             };
                             if upd {
+                                st.extreme = Some(arg_ref.clone().into_owned());
+                            }
+                        }
+                    }
+                    AggKind::AnyValue => {
+                        if !matches!(arg_ref, Value::Null) {
+                            let st = &mut entry.1[i];
+                            if st.extreme.is_none() {
                                 st.extreme = Some(arg_ref.clone().into_owned());
                             }
                         }
@@ -2356,6 +2379,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             let expected: Option<usize> = match lower.as_str() {
                 "count_star" => Some(0),
                 "count" | "sum" | "avg" | "min" | "max" | "array_agg"
+                | "any_value"
                 // v7.17.0 — boolean aggregates also take exactly
                 // one arg. `every` is an alias normalised inside
                 // collect_aggregates / rewrite_expr.
@@ -2712,6 +2736,14 @@ fn update_state(
                 }
             }
         }
+        AggKind::AnyValue => {
+            if is_null {
+                return Ok(());
+            }
+            if st.extreme.is_none() {
+                st.extreme = Some(v.clone().into_owned());
+            }
+        }
         AggKind::Max => {
             if is_null {
                 return Ok(());
@@ -2917,7 +2949,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 Value::Float(total / (st.count as f64))
             }
         }
-        "min" | "max" => st.extreme.clone().unwrap_or(Value::Null),
+        "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
         // v7.17.0 — string_agg: join all collected text items with
         // the captured separator. Empty / all-NULL group → NULL
         // (PG semantics).
