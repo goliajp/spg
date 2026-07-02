@@ -262,6 +262,18 @@ pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
                 t.rem_euclid(86_400_000_000),
             )
         }
+        // MySQL accepts string datetimes anywhere a DATETIME is
+        // expected.
+        Value::Text(s) => {
+            let t = parse_text_datetime(s).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("date_format(): cannot parse datetime {s:?}"),
+            })?;
+            let days = t.div_euclid(86_400_000_000);
+            (
+                i32::try_from(days).unwrap_or(i32::MAX),
+                t.rem_euclid(86_400_000_000),
+            )
+        }
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
@@ -958,4 +970,95 @@ pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, 
         }
     };
     Ok(Value::BigInt(out))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL GET_FORMAT({DATE|TIME|DATETIME},
+/// {'EUR'|'USA'|'JIS'|'ISO'|'INTERNAL'}): the fixed format-string
+/// table from the MySQL manual. The parser lowers the bare type
+/// keyword onto a string literal.
+pub(super) fn get_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("get_format() takes 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let (Value::Text(kind), Value::Text(region)) = (&args[0], &args[1]) else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "get_format() takes (type keyword, region text), got ({:?}, {:?})",
+                args[0].data_type(),
+                args[1].data_type()
+            ),
+        });
+    };
+    let fmt = match (
+        kind.to_ascii_lowercase().as_str(),
+        region.to_ascii_uppercase().as_str(),
+    ) {
+        ("date", "USA") => "%m.%d.%Y",
+        ("date", "JIS" | "ISO") => "%Y-%m-%d",
+        ("date", "EUR") => "%d.%m.%Y",
+        ("date", "INTERNAL") => "%Y%m%d",
+        ("datetime" | "timestamp", "USA" | "JIS" | "ISO") => "%Y-%m-%d %H.%i.%s",
+        ("datetime" | "timestamp", "EUR") => "%Y-%m-%d %H.%i.%s",
+        ("datetime" | "timestamp", "INTERNAL") => "%Y%m%d%H%i%s",
+        ("time", "USA") => "%h:%i:%s %p",
+        ("time", "JIS" | "ISO") => "%H:%i:%s",
+        ("time", "EUR") => "%H.%i.%s",
+        ("time", "INTERNAL") => "%H%i%s",
+        // Unknown region → NULL (MySQL behaviour).
+        _ => return Ok(Value::Null),
+    };
+    Ok(Value::text(String::from(fmt)))
+}
+
+/// Parse a '+HH:MM' / '-HH:MM' timezone offset into micros.
+fn parse_tz_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1_i64, &s[1..]),
+        b'-' => (-1_i64, &s[1..]),
+        _ => return None,
+    };
+    let (h, m) = rest.split_once(':')?;
+    let h: i64 = h.parse().ok()?;
+    let m: i64 = m.parse().ok()?;
+    if h > 14 || m > 59 {
+        return None;
+    }
+    Some(sign * (h * 3_600_000_000 + m * 60_000_000))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL CONVERT_TZ(dt, from_tz, to_tz).
+/// Offset forms ('+HH:MM') shift for real. Named zones return NULL —
+/// faithful to MySQL's behaviour when the mysql.time_zone tables
+/// aren't loaded (SPG carries no tzdata).
+pub(super) fn convert_tz_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("convert_tz() takes 3 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let ts = text_or_temporal_micros(&args[0], "convert_tz")?;
+    let (Value::Text(from), Value::Text(to)) = (&args[1], &args[2]) else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "convert_tz() timezones must be text, got ({:?}, {:?})",
+                args[1].data_type(),
+                args[2].data_type()
+            ),
+        });
+    };
+    let (Some(from_off), Some(to_off)) = (parse_tz_offset(from), parse_tz_offset(to)) else {
+        // Named zone without tzdata → NULL, like MySQL with
+        // unloaded time-zone tables.
+        return Ok(Value::Null);
+    };
+    Ok(Value::Timestamp(ts - from_off + to_off))
 }
