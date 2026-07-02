@@ -73,6 +73,51 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+SRF + MySQL-JSON campaign (tasks #301-#319) — set-returning
+functions land through a parser-rewrite pipeline, and the MySQL
+JSON surface goes from 2 to 22 functions in five cycles (branch
+at 292 commits ahead of develop, 2814 e2e green):
+
+- **SRF build-out (zero new executors)**: FROM-position
+  jsonb_array_elements(_text) + json_ variants,
+  jsonb_object_keys, generate_subscripts (multi-arg + reverse),
+  string_to_table, regexp_split_to_table — all rewritten in the
+  parser onto unnest over scalar TextArray surfaces. jsonb_each /
+  json_each / json_each_text complete the each family (the plain
+  forms keep jsonb rendering in the value column). PG column-
+  naming semantics preserved: OUT-parameter SRFs project `value`,
+  the rest take the function name, and a bare table alias on a
+  single-column SRF renames the column.
+- **FTS**: ts_headline (real match highlighting — stemmed-lexeme
+  word wrap with StartSel/StopSel options, Not-subtree exclusion)
+  and ts_rewrite (synonym-expansion subtree rewriting).
+- **MySQL JSON, complete non-schema surface**: batch 1 non-path
+  helpers (json_valid/type/length/keys/depth/quote/unquote/
+  array/pretty/storage_size); a MySQL JSON path parser ($ .key
+  ."quoted" [N]; wildcards error honestly) powering json_extract
+  + json_contains_path; the mutation family json_set/insert/
+  replace/remove with two-dialect routing ('$'-paths → MySQL,
+  '{a,b}' text-array paths → PG jsonb_set); json_array_append /
+  json_array_insert / json_contains (containment recursion);
+  json_merge_patch (RFC 7396) / json_merge_preserve /
+  json_overlaps; json_search (LIKE-matching path finder) +
+  json_value.
+- **MySQL misc**: inet_aton/ntoa + inet6_aton/ntoa (RFC 5952
+  compression) + is_ipv4/is_ipv6, INSERT() char-window replace,
+  FORMAT(X, D) thousands separators (dialect-disambiguated from
+  PG's printf format on the first arg's type), NAME_CONST.
+- **Datetime**: str_to_date (%-specifier parser, NULL on bad
+  input) + time_format; timestampadd/timestampdiff (bare unit
+  keywords lowered in the parser, calendar-exact month walks,
+  complete-units semantics); PG typed literals DATE '…' /
+  TIMESTAMP '…' / TIMESTAMPTZ '…' lowered onto the cast paths.
+- **Arrays**: array_append/prepend/cat + PG 14 trim_array;
+  string_to_array gains the 3-arg null_string form.
+- **Honest deferrals recorded in commits**: MySQL named locks
+  (needs a synchronized map; no_std engine has no mutex),
+  json_value RETURNING clause (parser syntax), JSON path
+  wildcards, TIME as a standalone type, large-object (lo_*) API.
+
 Stub-retirement wave (tasks #281-#299) — a systematic pass
 converting NULL/constant stubs into real catalog-backed
 implementations, plus aggregate + information_schema growth
