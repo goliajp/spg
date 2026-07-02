@@ -59,6 +59,14 @@ pub(crate) fn synth_information_schema_columns(
         ColumnSchema::new("ordinal_position", DataType::Int, false),
         ColumnSchema::new("is_nullable", DataType::Text, false),
         ColumnSchema::new("data_type", DataType::Text, false),
+        // v7.37.17 — widened to the columns Alembic autogenerate /
+        // SQLAlchemy reflection / JDBC getColumns actually read.
+        ColumnSchema::new("column_default", DataType::Text, true),
+        ColumnSchema::new("character_maximum_length", DataType::Int, true),
+        ColumnSchema::new("numeric_precision", DataType::Int, true),
+        ColumnSchema::new("numeric_scale", DataType::Int, true),
+        ColumnSchema::new("udt_name", DataType::Text, false),
+        ColumnSchema::new("is_identity", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
@@ -66,6 +74,56 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
+            // column_default: runtime expressions keep their SQL
+            // text; literal defaults render via Display.
+            let default_text: Value<'static> = if let Some(expr) =
+                &col.runtime_default
+            {
+                Value::text(expr.clone())
+            } else if let Some(v) = &col.default {
+                // Render the literal default's SQL form.
+                let rendered = match v {
+                    Value::Text(s) => alloc::format!("'{s}'::text"),
+                    Value::Int(n) => n.to_string(),
+                    Value::BigInt(n) => n.to_string(),
+                    Value::SmallInt(n) => n.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    other => alloc::format!("{other:?}"),
+                };
+                Value::text(rendered)
+            } else if col.auto_increment {
+                Value::text(alloc::format!(
+                    "nextval('{tname}_{}_seq'::regclass)",
+                    col.name
+                ))
+            } else {
+                Value::Null
+            };
+            let (num_prec, num_scale): (Value<'static>, Value<'static>) =
+                match col.ty {
+                    DataType::SmallInt => (Value::Int(16), Value::Int(0)),
+                    DataType::Int => (Value::Int(32), Value::Int(0)),
+                    DataType::BigInt => (Value::Int(64), Value::Int(0)),
+                    DataType::Float => (Value::Int(53), Value::Null),
+                    DataType::Numeric { .. } => (Value::Null, Value::Null),
+                    _ => (Value::Null, Value::Null),
+                };
+            // udt_name is PG's internal typname (int4, not integer).
+            let udt: &str = match col.ty {
+                DataType::SmallInt => "int2",
+                DataType::Int => "int4",
+                DataType::BigInt => "int8",
+                DataType::Float => "float8",
+                DataType::Bool => "bool",
+                DataType::Text => "text",
+                DataType::Bytes => "bytea",
+                DataType::Json => "jsonb",
+                DataType::Uuid => "uuid",
+                DataType::Date => "date",
+                DataType::Timestamp => "timestamp",
+                _ => "text",
+            };
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
@@ -74,6 +132,12 @@ pub(crate) fn synth_information_schema_columns(
                 Value::Int(ordinal),
                 Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
                 Value::text(pg_data_type_text(col.ty)),
+                default_text,
+                Value::Null, // character_maximum_length (SPG TEXT is unbounded)
+                num_prec,
+                num_scale,
+                Value::text::<&str>(udt),
+                Value::text::<&str>(if col.auto_increment { "YES" } else { "NO" }),
             ]));
         }
     }
