@@ -185,6 +185,7 @@ mod e2e_cash_words;
 mod e2e_range_predicates;
 mod e2e_jsonb_set_lax;
 mod e2e_acl_functions;
+mod e2e_to_date;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
