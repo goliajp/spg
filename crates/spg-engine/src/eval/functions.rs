@@ -5008,6 +5008,56 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — MySQL ADDDATE / SUBDATE /
+        // DATE_SUB. The bare-integer second argument means days
+        // (MySQL's ADDDATE(d, 31) shorthand); intervals shift like
+        // date_add. Results follow MySQL: DATE + day-granular shift
+        // stays a DATE, anything else is a TIMESTAMP.
+        "adddate" | "subdate" | "date_sub" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let sign: i64 = if name == "adddate" { 1 } else { -1 };
+            let base_is_date = matches!(&args[0], Value::Date(_))
+                || matches!(&args[0], Value::Text(s) if !s.contains(':'));
+            let base = super::datetime::text_or_temporal_micros(&args[0], name)?;
+            let (shift_micros, day_granular) = match &args[1] {
+                Value::Int(n) => (i64::from(*n) * 86_400_000_000, true),
+                Value::SmallInt(n) => (i64::from(*n) * 86_400_000_000, true),
+                Value::BigInt(n) => (n.saturating_mul(86_400_000_000), true),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => (
+                    i64::from(*months).saturating_mul(30 * 86_400_000_000)
+                        + i64::from(*days).saturating_mul(86_400_000_000)
+                        + micros,
+                    *micros == 0,
+                ),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() second arg must be days or interval, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let out = base.saturating_add(sign.saturating_mul(shift_micros));
+            if base_is_date && day_granular {
+                Ok(Value::Date(
+                    i32::try_from(out.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
+                ))
+            } else {
+                Ok(Value::Timestamp(out))
+            }
+        }
         "date_subtract" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
