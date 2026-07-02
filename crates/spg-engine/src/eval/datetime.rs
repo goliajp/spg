@@ -160,6 +160,15 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
+    // v7.37.17 (17.6 siblings) — PG's age(xid) overload, used by
+    // autovacuum-wraparound monitoring (`age(relfrozenxid)`).
+    // SPG's u64 tx ids never wrap, so the wraparound distance is
+    // honestly 0 ("no vacuum urgency") for every xid.
+    if args.len() == 1 {
+        if let Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) = &args[0] {
+            return Ok(Value::Int(0));
+        }
+    }
     // Coerce to TIMESTAMP micros — DATE lifts to midnight; TIMESTAMP
     // stays as-is; anything else errors.
     let to_micros = |v: &Value| -> Result<i64, EvalError> {
