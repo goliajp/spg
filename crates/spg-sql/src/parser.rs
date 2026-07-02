@@ -9713,6 +9713,23 @@ impl Parser {
         }
         self.advance(); // ON
         self.advance(); // CONFLICT
+        // v7.37.17 (17.6 siblings) — `ON CONSTRAINT <name>` names
+        // the constraint instead of listing columns (the pg_dump
+        // form); the engine resolves it.
+        let mut constraint_name: Option<String> = None;
+        if matches!(self.peek(), Token::On) {
+            self.advance(); // ON
+            match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("constraint") => {}
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected CONSTRAINT after ON CONFLICT ON, got {other:?}"
+                    )));
+                }
+            }
+            constraint_name = Some(self.expect_ident_like()?);
+        }
         // Optional `(col [, col]*)` target list.
         let mut target_columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
@@ -9759,6 +9776,7 @@ impl Parser {
             }
         };
         Ok(Some(crate::ast::OnConflictClause {
+            constraint_name,
             target_columns,
             action,
         }))
