@@ -3169,6 +3169,202 @@ fn apply_function_dispatch(
             Ok(Value::Timestamp(binned))
         }
         "date_part" => date_part(args),
+        // v7.37.17 (17.6 siblings) — PG 9.4+ make_date / make_time /
+        // make_timestamp / make_interval constructors.
+        "make_date" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("make_date() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn int_of(v: &Value<'_>) -> Result<i64, EvalError> {
+                match v {
+                    Value::Int(n) => Ok(i64::from(*n)),
+                    Value::SmallInt(n) => Ok(i64::from(*n)),
+                    Value::BigInt(n) => Ok(*n),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "make_date(): needs int, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let y = int_of(&args[0])?;
+            let m = int_of(&args[1])?;
+            let d = int_of(&args[2])?;
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "make_date(): invalid date ({y}, {m}, {d})"
+                    ),
+                });
+            }
+            let days = super::days_from_civil(y as i32, m as u32, d as u32);
+            Ok(Value::Date(days))
+        }
+        "make_time" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("make_time() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let h = match &args[0] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "make_time(): hour must be int".into(),
+                    });
+                }
+            };
+            let m = match &args[1] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "make_time(): min must be int".into(),
+                    });
+                }
+            };
+            let s = match &args[2] {
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "make_time(): sec must be numeric".into(),
+                    });
+                }
+            };
+            if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0.0..60.0).contains(&s) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "make_time(): invalid time ({h}, {m}, {s})"
+                    ),
+                });
+            }
+            let us = h * 3_600_000_000 + m * 60_000_000 + (s * 1_000_000.0) as i64;
+            // SPG has no standalone TIME type in Value; return as
+            // micros-in-day via Timestamp shape (callers that cast
+            // to TIME get the canonical form).
+            Ok(Value::Timestamp(us))
+        }
+        "make_timestamp" => {
+            if args.len() != 6 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "make_timestamp() takes 6 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn int_of(v: &Value<'_>) -> Result<i64, EvalError> {
+                match v {
+                    Value::Int(n) => Ok(i64::from(*n)),
+                    Value::SmallInt(n) => Ok(i64::from(*n)),
+                    Value::BigInt(n) => Ok(*n),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "make_timestamp(): needs int, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let y = int_of(&args[0])?;
+            let mo = int_of(&args[1])?;
+            let d = int_of(&args[2])?;
+            let h = int_of(&args[3])?;
+            let mi = int_of(&args[4])?;
+            let s = match &args[5] {
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "make_timestamp(): sec must be numeric".into(),
+                    });
+                }
+            };
+            if !(1..=12).contains(&mo)
+                || !(1..=31).contains(&d)
+                || !(0..=23).contains(&h)
+                || !(0..=59).contains(&mi)
+                || !(0.0..60.0).contains(&s)
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: "make_timestamp(): out-of-range component".into(),
+                });
+            }
+            let days = super::days_from_civil(y as i32, mo as u32, d as u32);
+            let us = i64::from(days) * 86_400_000_000
+                + h * 3_600_000_000
+                + mi * 60_000_000
+                + (s * 1_000_000.0) as i64;
+            Ok(Value::Timestamp(us))
+        }
+        "make_interval" => {
+            // make_interval(years, months, weeks, days, hours,
+            // mins, secs) — all optional positional (PG uses named
+            // args; positional zero-padding accepted here).
+            if args.len() > 7 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "make_interval() takes 0-7 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            fn num_of(v: Option<&Value<'_>>) -> Result<f64, EvalError> {
+                match v {
+                    None => Ok(0.0),
+                    Some(Value::Int(n)) => Ok(f64::from(*n)),
+                    Some(Value::SmallInt(n)) => Ok(f64::from(*n)),
+                    Some(Value::BigInt(n)) => Ok(*n as f64),
+                    Some(Value::Float(f)) => Ok(*f),
+                    Some(other) => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "make_interval(): needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            }
+            let years = num_of(args.first())?;
+            let months = num_of(args.get(1))?;
+            let weeks = num_of(args.get(2))?;
+            let days = num_of(args.get(3))?;
+            let hours = num_of(args.get(4))?;
+            let mins = num_of(args.get(5))?;
+            let secs = num_of(args.get(6))?;
+            let total_months = (years * 12.0 + months) as i32;
+            let total_days = (weeks * 7.0 + days) as i32;
+            let micros = (hours * 3_600_000_000.0
+                + mins * 60_000_000.0
+                + secs * 1_000_000.0) as i64;
+            Ok(Value::Interval {
+                months: total_months,
+                days: total_days,
+                micros,
+            })
+        }
         // v7.37.17 (17.6 siblings) — PG 16+ `date_add(ts, interval)`
         // and `date_subtract(ts, interval)`. Same as `ts + interval`
         // and `ts - interval` but as explicit function form (some
