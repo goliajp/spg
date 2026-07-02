@@ -742,10 +742,31 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
 fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let [text_arg, delim_arg] = args else {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("string_to_array expects 2 arguments, got {}", args.len()),
-        });
+    // v7.37.17 (17.6 siblings) — the 3-arg PG form adds
+    // `null_string`: elements equal to it become SQL NULL.
+    let (text_arg, delim_arg, null_arg) = match args {
+        [t, d] => (t, d, None),
+        [t, d, n] => (t, d, Some(n)),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "string_to_array expects 2 or 3 arguments, got {}",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let null_string: Option<&str> = match null_arg {
+        None | Some(Value::Null) => None,
+        Some(Value::Text(s)) => Some(s.as_ref()),
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "string_to_array null_string must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
     };
     let text = match text_arg {
         Value::Null => return Ok(Value::Null),
@@ -760,13 +781,20 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if text.is_empty() {
         return Ok(Value::TextArray(Vec::new()));
     }
+    let nullify = |p: String| -> Option<String> {
+        if null_string == Some(p.as_str()) {
+            None
+        } else {
+            Some(p)
+        }
+    };
     let parts: Vec<Option<String>> = match delim_arg {
         // NULL delimiter → one element per character.
-        Value::Null => text.chars().map(|c| Some(c.to_string())).collect(),
-        Value::Text(d) if d.is_empty() => alloc::vec![Some(text.to_string())],
+        Value::Null => text.chars().map(|c| nullify(c.to_string())).collect(),
+        Value::Text(d) if d.is_empty() => alloc::vec![nullify(text.to_string())],
         Value::Text(d) => text
             .split(d.as_ref())
-            .map(|p| Some(p.to_string()))
+            .map(|p| nullify(p.to_string()))
             .collect(),
         other => {
             return Err(EvalError::TypeMismatch {
