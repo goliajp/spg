@@ -1972,6 +1972,10 @@ fn apply_function_dispatch(
         // (bcrypt/blowfish support queues with the crypto epic);
         // return a stub-shape 22-char text so ORMs that call it
         // don't error at parse time.
+        // gen_salt(type[, iter]) — random salt for crypt(). The
+        // 'md5' scheme is real (matching the real md5crypt in
+        // crypt() below); bf/des/xdes error honestly — their
+        // ciphers (blowfish/DES) queue with the pgcrypto epic.
         "gen_salt" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::TypeMismatch {
@@ -1981,9 +1985,167 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            Ok(Value::text::<String>(
-                "spg_gen_salt_stub_22chr".into(),
-            ))
+            let scheme = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_lowercase(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "gen_salt(): type must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            match scheme.as_str() {
+                "md5" => {
+                    const ITOA64: &[u8; 64] =
+                        b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                    let mut salt = alloc::string::String::from("$1$");
+                    let mut bits = super::math::prng_next_u64();
+                    for _ in 0..8 {
+                        salt.push(ITOA64[(bits & 63) as usize] as char);
+                        bits >>= 6;
+                    }
+                    salt.push('$');
+                    Ok(Value::text(salt))
+                }
+                "bf" | "des" | "xdes" => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "gen_salt('{scheme}'): scheme not yet supported — \
+                         blowfish/DES ciphers queue with the pgcrypto epic; \
+                         use gen_salt('md5')"
+                    ),
+                }),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "gen_salt(): unknown salt type {other:?}"
+                    ),
+                }),
+            }
+        }
+        // crypt(password, salt) — pgcrypto password hashing. The
+        // '$1$' md5crypt scheme (FreeBSD algorithm) is real via
+        // the md-5 crate; verifying is crypt(pw, stored) == stored,
+        // exactly like PG. bcrypt/DES salts error honestly.
+        "crypt" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("crypt() takes 2 args, got {}", args.len()),
+                });
+            }
+            let (password, salt_full) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(p), Value::Text(s)) => (p.as_bytes(), s.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "crypt() takes 2 TEXT args".into(),
+                    });
+                }
+            };
+            let Some(rest) = salt_full.strip_prefix("$1$") else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "crypt(): only the '$1$' md5crypt scheme is \
+                         supported today (got {salt_full:?}); \
+                         bcrypt/DES queue with the pgcrypto epic"
+                    ),
+                });
+            };
+            // Salt = up to 8 chars, terminated by '$' if present.
+            let salt: &[u8] = rest
+                .split('$')
+                .next()
+                .unwrap_or("")
+                .as_bytes();
+            let salt = &salt[..salt.len().min(8)];
+
+            use md5::{Digest, Md5};
+            // FreeBSD md5crypt.
+            let mut ctx = Md5::new();
+            ctx.update(password);
+            ctx.update(b"$1$");
+            ctx.update(salt);
+            let mut alt = Md5::new();
+            alt.update(password);
+            alt.update(salt);
+            alt.update(password);
+            let alt_sum = alt.finalize();
+            let mut plen = password.len();
+            while plen > 0 {
+                ctx.update(&alt_sum[..plen.min(16)]);
+                plen = plen.saturating_sub(16);
+            }
+            let mut i = password.len();
+            while i > 0 {
+                if i & 1 != 0 {
+                    ctx.update([0u8]);
+                } else {
+                    ctx.update(&password[..1]);
+                }
+                i >>= 1;
+            }
+            let mut current: [u8; 16] = ctx.finalize().into();
+            for round in 0..1000 {
+                let mut c = Md5::new();
+                if round & 1 != 0 {
+                    c.update(password);
+                } else {
+                    c.update(current);
+                }
+                if round % 3 != 0 {
+                    c.update(salt);
+                }
+                if round % 7 != 0 {
+                    c.update(password);
+                }
+                if round & 1 != 0 {
+                    c.update(current);
+                } else {
+                    c.update(password);
+                }
+                current = c.finalize().into();
+            }
+            // Custom base64 of rearranged bytes.
+            fn to64(out: &mut alloc::string::String, mut v: u32, n: usize) {
+                const ITOA64: &[u8; 64] =
+                    b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                for _ in 0..n {
+                    out.push(ITOA64[(v & 63) as usize] as char);
+                    v >>= 6;
+                }
+            }
+            let mut out = alloc::string::String::from("$1$");
+            out.push_str(core::str::from_utf8(salt).unwrap_or(""));
+            out.push('$');
+            let c = &current;
+            to64(
+                &mut out,
+                (u32::from(c[0]) << 16) | (u32::from(c[6]) << 8) | u32::from(c[12]),
+                4,
+            );
+            to64(
+                &mut out,
+                (u32::from(c[1]) << 16) | (u32::from(c[7]) << 8) | u32::from(c[13]),
+                4,
+            );
+            to64(
+                &mut out,
+                (u32::from(c[2]) << 16) | (u32::from(c[8]) << 8) | u32::from(c[14]),
+                4,
+            );
+            to64(
+                &mut out,
+                (u32::from(c[3]) << 16) | (u32::from(c[9]) << 8) | u32::from(c[15]),
+                4,
+            );
+            to64(
+                &mut out,
+                (u32::from(c[4]) << 16) | (u32::from(c[10]) << 8) | u32::from(c[5]),
+                4,
+            );
+            to64(&mut out, u32::from(c[11]), 2);
+            Ok(Value::text(out))
         }
         // v7.37.17 (17.6 siblings) — pgcrypto hmac(data, key, algo)
         // returns keyed-hash MAC. Uses RustCrypto's `hmac` crate
