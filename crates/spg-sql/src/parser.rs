@@ -11010,6 +11010,26 @@ impl Parser {
                 )));
             }
             self.advance();
+            // v7.37.17 (17.6 siblings) — PG 12+ `AS [NOT]
+            // MATERIALIZED` optimizer hints. SPG materialises every
+            // CTE, so both spellings are accepted and absorbed.
+            if matches!(self.peek(), Token::Not) {
+                self.advance(); // NOT
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("materialized"))
+                {
+                    self.advance();
+                } else {
+                    return Err(self.err(format!(
+                        "expected MATERIALIZED after AS NOT, got {:?}",
+                        self.peek()
+                    )));
+                }
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("materialized"))
+            {
+                self.advance();
+            }
             if !matches!(self.peek(), Token::LParen) {
                 return Err(self.err(format!(
                     "expected '(' after AS in WITH clause, got {:?}",
@@ -11032,6 +11052,14 @@ impl Parser {
                         unreachable!("parse_select_stmt returns Select");
                     };
                     crate::ast::CteBody::Select(s)
+                }
+                // v7.37.17 (17.6 siblings) — VALUES as a CTE body:
+                // WITH t(a) AS (VALUES (1), (2)) … lowers through
+                // the shared rows helper onto a Select body.
+                Token::Values => {
+                    self.advance(); // VALUES
+                    let head = self.parse_values_rows_body()?;
+                    crate::ast::CteBody::Select(head)
                 }
                 Token::Insert => {
                     let inner = self.parse_one_statement()?;
