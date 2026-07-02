@@ -2359,6 +2359,11 @@ pub struct TableRef {
     /// column name for the unnested column. Empty = fall back to
     /// the table alias (pre-v7.13.2 behaviour).
     pub unnest_column_aliases: Vec<String>,
+    /// `WITH ORDINALITY` on an unnest-channel SRF — when true, the
+    /// row-stream gains a trailing BIGINT column counting rows
+    /// from 1 in element order. PG names it `ordinality`; a second
+    /// entry in the column-alias list renames it.
+    pub with_ordinality: bool,
     /// v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
     /// [, step])` set-returning source. When `Some`, the engine
     /// materialises a single-column virtual table by stepping
@@ -5252,6 +5257,7 @@ mod tests {
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
+                    with_ordinality: false,
                     generate_series_args: None,
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,

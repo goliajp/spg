@@ -85,10 +85,28 @@ impl Engine {
                 };
             let alias = tref.alias.clone().unwrap_or_else(|| "unnest".to_string());
             let col_name = tref.unnest_column_aliases.first().cloned().unwrap_or(alias);
-            return Ok((
-                rows,
-                alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)],
-            ));
+            let mut cols = alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)];
+            // WITH ORDINALITY — trailing BIGINT counting rows from
+            // 1 in element order; second column-alias entry renames.
+            let rows = if tref.with_ordinality {
+                let ord_name = tref
+                    .unnest_column_aliases
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| alloc::string::String::from("ordinality"));
+                cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let mut vals = row.values.to_vec();
+                        vals.push(Value::BigInt(i as i64 + 1));
+                        Row::new(vals)
+                    })
+                    .collect()
+            } else {
+                rows
+            };
+            return Ok((rows, cols));
         }
         // v7.37.17 (17.6 siblings) — derived table (`FROM ( SELECT …
         // ) alias`) joined with other tables: materialise the inner

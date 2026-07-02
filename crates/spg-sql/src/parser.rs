@@ -6670,6 +6670,7 @@ impl Parser {
                             as_of_segment: None,
                             unnest_expr: None,
                             unnest_column_aliases: Vec::new(),
+                            with_ordinality: false,
                             generate_series_args: None,
                             lateral_subquery: Some(Box::new(head)),
                             jsonb_each_text_arg: None,
@@ -10040,6 +10041,7 @@ impl Parser {
                         as_of_segment: None,
                         unnest_expr: None,
                         unnest_column_aliases: Vec::new(),
+                        with_ordinality: false,
                         generate_series_args: None,
                         lateral_subquery: None,
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
@@ -10062,6 +10064,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner_select)),
                 jsonb_each_text_arg: None,
@@ -10112,6 +10115,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
+                with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(head)),
                 jsonb_each_text_arg: None,
@@ -10155,6 +10159,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
+                with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
@@ -10189,6 +10194,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
@@ -10226,6 +10232,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
@@ -10271,6 +10278,7 @@ impl Parser {
                 )));
             }
             self.advance();
+            let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
             // PG's natural column name: the array-elements SRFs
@@ -10288,7 +10296,10 @@ impl Parser {
             } else {
                 alias_ident.clone().unwrap_or_else(|| fn_name.clone())
             };
-            let col_name = column_aliases.first().cloned().unwrap_or(natural_col);
+            let mut srf_cols = alloc::vec![column_aliases.first().cloned().unwrap_or(natural_col)];
+            // Keep any further entries — the second names the
+            // ordinality column under WITH ORDINALITY.
+            srf_cols.extend(column_aliases.into_iter().skip(1));
             // The *_to_table SRFs are row-streams over the existing
             // *_to_array scalars — map the call target; the display
             // name (alias / column defaults) keeps the SRF spelling.
@@ -10305,7 +10316,8 @@ impl Parser {
                     name: call_name,
                     args: fn_args,
                 })),
-                unnest_column_aliases: alloc::vec![col_name],
+                unnest_column_aliases: srf_cols,
+                with_ordinality,
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
@@ -10327,6 +10339,7 @@ impl Parser {
                 )));
             }
             self.advance();
+            let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
             return Ok(TableRef {
@@ -10335,6 +10348,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
+                with_ordinality,
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
@@ -10386,6 +10400,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
                 generate_series_args: Some(args),
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
@@ -10453,6 +10468,7 @@ impl Parser {
             as_of_segment,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
+            with_ordinality: false,
             generate_series_args: None,
             lateral_subquery: None,
             jsonb_each_text_arg: None,
@@ -10464,6 +10480,23 @@ impl Parser {
     /// PG-standard table-function column-list form. The column
     /// list is only honoured when paired with `UNNEST(...)` in
     /// the parent; other call sites currently discard it.
+    /// Absorb `WITH ORDINALITY` after an SRF call in FROM position.
+    /// Returns true when the clause was present. `WITH` alone (a
+    /// CTE can never start here) is not enough — the ORDINALITY
+    /// ident must follow, so a stray WITH still errors downstream.
+    fn absorb_with_ordinality(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+            && matches!(self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ordinality"))
+        {
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     fn parse_optional_alias_with_columns(&mut self) -> (Option<String>, Vec<String>) {
         let alias = self.parse_optional_alias();
         if alias.is_none() {
