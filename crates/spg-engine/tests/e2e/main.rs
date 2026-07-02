@@ -210,6 +210,7 @@ mod e2e_any_value;
 mod e2e_group_concat;
 mod e2e_json_arrayagg;
 mod e2e_pg_internal_helpers;
+mod e2e_pg_get_viewdef;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
