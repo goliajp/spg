@@ -9252,7 +9252,64 @@ fn apply_function_dispatch(
         // with sensible defaults so the dump preamble doesn't
         // fail. `pg_get_serial_sequence` returns NULL (no
         // sequence — SPG has AUTO_INCREMENT instead).
-        "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
+        // pg_get_indexdef(index [, col, pretty]) — REAL: rebuilt
+        // from live catalog state, same construction the pg_indexes
+        // view uses. Name input (regclass text) resolves; numeric
+        // oids can't map (synthetic) → NULL. The 3-arg column form
+        // returns the indexed column's name when col > 0.
+        "pg_get_indexdef" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            let col_no = match args.get(1) {
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                _ => 0,
+            };
+            for tname in cat.table_names() {
+                let Some(t) = cat.get(&tname) else { continue };
+                for idx in t.indices() {
+                    if idx.name != bare {
+                        continue;
+                    }
+                    let col_name = t
+                        .schema()
+                        .columns
+                        .get(idx.column_position)
+                        .map_or_else(|| String::from("?"), |c| c.name.clone());
+                    if col_no > 0 {
+                        // Column form: SPG indices are single-column
+                        // today, so only position 1 resolves.
+                        return Ok(if col_no == 1 {
+                            Value::text(col_name)
+                        } else {
+                            Value::Null
+                        });
+                    }
+                    let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+                    return Ok(Value::text(alloc::format!(
+                        "CREATE {unique_kw}INDEX {} ON public.{} ({})",
+                        idx.name,
+                        tname,
+                        col_name
+                    )));
+                }
+            }
+            Ok(Value::Null)
+        }
+        // Constraint DDL reconstruction (FK/CHECK shapes) queues
+        // with the v7.40 get_ddl surface.
+        "pg_get_constraintdef" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_get_serial_sequence returns
         // the OID name of the underlying sequence for an implicit
         // SERIAL / BIGSERIAL column. ORMs (SQLAlchemy, Django,
