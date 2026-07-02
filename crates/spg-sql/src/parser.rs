@@ -9602,7 +9602,8 @@ impl Parser {
                     || s.eq_ignore_ascii_case("jsonb_array_elements_text")
                     || s.eq_ignore_ascii_case("json_array_elements_text")
                     || s.eq_ignore_ascii_case("jsonb_object_keys")
-                    || s.eq_ignore_ascii_case("json_object_keys"))
+                    || s.eq_ignore_ascii_case("json_object_keys")
+                    || s.eq_ignore_ascii_case("generate_subscripts"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             let fn_name = match self.peek() {
@@ -9611,10 +9612,18 @@ impl Parser {
             };
             self.advance(); // fn name
             self.advance(); // (
-            let arg = self.parse_expr(0)?;
+            let mut fn_args: Vec<Expr> = Vec::new();
+            loop {
+                fn_args.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(alloc::format!(
-                    "expected ')' after {fn_name}() argument, got {:?}",
+                    "expected ')' after {fn_name}() arguments, got {:?}",
                     self.peek()
                 )));
             }
@@ -9623,11 +9632,18 @@ impl Parser {
             let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
             // PG's natural column name: the array-elements SRFs
             // declare an OUT parameter `value`; jsonb_object_keys
-            // has none, so the column is named after the function.
-            let natural_col = if fn_name.ends_with("_object_keys") {
-                fn_name.clone()
-            } else {
+            // and generate_subscripts have none, so the column is
+            // named after the function. A bare table alias on a
+            // single-column SRF renames the column too (PG: `FROM
+            // generate_subscripts(a, 1) AS s` projects column s) —
+            // except for the OUT-parameter SRFs, whose column stays
+            // `value` under a bare alias.
+            let natural_col = if fn_name.ends_with("_array_elements")
+                || fn_name.ends_with("_array_elements_text")
+            {
                 "value".to_string()
+            } else {
+                alias_ident.clone().unwrap_or_else(|| fn_name.clone())
             };
             let col_name = column_aliases.first().cloned().unwrap_or(natural_col);
             return Ok(TableRef {
@@ -9636,7 +9652,7 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(crate::ast::Expr::FunctionCall {
                     name: fn_name,
-                    args: alloc::vec![arg],
+                    args: fn_args,
                 })),
                 unnest_column_aliases: alloc::vec![col_name],
                 generate_series_args: None,
