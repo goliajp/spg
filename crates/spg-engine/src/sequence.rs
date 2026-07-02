@@ -95,7 +95,7 @@ impl Engine {
                     self.resolve_sequence_calls_in_expr(a)?;
                 }
                 let lc = name.to_ascii_lowercase();
-                if lc == "nextval" || lc == "currval" || lc == "setval" {
+                if lc == "nextval" || lc == "currval" || lc == "setval" || lc == "lastval" {
                     let v = self.eval_sequence_call(&lc, args)?;
                     *expr = Expr::Literal(value_to_literal(v));
                 } else if lc == "pg_get_serial_sequence" && args.len() == 2 {
@@ -223,6 +223,21 @@ impl Engine {
         op: &str,
         args: &[Expr],
     ) -> Result<Value<'static>, EngineError> {
+        // v7.37.17 — lastval(): the value most recently returned by
+        // nextval() in this session. PG errors when nextval hasn't
+        // been called yet; SPG matches.
+        if op == "lastval" {
+            let Some(seq) = self.last_sequence_used.clone() else {
+                return Err(EngineError::Unsupported(
+                    "lastval is not yet defined in this session".into(),
+                ));
+            };
+            let v = self
+                .active_catalog()
+                .sequence_current_value(&seq)
+                .map_err(EngineError::Storage)?;
+            return Ok(Value::BigInt(v));
+        }
         if args.is_empty() {
             return Err(EngineError::Unsupported(alloc::format!(
                 "{op}() takes at least one argument"
@@ -271,6 +286,8 @@ impl Engine {
                     .active_catalog_mut()
                     .sequence_next_value(&seq_name)
                     .map_err(EngineError::Storage)?;
+                // Register for lastval().
+                self.last_sequence_used = Some(seq_name.clone());
                 Ok(Value::BigInt(v))
             }
             "currval" => {
