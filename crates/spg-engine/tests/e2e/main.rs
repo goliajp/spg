@@ -130,6 +130,7 @@ mod e2e_intersect_except;
 mod e2e_cte_values_materialized;
 mod e2e_distinct_on;
 mod e2e_rollup;
+mod e2e_is_json;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;

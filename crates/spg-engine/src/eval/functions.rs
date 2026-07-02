@@ -9024,6 +9024,42 @@ fn apply_function_dispatch(
         "json_search" => crate::json::mysql_json_search(args),
         "json_value" => crate::json::mysql_json_value(args),
         // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
+        // v7.37.17 (17.6 siblings) — the SQL:2016 / PG 16
+        // `IS [NOT] JSON [kind]` predicate lowers onto this. Never
+        // errors: invalid JSON is simply false.
+        "pg_is_json" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pg_is_json() takes 2 args, got {}", args.len()),
+                });
+            }
+            let Value::Text(kind) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "pg_is_json() kind must be text".into(),
+                });
+            };
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let Ok(parsed) = crate::json::parse(s) else {
+                        return Ok(Value::Bool(false));
+                    };
+                    let ok = match kind.as_ref() {
+                        "object" => matches!(parsed, crate::json::JsonValue::Object(_)),
+                        "array" => matches!(parsed, crate::json::JsonValue::Array(_)),
+                        "scalar" => !matches!(
+                            parsed,
+                            crate::json::JsonValue::Object(_)
+                                | crate::json::JsonValue::Array(_)
+                        ),
+                        _ => true, // "value" — any valid JSON
+                    };
+                    Ok(Value::Bool(ok))
+                }
+                // Non-text values are not JSON text.
+                _ => Ok(Value::Bool(false)),
+            }
+        }
         "json_valid" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
