@@ -756,6 +756,12 @@ fn unit_micros(unit: &str) -> Option<i64> {
     })
 }
 
+/// pub(super) surface for the apply_function dispatch (adddate /
+/// subdate / date_sub share the coercion).
+pub(super) fn text_or_temporal_micros(v: &Value<'_>, fn_name: &str) -> Result<i64, EvalError> {
+    ts_of(v, fn_name)
+}
+
 fn ts_of(v: &Value<'_>, fn_name: &str) -> Result<i64, EvalError> {
     match v {
         Value::Timestamp(t) => Ok(*t),
