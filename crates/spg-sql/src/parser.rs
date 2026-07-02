@@ -9575,6 +9575,53 @@ impl Parser {
                 jsonb_each_text_arg: Some(Box::new(arg)),
             });
         }
+        // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
+        // / json_ variants as a FROM item. Rewritten into
+        // `unnest(<same fn>(<expr>))`: the scalar form returns the
+        // elements as a TEXT array, and the existing unnest SRF path
+        // materialises one row per element. PG's natural column name
+        // is `value`; an `AS a(col)` column-alias list overrides it.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("jsonb_array_elements")
+                    || s.eq_ignore_ascii_case("json_array_elements")
+                    || s.eq_ignore_ascii_case("jsonb_array_elements_text")
+                    || s.eq_ignore_ascii_case("json_array_elements_text"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            let fn_name = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => unreachable!(),
+            };
+            self.advance(); // fn name
+            self.advance(); // (
+            let arg = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after {fn_name}() argument, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
+            let col_name = column_aliases
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "value".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: Some(Box::new(crate::ast::Expr::FunctionCall {
+                    name: fn_name,
+                    args: alloc::vec![arg],
+                })),
+                unnest_column_aliases: alloc::vec![col_name],
+                generate_series_args: None,
+                lateral_subquery: None,
+                jsonb_each_text_arg: None,
+            });
+        }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
         // source. Detect at the head before the bare-ident fallback;
         // unnest is not a reserved token.
