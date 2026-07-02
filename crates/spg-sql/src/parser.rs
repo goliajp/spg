@@ -9970,6 +9970,21 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // `LATERAL generate_series(...)` / `LATERAL unnest(...)` —
+        // for these SRFs the keyword is noise at parse time: the
+        // join executor already substitutes outer-column references
+        // into unnest_expr / generate_series_args per outer row
+        // (v7.37.43-T4.5 substitute_outer_in_table_ref), and PG
+        // licences the correlation even without the keyword. Absorb
+        // it and fall through to the SRF arms below.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
+            && matches!(self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s) | Token::QuotedIdent(s))
+                    if s.eq_ignore_ascii_case("generate_series") || s.eq_ignore_ascii_case("unnest"))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
+        {
+            self.advance(); // LATERAL
+        }
         // v7.37.43-T4.5 — `LATERAL jsonb_each_text(<expr>)` —
         // set-returning function whose argument may reference a
         // preceding FROM item. We rewrite this to
@@ -10342,7 +10357,8 @@ impl Parser {
             let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
-            return Ok(TableRef {
+            let correlated = Self::expr_has_qualified_column(&expr);
+            let tref = TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
@@ -10352,6 +10368,11 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+            };
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
             });
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -10395,7 +10416,8 @@ impl Parser {
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "generate_series".to_string());
-            return Ok(TableRef {
+            let correlated = args.iter().any(Self::expr_has_qualified_column);
+            let tref = TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
@@ -10405,6 +10427,11 @@ impl Parser {
                 generate_series_args: Some(args),
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+            };
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
             });
         }
         // v7.16.2 — preserve information_schema / pg_catalog
@@ -10481,6 +10508,75 @@ impl Parser {
     /// PG-standard table-function column-list form. The column
     /// list is only honoured when paired with `UNNEST(...)` in
     /// the parent; other call sites currently discard it.
+    /// True when the expression tree contains a qualified column
+    /// reference (`t.col`) — the syntactic marker that an SRF
+    /// argument correlates with a preceding FROM item.
+    fn expr_has_qualified_column(e: &Expr) -> bool {
+        match e {
+            Expr::Column(c) => c.qualifier.is_some(),
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::expr_has_qualified_column(lhs) || Self::expr_has_qualified_column(rhs)
+            }
+            Expr::Unary { expr, .. } => Self::expr_has_qualified_column(expr),
+            Expr::Cast { expr, .. } => Self::expr_has_qualified_column(expr),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_qualified_column),
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                operand.as_deref().is_some_and(Self::expr_has_qualified_column)
+                    || branches.iter().any(|(w, t)| {
+                        Self::expr_has_qualified_column(w) || Self::expr_has_qualified_column(t)
+                    })
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(Self::expr_has_qualified_column)
+            }
+            _ => false,
+        }
+    }
+
+    /// Wrap a correlated SRF table ref (`unnest(t.col)` /
+    /// `generate_series(1, t.n)`) into the lateral_subquery
+    /// channel: `SELECT * FROM <srf>` executes per outer row with
+    /// outer references substituted (v7.37.43-T4.5 machinery).
+    /// Uncorrelated SRFs stay on their plain channels.
+    fn wrap_correlated_srf(srf: TableRef) -> TableRef {
+        let name = srf.name.clone();
+        let alias = srf.alias.clone();
+        let inner = crate::ast::SelectStatement {
+            ctes: Vec::new(),
+            distinct: false,
+            distinct_on: Vec::new(),
+            items: alloc::vec![crate::ast::SelectItem::Wildcard],
+            from: Some(crate::ast::FromClause {
+                primary: srf,
+                joins: Vec::new(),
+            }),
+            where_: None,
+            group_by: None,
+            group_by_all: false,
+            having: None,
+            unions: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_with_ties: false,
+        };
+        TableRef {
+            name,
+            alias,
+            as_of_segment: None,
+            unnest_expr: None,
+            unnest_column_aliases: Vec::new(),
+            with_ordinality: false,
+            generate_series_args: None,
+            lateral_subquery: Some(Box::new(inner)),
+            jsonb_each_text_arg: None,
+        }
+    }
+
     /// Absorb `WITH ORDINALITY` after an SRF call in FROM position.
     /// Returns true when the clause was present. `WITH` alone (a
     /// CTE can never start here) is not enough — the ORDINALITY

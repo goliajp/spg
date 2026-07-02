@@ -4261,6 +4261,11 @@ pub(crate) fn generate_series_rows(
     for a in args {
         arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
     }
+    // PG: a NULL bound or step yields zero rows (also keeps the
+    // NULL-padded lateral probe alive — schema without data).
+    if arg_values.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok((DataType::BigInt, alloc::vec::Vec::new()));
+    }
     match arg_values.as_slice() {
         [Value::Timestamp(start), Value::Timestamp(stop), step] => {
             let interval_step = match step {
