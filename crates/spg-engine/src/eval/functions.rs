@@ -6245,6 +6245,10 @@ fn apply_function_dispatch(
         // into a BigInt literal — this arm only handles the 1-arg
         // form (TIMESTAMP / DATE → epoch seconds).
         "date_format" => date_format_mysql(args),
+        // v7.37.17 (17.6 siblings) — inverse/companion of
+        // date_format.
+        "str_to_date" => super::datetime::str_to_date_mysql(args),
+        "time_format" => super::datetime::time_format_mysql(args),
         "unix_timestamp" => unix_timestamp_of(args),
         "from_unixtime" => from_unixtime(args),
         // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.
