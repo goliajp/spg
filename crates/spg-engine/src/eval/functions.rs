@@ -7631,6 +7631,138 @@ fn apply_function_dispatch(
         // COMMENT ON reader helpers. SPG doesn't yet retain
         // comments in the catalog; return NULL.
         "obj_description" | "col_description" | "shobj_description" => Ok(Value::Null),
+        // acldefault(objtype, owner_oid) — the default ACL for an
+        // object type, PG text form '{owner=privs/owner}'. SPG's
+        // single-role model maps every oid to 'admin'
+        // (pg_get_userbyid parity). Privilege strings per PG:
+        //   r relation=arwdDxt  s sequence=rwU  f function=X
+        //   d database=CTc     n schema=UC     L language=U
+        //   t tablespace=C     T type=U        F FDW=U
+        //   S server=U
+        "acldefault" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "acldefault() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let objtype = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref().to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "acldefault() objtype must be \"char\", got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let privs = match objtype.as_str() {
+                "r" => "arwdDxt",
+                "s" => "rwU",
+                "f" => "X",
+                "d" => "CTc",
+                "n" => "UC",
+                "L" => "U",
+                "t" => "C",
+                "T" => "U",
+                "F" => "U",
+                "S" => "U",
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "acldefault(): unrecognized object type {other:?}"
+                        ),
+                    });
+                }
+            };
+            Ok(Value::TextArray(alloc::vec![Some(alloc::format!(
+                "admin={privs}/admin"
+            ))]))
+        }
+        // makeaclitem(grantee_oid, grantor_oid, privileges, grantable)
+        // — construct one aclitem in PG's text form. Grantee oid 0 =
+        // PUBLIC (empty name before '='); '*' suffix per privilege
+        // when grantable. SPG's single-role model names every
+        // non-zero oid 'admin'.
+        "makeaclitem" => {
+            if args.len() != 4 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "makeaclitem() takes 4 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let grantee_is_public = match &args[0] {
+                Value::Int(n) => *n == 0,
+                Value::BigInt(n) => *n == 0,
+                Value::SmallInt(n) => *n == 0,
+                _ => false,
+            };
+            let privileges = match &args[2] {
+                Value::Text(s) => s.as_ref().to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "makeaclitem() privileges must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let grantable = matches!(&args[3], Value::Bool(true));
+            let mut letters = alloc::string::String::new();
+            for piece in privileges.split(',') {
+                let letter = match piece.trim().to_ascii_uppercase().as_str() {
+                    "SELECT" => 'r',
+                    "INSERT" => 'a',
+                    "UPDATE" => 'w',
+                    "DELETE" => 'd',
+                    "TRUNCATE" => 'D',
+                    "REFERENCES" => 'x',
+                    "TRIGGER" => 't',
+                    "EXECUTE" => 'X',
+                    "USAGE" => 'U',
+                    "CREATE" => 'C',
+                    "CONNECT" => 'c',
+                    "TEMPORARY" | "TEMP" => 'T',
+                    "MAINTAIN" => 'm',
+                    "SET" => 's',
+                    "ALTER SYSTEM" => 'A',
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "makeaclitem(): unrecognized privilege {other:?}"
+                            ),
+                        });
+                    }
+                };
+                letters.push(letter);
+                if grantable {
+                    letters.push('*');
+                }
+            }
+            let grantee = if grantee_is_public { "" } else { "admin" };
+            Ok(Value::text(alloc::format!("{grantee}={letters}/admin")))
+        }
+        // Object-addressing probes — record-returning identity
+        // resolvers used by dependency tooling (pg_depend joins).
+        // SPG's catalog doesn't retain PG's classid/objid address
+        // space; NULL keeps the queries parse-through.
+        "pg_describe_object"
+        | "pg_identify_object"
+        | "pg_identify_object_as_address"
+        | "pg_get_object_address" => Ok(Value::Null),
         // to_regclass / to_regtype / to_regnamespace / to_regproc:
         // string → oid lookup. Return NULL until the OID reverse-
         // resolver is wired (queues with system_catalog v7.40
