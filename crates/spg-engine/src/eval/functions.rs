@@ -6068,6 +6068,77 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // MySQL rand([seed]) — same [0,1) uniform; the optional
+        // seed reseeds the PRNG first (repeatable series).
+        "rand" => {
+            match args.first() {
+                None => Ok(Value::Float(prng_next_f64())),
+                Some(Value::Null) => Ok(Value::Float(prng_next_f64())),
+                Some(Value::Int(n)) => {
+                    super::math::prng_seed(f64::from(*n));
+                    Ok(Value::Float(prng_next_f64()))
+                }
+                Some(Value::BigInt(n)) => {
+                    super::math::prng_seed(*n as f64);
+                    Ok(Value::Float(prng_next_f64()))
+                }
+                Some(Value::SmallInt(n)) => {
+                    super::math::prng_seed(f64::from(*n));
+                    Ok(Value::Float(prng_next_f64()))
+                }
+                Some(other) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "rand() seed must be integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL session/utility probes. connection_id — SPG
+        // embedded has exactly one logical connection; sleep —
+        // no-op returning 0 like pg_sleep's shape; benchmark —
+        // returns 0 without looping (the timing side-channel is
+        // meaningless in-process); found_rows / row_count /
+        // last_insert_id — session counters queue with the MySQL
+        // wire epic, 0/-1 keep clients moving.
+        "connection_id" => Ok(Value::BigInt(1)),
+        "sleep" | "benchmark" => Ok(Value::Int(0)),
+        "found_rows" | "last_insert_id" => Ok(Value::BigInt(0)),
+        "row_count" => Ok(Value::BigInt(-1)),
+        // MySQL uuid_short() — 64-bit sequential-ish id off the
+        // PRNG (uniqueness within a session, like MySQL's within-
+        // server promise).
+        "uuid_short" => Ok(Value::BigInt(
+            (super::math::prng_next_u64() >> 1) as i64,
+        )),
+        // MySQL is_uuid(text) — validates the 36-char dashed or
+        // 32-char bare hex form.
+        "is_uuid" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("is_uuid() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Uuid(_) => Ok(Value::Bool(true)),
+                Value::Text(s) => {
+                    let t = s.trim();
+                    let hex_only: alloc::string::String =
+                        t.chars().filter(|c| *c != '-').collect();
+                    let valid = hex_only.len() == 32
+                        && hex_only.chars().all(|c| c.is_ascii_hexdigit())
+                        && (t.len() == 32
+                            || (t.len() == 36
+                                && t.as_bytes()[8] == b'-'
+                                && t.as_bytes()[13] == b'-'
+                                && t.as_bytes()[18] == b'-'
+                                && t.as_bytes()[23] == b'-'));
+                    Ok(Value::Bool(valid))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
+        }
         // v7.37.17 (17.6 siblings) — trig family via libm. Real
         // sin/cos/tan/asin/acos/atan/atan2/sinh/cosh/tanh + arch
         // hyperbolic variants. All accept f64; NULL passthrough.
