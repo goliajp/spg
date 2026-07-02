@@ -2205,6 +2205,44 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///   * ORDINAL_POSITION (Int)
 ///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
 ///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+/// v7.37.17 — synthesise `information_schema.sequences`.
+/// SQLAlchemy's sequence reflection and pgAdmin's sequence browser
+/// read this; one row per catalog sequence with its declared
+/// bounds.
+pub(crate) fn synth_info_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("sequence_catalog", DataType::Text, false),
+        ColumnSchema::new("sequence_schema", DataType::Text, false),
+        ColumnSchema::new("sequence_name", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("start_value", DataType::BigInt, false),
+        ColumnSchema::new("minimum_value", DataType::BigInt, false),
+        ColumnSchema::new("maximum_value", DataType::BigInt, false),
+        ColumnSchema::new("increment", DataType::BigInt, false),
+        ColumnSchema::new("cycle_option", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (name, def) in cat.sequences() {
+        let dt = match def.data_type {
+            spg_storage::SequenceDataType::SmallInt => "smallint",
+            spg_storage::SequenceDataType::Int => "integer",
+            spg_storage::SequenceDataType::BigInt => "bigint",
+        };
+        rows.push(Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(name.clone()),
+            Value::text::<&str>(dt),
+            Value::BigInt(def.start),
+            Value::BigInt(def.min_value),
+            Value::BigInt(def.max_value),
+            Value::BigInt(def.increment),
+            Value::text::<&str>(if def.cycle { "YES" } else { "NO" }),
+        ]));
+    }
+    (schema, rows)
+}
+
 pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("constraint_name", DataType::Text, false),

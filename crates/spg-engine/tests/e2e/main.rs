@@ -220,6 +220,7 @@ mod e2e_updatability_probes;
 mod e2e_lastval;
 mod e2e_sequence_last_value;
 mod e2e_info_schema_columns_widened;
+mod e2e_info_schema_sequences;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
