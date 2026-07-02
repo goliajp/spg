@@ -918,6 +918,57 @@ fn apply_function_dispatch(
         | "pg_copy_logical_replication_slot"
         | "pg_drop_replication_slot"
         | "pg_replication_slot_advance" => Ok(Value::Null),
+        // Logical-decoding consumers — SETOF change streams +
+        // message emission. SPG's replication protocol RFC
+        // (MAGIC_SUB/MAGIC_REPL) owns the real semantics; NULL
+        // keeps wal2json/debezium-style probe queries parseable.
+        "pg_logical_slot_get_changes"
+        | "pg_logical_slot_peek_changes"
+        | "pg_logical_slot_get_binary_changes"
+        | "pg_logical_slot_peek_binary_changes" => Ok(Value::Null),
+        // pg_logical_emit_message(transactional, prefix, content) —
+        // writes a message WAL record, returns its LSN. SPG's WAL
+        // has no message record type; return the same '0/0' text
+        // LSN as the pg_current_wal_lsn family.
+        "pg_logical_emit_message" => {
+            Ok(Value::text::<String>("0/0".into()))
+        }
+        // Collation versioning — SPG collates via Rust's Unicode
+        // tables, so the actual version is the Unicode version we
+        // ship (aligned with unicode_version() at 15.0). Never
+        // reports a mismatch warning because there is exactly one
+        // collation provider.
+        "pg_collation_actual_version"
+        | "pg_database_collation_actual_version" => {
+            match args.first() {
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::text::<String>("15.0".into())),
+            }
+        }
+        // pg_import_system_collations(schema) — count of collations
+        // imported from the OS. SPG has a single builtin provider;
+        // nothing to import → 0.
+        "pg_import_system_collations" => Ok(Value::Int(0)),
+        // Trigger-function names that appear in CREATE TRIGGER
+        // statements from pg_dump. Calling them directly as scalars
+        // (some ORMs probe existence this way) returns NULL.
+        "suppress_redundant_updates_trigger"
+        | "tsvector_update_trigger"
+        | "tsvector_update_trigger_column" => Ok(Value::Null),
+        // pg_nextoid(rel, col, index) — binary-upgrade-only oid
+        // allocator; binary_upgrade_* setters are pg_upgrade
+        // internals. NULL keeps pg_upgrade-generated dumps moving.
+        "pg_nextoid"
+        | "binary_upgrade_set_next_pg_type_oid"
+        | "binary_upgrade_set_next_array_pg_type_oid"
+        | "binary_upgrade_set_next_heap_pg_class_oid"
+        | "binary_upgrade_set_next_index_pg_class_oid"
+        | "binary_upgrade_set_next_toast_pg_class_oid"
+        | "binary_upgrade_set_next_pg_enum_oid"
+        | "binary_upgrade_set_next_pg_authid_oid"
+        | "binary_upgrade_set_record_init_privs"
+        | "binary_upgrade_set_missing_value"
+        | "binary_upgrade_create_empty_extension" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_stat_reset* family. Returns
         // void (NULL) — monitoring / admin dashboards call these on
         // schedule to reset counters. SPG's counters are session-
