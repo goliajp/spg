@@ -2205,6 +2205,33 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///   * ORDINAL_POSITION (Int)
 ///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
 ///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+/// v7.37.17 — synthesise `information_schema.check_constraints`.
+/// One row per CHECK expression, named `{table}_check{i}` (the
+/// same synthetic convention pg_constraint's CHECK rows use).
+pub(crate) fn synth_info_check_constraints(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_catalog", DataType::Text, false),
+        ColumnSchema::new("constraint_schema", DataType::Text, false),
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("check_clause", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for (ci, clause) in t.schema().checks.iter().enumerate() {
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(alloc::format!("{tname}_check{ci}")),
+                Value::text(clause.clone()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.17 — synthesise `information_schema.sequences`.
 /// SQLAlchemy's sequence reflection and pgAdmin's sequence browser
 /// read this; one row per catalog sequence with its declared
