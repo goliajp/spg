@@ -175,6 +175,69 @@ pub fn jsonb_each_text_rows(arg: &Value) -> Result<Vec<(String, Option<String>)>
     }
 }
 
+/// v7.37.17 (17.6 siblings) — set-returning function
+/// `jsonb_array_elements[_text](json)`. PG semantics: one row per
+/// array element. `_text` renders scalars as their lexeme and JSON
+/// null as SQL NULL; the plain form renders every element (including
+/// JSON null) as compact JSON text. Non-array inputs raise an error
+/// (PG's actual behaviour); SQL NULL produces 0 rows.
+///
+/// Returns the element texts as a Vec ready for FROM-clause
+/// materialisation (via the unnest rewrite in the parser).
+pub fn array_element_rows(
+    arg: &Value,
+    as_text: bool,
+    fn_name: &str,
+) -> Result<Vec<Option<String>>, EvalError> {
+    let src = match arg {
+        Value::Null => return Ok(Vec::new()),
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}: argument must be JSON / JSONB, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let parsed = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("{fn_name}: invalid JSON: {e}"),
+    })?;
+    match parsed {
+        JsonValue::Array(items) => {
+            let mut out: Vec<Option<String>> = Vec::with_capacity(items.len());
+            for v in items {
+                let text = if as_text {
+                    match &v {
+                        JsonValue::Null => None,
+                        JsonValue::Bool(b) => Some(if *b {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        }),
+                        JsonValue::Number(_)
+                        | JsonValue::NumberText(_)
+                        | JsonValue::String(_) => Some(v.as_text()),
+                        JsonValue::Array(_) | JsonValue::Object(_) => {
+                            Some(v.to_json_text())
+                        }
+                    }
+                } else {
+                    Some(v.to_json_text())
+                };
+                out.push(text);
+            }
+            Ok(out)
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "cannot extract elements from a non-array ({fn_name}: got {other:?})"
+            ),
+        }),
+    }
+}
+
 /// array index. Missing or non-existent steps return `Value::Null`.
 pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static>, EvalError> {
     let src = match lhs {

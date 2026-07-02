@@ -97,6 +97,7 @@ mod e2e_convert_from_to;
 mod e2e_jsonb_pretty;
 mod e2e_jsonb_strip_nulls;
 mod e2e_jsonb_object_keys;
+mod e2e_jsonb_array_elements;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;

@@ -1335,6 +1335,30 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — jsonb_array_elements[_text] /
+        // json_array_elements[_text] scalar surface: returns the
+        // array elements as a TextArray (same precedent as
+        // jsonb_object_keys). The parser rewrites the FROM-clause
+        // SRF form into `unnest(<this>(arg))`, so `SELECT * FROM
+        // jsonb_array_elements('[…]')` emits one row per element.
+        // `_text`: JSON null → SQL NULL, scalars → lexeme; plain:
+        // every element as compact JSON text.
+        "jsonb_array_elements"
+        | "json_array_elements"
+        | "jsonb_array_elements_text"
+        | "json_array_elements_text" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let as_text = name.ends_with("_text");
+            let items = crate::json::array_element_rows(&args[0], as_text, name)?;
+            Ok(Value::TextArray(items))
+        }
         // v7.37.17 (17.6 siblings) — pg_column_size(v) returns the
         // storage size of a value in bytes. Real implementation for
         // the value types SPG carries in-line (int / bigint / float /
