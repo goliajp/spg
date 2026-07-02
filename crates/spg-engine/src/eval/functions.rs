@@ -9839,6 +9839,65 @@ fn apply_function_dispatch(
         | "_pg_truetypid"
         | "_pg_truetypmod"
         | "_pg_interval_type" => Ok(Value::Null),
+        // Updatability probes — information_schema.views'
+        // is_updatable/is_insertable_into and psql \d+ both test
+        // pg_relation_is_updatable's event bitmask (8=INSERT,
+        // 4=UPDATE, 16=DELETE → 28 = fully updatable). SPG tables
+        // are always updatable; views are too (the v7.37.19 auto-
+        // updatable redirect handles INSERT/UPDATE/DELETE);
+        // missing relation → 0.
+        "pg_relation_is_updatable" => {
+            let bare_owned;
+            let bare: &str = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => {
+                    bare_owned = s
+                        .strip_prefix("public.")
+                        .unwrap_or(s)
+                        .trim_matches('"')
+                        .to_string();
+                    &bare_owned
+                }
+                // Numeric oid input — assume a known relation
+                // (synthetic oids have no reverse map).
+                Some(_) => return Ok(Value::Int(28)),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Int(0));
+            };
+            let known = cat.get(bare).is_some()
+                || cat.views().contains_key(bare);
+            Ok(Value::Int(if known { 28 } else { 0 }))
+        }
+        // pg_column_is_updatable(rel, attnum, include_triggers) —
+        // per-column form; SPG has no generated/identity columns
+        // blocking updates, so it mirrors the relation answer.
+        "pg_column_is_updatable" => {
+            let bare_owned;
+            let bare: &str = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => {
+                    bare_owned = s
+                        .strip_prefix("public.")
+                        .unwrap_or(s)
+                        .trim_matches('"')
+                        .to_string();
+                    &bare_owned
+                }
+                Some(_) => return Ok(Value::Bool(true)),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Bool(false));
+            };
+            let known = cat.get(bare).is_some()
+                || cat.views().contains_key(bare);
+            Ok(Value::Bool(known))
+        }
+        // row_security_active(rel) — SPG has no row-level security.
+        "row_security_active" => match args.first() {
+            None | Some(Value::Null) => Ok(Value::Null),
+            _ => Ok(Value::Bool(false)),
+        },
         // getdatabaseencoding() — SPG is UTF-8-only, like
         // pg_client_encoding / pg_encoding_to_char.
         "getdatabaseencoding" => Ok(Value::text::<String>("UTF8".into())),
