@@ -9853,11 +9853,102 @@ fn apply_function_dispatch(
             }
             Some(other) => Ok(Value::text(alloc::format!("'{other:?}'"))),
         },
-        // format_type(type_oid[, typmod]) — returns the canonical
-        // display name of a type. Real implementation walks the
-        // pg_type oid map; for parse-through we return NULL when
-        // the oid is unknown.
-        "format_type" => Ok(Value::text::<String>("unknown".into())),
+        // format_type(type_oid [, typmod]) — REAL: canonical SQL
+        // display names for the pg_type oid map SPG ships, with
+        // PG's typmod rendering (varchar(n), numeric(p,s),
+        // timestamp(n)). Unknown oid → PG returns "???"; SPG
+        // matches. NULL oid → NULL.
+        "format_type" => {
+            let oid = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                Some(_) => return Ok(Value::Null),
+            };
+            let typmod = match args.get(1) {
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                _ => -1,
+            };
+            // PG's deparse names (format_type uses SQL-standard
+            // spellings, not the internal typname).
+            let base: Option<&str> = match oid {
+                16 => Some("boolean"),
+                17 => Some("bytea"),
+                18 => Some("\"char\""),
+                19 => Some("name"),
+                20 => Some("bigint"),
+                21 => Some("smallint"),
+                23 => Some("integer"),
+                25 => Some("text"),
+                26 => Some("oid"),
+                114 => Some("json"),
+                142 => Some("xml"),
+                700 => Some("real"),
+                701 => Some("double precision"),
+                650 => Some("cidr"),
+                869 => Some("inet"),
+                829 => Some("macaddr"),
+                774 => Some("macaddr8"),
+                790 => Some("money"),
+                1042 => Some("character"),
+                1043 => Some("character varying"),
+                1082 => Some("date"),
+                1083 => Some("time without time zone"),
+                1114 => Some("timestamp without time zone"),
+                1184 => Some("timestamp with time zone"),
+                1186 => Some("interval"),
+                1266 => Some("time with time zone"),
+                1700 => Some("numeric"),
+                2950 => Some("uuid"),
+                3802 => Some("jsonb"),
+                3614 => Some("tsvector"),
+                3615 => Some("tsquery"),
+                3904 => Some("int4range"),
+                3906 => Some("numrange"),
+                3908 => Some("tstzrange"),
+                3910 => Some("tsrange"),
+                3912 => Some("daterange"),
+                3926 => Some("int8range"),
+                _ => None,
+            };
+            let Some(base) = base else {
+                return Ok(Value::text::<String>("???".into()));
+            };
+            let rendered = if typmod >= 4 {
+                match oid {
+                    1042 | 1043 => {
+                        alloc::format!("{base}({})", typmod - 4)
+                    }
+                    1700 => {
+                        let packed = typmod - 4;
+                        alloc::format!(
+                            "{base}({},{})",
+                            (packed >> 16) & 0xFFFF,
+                            packed & 0xFFFF
+                        )
+                    }
+                    _ => base.into(),
+                }
+            } else if typmod >= 0
+                && matches!(oid, 1083 | 1114 | 1184 | 1266)
+            {
+                // time/timestamp precision: 'timestamp(3) without
+                // time zone' — the precision goes before the tz
+                // qualifier.
+                match base.split_once(' ') {
+                    Some((head, tail)) => {
+                        alloc::format!("{head}({typmod}) {tail}")
+                    }
+                    None => alloc::format!("{base}({typmod})"),
+                }
+            } else {
+                base.into()
+            };
+            Ok(Value::text(rendered))
+        }
         // obj_description / col_description / shobj_description —
         // COMMENT ON reader helpers. SPG doesn't yet retain
         // comments in the catalog; return NULL.
