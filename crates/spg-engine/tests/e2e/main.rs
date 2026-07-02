@@ -306,6 +306,7 @@ mod e2e_fulltext_gin_seek;
 mod e2e_fulltext_index;
 mod e2e_fulltext_planner;
 mod e2e_generate_series;
+mod e2e_generate_series_join;
 mod e2e_generate_series_ordinality;
 mod e2e_generated_stored;
 mod e2e_geometry;
