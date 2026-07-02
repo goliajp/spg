@@ -6732,6 +6732,186 @@ fn apply_function_dispatch(
             }
         }
         "ts_rank_cd" => fts_ts_rank_cd(args),
+        // ts_delete(tsvector, lexeme) / ts_delete(tsvector, text[])
+        // — remove the given lexeme(s). SPG tsvector text form is
+        // 'word:pos' pairs; match on the word part.
+        "ts_delete" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ts_delete() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let vec_text = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "ts_delete() needs tsvector text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let targets: alloc::vec::Vec<alloc::string::String> = match &args[1]
+            {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => alloc::vec![s.as_ref().into()],
+                Value::TextArray(items) => {
+                    items.iter().flatten().cloned().collect()
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "ts_delete() needs lexeme text or text[], got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let kept: alloc::vec::Vec<&str> = vec_text
+                .split_whitespace()
+                .filter(|lexeme| {
+                    let word = match lexeme.split_once(':') {
+                        Some((w, _)) => w,
+                        None => lexeme,
+                    };
+                    !targets.iter().any(|t| t == word)
+                })
+                .collect();
+            Ok(Value::text(kept.join(" ")))
+        }
+        // ts_filter(tsvector, weights) — keep only lexemes that have
+        // at least one position tagged with one of the given weight
+        // letters (A/B/C/D). Weights arrive as text like '{a,b}' or
+        // a TextArray.
+        "ts_filter" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ts_filter() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let vec_text = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "ts_filter() needs tsvector text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let weights: alloc::vec::Vec<char> = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s
+                    .chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect(),
+                Value::TextArray(items) => items
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| s.chars().next())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "ts_filter() needs weight char[], got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if weights.iter().any(|c| !matches!(c, 'A'..='D')) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "ts_filter(): weights must be A, B, C or D".into(),
+                });
+            }
+            let kept: alloc::vec::Vec<&str> = vec_text
+                .split_whitespace()
+                .filter(|lexeme| match lexeme.split_once(':') {
+                    Some((_, positions)) => {
+                        positions.split(',').any(|pos| {
+                            match pos.chars().last() {
+                                Some(c) if c.is_ascii_alphabetic() => weights
+                                    .contains(&c.to_ascii_uppercase()),
+                                // Unweighted position = weight D.
+                                _ => weights.contains(&'D'),
+                            }
+                        })
+                    }
+                    // No positions at all = weight D.
+                    None => weights.contains(&'D'),
+                })
+                .collect();
+            Ok(Value::text(kept.join(" ")))
+        }
+        // tsquery_phrase(q1, q2[, distance]) — combine two tsqueries
+        // into a phrase query: q1 <-> q2, or q1 <N> q2.
+        "tsquery_phrase" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "tsquery_phrase() takes 2 or 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let q1 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "tsquery_phrase() needs tsquery text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let q2 = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "tsquery_phrase() needs tsquery text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let distance = match args.get(2) {
+                None => 1i64,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "tsquery_phrase() distance must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let joined = if distance == 1 {
+                alloc::format!("{q1} <-> {q2}")
+            } else {
+                alloc::format!("{q1} <{distance}> {q2}")
+            };
+            Ok(Value::text(joined))
+        }
         // v7.14.0 — PG dump preamble emits
         // `SELECT pg_catalog.set_config('search_path', '', false);`
         // and friends. SPG is single-schema; accept-as-no-op
