@@ -174,6 +174,7 @@ mod e2e_uuidv7;
 mod e2e_uuid_v5_v3;
 mod e2e_inet_family;
 mod e2e_make_date_time;
+mod e2e_isfinite;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

@@ -3169,6 +3169,31 @@ fn apply_function_dispatch(
             Ok(Value::Timestamp(binned))
         }
         "date_part" => date_part(args),
+        // v7.37.17 (17.6 siblings) — isfinite(date|timestamp|interval)
+        // returns whether the value is finite (not ±infinity). SPG
+        // doesn't store infinite date/timestamp sentinels, so
+        // everything stored is finite → true. Float args check
+        // f64::is_finite for the numeric overload some drivers emit.
+        "isfinite" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("isfinite() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Float(f) => Ok(Value::Bool(f.is_finite())),
+                Value::Date(_)
+                | Value::Timestamp(_)
+                | Value::Interval { .. } => Ok(Value::Bool(true)),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "isfinite() needs date/timestamp/interval, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — PG 9.4+ make_date / make_time /
         // make_timestamp / make_interval constructors.
         "make_date" => {
