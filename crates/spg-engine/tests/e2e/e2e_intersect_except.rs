@@ -95,6 +95,33 @@ fn intersect_binds_tighter_than_union() {
 }
 
 #[test]
+fn parenthesized_groups_override_precedence() {
+    let mut e = Engine::new();
+    setup(&mut e);
+    // (1 UNION l) INTERSECT r — the explicit group forces the
+    // union first: {1,2,3} ∩ {2,3,4} = {2,3} (1 must NOT survive,
+    // the mirror of the precedence test above).
+    assert_eq!(
+        ints(
+            &mut e,
+            "(SELECT 1 UNION SELECT x FROM l) INTERSECT SELECT x FROM r \
+             ORDER BY 1"
+        ),
+        [2, 3]
+    );
+    // Peer-position group: l EXCEPT (r EXCEPT SELECT 3)
+    // = {1,2,3} - {2,4} = {1,3}.
+    assert_eq!(
+        ints(
+            &mut e,
+            "SELECT x FROM l EXCEPT (SELECT x FROM r EXCEPT SELECT 3) \
+             ORDER BY 1"
+        ),
+        [1, 3]
+    );
+}
+
+#[test]
 fn chains_with_union() {
     let mut e = Engine::new();
     setup(&mut e);
