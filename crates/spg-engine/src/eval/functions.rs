@@ -6457,6 +6457,55 @@ fn apply_function_dispatch(
         )),
         // MySQL is_uuid(text) — validates the 36-char dashed or
         // 32-char bare hex form.
+        // v7.37.17 (17.6 siblings) — MySQL INSERT(str, pos, len,
+        // newstr): replaces the len-char window starting at 1-based
+        // pos with newstr. pos out of range → original string; len
+        // past the end → replace through the end. Char-based, so
+        // multi-byte text is safe.
+        "insert" => {
+            if args.len() != 4 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("insert() takes 4 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Text(s), Value::Text(new)) = (&args[0], &args[3]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "insert() str and newstr must be text".into(),
+                });
+            };
+            let as_i64 = |v: &Value| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                }
+            };
+            let (Some(pos), Some(len)) = (as_i64(&args[1]), as_i64(&args[2])) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "insert() pos and len must be integers".into(),
+                });
+            };
+            let chars: alloc::vec::Vec<char> = s.chars().collect();
+            let n = chars.len() as i64;
+            if pos < 1 || pos > n {
+                return Ok(Value::text(s.to_string()));
+            }
+            let start = (pos - 1) as usize;
+            let end = if len < 0 {
+                chars.len()
+            } else {
+                ((pos - 1).saturating_add(len).min(n)) as usize
+            };
+            let mut out = alloc::string::String::new();
+            out.extend(&chars[..start]);
+            out.push_str(new);
+            out.extend(&chars[end..]);
+            Ok(Value::text(out))
+        }
         "is_uuid" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -8825,6 +8874,13 @@ fn apply_function_dispatch(
         "inet_same_family" => super::inet::inet_same_family(args),
         // inet_merge(a, b) — the smallest network including both.
         "inet_merge" => super::inet::inet_merge(args),
+        // v7.37.17 (17.6 siblings) — MySQL network address helpers.
+        "inet_aton" => super::inet::mysql_inet_aton(args),
+        "inet_ntoa" => super::inet::mysql_inet_ntoa(args),
+        "inet6_aton" => super::inet::mysql_inet6_aton(args),
+        "inet6_ntoa" => super::inet::mysql_inet6_ntoa(args),
+        "is_ipv4" => super::inet::mysql_is_ipv4(args),
+        "is_ipv6" => super::inet::mysql_is_ipv6(args),
         // macaddr8_set7bit — EUI-64 → modified EUI-64.
         "macaddr8_set7bit" => super::inet::macaddr8_set7bit(args),
         // Connection-address probes. PG returns NULL for these on
