@@ -11617,6 +11617,26 @@ impl Parser {
             } else {
                 false
             };
+            // v7.37.17 (17.6 siblings) — MySQL TIMESTAMPADD /
+            // TIMESTAMPDIFF take a bare unit keyword as the first
+            // argument (MINUTE, DAY, ...); lower it onto a string
+            // literal so the evaluator sees plain text.
+            if (first.eq_ignore_ascii_case("timestampadd")
+                || first.eq_ignore_ascii_case("timestampdiff"))
+                && matches!(self.peek(), Token::Ident(u) if matches!(
+                    u.to_ascii_lowercase().as_str(),
+                    "microsecond" | "second" | "minute" | "hour" | "day"
+                        | "week" | "month" | "quarter" | "year"
+                ))
+            {
+                if let Token::Ident(u) = self.peek() {
+                    args.push(Expr::Literal(Literal::String(u.to_ascii_lowercase())));
+                }
+                self.advance();
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                }
+            }
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     args.push(self.parse_expr(0)?);
