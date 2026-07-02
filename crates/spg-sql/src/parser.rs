@@ -6697,6 +6697,7 @@ impl Parser {
             None
         };
         let mut group_by_all = false;
+        let mut rollup_keys: Vec<Expr> = Vec::new();
         let group_by = if matches!(self.peek(), Token::Group) {
             self.advance();
             if !matches!(self.peek(), Token::By) {
@@ -6709,6 +6710,33 @@ impl Parser {
                 self.advance();
                 group_by_all = true;
                 None
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("rollup"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                // v7.37.17 (17.6 siblings) — GROUP BY ROLLUP(a, b):
+                // subtotal rows. Parsed here; expanded into UNION
+                // ALL peers below once the base statement exists.
+                self.advance(); // ROLLUP
+                self.advance(); // (
+                let mut keys = Vec::new();
+                loop {
+                    keys.push(self.parse_expr(0)?);
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                        }
+                        Token::RParen => break,
+                        other => {
+                            return Err(self.err(format!(
+                                "expected ',' or ')' in ROLLUP list, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                self.advance(); // )
+                rollup_keys = keys.clone();
+                Some(keys)
             } else {
                 let mut groups = Vec::new();
                 loop {
@@ -6730,7 +6758,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(SelectStatement {
+        let mut stmt = SelectStatement {
             ctes: Vec::new(),
             distinct,
             distinct_on,
@@ -6745,7 +6773,34 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
-        })
+        };
+        // ROLLUP expansion: one UNION ALL peer per shorter prefix
+        // of the key list (…, (a), ()), with the dropped keys
+        // replaced by NULL literals in the peer's items and
+        // group_by. PG-legal: non-grouped select items must be
+        // group keys or aggregates, so a dropped key's occurrences
+        // in the projection are exactly the ones to nullify.
+        if !rollup_keys.is_empty() {
+            for keep in (0..rollup_keys.len()).rev() {
+                let mut peer = stmt.clone();
+                peer.unions = Vec::new();
+                let (kept, dropped) = rollup_keys.split_at(keep);
+                peer.group_by = if kept.is_empty() {
+                    None
+                } else {
+                    Some(kept.to_vec())
+                };
+                for item in &mut peer.items {
+                    if let SelectItem::Expr { expr, .. } = item
+                        && dropped.iter().any(|d| d == expr)
+                    {
+                        *expr = Expr::Literal(Literal::Null);
+                    }
+                }
+                stmt.unions.push((UnionKind::All, peer));
+            }
+        }
+        Ok(stmt)
     }
 
     fn parse_create_table_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
