@@ -127,6 +127,10 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // the group (SPG: the first seen, deterministic for
             // ordered input).
             | "any_value"
+            // PG 14+ — range_agg: collect ranges into a multirange
+            // (insertion order, no coalescing — matches the
+            // multirange constructor contract).
+            | "range_agg"
             // MySQL group_concat (string_agg with ',' default) +
             // SQL/XML xmlagg (separator-less concatenation).
             | "group_concat"
@@ -239,6 +243,8 @@ enum AggKind {
     Max,
     /// PG 16+ any_value — first non-NULL value seen.
     AnyValue,
+    /// PG 14+ range_agg — collect ranges into a multirange.
+    RangeAgg,
     StringAgg,
     ArrayAgg,
     BoolAnd,
@@ -271,6 +277,7 @@ fn classify_agg_name(name: &str) -> AggKind {
         "min" => AggKind::Min,
         "max" => AggKind::Max,
         "any_value" => AggKind::AnyValue,
+        "range_agg" => AggKind::RangeAgg,
         "string_agg" | "group_concat" | "xmlagg" => AggKind::StringAgg,
         "array_agg" => AggKind::ArrayAgg,
         "bool_and" => AggKind::BoolAnd,
@@ -2388,7 +2395,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             let expected: Option<usize> = match lower.as_str() {
                 "count_star" => Some(0),
                 "count" | "sum" | "avg" | "min" | "max" | "array_agg"
-                | "any_value"
+                | "any_value" | "range_agg"
                 // v7.17.0 — boolean aggregates also take exactly
                 // one arg. `every` is an alias normalised inside
                 // collect_aggregates / rewrite_expr.
@@ -2755,6 +2762,46 @@ fn update_state(
                 st.extreme = Some(v.clone().into_owned());
             }
         }
+        AggKind::RangeAgg => {
+            if is_null {
+                return Ok(());
+            }
+            let Value::Range {
+                kind,
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+            } = v
+            else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "range_agg requires a range value, got {:?}",
+                        v.data_type()
+                    ),
+                });
+            };
+            // Initialise the accumulator on first sight (even for
+            // an empty range, so all-empty groups finalize to {}).
+            if st.extreme.is_none() {
+                st.extreme = Some(Value::Multirange {
+                    kind: *kind,
+                    ranges: alloc::vec::Vec::new(),
+                });
+            }
+            if !empty
+                && let Some(Value::Multirange { ranges, .. }) = &mut st.extreme
+            {
+                ranges.push(spg_storage::RangeSpan {
+                    lower: lower.clone(),
+                    upper: upper.clone(),
+                    lower_inc: *lower_inc,
+                    upper_inc: *upper_inc,
+                    empty: false,
+                });
+            }
+        }
         AggKind::Max => {
             if is_null {
                 return Ok(());
@@ -2974,6 +3021,9 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             }
         }
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
+        // PG: range_agg over an empty group is NULL; all-empty
+        // ranges finalize to the empty multirange {}.
+        "range_agg" => st.extreme.clone().unwrap_or(Value::Null),
         // v7.17.0 — string_agg: join all collected text items with
         // the captured separator. Empty / all-NULL group → NULL
         // (PG semantics).
