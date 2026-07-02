@@ -1187,7 +1187,8 @@ fn apply_function_dispatch(
         // pretty-printed JSON text. Walks the parsed tree and
         // re-emits with 2-space indent + newlines between object /
         // array members.
-        "jsonb_pretty" => {
+        // "json_pretty" is MySQL's spelling.
+        "jsonb_pretty" | "json_pretty" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("jsonb_pretty() takes 1 arg, got {}", args.len()),
@@ -1195,7 +1196,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Json(s) => {
+                // Text accepted alongside Json so string-literal
+                // arguments (MySQL json_pretty spelling) reach it.
+                Value::Json(s) | Value::Text(s) => {
                     let parsed = crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
                         detail: format!("jsonb_pretty(): JSON parse failed: {e}"),
                     })?;
@@ -8594,7 +8597,282 @@ fn apply_function_dispatch(
             out.push('}');
             Ok(Value::json(out))
         }
-        "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
+        // "json_array" is MySQL's spelling of json_build_array.
+        "json_build_array" | "jsonb_build_array" | "json_array" => {
+            crate::json::build_array(args)
+        }
+        // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
+        // The path-based family (json_extract / json_set with '$.x'
+        // paths) needs a MySQL JSON path parser and is queued.
+        "json_valid" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_valid() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    Ok(Value::Bool(crate::json::parse(s).is_ok()))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
+        }
+        // MySQL JSON_TYPE: uppercase names with the INTEGER/DOUBLE
+        // distinction (unlike PG's lowercase jsonb_typeof).
+        "json_type" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_type() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: format!("json_type(): invalid JSON: {e}"),
+                        }
+                    })?;
+                    let name = match &parsed {
+                        crate::json::JsonValue::Object(_) => "OBJECT",
+                        crate::json::JsonValue::Array(_) => "ARRAY",
+                        crate::json::JsonValue::String(_) => "STRING",
+                        crate::json::JsonValue::Bool(_) => "BOOLEAN",
+                        crate::json::JsonValue::Null => "NULL",
+                        crate::json::JsonValue::Number(x) => {
+                            if *x == libm::trunc(*x) {
+                                "INTEGER"
+                            } else {
+                                "DOUBLE"
+                            }
+                        }
+                        crate::json::JsonValue::NumberText(t) => {
+                            if t.contains('.') || t.contains('e') || t.contains('E') {
+                                "DOUBLE"
+                            } else {
+                                "INTEGER"
+                            }
+                        }
+                    };
+                    Ok(Value::text(alloc::string::String::from(name)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_type() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_LENGTH: object → member count, array → element
+        // count, scalar → 1.
+        "json_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_length() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: format!("json_length(): invalid JSON: {e}"),
+                        }
+                    })?;
+                    let n = match &parsed {
+                        crate::json::JsonValue::Object(members) => members.len(),
+                        crate::json::JsonValue::Array(items) => items.len(),
+                        _ => 1,
+                    };
+                    Ok(Value::Int(n as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_length() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_KEYS: the object's top-level keys as a JSON
+        // array (["a","b"]), not a SQL array.
+        "json_keys" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_keys() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: format!("json_keys(): invalid JSON: {e}"),
+                        }
+                    })?;
+                    match parsed {
+                        crate::json::JsonValue::Object(members) => {
+                            let mut out = alloc::string::String::from("[");
+                            for (i, (k, _)) in members.iter().enumerate() {
+                                if i > 0 {
+                                    out.push_str(", ");
+                                }
+                                out.push('"');
+                                for c in k.chars() {
+                                    match c {
+                                        '"' => out.push_str("\\\""),
+                                        '\\' => out.push_str("\\\\"),
+                                        c => out.push(c),
+                                    }
+                                }
+                                out.push('"');
+                            }
+                            out.push(']');
+                            Ok(Value::Json(alloc::borrow::Cow::Owned(out)))
+                        }
+                        // Non-object → NULL (MySQL semantics).
+                        _ => Ok(Value::Null),
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_keys() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_DEPTH: scalar / empty object / empty array = 1;
+        // each level of nesting adds 1.
+        "json_depth" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_depth() takes 1 arg, got {}", args.len()),
+                });
+            }
+            fn depth(v: &crate::json::JsonValue) -> i32 {
+                match v {
+                    crate::json::JsonValue::Object(members) => {
+                        1 + members.iter().map(|(_, x)| depth(x)).max().unwrap_or(0)
+                    }
+                    crate::json::JsonValue::Array(items) => {
+                        1 + items.iter().map(depth).max().unwrap_or(0)
+                    }
+                    _ => 1,
+                }
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let parsed = crate::json::parse(s).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: format!("json_depth(): invalid JSON: {e}"),
+                        }
+                    })?;
+                    Ok(Value::Int(depth(&parsed)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_depth() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_QUOTE: wrap a string as a JSON string literal.
+        "json_quote" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_quote() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let mut out = alloc::string::String::from("\"");
+                    for c in s.chars() {
+                        match c {
+                            '"' => out.push_str("\\\""),
+                            '\\' => out.push_str("\\\\"),
+                            '\n' => out.push_str("\\n"),
+                            '\r' => out.push_str("\\r"),
+                            '\t' => out.push_str("\\t"),
+                            c if (c as u32) < 0x20 => {
+                                out.push_str(&alloc::format!("\\u{:04x}", c as u32));
+                            }
+                            c => out.push(c),
+                        }
+                    }
+                    out.push('"');
+                    Ok(Value::Json(alloc::borrow::Cow::Owned(out)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_quote() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_UNQUOTE: a JSON string loses its quotes; other
+        // JSON values render as their compact text.
+        "json_unquote" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_unquote() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.starts_with('"') {
+                        let parsed = crate::json::parse(trimmed).map_err(|e| {
+                            EvalError::TypeMismatch {
+                                detail: format!("json_unquote(): invalid JSON: {e}"),
+                            }
+                        })?;
+                        match parsed {
+                            crate::json::JsonValue::String(inner) => Ok(Value::text(inner)),
+                            _ => Ok(Value::text(trimmed.to_string())),
+                        }
+                    } else {
+                        Ok(Value::text(trimmed.to_string()))
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_unquote() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL JSON_STORAGE_SIZE: bytes used to store the value —
+        // SPG stores JSON as text, so this is the compact text's
+        // byte length (real for SPG's storage model).
+        "json_storage_size" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_storage_size() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) | Value::Text(s) => Ok(Value::Int(s.len() as i32)),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "json_storage_size() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "jsonb_set" | "json_set" => crate::json::set(args),
         // jsonb_set_lax — jsonb_set with configurable SQL-NULL
         // new_value handling (PG 13+). Treatments:
