@@ -214,6 +214,7 @@ mod e2e_pg_get_viewdef;
 mod e2e_pg_get_indexdef;
 mod e2e_pg_get_constraintdef;
 mod e2e_format_type;
+mod e2e_to_regclass;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

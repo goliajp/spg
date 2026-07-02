@@ -10085,14 +10085,96 @@ fn apply_function_dispatch(
         | "pg_identify_object"
         | "pg_identify_object_as_address"
         | "pg_get_object_address" => Ok(Value::Null),
-        // to_regclass / to_regtype / to_regnamespace / to_regproc:
-        // string → oid lookup. Return NULL until the OID reverse-
-        // resolver is wired (queues with system_catalog v7.40
-        // widening).
-        "to_regclass"
-        | "to_regtype"
-        | "to_regnamespace"
-        | "to_regproc"
+        // to_regclass(name) — REAL: resolves a table/view name to
+        // its oid using the same synthetic map pg_class synthesizes
+        // (16384 + position in table_names order), NULL when the
+        // relation doesn't exist. The dominant caller shape is the
+        // existence check Django/Alembic emit:
+        //   SELECT to_regclass('tbl') IS NOT NULL
+        "to_regclass" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            for (pos, tname) in cat.table_names().iter().enumerate() {
+                if tname == bare {
+                    return Ok(Value::BigInt(16384 + pos as i64));
+                }
+            }
+            // Views resolve too (regclass covers all relations);
+            // their oid band sits above the table band.
+            for (pos, (vname, _)) in cat.views().iter().enumerate() {
+                if vname == bare {
+                    return Ok(Value::BigInt(32768 + pos as i64));
+                }
+            }
+            Ok(Value::Null)
+        }
+        // to_regtype(name) — REAL for the builtin scalar map (the
+        // same 38 names format_type renders); NULL for unknown.
+        "to_regtype" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.to_lowercase(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let oid: Option<i64> = match name_arg.trim() {
+                "bool" | "boolean" => Some(16),
+                "bytea" => Some(17),
+                "name" => Some(19),
+                "int8" | "bigint" => Some(20),
+                "int2" | "smallint" => Some(21),
+                "int4" | "int" | "integer" => Some(23),
+                "text" => Some(25),
+                "oid" => Some(26),
+                "json" => Some(114),
+                "xml" => Some(142),
+                "float4" | "real" => Some(700),
+                "float8" | "double precision" => Some(701),
+                "cidr" => Some(650),
+                "inet" => Some(869),
+                "macaddr" => Some(829),
+                "macaddr8" => Some(774),
+                "money" => Some(790),
+                "bpchar" | "char" | "character" => Some(1042),
+                "varchar" | "character varying" => Some(1043),
+                "date" => Some(1082),
+                "time" | "time without time zone" => Some(1083),
+                "timestamp" | "timestamp without time zone" => Some(1114),
+                "timestamptz" | "timestamp with time zone" => Some(1184),
+                "interval" => Some(1186),
+                "timetz" | "time with time zone" => Some(1266),
+                "numeric" | "decimal" => Some(1700),
+                "uuid" => Some(2950),
+                "jsonb" => Some(3802),
+                "tsvector" => Some(3614),
+                "tsquery" => Some(3615),
+                _ => None,
+            };
+            Ok(oid.map_or(Value::Null, Value::BigInt))
+        }
+        // to_regnamespace — 'public' and 'pg_catalog' exist.
+        "to_regnamespace" => match args.first() {
+            None | Some(Value::Null) => Ok(Value::Null),
+            Some(Value::Text(s)) => match s.as_ref() {
+                "public" => Ok(Value::BigInt(2200)),
+                "pg_catalog" => Ok(Value::BigInt(11)),
+                "information_schema" => Ok(Value::BigInt(13000)),
+                _ => Ok(Value::Null),
+            },
+            Some(_) => Ok(Value::Null),
+        },
+        // Function/operator/role resolvers — the oid spaces queue
+        // with system_catalog v7.40 widening.
+        "to_regproc"
         | "to_regprocedure"
         | "to_regoperator"
         | "to_regrole" => Ok(Value::Null),
