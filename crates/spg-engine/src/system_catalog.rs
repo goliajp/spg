@@ -2205,6 +2205,43 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///   * ORDINAL_POSITION (Int)
 ///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
 ///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+/// v7.37.17 — synthesise `information_schema.triggers`.
+/// pgAdmin's trigger panel and SQLAlchemy read this. PG explodes
+/// one row per (trigger × event); SPG mirrors that.
+pub(crate) fn synth_info_triggers(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("trigger_catalog", DataType::Text, false),
+        ColumnSchema::new("trigger_schema", DataType::Text, false),
+        ColumnSchema::new("trigger_name", DataType::Text, false),
+        ColumnSchema::new("event_manipulation", DataType::Text, false),
+        ColumnSchema::new("event_object_schema", DataType::Text, false),
+        ColumnSchema::new("event_object_table", DataType::Text, false),
+        ColumnSchema::new("action_statement", DataType::Text, false),
+        ColumnSchema::new("action_orientation", DataType::Text, false),
+        ColumnSchema::new("action_timing", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for trg in cat.triggers() {
+        for event in &trg.events {
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(trg.name.clone()),
+                Value::text(event.clone()),
+                Value::text("public"),
+                Value::text(trg.table.clone()),
+                Value::text(alloc::format!(
+                    "EXECUTE FUNCTION {}()",
+                    trg.function
+                )),
+                Value::text(trg.for_each.clone()),
+                Value::text(trg.timing.clone()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.17 — synthesise `information_schema.check_constraints`.
 /// One row per CHECK expression, named `{table}_check{i}` (the
 /// same synthetic convention pg_constraint's CHECK rows use).
