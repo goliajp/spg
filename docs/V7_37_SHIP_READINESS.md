@@ -73,6 +73,48 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Structural-SQL campaign (tasks #321-#336) — three multi-cycle
+arcs close out the range type, derived tables and the SQL set
+operations, with two real correctness bugs found and fixed along
+the way (branch at 309 commits ahead of develop, 2855 e2e green):
+
+- **Ranges, full lifecycle (#325-#328)**: constructor functions
+  int4range..tstzrange (until then ranges only entered via
+  '::int4range' text casts; bounds flags, NULL = unbounded,
+  equal-bounds → empty), multirange constructors, range_agg
+  (PG 14 — collect into a multirange) and range_intersect_agg
+  (calendar-exact intersection fold; unbounded loses to bounded,
+  non-inclusive touch collapses to empty). The #256 bound
+  predicates now answer directly off real Range values.
+- **Derived tables (#329-#332)**: FROM ( SELECT … ) never parsed —
+  subqueries only entered FROM through explicit LATERAL. Now:
+  plain derived tables (primary + JOIN positions, UNION tails,
+  aggregates over them), AS t(a, b) positional column aliases,
+  FROM ( VALUES … ) t(cols) with PG's column1..columnN defaults,
+  and the top-level bare VALUES statement with ORDER BY/LIMIT
+  tails (shared parse_select_tail_into extraction).
+- **Set operations (#333-#336)**: INTERSECT [ALL] and EXCEPT
+  [ALL] join UNION (PG multiset semantics — min-count
+  intersection, occurrence-cancelling subtraction), INTERSECT
+  binds tighter than UNION/EXCEPT (boundary-aware regroup),
+  parenthesized groups override precedence, and groups carry
+  their own ORDER BY/LIMIT via a derived-table wrap.
+- **Correctness fixes surfaced by the campaign's own tests**:
+  resolve_order_by_position substituted an ORDER BY alias with
+  the HEAD's item expression, so a UNION of constant SELECTs was
+  a silent no-sort ('SELECT 3 AS x UNION ALL SELECT 1 ORDER BY x
+  DESC' returned unsorted); and positional ORDER BY keys reached
+  the union sort unresolved under Wildcard projections. Both
+  fixed with regression pins.
+- **MySQL closures (#321-#324)**: clock spellings (curdate/
+  sysdate/utc_* — the time family renders HH:MM:SS text),
+  adddate/subdate/date_sub with bare-day shorthand, get_format's
+  manual table + convert_tz offset forms (named zones → NULL,
+  faithful to unloaded time-zone tables), to_base64/from_base64
+  (76-char wrap), MySQL-shape sha/sha2 hex digests, random_bytes,
+  load_file → NULL. tsquery_and/or/not complete the FTS operator
+  catalog forms (#323).
+
 SRF + MySQL-JSON campaign (tasks #301-#319) — set-returning
 functions land through a parser-rewrite pipeline, and the MySQL
 JSON surface goes from 2 to 22 functions in five cycles (branch
