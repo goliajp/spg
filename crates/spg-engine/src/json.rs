@@ -2589,3 +2589,222 @@ pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     };
     Ok(Value::Bool(overlaps))
 }
+
+/// SQL LIKE matcher for json_search: `%` any run, `_` one char,
+/// `escape` literalises the next char.
+fn like_match(text: &[char], pat: &[char], escape: char) -> bool {
+    match pat {
+        [] => text.is_empty(),
+        ['%', rest @ ..] => {
+            (0..=text.len()).any(|skip| like_match(&text[skip..], rest, escape))
+        }
+        ['_', rest @ ..] => !text.is_empty() && like_match(&text[1..], rest, escape),
+        [e, lit, rest @ ..] if *e == escape => {
+            text.first() == Some(lit) && like_match(&text[1..], rest, escape)
+        }
+        [c, rest @ ..] => text.first() == Some(c) && like_match(&text[1..], rest, escape),
+    }
+}
+
+/// Render one MySQL path step onto a path string. Identifier-shaped
+/// keys render bare (`$.a`); anything else quotes (`$."a b"`).
+fn push_path_step(out: &mut String, step_key: Option<&str>, step_idx: Option<usize>) {
+    if let Some(k) = step_key {
+        let ident_shaped = !k.is_empty()
+            && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !k.chars().next().unwrap().is_numeric();
+        if ident_shaped {
+            out.push('.');
+            out.push_str(k);
+        } else {
+            out.push_str(".\"");
+            for c in k.chars() {
+                if c == '"' || c == '\\' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        }
+    }
+    if let Some(i) = step_idx {
+        out.push('[');
+        out.push_str(&alloc::format!("{i}"));
+        out.push(']');
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_SEARCH(doc, 'one'|'all',
+/// pattern [, escape [, path...]]). Returns the path of the first
+/// string value LIKE-matching the pattern ('one') or a JSON array
+/// of all such paths ('all'); NULL when nothing matches. The
+/// optional path args narrow where the walk starts.
+pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_search() takes doc, one/all, pattern [, escape [, path...]], got {} args",
+                args.len()
+            ),
+        });
+    }
+    if args[..3].iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_search() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("json_search(): invalid JSON: {e}"),
+    })?;
+    let one = match &args[1] {
+        Value::Text(m) if m.eq_ignore_ascii_case("one") => true,
+        Value::Text(m) if m.eq_ignore_ascii_case("all") => false,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_search() second arg must be 'one' or 'all', got {other:?}"
+                ),
+            });
+        }
+    };
+    let Value::Text(pattern) = &args[2] else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_search() pattern must be text, got {:?}",
+                args[2].data_type()
+            ),
+        });
+    };
+    let escape = match args.get(3) {
+        None | Some(Value::Null) => '\\',
+        Some(Value::Text(e)) if e.chars().count() == 1 => e.chars().next().unwrap(),
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_search() escape must be a single character, got {other:?}"
+                ),
+            });
+        }
+    };
+    let pat: Vec<char> = pattern.chars().collect();
+    fn walk(
+        v: &JsonValue,
+        path: &str,
+        pat: &[char],
+        escape: char,
+        hits: &mut Vec<String>,
+        stop_at_one: bool,
+    ) {
+        if stop_at_one && !hits.is_empty() {
+            return;
+        }
+        match v {
+            JsonValue::String(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                if like_match(&chars, pat, escape) {
+                    hits.push(path.to_string());
+                }
+            }
+            JsonValue::Object(members) => {
+                for (k, mv) in members {
+                    let mut p = path.to_string();
+                    push_path_step(&mut p, Some(k), None);
+                    walk(mv, &p, pat, escape, hits, stop_at_one);
+                }
+            }
+            JsonValue::Array(items) => {
+                for (i, iv) in items.iter().enumerate() {
+                    let mut p = path.to_string();
+                    push_path_step(&mut p, None, Some(i));
+                    walk(iv, &p, pat, escape, hits, stop_at_one);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits: Vec<String> = Vec::new();
+    let start_paths: Vec<String> = args.get(4..).unwrap_or(&[])
+        .iter()
+        .map(|v| match v {
+            Value::Text(p) => Ok(p.to_string()),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_search() paths must be text, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    if start_paths.is_empty() {
+        walk(&doc, "$", &pat, escape, &mut hits, one);
+    } else {
+        for p in &start_paths {
+            let steps = mysql_path_steps(p)?;
+            if let Some(sub) = mysql_path_get(&doc, &steps) {
+                walk(sub, p.trim(), &pat, escape, &mut hits, one);
+            }
+        }
+    }
+    match hits.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Json(alloc::borrow::Cow::Owned(
+            JsonValue::String(hits.into_iter().next().unwrap()).to_json_text(),
+        ))),
+        _ => {
+            let arr = JsonValue::Array(hits.into_iter().map(JsonValue::String).collect());
+            Ok(Value::Json(alloc::borrow::Cow::Owned(arr.to_json_text())))
+        }
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_VALUE(doc, path). Returns
+/// the scalar at the path as unquoted text (MySQL's default
+/// RETURNING VARCHAR); containers render as JSON text; a miss is
+/// NULL. The RETURNING clause is parser syntax and queued.
+pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("json_value() takes 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_value() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("json_value(): invalid JSON: {e}"),
+    })?;
+    let Value::Text(p) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_value() path must be text, got {:?}",
+                args[1].data_type()
+            ),
+        });
+    };
+    let steps = mysql_path_steps(p)?;
+    match mysql_path_get(&doc, &steps) {
+        None => Ok(Value::Null),
+        Some(JsonValue::Null) => Ok(Value::Null),
+        Some(v) => Ok(Value::text(v.as_text())),
+    }
+}
