@@ -5952,6 +5952,269 @@ fn apply_function_dispatch(
         // MySQL `ifnull(a, b)` — alias for coalesce(a, b).
         // Used by every ORM with a MySQL target (Hibernate /
         // Laravel / Sequelize).
+        // MySQL locate(substr, str[, pos]) — 1-based char position,
+        // 0 when absent. NOTE the MySQL argument order (needle
+        // first), the reverse of PG's strpos.
+        "locate" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "locate() takes 2 or 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let (needle, hay) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(n), Value::Text(h)) => (n.as_ref(), h.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "locate() takes TEXT args".into(),
+                    });
+                }
+            };
+            let start = match args.get(2) {
+                None => 1i64,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "locate() pos must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if start < 1 {
+                return Ok(Value::Int(0));
+            }
+            // Skip (start-1) chars, search, report 1-based char pos.
+            let skip = (start - 1) as usize;
+            let char_offset: usize = hay.chars().take(skip).map(char::len_utf8).sum();
+            if char_offset > hay.len() {
+                return Ok(Value::Int(0));
+            }
+            match hay[char_offset..].find(needle) {
+                Some(byte_pos) => {
+                    let chars_before =
+                        hay[..char_offset + byte_pos].chars().count();
+                    Ok(Value::Int(chars_before as i32 + 1))
+                }
+                None => Ok(Value::Int(0)),
+            }
+        }
+        // MySQL instr(str, substr) — same as locate with swapped args.
+        "instr" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("instr() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(hay), Value::Text(needle)) => {
+                    match hay.find(needle.as_ref()) {
+                        Some(byte_pos) => Ok(Value::Int(
+                            hay[..byte_pos].chars().count() as i32 + 1,
+                        )),
+                        None => Ok(Value::Int(0)),
+                    }
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "instr() takes 2 TEXT args".into(),
+                }),
+            }
+        }
+        // MySQL substring_index(str, delim, count) — everything
+        // before the count-th delimiter; negative count = from the
+        // right.
+        "substring_index" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "substring_index() takes 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let (s, delim) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(s), Value::Text(d)) => (s.as_ref(), d.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "substring_index() takes TEXT args".into(),
+                    });
+                }
+            };
+            let count = match &args[2] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "substring_index() count must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if count == 0 || delim.is_empty() {
+                return Ok(Value::text::<String>("".into()));
+            }
+            if count > 0 {
+                let mut pos = 0usize;
+                let mut found = 0i64;
+                while let Some(p) = s[pos..].find(delim) {
+                    found += 1;
+                    if found == count {
+                        return Ok(Value::text(s[..pos + p].to_string()));
+                    }
+                    pos += p + delim.len();
+                }
+                Ok(Value::text(s.to_string()))
+            } else {
+                let want = -count;
+                let positions: alloc::vec::Vec<usize> = {
+                    let mut v = alloc::vec::Vec::new();
+                    let mut pos = 0usize;
+                    while let Some(p) = s[pos..].find(delim) {
+                        v.push(pos + p);
+                        pos += p + delim.len();
+                    }
+                    v
+                };
+                if (positions.len() as i64) < want {
+                    Ok(Value::text(s.to_string()))
+                } else {
+                    let idx = positions[positions.len() - want as usize];
+                    Ok(Value::text(s[idx + delim.len()..].to_string()))
+                }
+            }
+        }
+        // MySQL find_in_set(str, strlist) — 1-based index of str in
+        // a comma-separated list, 0 when absent.
+        "find_in_set" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "find_in_set() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(needle), Value::Text(list)) => {
+                    if list.is_empty() {
+                        return Ok(Value::Int(0));
+                    }
+                    for (i, item) in list.split(',').enumerate() {
+                        if item == needle.as_ref() {
+                            return Ok(Value::Int(i as i32 + 1));
+                        }
+                    }
+                    Ok(Value::Int(0))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "find_in_set() takes 2 TEXT args".into(),
+                }),
+            }
+        }
+        // MySQL elt(n, a, b, ...) — the n-th string argument
+        // (1-based); NULL when out of range.
+        "elt" => {
+            if args.len() < 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "elt() takes 2+ args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let n = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "elt() index must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n < 1 || (n as usize) >= args.len() {
+                return Ok(Value::Null);
+            }
+            Ok(args[n as usize].clone().into_owned())
+        }
+        // MySQL field(str, a, b, ...) — 1-based index of str among
+        // the rest; 0 when absent or str is NULL.
+        "field" => {
+            if args.len() < 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "field() takes 2+ args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let needle = match &args[0] {
+                Value::Null => return Ok(Value::Int(0)),
+                Value::Text(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "field() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            for (i, candidate) in args[1..].iter().enumerate() {
+                if let Value::Text(c) = candidate {
+                    if c.as_ref() == needle {
+                        return Ok(Value::Int(i as i32 + 1));
+                    }
+                }
+            }
+            Ok(Value::Int(0))
+        }
+        // MySQL space(n) — a string of n spaces.
+        "space" => {
+            let n = match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "space() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n <= 0 {
+                return Ok(Value::text::<String>("".into()));
+            }
+            if n > 1_000_000 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "space(): {n} exceeds the 1MB result cap"
+                    ),
+                });
+            }
+            Ok(Value::text(" ".repeat(n as usize)))
+        }
         "ifnull" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
