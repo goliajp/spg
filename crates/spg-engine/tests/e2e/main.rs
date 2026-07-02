@@ -205,6 +205,7 @@ mod e2e_age_xid;
 mod e2e_srf_metadata_probes;
 mod e2e_json_field_fns;
 mod e2e_jsonb_exists_fns;
+mod e2e_pairwise_catalog_fns;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
