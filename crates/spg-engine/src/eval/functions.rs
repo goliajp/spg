@@ -3753,6 +3753,130 @@ fn apply_function_dispatch(
                 _ => unreachable!(),
             }
         }
+        // MySQL quarter / to_days / yearweek — same date-input
+        // handling as the accessor batch above.
+        "quarter" | "to_days" | "yearweek" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let days: i32 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Date(d) => *d,
+                Value::Timestamp(us) => (us.div_euclid(86_400_000_000)) as i32,
+                Value::Text(s) => match super::format::parse_date_literal(s) {
+                    Some(d) => d,
+                    None => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): invalid date {s:?}"
+                            ),
+                        });
+                    }
+                },
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs date, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let (y, m, _d) = super::civil_from_days(days);
+            match name {
+                "quarter" => Ok(Value::Int(((m - 1) / 3 + 1) as i32)),
+                // MySQL TO_DAYS counts from year 0:
+                // to_days('1970-01-01') = 719528.
+                "to_days" => Ok(Value::BigInt(i64::from(days) + 719_528)),
+                "yearweek" => {
+                    // MySQL default mode 0: weeks start Sunday;
+                    // days before the year's first Sunday belong to
+                    // the previous year's last week.
+                    fn week_of(days: i32, year: i32) -> Option<i32> {
+                        let jan1 = crate::eval::format::days_from_civil(year, 1, 1);
+                        // Weekday with Sunday=0: 1970-01-01 was
+                        // Thursday (Sunday-based index 4).
+                        let wd_sun = (i64::from(jan1) + 4).rem_euclid(7) as i32;
+                        let first_sunday = jan1 + ((7 - wd_sun) % 7);
+                        if days >= first_sunday {
+                            Some((days - first_sunday) / 7 + 1)
+                        } else {
+                            None
+                        }
+                    }
+                    match week_of(days, y) {
+                        Some(w) => Ok(Value::Int(y * 100 + w)),
+                        None => {
+                            // Belongs to the previous year's count.
+                            let w = week_of(days, y - 1).unwrap_or(52);
+                            Ok(Value::Int((y - 1) * 100 + w))
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        // MySQL from_days(n) — inverse of to_days.
+        "from_days" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "from_days() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Date(*n - 719_528)),
+                Value::BigInt(n) => Ok(Value::Date((*n - 719_528) as i32)),
+                Value::SmallInt(n) => {
+                    Ok(Value::Date(i32::from(*n) - 719_528))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "from_days() needs integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL makedate(year, dayofyear) — dayofyear must be ≥ 1;
+        // 0 or negative → NULL (MySQL semantics).
+        "makedate" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "makedate() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let int_of = |v: &Value<'_>| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    _ => None,
+                }
+            };
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Some(year), Some(doy)) = (int_of(&args[0]), int_of(&args[1]))
+            else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "makedate() takes 2 integer args".into(),
+                });
+            };
+            if doy < 1 {
+                return Ok(Value::Null);
+            }
+            let jan1 = super::days_from_civil(year as i32, 1, 1);
+            Ok(Value::Date(jan1 + doy as i32 - 1))
+        }
         // MySQL datediff(a, b) — a - b in days (date parts only).
         "datediff" => {
             if args.len() != 2 {
