@@ -3162,7 +3162,8 @@ fn apply_function_dispatch(
         // `length` is reduced by the clipped prefix). A NULL arg
         // makes the result NULL. Out-of-range windows return an
         // empty value, not NULL.
-        "substring" | "substr" => {
+        // "mid" is the MySQL alias for 3-arg substring.
+        "substring" | "substr" | "mid" => {
             if !matches!(args.len(), 2 | 3) {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("substring() takes 2 or 3 args, got {}", args.len()),
@@ -3318,7 +3319,229 @@ fn apply_function_dispatch(
                 }),
             }
         }
-        "upper" => {
+        // MySQL hex(int|text) — uppercase hex of an integer's value
+        // or of a string's bytes.
+        "hex" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("hex() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => {
+                    Ok(Value::text(alloc::format!("{:X}", *n as i64 as u64)))
+                }
+                Value::SmallInt(n) => {
+                    Ok(Value::text(alloc::format!("{:X}", *n as i64 as u64)))
+                }
+                Value::BigInt(n) => {
+                    Ok(Value::text(alloc::format!("{:X}", *n as u64)))
+                }
+                Value::Text(s) => {
+                    let mut out = alloc::string::String::with_capacity(s.len() * 2);
+                    for b in s.as_bytes() {
+                        out.push_str(&alloc::format!("{b:02X}"));
+                    }
+                    Ok(Value::text(out))
+                }
+                Value::Bytes(b) => {
+                    let mut out = alloc::string::String::with_capacity(b.len() * 2);
+                    for byte in b.iter() {
+                        out.push_str(&alloc::format!("{byte:02X}"));
+                    }
+                    Ok(Value::text(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "hex() needs int/text/bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL unhex(hex_text) — hex string back to bytes; NULL on
+        // invalid input (MySQL semantics, not an error).
+        "unhex" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("unhex() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let t = s.as_ref();
+                    if t.len() % 2 != 0 {
+                        return Ok(Value::Null);
+                    }
+                    let mut out = alloc::vec::Vec::with_capacity(t.len() / 2);
+                    let bytes = t.as_bytes();
+                    for pair in bytes.chunks(2) {
+                        let hi = (pair[0] as char).to_digit(16);
+                        let lo = (pair[1] as char).to_digit(16);
+                        match (hi, lo) {
+                            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+                            _ => return Ok(Value::Null),
+                        }
+                    }
+                    Ok(Value::Bytes(alloc::borrow::Cow::Owned(out)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "unhex() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL conv(n, from_base, to_base) — base conversion
+        // (2-36). Negative to_base renders as signed.
+        "conv" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("conv() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let digits = match &args[0] {
+                Value::Text(s) => s.as_ref().to_string(),
+                Value::Int(n) => n.to_string(),
+                Value::BigInt(n) => n.to_string(),
+                Value::SmallInt(n) => n.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "conv() needs text/int, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let base_of = |v: &Value<'_>| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    _ => None,
+                }
+            };
+            let (Some(from_base), Some(to_base)) =
+                (base_of(&args[1]), base_of(&args[2]))
+            else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "conv() bases must be integers".into(),
+                });
+            };
+            if !(2..=36).contains(&from_base.abs())
+                || !(2..=36).contains(&to_base.abs())
+            {
+                return Ok(Value::Null);
+            }
+            let trimmed = digits.trim();
+            let (neg, body) = match trimmed.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, trimmed),
+            };
+            let Ok(mag) = u64::from_str_radix(body, from_base.unsigned_abs() as u32)
+            else {
+                return Ok(Value::text::<String>("0".into()));
+            };
+            // MySQL treats values as unsigned unless to_base < 0.
+            let value: u64 = if neg { (mag as i64).wrapping_neg() as u64 } else { mag };
+            fn to_base_str(mut v: u64, base: u64) -> alloc::string::String {
+                const DIGITS: &[u8; 36] =
+                    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                if v == 0 {
+                    return "0".into();
+                }
+                let mut out = alloc::vec::Vec::new();
+                while v > 0 {
+                    out.push(DIGITS[(v % base) as usize]);
+                    v /= base;
+                }
+                out.reverse();
+                alloc::string::String::from_utf8(out).unwrap_or_default()
+            }
+            let rendered = if to_base < 0 {
+                let signed = value as i64;
+                if signed < 0 {
+                    alloc::format!(
+                        "-{}",
+                        to_base_str(signed.unsigned_abs(), to_base.unsigned_abs())
+                    )
+                } else {
+                    to_base_str(signed as u64, to_base.unsigned_abs())
+                }
+            } else {
+                to_base_str(value, to_base as u64)
+            };
+            Ok(Value::text(rendered))
+        }
+        // MySQL bin(n) / oct(n) — binary / octal digit strings.
+        "bin" | "oct" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let n = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let rendered = if name == "bin" {
+                alloc::format!("{:b}", n as u64)
+            } else {
+                alloc::format!("{:o}", n as u64)
+            };
+            Ok(Value::text(rendered))
+        }
+        // MySQL ord(s) — the code of the first character: for
+        // multi-byte chars, its UTF-8 bytes read as a big-endian
+        // number (matches MySQL's utf8mb4 behavior).
+        "ord" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("ord() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let mut value: i64 = 0;
+                    match s.chars().next() {
+                        None => Ok(Value::BigInt(0)),
+                        Some(c) => {
+                            let mut buf = [0u8; 4];
+                            for b in c.encode_utf8(&mut buf).as_bytes() {
+                                value = (value << 8) | i64::from(*b);
+                            }
+                            Ok(Value::BigInt(value))
+                        }
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ord() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // MySQL lcase / ucase — aliases of lower / upper.
+        "upper" | "ucase" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("upper() takes 1 arg, got {}", args.len()),
@@ -3332,7 +3555,7 @@ fn apply_function_dispatch(
                 }),
             }
         }
-        "lower" => {
+        "lower" | "lcase" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("lower() takes 1 arg, got {}", args.len()),
