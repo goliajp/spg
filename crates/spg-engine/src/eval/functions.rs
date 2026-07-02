@@ -6547,6 +6547,120 @@ fn apply_function_dispatch(
         // v7.12.2 — ranking functions. mailrs's fallback search
         // query ORDERs BY ts_rank(search_vector, q) DESC.
         "ts_rank" => fts_ts_rank(args),
+        // v7.37.17 (17.6 siblings) — FTS introspection helpers.
+        // strip(tsvector) removes position/weight info; SPG's
+        // tsvector text form is 'word:pos' pairs — strip drops
+        // the :pos suffixes.
+        "strip" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("strip() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let stripped: alloc::vec::Vec<alloc::string::String> = s
+                        .split_whitespace()
+                        .map(|lexeme| {
+                            // Keep only up to the first ':'.
+                            match lexeme.split_once(':') {
+                                Some((word, _)) => word.into(),
+                                None => lexeme.into(),
+                            }
+                        })
+                        .collect();
+                    Ok(Value::text(stripped.join(" ")))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "strip() needs tsvector text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // tsvector_length / length(tsvector) — count distinct
+        // lexemes. SPG's length() handles text; this named form
+        // counts whitespace-separated lexemes.
+        "tsvector_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "tsvector_length() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    Ok(Value::Int(s.split_whitespace().count() as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "tsvector_length() needs tsvector text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // numnode(tsquery) — count lexeme + operator nodes.
+        // Approximation: count words + explicit operators.
+        "numnode" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("numnode() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let words = s
+                        .split(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == '!' || c == '(' || c == ')')
+                        .filter(|w| !w.is_empty())
+                        .count();
+                    let ops = s.chars().filter(|c| matches!(c, '&' | '|' | '!')).count();
+                    Ok(Value::Int((words + ops) as i32))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "numnode() needs tsquery text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // querytree(tsquery) — the indexable part of the query.
+        // SPG's simple form returns the input minus negated terms.
+        "querytree" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("querytree() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    // Drop '!term' segments.
+                    let kept: alloc::vec::Vec<&str> = s
+                        .split_whitespace()
+                        .filter(|w| !w.starts_with('!'))
+                        .collect();
+                    if kept.is_empty() {
+                        Ok(Value::text::<String>("T".into()))
+                    } else {
+                        Ok(Value::text(kept.join(" ")))
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "querytree() needs tsquery text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "ts_rank_cd" => fts_ts_rank_cd(args),
         // v7.14.0 — PG dump preamble emits
         // `SELECT pg_catalog.set_config('search_path', '', false);`
