@@ -648,6 +648,13 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.17 — information_schema.sequences.
+                "__spg_info_sequences" => {
+                    let (schema, rows) = crate::system_catalog::synth_info_sequences(
+                        self.active_catalog(),
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-65 — mysql.user / mysql.db.
                 "__spg_mysql_user" => {
                     let (schema, rows) = synth_mysql_user(self);
