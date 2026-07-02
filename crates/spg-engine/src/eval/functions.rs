@@ -9307,9 +9307,114 @@ fn apply_function_dispatch(
             }
             Ok(Value::Null)
         }
-        // Constraint DDL reconstruction (FK/CHECK shapes) queues
-        // with the v7.40 get_ddl surface.
-        "pg_get_constraintdef" => Ok(Value::Null),
+        // pg_get_constraintdef(conname [, pretty]) — REAL for
+        // PK / UNIQUE / FK: rebuilt from live catalog state using
+        // the same naming convention synth_pg_constraint emits
+        // ({t}_pkey / {t}_uniq{i} / fk.name-or-{t}_fk{i}).
+        // Numeric-oid input can't map (synthetic) → NULL.
+        "pg_get_constraintdef" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let bare = name_arg.trim_matches('"');
+            for tname in cat.table_names() {
+                let Some(t) = cat.get(&tname) else { continue };
+                let cols = &t.schema().columns;
+                let col_name_at = |pos: usize| -> String {
+                    cols.get(pos).map_or_else(
+                        || alloc::format!("col{pos}"),
+                        |c| c.name.clone(),
+                    )
+                };
+                for (ci, uc) in
+                    t.schema().uniqueness_constraints.iter().enumerate()
+                {
+                    let conname = if uc.is_primary_key {
+                        alloc::format!("{tname}_pkey")
+                    } else {
+                        alloc::format!("{tname}_uniq{ci}")
+                    };
+                    if conname != bare {
+                        continue;
+                    }
+                    let names: alloc::vec::Vec<String> =
+                        uc.columns.iter().map(|&p| col_name_at(p)).collect();
+                    let kw = if uc.is_primary_key {
+                        "PRIMARY KEY"
+                    } else {
+                        "UNIQUE"
+                    };
+                    return Ok(Value::text(alloc::format!(
+                        "{kw} ({})",
+                        names.join(", ")
+                    )));
+                }
+                for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+                    let conname = fk
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+                    if conname != bare {
+                        continue;
+                    }
+                    let local: alloc::vec::Vec<String> = fk
+                        .local_columns
+                        .iter()
+                        .map(|&p| col_name_at(p))
+                        .collect();
+                    let parent_names: alloc::vec::Vec<String> =
+                        match ctx.catalog.and_then(|c| c.get(&fk.parent_table))
+                        {
+                            Some(parent) => fk
+                                .parent_columns
+                                .iter()
+                                .map(|&p| {
+                                    parent.schema().columns.get(p).map_or_else(
+                                        || alloc::format!("col{p}"),
+                                        |c| c.name.clone(),
+                                    )
+                                })
+                                .collect(),
+                            None => fk
+                                .parent_columns
+                                .iter()
+                                .map(|p| alloc::format!("col{p}"))
+                                .collect(),
+                        };
+                    let mut def = alloc::format!(
+                        "FOREIGN KEY ({}) REFERENCES {}({})",
+                        local.join(", "),
+                        fk.parent_table,
+                        parent_names.join(", ")
+                    );
+                    use spg_storage::FkAction;
+                    // SPG stores Restrict as the unspecified-action
+                    // default (PG's default is NO ACTION, omitted in
+                    // its deparse). SPG can't distinguish a declared
+                    // RESTRICT from the default → omit both, so the
+                    // common case round-trips like PG.
+                    let action_word = |a: FkAction| match a {
+                        FkAction::Cascade => Some("CASCADE"),
+                        FkAction::SetNull => Some("SET NULL"),
+                        FkAction::SetDefault => Some("SET DEFAULT"),
+                        FkAction::Restrict | FkAction::NoAction => None,
+                    };
+                    if let Some(w) = action_word(fk.on_delete) {
+                        def.push_str(&alloc::format!(" ON DELETE {w}"));
+                    }
+                    if let Some(w) = action_word(fk.on_update) {
+                        def.push_str(&alloc::format!(" ON UPDATE {w}"));
+                    }
+                    return Ok(Value::text(def));
+                }
+            }
+            Ok(Value::Null)
+        }
         // v7.37.17 (17.6 siblings) — pg_get_serial_sequence returns
         // the OID name of the underlying sequence for an implicit
         // SERIAL / BIGSERIAL column. ORMs (SQLAlchemy, Django,
