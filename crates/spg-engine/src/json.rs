@@ -2434,3 +2434,158 @@ pub fn mysql_json_contains(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         Some(t) => Ok(Value::Bool(mysql_contains(t, &cand))),
     }
 }
+
+/// RFC 7396 merge-patch: a non-object patch replaces the target;
+/// an object patch merges key-by-key, with JSON null values
+/// removing keys.
+fn merge_patch(target: JsonValue, patch: JsonValue) -> JsonValue {
+    let JsonValue::Object(patch_members) = patch else {
+        return patch;
+    };
+    let mut out = match target {
+        JsonValue::Object(members) => members,
+        _ => Vec::new(),
+    };
+    for (k, v) in patch_members {
+        if matches!(v, JsonValue::Null) {
+            out.retain(|(mk, _)| *mk != k);
+        } else if let Some(slot) = out.iter_mut().find(|(mk, _)| *mk == k) {
+            let old = core::mem::replace(&mut slot.1, JsonValue::Null);
+            slot.1 = merge_patch(old, v);
+        } else {
+            // Merging into a missing key still strips nested nulls.
+            out.push((k, merge_patch(JsonValue::Null, v)));
+        }
+    }
+    JsonValue::Object(out)
+}
+
+/// MySQL JSON_MERGE_PRESERVE pairwise rule: arrays concatenate,
+/// objects merge with duplicate-key values merged recursively,
+/// scalars combine into arrays (a non-array beside an array wraps
+/// first).
+fn merge_preserve(a: JsonValue, b: JsonValue) -> JsonValue {
+    match (a, b) {
+        (JsonValue::Object(mut ma), JsonValue::Object(mb)) => {
+            for (k, v) in mb {
+                if let Some(pos) = ma.iter().position(|(mk, _)| *mk == k) {
+                    let (_, old) = ma.remove(pos);
+                    ma.insert(pos, (k, merge_preserve(old, v)));
+                } else {
+                    ma.push((k, v));
+                }
+            }
+            JsonValue::Object(ma)
+        }
+        (JsonValue::Array(mut xs), JsonValue::Array(ys)) => {
+            xs.extend(ys);
+            JsonValue::Array(xs)
+        }
+        (JsonValue::Array(mut xs), scalar) => {
+            xs.push(scalar);
+            JsonValue::Array(xs)
+        }
+        (scalar, JsonValue::Array(ys)) => {
+            let mut xs = alloc::vec![scalar];
+            xs.extend(ys);
+            JsonValue::Array(xs)
+        }
+        (sa, sb) => JsonValue::Array(alloc::vec![sa, sb]),
+    }
+}
+
+fn mysql_json_merge(
+    args: &[Value<'_>],
+    fn_name: &str,
+    combine: fn(JsonValue, JsonValue) -> JsonValue,
+) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes at least 2 documents, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let mut acc: Option<JsonValue> = None;
+    for arg in args {
+        let src = match arg {
+            Value::Json(s) | Value::Text(s) => s.as_ref(),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{fn_name}() arguments must be json, got {:?}",
+                        other.data_type()
+                    ),
+                });
+            }
+        };
+        let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("{fn_name}(): invalid JSON: {e}"),
+        })?;
+        acc = Some(match acc {
+            None => doc,
+            Some(prev) => combine(prev, doc),
+        });
+    }
+    Ok(Value::Json(alloc::borrow::Cow::Owned(
+        acc.unwrap().to_json_text(),
+    )))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_MERGE_PATCH (RFC 7396).
+pub fn mysql_json_merge_patch(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    mysql_json_merge(args, "json_merge_patch", merge_patch)
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_MERGE_PRESERVE (and its
+/// deprecated JSON_MERGE alias).
+pub fn mysql_json_merge_preserve(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    mysql_json_merge(args, "json_merge_preserve", merge_preserve)
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_OVERLAPS(d1, d2): arrays
+/// share any element; objects share any key-value pair; scalars
+/// compare equal; an array vs a scalar checks membership.
+pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("json_overlaps() takes 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let parse_arg = |v: &Value<'_>| -> Result<JsonValue, EvalError> {
+        match v {
+            Value::Json(s) | Value::Text(s) => parse(s).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("json_overlaps(): invalid JSON: {e}"),
+            }),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_overlaps() arguments must be json, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        }
+    };
+    let a = parse_arg(&args[0])?;
+    let b = parse_arg(&args[1])?;
+    let overlaps = match (&a, &b) {
+        (JsonValue::Array(xs), JsonValue::Array(ys)) => {
+            xs.iter().any(|x| ys.iter().any(|y| mysql_contains(x, y) && mysql_contains(y, x)))
+        }
+        (JsonValue::Object(ma), JsonValue::Object(mb)) => ma.iter().any(|(k, v)| {
+            mb.iter()
+                .any(|(k2, v2)| k == k2 && mysql_contains(v, v2) && mysql_contains(v2, v))
+        }),
+        (JsonValue::Array(xs), scalar) | (scalar, JsonValue::Array(xs)) => xs
+            .iter()
+            .any(|x| mysql_contains(x, scalar) && mysql_contains(scalar, x)),
+        (sa, sb) => mysql_contains(sa, sb) && mysql_contains(sb, sa),
+    };
+    Ok(Value::Bool(overlaps))
+}
