@@ -68,6 +68,33 @@ fn except_distinct_and_all() {
 }
 
 #[test]
+fn intersect_binds_tighter_than_union() {
+    let mut e = Engine::new();
+    setup(&mut e);
+    // PG precedence: A UNION B INTERSECT C = A ∪ (B ∩ C).
+    // Here: {1} ∪ ({1,2,2,3} ∩ {2,3,3,4}) = {1} ∪ {2,3} = {1,2,3}.
+    assert_eq!(
+        ints(
+            &mut e,
+            "SELECT 1 UNION SELECT x FROM l INTERSECT SELECT x FROM r \
+             ORDER BY 1"
+        ),
+        [1, 2, 3]
+    );
+    // Left-fold would have given ({1} ∪ l) ∩ r = {2,3} — pin the
+    // difference: 1 must survive.
+    // Leading intersect still folds left correctly:
+    // (l ∩ r) EXCEPT SELECT 2 = {3}.
+    assert_eq!(
+        ints(
+            &mut e,
+            "SELECT x FROM l INTERSECT SELECT x FROM r EXCEPT SELECT 2"
+        ),
+        [3]
+    );
+}
+
+#[test]
 fn chains_with_union() {
     let mut e = Engine::new();
     setup(&mut e);

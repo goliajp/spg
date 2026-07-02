@@ -6228,6 +6228,25 @@ impl Parser {
             let peer = self.parse_bare_select()?;
             head.unions.push((kind, peer));
         }
+        // v7.37.17 (17.6 siblings) — PG precedence: INTERSECT binds
+        // tighter than UNION / EXCEPT. The executor folds the chain
+        // left-to-right, which is already correct for LEADING
+        // intersects (A INTERSECT B UNION C); an INTERSECT pair
+        // that FOLLOWS a union/except pair nests into that previous
+        // peer instead, so A UNION B INTERSECT C = A ∪ (B ∩ C).
+        {
+            let pairs = core::mem::take(&mut head.unions);
+            let mut regrouped: Vec<(UnionKind, SelectStatement)> = Vec::new();
+            for (kind, peer) in pairs {
+                let is_intersect =
+                    matches!(kind, UnionKind::Intersect | UnionKind::IntersectAll);
+                match (is_intersect, regrouped.last_mut()) {
+                    (true, Some((_, prev))) => prev.unions.push((kind, peer)),
+                    _ => regrouped.push((kind, peer)),
+                }
+            }
+            head.unions = regrouped;
+        }
         self.parse_select_tail_into(&mut head)?;
         Ok(Statement::Select(head))
     }
