@@ -73,6 +73,48 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Stub-retirement wave (tasks #281-#299) — a systematic pass
+converting NULL/constant stubs into real catalog-backed
+implementations, plus aggregate + information_schema growth
+(branch at 272 commits ahead of develop, 2741 e2e green):
+
+- **Aggregates**: any_value (PG 16), group_concat (MySQL's
+  most-used aggregate, ',' default + scalar coercion), xmlagg,
+  SQL:2016 json_arrayagg/json_objectagg spellings
+  (differential-tested vs the pg names).
+- **pg_get_*def trilogy — real deparse**: pg_get_viewdef
+  (catalog view bodies), pg_get_indexdef (CREATE INDEX
+  reconstruction, differential-equal to pg_indexes.indexdef),
+  pg_get_constraintdef (PK/UNIQUE/FK with ON DELETE/UPDATE
+  actions; default action omitted like PG). psql \d and
+  pgAdmin panels show real DDL now.
+- **Resolver upgrades**: format_type ("unknown" stub → 38-oid
+  SQL-standard names + varchar(n)/numeric(p,s)/timestamp(n)
+  typmod rendering); to_regclass/to_regtype/to_regnamespace
+  (always-NULL → real; the Django/Alembic
+  `to_regclass('t') IS NOT NULL` existence check works).
+- **Size meters go live**: pg_relation_size family +
+  pg_database_size read Table::hot_bytes / hot_tier_bytes
+  (the freezer's own meters); pg_class.relpages + pg_relpages
+  report 8 KiB-page units off the same counter. Capacity
+  dashboards stop reading zero.
+- **Sequence surface**: lastval() real (new Engine
+  last_sequence_used register; PG's exact not-yet-defined
+  error), pg_sequence_last_value real (is_called=false →
+  NULL).
+- **information_schema growth**: columns widened 7→13
+  (column_default incl. serial nextval synthesis,
+  numeric_precision/scale, udt_name, is_identity); four new
+  views — sequences, check_constraints, triggers (PG-style
+  event explosion), constraint_column_usage (FK rows list the
+  REFERENCED table's columns, the subtle PG semantic).
+- **Misc**: updatability probes (pg_relation_is_updatable → 28
+  for tables AND views — views are genuinely updatable via the
+  auto-updatable redirect), _pg_* typmod-math internals for
+  SQLAlchemy/JDBC, age(xid)/mxid_age wraparound unblock,
+  jsonb ?/?|/?&/@>/<@ + ->/->> catalog function names,
+  24 *_larger/*_smaller MAX/MIN internals, textcat/byteacat.
+
 Late-cycle additions (tasks #251-#279) on top of the sections
 below:
 
