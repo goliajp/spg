@@ -1628,6 +1628,42 @@ impl Engine {
             // queries surface via the substitution path during
             // per-row execution and still return the right values.
             _ => {
+                // `SELECT * FROM <srf>(… outer.col …)` — the wrapped
+                // correlated-SRF shape. The probe can't evaluate the
+                // outer reference, but the SRF ref itself dictates
+                // the schema: column-alias list first, then the
+                // executor's natural defaults (alias / fn name), plus
+                // the WITH ORDINALITY counter.
+                if let [SelectItem::Wildcard] = inner.items.as_slice()
+                    && let Some(from) = &inner.from
+                    && from.joins.is_empty()
+                    && (from.primary.unnest_expr.is_some()
+                        || from.primary.generate_series_args.is_some())
+                {
+                    let t = &from.primary;
+                    let elem_dtype = if t.generate_series_args.is_some() {
+                        DataType::BigInt
+                    } else {
+                        DataType::Text
+                    };
+                    let first = t
+                        .unnest_column_aliases
+                        .first()
+                        .cloned()
+                        .or_else(|| t.alias.clone())
+                        .unwrap_or_else(|| t.name.clone());
+                    let mut out =
+                        alloc::vec![ColumnSchema::new(first, elem_dtype, true)];
+                    if t.with_ordinality {
+                        let ord = t
+                            .unnest_column_aliases
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_else(|| "ordinality".to_string());
+                        out.push(ColumnSchema::new(ord, DataType::BigInt, false));
+                    }
+                    return Ok(out);
+                }
                 let mut out: Vec<ColumnSchema> = Vec::new();
                 for (i, item) in inner.items.iter().enumerate() {
                     let name = match item {
