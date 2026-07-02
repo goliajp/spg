@@ -10390,7 +10390,8 @@ impl Parser {
                     args.len()
                 )));
             }
-            let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
+            let with_ordinality = self.absorb_with_ordinality();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "generate_series".to_string());
@@ -10399,8 +10400,8 @@ impl Parser {
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: None,
-                unnest_column_aliases: Vec::new(),
-                with_ordinality: false,
+                unnest_column_aliases: column_aliases,
+                with_ordinality,
                 generate_series_args: Some(args),
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
