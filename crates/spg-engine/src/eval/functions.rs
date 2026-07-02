@@ -3369,6 +3369,72 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — generate_subscripts(arr, dim
+        // [, reverse]) scalar surface: returns the valid subscripts
+        // of the array's dim'th dimension as an IntArray (the parser
+        // rewrites the FROM-clause SRF form into unnest over this).
+        // SPG arrays are one-dimensional, so dim != 1 yields an
+        // empty set — PG's behaviour for a missing dimension.
+        "generate_subscripts" => {
+            if !matches!(args.len(), 2 | 3) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "generate_subscripts() takes 2 or 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let len = match &args[0] {
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "generate_subscripts() first arg must be an array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let dim = match &args[1] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "generate_subscripts() dim must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let reverse = match args.get(2) {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "generate_subscripts() reverse must be boolean, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut subs: alloc::vec::Vec<Option<i32>> = if dim == 1 {
+                (1..=len as i32).map(Some).collect()
+            } else {
+                alloc::vec::Vec::new()
+            };
+            if reverse {
+                subs.reverse();
+            }
+            Ok(Value::IntArray(subs))
+        }
         // v7.37.17 (17.6 siblings) — PG 14+ trim_array(arr, n) removes
         // the last n elements. Errors like PG when n is negative or
         // exceeds the array length.
