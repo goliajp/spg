@@ -495,6 +495,10 @@ pub(crate) fn explain_select(
         let label = match kind {
             UnionKind::All => "UNION ALL",
             UnionKind::Distinct => "UNION",
+            UnionKind::Intersect => "INTERSECT",
+            UnionKind::IntersectAll => "INTERSECT ALL",
+            UnionKind::Except => "EXCEPT",
+            UnionKind::ExceptAll => "EXCEPT ALL",
         };
         out.push(alloc::format!("{child}{label}"));
         explain_select(peer, engine, depth + 2, out);

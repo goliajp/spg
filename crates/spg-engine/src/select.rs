@@ -1615,9 +1615,54 @@ impl Engine {
                     peer_cols.len()
                 )));
             }
-            rows.extend(peer_rows);
-            if matches!(kind, UnionKind::Distinct) {
-                rows = dedup_rows(rows);
+            match kind {
+                UnionKind::All => rows.extend(peer_rows),
+                UnionKind::Distinct => {
+                    rows.extend(peer_rows);
+                    rows = dedup_rows(rows);
+                }
+                // v7.37.17 (17.6 siblings) — PG set semantics.
+                // INTERSECT: distinct rows present on both sides.
+                UnionKind::Intersect => {
+                    rows = dedup_rows(rows)
+                        .into_iter()
+                        .filter(|r| peer_rows.iter().any(|p| p == r))
+                        .collect();
+                }
+                // INTERSECT ALL: multiset intersection — each row
+                // keeps min(left count, right count) occurrences.
+                UnionKind::IntersectAll => {
+                    let mut peer_pool = peer_rows;
+                    let mut kept: Vec<Row<'static>> = Vec::new();
+                    for r in rows {
+                        if let Some(pos) = peer_pool.iter().position(|p| p == &r) {
+                            peer_pool.swap_remove(pos);
+                            kept.push(r);
+                        }
+                    }
+                    rows = kept;
+                }
+                // EXCEPT: distinct left rows absent from the right.
+                UnionKind::Except => {
+                    rows = dedup_rows(rows)
+                        .into_iter()
+                        .filter(|r| !peer_rows.iter().any(|p| p == r))
+                        .collect();
+                }
+                // EXCEPT ALL: multiset subtraction — each right
+                // occurrence cancels one left occurrence.
+                UnionKind::ExceptAll => {
+                    let mut peer_pool = peer_rows;
+                    let mut kept: Vec<Row<'static>> = Vec::new();
+                    for r in rows {
+                        if let Some(pos) = peer_pool.iter().position(|p| p == &r) {
+                            peer_pool.swap_remove(pos);
+                        } else {
+                            kept.push(r);
+                        }
+                    }
+                    rows = kept;
+                }
             }
         }
         // ORDER BY at the top of a UNION applies to the combined result.

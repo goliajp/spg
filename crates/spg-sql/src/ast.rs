@@ -2306,6 +2306,15 @@ pub enum UnionKind {
     Distinct,
     /// `UNION ALL` — concatenates without dedup.
     All,
+    /// v7.37.17 (17.6 siblings) — `INTERSECT`: distinct rows
+    /// present on both sides.
+    Intersect,
+    /// `INTERSECT ALL` — multiset intersection (min per-row count).
+    IntersectAll,
+    /// `EXCEPT` — distinct left rows absent from the right.
+    Except,
+    /// `EXCEPT ALL` — multiset subtraction.
+    ExceptAll,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4505,6 +4514,10 @@ impl fmt::Display for SelectStatement {
             f.write_str(match kind {
                 UnionKind::Distinct => " UNION ",
                 UnionKind::All => " UNION ALL ",
+                UnionKind::Intersect => " INTERSECT ",
+                UnionKind::IntersectAll => " INTERSECT ALL ",
+                UnionKind::Except => " EXCEPT ",
+                UnionKind::ExceptAll => " EXCEPT ALL ",
             })?;
             write_bare_select(peer, f)?;
         }

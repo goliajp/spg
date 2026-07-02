@@ -6203,13 +6203,27 @@ impl Parser {
         // get a fresh bare-select parse and may not have their own ORDER
         // BY / LIMIT.
         let mut head = self.parse_bare_select()?;
-        while matches!(self.peek(), Token::Union) {
+        // v7.37.17 (17.6 siblings) — the three SQL set operations
+        // share the peer chain: UNION [ALL], EXCEPT [ALL] (a
+        // reserved token), and INTERSECT [ALL] (a bare ident — it
+        // was never reserved in SPG's lexer).
+        loop {
+            let base = match self.peek() {
+                Token::Union => UnionKind::Distinct,
+                Token::Except => UnionKind::Except,
+                Token::Ident(s) if s.eq_ignore_ascii_case("intersect") => UnionKind::Intersect,
+                _ => break,
+            };
             self.advance();
             let kind = if matches!(self.peek(), Token::All) {
                 self.advance();
-                UnionKind::All
+                match base {
+                    UnionKind::Distinct => UnionKind::All,
+                    UnionKind::Except => UnionKind::ExceptAll,
+                    _ => UnionKind::IntersectAll,
+                }
             } else {
-                UnionKind::Distinct
+                base
             };
             let peer = self.parse_bare_select()?;
             head.unions.push((kind, peer));
