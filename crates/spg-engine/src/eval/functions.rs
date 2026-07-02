@@ -6885,6 +6885,113 @@ fn apply_function_dispatch(
         }
         // tsquery_phrase(q1, q2[, distance]) — combine two tsqueries
         // into a phrase query: q1 <-> q2, or q1 <N> q2.
+        // tsvector_to_array(tsvector) — lexemes as text[], positions
+        // dropped. PG returns them sorted; SPG's tsvector text form
+        // is already sorted at construction, but sort defensively so
+        // hand-written literals round-trip like PG.
+        "tsvector_to_array" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "tsvector_to_array() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let mut words: alloc::vec::Vec<alloc::string::String> = s
+                        .split_whitespace()
+                        .map(|lexeme| match lexeme.split_once(':') {
+                            Some((word, _)) => word.into(),
+                            None => lexeme.into(),
+                        })
+                        .collect();
+                    words.sort();
+                    words.dedup();
+                    Ok(Value::TextArray(
+                        words.into_iter().map(Some).collect(),
+                    ))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "tsvector_to_array() needs tsvector text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // array_to_tsvector(text[]) — lexemes joined into a
+        // position-less tsvector. PG sorts + dedups and rejects
+        // NULL elements.
+        "array_to_tsvector" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_to_tsvector() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::TextArray(items) => {
+                    let mut words: alloc::vec::Vec<alloc::string::String> =
+                        alloc::vec::Vec::with_capacity(items.len());
+                    for item in items {
+                        match item {
+                            Some(w) => words.push(w.clone()),
+                            None => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail:
+                                        "array_to_tsvector(): lexeme array may not contain nulls"
+                                            .into(),
+                                });
+                            }
+                        }
+                    }
+                    words.sort();
+                    words.dedup();
+                    Ok(Value::text(words.join(" ")))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_to_tsvector() needs text[], got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // get_current_ts_config() — the default_text_search_config
+        // GUC. SPG's FTS pipeline is the PG 'english' simple path.
+        "get_current_ts_config" => {
+            Ok(Value::text::<String>("english".into()))
+        }
+        // ts_lexize(dict, token) — run one token through a
+        // dictionary. SPG ships the 'simple' dictionary semantics:
+        // lowercase the token, return it as a 1-element array.
+        "ts_lexize" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ts_lexize() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(_dict), Value::Text(token)) => {
+                    Ok(Value::TextArray(alloc::vec![Some(
+                        token.to_lowercase()
+                    )]))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "ts_lexize() takes 2 TEXT args".into(),
+                }),
+            }
+        }
         "tsquery_phrase" => {
             if args.len() != 2 && args.len() != 3 {
                 return Err(EvalError::TypeMismatch {
