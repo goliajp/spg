@@ -11543,6 +11543,10 @@ fn apply_function_dispatch(
         // at the top of this match against the SequenceResolver.
         // `lastval()` (no-arg session memory) still degrades to
         // NULL pending a Phase 1.1b session tracker.
+        // lastval() is intercepted by the sequence pre-resolver
+        // (sequence.rs) before eval; reaching this arm means a
+        // read-only context with no resolver — NULL keeps it
+        // parseable.
         "lastval" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_sequence_last_value(regclass)
         // returns the sequence's most-recent value or NULL if not

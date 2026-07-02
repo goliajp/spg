@@ -456,6 +456,10 @@ pub struct Engine {
     /// preamble) turns it off. The plan cache is cleared on every
     /// flip — the same SQL text lexes differently per dialect.
     backslash_escapes: bool,
+    /// v7.37.17 — name of the sequence most recently advanced by
+    /// nextval() in this Engine (session). Backs PG's lastval().
+    /// None until the first nextval; PG errors in that state.
+    last_sequence_used: Option<String>,
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
@@ -657,6 +661,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
@@ -831,6 +836,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
@@ -906,6 +912,7 @@ impl Engine {
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
                     backslash_escapes: false,
+                    last_sequence_used: None,
                     next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
