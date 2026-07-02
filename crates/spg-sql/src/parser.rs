@@ -9519,6 +9519,91 @@ impl Parser {
         // every other table-ref shape (unnest / generate_series /
         // bare ident); the lateral subquery itself follows the
         // regular SELECT grammar.
+        // v7.37.17 (17.6 siblings) — `FROM ( VALUES (…), (…) ) [AS]
+        // t(cols)`. Each row lowers to a constant SELECT with PG's
+        // default column1..columnN names; subsequent rows chain as
+        // UNION ALL peers. The result rides the derived-table
+        // lateral_subquery channel — zero executor work.
+        if matches!(self.peek(), Token::LParen)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Values))
+        {
+            self.advance(); // (
+            self.advance(); // VALUES
+            let mut row_selects: Vec<SelectStatement> = Vec::new();
+            loop {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' to start a VALUES row, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance(); // (
+                let mut items: Vec<SelectItem> = Vec::new();
+                loop {
+                    let expr = self.parse_expr(0)?;
+                    items.push(SelectItem::Expr {
+                        expr,
+                        alias: Some(alloc::format!("column{}", items.len() + 1)),
+                    });
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                        }
+                        Token::RParen => break,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in VALUES row, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                self.advance(); // )
+                row_selects.push(SelectStatement {
+                    ctes: Vec::new(),
+                    distinct: false,
+                    items,
+                    from: None,
+                    where_: None,
+                    group_by: None,
+                    group_by_all: false,
+                    having: None,
+                    unions: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    limit_with_ties: false,
+                });
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after VALUES list, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut head = row_selects.remove(0);
+            head.unions = row_selects
+                .into_iter()
+                .map(|s| (UnionKind::All, s))
+                .collect();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident.clone().unwrap_or_else(|| "values".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: column_aliases,
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(head)),
+                jsonb_each_text_arg: None,
+            });
+        }
         // v7.37.17 (17.6 siblings) — plain derived table:
         // `FROM ( SELECT … ) [AS] alias`. Rides the same
         // lateral_subquery channel the explicit LATERAL form uses —
