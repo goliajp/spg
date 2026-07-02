@@ -9480,6 +9480,119 @@ fn apply_function_dispatch(
         // SPG has no async notification channel yet; accept + return
         // void (NULL).
         "pg_notify" => Ok(Value::Null),
+        // information_schema._pg_* internal helpers — SQLAlchemy,
+        // asyncpg and JDBC's DatabaseMetaData introspection queries
+        // call these. The typmod math is real (PG's atttypmod
+        // encoding: varchar/bpchar typmod = len + 4; numeric
+        // typmod = ((precision << 16) | scale) + 4).
+        "_pg_char_max_length" | "_pg_char_octet_length" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            let int_of = |v: &Value<'_>| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    _ => None,
+                }
+            };
+            match (int_of(&args[0]), int_of(&args[1])) {
+                (Some(typid), Some(typmod)) => {
+                    // 1043 varchar, 1042 bpchar.
+                    if (typid == 1043 || typid == 1042) && typmod >= 4 {
+                        let len = typmod - 4;
+                        if name == "_pg_char_octet_length" {
+                            // Worst-case UTF-8 expansion, like PG.
+                            Ok(Value::Int((len * 4) as i32))
+                        } else {
+                            Ok(Value::Int(len as i32))
+                        }
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "_pg_numeric_precision" | "_pg_numeric_scale" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            let int_of = |v: &Value<'_>| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    _ => None,
+                }
+            };
+            match (int_of(&args[0]), int_of(&args[1])) {
+                (Some(typid), Some(typmod)) => match typid {
+                    // Fixed-precision integer types.
+                    21 if name == "_pg_numeric_precision" => Ok(Value::Int(16)),
+                    23 if name == "_pg_numeric_precision" => Ok(Value::Int(32)),
+                    20 if name == "_pg_numeric_precision" => Ok(Value::Int(64)),
+                    21 | 23 | 20 => Ok(Value::Int(0)),
+                    // 1700 numeric: typmod packs (precision, scale).
+                    1700 if typmod >= 4 => {
+                        let packed = typmod - 4;
+                        if name == "_pg_numeric_precision" {
+                            Ok(Value::Int(((packed >> 16) & 0xFFFF) as i32))
+                        } else {
+                            Ok(Value::Int((packed & 0xFFFF) as i32))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                },
+                _ => Ok(Value::Null),
+            }
+        }
+        "_pg_datetime_precision" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            let int_of = |v: &Value<'_>| -> Option<i64> {
+                match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    _ => None,
+                }
+            };
+            match (int_of(&args[0]), int_of(&args[1])) {
+                (Some(typid), Some(typmod)) => match typid {
+                    // 1082 date has no fractional seconds.
+                    1082 => Ok(Value::Int(0)),
+                    // time/timestamp family: default precision 6,
+                    // explicit typmod overrides.
+                    1083 | 1114 | 1184 | 1266 => {
+                        if typmod < 0 {
+                            Ok(Value::Int(6))
+                        } else {
+                            Ok(Value::Int(typmod as i32))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                },
+                _ => Ok(Value::Null),
+            }
+        }
+        // Record-consuming internals — _pg_expandarray is an SRF
+        // (SQLAlchemy walks index columns through it); truetypid /
+        // truetypmod take pg_attribute+pg_type records. NULL keeps
+        // the introspection queries parseable.
+        "_pg_expandarray"
+        | "_pg_index_position"
+        | "_pg_truetypid"
+        | "_pg_truetypmod"
+        | "_pg_interval_type" => Ok(Value::Null),
         // getdatabaseencoding() — SPG is UTF-8-only, like
         // pg_client_encoding / pg_encoding_to_char.
         "getdatabaseencoding" => Ok(Value::text::<String>("UTF8".into())),
