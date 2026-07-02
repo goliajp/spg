@@ -9607,6 +9607,59 @@ impl Parser {
         } else {
             None
         };
+        // PG 10+ `OVERRIDING {SYSTEM | USER} VALUE` — pg_dump emits
+        // it for identity columns. SPG always uses the values the
+        // statement supplies (identity defaults only fill omitted
+        // columns), which is exactly OVERRIDING SYSTEM VALUE
+        // semantics; accept and absorb both spellings.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("overriding")) {
+            self.advance();
+            let which = self.expect_ident_like()?;
+            if !which.eq_ignore_ascii_case("system") && !which.eq_ignore_ascii_case("user") {
+                return Err(self.err(format!(
+                    "expected SYSTEM or USER after OVERRIDING, got {which:?}"
+                )));
+            }
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("value")) {
+                return Err(self.err(format!(
+                    "expected VALUE after OVERRIDING {}, got {:?}",
+                    which.to_ascii_uppercase(),
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        // `INSERT INTO t DEFAULT VALUES` — a single row made
+        // entirely of column defaults. Lower to the permuted
+        // column-list path with an empty list: every schema column
+        // is unmapped, so the engine fills each from its default
+        // (serials advance, plain defaults evaluate, the rest NULL).
+        if matches!(self.peek(), Token::Default) {
+            self.advance();
+            if !matches!(self.peek(), Token::Values) {
+                return Err(self.err(format!(
+                    "expected VALUES after DEFAULT in INSERT, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if columns.is_some() {
+                return Err(self.err(
+                    "DEFAULT VALUES cannot follow an INSERT column list".into(),
+                ));
+            }
+            let on_conflict = self.parse_optional_on_conflict()?;
+            let returning = self.parse_optional_returning()?;
+            return Ok(Statement::Insert(InsertStatement {
+                ctes: Vec::new(),
+                table,
+                columns: Some(Vec::new()),
+                rows: alloc::vec![Vec::new()],
+                select_source: None,
+                on_conflict,
+                returning,
+            }));
+        }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
         // round-5 G4). Dispatch on VALUES vs SELECT.
         if matches!(self.peek(), Token::Select) {
