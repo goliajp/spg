@@ -11124,9 +11124,47 @@ impl Parser {
                     };
                     continue;
                 }
+                // v7.37.17 (17.6 siblings) — SQL:2016 / PG 16
+                // `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]`.
+                // Lowers onto pg_is_json(x, kind); NOT wraps the
+                // call in a logical negation.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("json"))
+                {
+                    self.advance(); // JSON
+                    let kind = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if matches!(
+                                s.to_ascii_lowercase().as_str(),
+                                "value" | "object" | "array" | "scalar"
+                            ) =>
+                        {
+                            let k = s.to_ascii_lowercase();
+                            self.advance();
+                            k
+                        }
+                        _ => "value".to_string(),
+                    };
+                    let call = Expr::FunctionCall {
+                        name: "pg_is_json".to_string(),
+                        args: alloc::vec![
+                            expr,
+                            Expr::Literal(Literal::String(kind)),
+                        ],
+                    };
+                    expr = if negated {
+                        Expr::Unary {
+                            op: UnOp::Not,
+                            expr: Box::new(call),
+                        }
+                    } else {
+                        call
+                    };
+                    continue;
+                }
                 if !matches!(self.peek(), Token::Null) {
                     return Err(self.err(format!(
-                        "expected NULL or DISTINCT after IS{}, got {:?}",
+                        "expected NULL, DISTINCT or JSON after IS{}, got {:?}",
                         if negated { " NOT" } else { "" },
                         self.peek()
                     )));
