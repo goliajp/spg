@@ -2205,6 +2205,73 @@ pub(crate) fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///   * ORDINAL_POSITION (Int)
 ///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
 ///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+/// v7.37.17 — synthesise `information_schema.constraint_column_usage`.
+/// PG semantics: PK/UNIQUE rows list the constrained columns on
+/// their own table; FK rows list the columns of the REFERENCED
+/// table. (CHECK column extraction needs expression analysis —
+/// queued.) ORM relationship builders join this against
+/// table_constraints/key_column_usage.
+pub(crate) fn synth_info_constraint_column_usage(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("constraint_catalog", DataType::Text, false),
+        ColumnSchema::new("constraint_schema", DataType::Text, false),
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut push = |table: &str, column: String, conname: String| {
+        rows.push(Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(table.to_string()),
+            Value::text(column),
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(conname),
+        ]));
+    };
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let cols = &t.schema().columns;
+        let col_name_at = |pos: usize| -> String {
+            cols.get(pos)
+                .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
+        };
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = if uc.is_primary_key {
+                alloc::format!("{tname}_pkey")
+            } else {
+                alloc::format!("{tname}_uniq{ci}")
+            };
+            for &p in &uc.columns {
+                push(&tname, col_name_at(p), conname.clone());
+            }
+        }
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+            // FK rows reference the PARENT table's columns.
+            if let Some(parent) = cat.get(&fk.parent_table) {
+                for &p in &fk.parent_columns {
+                    let pname = parent.schema().columns.get(p).map_or_else(
+                        || alloc::format!("col{p}"),
+                        |c| c.name.clone(),
+                    );
+                    push(&fk.parent_table, pname, conname.clone());
+                }
+            }
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.17 — synthesise `information_schema.triggers`.
 /// pgAdmin's trigger panel and SQLAlchemy read this. PG explodes
 /// one row per (trigger × event); SPG mirrors that.

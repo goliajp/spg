@@ -648,6 +648,14 @@ impl Engine {
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.37.17 — information_schema.constraint_column_usage.
+                "__spg_info_constraint_column_usage" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_info_constraint_column_usage(
+                            self.active_catalog(),
+                        );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.17 — information_schema.triggers.
                 "__spg_info_triggers" => {
                     let (schema, rows) = crate::system_catalog::synth_info_triggers(
