@@ -8601,9 +8601,12 @@ fn apply_function_dispatch(
         "json_build_array" | "jsonb_build_array" | "json_array" => {
             crate::json::build_array(args)
         }
+        // v7.37.17 (17.6 siblings) — MySQL path-based JSON functions
+        // (json.rs mysql_path_steps parser: $, .key, ."quoted", [N];
+        // wildcards error honestly).
+        "json_extract" => crate::json::mysql_json_extract(args),
+        "json_contains_path" => crate::json::mysql_json_contains_path(args),
         // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
-        // The path-based family (json_extract / json_set with '$.x'
-        // paths) needs a MySQL JSON path parser and is queued.
         "json_valid" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {

@@ -107,6 +107,7 @@ mod e2e_ts_rewrite;
 mod e2e_mysql_inet;
 mod e2e_mysql_format;
 mod e2e_mysql_json;
+mod e2e_mysql_json_path;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;

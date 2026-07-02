@@ -1762,3 +1762,251 @@ mod tests {
         assert_eq!(v, Value::json::<String>("{\"x\":[1,2]}".into()));
     }
 }
+
+/// v7.37.17 (17.6 siblings) — one step of a MySQL JSON path
+/// (`$.key`, `$."quoted key"`, `$[0]`).
+#[derive(Debug)]
+pub enum MysqlPathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Parse a MySQL JSON path. Supports `$`, `.key`, `."quoted key"`
+/// and `[N]`; wildcard steps (`*`, `[*]`, `**`) error honestly —
+/// they return multiple matches per document and need a different
+/// walker shape.
+pub fn mysql_path_steps(path: &str) -> Result<Vec<MysqlPathStep>, EvalError> {
+    let chars: Vec<char> = path.trim().chars().collect();
+    if chars.first() != Some(&'$') {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid JSON path expression (must start with $): {path:?}"),
+        });
+    }
+    let mut steps = Vec::new();
+    let mut i = 1;
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '"' {
+                    i += 1;
+                    let mut key = String::new();
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' && i + 1 < chars.len() {
+                            i += 1;
+                        }
+                        key.push(chars[i]);
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "invalid JSON path expression (unterminated quote): {path:?}"
+                            ),
+                        });
+                    }
+                    i += 1; // closing quote
+                    steps.push(MysqlPathStep::Key(key));
+                } else {
+                    let mut key = String::new();
+                    while i < chars.len()
+                        && (chars[i].is_alphanumeric() || chars[i] == '_')
+                    {
+                        key.push(chars[i]);
+                        i += 1;
+                    }
+                    if key.is_empty() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "unsupported JSON path step at position {i} in {path:?} \
+                                 (wildcards are not supported)"
+                            ),
+                        });
+                    }
+                    steps.push(MysqlPathStep::Key(key));
+                }
+            }
+            '[' => {
+                i += 1;
+                let mut num = String::new();
+                while i < chars.len() && chars[i] != ']' {
+                    num.push(chars[i]);
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "invalid JSON path expression (unterminated bracket): {path:?}"
+                        ),
+                    });
+                }
+                i += 1; // ]
+                let idx: usize = num.trim().parse().map_err(|_| EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "unsupported JSON path index {num:?} in {path:?} \
+                         (wildcards are not supported)"
+                    ),
+                })?;
+                steps.push(MysqlPathStep::Index(idx));
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid JSON path expression (unexpected {other:?}): {path:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Walk a parsed JSON document along a MySQL path. Returns None
+/// when any step misses.
+pub fn mysql_path_get<'a>(
+    doc: &'a JsonValue,
+    steps: &[MysqlPathStep],
+) -> Option<&'a JsonValue> {
+    let mut cur = doc;
+    for step in steps {
+        match (step, cur) {
+            (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                cur = members.iter().find(|(mk, _)| mk == k).map(|(_, v)| v)?;
+            }
+            (MysqlPathStep::Index(idx), JsonValue::Array(items)) => {
+                cur = items.get(*idx)?;
+            }
+            // MySQL: a non-array auto-wraps as a one-element array
+            // for [0].
+            (MysqlPathStep::Index(0), scalar) => {
+                cur = scalar;
+            }
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_EXTRACT(doc, path...).
+/// One path → the value at that path (or SQL NULL when it misses);
+/// several paths → a JSON array of the values that matched (NULL
+/// when none did).
+pub fn mysql_json_extract(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_extract() takes a document and at least one path, got {} args",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_extract() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("json_extract(): invalid JSON: {e}"),
+    })?;
+    let mut hits: Vec<String> = Vec::new();
+    for path_v in &args[1..] {
+        let Value::Text(p) = path_v else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_extract() paths must be text, got {:?}",
+                    path_v.data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        if let Some(v) = mysql_path_get(&doc, &steps) {
+            hits.push(v.to_json_text());
+        }
+    }
+    match (args.len() - 1, hits.len()) {
+        (_, 0) => Ok(Value::Null),
+        (1, _) => Ok(Value::Json(alloc::borrow::Cow::Owned(
+            hits.into_iter().next().unwrap(),
+        ))),
+        _ => {
+            let mut out = String::from("[");
+            for (i, h) in hits.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(h);
+            }
+            out.push(']');
+            Ok(Value::Json(alloc::borrow::Cow::Owned(out)))
+        }
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_CONTAINS_PATH(doc,
+/// 'one'|'all', path...).
+pub fn mysql_json_contains_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_contains_path() takes a document, one/all, and at least one path, got {} args",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_contains_path() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("json_contains_path(): invalid JSON: {e}"),
+    })?;
+    let mode = match &args[1] {
+        Value::Text(m) if m.eq_ignore_ascii_case("one") => false,
+        Value::Text(m) if m.eq_ignore_ascii_case("all") => true,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_contains_path() second arg must be 'one' or 'all', got {other:?}"
+                ),
+            });
+        }
+    };
+    let mut found_any = false;
+    let mut found_all = true;
+    for path_v in &args[2..] {
+        let Value::Text(p) = path_v else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_contains_path() paths must be text, got {:?}",
+                    path_v.data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        if mysql_path_get(&doc, &steps).is_some() {
+            found_any = true;
+        } else {
+            found_all = false;
+        }
+    }
+    Ok(Value::Bool(if mode { found_all } else { found_any }))
+}
