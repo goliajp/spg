@@ -131,6 +131,8 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // (insertion order, no coalescing — matches the
             // multirange constructor contract).
             | "range_agg"
+            // PG 14+ — range_intersect_agg: intersection fold.
+            | "range_intersect_agg"
             // MySQL group_concat (string_agg with ',' default) +
             // SQL/XML xmlagg (separator-less concatenation).
             | "group_concat"
@@ -245,6 +247,8 @@ enum AggKind {
     AnyValue,
     /// PG 14+ range_agg — collect ranges into a multirange.
     RangeAgg,
+    /// PG 14+ range_intersect_agg — intersection fold over ranges.
+    RangeIntersectAgg,
     StringAgg,
     ArrayAgg,
     BoolAnd,
@@ -278,6 +282,7 @@ fn classify_agg_name(name: &str) -> AggKind {
         "max" => AggKind::Max,
         "any_value" => AggKind::AnyValue,
         "range_agg" => AggKind::RangeAgg,
+        "range_intersect_agg" => AggKind::RangeIntersectAgg,
         "string_agg" | "group_concat" | "xmlagg" => AggKind::StringAgg,
         "array_agg" => AggKind::ArrayAgg,
         "bool_and" => AggKind::BoolAnd,
@@ -2395,7 +2400,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             let expected: Option<usize> = match lower.as_str() {
                 "count_star" => Some(0),
                 "count" | "sum" | "avg" | "min" | "max" | "array_agg"
-                | "any_value" | "range_agg"
+                | "any_value" | "range_agg" | "range_intersect_agg"
                 // v7.17.0 — boolean aggregates also take exactly
                 // one arg. `every` is an alias normalised inside
                 // collect_aggregates / rewrite_expr.
@@ -2802,6 +2807,25 @@ fn update_state(
                 });
             }
         }
+        AggKind::RangeIntersectAgg => {
+            if is_null {
+                return Ok(());
+            }
+            if !matches!(v, Value::Range { .. }) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "range_intersect_agg requires a range value, got {:?}",
+                        v.data_type()
+                    ),
+                });
+            }
+            match &st.extreme {
+                None => st.extreme = Some(v.clone().into_owned()),
+                Some(prev) => {
+                    st.extreme = Some(range_intersect(prev, &v.clone().into_owned()));
+                }
+            }
+        }
         AggKind::Max => {
             if is_null {
                 return Ok(());
@@ -3023,7 +3047,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
         // PG: range_agg over an empty group is NULL; all-empty
         // ranges finalize to the empty multirange {}.
-        "range_agg" => st.extreme.clone().unwrap_or(Value::Null),
+        "range_agg" | "range_intersect_agg" => st.extreme.clone().unwrap_or(Value::Null),
         // v7.17.0 — string_agg: join all collected text items with
         // the captured separator. Empty / all-NULL group → NULL
         // (PG semantics).
@@ -3864,6 +3888,87 @@ pub(crate) fn encode_key(vals: &[Value<'static>]) -> String {
 }
 
 #[allow(clippy::cast_precision_loss)]
+/// v7.37.17 (17.6 siblings) — intersect two ranges (same kind).
+/// The greater lower bound wins (tie keeps inclusivity only when
+/// both are inclusive); the smaller upper bound mirrors it; an
+/// unbounded side loses to a bounded one. lower > upper — or a
+/// touch that isn't inclusive on both ends — collapses to empty,
+/// and any empty input pins the fold at empty.
+fn range_intersect(a: &Value<'static>, b: &Value<'static>) -> Value<'static> {
+    let (
+        Value::Range {
+            kind,
+            lower: la,
+            upper: ua,
+            lower_inc: lia,
+            upper_inc: uia,
+            empty: ea,
+        },
+        Value::Range {
+            lower: lb,
+            upper: ub,
+            lower_inc: lib_,
+            upper_inc: uib,
+            empty: eb,
+            ..
+        },
+    ) = (a, b)
+    else {
+        return Value::Null;
+    };
+    let kind = *kind;
+    let empty_range = Value::Range {
+        kind,
+        lower: None,
+        upper: None,
+        lower_inc: false,
+        upper_inc: false,
+        empty: true,
+    };
+    if *ea || *eb {
+        return empty_range;
+    }
+    // Greater lower bound (None = -infinity loses to any bound).
+    let (lower, lower_inc) = match (la, lb) {
+        (None, None) => (None, false),
+        (Some(x), None) => (Some(x.clone()), *lia),
+        (None, Some(y)) => (Some(y.clone()), *lib_),
+        (Some(x), Some(y)) => match value_cmp(x, y) {
+            core::cmp::Ordering::Greater => (Some(x.clone()), *lia),
+            core::cmp::Ordering::Less => (Some(y.clone()), *lib_),
+            core::cmp::Ordering::Equal => (Some(x.clone()), *lia && *lib_),
+        },
+    };
+    // Smaller upper bound (None = +infinity loses to any bound).
+    let (upper, upper_inc) = match (ua, ub) {
+        (None, None) => (None, false),
+        (Some(x), None) => (Some(x.clone()), *uia),
+        (None, Some(y)) => (Some(y.clone()), *uib),
+        (Some(x), Some(y)) => match value_cmp(x, y) {
+            core::cmp::Ordering::Less => (Some(x.clone()), *uia),
+            core::cmp::Ordering::Greater => (Some(y.clone()), *uib),
+            core::cmp::Ordering::Equal => (Some(x.clone()), *uia && *uib),
+        },
+    };
+    if let (Some(lo), Some(up)) = (&lower, &upper) {
+        match value_cmp(lo, up) {
+            core::cmp::Ordering::Greater => return empty_range,
+            core::cmp::Ordering::Equal if !(lower_inc && upper_inc) => {
+                return empty_range;
+            }
+            _ => {}
+        }
+    }
+    Value::Range {
+        kind,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        empty: false,
+    }
+}
+
 fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering::Equal;
     match (a, b) {

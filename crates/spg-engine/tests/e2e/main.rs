@@ -122,6 +122,7 @@ mod e2e_mysql_base64_sha2;
 mod e2e_range_constructors;
 mod e2e_multirange_constructors;
 mod e2e_range_agg;
+mod e2e_range_intersect_agg;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
