@@ -288,6 +288,12 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                                 qualifier: None,
                                 name: a.clone(),
                             }),
+                            // Unions + no alias: leave the positional
+                            // literal for the union sort path to map
+                            // onto the Nth projected column —
+                            // substituting the HEAD's expr would sort
+                            // every combined row by the head's value.
+                            (true, None) => continue,
                             _ => expr.clone(),
                         };
                     }
