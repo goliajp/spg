@@ -127,6 +127,10 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // the group (SPG: the first seen, deterministic for
             // ordered input).
             | "any_value"
+            // MySQL group_concat (string_agg with ',' default) +
+            // SQL/XML xmlagg (separator-less concatenation).
+            | "group_concat"
+            | "xmlagg"
             // v7.17.0 — boolean aggregates. `every` is SQL-standard
             // alias for `bool_and`.
             | "bool_and"
@@ -264,7 +268,7 @@ fn classify_agg_name(name: &str) -> AggKind {
         "min" => AggKind::Min,
         "max" => AggKind::Max,
         "any_value" => AggKind::AnyValue,
-        "string_agg" => AggKind::StringAgg,
+        "string_agg" | "group_concat" | "xmlagg" => AggKind::StringAgg,
         "array_agg" => AggKind::ArrayAgg,
         "bool_and" => AggKind::BoolAnd,
         "bool_or" => AggKind::BoolOr,
@@ -2389,7 +2393,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 | "stddev" | "stddev_samp" | "stddev_pop"
                 | "variance" | "var_samp" | "var_pop"
                 | "bit_and" | "bit_or" | "bit_xor"
-                | "json_agg" | "jsonb_agg" => Some(1),
+                | "json_agg" | "jsonb_agg" | "group_concat" | "xmlagg" => Some(1),
                 // v7.32 (round-29) — two-argument aggregates: string_agg,
                 // the regression family f(Y, X), and json_object_agg.
                 "string_agg"
@@ -2773,8 +2777,21 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
-            if let Value::Text(s) = v {
-                st.items.push(Value::text(s.clone()));
+            // Text collects as-is; other scalars coerce to their
+            // text rendering (MySQL group_concat semantics — also
+            // matches PG's cast-then-aggregate idiom for
+            // string_agg(v::text, sep)).
+            let rendered: Option<Value<'static>> = match v {
+                Value::Text(s) => Some(Value::text(s.clone())),
+                Value::Int(n) => Some(Value::text(n.to_string())),
+                Value::BigInt(n) => Some(Value::text(n.to_string())),
+                Value::SmallInt(n) => Some(Value::text(n.to_string())),
+                Value::Float(f) => Some(Value::text(f.to_string())),
+                Value::Bool(b) => Some(Value::text(if *b { "1" } else { "0" })),
+                _ => None,
+            };
+            if let Some(item) = rendered {
+                st.items.push(item);
                 if let Some(k) = order_keys {
                     st.item_keys.push(k);
                 }
@@ -2953,18 +2970,33 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         // v7.17.0 — string_agg: join all collected text items with
         // the captured separator. Empty / all-NULL group → NULL
         // (PG semantics).
-        "string_agg" => {
+        "string_agg" | "group_concat" | "xmlagg" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
-            let sep = st.separator.clone().unwrap_or_default();
+            // group_concat defaults to ',' (MySQL); xmlagg and a
+            // separator-less string_agg join bare.
+            let sep = st.separator.clone().unwrap_or_else(|| {
+                if name == "group_concat" { ",".into() } else { String::new() }
+            });
             let mut out = String::new();
             for (i, item) in st.items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(&sep);
                 }
-                if let Value::Text(s) = item {
-                    out.push_str(s);
+                match item {
+                    Value::Text(s) => out.push_str(s),
+                    // MySQL group_concat coerces scalars to text;
+                    // harmless for string_agg (typed inputs are
+                    // Text already).
+                    Value::Int(n) => out.push_str(&n.to_string()),
+                    Value::BigInt(n) => out.push_str(&n.to_string()),
+                    Value::SmallInt(n) => out.push_str(&n.to_string()),
+                    Value::Float(f) => out.push_str(&f.to_string()),
+                    Value::Bool(b) => {
+                        out.push_str(if *b { "1" } else { "0" });
+                    }
+                    _ => {}
                 }
             }
             Value::text(out)
@@ -3300,7 +3332,7 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         },
         "avg" => DataType::Float,
         // v7.17.0 — string_agg always returns TEXT.
-        "string_agg" => DataType::Text,
+        "string_agg" | "group_concat" | "xmlagg" => DataType::Text,
         "array_agg" => match arg_ty {
             Some(DataType::Int | DataType::SmallInt) => DataType::IntArray,
             Some(DataType::BigInt) => DataType::BigIntArray,
