@@ -34,6 +34,44 @@ impl Engine {
         tref: &TableRef,
     ) -> Result<(Vec<Row<'static>>, Vec<ColumnSchema>), EngineError> {
         if let Some(expr) = tref.unnest_expr.as_deref() {
+            // Multi-arg unnest(a, b, …) — parallel zip via the
+            // shared builder; columns alias positionally, default
+            // PG's `unnest`; ordinality rides after.
+            if let Some(args) = crate::select::unnest_zip_args(expr) {
+                let (dtypes, rows) = crate::select::unnest_zip_rows(args)?;
+                let n_vals = dtypes.len();
+                let mut cols: Vec<ColumnSchema> = dtypes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, dt)| {
+                        let name = tref
+                            .unnest_column_aliases
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| alloc::string::String::from("unnest"));
+                        ColumnSchema::new(name, *dt, true)
+                    })
+                    .collect();
+                let rows = if tref.with_ordinality {
+                    let ord_name = tref
+                        .unnest_column_aliases
+                        .get(n_vals)
+                        .cloned()
+                        .unwrap_or_else(|| alloc::string::String::from("ordinality"));
+                    cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+                    rows.into_iter()
+                        .enumerate()
+                        .map(|(i, row)| {
+                            let mut vals = row.values.to_vec();
+                            vals.push(Value::BigInt(i as i64 + 1));
+                            Row::new(vals)
+                        })
+                        .collect()
+                } else {
+                    rows
+                };
+                return Ok((rows, cols));
+            }
             let empty_schema: Vec<ColumnSchema> = Vec::new();
             let ctx = EvalContext::new(&empty_schema, None);
             let dummy_row = Row::new(Vec::new());

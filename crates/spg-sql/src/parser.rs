@@ -10346,7 +10346,11 @@ impl Parser {
         {
             self.advance(); // unnest
             self.advance(); // (
-            let expr = self.parse_expr(0)?;
+            let mut srf_args = alloc::vec![self.parse_expr(0)?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                srf_args.push(self.parse_expr(0)?);
+            }
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(alloc::format!(
                     "expected ')' after unnest() argument, got {:?}",
@@ -10354,6 +10358,18 @@ impl Parser {
                 )));
             }
             self.advance();
+            // Multi-arg unnest(a, b, …) zips the arrays in
+            // parallel, NULL-padding to the longest (PG's ROWS
+            // FROM shorthand). Lower onto the unnest channel as an
+            // internal marker call the executors unpack.
+            let expr = if srf_args.len() == 1 {
+                srf_args.pop().expect("len checked")
+            } else {
+                crate::ast::Expr::FunctionCall {
+                    name: "__unnest_zip".to_string(),
+                    args: srf_args,
+                }
+            };
             let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());

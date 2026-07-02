@@ -1768,6 +1768,15 @@ impl Engine {
             .unnest_expr
             .as_deref()
             .expect("caller guards unnest_expr.is_some()");
+        // Multi-arg unnest(a, b, …) — parallel zip, NULL-padded.
+        // N value columns instead of one; the shared builder does
+        // the work and the tail below (WHERE / agg / projection)
+        // runs against the wider schema.
+        let multi: Option<(alloc::vec::Vec<DataType>, alloc::vec::Vec<Row<'static>>)> =
+            match unnest_zip_args(expr) {
+                Some(args) => Some(unnest_zip_rows(args)?),
+                None => None,
+            };
         // Evaluate the array expression once. Empty schema / empty
         // row — uncorrelated UNNEST cannot reference outer columns.
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
@@ -1775,8 +1784,12 @@ impl Engine {
         let dummy_row = Row::new(alloc::vec::Vec::new());
         // v7.11.13 — unnest dispatches per array element type so
         // INT[] / BIGINT[] surface their PG types in projection.
-        let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
-            match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
+        let (dtypes, rows): (alloc::vec::Vec<DataType>, alloc::vec::Vec<Row<'static>>) =
+            if let Some(m) = multi {
+                m
+            } else {
+                let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
+                    match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
                 Value::Null => (DataType::Text, alloc::vec::Vec::new()),
                 Value::TextArray(items) => {
                     let rows = items
@@ -1820,30 +1833,45 @@ impl Engine {
                         other.data_type()
                     )));
                 }
+                };
+                (alloc::vec![elem_dtype], rows)
             };
         let alias = primary
             .alias
             .clone()
             .unwrap_or_else(|| "unnest".to_string());
         // v7.13.2 — mailrs round-6 S5. Honour PG-standard
-        // `UNNEST(arr) AS p(col_name)` column-list aliasing: the
-        // first entry overrides the projected column's name.
-        // Without the column list, fall back to the table alias
-        // (pre-v7.13.2 behaviour).
-        let col_name = primary
-            .unnest_column_aliases
-            .first()
-            .cloned()
-            .unwrap_or_else(|| alias.clone());
-        let col_schema = ColumnSchema::new(col_name, elem_dtype, true);
-        let mut schema_cols = alloc::vec![col_schema.clone()];
+        // `UNNEST(arr) AS p(col_name)` column-list aliasing:
+        // entries map positionally over the value columns. Without
+        // the column list, a single column falls back to the table
+        // alias (pre-v7.13.2 behaviour); multi-arg columns default
+        // to PG's `unnest`.
+        let n_vals = dtypes.len();
+        let mut schema_cols: alloc::vec::Vec<ColumnSchema> = dtypes
+            .iter()
+            .enumerate()
+            .map(|(i, dt)| {
+                let name = primary
+                    .unnest_column_aliases
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if n_vals == 1 {
+                            alias.clone()
+                        } else {
+                            "unnest".to_string()
+                        }
+                    });
+                ColumnSchema::new(name, *dt, true)
+            })
+            .collect();
         // WITH ORDINALITY — trailing BIGINT counting rows from 1
-        // in element order. The second column-alias entry renames
-        // it (PG default: `ordinality`).
+        // in element order. The alias entry after the value
+        // columns renames it (PG default: `ordinality`).
         let rows = if primary.with_ordinality {
             let ord_name = primary
                 .unnest_column_aliases
-                .get(1)
+                .get(n_vals)
                 .cloned()
                 .unwrap_or_else(|| "ordinality".to_string());
             schema_cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
@@ -4240,6 +4268,73 @@ fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
         out.extend_from_slice(s.as_bytes());
     }
     out
+}
+
+/// Multi-arg `unnest(a, b, …)` — evaluate each array argument
+/// (uncorrelated; outer refs were substituted upstream), then zip
+/// them in parallel, NULL-padding shorter arrays to the longest
+/// (PG's ROWS FROM shorthand). Shared by the primary-position
+/// executor and the join-position materialiser, which both detect
+/// the parser's `__unnest_zip` marker call.
+pub(crate) fn unnest_zip_rows(
+    args: &[Expr],
+) -> Result<(alloc::vec::Vec<DataType>, alloc::vec::Vec<Row<'static>>), EngineError> {
+    let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    let ctx = EvalContext::new(&empty_schema, None);
+    let dummy_row = Row::new(alloc::vec::Vec::new());
+    let mut dtypes: alloc::vec::Vec<DataType> = alloc::vec::Vec::with_capacity(args.len());
+    let mut columns: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> =
+        alloc::vec::Vec::with_capacity(args.len());
+    for a in args {
+        let v = eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+        let (dt, items): (DataType, alloc::vec::Vec<Value<'static>>) = match v {
+            Value::Null => (DataType::Text, alloc::vec::Vec::new()),
+            Value::TextArray(xs) => (
+                DataType::Text,
+                xs.into_iter()
+                    .map(|x| x.map(Value::text).unwrap_or(Value::Null))
+                    .collect(),
+            ),
+            Value::IntArray(xs) => (
+                DataType::Int,
+                xs.into_iter()
+                    .map(|x| x.map(Value::Int).unwrap_or(Value::Null))
+                    .collect(),
+            ),
+            Value::BigIntArray(xs) => (
+                DataType::BigInt,
+                xs.into_iter()
+                    .map(|x| x.map(Value::BigInt).unwrap_or(Value::Null))
+                    .collect(),
+            ),
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "unnest() expects array arguments, got {:?}",
+                    other.data_type()
+                )));
+            }
+        };
+        dtypes.push(dt);
+        columns.push(items);
+    }
+    let max_len = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::with_capacity(max_len);
+    for i in 0..max_len {
+        let vals: alloc::vec::Vec<Value<'static>> = columns
+            .iter()
+            .map(|c| c.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
+        rows.push(Row::new(vals));
+    }
+    Ok((dtypes, rows))
+}
+
+/// Detect the parser's multi-arg unnest marker on an unnest_expr.
+pub(crate) fn unnest_zip_args(expr: &Expr) -> Option<&[Expr]> {
+    match expr {
+        Expr::FunctionCall { name, args } if name == "__unnest_zip" => Some(args.as_slice()),
+        _ => None,
+    }
 }
 
 /// Evaluate generate_series arguments (uncorrelated — outer refs
