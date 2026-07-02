@@ -9519,6 +9519,46 @@ impl Parser {
         // every other table-ref shape (unnest / generate_series /
         // bare ident); the lateral subquery itself follows the
         // regular SELECT grammar.
+        // v7.37.17 (17.6 siblings) — plain derived table:
+        // `FROM ( SELECT … ) [AS] alias`. Rides the same
+        // lateral_subquery channel the explicit LATERAL form uses —
+        // an uncorrelated inner SELECT executes identically. The
+        // inner parse carries UNION tails (they live on
+        // SelectStatement.unions).
+        if matches!(self.peek(), Token::LParen)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Select))
+        {
+            self.advance(); // (
+            let inner = match self.parse_one_statement()? {
+                Statement::Select(s) => s,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT inside derived table ( … ), got {other:?}"
+                    )));
+                }
+            };
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after derived-table subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let alias_ident = self.parse_optional_alias();
+            let name = alias_ident
+                .clone()
+                .unwrap_or_else(|| "subquery".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(inner)),
+                jsonb_each_text_arg: None,
+            });
+        }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
