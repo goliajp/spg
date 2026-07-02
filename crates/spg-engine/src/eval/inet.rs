@@ -504,3 +504,182 @@ pub(super) fn inet_op_bool_result(
     };
     Ok(Value::Bool(result))
 }
+
+/// v7.37.17 (17.6 siblings) — MySQL INET_ATON(text) → the IPv4
+/// address as a BigInt. Invalid input → NULL (MySQL semantics, not
+/// an error).
+pub(super) fn mysql_inet_aton(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Text(s)] => s,
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("inet_aton() takes one TEXT arg, got {} args", args.len()),
+            });
+        }
+    };
+    match parse_ipv4(s) {
+        Some(b) => Ok(Value::BigInt(
+            (i64::from(b[0]) << 24) | (i64::from(b[1]) << 16) | (i64::from(b[2]) << 8)
+                | i64::from(b[3]),
+        )),
+        None => Ok(Value::Null),
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL INET_NTOA(n) → dotted-quad text.
+/// Out-of-range input → NULL (MySQL semantics).
+pub(super) fn mysql_inet_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let n = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Int(n)] => i64::from(*n),
+        [Value::SmallInt(n)] => i64::from(*n),
+        [Value::BigInt(n)] => *n,
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "inet_ntoa() takes one integer arg, got {:?}",
+                    args.first().map(|a| a.data_type())
+                ),
+            });
+        }
+    };
+    if !(0..=0xFFFF_FFFF).contains(&n) {
+        return Ok(Value::Null);
+    }
+    let n = n as u32;
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}",
+        (n >> 24) & 0xFF,
+        (n >> 16) & 0xFF,
+        (n >> 8) & 0xFF,
+        n & 0xFF
+    )))
+}
+
+/// RFC 5952 text rendering for a 16-byte IPv6 address: lowercase
+/// hex, longest zero run (length ≥ 2) compressed to `::`.
+fn format_ipv6(bytes: &[u8; 16]) -> alloc::string::String {
+    let mut groups = [0u16; 8];
+    for (i, g) in groups.iter_mut().enumerate() {
+        *g = (u16::from(bytes[i * 2]) << 8) | u16::from(bytes[i * 2 + 1]);
+    }
+    // Longest run of zero groups (first among ties), min length 2.
+    let (mut best_start, mut best_len) = (usize::MAX, 0usize);
+    let mut i = 0;
+    while i < 8 {
+        if groups[i] == 0 {
+            let start = i;
+            while i < 8 && groups[i] == 0 {
+                i += 1;
+            }
+            let len = i - start;
+            if len > best_len {
+                best_start = start;
+                best_len = len;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = alloc::string::String::new();
+    if best_len >= 2 {
+        for (idx, g) in groups.iter().enumerate().take(best_start) {
+            if idx > 0 {
+                out.push(':');
+            }
+            out.push_str(&alloc::format!("{g:x}"));
+        }
+        out.push_str("::");
+        for (idx, g) in groups.iter().enumerate().skip(best_start + best_len) {
+            if idx > best_start + best_len {
+                out.push(':');
+            }
+            out.push_str(&alloc::format!("{g:x}"));
+        }
+    } else {
+        for (idx, g) in groups.iter().enumerate() {
+            if idx > 0 {
+                out.push(':');
+            }
+            out.push_str(&alloc::format!("{g:x}"));
+        }
+    }
+    out
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL INET6_ATON(text) → the address
+/// as VARBINARY: 16 bytes for IPv6, 4 bytes for IPv4 (MySQL keeps
+/// the shorter form for v4 input). Invalid → NULL.
+pub(super) fn mysql_inet6_aton(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Text(s)] => s,
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("inet6_aton() takes one TEXT arg, got {} args", args.len()),
+            });
+        }
+    };
+    if let Some(b) = parse_ipv4(s) {
+        return Ok(Value::Bytes(alloc::borrow::Cow::Owned(b.to_vec())));
+    }
+    match parse_ipv6(s) {
+        Some(b) => Ok(Value::Bytes(alloc::borrow::Cow::Owned(b.to_vec()))),
+        None => Ok(Value::Null),
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL INET6_NTOA(varbinary) → text.
+/// 4-byte input renders dotted-quad; 16-byte renders RFC 5952
+/// compressed IPv6. Anything else → NULL.
+pub(super) fn mysql_inet6_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let bytes = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Bytes(b)] => b.as_ref(),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "inet6_ntoa() takes one binary arg, got {:?}",
+                    args.first().map(|a| a.data_type())
+                ),
+            });
+        }
+    };
+    match bytes.len() {
+        4 => Ok(Value::text(alloc::format!(
+            "{}.{}.{}.{}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3]
+        ))),
+        16 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(bytes);
+            Ok(Value::text(format_ipv6(&b)))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL IS_IPV4(text) / IS_IPV6(text).
+pub(super) fn mysql_is_ipv4(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    match args {
+        [Value::Null] => Ok(Value::Null),
+        [Value::Text(s)] => Ok(Value::Bool(parse_ipv4(s).is_some())),
+        _ => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("is_ipv4() takes one TEXT arg, got {} args", args.len()),
+        }),
+    }
+}
+
+pub(super) fn mysql_is_ipv6(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    match args {
+        [Value::Null] => Ok(Value::Null),
+        [Value::Text(s)] => Ok(Value::Bool(!s.is_empty() && parse_ipv6(s).is_some())),
+        _ => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("is_ipv6() takes one TEXT arg, got {} args", args.len()),
+        }),
+    }
+}
