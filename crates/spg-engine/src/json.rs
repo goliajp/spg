@@ -2010,3 +2010,229 @@ pub fn mysql_json_contains_path(args: &[Value<'_>]) -> Result<Value<'static>, Ev
     }
     Ok(Value::Bool(if mode { found_all } else { found_any }))
 }
+
+/// v7.37.17 (17.6 siblings) — convert a SQL value into a JsonValue
+/// for the MySQL JSON mutation functions (SQL text becomes a JSON
+/// string; JSON passes through parsed).
+fn value_to_jsonvalue(v: &Value) -> Result<JsonValue, EvalError> {
+    Ok(match v {
+        Value::Null => JsonValue::Null,
+        Value::Bool(b) => JsonValue::Bool(*b),
+        Value::Json(s) => parse(s).map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("invalid JSON value: {e}"),
+        })?,
+        Value::Text(s) => JsonValue::String(s.to_string()),
+        other => {
+            // Numbers and everything else render through the
+            // to_json text form, then parse back.
+            let text = value_to_json_text(other);
+            parse(&text).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("invalid JSON value: {e}"),
+            })?
+        }
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MutateMode {
+    /// json_set — replace existing, create missing.
+    Set,
+    /// json_insert — create missing only.
+    Insert,
+    /// json_replace — replace existing only.
+    Replace,
+}
+
+/// Apply one path mutation. Missing intermediate steps are a no-op
+/// (MySQL: only the final step may be created).
+fn mutate_at(cur: &mut JsonValue, steps: &[MysqlPathStep], mode: MutateMode, newval: &JsonValue) {
+    match steps {
+        [] => {
+            if matches!(mode, MutateMode::Set | MutateMode::Replace) {
+                *cur = newval.clone();
+            }
+        }
+        [last] => match (last, &mut *cur) {
+            (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                if let Some(slot) = members.iter_mut().find(|(mk, _)| mk == k) {
+                    if matches!(mode, MutateMode::Set | MutateMode::Replace) {
+                        slot.1 = newval.clone();
+                    }
+                } else if matches!(mode, MutateMode::Set | MutateMode::Insert) {
+                    members.push((k.clone(), newval.clone()));
+                }
+            }
+            (MysqlPathStep::Index(i), JsonValue::Array(items)) => {
+                if *i < items.len() {
+                    if matches!(mode, MutateMode::Set | MutateMode::Replace) {
+                        items[*i] = newval.clone();
+                    }
+                } else if matches!(mode, MutateMode::Set | MutateMode::Insert) {
+                    // Index past the end appends (MySQL semantics).
+                    items.push(newval.clone());
+                }
+            }
+            // Scalar auto-wraps as a one-element array: [0] exists.
+            (MysqlPathStep::Index(0), scalar) => {
+                if matches!(mode, MutateMode::Set | MutateMode::Replace) {
+                    *scalar = newval.clone();
+                }
+            }
+            _ => {}
+        },
+        [head, rest @ ..] => match (head, cur) {
+            (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                if let Some(slot) = members.iter_mut().find(|(mk, _)| mk == k) {
+                    mutate_at(&mut slot.1, rest, mode, newval);
+                }
+            }
+            (MysqlPathStep::Index(i), JsonValue::Array(items)) => {
+                if let Some(slot) = items.get_mut(*i) {
+                    mutate_at(slot, rest, mode, newval);
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+fn mysql_json_mutate(
+    args: &[Value<'_>],
+    mode: MutateMode,
+    fn_name: &str,
+) -> Result<Value<'static>, EvalError> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes a document plus (path, value) pairs, got {} args",
+                args.len()
+            ),
+        });
+    }
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let mut doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("{fn_name}(): invalid JSON: {e}"),
+    })?;
+    for pair in args[1..].chunks(2) {
+        let Value::Text(p) = &pair[0] else {
+            if matches!(pair[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}() paths must be text, got {:?}",
+                    pair[0].data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        let newval = value_to_jsonvalue(&pair[1])?;
+        mutate_at(&mut doc, &steps, mode, &newval);
+    }
+    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_SET / JSON_INSERT /
+/// JSON_REPLACE ('$.x'-path forms; the PG jsonb_set text-array
+/// spelling stays on crate::json::set).
+pub fn mysql_json_set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    mysql_json_mutate(args, MutateMode::Set, "json_set")
+}
+
+pub fn mysql_json_insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    mysql_json_mutate(args, MutateMode::Insert, "json_insert")
+}
+
+pub fn mysql_json_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    mysql_json_mutate(args, MutateMode::Replace, "json_replace")
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_REMOVE(doc, path...).
+/// Removing the root path `$` errors, as in MySQL.
+pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_remove() takes a document and at least one path, got {} args",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_remove() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let mut doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("json_remove(): invalid JSON: {e}"),
+    })?;
+    fn remove_at(cur: &mut JsonValue, steps: &[MysqlPathStep]) {
+        match steps {
+            [] => {}
+            [last] => match (last, cur) {
+                (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                    members.retain(|(mk, _)| mk != k);
+                }
+                (MysqlPathStep::Index(i), JsonValue::Array(items)) => {
+                    if *i < items.len() {
+                        items.remove(*i);
+                    }
+                }
+                _ => {}
+            },
+            [head, rest @ ..] => match (head, cur) {
+                (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                    if let Some(slot) = members.iter_mut().find(|(mk, _)| mk == k) {
+                        remove_at(&mut slot.1, rest);
+                    }
+                }
+                (MysqlPathStep::Index(i), JsonValue::Array(items)) => {
+                    if let Some(slot) = items.get_mut(*i) {
+                        remove_at(slot, rest);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    for path_v in &args[1..] {
+        let Value::Text(p) = path_v else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_remove() paths must be text, got {:?}",
+                    path_v.data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        if steps.is_empty() {
+            return Err(EvalError::TypeMismatch {
+                detail: "The path expression '$' is not allowed in this context".into(),
+            });
+        }
+        remove_at(&mut doc, &steps);
+    }
+    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+}
