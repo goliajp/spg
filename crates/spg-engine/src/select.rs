@@ -1601,10 +1601,19 @@ impl Engine {
             unreachable!("bare SELECT cannot return CommandOk")
         };
         for (kind, peer) in &stmt_ref.unions {
+            // v7.37.17 (17.6 siblings) — a peer carrying its own
+            // unions is a nested INTERSECT group (the parser's
+            // precedence regrouping); recurse through the
+            // union-aware wrapper for it.
+            let peer_result = if peer.unions.is_empty() {
+                self.exec_bare_select_cancel(peer, cancel)?
+            } else {
+                self.exec_select_cancel(peer, cancel)?
+            };
             let QueryResult::Rows {
                 columns: peer_cols,
                 rows: peer_rows,
-            } = self.exec_bare_select_cancel(peer, cancel)?
+            } = peer_result
             else {
                 unreachable!("bare SELECT cannot return CommandOk")
             };
