@@ -9309,8 +9309,31 @@ fn apply_function_dispatch(
         // NULL / empty text where PG would return real DDL text.
         // Full DDL reconstruction queues with the get_ddl surface
         // in v7.40 that reuses spgctl's DDL round-tripper.
-        "pg_get_viewdef"
-        | "pg_get_functiondef"
+        // pg_get_viewdef(view [, pretty]) — REAL: SPG's catalog
+        // keeps every view's SQL body; look it up by name (regclass
+        // text form; 'public.' qualification stripped). The pretty
+        // flag is accepted and ignored — SPG returns the body as
+        // written. Numeric-oid input can't map (synthetic oids) →
+        // NULL.
+        "pg_get_viewdef" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            match cat.views().get(bare) {
+                Some(def) => Ok(Value::text(def.body.clone())),
+                None => Ok(Value::Null),
+            }
+        }
+        "pg_get_functiondef"
         | "pg_get_triggerdef"
         | "pg_get_ruledef"
         | "pg_get_expr"
