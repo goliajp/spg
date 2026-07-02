@@ -11550,11 +11550,28 @@ fn apply_function_dispatch(
         "lastval" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — pg_sequence_last_value(regclass)
         // returns the sequence's most-recent value or NULL if not
-        // yet advanced. SPG's sequence surface doesn't yet expose
-        // this via regclass name → BigInt lookup; return NULL for
-        // parse-through (monitoring queries that emit this get a
-        // graceful NULL instead of "unknown function").
-        "pg_sequence_last_value" => Ok(Value::Null),
+        // yet advanced — REAL: reads the catalog's SequenceDef
+        // (the pg_sequences view's last_value source). Missing
+        // sequence or never advanced (is_called=false) → NULL,
+        // matching PG.
+        "pg_sequence_last_value" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::Null),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            match cat.sequence_current_value(bare) {
+                Ok(v) => Ok(Value::BigInt(v)),
+                Err(_) => Ok(Value::Null),
+            }
+        }
         // pg_sequence_parameters(oid) returns a row with (start,
         // minimum, maximum, increment, cycle, cache, data_type).
         // Scalar surface returns NULL; the real row-shape is only
