@@ -10240,6 +10240,31 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("case") => {
                 self.parse_case_atom()
             }
+            // v7.37.17 (17.6 siblings) — PG typed datetime literals:
+            // `DATE '2003-01-02'` / `TIMESTAMP '…'` / `TIMESTAMPTZ
+            // '…'`. Lower onto the ::cast node so the existing
+            // runtime text→date/timestamp paths do the parsing. The
+            // string must follow immediately, else the ident stays a
+            // plain column reference.
+            Token::Ident(s)
+                if matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "date" | "timestamp" | "timestamptz"
+                ) && matches!(self.peek(), Token::String(_)) =>
+            {
+                let target = match s.to_ascii_lowercase().as_str() {
+                    "date" => CastTarget::Date,
+                    "timestamp" => CastTarget::Timestamp,
+                    _ => CastTarget::Timestamptz,
+                };
+                let Token::String(lit) = self.advance() else {
+                    unreachable!("peek guaranteed a string token");
+                };
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(Literal::String(lit))),
+                    target,
+                })
+            }
             // v7.10.10 — `ARRAY[expr, expr, …]` constructor. ARRAY
             // is not a reserved token; we match by case-insensitive
             // ident. The opening `[` must follow immediately.

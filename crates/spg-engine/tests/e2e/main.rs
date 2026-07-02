@@ -114,6 +114,7 @@ mod e2e_mysql_json_merge;
 mod e2e_mysql_json_search;
 mod e2e_str_to_date;
 mod e2e_timestampdiff;
+mod e2e_typed_datetime_literals;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
