@@ -896,6 +896,21 @@ fn apply_function_dispatch(
         "pg_hba_file_rules" | "pg_ident_file_mappings" | "pg_config" => {
             Ok(Value::Null)
         }
+        // SRF settings/metadata readers — psql tab-completion
+        // (pg_get_keywords), reloptions expansion
+        // (pg_options_to_table), timezone catalogs, partition-tree
+        // walker, extended-stats reader, logical-decoding dirs.
+        // Scalar surface: NULL keeps the callers parseable.
+        "pg_get_keywords"
+        | "pg_options_to_table"
+        | "pg_show_all_settings"
+        | "pg_show_all_file_settings"
+        | "pg_timezone_names"
+        | "pg_timezone_abbrevs"
+        | "pg_partition_tree"
+        | "pg_mcv_list_items"
+        | "pg_ls_logicalmapdir"
+        | "pg_ls_logicalsnapdir" => Ok(Value::Null),
         // Replication-origin family — pg_recvlogical / pglogical
         // probe. SPG has no logical replication yet.
         "pg_replication_origin_advance"
