@@ -4481,13 +4481,67 @@ fn apply_function_dispatch(
         // converts a Unix epoch (seconds since 1970-01-01 UTC) to a
         // `timestamp with time zone`. SPG uses micros-since-epoch
         // internally, so this is just a scale-and-round.
-        "to_timestamp" => {
-            if args.len() != 1 {
-                // 2-arg form is `to_timestamp(text, fmt)` which is
-                // format-parsing — that's a separate epic.
+        // to_date(text, fmt) — format-template date parsing.
+        // Tokens: YYYY YY MM DD MON MONTH + literal separators.
+        "to_date" => {
+            if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "to_timestamp() takes 1 arg (numeric epoch), got {}; the 2-arg text-format form isn't shipped yet",
+                        "to_date() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let (input, fmt) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(i), Value::Text(f)) => (i.as_ref(), f.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "to_date() takes 2 TEXT args".into(),
+                    });
+                }
+            };
+            let (y, m, d, ..) = parse_by_format(input, fmt).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("to_date(): {e}"),
+                }
+            })?;
+            Ok(Value::Date(super::days_from_civil(y, m, d)))
+        }
+        "to_timestamp" => {
+            // 2-arg form: to_timestamp(text, fmt) — format parsing.
+            if args.len() == 2 {
+                let (input, fmt) = match (&args[0], &args[1]) {
+                    (Value::Null, _) | (_, Value::Null) => {
+                        return Ok(Value::Null);
+                    }
+                    (Value::Text(i), Value::Text(f)) => {
+                        (i.as_ref(), f.as_ref())
+                    }
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail:
+                                "to_timestamp(text, fmt) takes 2 TEXT args"
+                                    .into(),
+                        });
+                    }
+                };
+                let (y, m, d, h, mi, s, us) = parse_by_format(input, fmt)
+                    .map_err(|e| EvalError::TypeMismatch {
+                        detail: alloc::format!("to_timestamp(): {e}"),
+                    })?;
+                let days = i64::from(super::days_from_civil(y, m, d));
+                let micros = days * 86_400_000_000
+                    + i64::from(h) * 3_600_000_000
+                    + i64::from(mi) * 60_000_000
+                    + i64::from(s) * 1_000_000
+                    + i64::from(us);
+                return Ok(Value::Timestamp(micros));
+            }
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "to_timestamp() takes 1 arg (numeric epoch) or 2 args (text, fmt), got {}",
                         args.len()
                     ),
                 });
@@ -9121,6 +9175,181 @@ fn expect_text_arg<'a>(
             ),
         }),
     }
+}
+
+/// v7.37.17 (17.6 siblings) — parse a datetime string against a PG
+/// to_date/to_timestamp format template. Numeric field tokens
+/// (YYYY/YY/MM/DD/HH24/HH12/HH/MI/SS/MS/US) consume up to their
+/// width in digits; MON/MONTH match English month names
+/// case-insensitively; AM/PM adjust HH12; every other template
+/// char consumes one input char (separator). Returns
+/// (year, month, day, hour, minute, second, microsecond).
+#[allow(clippy::type_complexity)]
+fn parse_by_format(
+    input: &str,
+    fmt: &str,
+) -> Result<(i32, u32, u32, u32, u32, u32, u32), String> {
+    const MONTHS: [&str; 12] = [
+        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+    ];
+    let mut year: i32 = 1;
+    let mut month: u32 = 1;
+    let mut day: u32 = 1;
+    let mut hour: u32 = 0;
+    let mut minute: u32 = 0;
+    let mut second: u32 = 0;
+    let mut micros: u32 = 0;
+    let mut pm_shift = false;
+    let mut is_hh12 = false;
+
+    let fmt_bytes: alloc::vec::Vec<char> = fmt.chars().collect();
+    let in_bytes: alloc::vec::Vec<char> = input.chars().collect();
+    let mut fi = 0usize;
+    let mut ii = 0usize;
+
+    fn starts_with_ci(hay: &[char], pos: usize, needle: &str) -> bool {
+        needle.chars().enumerate().all(|(k, c)| {
+            hay.get(pos + k)
+                .is_some_and(|h| h.eq_ignore_ascii_case(&c))
+        })
+    }
+    fn take_digits(input: &[char], pos: &mut usize, max: usize) -> Option<u64> {
+        let start = *pos;
+        let mut val: u64 = 0;
+        while *pos < input.len() && *pos - start < max {
+            match input[*pos].to_digit(10) {
+                Some(d) => {
+                    val = val * 10 + u64::from(d);
+                    *pos += 1;
+                }
+                None => break,
+            }
+        }
+        if *pos == start { None } else { Some(val) }
+    }
+
+    while fi < fmt_bytes.len() {
+        // Longest-token-first matching.
+        if starts_with_ci(&fmt_bytes, fi, "YYYY") {
+            let v = take_digits(&in_bytes, &mut ii, 4)
+                .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
+            year = v as i32;
+            fi += 4;
+        } else if starts_with_ci(&fmt_bytes, fi, "YY") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
+            year = 2000 + v as i32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "MONTH") {
+            let rest: alloc::string::String =
+                in_bytes[ii..].iter().collect::<alloc::string::String>();
+            let upper = rest.to_ascii_uppercase();
+            let m = MONTHS
+                .iter()
+                .position(|name| upper.starts_with(name))
+                .ok_or_else(|| alloc::format!("unrecognized month name at position {ii}"))?;
+            month = m as u32 + 1;
+            ii += MONTHS[m].len();
+            fi += 5;
+        } else if starts_with_ci(&fmt_bytes, fi, "MON") {
+            let rest: alloc::string::String =
+                in_bytes[ii..].iter().take(3).collect();
+            let upper = rest.to_ascii_uppercase();
+            let m = MONTHS
+                .iter()
+                .position(|name| name.starts_with(&upper))
+                .ok_or_else(|| alloc::format!("unrecognized month abbrev at position {ii}"))?;
+            month = m as u32 + 1;
+            ii += 3;
+            fi += 3;
+        } else if starts_with_ci(&fmt_bytes, fi, "MM") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected month digits at position {ii}"))?;
+            month = v as u32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "DD") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected day digits at position {ii}"))?;
+            day = v as u32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "HH24") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected hour digits at position {ii}"))?;
+            hour = v as u32;
+            fi += 4;
+        } else if starts_with_ci(&fmt_bytes, fi, "HH12")
+            || starts_with_ci(&fmt_bytes, fi, "HH")
+        {
+            let width = if starts_with_ci(&fmt_bytes, fi, "HH12") { 4 } else { 2 };
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected hour digits at position {ii}"))?;
+            hour = v as u32;
+            is_hh12 = true;
+            fi += width;
+        } else if starts_with_ci(&fmt_bytes, fi, "MI") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected minute digits at position {ii}"))?;
+            minute = v as u32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "SS") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected second digits at position {ii}"))?;
+            second = v as u32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "US") {
+            let v = take_digits(&in_bytes, &mut ii, 6)
+                .ok_or_else(|| alloc::format!("expected microsecond digits at position {ii}"))?;
+            micros = v as u32;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "MS") {
+            let v = take_digits(&in_bytes, &mut ii, 3)
+                .ok_or_else(|| alloc::format!("expected millisecond digits at position {ii}"))?;
+            micros = v as u32 * 1000;
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "A.M.")
+            || starts_with_ci(&fmt_bytes, fi, "P.M.")
+        {
+            if starts_with_ci(&in_bytes, ii, "P.M.") {
+                pm_shift = true;
+            }
+            ii += 4;
+            fi += 4;
+        } else if starts_with_ci(&fmt_bytes, fi, "AM")
+            || starts_with_ci(&fmt_bytes, fi, "PM")
+        {
+            if starts_with_ci(&in_bytes, ii, "PM") {
+                pm_shift = true;
+            }
+            ii += 2;
+            fi += 2;
+        } else {
+            // Literal separator — consume one input char.
+            if ii < in_bytes.len() {
+                ii += 1;
+            }
+            fi += 1;
+        }
+    }
+    if is_hh12 {
+        if pm_shift && hour < 12 {
+            hour += 12;
+        } else if !pm_shift && hour == 12 {
+            hour = 0;
+        }
+    }
+    if !(1..=12).contains(&month) {
+        return Err(alloc::format!("month {month} out of range"));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(alloc::format!("day {day} out of range"));
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(alloc::format!(
+            "time {hour}:{minute}:{second} out of range"
+        ));
+    }
+    Ok((year, month, day, hour, minute, second, micros))
 }
 
 #[cfg(feature = "injection-points")]
