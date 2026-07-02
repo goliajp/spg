@@ -73,6 +73,52 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Analytics + INSERT + SRF-correlation campaign (tasks #338-#350) —
+grouping analytics, the INSERT clause tail, and the SRF ordinality
+/ correlation story close out, with two real engine gaps found and
+fixed by the campaign's own verification pins (2889 e2e green):
+
+- **Analytics (#339-#342)**: SELECT DISTINCT ON (exprs) —
+  keep-first dedup at the executor exit (Django's
+  .distinct(field) shape); GROUP BY ROLLUP / CUBE / GROUPING SETS
+  expand at parse time into UNION ALL peers with dropped keys
+  nullified in items + group_by (primary set's keys nullified in
+  the HEAD too); GROUPING(keys…) rewrites to the per-set bitmask
+  constant, recursively through CASE/operators so subtotal
+  labelling works. Three union ORDER BY bugs fixed along the way
+  (alias under unions substituted with the HEAD constant;
+  positional keys unresolved under Wildcard projections;
+  unaliased positional under unions).
+- **SQL:2016 predicates (#343)**: IS [NOT] JSON
+  [VALUE|OBJECT|ARRAY|SCALAR] lowers to a pg_is_json helper.
+- **INSERT clause tail (#344-#345)**: ON CONFLICT ON CONSTRAINT
+  <name> resolves pg_dump's conflict-target form against the
+  synthetic {t}_pkey / {t}_uniq{i} names; INSERT … DEFAULT VALUES
+  lowers to the empty-column-list default-fill path (serials
+  advance); OVERRIDING {SYSTEM|USER} VALUE accepted and absorbed
+  (SPG always uses statement-supplied values).
+- **WITH ORDINALITY (#346-#348)**: unnest and every parser-
+  rewritten SRF gain the trailing 1-based BIGINT counter (second
+  column-alias entry renames it); generate_series gets the same
+  plus AS t(n) column aliasing it previously discarded; a shared
+  generate_series_rows builder gives the join-position
+  materialiser a generate_series arm (FROM t, generate_series(…)
+  was TableNotFound before).
+- **Correlated SRFs (#349-#350)**: LATERAL before
+  generate_series/unnest parses (keyword absorbed); SRF arguments
+  containing qualified column references wrap onto the
+  lateral_subquery channel so the per-outer-row machinery drives
+  them, with or without the keyword (PG's implicit-correlation
+  rule). Two engine gaps closed by the pins: the lateral probe
+  fallback synthesised col0 for wrapped SRFs (now derives the
+  schema from the SRF ref), and array-valued outer columns never
+  substituted (value_to_literal_expr has no array form — now
+  materialised as ARRAY[…] element-literal constructors).
+  generate_series returns zero rows on NULL bounds (PG
+  semantics).
+- **CTE hints (#338)**: AS [NOT] MATERIALIZED absorbed; WITH
+  t(a) AS (VALUES …) bodies parse onto the VALUES lowering.
+
 Structural-SQL campaign (tasks #321-#336) — three multi-cycle
 arcs close out the range type, derived tables and the SQL set
 operations, with two real correctness bugs found and fixed along
