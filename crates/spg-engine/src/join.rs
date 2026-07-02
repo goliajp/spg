@@ -2705,7 +2705,46 @@ fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row<'static>, outer_schema
             .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
         {
             let v = outer_row.values.get(idx).cloned().unwrap_or(Value::Null);
-            if let Ok(lit) = value_to_literal_expr(v) {
+            // Array values have no Literal form — materialise as an
+            // ARRAY[…] constructor of element literals so a
+            // correlated `unnest(t.arr_col)` substitutes per row.
+            let lit = match v {
+                Value::TextArray(items) => Some(Expr::Array(
+                    items
+                        .into_iter()
+                        .map(|it| {
+                            Expr::Literal(match it {
+                                Some(s) => spg_sql::ast::Literal::String(s),
+                                None => spg_sql::ast::Literal::Null,
+                            })
+                        })
+                        .collect(),
+                )),
+                Value::IntArray(items) => Some(Expr::Array(
+                    items
+                        .into_iter()
+                        .map(|it| {
+                            Expr::Literal(match it {
+                                Some(n) => spg_sql::ast::Literal::Integer(i64::from(n)),
+                                None => spg_sql::ast::Literal::Null,
+                            })
+                        })
+                        .collect(),
+                )),
+                Value::BigIntArray(items) => Some(Expr::Array(
+                    items
+                        .into_iter()
+                        .map(|it| {
+                            Expr::Literal(match it {
+                                Some(n) => spg_sql::ast::Literal::Integer(n),
+                                None => spg_sql::ast::Literal::Null,
+                            })
+                        })
+                        .collect(),
+                )),
+                other => value_to_literal_expr(other).ok(),
+            };
+            if let Some(lit) = lit {
                 *e = lit;
                 return;
             }
