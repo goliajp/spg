@@ -4032,11 +4032,91 @@ fn apply_function_dispatch(
         // Return NULL / false until real parser lands.
         "xpath" | "xmlexists" => Ok(Value::Null),
         "xpath_exists" => Ok(Value::Bool(false)),
+        // xmltext(text) — PG 16+: escape a string into an XML text
+        // node (&, <, > get entity-escaped). Real implementation.
+        "xmltext" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "xmltext() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let mut out = alloc::string::String::with_capacity(s.len());
+                    for c in s.chars() {
+                        match c {
+                            '&' => out.push_str("&amp;"),
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            other => out.push(other),
+                        }
+                    }
+                    Ok(Value::text(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "xmltext(): needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // xmlconcat(xml, ...) — variadic fragment concatenation.
+        // NULL args are skipped; all-NULL → NULL (PG semantics).
+        "xmlconcat" => {
+            let mut out = alloc::string::String::new();
+            let mut any = false;
+            for arg in args {
+                match arg {
+                    Value::Null => {}
+                    Value::Text(s) => {
+                        out.push_str(s);
+                        any = true;
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "xmlconcat(): needs xml text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            }
+            if any {
+                Ok(Value::text(out))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        // XML export family — table_to_xml / query_to_xml /
+        // cursor_to_xml / schema_to_xml / database_to_xml + the
+        // _and_xmlschema / _to_xmlschema variants. Mapping catalog
+        // state into PG's XML Schema output queues with the XML
+        // epic; NULL keeps exporter scripts parse-through.
+        "table_to_xml"
+        | "query_to_xml"
+        | "cursor_to_xml"
+        | "schema_to_xml"
+        | "database_to_xml"
+        | "table_to_xmlschema"
+        | "query_to_xmlschema"
+        | "cursor_to_xmlschema"
+        | "schema_to_xmlschema"
+        | "database_to_xmlschema"
+        | "table_to_xml_and_xmlschema"
+        | "query_to_xml_and_xmlschema"
+        | "schema_to_xml_and_xmlschema"
+        | "database_to_xml_and_xmlschema" => Ok(Value::Null),
         // xmlagg is aggregate; xmlparse / xmlserialize / xmlelement
         // are parser-level constructs (special-case in AST). This
         // arm covers only their scalar synonyms if any driver
-        // emits them.
-        "xmlconcat" | "xml" => Ok(Value::Null),
+        // emits them. (xmlconcat has a real implementation above.)
+        "xml" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — replication-slot + subscription
         // + progress-info stat probes emitted by postgres_exporter
         // and Prometheus replication-lag scrapes.
