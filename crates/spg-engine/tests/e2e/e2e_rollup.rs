@@ -77,3 +77,52 @@ fn single_key_rollup() {
     assert_eq!(cell(&got[2][0]), None); // grand total
     assert_eq!(as_i64(&got[2][1]), 6);
 }
+
+#[test]
+fn cube_all_subsets() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE c2 (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("INSERT INTO c2 VALUES ('x', 'p', 1), ('x', 'q', 2), ('y', 'p', 4)")
+        .unwrap();
+    let got = rows(
+        &mut e,
+        "SELECT a, b, SUM(v) FROM c2 GROUP BY CUBE(a, b) \
+         ORDER BY 1 NULLS LAST, 2 NULLS LAST",
+    );
+    // 3 detail + 2 per-a + 2 per-b + 1 grand = 8.
+    assert_eq!(got.len(), 8);
+    // Per-b subtotal (NULL, 'p', 5) appears — the grouping ROLLUP
+    // can't produce.
+    assert!(got.iter().any(|r| {
+        cell(&r[0]).is_none()
+            && cell(&r[1]).as_deref() == Some("p")
+            && as_i64(&r[2]) == 5
+    }));
+    // Grand total (NULL, NULL, 7).
+    assert!(got.iter().any(|r| {
+        cell(&r[0]).is_none() && cell(&r[1]).is_none() && as_i64(&r[2]) == 7
+    }));
+}
+
+#[test]
+fn grouping_sets_explicit_list() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE g2 (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("INSERT INTO g2 VALUES ('x', 'p', 1), ('y', 'p', 2)")
+        .unwrap();
+    // Only per-a and per-b groupings — NO grand total (not listed).
+    let got = rows(
+        &mut e,
+        "SELECT a, b, SUM(v) FROM g2 \
+         GROUP BY GROUPING SETS ((a), (b)) \
+         ORDER BY 1 NULLS LAST, 2 NULLS LAST",
+    );
+    assert_eq!(got.len(), 3); // x, y per-a + p per-b.
+    assert!(got.iter().all(|r| !(cell(&r[0]).is_none() && cell(&r[1]).is_none())));
+    // Per-b row: (NULL, p, 3).
+    assert!(got.iter().any(|r| {
+        cell(&r[0]).is_none()
+            && cell(&r[1]).as_deref() == Some("p")
+            && as_i64(&r[2]) == 3
+    }));
+}
