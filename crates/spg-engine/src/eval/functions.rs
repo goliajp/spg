@@ -3526,6 +3526,141 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.37.17 (17.6 siblings) — range constructor functions.
+        // Until now ranges only entered SPG through '::int4range'
+        // text casts; these are the PG constructor forms
+        // int4range(lo, hi [, bounds]) etc. NULL bounds are
+        // unbounded; equal bounds without '[]' inclusivity collapse
+        // to the empty range (PG canonical). Element coercion
+        // matches parse_range_element's shapes.
+        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
+            if !matches!(args.len(), 2 | 3) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 or 3 args, got {}", args.len()),
+                });
+            }
+            use spg_storage::RangeKind as K;
+            let kind = match name {
+                "int4range" => K::Int4,
+                "int8range" => K::Int8,
+                "numrange" => K::Num,
+                "daterange" => K::Date,
+                "tsrange" => K::Ts,
+                _ => K::TsTz,
+            };
+            let (lower_inc, upper_inc) = match args.get(2) {
+                None | Some(Value::Null) => (true, false),
+                Some(Value::Text(b)) => match b.as_ref() {
+                    "[)" => (true, false),
+                    "[]" => (true, true),
+                    "()" => (false, false),
+                    "(]" => (false, true),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!("invalid range bound flags: {other:?}"),
+                        });
+                    }
+                },
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() bounds must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let coerce = |v: &Value<'_>| -> Result<Option<Value<'static>>, EvalError> {
+                Ok(match (kind, v) {
+                    (_, Value::Null) => None,
+                    (K::Int4, Value::Int(n)) => Some(Value::Int(*n)),
+                    (K::Int4, Value::SmallInt(n)) => Some(Value::Int(i32::from(*n))),
+                    (K::Int4, Value::BigInt(n)) => Some(Value::Int(
+                        i32::try_from(*n).map_err(|_| EvalError::TypeMismatch {
+                            detail: format!("{name}(): bound out of int4 range: {n}"),
+                        })?,
+                    )),
+                    (K::Int8, Value::Int(n)) => Some(Value::BigInt(i64::from(*n))),
+                    (K::Int8, Value::SmallInt(n)) => Some(Value::BigInt(i64::from(*n))),
+                    (K::Int8, Value::BigInt(n)) => Some(Value::BigInt(*n)),
+                    (K::Num, Value::Numeric { scaled, scale }) => Some(Value::Numeric {
+                        scaled: *scaled,
+                        scale: *scale,
+                    }),
+                    (K::Num, Value::Int(n)) => Some(Value::Numeric {
+                        scaled: i128::from(*n),
+                        scale: 0,
+                    }),
+                    (K::Num, Value::SmallInt(n)) => Some(Value::Numeric {
+                        scaled: i128::from(*n),
+                        scale: 0,
+                    }),
+                    (K::Num, Value::BigInt(n)) => Some(Value::Numeric {
+                        scaled: i128::from(*n),
+                        scale: 0,
+                    }),
+                    // Float literals (numrange(1.1, 2.2)) route
+                    // through the range-element text parse so the
+                    // Numeric scale matches the lexeme.
+                    (K::Num, Value::Float(f)) => Some(
+                        crate::conversions::parse_range_element(
+                            &alloc::format!("{f}"),
+                            kind,
+                        )
+                        .ok_or_else(|| EvalError::TypeMismatch {
+                            detail: format!("{name}(): cannot parse bound {f}"),
+                        })?,
+                    ),
+                    (K::Date, Value::Date(d)) => Some(Value::Date(*d)),
+                    (K::Ts | K::TsTz, Value::Timestamp(t)) => Some(Value::Timestamp(*t)),
+                    (K::Ts | K::TsTz, Value::Date(d)) => {
+                        Some(Value::Timestamp(i64::from(*d) * 86_400_000_000))
+                    }
+                    // Text bounds reuse the range-element parser.
+                    (_, Value::Text(s)) => {
+                        Some(crate::conversions::parse_range_element(s, kind).ok_or_else(
+                            || EvalError::TypeMismatch {
+                                detail: format!("{name}(): cannot parse bound {s:?}"),
+                            },
+                        )?)
+                    }
+                    (_, other) => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "{name}(): bound type {:?} doesn't match the range",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                })
+            };
+            let lower = coerce(&args[0])?;
+            let upper = coerce(&args[1])?;
+            // PG: equal bounds that don't include both ends collapse
+            // to 'empty'.
+            let empty = match (&lower, &upper) {
+                (Some(l), Some(u)) => l == u && !(lower_inc && upper_inc),
+                _ => false,
+            };
+            if empty {
+                return Ok(Value::Range {
+                    kind,
+                    lower: None,
+                    upper: None,
+                    lower_inc: false,
+                    upper_inc: false,
+                    empty: true,
+                });
+            }
+            Ok(Value::Range {
+                kind,
+                lower: lower.map(alloc::boxed::Box::new),
+                upper: upper.map(alloc::boxed::Box::new),
+                lower_inc,
+                upper_inc,
+                empty: false,
+            })
+        }
         // v7.37.17 (17.6 siblings) — generate_subscripts(arr, dim
         // [, reverse]) scalar surface: returns the valid subscripts
         // of the array's dim'th dimension as an IntArray (the parser
@@ -12236,6 +12371,26 @@ fn apply_function_dispatch(
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Text(s) => s.trim(),
+                // Real Range values (from the constructor functions)
+                // answer directly off the bounds.
+                Value::Range {
+                    lower,
+                    upper,
+                    lower_inc,
+                    upper_inc,
+                    empty,
+                    ..
+                } => {
+                    let result = match name {
+                        "isempty" => *empty,
+                        "lower_inc" => !empty && *lower_inc && lower.is_some(),
+                        "upper_inc" => !empty && *upper_inc && upper.is_some(),
+                        "lower_inf" => !empty && lower.is_none(),
+                        "upper_inf" => !empty && upper.is_none(),
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Bool(result));
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
