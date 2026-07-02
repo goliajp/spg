@@ -2461,7 +2461,14 @@ impl Engine {
             .alias
             .clone()
             .unwrap_or_else(|| primary.name.clone());
-        let schema_cols: alloc::vec::Vec<ColumnSchema> = inner_cols;
+        // `AS t(a, b)` renames the materialised columns positionally
+        // (extra inner columns keep their own names, PG behaviour).
+        let mut schema_cols: alloc::vec::Vec<ColumnSchema> = inner_cols;
+        for (i, new_name) in primary.unnest_column_aliases.iter().enumerate() {
+            if let Some(col) = schema_cols.get_mut(i) {
+                col.name = new_name.clone();
+            }
+        }
         let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
         // WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
