@@ -2032,58 +2032,7 @@ impl Engine {
             .generate_series_args
             .as_ref()
             .expect("caller guards generate_series_args.is_some()");
-        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-        let ctx = EvalContext::new(&empty_schema, None);
-        let dummy_row = Row::new(alloc::vec::Vec::new());
-        let mut arg_values: alloc::vec::Vec<Value<'static>> =
-            alloc::vec::Vec::with_capacity(args.len());
-        for a in args {
-            arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
-        }
-        // Dispatch on the start value's shape. Reject mixed-shape
-        // calls early (e.g. start = timestamp, stop = integer) so
-        // the caller gets a clean error rather than a panic.
-        let (elem_dtype, rows) = match arg_values.as_slice() {
-            [Value::Timestamp(start), Value::Timestamp(stop), step] => {
-                let interval_step = match step {
-                    Value::Interval { .. } => step.clone(),
-                    other => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "generate_series(timestamp, timestamp, …): \
-                             step must be INTERVAL, got {:?}",
-                            other.data_type()
-                        )));
-                    }
-                };
-                let rows = generate_series_timestamps(*start, *stop, interval_step, &cancel)?;
-                (DataType::Timestamp, rows)
-            }
-            [start, stop, step]
-                if value_is_integer(start) && value_is_integer(stop) && value_is_integer(step) =>
-            {
-                let s = value_to_i64(start);
-                let e = value_to_i64(stop);
-                let st = value_to_i64(step);
-                let rows = generate_series_integers(s, e, st, &cancel)?;
-                (DataType::BigInt, rows)
-            }
-            [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
-                let s = value_to_i64(start);
-                let e = value_to_i64(stop);
-                let rows = generate_series_integers(s, e, 1, &cancel)?;
-                (DataType::BigInt, rows)
-            }
-            _ => {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
-                     argument shapes; got {:?}",
-                    arg_values
-                        .iter()
-                        .map(|v| v.data_type())
-                        .collect::<alloc::vec::Vec<_>>()
-                )));
-            }
-        };
+        let (elem_dtype, rows) = generate_series_rows(args, &cancel)?;
         let alias = primary
             .alias
             .clone()
@@ -4291,6 +4240,66 @@ fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
         out.extend_from_slice(s.as_bytes());
     }
     out
+}
+
+/// Evaluate generate_series arguments (uncorrelated — outer refs
+/// were substituted upstream where applicable) and build the row
+/// stream. Dispatches on the start value's shape and rejects
+/// mixed-shape calls early (e.g. start = timestamp, stop =
+/// integer) so the caller gets a clean error rather than a panic.
+/// Shared by the primary-position executor and the join-position
+/// materialiser.
+pub(crate) fn generate_series_rows(
+    args: &[Expr],
+    cancel: &CancelToken<'_>,
+) -> Result<(DataType, alloc::vec::Vec<Row<'static>>), EngineError> {
+    let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    let ctx = EvalContext::new(&empty_schema, None);
+    let dummy_row = Row::new(alloc::vec::Vec::new());
+    let mut arg_values: alloc::vec::Vec<Value<'static>> =
+        alloc::vec::Vec::with_capacity(args.len());
+    for a in args {
+        arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
+    }
+    match arg_values.as_slice() {
+        [Value::Timestamp(start), Value::Timestamp(stop), step] => {
+            let interval_step = match step {
+                Value::Interval { .. } => step.clone(),
+                other => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "generate_series(timestamp, timestamp, …): \
+                         step must be INTERVAL, got {:?}",
+                        other.data_type()
+                    )));
+                }
+            };
+            let rows = generate_series_timestamps(*start, *stop, interval_step, cancel)?;
+            Ok((DataType::Timestamp, rows))
+        }
+        [start, stop, step]
+            if value_is_integer(start) && value_is_integer(stop) && value_is_integer(step) =>
+        {
+            let s = value_to_i64(start);
+            let e = value_to_i64(stop);
+            let st = value_to_i64(step);
+            let rows = generate_series_integers(s, e, st, cancel)?;
+            Ok((DataType::BigInt, rows))
+        }
+        [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
+            let s = value_to_i64(start);
+            let e = value_to_i64(stop);
+            let rows = generate_series_integers(s, e, 1, cancel)?;
+            Ok((DataType::BigInt, rows))
+        }
+        _ => Err(EngineError::Unsupported(alloc::format!(
+            "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
+             argument shapes; got {:?}",
+            arg_values
+                .iter()
+                .map(|v| v.data_type())
+                .collect::<alloc::vec::Vec<_>>()
+        ))),
+    }
 }
 
 /// v7.17.0 Phase 3.10 — integer-mode generate_series materialiser.

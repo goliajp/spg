@@ -108,6 +108,38 @@ impl Engine {
             };
             return Ok((rows, cols));
         }
+        // generate_series in a FROM list next to other tables —
+        // same row builder as the primary-position executor;
+        // ordinality/alias handling mirrors the unnest arm above.
+        if let Some(args) = tref.generate_series_args.as_ref() {
+            let (elem_dtype, rows) =
+                crate::select::generate_series_rows(args, &crate::CancelToken::none())?;
+            let alias = tref
+                .alias
+                .clone()
+                .unwrap_or_else(|| alloc::string::String::from("generate_series"));
+            let col_name = tref.unnest_column_aliases.first().cloned().unwrap_or(alias);
+            let mut cols = alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)];
+            let rows = if tref.with_ordinality {
+                let ord_name = tref
+                    .unnest_column_aliases
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| alloc::string::String::from("ordinality"));
+                cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let mut vals = row.values.to_vec();
+                        vals.push(Value::BigInt(i as i64 + 1));
+                        Row::new(vals)
+                    })
+                    .collect()
+            } else {
+                rows
+            };
+            return Ok((rows, cols));
+        }
         // v7.37.17 (17.6 siblings) — derived table (`FROM ( SELECT …
         // ) alias`) joined with other tables: materialise the inner
         // SELECT once through the union-aware executor. Correlated
@@ -163,6 +195,7 @@ impl Engine {
     ) -> Result<(Vec<Row<'static>>, Vec<ColumnSchema>), EngineError> {
         if preds.is_empty()
             || tref.unnest_expr.is_some()
+            || tref.generate_series_args.is_some()
             || tref.lateral_subquery.is_some()
             || tref.as_of_segment.is_some()
         {
