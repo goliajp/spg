@@ -64,13 +64,23 @@ fn pgstattuple_probes_return_null() {
 }
 
 #[test]
-fn prewarm_and_relpages_return_zero() {
+fn prewarm_zero_and_relpages_real() {
     let mut e = Engine::new();
-    for f in &["pg_prewarm('t')", "pg_relpages('t')"] {
-        let sql = format!("SELECT {f}");
-        match first(&mut e, &sql) {
-            spg_storage::Value::BigInt(0) => {}
-            other => panic!("SELECT {f}: got {other:?}"),
-        }
+    match first(&mut e, "SELECT pg_prewarm('t')") {
+        spg_storage::Value::BigInt(0) => {}
+        other => panic!("pg_prewarm: got {other:?}"),
+    }
+    // pg_relpages is real now (hot_bytes / 8192, same meter as
+    // pg_class.relpages): missing table → NULL, small table → ≥1
+    // page once rows land.
+    assert!(matches!(
+        first(&mut e, "SELECT pg_relpages('t')"),
+        spg_storage::Value::Null
+    ));
+    e.execute("CREATE TABLE rp (v TEXT)").unwrap();
+    e.execute("INSERT INTO rp VALUES (repeat('z', 200))").unwrap();
+    match first(&mut e, "SELECT pg_relpages('rp')") {
+        spg_storage::Value::BigInt(n) => assert!(n >= 1, "pages: {n}"),
+        other => panic!("pg_relpages('rp'): got {other:?}"),
     }
 }

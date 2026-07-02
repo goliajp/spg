@@ -1462,6 +1462,10 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         );
         let relnatts = i16::try_from(schema_ref.columns.len()).unwrap_or(i16::MAX);
         let reltuples = t.rows().len() as f64;
+        // relpages in PG-page units (8 KiB) off the maintained
+        // hot-tier byte meter — capacity queries multiply
+        // relpages × 8192 to estimate table size.
+        let relpages = i32::try_from(t.hot_bytes().div_ceil(8192)).unwrap_or(i32::MAX);
         let has_index = !t.indices().is_empty();
         let has_triggers = cat
             .triggers()
@@ -1478,7 +1482,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(0),    // relam (table AM; 0 == default heap)
             Value::BigInt(oid),  // relfilenode shares oid in SPG (no separate fork)
             Value::BigInt(0),    // reltablespace (0 == default)
-            Value::Int(0),       // relpages (no shared-buffer accounting)
+            Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
             Value::Int(0),       // relallvisible — visibility map lands in 15.17
             Value::BigInt(0),    // reltoastrelid (SPG no TOAST)
