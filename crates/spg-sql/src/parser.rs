@@ -6584,10 +6584,50 @@ impl Parser {
                 Ok(h)
             });
             self.nest_depth -= 1;
-            let head = match &mut head {
+            let mut head = match &mut head {
                 Ok(h) => core::mem::take(h),
                 Err(_) => return head,
             };
+            // v7.37.17 (17.6 siblings) — group-internal tail:
+            // `(A UNION B ORDER BY 1 LIMIT 5)`. Parse it into the
+            // group head, then wrap the group as a derived table
+            // (SELECT * FROM (group)) so the outer chain / outer
+            // tail can't clobber the group's own ordering or limit.
+            let has_tail = matches!(
+                self.peek(),
+                Token::Order | Token::Limit | Token::Offset
+            ) || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("fetch"));
+            if has_tail {
+                self.parse_select_tail_into(&mut head)?;
+                head = SelectStatement {
+                    ctes: Vec::new(),
+                    distinct: false,
+                    items: alloc::vec![SelectItem::Wildcard],
+                    from: Some(FromClause {
+                        primary: TableRef {
+                            name: "subquery".to_string(),
+                            alias: None,
+                            as_of_segment: None,
+                            unnest_expr: None,
+                            unnest_column_aliases: Vec::new(),
+                            generate_series_args: None,
+                            lateral_subquery: Some(Box::new(head)),
+                            jsonb_each_text_arg: None,
+                        },
+                        joins: Vec::new(),
+                    }),
+                    where_: None,
+                    group_by: None,
+                    group_by_all: false,
+                    having: None,
+                    unions: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    limit_with_ties: false,
+                };
+            }
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(format!(
                     "expected ')' after parenthesized query group, got {:?}",
