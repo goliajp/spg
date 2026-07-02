@@ -1417,6 +1417,43 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        let result = self.exec_select_cancel_inner(stmt, cancel)?;
+        // v7.37.17 (17.6 siblings) — `SELECT DISTINCT ON (exprs)`:
+        // rows arrive here already ORDER BY'd; keep the FIRST row of
+        // each group the expressions define (PG semantics). The
+        // expressions evaluate against the projected schema — an
+        // expression that isn't in the select list errors honestly.
+        if stmt.distinct_on.is_empty() {
+            return Ok(result);
+        }
+        let QueryResult::Rows { columns, rows } = result else {
+            return Ok(result);
+        };
+        let ctx = self.ev_ctx(&columns, None);
+        let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
+        let mut kept: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+        for row in rows {
+            let key: alloc::vec::Vec<Value<'static>> = stmt
+                .distinct_on
+                .iter()
+                .map(|e| eval::eval_expr(e, &row, &ctx).map_err(EngineError::Eval))
+                .collect::<Result<_, _>>()?;
+            if !seen.iter().any(|k| k == &key) {
+                seen.push(key);
+                kept.push(row);
+            }
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: kept,
+        })
+    }
+
+    fn exec_select_cancel_inner(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
         // v7.38 P0 元机制 A — first observable point inside the
         // planner / executor. Tests use this to inject a delay or

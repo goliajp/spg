@@ -2132,6 +2132,10 @@ pub struct SelectStatement {
     /// only — no `WITH RECURSIVE` for v4.x.
     pub ctes: Vec<Cte>,
     pub distinct: bool,
+    /// v7.37.17 (17.6 siblings) — `SELECT DISTINCT ON (exprs)`:
+    /// keep the first row (per ORDER BY) of each group the
+    /// expressions define. Empty = no DISTINCT ON.
+    pub distinct_on: Vec<Expr>,
     pub items: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub where_: Option<Expr>,
@@ -5257,6 +5261,7 @@ mod tests {
             offset: None,
             limit_with_ties: false,
             distinct: false,
+            distinct_on: Vec::new(),
             ctes: vec![],
         };
         assert_eq!(s.to_string(), "SELECT * FROM users");

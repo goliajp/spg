@@ -775,6 +775,7 @@ impl Engine {
         let probe = SelectStatement {
             ctes: Vec::new(),
             distinct: false,
+            distinct_on: Vec::new(),
             items: alloc::vec![SelectItem::Expr {
                 expr: Expr::Column(pk_col_name),
                 alias: None,
