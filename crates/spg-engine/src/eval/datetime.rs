@@ -482,3 +482,263 @@ pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     };
     Ok(Value::Timestamp(truncated))
 }
+
+/// v7.37.17 (17.6 siblings) — MySQL STR_TO_DATE(str, format): the
+/// inverse of DATE_FORMAT. Unparseable input returns NULL (MySQL
+/// raises a warning, not an error). A format with no time
+/// specifiers produces a DATE; any time specifier produces a
+/// TIMESTAMP.
+pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("str_to_date() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Value::Text(input), Value::Text(fmt)) = (&args[0], &args[1]) else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "str_to_date() takes (text, text), got ({:?}, {:?})",
+                args[0].data_type(),
+                args[1].data_type()
+            ),
+        });
+    };
+    const MONTH_FULL_UP: [&str; 12] = [
+        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+    ];
+    let inp: alloc::vec::Vec<char> = input.chars().collect();
+    let f: alloc::vec::Vec<char> = fmt.chars().collect();
+    let mut year: i32 = 1970;
+    let mut month: u32 = 1;
+    let mut day: u32 = 1;
+    let mut hour: u32 = 0;
+    let mut minute: u32 = 0;
+    let mut second: u32 = 0;
+    let mut micros: u32 = 0;
+    let mut pm: Option<bool> = None;
+    let mut has_time = false;
+    let mut ip = 0usize;
+    let mut fp = 0usize;
+    // Reads 1..=max ASCII digits.
+    let read_num = |ip: &mut usize, max: usize, inp: &[char]| -> Option<u32> {
+        let start = *ip;
+        while *ip < inp.len() && *ip - start < max && inp[*ip].is_ascii_digit() {
+            *ip += 1;
+        }
+        if *ip == start {
+            return None;
+        }
+        inp[start..*ip]
+            .iter()
+            .collect::<alloc::string::String>()
+            .parse()
+            .ok()
+    };
+    while fp < f.len() {
+        if f[fp] != '%' {
+            // Literal — whitespace in the format matches any run of
+            // whitespace; other chars must match exactly.
+            if f[fp].is_whitespace() {
+                while ip < inp.len() && inp[ip].is_whitespace() {
+                    ip += 1;
+                }
+                fp += 1;
+                continue;
+            }
+            if ip < inp.len() && inp[ip] == f[fp] {
+                ip += 1;
+                fp += 1;
+                continue;
+            }
+            return Ok(Value::Null);
+        }
+        if fp + 1 >= f.len() {
+            return Ok(Value::Null);
+        }
+        let spec = f[fp + 1];
+        fp += 2;
+        match spec {
+            'Y' => match read_num(&mut ip, 4, &inp) {
+                Some(v) => year = v as i32,
+                None => return Ok(Value::Null),
+            },
+            'y' => match read_num(&mut ip, 2, &inp) {
+                // MySQL 2-digit year: 70..=99 → 19xx, else 20xx.
+                Some(v) => year = if v >= 70 { 1900 + v as i32 } else { 2000 + v as i32 },
+                None => return Ok(Value::Null),
+            },
+            'm' | 'c' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 1..=12) => month = v,
+                _ => return Ok(Value::Null),
+            },
+            'd' | 'e' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 1..=31) => day = v,
+                _ => return Ok(Value::Null),
+            },
+            'H' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 0..=23) => {
+                    hour = v;
+                    has_time = true;
+                }
+                _ => return Ok(Value::Null),
+            },
+            'h' | 'I' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 1..=12) => {
+                    hour = v;
+                    has_time = true;
+                }
+                _ => return Ok(Value::Null),
+            },
+            'i' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 0..=59) => {
+                    minute = v;
+                    has_time = true;
+                }
+                _ => return Ok(Value::Null),
+            },
+            's' | 'S' => match read_num(&mut ip, 2, &inp) {
+                Some(v @ 0..=59) => {
+                    second = v;
+                    has_time = true;
+                }
+                _ => return Ok(Value::Null),
+            },
+            'f' => {
+                let start = ip;
+                match read_num(&mut ip, 6, &inp) {
+                    Some(v) => {
+                        // Right-pad to microseconds.
+                        let ndigits = ip - start;
+                        let mut scaled = v;
+                        for _ in ndigits..6 {
+                            scaled *= 10;
+                        }
+                        micros = scaled;
+                        has_time = true;
+                    }
+                    None => return Ok(Value::Null),
+                }
+            }
+            'p' => {
+                if ip + 2 <= inp.len() {
+                    let tag: alloc::string::String =
+                        inp[ip..ip + 2].iter().collect::<alloc::string::String>().to_ascii_uppercase();
+                    match tag.as_str() {
+                        "AM" => pm = Some(false),
+                        "PM" => pm = Some(true),
+                        _ => return Ok(Value::Null),
+                    }
+                    ip += 2;
+                    has_time = true;
+                } else {
+                    return Ok(Value::Null);
+                }
+            }
+            'M' | 'b' => {
+                // Month name (full or abbreviated) — match the
+                // longest month prefix.
+                let rest: alloc::string::String = inp[ip..].iter().collect::<alloc::string::String>().to_ascii_uppercase();
+                let mut matched = None;
+                for (idx, name) in MONTH_FULL_UP.iter().enumerate() {
+                    if rest.starts_with(name) {
+                        matched = Some((idx as u32 + 1, name.len()));
+                        break;
+                    }
+                    if rest.starts_with(&name[..3]) {
+                        matched = Some((idx as u32 + 1, 3));
+                        // Keep looking for a full-name match (June
+                        // vs Jun) — full names win.
+                    }
+                }
+                match matched {
+                    Some((m, len)) => {
+                        month = m;
+                        ip += len;
+                    }
+                    None => return Ok(Value::Null),
+                }
+            }
+            '%' => {
+                if ip < inp.len() && inp[ip] == '%' {
+                    ip += 1;
+                } else {
+                    return Ok(Value::Null);
+                }
+            }
+            _ => return Ok(Value::Null),
+        }
+    }
+    if let Some(is_pm) = pm {
+        hour = match (hour % 12, is_pm) {
+            (h, true) => h + 12,
+            (h, false) => h,
+        };
+    }
+    let days = days_from_civil(year, month, day);
+    if has_time {
+        let micros_total = i64::from(days) * 86_400_000_000
+            + i64::from(hour) * 3_600_000_000
+            + i64::from(minute) * 60_000_000
+            + i64::from(second) * 1_000_000
+            + i64::from(micros);
+        Ok(Value::Timestamp(micros_total))
+    } else {
+        Ok(Value::Date(days))
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL TIME_FORMAT(time, format): the
+/// time-of-day slice of DATE_FORMAT. Accepts a TIMESTAMP (its
+/// time-of-day) or an 'HH:MM[:SS[.ffffff]]' text value.
+pub(super) fn time_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("time_format() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    // Normalise to a timestamp on day 0, then reuse date_format.
+    let day_micros: i64 = match &args[0] {
+        Value::Timestamp(t) => t.rem_euclid(86_400_000_000),
+        Value::Text(s) => {
+            let mut parts = s.trim().splitn(3, ':');
+            let h: i64 = parts
+                .next()
+                .and_then(|x| x.parse().ok())
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: format!("time_format(): cannot parse time {s:?}"),
+                })?;
+            let m: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let (sec, us) = match parts.next() {
+                None => (0_i64, 0_i64),
+                Some(rest) => match rest.split_once('.') {
+                    None => (rest.parse().unwrap_or(0), 0),
+                    Some((s_int, s_frac)) => {
+                        let mut frac = String::from(s_frac);
+                        while frac.len() < 6 {
+                            frac.push('0');
+                        }
+                        frac.truncate(6);
+                        (s_int.parse().unwrap_or(0), frac.parse().unwrap_or(0))
+                    }
+                },
+            };
+            h * 3_600_000_000 + m * 60_000_000 + sec * 1_000_000 + us
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "time_format() needs TIME text or TIMESTAMP, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    date_format_mysql(&[Value::Timestamp(day_micros), args[1].clone().into_owned()])
+}

@@ -112,6 +112,7 @@ mod e2e_mysql_json_mutate;
 mod e2e_mysql_json_array;
 mod e2e_mysql_json_merge;
 mod e2e_mysql_json_search;
+mod e2e_str_to_date;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
