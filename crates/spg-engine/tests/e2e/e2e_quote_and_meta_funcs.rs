@@ -52,7 +52,10 @@ fn quote_nullable_returns_null_text_for_null() {
 }
 
 #[test]
-fn to_regclass_returns_null_for_now() {
+fn to_regclass_missing_relation_is_null() {
+    // Upgraded from stub: to_regclass/to_regtype are real
+    // resolvers now (see e2e_to_regclass.rs); a missing relation
+    // still resolves to NULL, and 'int' resolves to oid 23.
     let mut e = Engine::new();
     assert!(matches!(
         first(&mut e, "SELECT to_regclass('some_table')"),
@@ -60,7 +63,7 @@ fn to_regclass_returns_null_for_now() {
     ));
     assert!(matches!(
         first(&mut e, "SELECT to_regtype('int')"),
-        spg_storage::Value::Null
+        spg_storage::Value::BigInt(23)
     ));
 }
 
