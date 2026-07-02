@@ -7848,6 +7848,58 @@ fn apply_function_dispatch(
             Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
         "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        // Catalog function forms of the -> / ->> operators —
+        // json_object_field(doc, key), json_array_element(doc, i)
+        // + _text variants + jsonb_ twins. Some ORMs/drivers call
+        // these by name instead of emitting the operator. Delegates
+        // to the operators' path_walk with a single-step path.
+        "json_object_field"
+        | "jsonb_object_field"
+        | "json_object_field_text"
+        | "jsonb_object_field_text"
+        | "json_array_element"
+        | "jsonb_array_element"
+        | "json_array_element_text"
+        | "jsonb_array_element_text" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let as_text = name.ends_with("_text");
+            let step = if name.contains("array_element") {
+                match &args[1] {
+                    Value::Int(n) => n.to_string(),
+                    Value::BigInt(n) => n.to_string(),
+                    Value::SmallInt(n) => n.to_string(),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}() index must be integer, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            } else {
+                match &args[1] {
+                    Value::Text(s) => s.as_ref().to_string(),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}() key must be text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            };
+            let path = alloc::format!("{{{step}}}");
+            crate::json::path_walk(&args[0], &Value::text(path), as_text)
+        }
         // v7.37.17 (17.6 siblings) — json_extract_path(json,
         // VARIADIC path...) + _text variants. Function form of the
         // #> / #>> operators. Delegates to the same path_walk used
