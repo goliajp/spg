@@ -981,3 +981,55 @@ pub(super) fn fts_ts_rewrite(
     }
     Ok(Value::TsQuery(rewrite(&query, &target, &substitute)))
 }
+
+/// v7.37.17 (17.6 siblings) — the tsquery boolean catalog
+/// functions: tsquery_and / tsquery_or (2-arg) and tsquery_not
+/// (1-arg) are the function forms of the && / || / !! operators.
+/// Unknown string literals resolve through the tsquery input
+/// parser, as everywhere else in the FTS surface.
+pub(super) fn fts_tsquery_bool(
+    args: &[Value<'_>],
+    ctx: &EvalContext<'_>,
+    op: &str,
+) -> Result<Value<'static>, EvalError> {
+    let arity = if op == "not" { 1 } else { 2 };
+    if args.len() != arity {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("tsquery_{op}() takes {arity} arg(s), got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let config = match ctx.default_text_search_config {
+        Some(name_str) => {
+            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::Simple)
+        }
+        None => crate::fts::TsConfig::Simple,
+    };
+    let as_query = |v: &Value<'_>| -> Result<spg_storage::TsQueryAst, EvalError> {
+        match v {
+            Value::TsQuery(q) => Ok(q.clone()),
+            Value::Text(s) => crate::fts::to_tsquery(config, s),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "tsquery_{op}() arguments must be tsquery, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        }
+    };
+    use spg_storage::TsQueryAst as A;
+    let out = match op {
+        "and" => A::And(
+            Box::new(as_query(&args[0])?),
+            Box::new(as_query(&args[1])?),
+        ),
+        "or" => A::Or(
+            Box::new(as_query(&args[0])?),
+            Box::new(as_query(&args[1])?),
+        ),
+        _ => A::Not(Box::new(as_query(&args[0])?)),
+    };
+    Ok(Value::TsQuery(out))
+}

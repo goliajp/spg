@@ -9500,6 +9500,11 @@ fn apply_function_dispatch(
         // v7.37.17 (17.6 siblings) — ts_rewrite(query, target,
         // substitute): synonym-expansion subtree rewrite.
         "ts_rewrite" => fts_ts_rewrite(args, ctx),
+        // v7.37.17 (17.6 siblings) — the boolean catalog forms of
+        // the && / || / !! tsquery operators.
+        "tsquery_and" => fts_tsquery_bool(args, ctx, "and"),
+        "tsquery_or" => fts_tsquery_bool(args, ctx, "or"),
+        "tsquery_not" => fts_tsquery_bool(args, ctx, "not"),
         // v7.24 (round-15) — string_to_array(text, delim): inverse
         // of array_to_string. PG semantics: NULL text → NULL,
         // '' → empty array, NULL delim → one element per char.
