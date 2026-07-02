@@ -1348,6 +1348,62 @@ fn apply_function_dispatch(
         | "pg_read_file"
         | "pg_read_binary_file"
         | "pg_stat_file" => Ok(Value::Null),
+        // pg_tablespace_location(oid) — the filesystem path of a
+        // tablespace. PG returns '' for the built-in pg_default /
+        // pg_global; SPG parse-accepts tablespaces without location
+        // semantics, so '' is the honest PG-shaped answer for all.
+        "pg_tablespace_location" => match args.first() {
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Ok(Value::text::<String>("".into())),
+        },
+        // pg_tablespace_databases(oid) — SRF of database oids in a
+        // tablespace; pg_filenode_relation — filenode → regclass.
+        // NULL for the scalar surface.
+        "pg_tablespace_databases" | "pg_filenode_relation" => Ok(Value::Null),
+        // pageinspect extension surface — raw page readers used in
+        // corruption forensics. SPG's storage is not page-organized
+        // the way PG's heap is; NULL keeps forensic runbooks
+        // parse-through (SPG's own equivalent is pg_amcheck's
+        // verify_heapam / bt_index_check which ARE real here).
+        "get_raw_page"
+        | "page_header"
+        | "page_checksum"
+        | "fsm_page_contents"
+        | "heap_page_items"
+        | "heap_page_item_attrs"
+        | "heap_tuple_infomask_flags"
+        | "bt_metap"
+        | "bt_page_stats"
+        | "bt_page_items"
+        | "bt_multi_page_stats"
+        | "brin_page_type"
+        | "brin_metapage_info"
+        | "brin_revmap_data"
+        | "brin_page_items"
+        | "gin_metapage_info"
+        | "gin_page_opaque_info"
+        | "gin_leafpage_items"
+        | "gist_page_opaque_info"
+        | "gist_page_items"
+        | "gist_page_items_bytea"
+        | "hash_page_type"
+        | "hash_page_stats"
+        | "hash_page_items"
+        | "hash_bitmap_info"
+        | "hash_metapage_info" => Ok(Value::Null),
+        // pgstattuple / pg_prewarm / pg_buffercache extension
+        // probes. pgstattuple's record surface → NULL; pg_relpages
+        // and pg_prewarm return counts → 0 (SPG has no PG-shaped
+        // page cache to report or warm).
+        "pgstattuple"
+        | "pgstattuple_approx"
+        | "pgstatindex"
+        | "pgstatginindex"
+        | "pgstathashindex"
+        | "pg_buffercache_summary"
+        | "pg_buffercache_usage_counts"
+        | "pg_buffercache_evict" => Ok(Value::Null),
+        "pg_relpages" | "pg_prewarm" => Ok(Value::BigInt(0)),
         // v7.37.17 (17.6 siblings) — factorial(smallint | int | bigint)
         // returns n! as BIGINT. Overflows at n=20 for i64 — errors
         // beyond that. Negative n = error (matches PG).
