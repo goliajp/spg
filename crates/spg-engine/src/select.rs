@@ -2088,9 +2088,36 @@ impl Engine {
             .alias
             .clone()
             .unwrap_or_else(|| "generate_series".to_string());
-        let col_name = alias.clone();
+        // `AS t(n)` — the first column-alias entry renames the
+        // series column (PG semantics); bare alias keeps the
+        // pre-existing behaviour of naming the column after it.
+        let col_name = primary
+            .unnest_column_aliases
+            .first()
+            .cloned()
+            .unwrap_or_else(|| alias.clone());
         let col_schema = ColumnSchema::new(col_name, elem_dtype, true);
-        let schema_cols = alloc::vec![col_schema.clone()];
+        let mut schema_cols = alloc::vec![col_schema.clone()];
+        // WITH ORDINALITY — trailing BIGINT counting rows from 1;
+        // the second column-alias entry renames it.
+        let rows = if primary.with_ordinality {
+            let ord_name = primary
+                .unnest_column_aliases
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "ordinality".to_string());
+            schema_cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let mut vals = row.values.to_vec();
+                    vals.push(Value::BigInt(i as i64 + 1));
+                    Row::new(vals)
+                })
+                .collect()
+        } else {
+            rows
+        };
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
         // WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
