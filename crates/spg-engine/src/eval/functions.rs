@@ -1469,7 +1469,29 @@ fn apply_function_dispatch(
         | "pg_buffercache_summary"
         | "pg_buffercache_usage_counts"
         | "pg_buffercache_evict" => Ok(Value::Null),
-        "pg_relpages" | "pg_prewarm" => Ok(Value::BigInt(0)),
+        "pg_prewarm" => Ok(Value::BigInt(0)),
+        // pg_relpages — same 8 KiB-page meter pg_class.relpages
+        // reports (hot_bytes / 8192).
+        "pg_relpages" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(_) => return Ok(Value::BigInt(0)),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::BigInt(0));
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            match cat.get(bare) {
+                Some(t) => {
+                    Ok(Value::BigInt(t.hot_bytes().div_ceil(8192) as i64))
+                }
+                None => Ok(Value::Null),
+            }
+        }
         // v7.37.17 (17.6 siblings) — factorial(smallint | int | bigint)
         // returns n! as BIGINT. Overflows at n=20 for i64 — errors
         // beyond that. Negative n = error (matches PG).
