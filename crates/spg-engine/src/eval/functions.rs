@@ -6547,6 +6547,19 @@ fn apply_function_dispatch(
         // v7.12.2 — ranking functions. mailrs's fallback search
         // query ORDERs BY ts_rank(search_vector, q) DESC.
         "ts_rank" => fts_ts_rank(args),
+        // v7.37.17 (17.6 siblings) — index-maintenance probes.
+        // GIN / BRIN maintenance functions emitted by autovacuum
+        // scripts + cron cleanups. Return 0 (count of pages/rows
+        // processed) so scripts complete cleanly.
+        "gin_clean_pending_list"
+        | "brin_summarize_new_values" => Ok(Value::BigInt(0)),
+        // brin_summarize_range / brin_desummarize_range are void.
+        "brin_summarize_range" | "brin_desummarize_range" => Ok(Value::Null),
+        // amvalidate(oid) — validates an access-method operator
+        // class. Always true for SPG's builtin BTree.
+        "amvalidate" => Ok(Value::Bool(true)),
+        // gin/gist support probes.
+        "gin_cmp_tslexeme" | "gin_compare_jsonb" => Ok(Value::Int(0)),
         // v7.37.17 (17.6 siblings) — FTS introspection helpers.
         // strip(tsvector) removes position/weight info; SPG's
         // tsvector text form is 'word:pos' pairs — strip drops
