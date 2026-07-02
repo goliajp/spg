@@ -763,6 +763,7 @@ impl Engine {
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
+            with_ordinality: false,
             generate_series_args: None,
             lateral_subquery: None,
             jsonb_each_text_arg: None,
