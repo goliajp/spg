@@ -1471,11 +1471,55 @@ impl Engine {
     > {
         let mut pending_updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let mut skipped_count = 0usize;
-        let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
-            self.active_catalog(),
-            table_name,
-            clause.target_columns.as_slice(),
-        )?;
+        // v7.37.17 (17.6 siblings) — `ON CONFLICT ON CONSTRAINT
+        // <name>` resolves the name to the constraint's columns via
+        // the same synthetic naming convention pg_constraint
+        // synthesises ({t}_pkey for the primary key, {t}_uniq{i}
+        // for the i-th non-PK unique).
+        let named_columns: Vec<String> = if let Some(cname) = &clause.constraint_name {
+            let table = self.active_catalog().get(table_name).ok_or_else(|| {
+                spg_storage::StorageError::TableNotFound {
+                    name: alloc::string::String::from(table_name),
+                }
+            })?;
+            let schema = table.schema();
+            let mut uniq_idx = 0usize;
+            let mut found: Option<Vec<String>> = None;
+            for uc in &schema.uniqueness_constraints {
+                let synth = if uc.is_primary_key {
+                    alloc::format!("{table_name}_pkey")
+                } else {
+                    uniq_idx += 1;
+                    alloc::format!("{table_name}_uniq{}", uniq_idx - 1)
+                };
+                if synth.eq_ignore_ascii_case(cname) {
+                    found = Some(
+                        uc.columns
+                            .iter()
+                            .filter_map(|&pos| {
+                                schema.columns.get(pos).map(|c| c.name.clone())
+                            })
+                            .collect(),
+                    );
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ON CONFLICT ON CONSTRAINT: no unique or primary key \
+                     constraint named {cname:?} on table {table_name:?}"
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+        let target_cols: &[String] = if named_columns.is_empty() {
+            clause.target_columns.as_slice()
+        } else {
+            named_columns.as_slice()
+        };
+        let (conflict_cols, conflict_nnd) =
+            resolve_on_conflict_columns(self.active_catalog(), table_name, target_cols)?;
         let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
         let mut seen_keys: Vec<Vec<Value<'static>>> = Vec::new();
         for values in all_values {

@@ -2105,6 +2105,10 @@ pub struct OnConflictClause {
     /// target — engine picks the table's first BTree index by
     /// convention.
     pub target_columns: Vec<String>,
+    /// v7.37.17 (17.6 siblings) — `ON CONFLICT ON CONSTRAINT
+    /// <name>`: the pg_dump conflict-target form. The engine
+    /// resolves the name to the constraint's columns.
+    pub constraint_name: Option<String>,
     /// The action on conflict.
     pub action: OnConflictAction,
 }
@@ -4397,6 +4401,9 @@ impl fmt::Display for InsertStatement {
 impl fmt::Display for OnConflictClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ON CONFLICT")?;
+        if let Some(name) = &self.constraint_name {
+            write!(f, " ON CONSTRAINT {name}")?;
+        }
         if !self.target_columns.is_empty() {
             f.write_str(" (")?;
             for (i, c) in self.target_columns.iter().enumerate() {
