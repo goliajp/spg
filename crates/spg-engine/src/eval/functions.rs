@@ -3661,6 +3661,65 @@ fn apply_function_dispatch(
                 empty: false,
             })
         }
+        // v7.37.17 (17.6 siblings) — multirange constructor
+        // functions: variadic over ranges of the matching kind.
+        // Empty ranges are dropped; zero arguments produce the
+        // empty multirange {}. No overlap coalescing — matches the
+        // existing Multirange contract (the engine trusts the
+        // caller, mirroring PG's _construct_array pattern).
+        "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
+        | "tsmultirange" | "tstzmultirange" => {
+            use spg_storage::RangeKind as K;
+            let kind = match name {
+                "int4multirange" => K::Int4,
+                "int8multirange" => K::Int8,
+                "nummultirange" => K::Num,
+                "datemultirange" => K::Date,
+                "tsmultirange" => K::Ts,
+                _ => K::TsTz,
+            };
+            let mut ranges: alloc::vec::Vec<spg_storage::RangeSpan> = alloc::vec::Vec::new();
+            for arg in args {
+                match arg {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Range {
+                        kind: rk,
+                        lower,
+                        upper,
+                        lower_inc,
+                        upper_inc,
+                        empty,
+                    } => {
+                        if *rk != kind {
+                            return Err(EvalError::TypeMismatch {
+                                detail: format!(
+                                    "{name}(): range kind {rk:?} doesn't match {kind:?}"
+                                ),
+                            });
+                        }
+                        if *empty {
+                            continue;
+                        }
+                        ranges.push(spg_storage::RangeSpan {
+                            lower: lower.clone(),
+                            upper: upper.clone(),
+                            lower_inc: *lower_inc,
+                            upper_inc: *upper_inc,
+                            empty: false,
+                        });
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "{name}() arguments must be ranges, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(Value::Multirange { kind, ranges })
+        }
         // v7.37.17 (17.6 siblings) — generate_subscripts(arr, dim
         // [, reverse]) scalar surface: returns the valid subscripts
         // of the array's dim'th dimension as an IntArray (the parser
