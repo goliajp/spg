@@ -16,6 +16,7 @@ mod e2e_alter_table_pg_dump_compat;
 mod e2e_alter_table_pg_only_residuals;
 mod e2e_alter_trigger_variants;
 mod e2e_array_agg_argmax;
+mod e2e_array_append_cat_trim;
 mod e2e_array_family;
 mod e2e_array_ops;
 mod e2e_as_of_segment;

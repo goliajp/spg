@@ -3192,6 +3192,213 @@ fn apply_function_dispatch(
             }
             Ok(Value::IntArray(hits))
         }
+        // v7.37.17 (17.6 siblings) — array_append(arr, el) /
+        // array_prepend(el, arr). PG semantics: a NULL array acts as
+        // an empty array of the element's type (array_append(NULL, 3)
+        // → {3}); a NULL element is appended as a NULL item. Both
+        // NULL → NULL (PG can't resolve the polymorphic type either).
+        "array_append" | "array_prepend" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            // Normalize to (array, element, prepend?).
+            let (arr_v, el_v, prepend) = if name == "array_append" {
+                (&args[0], &args[1], false)
+            } else {
+                (&args[1], &args[0], true)
+            };
+            let push_text = |items: &[Option<String>], el: Option<String>| {
+                let mut out: alloc::vec::Vec<Option<String>> = items.to_vec();
+                if prepend {
+                    out.insert(0, el);
+                } else {
+                    out.push(el);
+                }
+                Value::TextArray(out)
+            };
+            let push_int = |items: &[Option<i32>], el: Option<i32>| {
+                let mut out: alloc::vec::Vec<Option<i32>> = items.to_vec();
+                if prepend {
+                    out.insert(0, el);
+                } else {
+                    out.push(el);
+                }
+                Value::IntArray(out)
+            };
+            let push_bigint = |items: &[Option<i64>], el: Option<i64>| {
+                let mut out: alloc::vec::Vec<Option<i64>> = items.to_vec();
+                if prepend {
+                    out.insert(0, el);
+                } else {
+                    out.push(el);
+                }
+                Value::BigIntArray(out)
+            };
+            let as_i32 = |v: &Value| -> Option<Option<i32>> {
+                match v {
+                    Value::Null => Some(None),
+                    Value::Int(n) => Some(Some(*n)),
+                    Value::SmallInt(n) => Some(Some(i32::from(*n))),
+                    Value::BigInt(n) => i32::try_from(*n).ok().map(Some),
+                    _ => None,
+                }
+            };
+            let as_i64 = |v: &Value| -> Option<Option<i64>> {
+                match v {
+                    Value::Null => Some(None),
+                    Value::Int(n) => Some(Some(i64::from(*n))),
+                    Value::SmallInt(n) => Some(Some(i64::from(*n))),
+                    Value::BigInt(n) => Some(Some(*n)),
+                    _ => None,
+                }
+            };
+            match arr_v {
+                Value::Null => match el_v {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(s) => Ok(push_text(&[], Some(s.to_string()))),
+                    Value::Int(_) | Value::SmallInt(_) => {
+                        Ok(push_int(&[], as_i32(el_v).unwrap()))
+                    }
+                    Value::BigInt(n) => Ok(push_bigint(&[], Some(*n))),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}(): unsupported element type {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                Value::TextArray(items) => match el_v {
+                    Value::Null => Ok(push_text(items, None)),
+                    Value::Text(s) => Ok(push_text(items, Some(s.to_string()))),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}(): element type {:?} doesn't match TextArray",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                Value::IntArray(items) => match as_i32(el_v) {
+                    Some(el) => Ok(push_int(items, el)),
+                    None => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}(): element type {:?} doesn't match IntArray",
+                            el_v.data_type()
+                        ),
+                    }),
+                },
+                Value::BigIntArray(items) => match as_i64(el_v) {
+                    Some(el) => Ok(push_bigint(items, el)),
+                    None => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}(): element type {:?} doesn't match BigIntArray",
+                            el_v.data_type()
+                        ),
+                    }),
+                },
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() array arg must be an array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — array_cat(arr1, arr2)
+        // concatenates two arrays of the same element type. A NULL
+        // side yields the other side unchanged (PG semantics).
+        "array_cat" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_cat() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, other) | (other, Value::Null) => {
+                    Ok(other.clone().into_owned())
+                }
+                (Value::TextArray(a), Value::TextArray(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().cloned());
+                    Ok(Value::TextArray(out))
+                }
+                (Value::IntArray(a), Value::IntArray(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().copied());
+                    Ok(Value::IntArray(out))
+                }
+                (Value::BigIntArray(a), Value::BigIntArray(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().copied());
+                    Ok(Value::BigIntArray(out))
+                }
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_cat() element types differ: {:?} vs {:?}",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — PG 14+ trim_array(arr, n) removes
+        // the last n elements. Errors like PG when n is negative or
+        // exceeds the array length.
+        "trim_array" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("trim_array() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let n = match &args[1] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "trim_array() second arg must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let len = match &args[0] {
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "trim_array() first arg must be an array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n < 0 || n as usize > len {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "number of elements to trim must be between 0 and {len}"
+                    ),
+                });
+            }
+            let keep = len - n as usize;
+            match &args[0] {
+                Value::TextArray(items) => {
+                    Ok(Value::TextArray(items[..keep].to_vec()))
+                }
+                Value::IntArray(items) => Ok(Value::IntArray(items[..keep].to_vec())),
+                Value::BigIntArray(items) => {
+                    Ok(Value::BigIntArray(items[..keep].to_vec()))
+                }
+                _ => unreachable!(),
+            }
+        }
         // v7.11.15 — `substring(s, start)` / `substring(s, start, length)`
         // for both TEXT and BYTEA. PG semantics: `start` is 1-based;
         // values ≤ 0 clamp into the string (i.e. effective start is
