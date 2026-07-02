@@ -8606,6 +8606,9 @@ fn apply_function_dispatch(
         // wildcards error honestly).
         "json_extract" => crate::json::mysql_json_extract(args),
         "json_contains_path" => crate::json::mysql_json_contains_path(args),
+        "json_array_append" => crate::json::mysql_json_array_append(args),
+        "json_array_insert" => crate::json::mysql_json_array_insert(args),
+        "json_contains" => crate::json::mysql_json_contains(args),
         // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
         "json_valid" => {
             if args.len() != 1 {

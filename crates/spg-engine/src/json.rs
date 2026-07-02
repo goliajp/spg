@@ -2236,3 +2236,201 @@ pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     }
     Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
 }
+
+/// Apply `f` to the value AT the full path (not its parent). Missing
+/// steps are a no-op.
+fn modify_at(cur: &mut JsonValue, steps: &[MysqlPathStep], f: &mut dyn FnMut(&mut JsonValue)) {
+    match steps {
+        [] => f(cur),
+        [head, rest @ ..] => match (head, cur) {
+            (MysqlPathStep::Key(k), JsonValue::Object(members)) => {
+                if let Some(slot) = members.iter_mut().find(|(mk, _)| mk == k) {
+                    modify_at(&mut slot.1, rest, f);
+                }
+            }
+            (MysqlPathStep::Index(i), JsonValue::Array(items)) => {
+                if let Some(slot) = items.get_mut(*i) {
+                    modify_at(slot, rest, f);
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+/// Shared arg plumbing for the (doc, path, value)-pairs mutators.
+fn mysql_doc_and_pairs<'a>(
+    args: &'a [Value<'_>],
+    fn_name: &str,
+) -> Result<Option<(JsonValue, &'a [Value<'a>])>, EvalError> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes a document plus (path, value) pairs, got {} args",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(None);
+    }
+    let src = match &args[0] {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}() document must be json, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("{fn_name}(): invalid JSON: {e}"),
+    })?;
+    Ok(Some((doc, &args[1..])))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_ARRAY_APPEND(doc, path,
+/// val, ...). The value at path gains `val` at the end; a non-array
+/// value wraps as `[old, val]` (MySQL semantics).
+pub fn mysql_json_array_append(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let Some((mut doc, pairs)) = mysql_doc_and_pairs(args, "json_array_append")? else {
+        return Ok(Value::Null);
+    };
+    for pair in pairs.chunks(2) {
+        let Value::Text(p) = &pair[0] else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_array_append() paths must be text, got {:?}",
+                    pair[0].data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        let newval = value_to_jsonvalue(&pair[1])?;
+        modify_at(&mut doc, &steps, &mut |v| match v {
+            JsonValue::Array(items) => items.push(newval.clone()),
+            other => {
+                let old = core::mem::replace(other, JsonValue::Null);
+                *other = JsonValue::Array(alloc::vec![old, newval.clone()]);
+            }
+        });
+    }
+    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_ARRAY_INSERT(doc, path,
+/// val, ...). The path must end in `[N]`; the value is inserted at
+/// position N in the parent array, shifting later elements right
+/// (past-the-end appends). A non-array parent is a no-op.
+pub fn mysql_json_array_insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let Some((mut doc, pairs)) = mysql_doc_and_pairs(args, "json_array_insert")? else {
+        return Ok(Value::Null);
+    };
+    for pair in pairs.chunks(2) {
+        let Value::Text(p) = &pair[0] else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_array_insert() paths must be text, got {:?}",
+                    pair[0].data_type()
+                ),
+            });
+        };
+        let steps = mysql_path_steps(p)?;
+        let Some(MysqlPathStep::Index(idx)) = steps.last() else {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_array_insert() path must end with an array index: {p:?}"
+                ),
+            });
+        };
+        let idx = *idx;
+        let newval = value_to_jsonvalue(&pair[1])?;
+        modify_at(&mut doc, &steps[..steps.len() - 1], &mut |v| {
+            if let JsonValue::Array(items) = v {
+                let at = idx.min(items.len());
+                items.insert(at, newval.clone());
+            }
+        });
+    }
+    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+}
+
+/// MySQL JSON containment recursion: candidate object ⊆ target
+/// object (same keys, contained values); each candidate array
+/// element contained in some target array element; a candidate
+/// scalar is contained in an array when it equals some element.
+fn mysql_contains(target: &JsonValue, cand: &JsonValue) -> bool {
+    match (target, cand) {
+        (JsonValue::Object(t), JsonValue::Object(c)) => c.iter().all(|(ck, cv)| {
+            t.iter()
+                .any(|(tk, tv)| tk == ck && mysql_contains(tv, cv))
+        }),
+        (JsonValue::Array(t), JsonValue::Array(c)) => c
+            .iter()
+            .all(|cv| t.iter().any(|tv| mysql_contains(tv, cv))),
+        (JsonValue::Array(t), scalar) => {
+            t.iter().any(|tv| mysql_contains(tv, scalar))
+        }
+        // Numbers compare numerically across the two lexeme forms.
+        (JsonValue::Number(a), JsonValue::NumberText(b))
+        | (JsonValue::NumberText(b), JsonValue::Number(a)) => {
+            b.parse::<f64>().map(|x| x == *a).unwrap_or(false)
+        }
+        (JsonValue::NumberText(a), JsonValue::NumberText(b)) => {
+            a == b
+                || (a.parse::<f64>().ok().zip(b.parse::<f64>().ok()))
+                    .map(|(x, y)| x == y)
+                    .unwrap_or(false)
+        }
+        (a, b) => a == b,
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL JSON_CONTAINS(target, candidate
+/// [, path]).
+pub fn mysql_json_contains(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("json_contains() takes 2 or 3 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let parse_arg = |v: &Value<'_>, which: &str| -> Result<JsonValue, EvalError> {
+        match v {
+            Value::Json(s) | Value::Text(s) => parse(s).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("json_contains(): invalid {which} JSON: {e}"),
+            }),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_contains() {which} must be json, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        }
+    };
+    let target = parse_arg(&args[0], "target")?;
+    let cand = parse_arg(&args[1], "candidate")?;
+    let effective = match args.get(2) {
+        None => Some(&target),
+        Some(Value::Text(p)) => {
+            let steps = mysql_path_steps(p)?;
+            mysql_path_get(&target, &steps)
+        }
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "json_contains() path must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    match effective {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::Bool(mysql_contains(t, &cand))),
+    }
+}
