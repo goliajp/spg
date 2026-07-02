@@ -3753,6 +3753,173 @@ fn apply_function_dispatch(
                 _ => unreachable!(),
             }
         }
+        // MySQL time-of-day arithmetic — time_to_sec / sec_to_time /
+        // maketime / addtime / subtime / timediff / microsecond.
+        // SPG carries TIME as text; these parse '[-]H:MM:SS[.ffffff]'
+        // into signed microseconds and format back (hours may exceed
+        // 24, like MySQL's TIME type).
+        "time_to_sec" | "sec_to_time" | "maketime" | "addtime" | "subtime"
+        | "timediff" | "microsecond" => {
+            fn parse_time_us(s: &str) -> Option<i64> {
+                let s = s.trim();
+                let (neg, body) = match s.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, s),
+                };
+                let mut parts = body.split(':');
+                let h: i64 = parts.next()?.parse().ok()?;
+                let m: i64 = parts.next().unwrap_or("0").parse().ok()?;
+                let sec_part = parts.next().unwrap_or("0");
+                let (sec_s, frac_s) =
+                    sec_part.split_once('.').unwrap_or((sec_part, ""));
+                let sec: i64 = sec_s.parse().ok()?;
+                let mut frac_padded = alloc::string::String::from(frac_s);
+                while frac_padded.len() < 6 {
+                    frac_padded.push('0');
+                }
+                frac_padded.truncate(6);
+                let micros: i64 = if frac_padded.is_empty() {
+                    0
+                } else {
+                    frac_padded.parse().ok()?
+                };
+                let total =
+                    h * 3_600_000_000 + m * 60_000_000 + sec * 1_000_000 + micros;
+                Some(if neg { -total } else { total })
+            }
+            fn format_time_us(us: i64) -> alloc::string::String {
+                let neg = us < 0;
+                let abs = us.unsigned_abs();
+                let h = abs / 3_600_000_000;
+                let m = (abs / 60_000_000) % 60;
+                let s = (abs / 1_000_000) % 60;
+                let frac = abs % 1_000_000;
+                let sign = if neg { "-" } else { "" };
+                if frac == 0 {
+                    alloc::format!("{sign}{h:02}:{m:02}:{s:02}")
+                } else {
+                    alloc::format!("{sign}{h:02}:{m:02}:{s:02}.{frac:06}")
+                }
+            }
+            let time_arg = |v: &Value<'_>,
+                            what: &str|
+             -> Result<Option<i64>, EvalError> {
+                match v {
+                    Value::Null => Ok(None),
+                    Value::Text(s) => {
+                        parse_time_us(s).map(Some).ok_or_else(|| {
+                            EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "{what}: invalid time {s:?}"
+                                ),
+                            }
+                        })
+                    }
+                    Value::Timestamp(us) => {
+                        Ok(Some(us.rem_euclid(86_400_000_000)))
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{what}: needs time, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            match name {
+                "time_to_sec" => {
+                    let Some(us) = time_arg(&args[0], "time_to_sec()")? else {
+                        return Ok(Value::Null);
+                    };
+                    Ok(Value::BigInt(us.div_euclid(1_000_000)))
+                }
+                "sec_to_time" => {
+                    let secs = match &args[0] {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        Value::SmallInt(n) => i64::from(*n),
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "sec_to_time() needs integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    Ok(Value::text(format_time_us(secs * 1_000_000)))
+                }
+                "maketime" => {
+                    if args.len() != 3 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "maketime() takes 3 args, got {}",
+                                args.len()
+                            ),
+                        });
+                    }
+                    if args.iter().any(|v| matches!(v, Value::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    let int_of = |v: &Value<'_>| -> Option<i64> {
+                        match v {
+                            Value::Int(n) => Some(i64::from(*n)),
+                            Value::BigInt(n) => Some(*n),
+                            Value::SmallInt(n) => Some(i64::from(*n)),
+                            _ => None,
+                        }
+                    };
+                    let (Some(h), Some(m), Some(s)) = (
+                        int_of(&args[0]),
+                        int_of(&args[1]),
+                        int_of(&args[2]),
+                    ) else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "maketime() takes 3 integer args".into(),
+                        });
+                    };
+                    if !(0..=59).contains(&m) || !(0..=59).contains(&s) {
+                        return Ok(Value::Null);
+                    }
+                    let sign = if h < 0 { -1 } else { 1 };
+                    let us = sign
+                        * (h.abs() * 3_600_000_000
+                            + m * 60_000_000
+                            + s * 1_000_000);
+                    Ok(Value::text(format_time_us(us)))
+                }
+                "addtime" | "subtime" | "timediff" => {
+                    if args.len() != 2 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "{name}() takes 2 args, got {}",
+                                args.len()
+                            ),
+                        });
+                    }
+                    let (Some(a), Some(b)) = (
+                        time_arg(&args[0], name)?,
+                        time_arg(&args[1], name)?,
+                    ) else {
+                        return Ok(Value::Null);
+                    };
+                    let result = match name {
+                        "addtime" => a + b,
+                        "subtime" | "timediff" => a - b,
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::text(format_time_us(result)))
+                }
+                "microsecond" => {
+                    let Some(us) = time_arg(&args[0], "microsecond()")? else {
+                        return Ok(Value::Null);
+                    };
+                    Ok(Value::Int((us.rem_euclid(1_000_000)) as i32))
+                }
+                _ => unreachable!(),
+            }
+        }
         // MySQL quarter / to_days / yearweek — same date-input
         // handling as the accessor batch above.
         "quarter" | "to_days" | "yearweek" => {
