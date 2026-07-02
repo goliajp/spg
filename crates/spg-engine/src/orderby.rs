@@ -12,7 +12,7 @@
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, Literal, OrderBy, SelectItem, SelectStatement};
+use spg_sql::ast::{ColumnName, Expr, Literal, OrderBy, SelectItem, SelectStatement};
 use spg_storage::{Row, Value};
 
 use crate::conversions::{
@@ -267,20 +267,38 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
     // (`ORDER BY 2`) bind to the 1-based projection index;
     // identifier references that match a SELECT-list alias bind to
     // the projected expression (Step 4 of L3a).
+    // v7.37.17 (17.6 siblings) — with UNION peers the combined
+    // result is already projected, so substituting the HEAD's item
+    // expression would sort every combined row by the head's value
+    // (a constant SELECT head made `… UNION ALL … ORDER BY x` a
+    // silent no-sort). Resolve to the projected column NAME instead;
+    // the union ORDER BY path evaluates names against the output
+    // schema.
+    let has_unions = !s.unions.is_empty();
     for order in &mut s.order_by {
         match &order.expr {
             Expr::Literal(Literal::Integer(n)) if *n >= 1 => {
                 if let Ok(idx_one_based) = usize::try_from(*n) {
                     let idx = idx_one_based - 1;
                     if idx < s.items.len()
-                        && let SelectItem::Expr { expr, .. } = &s.items[idx]
+                        && let SelectItem::Expr { expr, alias } = &s.items[idx]
                     {
-                        order.expr = expr.clone();
+                        order.expr = match (has_unions, alias) {
+                            (true, Some(a)) => Expr::Column(ColumnName {
+                                qualifier: None,
+                                name: a.clone(),
+                            }),
+                            _ => expr.clone(),
+                        };
                     }
                 }
             }
             Expr::Column(c) if c.qualifier.is_none() => {
-                // Alias-in-ORDER-BY lookup.
+                // Alias-in-ORDER-BY lookup. Under unions the alias
+                // already names the projected column — leave it.
+                if has_unions {
+                    continue;
+                }
                 for item in &s.items {
                     if let SelectItem::Expr {
                         expr,

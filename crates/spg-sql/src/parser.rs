@@ -513,6 +513,16 @@ impl Parser {
         }
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
+            // v7.37.17 (17.6 siblings) — top-level bare VALUES
+            // statement (`VALUES (1), (2) [ORDER BY …] [LIMIT …]`).
+            // Lowers to the same UNION ALL chain the FROM-position
+            // form uses, then reuses the shared SELECT tail.
+            Token::Values => {
+                self.advance(); // VALUES
+                let mut head = self.parse_values_rows_body()?;
+                self.parse_select_tail_into(&mut head)?;
+                Ok(Statement::Select(head))
+            }
             // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. The
             // body is a dollar-quoted plpgsql block (lexer already
             // collapsed `$$…$$` into a single Token::String).
@@ -6204,6 +6214,15 @@ impl Parser {
             let peer = self.parse_bare_select()?;
             head.unions.push((kind, peer));
         }
+        self.parse_select_tail_into(&mut head)?;
+        Ok(Statement::Select(head))
+    }
+
+
+    /// v7.37.17 (17.6 siblings) — the shared SELECT tail: ORDER BY /
+    /// LIMIT / OFFSET / FETCH FIRST / FOR-lock clauses. Extracted so
+    /// the top-level bare VALUES statement reuses it verbatim.
+    fn parse_select_tail_into(&mut self, head: &mut SelectStatement) -> Result<(), ParseError> {
         head.order_by = if matches!(self.peek(), Token::Order) {
             self.advance();
             if !matches!(self.peek(), Token::By) {
@@ -6331,7 +6350,7 @@ impl Parser {
         // through-write ordering still get the right answer
         // because SPG serialises writes anyway.
         self.consume_optional_for_lock_clauses();
-        Ok(Statement::Select(head))
+        Ok(())
     }
 
     /// v7.17.0 Phase 3.4 — eat zero or more `FOR { UPDATE | NO KEY
@@ -9402,6 +9421,70 @@ impl Parser {
         Ok(SelectItem::Expr { expr, alias })
     }
 
+    /// v7.37.17 (17.6 siblings) — parse `(row), (row), …` after a
+    /// consumed VALUES keyword. Each row lowers to a constant SELECT
+    /// with PG's default column1..columnN names; subsequent rows
+    /// chain as UNION ALL peers. Shared by the FROM-position
+    /// `( VALUES … )` arm and the top-level bare VALUES statement.
+    fn parse_values_rows_body(&mut self) -> Result<SelectStatement, ParseError> {
+        let mut row_selects: Vec<SelectStatement> = Vec::new();
+        loop {
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected '(' to start a VALUES row, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance(); // (
+            let mut items: Vec<SelectItem> = Vec::new();
+            loop {
+                let expr = self.parse_expr(0)?;
+                items.push(SelectItem::Expr {
+                    expr,
+                    alias: Some(alloc::format!("column{}", items.len() + 1)),
+                });
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in VALUES row, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            self.advance(); // )
+            row_selects.push(SelectStatement {
+                ctes: Vec::new(),
+                distinct: false,
+                items,
+                from: None,
+                where_: None,
+                group_by: None,
+                group_by_all: false,
+                having: None,
+                unions: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                limit_with_ties: false,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let mut head = row_selects.remove(0);
+        head.unions = row_selects
+            .into_iter()
+            .map(|s| (UnionKind::All, s))
+            .collect();
+        Ok(head)
+    }
+
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
         // v7.37.43-T4.5 — `LATERAL jsonb_each_text(<expr>)` —
         // set-returning function whose argument may reference a
@@ -9529,56 +9612,7 @@ impl Parser {
         {
             self.advance(); // (
             self.advance(); // VALUES
-            let mut row_selects: Vec<SelectStatement> = Vec::new();
-            loop {
-                if !matches!(self.peek(), Token::LParen) {
-                    return Err(self.err(alloc::format!(
-                        "expected '(' to start a VALUES row, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance(); // (
-                let mut items: Vec<SelectItem> = Vec::new();
-                loop {
-                    let expr = self.parse_expr(0)?;
-                    items.push(SelectItem::Expr {
-                        expr,
-                        alias: Some(alloc::format!("column{}", items.len() + 1)),
-                    });
-                    match self.peek() {
-                        Token::Comma => {
-                            self.advance();
-                        }
-                        Token::RParen => break,
-                        other => {
-                            return Err(self.err(alloc::format!(
-                                "expected ',' or ')' in VALUES row, got {other:?}"
-                            )));
-                        }
-                    }
-                }
-                self.advance(); // )
-                row_selects.push(SelectStatement {
-                    ctes: Vec::new(),
-                    distinct: false,
-                    items,
-                    from: None,
-                    where_: None,
-                    group_by: None,
-                    group_by_all: false,
-                    having: None,
-                    unions: Vec::new(),
-                    order_by: Vec::new(),
-                    limit: None,
-                    offset: None,
-                    limit_with_ties: false,
-                });
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    continue;
-                }
-                break;
-            }
+            let head = self.parse_values_rows_body()?;
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(alloc::format!(
                     "expected ')' after VALUES list, got {:?}",
@@ -9586,11 +9620,6 @@ impl Parser {
                 )));
             }
             self.advance();
-            let mut head = row_selects.remove(0);
-            head.unions = row_selects
-                .into_iter()
-                .map(|s| (UnionKind::All, s))
-                .collect();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "values".to_string());
             return Ok(TableRef {
