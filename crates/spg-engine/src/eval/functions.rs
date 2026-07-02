@@ -6251,7 +6251,80 @@ fn apply_function_dispatch(
         // (1-based). NULL arg → empty string for %s; NULL for %I
         // is an error in PG; NULL for %L renders as the SQL
         // literal `NULL`. Args missing for a position → error.
+        // format() serves two dialects: PG's printf-style form takes
+        // a text format string first; MySQL's FORMAT(X, D) takes a
+        // number first (round to D decimals + comma thousands
+        // separators). Disambiguate on the first arg's type — PG's
+        // form can never start with a number.
+        "format"
+            if args.len() == 2
+                && matches!(
+                    args[0],
+                    Value::Int(_)
+                        | Value::SmallInt(_)
+                        | Value::BigInt(_)
+                        | Value::Float(_)
+                        | Value::Numeric { .. }
+                ) =>
+        {
+            let x = match &args[0] {
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                Value::Float(f) => *f,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / libm::pow(10.0, f64::from(*scale))
+                }
+                _ => unreachable!(),
+            };
+            let d = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => (*n).clamp(0, 30) as usize,
+                Value::SmallInt(n) => i32::from(*n).clamp(0, 30) as usize,
+                Value::BigInt(n) => (*n).clamp(0, 30) as usize,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "format() decimals must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let rendered = alloc::format!("{x:.d$}");
+            let (int_part, frac_part) = match rendered.split_once('.') {
+                Some((i, f)) => (i, Some(f)),
+                None => (rendered.as_str(), None),
+            };
+            let (sign, digits) = match int_part.strip_prefix('-') {
+                Some(rest) => ("-", rest),
+                None => ("", int_part),
+            };
+            let mut grouped = alloc::string::String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                    grouped.push(',');
+                }
+                grouped.push(c);
+            }
+            let out = match frac_part {
+                Some(f) => alloc::format!("{sign}{grouped}.{f}"),
+                None => alloc::format!("{sign}{grouped}"),
+            };
+            Ok(Value::text(out))
+        }
         "format" => format_string(args),
+        // v7.37.17 (17.6 siblings) — MySQL NAME_CONST(name, value)
+        // returns the value; the name only labels the output column
+        // in MySQL (mysqlbinlog emits these).
+        "name_const" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("name_const() takes 2 args, got {}", args.len()),
+                });
+            }
+            Ok(args[1].clone().into_owned())
+        }
         // PG `concat(args...)` — variadic; coerces every arg to
         // its text representation; NULL arguments are silently
         // skipped (the canonical PG semantic — `concat()` is the
