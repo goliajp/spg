@@ -513,6 +513,19 @@ impl Parser {
         }
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
+            // v7.37.17 (17.6 siblings) — a statement opening with a
+            // parenthesized query group: `(SELECT … UNION …)
+            // INTERSECT …`. parse_bare_select's group arm consumes
+            // the parens; the select parser handles the outer chain
+            // and tail.
+            Token::LParen
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Select | Token::LParen)
+                ) =>
+            {
+                self.parse_select_stmt()
+            }
             // v7.37.17 (17.6 siblings) — top-level bare VALUES
             // statement (`VALUES (1), (2) [ORDER BY …] [LIMIT …]`).
             // Lowers to the same UNION ALL chain the FROM-position
@@ -6203,10 +6216,28 @@ impl Parser {
         // get a fresh bare-select parse and may not have their own ORDER
         // BY / LIMIT.
         let mut head = self.parse_bare_select()?;
-        // v7.37.17 (17.6 siblings) — the three SQL set operations
-        // share the peer chain: UNION [ALL], EXCEPT [ALL] (a
-        // reserved token), and INTERSECT [ALL] (a bare ident — it
-        // was never reserved in SPG's lexer).
+        self.parse_setop_chain_into(&mut head)?;
+        self.parse_select_tail_into(&mut head)?;
+        Ok(Statement::Select(head))
+    }
+
+    /// v7.37.17 (17.6 siblings) — the three SQL set operations
+    /// share the peer chain: UNION [ALL], EXCEPT [ALL] (a reserved
+    /// token), and INTERSECT [ALL] (a bare ident — it was never
+    /// reserved in SPG's lexer). PG precedence: INTERSECT binds
+    /// tighter than UNION / EXCEPT — the executor folds the chain
+    /// left-to-right, which is already correct for LEADING
+    /// intersects; an INTERSECT pair that FOLLOWS a union/except
+    /// pair nests into that previous peer, so A UNION B INTERSECT C
+    /// = A ∪ (B ∩ C). Shared by the top level and parenthesized
+    /// groups.
+    fn parse_setop_chain_into(&mut self, head: &mut SelectStatement) -> Result<(), ParseError> {
+        // A parenthesized group arrives with its own (already
+        // regrouped) unions on `head`; only the pairs THIS chain
+        // appends participate in the precedence regroup below —
+        // nesting an outer INTERSECT into a group-internal peer
+        // would dissolve the explicit grouping.
+        let boundary = head.unions.len();
         loop {
             let base = match self.peek() {
                 Token::Union => UnionKind::Distinct,
@@ -6228,27 +6259,22 @@ impl Parser {
             let peer = self.parse_bare_select()?;
             head.unions.push((kind, peer));
         }
-        // v7.37.17 (17.6 siblings) — PG precedence: INTERSECT binds
-        // tighter than UNION / EXCEPT. The executor folds the chain
-        // left-to-right, which is already correct for LEADING
-        // intersects (A INTERSECT B UNION C); an INTERSECT pair
-        // that FOLLOWS a union/except pair nests into that previous
-        // peer instead, so A UNION B INTERSECT C = A ∪ (B ∩ C).
-        {
-            let pairs = core::mem::take(&mut head.unions);
-            let mut regrouped: Vec<(UnionKind, SelectStatement)> = Vec::new();
-            for (kind, peer) in pairs {
-                let is_intersect =
-                    matches!(kind, UnionKind::Intersect | UnionKind::IntersectAll);
-                match (is_intersect, regrouped.last_mut()) {
-                    (true, Some((_, prev))) => prev.unions.push((kind, peer)),
-                    _ => regrouped.push((kind, peer)),
-                }
+        let mut pairs = core::mem::take(&mut head.unions);
+        let tail = pairs.split_off(boundary);
+        let mut regrouped: Vec<(UnionKind, SelectStatement)> = pairs;
+        for (kind, peer) in tail {
+            let is_intersect = matches!(kind, UnionKind::Intersect | UnionKind::IntersectAll);
+            // An intersect nests into the previous element of THIS
+            // chain only; with no new previous element it stays at
+            // the outer level (the left fold applies it to the
+            // whole head, group included).
+            match (is_intersect, regrouped.len() > boundary, regrouped.last_mut()) {
+                (true, true, Some((_, prev))) => prev.unions.push((kind, peer)),
+                _ => regrouped.push((kind, peer)),
             }
-            head.unions = regrouped;
         }
-        self.parse_select_tail_into(&mut head)?;
-        Ok(Statement::Select(head))
+        head.unions = regrouped;
+        Ok(())
     }
 
 
@@ -6540,6 +6566,37 @@ impl Parser {
     /// `unions` empty and `order_by` / `limit` `None`; the top-level
     /// `parse_select_stmt` is responsible for filling those in.
     fn parse_bare_select(&mut self) -> Result<SelectStatement, ParseError> {
+        // v7.37.17 (17.6 siblings) — parenthesized set-operation
+        // group: `( <select chain> )` usable anywhere a query block
+        // is (head or peer of an outer chain). The group's own
+        // unions ride the returned SelectStatement; the executor's
+        // nested-peer recursion runs them.
+        if matches!(self.peek(), Token::LParen)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Select | Token::LParen)
+            )
+        {
+            self.advance(); // (
+            self.enter_nested()?;
+            let mut head = self.parse_bare_select().and_then(|mut h| {
+                self.parse_setop_chain_into(&mut h)?;
+                Ok(h)
+            });
+            self.nest_depth -= 1;
+            let head = match &mut head {
+                Ok(h) => core::mem::take(h),
+                Err(_) => return head,
+            };
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(format!(
+                    "expected ')' after parenthesized query group, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            return Ok(head);
+        }
         if !matches!(self.peek(), Token::Select) {
             return Err(self.err(format!(
                 "expected SELECT to start a query block, got {:?}",
