@@ -7848,6 +7848,64 @@ fn apply_function_dispatch(
             Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
         "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        // Catalog function forms of the ? / ?| / ?& / @> / <@
+        // operators — same helpers the operators use.
+        "jsonb_exists" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_exists() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::key_exists(&args[0], &args[1])
+        }
+        "jsonb_exists_any" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_exists_any() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::keys_any(&args[0], &args[1])
+        }
+        "jsonb_exists_all" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_exists_all() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::keys_all(&args[0], &args[1])
+        }
+        "jsonb_contains" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_contains() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::contains(&args[0], &args[1])
+        }
+        "jsonb_contained" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_contained() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            // a <@ b  ==  b @> a.
+            crate::json::contains(&args[1], &args[0])
+        }
         // Catalog function forms of the -> / ->> operators —
         // json_object_field(doc, key), json_array_element(doc, i)
         // + _text variants + jsonb_ twins. Some ORMs/drivers call
