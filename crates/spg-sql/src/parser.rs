@@ -9600,7 +9600,9 @@ impl Parser {
                 if s.eq_ignore_ascii_case("jsonb_array_elements")
                     || s.eq_ignore_ascii_case("json_array_elements")
                     || s.eq_ignore_ascii_case("jsonb_array_elements_text")
-                    || s.eq_ignore_ascii_case("json_array_elements_text"))
+                    || s.eq_ignore_ascii_case("json_array_elements_text")
+                    || s.eq_ignore_ascii_case("jsonb_object_keys")
+                    || s.eq_ignore_ascii_case("json_object_keys"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             let fn_name = match self.peek() {
@@ -9619,10 +9621,15 @@ impl Parser {
             self.advance();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
-            let col_name = column_aliases
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "value".to_string());
+            // PG's natural column name: the array-elements SRFs
+            // declare an OUT parameter `value`; jsonb_object_keys
+            // has none, so the column is named after the function.
+            let natural_col = if fn_name.ends_with("_object_keys") {
+                fn_name.clone()
+            } else {
+                "value".to_string()
+            };
+            let col_name = column_aliases.first().cloned().unwrap_or(natural_col);
             return Ok(TableRef {
                 name,
                 alias: alias_ident,

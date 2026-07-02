@@ -1050,7 +1050,10 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Json(s) => {
+                // Text accepted alongside Json so the FROM-position
+                // SRF rewrite (string literal argument, no jsonb cast
+                // context) reaches this arm.
+                Value::Json(s) | Value::Text(s) => {
                     let parsed =
                         crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
                             detail: format!("{name}(): JSON parse failed: {e}"),
