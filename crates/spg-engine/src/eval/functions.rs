@@ -8609,6 +8609,12 @@ fn apply_function_dispatch(
         "json_array_append" => crate::json::mysql_json_array_append(args),
         "json_array_insert" => crate::json::mysql_json_array_insert(args),
         "json_contains" => crate::json::mysql_json_contains(args),
+        "json_merge_patch" => crate::json::mysql_json_merge_patch(args),
+        // "json_merge" is the deprecated MySQL alias for _preserve.
+        "json_merge_preserve" | "json_merge" => {
+            crate::json::mysql_json_merge_preserve(args)
+        }
+        "json_overlaps" => crate::json::mysql_json_overlaps(args),
         // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
         "json_valid" => {
             if args.len() != 1 {
