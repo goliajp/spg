@@ -2151,6 +2151,16 @@ impl Engine {
         if from.primary.jsonb_each_text_arg.is_some() {
             return self.exec_select_jsonb_each_text(stmt, &from.primary, cancel);
         }
+        // v7.37.17 (17.6 siblings) — plain derived table in primary
+        // position: `FROM ( SELECT … ) alias` (no joins). The inner
+        // SELECT materialises once (it is uncorrelated by
+        // construction), then the outer projection / WHERE /
+        // aggregate / ORDER BY pipeline runs over the synthetic
+        // table. Joined derived tables keep riding the LATERAL
+        // machinery in join.rs.
+        if from.joins.is_empty() && from.primary.lateral_subquery.is_some() {
+            return self.exec_select_derived(stmt, &from.primary, cancel);
+        }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
         // [, step])` set-returning source. Dispatch mirrors UNNEST:
         // materialise the row stream from a single eval pass, then
@@ -2376,6 +2386,138 @@ impl Engine {
             .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
             .collect();
         // ORDER BY.
+        if !stmt.order_by.is_empty() {
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, r)| -> Result<_, EngineError> {
+                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        })
+                        .collect();
+                    Ok((i, keys?))
+                })
+                .collect::<Result<_, _>>()?;
+            indexed.sort_by(|a, b| {
+                for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
+                    let o = &stmt.order_by[idx];
+                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    if cmp != core::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            projected_rows = indexed
+                .into_iter()
+                .map(|(i, _)| projected_rows[i].clone())
+                .collect();
+        }
+        if let Some(offset) = stmt.offset_literal() {
+            let off = (offset as usize).min(projected_rows.len());
+            projected_rows.drain(..off);
+        }
+        if let Some(limit) = stmt.limit_literal() {
+            projected_rows.truncate(limit as usize);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: projected_rows,
+        })
+    }
+
+    /// v7.37.17 (17.6 siblings) — execute `SELECT … FROM
+    /// ( SELECT … ) alias` in primary position. The inner SELECT
+    /// materialises once through the regular bare-select executor
+    /// (UNION tails included), then the outer WHERE / aggregate /
+    /// projection / ORDER BY / LIMIT pipeline runs over the
+    /// synthetic table — the same post-materialisation shape as
+    /// exec_select_jsonb_each_text, generalised to N columns.
+    fn exec_select_derived(
+        &self,
+        stmt: &SelectStatement,
+        primary: &TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let inner = primary
+            .lateral_subquery
+            .as_deref()
+            .expect("caller guards lateral_subquery.is_some()");
+        // exec_select_cancel is the union-aware wrapper — the inner
+        // SELECT may carry UNION tails on stmt.unions.
+        let QueryResult::Rows {
+            columns: inner_cols,
+            rows,
+        } = self.exec_select_cancel(inner, cancel)?
+        else {
+            return Err(EngineError::Unsupported(
+                "derived table subquery must return rows".into(),
+            ));
+        };
+        let alias = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| primary.name.clone());
+        let schema_cols: alloc::vec::Vec<ColumnSchema> = inner_cols;
+        let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
+        // WHERE.
+        let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
+            let mut out = alloc::vec::Vec::with_capacity(rows.len());
+            for row in rows {
+                cancel.check()?;
+                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Bool(true)) {
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            rows
+        };
+        // Aggregate dispatch.
+        if aggregate::uses_aggregate(stmt) {
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
+            let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
+            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(RowRef::Owned).collect();
+            let agg = aggregate::run(
+                stmt,
+                &filtered_refs,
+                &schema_cols,
+                Some(&alias),
+                Some(&agg_correlated),
+            )?;
+            return self.finish_agg_result(agg, stmt, cancel);
+        }
+        // Projection.
+        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let mut projected_rows: alloc::vec::Vec<Row<'static>> =
+            alloc::vec::Vec::with_capacity(filtered.len());
+        for row in &filtered {
+            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+            for p in &projection {
+                let v = eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?;
+                vals.push(v);
+            }
+            projected_rows.push(Row::new(vals));
+        }
+        let columns: alloc::vec::Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // ORDER BY over the source rows (same shape as the other
+        // synthetic-table executors).
         if !stmt.order_by.is_empty() {
             let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
                 .iter()
