@@ -735,3 +735,170 @@ pub(super) fn tsvector_concat(
     out.sort_by(|a, b| a.word.cmp(&b.word));
     Value::TsVector(out)
 }
+
+/// v7.37.17 (17.6 siblings) — `ts_headline([config,] document,
+/// query [, options])`. Wraps every document word whose stemmed
+/// form appears as a positive term in the query with StartSel /
+/// StopSel (default `<b>` / `</b>`, overridable via the options
+/// string). Highlights across the whole document — PG's
+/// HighlightAll=true rendering; fragment selection (MaxWords /
+/// MinWords / MaxFragments) is accepted in the options string but
+/// not applied.
+pub(super) fn fts_ts_headline(
+    args: &[Value<'_>],
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // Disambiguate the 2-4 arg forms by where the tsquery sits.
+    let is_queryish = |v: &Value<'_>| matches!(v, Value::TsQuery(_));
+    let (config_arg, doc_arg, query_arg, opts_arg) = match args {
+        [d, q] => (None, d, q, None),
+        [d, q, o] if is_queryish(q) => (None, d, q, Some(o)),
+        [c, d, q] => (Some(c), d, q, None),
+        [c, d, q, o] => (Some(c), d, q, Some(o)),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("ts_headline() takes 2 to 4 args, got {}", args.len()),
+            });
+        }
+    };
+    if matches!(doc_arg, Value::Null) || matches!(query_arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let config = match config_arg {
+        None => match ctx.default_text_search_config {
+            Some(name_str) => crate::fts::TsConfig::from_name(name_str).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: format!(
+                        "text search config not implemented: {name_str:?} (supported: simple, english)"
+                    ),
+                }
+            })?,
+            None => crate::fts::TsConfig::Simple,
+        },
+        Some(Value::Text(name_str)) => {
+            crate::fts::TsConfig::from_name(name_str).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!(
+                    "text search config not implemented: {name_str:?} (supported: simple, english)"
+                ),
+            })?
+        }
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "ts_headline() config must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc = match doc_arg {
+        Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "ts_headline() document must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let query = match query_arg {
+        Value::TsQuery(q) => q.clone(),
+        // An unquoted string literal reaches us as Text — PG resolves
+        // the unknown literal through the tsquery input parser.
+        Value::Text(s) => crate::fts::to_tsquery(config, s)?,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "ts_headline() query must be tsquery, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    // StartSel / StopSel from the options string; other options
+    // (MaxWords, MinWords, ShortWord, HighlightAll, MaxFragments,
+    // FragmentDelimiter) are accepted and ignored — whole-document
+    // highlighting.
+    let mut start_sel = String::from("<b>");
+    let mut stop_sel = String::from("</b>");
+    if let Some(opts_v) = opts_arg {
+        let opts = match opts_v {
+            Value::Null => "",
+            Value::Text(s) => s.as_ref(),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ts_headline() options must be text, got {:?}",
+                        other.data_type()
+                    ),
+                });
+            }
+        };
+        for pair in opts.split(',') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let v = v.trim().trim_matches('"');
+            match k.trim().to_ascii_lowercase().as_str() {
+                "startsel" => start_sel = v.to_string(),
+                "stopsel" => stop_sel = v.to_string(),
+                _ => {}
+            }
+        }
+    }
+    // Positive query lexemes — Not subtrees excluded.
+    fn collect_positive(ast: &spg_storage::TsQueryAst, out: &mut Vec<String>) {
+        match ast {
+            spg_storage::TsQueryAst::Term { word, .. } => {
+                if !word.is_empty() {
+                    out.push(word.clone());
+                }
+            }
+            spg_storage::TsQueryAst::And(l, r) | spg_storage::TsQueryAst::Or(l, r) => {
+                collect_positive(l, out);
+                collect_positive(r, out);
+            }
+            spg_storage::TsQueryAst::Not(_) => {}
+            spg_storage::TsQueryAst::Phrase { left, right, .. } => {
+                collect_positive(left, out);
+                collect_positive(right, out);
+            }
+        }
+    }
+    let mut terms: Vec<String> = Vec::new();
+    collect_positive(&query, &mut terms);
+    // Scan the document, preserving the original text. Word runs
+    // follow the same alphanumeric-or-underscore rule as
+    // crate::fts::tokenize so headline matches agree with @@.
+    let mut out = String::with_capacity(doc.len() + 16);
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        let lowered: String = word.chars().flat_map(|c| c.to_lowercase()).collect();
+        let lex = match config {
+            crate::fts::TsConfig::Simple => lowered,
+            crate::fts::TsConfig::English => crate::fts::porter_stem(&lowered),
+        };
+        if terms.iter().any(|t| *t == lex) {
+            out.push_str(&start_sel);
+            out.push_str(word);
+            out.push_str(&stop_sel);
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in doc.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    Ok(Value::text(out))
+}

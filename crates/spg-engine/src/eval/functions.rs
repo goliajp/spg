@@ -8995,6 +8995,9 @@ fn apply_function_dispatch(
         // every lexeme. mailrs's migrate-016 search trigger builds
         // its vector as setweight(to_tsvector(…),'A') || ….
         "setweight" => fts_setweight(args),
+        // v7.37.17 (17.6 siblings) — ts_headline([config,] doc,
+        // query [, options]): wrap matched words in StartSel/StopSel.
+        "ts_headline" => fts_ts_headline(args, ctx),
         // v7.24 (round-15) — string_to_array(text, delim): inverse
         // of array_to_string. PG semantics: NULL text → NULL,
         // '' → empty array, NULL delim → one element per char.
