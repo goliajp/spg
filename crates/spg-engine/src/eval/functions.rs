@@ -942,6 +942,7 @@ fn apply_function_dispatch(
         // tx ID as BigInt. txid_ names are pre-PG 13 aliases for
         // the pg_ names.
         "txid_current"
+        | "txid_current_if_assigned"
         | "pg_current_xact_id"
         | "pg_current_xact_id_if_assigned" => {
             // Use next_tx_id as a best-effort scalar surface.
@@ -7643,6 +7644,48 @@ fn apply_function_dispatch(
         // SPG has no async notification channel yet; accept + return
         // void (NULL).
         "pg_notify" => Ok(Value::Null),
+        // getdatabaseencoding() — SPG is UTF-8-only, like
+        // pg_client_encoding / pg_encoding_to_char.
+        "getdatabaseencoding" => Ok(Value::text::<String>("UTF8".into())),
+        // current_schemas(include_implicit) — the effective search
+        // path. SPG is single-schema 'public'; with the implicit
+        // flag PG prepends pg_catalog.
+        "current_schemas" => {
+            let include_implicit = match args.first() {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "current_schemas() takes a BOOL, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut schemas: alloc::vec::Vec<Option<alloc::string::String>> =
+                alloc::vec::Vec::new();
+            if include_implicit {
+                schemas.push(Some("pg_catalog".into()));
+            }
+            schemas.push(Some("public".into()));
+            Ok(Value::TextArray(schemas))
+        }
+        // pg_trigger_depth() — nesting level of trigger execution.
+        // SPG's trigger surface doesn't re-enter; top level = 0.
+        "pg_trigger_depth" => Ok(Value::Int(0)),
+        // pg_jit_available() — SPG has no LLVM JIT.
+        "pg_jit_available" => Ok(Value::Bool(false)),
+        // pg_listening_channels() — LISTEN registrations (SRF).
+        // Scalar surface: NULL (no channels).
+        "pg_listening_channels" => Ok(Value::Null),
+        // Event-trigger context readers — only meaningful inside a
+        // running event trigger; PG errors outside that context,
+        // SPG returns NULL to stay parse-through for tooling.
+        "pg_event_trigger_ddl_commands"
+        | "pg_event_trigger_dropped_objects"
+        | "pg_event_trigger_table_rewrite_oid"
+        | "pg_event_trigger_table_rewrite_reason" => Ok(Value::Null),
         // pg_cancel_backend / pg_terminate_backend — admin-level
         // signal helpers. Return true (as if the cancel took effect).
         "pg_cancel_backend" | "pg_terminate_backend" => Ok(Value::Bool(true)),
