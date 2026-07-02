@@ -3753,6 +3753,178 @@ fn apply_function_dispatch(
                 _ => unreachable!(),
             }
         }
+        // MySQL bare date-component accessors — day / dayofmonth /
+        // month / year / weekday / week. The single most common
+        // MySQL report shape (`SELECT MONTH(created_at) ...`).
+        "day" | "dayofmonth" | "month" | "year" | "weekday" | "week" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let days: i32 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Date(d) => *d,
+                Value::Timestamp(us) => (us.div_euclid(86_400_000_000)) as i32,
+                Value::Text(s) => match super::format::parse_date_literal(s) {
+                    Some(d) => d,
+                    None => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): invalid date {s:?}"
+                            ),
+                        });
+                    }
+                },
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs date, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let (y, m, d) = super::civil_from_days(days);
+            match name {
+                "day" | "dayofmonth" => Ok(Value::Int(d as i32)),
+                "month" => Ok(Value::Int(m as i32)),
+                "year" => Ok(Value::Int(y)),
+                // MySQL WEEKDAY: 0 = Monday .. 6 = Sunday.
+                "weekday" => {
+                    Ok(Value::Int((i64::from(days) + 3).rem_euclid(7) as i32))
+                }
+                // WEEK mode 0: weeks start Sunday; days before the
+                // year's first Sunday are week 0.
+                "week" => {
+                    let jan1 = super::days_from_civil(y, 1, 1);
+                    let wd_sun = (i64::from(jan1) + 4).rem_euclid(7) as i32;
+                    let first_sunday = jan1 + ((7 - wd_sun) % 7);
+                    if days >= first_sunday {
+                        Ok(Value::Int((days - first_sunday) / 7 + 1))
+                    } else {
+                        Ok(Value::Int(0))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        // MySQL bare time-component accessors — hour / minute /
+        // second on time text or timestamps.
+        "hour" | "minute" | "second" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let us: i64 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Timestamp(t) => t.rem_euclid(86_400_000_000),
+                Value::Text(s) => {
+                    // '[-]H:MM:SS[.ffffff]' — reuse the simple split;
+                    // hour may exceed 24 for MySQL TIME values.
+                    let body = s.trim().trim_start_matches('-');
+                    let mut parts = body.split(':');
+                    let h: i64 = parts
+                        .next()
+                        .and_then(|p| p.parse().ok())
+                        .ok_or_else(|| EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): invalid time {s:?}"
+                            ),
+                        })?;
+                    let m: i64 =
+                        parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let sec_part = parts.next().unwrap_or("0");
+                    let sec: i64 = sec_part
+                        .split_once('.')
+                        .map_or(sec_part, |(w, _)| w)
+                        .parse()
+                        .unwrap_or(0);
+                    h * 3_600_000_000 + m * 60_000_000 + sec * 1_000_000
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs time, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            match name {
+                "hour" => Ok(Value::Int((us / 3_600_000_000) as i32)),
+                "minute" => Ok(Value::Int(((us / 60_000_000) % 60) as i32)),
+                "second" => Ok(Value::Int(((us / 1_000_000) % 60) as i32)),
+                _ => unreachable!(),
+            }
+        }
+        // MySQL period_add(P, N) / period_diff(P1, P2) — YYYYMM
+        // period arithmetic.
+        "period_add" | "period_diff" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let period_of = |v: &Value<'_>| -> Option<i64> {
+                let p = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    Value::SmallInt(n) => i64::from(*n),
+                    _ => return None,
+                };
+                // YYMM shorthand → 20YY/19YY like MySQL.
+                let p = if p < 10_000 {
+                    let yy = p / 100;
+                    let mm = p % 100;
+                    if yy < 70 { (2000 + yy) * 100 + mm } else { (1900 + yy) * 100 + mm }
+                } else {
+                    p
+                };
+                Some(p)
+            };
+            let months_of = |p: i64| -> i64 { (p / 100) * 12 + (p % 100) - 1 };
+            match name {
+                "period_add" => {
+                    let (Some(p), n) = (
+                        period_of(&args[0]),
+                        match &args[1] {
+                            Value::Int(n) => i64::from(*n),
+                            Value::BigInt(n) => *n,
+                            Value::SmallInt(n) => i64::from(*n),
+                            _ => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: "period_add() takes integers".into(),
+                                });
+                            }
+                        },
+                    ) else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "period_add() takes integers".into(),
+                        });
+                    };
+                    let total = months_of(p) + n;
+                    Ok(Value::BigInt(
+                        (total.div_euclid(12)) * 100 + total.rem_euclid(12) + 1,
+                    ))
+                }
+                "period_diff" => {
+                    let (Some(a), Some(b)) =
+                        (period_of(&args[0]), period_of(&args[1]))
+                    else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "period_diff() takes integers".into(),
+                        });
+                    };
+                    Ok(Value::BigInt(months_of(a) - months_of(b)))
+                }
+                _ => unreachable!(),
+            }
+        }
         // MySQL time-of-day arithmetic — time_to_sec / sec_to_time /
         // maketime / addtime / subtime / timediff / microsecond.
         // SPG carries TIME as text; these parse '[-]H:MM:SS[.ffffff]'
