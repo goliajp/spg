@@ -3667,6 +3667,150 @@ fn apply_function_dispatch(
         // doesn't store infinite date/timestamp sentinels, so
         // everything stored is finite → true. Float args check
         // f64::is_finite for the numeric overload some drivers emit.
+        // MySQL date accessors — dayname / monthname / dayofweek /
+        // dayofyear / weekofyear / last_day / datediff. All real,
+        // computed on days-since-epoch via civil_from_days.
+        "dayname" | "monthname" | "dayofweek" | "dayofyear" | "weekofyear"
+        | "last_day" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let days: i32 = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Date(d) => *d,
+                Value::Timestamp(us) => {
+                    (us.div_euclid(86_400_000_000)) as i32
+                }
+                Value::Text(s) => {
+                    match super::format::parse_date_literal(s) {
+                        Some(d) => d,
+                        None => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "{name}(): invalid date {s:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs date, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let (y, m, d) = super::civil_from_days(days);
+            match name {
+                "dayname" => {
+                    const NAMES: [&str; 7] = [
+                        "Monday", "Tuesday", "Wednesday", "Thursday",
+                        "Friday", "Saturday", "Sunday",
+                    ];
+                    // 1970-01-01 was a Thursday (index 3).
+                    let idx = (i64::from(days) + 3).rem_euclid(7) as usize;
+                    Ok(Value::text::<String>(NAMES[idx].into()))
+                }
+                "monthname" => {
+                    const NAMES: [&str; 12] = [
+                        "January", "February", "March", "April", "May",
+                        "June", "July", "August", "September", "October",
+                        "November", "December",
+                    ];
+                    Ok(Value::text::<String>(NAMES[m as usize - 1].into()))
+                }
+                "dayofweek" => {
+                    // MySQL: 1 = Sunday .. 7 = Saturday.
+                    let idx = (i64::from(days) + 4).rem_euclid(7);
+                    Ok(Value::Int(idx as i32 + 1))
+                }
+                "dayofyear" => {
+                    let jan1 = super::days_from_civil(y, 1, 1);
+                    Ok(Value::Int(days - jan1 + 1))
+                }
+                "weekofyear" => {
+                    // ISO 8601 week number: the week containing the
+                    // year's first Thursday is week 1.
+                    let weekday = (i64::from(days) + 3).rem_euclid(7) as i32; // 0=Mon
+                    let thursday = days + (3 - weekday);
+                    let (ty, ..) = super::civil_from_days(thursday);
+                    let jan1 = super::days_from_civil(ty, 1, 1);
+                    Ok(Value::Int((thursday - jan1) / 7 + 1))
+                }
+                "last_day" => {
+                    let next_month = if m == 12 {
+                        super::days_from_civil(y + 1, 1, 1)
+                    } else {
+                        super::days_from_civil(y, m + 1, 1)
+                    };
+                    let _ = d;
+                    Ok(Value::Date(next_month - 1))
+                }
+                _ => unreachable!(),
+            }
+        }
+        // MySQL datediff(a, b) — a - b in days (date parts only).
+        "datediff" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "datediff() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let to_days = |v: &Value<'_>| -> Result<Option<i32>, EvalError> {
+                match v {
+                    Value::Null => Ok(None),
+                    Value::Date(d) => Ok(Some(*d)),
+                    Value::Timestamp(us) => {
+                        Ok(Some(us.div_euclid(86_400_000_000) as i32))
+                    }
+                    Value::Text(s) => super::format::parse_date_literal(s)
+                        .map(Some)
+                        .ok_or_else(|| EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "datediff(): invalid date {s:?}"
+                            ),
+                        }),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "datediff() needs dates, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            match (to_days(&args[0])?, to_days(&args[1])?) {
+                (Some(a), Some(b)) => Ok(Value::Int(a - b)),
+                _ => Ok(Value::Null),
+            }
+        }
+        // MySQL strcmp(a, b) — -1 / 0 / 1 string comparison.
+        "strcmp" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("strcmp() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(a), Value::Text(b)) => {
+                    Ok(Value::Int(match a.as_ref().cmp(b.as_ref()) {
+                        core::cmp::Ordering::Less => -1,
+                        core::cmp::Ordering::Equal => 0,
+                        core::cmp::Ordering::Greater => 1,
+                    }))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "strcmp() takes 2 TEXT args".into(),
+                }),
+            }
+        }
         "isfinite" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {

@@ -194,6 +194,7 @@ mod e2e_crypt;
 mod e2e_armor;
 mod e2e_mysql_string_fns;
 mod e2e_mysql_conv_fns;
+mod e2e_mysql_date_fns;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
