@@ -8615,6 +8615,8 @@ fn apply_function_dispatch(
             crate::json::mysql_json_merge_preserve(args)
         }
         "json_overlaps" => crate::json::mysql_json_overlaps(args),
+        "json_search" => crate::json::mysql_json_search(args),
+        "json_value" => crate::json::mysql_json_value(args),
         // v7.37.17 (17.6 siblings) — MySQL non-path JSON functions.
         "json_valid" => {
             if args.len() != 1 {
