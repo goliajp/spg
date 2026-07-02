@@ -6249,6 +6249,8 @@ fn apply_function_dispatch(
         // date_format.
         "str_to_date" => super::datetime::str_to_date_mysql(args),
         "time_format" => super::datetime::time_format_mysql(args),
+        "timestampadd" => super::datetime::timestampadd_mysql(args),
+        "timestampdiff" => super::datetime::timestampdiff_mysql(args),
         "unix_timestamp" => unix_timestamp_of(args),
         "from_unixtime" => from_unixtime(args),
         // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.

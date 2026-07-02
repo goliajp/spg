@@ -742,3 +742,214 @@ pub(super) fn time_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
     };
     date_format_mysql(&[Value::Timestamp(day_micros), args[1].clone().into_owned()])
 }
+
+/// Micros-per-unit for the fixed-length MySQL interval units.
+fn unit_micros(unit: &str) -> Option<i64> {
+    Some(match unit {
+        "microsecond" => 1,
+        "second" => 1_000_000,
+        "minute" => 60_000_000,
+        "hour" => 3_600_000_000,
+        "day" => 86_400_000_000,
+        "week" => 7 * 86_400_000_000,
+        _ => return None,
+    })
+}
+
+fn ts_of(v: &Value<'_>, fn_name: &str) -> Result<i64, EvalError> {
+    match v {
+        Value::Timestamp(t) => Ok(*t),
+        Value::Date(d) => Ok(i64::from(*d) * 86_400_000_000),
+        // MySQL accepts string datetimes everywhere a DATETIME is
+        // expected — parse 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]'.
+        Value::Text(s) => parse_text_datetime(s).ok_or_else(|| EvalError::TypeMismatch {
+            detail: format!("{fn_name}(): cannot parse datetime {s:?}"),
+        }),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{fn_name}() needs DATE or TIMESTAMP, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+/// Parse 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]' into epoch micros.
+fn parse_text_datetime(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.split_once(' ') {
+        Some((d, t)) => (d, Some(t)),
+        None => match s.split_once('T') {
+            Some((d, t)) => (d, Some(t)),
+            None => (s, None),
+        },
+    };
+    let mut dp = date_part.splitn(3, '-');
+    let y: i32 = dp.next()?.parse().ok()?;
+    let mo: u32 = dp.next()?.parse().ok()?;
+    let d: u32 = dp.next()?.parse().ok()?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    let mut micros = i64::from(days) * 86_400_000_000;
+    if let Some(t) = time_part {
+        let mut tp = t.splitn(3, ':');
+        let h: i64 = tp.next()?.parse().ok()?;
+        let mi: i64 = tp.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let (sec, us): (i64, i64) = match tp.next() {
+            None => (0, 0),
+            Some(rest) => match rest.split_once('.') {
+                None => (rest.parse().ok()?, 0),
+                Some((si, sf)) => {
+                    let mut frac = String::from(sf);
+                    while frac.len() < 6 {
+                        frac.push('0');
+                    }
+                    frac.truncate(6);
+                    (si.parse().ok()?, frac.parse().ok()?)
+                }
+            },
+        };
+        if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&sec) {
+            return None;
+        }
+        micros += h * 3_600_000_000 + mi * 60_000_000 + sec * 1_000_000 + us;
+    }
+    Some(micros)
+}
+
+/// Shift a timestamp by n calendar months (day-of-month clamps to
+/// the target month's length, MySQL behaviour).
+fn add_months(ts: i64, n: i64) -> i64 {
+    let days = ts.div_euclid(86_400_000_000);
+    let day_micros = ts.rem_euclid(86_400_000_000);
+    let (y, m, d) = civil_from_days(i32::try_from(days).unwrap_or(i32::MAX));
+    let total = i64::from(y) * 12 + i64::from(m) - 1 + n;
+    let ny = i32::try_from(total.div_euclid(12)).unwrap_or(i32::MAX);
+    let nm = u32::try_from(total.rem_euclid(12)).unwrap_or(0) + 1;
+    let month_len = |y: i32, m: u32| -> u32 {
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                    29
+                } else {
+                    28
+                }
+            }
+        }
+    };
+    let nd = d.min(month_len(ny, nm));
+    i64::from(days_from_civil(ny, nm, nd)) * 86_400_000_000 + day_micros
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL TIMESTAMPADD(unit, n, datetime).
+/// The parser lowers the bare unit keyword onto a string literal.
+pub(super) fn timestampadd_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("timestampadd() takes 3 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(unit) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "timestampadd() unit must be a keyword, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    let n = match &args[1] {
+        Value::Int(v) => i64::from(*v),
+        Value::SmallInt(v) => i64::from(*v),
+        Value::BigInt(v) => *v,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "timestampadd() count must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let ts = ts_of(&args[2], "timestampadd")?;
+    let unit_lc = unit.to_ascii_lowercase();
+    let out = if let Some(per) = unit_micros(&unit_lc) {
+        ts.saturating_add(n.saturating_mul(per))
+    } else {
+        match unit_lc.as_str() {
+            "month" => add_months(ts, n),
+            "quarter" => add_months(ts, n.saturating_mul(3)),
+            "year" => add_months(ts, n.saturating_mul(12)),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("timestampadd(): unknown unit {other:?}"),
+                });
+            }
+        }
+    };
+    Ok(Value::Timestamp(out))
+}
+
+/// v7.37.17 (17.6 siblings) — MySQL TIMESTAMPDIFF(unit, from, to):
+/// the count of COMPLETE units from `from` to `to` (signed).
+pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("timestampdiff() takes 3 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(unit) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "timestampdiff() unit must be a keyword, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    let from = ts_of(&args[1], "timestampdiff")?;
+    let to = ts_of(&args[2], "timestampdiff")?;
+    let unit_lc = unit.to_ascii_lowercase();
+    let out = if let Some(per) = unit_micros(&unit_lc) {
+        (to - from) / per
+    } else {
+        let months_between = |from: i64, to: i64| -> i64 {
+            // Count complete months: advance from `from` while the
+            // shifted point stays ≤ `to` (mirrored for negatives).
+            let sign = if to >= from { 1 } else { -1 };
+            let (lo, hi) = if sign > 0 { (from, to) } else { (to, from) };
+            let (ly, lm, _) = civil_from_days(
+                i32::try_from(lo.div_euclid(86_400_000_000)).unwrap_or(0),
+            );
+            let (hy, hm, _) = civil_from_days(
+                i32::try_from(hi.div_euclid(86_400_000_000)).unwrap_or(0),
+            );
+            let mut approx =
+                (i64::from(hy) * 12 + i64::from(hm)) - (i64::from(ly) * 12 + i64::from(lm));
+            // Adjust down while the full-month shift overshoots.
+            while approx > 0 && add_months(lo, approx) > hi {
+                approx -= 1;
+            }
+            sign * approx
+        };
+        match unit_lc.as_str() {
+            "month" => months_between(from, to),
+            "quarter" => months_between(from, to) / 3,
+            "year" => months_between(from, to) / 12,
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("timestampdiff(): unknown unit {other:?}"),
+                });
+            }
+        }
+    };
+    Ok(Value::BigInt(out))
+}
