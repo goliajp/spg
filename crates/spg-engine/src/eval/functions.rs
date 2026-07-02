@@ -4740,6 +4740,63 @@ fn apply_function_dispatch(
             };
             Ok(Value::Float(r))
         }
+        // cot(x) — cotangent. PG builtin missing from the trig
+        // batch above.
+        "cot" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("cot() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let x = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cot() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            Ok(Value::Float(1.0 / libm::tan(x)))
+        }
+        // log2(x) — base-2 logarithm (not PG builtin but MySQL-compat
+        // + common in analytics SQL).
+        "log2" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("log2() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let x = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(f) => *f,
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "log2() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if x <= 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "log2(): argument must be positive, got {x}"
+                    ),
+                });
+            }
+            Ok(Value::Float(libm::log2(x)))
+        }
         // atan2(y, x) takes 2 args.
         "atan2" => {
             if args.len() != 2 {
