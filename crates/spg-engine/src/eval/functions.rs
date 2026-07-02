@@ -8876,7 +8876,20 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // json_set serves two dialects: MySQL's '$.x' string paths
+        // route to the MySQL mutator; PG's text-array path spelling
+        // ('{a,b}') stays on crate::json::set.
+        "jsonb_set" | "json_set"
+            if args.len() >= 3
+                && matches!(&args[1], Value::Text(p) if p.trim_start().starts_with('$')) =>
+        {
+            crate::json::mysql_json_set(args)
+        }
         "jsonb_set" | "json_set" => crate::json::set(args),
+        // v7.37.17 (17.6 siblings) — MySQL JSON mutation family on
+        // the '$.x' path machinery.
+        "json_replace" => crate::json::mysql_json_replace(args),
+        "json_remove" => crate::json::mysql_json_remove(args),
         // jsonb_set_lax — jsonb_set with configurable SQL-NULL
         // new_value handling (PG 13+). Treatments:
         //   use_json_null (default) / raise_exception /
@@ -9114,6 +9127,13 @@ fn apply_function_dispatch(
         // v7.37.17 (17.6 siblings) — jsonb_delete_path: function
         // form of the #- operator.
         "jsonb_delete_path" | "json_delete_path" => crate::json::delete_path(args),
+        // Same two-dialect routing as json_set above.
+        "jsonb_insert" | "json_insert"
+            if args.len() >= 3
+                && matches!(&args[1], Value::Text(p) if p.trim_start().starts_with('$')) =>
+        {
+            crate::json::mysql_json_insert(args)
+        }
         "jsonb_insert" | "json_insert" => crate::json::insert(args),
         // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
         // v7.37.17 (17.6 siblings) — jsonb_concat / jsonb_delete —
