@@ -125,6 +125,7 @@ mod e2e_range_agg;
 mod e2e_range_intersect_agg;
 mod e2e_derived_table;
 mod e2e_from_values;
+mod e2e_bare_values;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
