@@ -122,6 +122,31 @@ fn parenthesized_groups_override_precedence() {
 }
 
 #[test]
+fn group_internal_order_by_and_limit() {
+    let mut e = Engine::new();
+    setup(&mut e);
+    // The group's LIMIT applies inside the parens: top-2 of r
+    // ordered desc = {4, 3}, then UNION with {1} = {1, 3, 4}.
+    assert_eq!(
+        ints(
+            &mut e,
+            "(SELECT x FROM r ORDER BY x DESC LIMIT 2) UNION SELECT 1 \
+             ORDER BY 1"
+        ),
+        [1, 3, 4]
+    );
+    // Peer-position group with its own LIMIT: {1} ∪ top-1 of l
+    // ascending = {1} ∪ {1} → dedup {1}.
+    assert_eq!(
+        ints(
+            &mut e,
+            "SELECT 1 UNION (SELECT x FROM l ORDER BY x LIMIT 1)"
+        ),
+        [1]
+    );
+}
+
+#[test]
 fn chains_with_union() {
     let mut e = Engine::new();
     setup(&mut e);

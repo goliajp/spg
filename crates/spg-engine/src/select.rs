@@ -1678,10 +1678,32 @@ impl Engine {
         // Eval against the projected schema (NOT the source table).
         if !stmt.order_by.is_empty() {
             let synth_ctx = EvalContext::new(&columns, None);
-            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            // v7.37.17 (17.6 siblings) — positional keys (ORDER BY 1)
+            // survive to here when the head projects a Wildcard (the
+            // group-tail wrapper shape): map them onto the Nth
+            // projected column so the combined sort works.
+            let resolved_order: Vec<spg_sql::ast::OrderBy> = stmt
+                .order_by
+                .iter()
+                .map(|o| {
+                    let mut o = o.clone();
+                    if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
+                        && *n >= 1
+                        && let Ok(idx) = usize::try_from(*n - 1)
+                        && idx < columns.len()
+                    {
+                        o.expr = Expr::Column(spg_sql::ast::ColumnName {
+                            qualifier: None,
+                            name: columns[idx].name.clone(),
+                        });
+                    }
+                    o
+                })
+                .collect();
+            let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
             let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
-                let keys = build_order_keys(&stmt.order_by, &r, &synth_ctx)?;
+                let keys = build_order_keys(&resolved_order, &r, &synth_ctx)?;
                 tagged.push((keys, r));
             }
             sort_by_keys(&mut tagged, &descs);
