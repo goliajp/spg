@@ -101,6 +101,7 @@ mod e2e_jsonb_array_elements;
 mod e2e_jsonb_each;
 mod e2e_jsonb_object_keys_from;
 mod e2e_generate_subscripts;
+mod e2e_string_to_table;
 mod e2e_array_to_json;
 mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;

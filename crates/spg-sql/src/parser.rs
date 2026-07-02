@@ -9603,7 +9603,9 @@ impl Parser {
                     || s.eq_ignore_ascii_case("json_array_elements_text")
                     || s.eq_ignore_ascii_case("jsonb_object_keys")
                     || s.eq_ignore_ascii_case("json_object_keys")
-                    || s.eq_ignore_ascii_case("generate_subscripts"))
+                    || s.eq_ignore_ascii_case("generate_subscripts")
+                    || s.eq_ignore_ascii_case("string_to_table")
+                    || s.eq_ignore_ascii_case("regexp_split_to_table"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             let fn_name = match self.peek() {
@@ -9646,12 +9648,20 @@ impl Parser {
                 alias_ident.clone().unwrap_or_else(|| fn_name.clone())
             };
             let col_name = column_aliases.first().cloned().unwrap_or(natural_col);
+            // The *_to_table SRFs are row-streams over the existing
+            // *_to_array scalars — map the call target; the display
+            // name (alias / column defaults) keeps the SRF spelling.
+            let call_name = match fn_name.as_str() {
+                "string_to_table" => "string_to_array".to_string(),
+                "regexp_split_to_table" => "regexp_split_to_array".to_string(),
+                _ => fn_name,
+            };
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(crate::ast::Expr::FunctionCall {
-                    name: fn_name,
+                    name: call_name,
                     args: fn_args,
                 })),
                 unnest_column_aliases: alloc::vec![col_name],
