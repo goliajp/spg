@@ -90,6 +90,26 @@ impl Engine {
                 alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)],
             ));
         }
+        // v7.37.17 (17.6 siblings) — derived table (`FROM ( SELECT …
+        // ) alias`) joined with other tables: materialise the inner
+        // SELECT once through the union-aware executor. Correlated
+        // (true LATERAL) refs never reach here — join.rs routes them
+        // through the per-outer-row machinery before materialising.
+        if let Some(inner) = tref.lateral_subquery.as_deref() {
+            let crate::QueryResult::Rows { mut columns, rows } =
+                self.exec_select_cancel(inner, crate::CancelToken::none())?
+            else {
+                return Err(EngineError::Unsupported(
+                    "derived table subquery must return rows".into(),
+                ));
+            };
+            for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = columns.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            return Ok((rows, columns));
+        }
         let table =
             self.active_catalog()
                 .get(&tref.name)

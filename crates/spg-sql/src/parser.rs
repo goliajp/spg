@@ -9544,7 +9544,10 @@ impl Parser {
                 )));
             }
             self.advance();
-            let alias_ident = self.parse_optional_alias();
+            // `AS t(a, b)` column-alias list rides the
+            // unnest_column_aliases field (same positional-rename
+            // contract the unnest SRFs use).
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "subquery".to_string());
@@ -9553,7 +9556,7 @@ impl Parser {
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: None,
-                unnest_column_aliases: Vec::new(),
+                unnest_column_aliases: column_aliases,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
