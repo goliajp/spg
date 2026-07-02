@@ -7800,6 +7800,9 @@ fn apply_function_dispatch(
         }
         // v7.17.0 Phase 3.7 — PG regex function family.
         "regexp_matches" => regexp_matches(args),
+        // PG 10+ singular form: first match as text[], NULL when
+        // no match.
+        "regexp_match" => super::regexp::regexp_match(args),
         "regexp_replace" => regexp_replace(args),
         "regexp_split_to_array" => regexp_split_to_array(args),
         // v7.37.17 (17.6 siblings) — PG 15+ regexp family.

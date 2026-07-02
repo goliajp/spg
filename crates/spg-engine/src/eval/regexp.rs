@@ -324,13 +324,11 @@ fn re_match_at(node: &ReNode, s: &[char], pos: usize) -> Option<usize> {
                 None
             }
         }
-        ReNode::Concat(items) => {
-            let mut p = pos;
-            for it in items {
-                p = re_match_at(it, s, p)?;
-            }
-            Some(p)
-        }
+        // v7.37.17 (17.6 siblings) — Concat delegates to the
+        // backtracking sequence matcher so quantifiers can shrink
+        // when the tail fails ('bar.*que' now matches 'barbeque';
+        // the old v7.17 stop-gap was greedy-without-backtracking).
+        ReNode::Concat(items) => re_match_seq(items, s, pos),
         ReNode::Alt(branches) => {
             for b in branches {
                 if let Some(p) = re_match_at(b, s, pos) {
@@ -340,10 +338,9 @@ fn re_match_at(node: &ReNode, s: &[char], pos: usize) -> Option<usize> {
             None
         }
         ReNode::Quant { inner, min, max } => {
-            // Greedy: gather as many matches as possible, then
-            // shrink. v7.17 stop-gap doesn't continue the outer
-            // tail match (we're at a leaf in concat already), so
-            // we just return the longest match.
+            // Standalone quantifier (no tail) — the longest match
+            // IS correct here; tail interaction is handled by
+            // re_match_seq.
             let mut count = 0usize;
             let mut p = pos;
             loop {
@@ -364,6 +361,74 @@ fn re_match_at(node: &ReNode, s: &[char], pos: usize) -> Option<usize> {
                 return None;
             }
             Some(p)
+        }
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — backtracking sequence matcher.
+/// Matches `items` in order starting at `pos`; greedy quantifiers
+/// try their longest expansion first and shrink until the rest of
+/// the sequence matches. Alternations retry the tail per branch.
+fn re_match_seq(items: &[ReNode], s: &[char], pos: usize) -> Option<usize> {
+    let Some((first, rest)) = items.split_first() else {
+        return Some(pos);
+    };
+    match first {
+        ReNode::Quant { inner, min, max } => {
+            // Enumerate every reachable end position (0, 1, 2, ...
+            // repetitions), then try the tail longest-first.
+            let mut ends = alloc::vec![pos];
+            let mut p = pos;
+            let mut count = 0usize;
+            loop {
+                if let Some(cap) = max {
+                    if count >= *cap {
+                        break;
+                    }
+                }
+                match re_match_at(inner, s, p) {
+                    Some(np) if np > p => {
+                        p = np;
+                        count += 1;
+                        ends.push(p);
+                    }
+                    _ => break,
+                }
+            }
+            for (reps, &end) in ends.iter().enumerate().rev() {
+                if reps < *min {
+                    break;
+                }
+                if let Some(e) = re_match_seq(rest, s, end) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        ReNode::Alt(branches) => {
+            for b in branches {
+                // Each branch may itself contain quantifiers —
+                // match it standalone, then retry the tail.
+                if let Some(p) = re_match_at(b, s, pos) {
+                    if let Some(e) = re_match_seq(rest, s, p) {
+                        return Some(e);
+                    }
+                }
+            }
+            None
+        }
+        ReNode::Concat(nested) => {
+            // Flatten: nested ++ rest, preserving backtracking
+            // across the boundary.
+            let mut combined: alloc::vec::Vec<ReNode> =
+                alloc::vec::Vec::with_capacity(nested.len() + rest.len());
+            combined.extend(nested.iter().cloned());
+            combined.extend(rest.iter().cloned());
+            re_match_seq(&combined, s, pos)
+        }
+        other => {
+            let p = re_match_at(other, s, pos)?;
+            re_match_seq(rest, s, p)
         }
     }
 }
@@ -427,6 +492,37 @@ pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         }
     }
     Ok(Value::TextArray(out))
+}
+
+/// v7.37.17 (17.6 siblings) — PG 10+ `regexp_match(s, pat[, flags])`
+/// (singular): the FIRST match as a 1-element text[], or SQL NULL
+/// when nothing matches. SPG's regex engine reports whole-match
+/// spans (capture-group extraction queues with the regex epic), so
+/// the array holds the whole match — identical to PG for patterns
+/// without parenthesized groups.
+pub(super) fn regexp_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let (text, pat) = match args.len() {
+        2 | 3 => (text_arg(&args[0])?, text_arg(&args[1])?),
+        n => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("regexp_match() takes 2 or 3 args, got {n}"),
+            });
+        }
+    };
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    match re_find(&node, &chars, 0) {
+        Some((s_pos, e_pos)) => Ok(Value::TextArray(alloc::vec![Some(
+            chars[s_pos..e_pos].iter().collect(),
+        )])),
+        None => Ok(Value::Null),
+    }
 }
 
 /// v7.17.0 Phase 3.7 — `regexp_replace(s, pat, repl[, flags])`.
