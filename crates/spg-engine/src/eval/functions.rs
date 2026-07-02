@@ -8367,10 +8367,118 @@ fn apply_function_dispatch(
         | "pg_last_wal_replay_lsn" => Ok(Value::text::<String>("0/0".into())),
         // pg_last_xact_replay_timestamp — replica lag probe.
         "pg_last_xact_replay_timestamp" => Ok(Value::Null),
-        // Range comparison helpers.
-        "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => Ok(Value::Bool(false)),
-        // Container empty check for ranges.
-        "isempty" => Ok(Value::Bool(false)),
+        // Range bound predicates — real text-form parsing. SPG
+        // stores ranges in PG's canonical text form '[a,b)' /
+        // '(a,b]' / 'empty'; the predicates read the brackets and
+        // bound emptiness directly. (These returned constant false
+        // before, which was wrong for the canonical '[a,b)' form
+        // where lower_inc is true.)
+        "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" | "isempty" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let s = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.trim(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs range text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if s.eq_ignore_ascii_case("empty") {
+                // PG: all four bound predicates are false on the
+                // empty range; isempty is true.
+                return Ok(Value::Bool(name == "isempty"));
+            }
+            if name == "isempty" {
+                return Ok(Value::Bool(false));
+            }
+            // Split '[lo,hi)' into (bracket, lo, hi, closer).
+            let opener = s.chars().next();
+            let closer = s.chars().last();
+            let inner = &s[1..s.len().saturating_sub(1)];
+            let (lo, hi) = inner.split_once(',').unwrap_or((inner, ""));
+            let result = match name {
+                "lower_inc" => opener == Some('[') && !lo.trim().is_empty(),
+                "upper_inc" => closer == Some(']') && !hi.trim().is_empty(),
+                "lower_inf" => lo.trim().is_empty(),
+                "upper_inf" => hi.trim().is_empty(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Bool(result))
+        }
+        // range_merge(a, b) — the smallest range containing both.
+        // Numeric bounds compare numerically, others lexically.
+        "range_merge" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "range_merge() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let (a, b) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(a), Value::Text(b)) => (a.trim(), b.trim()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "range_merge() takes 2 range TEXT args".into(),
+                    });
+                }
+            };
+            if a.eq_ignore_ascii_case("empty") {
+                return Ok(Value::text(b.to_string()));
+            }
+            if b.eq_ignore_ascii_case("empty") {
+                return Ok(Value::text(a.to_string()));
+            }
+            // (opener, lo, hi, closer) from '[lo,hi)'.
+            fn split_range(s: &str) -> (char, &str, &str, char) {
+                let opener = s.chars().next().unwrap_or('[');
+                let closer = s.chars().last().unwrap_or(')');
+                let inner = &s[1..s.len().saturating_sub(1)];
+                let (lo, hi) = inner.split_once(',').unwrap_or((inner, ""));
+                (opener, lo.trim(), hi.trim(), closer)
+            }
+            // less-than for bounds: numeric when both parse, else
+            // lexicographic.
+            fn bound_lt(x: &str, y: &str) -> bool {
+                match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(fx), Ok(fy)) => fx < fy,
+                    _ => x < y,
+                }
+            }
+            let (op_a, lo_a, hi_a, cl_a) = split_range(a);
+            let (op_b, lo_b, hi_b, cl_b) = split_range(b);
+            // Lower bound: -inf (empty) wins; then the smaller
+            // value; on tie the inclusive bracket wins.
+            let (lo, op) = if lo_a.is_empty() || lo_b.is_empty() {
+                ("", '(')
+            } else if bound_lt(lo_a, lo_b) {
+                (lo_a, op_a)
+            } else if bound_lt(lo_b, lo_a) {
+                (lo_b, op_b)
+            } else {
+                (lo_a, if op_a == '[' || op_b == '[' { '[' } else { '(' })
+            };
+            let (hi, cl) = if hi_a.is_empty() || hi_b.is_empty() {
+                ("", ')')
+            } else if bound_lt(hi_b, hi_a) {
+                (hi_a, cl_a)
+            } else if bound_lt(hi_a, hi_b) {
+                (hi_b, cl_b)
+            } else {
+                (hi_a, if cl_a == ']' || cl_b == ']' { ']' } else { ')' })
+            };
+            Ok(Value::text(alloc::format!("{op}{lo},{hi}{cl}")))
+        }
         // v7.37.14 (B6.5) — PG `pg_blocking_pids(pid)` returns the
         // array of pids currently blocking `pid`. SPG's single-
         // writer + Arc-snapshot model means there is no per-tuple
