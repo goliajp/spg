@@ -190,6 +190,7 @@ mod e2e_session_probes;
 mod e2e_xmltext_concat;
 mod e2e_pageinspect_probes;
 mod e2e_logical_decoding_probes;
+mod e2e_crypt;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

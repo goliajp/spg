@@ -60,11 +60,13 @@ fn gen_random_bytes_null_passthrough() {
 }
 
 #[test]
-fn gen_salt_returns_stub_text() {
+fn gen_salt_md5_real_salt() {
+    // Upgraded from stub: gen_salt('md5') is a real random salt
+    // now; 'bf' errors until blowfish lands (see e2e_crypt.rs).
     let mut e = Engine::new();
-    match first(&mut e, "SELECT gen_salt('bf')") {
+    match first(&mut e, "SELECT gen_salt('md5')") {
         spg_storage::Value::Text(s) => {
-            assert!(!s.is_empty());
+            assert!(s.starts_with("$1$") && s.ends_with('$'));
         }
         other => panic!("got {other:?}"),
     }
