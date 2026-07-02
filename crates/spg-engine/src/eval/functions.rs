@@ -1984,7 +1984,8 @@ fn apply_function_dispatch(
         // seeded from wall-clock on Engine construction and is
         // fine for auth-token style usage. Real system-entropy
         // hardening queues with the crypto epic.
-        "gen_random_bytes" => {
+        // "random_bytes" is MySQL's spelling of gen_random_bytes.
+        "gen_random_bytes" | "random_bytes" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -2439,6 +2440,159 @@ fn apply_function_dispatch(
             }
             Ok(Value::text(hex))
         }
+        // v7.37.17 (17.6 siblings) — MySQL TO_BASE64 / FROM_BASE64.
+        // MySQL wraps the encoded form at 76 chars per line; the
+        // decoder tolerates whitespace. FROM_BASE64 returns binary
+        // (Bytes); invalid input → NULL, not an error.
+        "to_base64" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("to_base64() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(_) | Value::Bytes(_) => {
+                    let encoded = super::encoding::encode_text(&[
+                        args[0].clone().into_owned(),
+                        Value::text(alloc::string::String::from("base64")),
+                    ])?;
+                    let Value::Text(flat) = encoded else {
+                        unreachable!("encode_text returns Text");
+                    };
+                    let mut wrapped = alloc::string::String::with_capacity(flat.len() + 8);
+                    for (i, c) in flat.chars().enumerate() {
+                        if i > 0 && i % 76 == 0 {
+                            wrapped.push('\n');
+                        }
+                        wrapped.push(c);
+                    }
+                    Ok(Value::text(wrapped))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "to_base64() needs text or bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "from_base64" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("from_base64() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let compact: alloc::string::String =
+                        s.chars().filter(|c| !c.is_whitespace()).collect();
+                    match super::encoding::decode_text(&[
+                        Value::text(compact),
+                        Value::text(alloc::string::String::from("base64")),
+                    ]) {
+                        Ok(Value::Text(t)) => {
+                            Ok(Value::Bytes(t.as_bytes().to_vec().into()))
+                        }
+                        Ok(other) => Ok(other),
+                        // MySQL: invalid base64 → NULL.
+                        Err(_) => Ok(Value::Null),
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "from_base64() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.37.17 (17.6 siblings) — MySQL SHA(str) (hex text — MySQL
+        // semantics, unlike PG's bytes-returning sha1) and
+        // SHA2(str, bits) with bits 0|224|256|384|512 (0 = 256).
+        "sha" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("sha() takes 1 arg, got {}", args.len()),
+                });
+            }
+            use sha1::{Digest, Sha1};
+            let input: &[u8] = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "sha() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let mut h = Sha1::new();
+            h.update(input);
+            let mut hex = alloc::string::String::with_capacity(40);
+            for b in h.finalize() {
+                hex.push_str(&alloc::format!("{b:02x}"));
+            }
+            Ok(Value::text(hex))
+        }
+        "sha2" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("sha2() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+            let input: &[u8] = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytes(b) => b.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "sha2() needs text or bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let bits = match &args[1] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "sha2() bits must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let digest: alloc::vec::Vec<u8> = match bits {
+                0 | 256 => Sha256::digest(input).to_vec(),
+                224 => Sha224::digest(input).to_vec(),
+                384 => Sha384::digest(input).to_vec(),
+                512 => Sha512::digest(input).to_vec(),
+                // MySQL: unsupported bit length → NULL.
+                _ => return Ok(Value::Null),
+            };
+            let mut hex = alloc::string::String::with_capacity(digest.len() * 2);
+            for b in digest {
+                hex.push_str(&alloc::format!("{b:02x}"));
+            }
+            Ok(Value::text(hex))
+        }
+        // MySQL LOAD_FILE: NULL without the FILE privilege /
+        // secure_file_priv access — the shape unprivileged clients
+        // always see. SPG does not expose host-filesystem reads
+        // through SQL.
+        "load_file" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — PG cryptographic hash functions.
         // sha1 is already in the dep graph (users.rs MySQL auth);
         // sha2 provides sha224/sha256/sha384/sha512. Hex output
