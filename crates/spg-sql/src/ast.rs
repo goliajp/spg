@@ -2374,7 +2374,12 @@ pub struct TableRef {
     /// / `lateral_subquery`. The optional `LATERAL` keyword does not
     /// require a separate flag — the executor evaluates per-row
     /// whenever the join sits in a JoinKind context.
-    pub jsonb_each_text_arg: Option<Box<Expr>>,
+    ///
+    /// v7.37.17 (17.6 siblings) — the tuple's first slot carries the
+    /// lowercase SRF name (`jsonb_each` / `jsonb_each_text` /
+    /// `json_each` / `json_each_text`) so the executor picks the
+    /// value-column rendering (JSON text vs unwrapped text).
+    pub jsonb_each_text_arg: Option<(String, Box<Expr>)>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of

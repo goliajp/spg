@@ -2282,21 +2282,28 @@ impl Engine {
         primary: &TableRef,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let arg_expr = primary
+        let (each_fn, arg_expr) = primary
             .jsonb_each_text_arg
-            .as_deref()
+            .as_ref()
+            .map(|(name, expr)| (name.as_str(), expr.as_ref()))
             .expect("caller guards jsonb_each_text_arg.is_some()");
+        // v7.37.17 (17.6 siblings) — the plain jsonb_each / json_each
+        // forms keep JSON rendering in the value column (JSON null
+        // stays jsonb 'null', strings keep their quotes).
+        let as_text = each_fn.ends_with("_text");
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
         let ctx = EvalContext::new(&empty_schema, None);
         let dummy_row = Row::new(alloc::vec::Vec::new());
         let arg_value = eval::eval_expr(arg_expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
-        let pairs = crate::json::jsonb_each_text_rows(&arg_value).map_err(EngineError::Eval)?;
+        let pairs =
+            crate::json::each_rows(&arg_value, as_text, each_fn).map_err(EngineError::Eval)?;
         let rows: alloc::vec::Vec<Row<'static>> = pairs
             .into_iter()
             .map(|(k, v)| {
                 let key_val = Value::text(k);
                 let value_val = match v {
-                    Some(s) => Value::text(s),
+                    Some(s) if as_text => Value::text(s),
+                    Some(s) => Value::Json(alloc::borrow::Cow::Owned(s)),
                     None => Value::Null,
                 };
                 Row::new(alloc::vec![key_val, value_val])
@@ -2305,9 +2312,14 @@ impl Engine {
         let alias = primary
             .alias
             .clone()
-            .unwrap_or_else(|| "jsonb_each_text".to_string());
+            .unwrap_or_else(|| each_fn.to_string());
+        let value_dtype = if as_text {
+            spg_storage::DataType::Text
+        } else {
+            spg_storage::DataType::Json
+        };
         let key_col = ColumnSchema::new("key".to_string(), spg_storage::DataType::Text, false);
-        let value_col = ColumnSchema::new("value".to_string(), spg_storage::DataType::Text, true);
+        let value_col = ColumnSchema::new("value".to_string(), value_dtype, as_text);
         let schema_cols = alloc::vec![key_col, value_col];
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
         // WHERE.
