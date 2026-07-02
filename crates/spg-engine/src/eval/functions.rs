@@ -9576,13 +9576,52 @@ fn apply_function_dispatch(
         }
         // pg_database_size / pg_relation_size / pg_total_relation_size:
         // monitoring dashboards + Postgres exporter emit these.
-        // Return 0 — SPG doesn't yet track per-relation on-disk
-        // size across hot + cold tiers with the same shape.
-        "pg_database_size"
-        | "pg_relation_size"
-        | "pg_total_relation_size"
+        // pg_relation_size family — REAL from the storage layer's
+        // maintained hot-tier byte meter (Table::hot_bytes, the
+        // same counter the freezer budgets against) + the index
+        // resident-byte walkers. Cold-tier on-disk accounting joins
+        // in v7.38; hot bytes are the live footprint and strictly
+        // better than the old constant 0.
+        "pg_relation_size"
         | "pg_table_size"
-        | "pg_indexes_size" => Ok(Value::BigInt(0)),
+        | "pg_total_relation_size"
+        | "pg_indexes_size" => {
+            let name_arg = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                // Numeric oid — synthetic, no reverse map.
+                Some(_) => return Ok(Value::BigInt(0)),
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::BigInt(0));
+            };
+            let bare = name_arg
+                .strip_prefix("public.")
+                .unwrap_or(name_arg)
+                .trim_matches('"');
+            let Some(t) = cat.get(bare) else {
+                return Ok(Value::Null);
+            };
+            let heap = t.hot_bytes() as i64;
+            let idx: i64 = t
+                .indices()
+                .iter()
+                .map(|i| i.kind.approx_resident_bytes() as i64)
+                .sum();
+            Ok(Value::BigInt(match name {
+                "pg_relation_size" | "pg_table_size" => heap,
+                "pg_indexes_size" => idx,
+                _ => heap + idx, // pg_total_relation_size
+            }))
+        }
+        // pg_database_size — the whole hot tier (same meter the
+        // SPG_HOT_TIER_BYTES freezer budget reads).
+        "pg_database_size" => {
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::BigInt(0));
+            };
+            Ok(Value::BigInt(cat.hot_tier_bytes() as i64))
+        }
         // pg_encoding_to_char / pg_char_to_encoding — the encoding
         // lookup pair. SPG always speaks UTF8 (encoding id 6).
         "pg_encoding_to_char" => Ok(Value::text::<String>("UTF8".into())),
