@@ -100,6 +100,120 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     Ok(Value::text(s))
 }
 
+/// v7.37.17 (17.6 siblings) — pgcrypto armor(bytea): OpenPGP
+/// ASCII-armor (RFC 4880 §6) — base64 body in 76-char lines plus a
+/// CRC-24 trailer line.
+pub(super) fn pgp_armor(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let bytes: &[u8] = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Bytes(b)] => b.as_ref(),
+        [Value::Text(s)] => s.as_bytes(),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("armor() takes 1 bytea arg, got {} args", args.len()),
+            });
+        }
+    };
+    let body = b64_encode(bytes, B64_STD);
+    let crc = crc24(bytes);
+    let crc_bytes = [(crc >> 16) as u8, (crc >> 8) as u8, crc as u8];
+    let mut out = String::from("-----BEGIN PGP MESSAGE-----\n\n");
+    for chunk in body.as_bytes().chunks(76) {
+        out.push_str(core::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push('=');
+    out.push_str(&b64_encode(&crc_bytes, B64_STD));
+    out.push('\n');
+    out.push_str("-----END PGP MESSAGE-----\n");
+    Ok(Value::text(out))
+}
+
+/// dearmor(text) — inverse of armor(): strips the BEGIN/END lines
+/// and armor headers, base64-decodes the body, and verifies the
+/// CRC-24 trailer when present.
+pub(super) fn pgp_dearmor(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let text = match args {
+        [Value::Null] => return Ok(Value::Null),
+        [Value::Text(s)] => s.as_ref(),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("dearmor() takes 1 text arg, got {} args", args.len()),
+            });
+        }
+    };
+    let mut body = String::new();
+    let mut crc_line: Option<&str> = None;
+    let mut in_body = false;
+    let mut past_headers = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.starts_with("-----BEGIN") {
+            in_body = true;
+            past_headers = false;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            break;
+        }
+        if !in_body {
+            continue;
+        }
+        if !past_headers {
+            // Armor headers end at the first blank line; a line
+            // without ':' also means the body started directly.
+            if line.is_empty() {
+                past_headers = true;
+                continue;
+            }
+            if line.contains(": ") {
+                continue;
+            }
+            past_headers = true;
+        }
+        if let Some(rest) = line.strip_prefix('=') {
+            crc_line = Some(rest);
+            continue;
+        }
+        body.push_str(line);
+    }
+    if !in_body {
+        return Err(EvalError::TypeMismatch {
+            detail: "dearmor(): no armor boundary found".into(),
+        });
+    }
+    let bytes = b64_decode(&body, B64_STD)?;
+    if let Some(crc_text) = crc_line {
+        let crc_bytes = b64_decode(crc_text, B64_STD)?;
+        if crc_bytes.len() == 3 {
+            let stated = (u32::from(crc_bytes[0]) << 16)
+                | (u32::from(crc_bytes[1]) << 8)
+                | u32::from(crc_bytes[2]);
+            if stated != crc24(&bytes) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "dearmor(): CRC-24 mismatch".into(),
+                });
+            }
+        }
+    }
+    Ok(Value::Bytes(alloc::borrow::Cow::Owned(bytes)))
+}
+
+/// OpenPGP CRC-24 (RFC 4880 §6.1): init 0xB704CE, poly 0x1864CFB.
+fn crc24(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0x00B7_04CE;
+    for &b in bytes {
+        crc ^= u32::from(b) << 16;
+        for _ in 0..8 {
+            crc <<= 1;
+            if crc & 0x0100_0000 != 0 {
+                crc ^= 0x0186_4CFB;
+            }
+        }
+    }
+    crc & 0x00FF_FFFF
+}
+
 // ── byte-level encoders ───────────────────────────────────────────
 
 const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

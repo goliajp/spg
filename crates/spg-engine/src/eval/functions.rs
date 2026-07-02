@@ -7064,6 +7064,25 @@ fn apply_function_dispatch(
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
+        // pgcrypto ASCII armor — real RFC 4880 §6 implementation
+        // (base64 body + CRC-24 trailer).
+        "armor" => super::encoding::pgp_armor(args),
+        "dearmor" => super::encoding::pgp_dearmor(args),
+        // PGP encryption surface — needs AES/blowfish ciphers not
+        // in the dep graph; errors honestly (queued with the
+        // pgcrypto epic) instead of producing fake ciphertext.
+        "pgp_sym_encrypt" | "pgp_sym_decrypt" | "pgp_sym_encrypt_bytea"
+        | "pgp_sym_decrypt_bytea" | "pgp_pub_encrypt" | "pgp_pub_decrypt"
+        | "pgp_pub_encrypt_bytea" | "pgp_pub_decrypt_bytea" => {
+            Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{name}(): PGP encryption not yet supported — \
+                     AES/blowfish ciphers queue with the pgcrypto epic"
+                ),
+            })
+        }
+        // pgp_key_id(bytea) — key-ID extraction from a PGP packet.
+        "pgp_key_id" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — convert_from / convert_to
         // handle text ↔ bytea encoding conversion. SPG stores text
         // as UTF-8 always so both simply reinterpret the bytes.
