@@ -71,6 +71,140 @@ pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     Ok(Value::text(out))
 }
 
+/// v7.37.17 (17.6 siblings) — family(inet) returns 4 for IPv4,
+/// 6 for IPv6.
+pub(super) fn inet_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("family() takes one TEXT arg, got {} args", args.len()),
+            });
+        }
+    };
+    let host = s.split('/').next().unwrap_or("");
+    if host.contains(':') {
+        Ok(Value::Int(6))
+    } else {
+        Ok(Value::Int(4))
+    }
+}
+
+/// v7.37.17 (17.6 siblings) — netmask(inet) builds the dotted-quad
+/// netmask from the prefix length (IPv4 only for now).
+pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("netmask() takes one TEXT arg, got {} args", args.len()),
+            });
+        }
+    };
+    let mut split = s.splitn(2, '/');
+    let host = split.next().unwrap_or("");
+    let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
+    if host.contains(':') {
+        // IPv6 — punt to text passthrough until full v6 support.
+        return Ok(Value::text(s));
+    }
+    let mask = mask.min(32);
+    let bits: u32 = if mask == 0 { 0 } else { u32::MAX << (32 - mask) };
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}",
+        (bits >> 24) & 0xFF,
+        (bits >> 16) & 0xFF,
+        (bits >> 8) & 0xFF,
+        bits & 0xFF
+    )))
+}
+
+/// v7.37.17 (17.6 siblings) — hostmask(inet) — the complement of
+/// netmask (IPv4).
+pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("hostmask() takes one TEXT arg, got {} args", args.len()),
+            });
+        }
+    };
+    let mut split = s.splitn(2, '/');
+    let host = split.next().unwrap_or("");
+    let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
+    if host.contains(':') {
+        return Ok(Value::text(s));
+    }
+    let mask = mask.min(32);
+    let bits: u32 = if mask == 0 { u32::MAX } else { !(u32::MAX << (32 - mask)) };
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}",
+        (bits >> 24) & 0xFF,
+        (bits >> 16) & 0xFF,
+        (bits >> 8) & 0xFF,
+        bits & 0xFF
+    )))
+}
+
+/// v7.37.17 (17.6 siblings) — broadcast(inet) — network address
+/// with host bits set to 1 (IPv4).
+pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "broadcast() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let mut split = s.splitn(2, '/');
+    let host = split.next().unwrap_or("");
+    let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
+    if host.contains(':') {
+        return Ok(Value::text(s));
+    }
+    let octets: Vec<u32> = host
+        .split('.')
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    if octets.len() != 4 {
+        return Ok(Value::text(s));
+    }
+    let addr = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    let mask = mask.min(32);
+    let host_bits: u32 = if mask == 0 { u32::MAX } else { !(u32::MAX << (32 - mask)) };
+    let bcast = addr | host_bits;
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}/{mask}",
+        (bcast >> 24) & 0xFF,
+        (bcast >> 16) & 0xFF,
+        (bcast >> 8) & 0xFF,
+        bcast & 0xFF
+    )))
+}
+
+/// v7.37.17 (17.6 siblings) — inet_same_family(a, b).
+pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    match args {
+        [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+        [Value::Text(a), Value::Text(b)] => {
+            let fam = |s: &str| if s.split('/').next().unwrap_or("").contains(':') { 6 } else { 4 };
+            Ok(Value::Bool(fam(a) == fam(b)))
+        }
+        _ => Err(EvalError::TypeMismatch {
+            detail: "inet_same_family() takes 2 TEXT args".into(),
+        }),
+    }
+}
+
 pub(super) fn inet_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),

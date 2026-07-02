@@ -6111,6 +6111,12 @@ fn apply_function_dispatch(
         "host" => inet_host(args),
         "network" => inet_network(args),
         "masklen" => inet_masklen(args),
+        // v7.37.17 (17.6 siblings) — completing the INET family.
+        "family" => super::inet::inet_family(args),
+        "netmask" => super::inet::inet_netmask(args),
+        "hostmask" => super::inet::inet_hostmask(args),
+        "broadcast" => super::inet::inet_broadcast(args),
+        "inet_same_family" => super::inet::inet_same_family(args),
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
