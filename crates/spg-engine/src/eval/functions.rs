@@ -7471,6 +7471,190 @@ fn apply_function_dispatch(
                 Ok(Value::Bool(normalized == s))
             }
         }
+        // to_ascii(text) — strip accents, keeping the base letters.
+        // PG restricts this to LATIN1/LATIN2/LATIN9/WIN1250 source
+        // encodings; SPG operates on the already-decoded string:
+        // NFD-decompose, drop combining marks, keep the rest.
+        "to_ascii" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "to_ascii() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    use unicode_normalization::UnicodeNormalization;
+                    let stripped: alloc::string::String = s
+                        .nfd()
+                        .filter(|c| {
+                            // Combining marks occupy U+0300..=U+036F
+                            // (plus extended blocks).
+                            !matches!(*c, '\u{0300}'..='\u{036F}'
+                                | '\u{1AB0}'..='\u{1AFF}'
+                                | '\u{1DC0}'..='\u{1DFF}'
+                                | '\u{20D0}'..='\u{20FF}')
+                        })
+                        .collect();
+                    Ok(Value::text(stripped))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "to_ascii() needs text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // cash_words(money) — spell out an amount in English words,
+        // PG shape: 'One hundred fourteen dollars and six cents'.
+        // Accepts numeric-ish input (SPG stores money as numeric).
+        "cash_words" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "cash_words() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            // Normalize the input to (dollars: i64, cents: i64).
+            let (dollars, cents, negative) = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => (i64::from(n.unsigned_abs()), 0, *n < 0),
+                Value::SmallInt(n) => (i64::from(n.unsigned_abs()), 0, *n < 0),
+                Value::BigInt(n) => (n.wrapping_abs(), 0, *n < 0),
+                Value::Float(f) => {
+                    let neg = *f < 0.0;
+                    let abs = if neg { -*f } else { *f };
+                    let total_cents = (abs * 100.0 + 0.5) as i64;
+                    (total_cents / 100, total_cents % 100, neg)
+                }
+                Value::Numeric { scaled, scale } => {
+                    let neg = *scaled < 0;
+                    let abs = scaled.unsigned_abs();
+                    let pow = 10u128.pow(u32::from(*scale));
+                    let whole = (abs / pow) as i64;
+                    let frac = abs % pow;
+                    // Rescale the fraction to cents.
+                    let cents = if *scale >= 2 {
+                        (frac / 10u128.pow(u32::from(*scale) - 2)) as i64
+                    } else {
+                        (frac * 10u128.pow(2 - u32::from(*scale))) as i64
+                    };
+                    (whole, cents, neg)
+                }
+                Value::Text(s) => {
+                    // Money text form like '$1,234.56' or '1.23'.
+                    let cleaned: alloc::string::String = s
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    let neg = cleaned.starts_with('-');
+                    let cleaned = cleaned.trim_start_matches('-');
+                    let (whole_s, frac_s) =
+                        cleaned.split_once('.').unwrap_or((cleaned, ""));
+                    let whole: i64 = whole_s.parse().unwrap_or(0);
+                    let mut frac_2 = alloc::string::String::from(frac_s);
+                    frac_2.truncate(2);
+                    while frac_2.len() < 2 {
+                        frac_2.push('0');
+                    }
+                    let cents: i64 = frac_2.parse().unwrap_or(0);
+                    (whole, cents, neg)
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cash_words() needs money/numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            fn three_digits(n: i64, out: &mut alloc::string::String) {
+                const ONES: [&str; 20] = [
+                    "zero", "one", "two", "three", "four", "five", "six",
+                    "seven", "eight", "nine", "ten", "eleven", "twelve",
+                    "thirteen", "fourteen", "fifteen", "sixteen",
+                    "seventeen", "eighteen", "nineteen",
+                ];
+                const TENS: [&str; 10] = [
+                    "", "", "twenty", "thirty", "forty", "fifty", "sixty",
+                    "seventy", "eighty", "ninety",
+                ];
+                let mut n = n;
+                if n >= 100 {
+                    out.push_str(ONES[(n / 100) as usize]);
+                    out.push_str(" hundred");
+                    n %= 100;
+                    if n > 0 {
+                        out.push(' ');
+                    }
+                }
+                if n >= 20 {
+                    out.push_str(TENS[(n / 10) as usize]);
+                    n %= 10;
+                    if n > 0 {
+                        out.push(' ');
+                        out.push_str(ONES[n as usize]);
+                    }
+                } else if n > 0 {
+                    out.push_str(ONES[n as usize]);
+                }
+            }
+            fn spell(n: i64) -> alloc::string::String {
+                if n == 0 {
+                    return "zero".into();
+                }
+                const GROUPS: [&str; 7] = [
+                    "", " thousand", " million", " billion", " trillion",
+                    " quadrillion", " quintillion",
+                ];
+                // Split into groups of three digits, most significant
+                // first.
+                let mut parts: alloc::vec::Vec<(i64, usize)> =
+                    alloc::vec::Vec::new();
+                let mut rem = n;
+                let mut group = 0usize;
+                while rem > 0 {
+                    let chunk = rem % 1000;
+                    if chunk > 0 {
+                        parts.push((chunk, group));
+                    }
+                    rem /= 1000;
+                    group += 1;
+                }
+                let mut out = alloc::string::String::new();
+                for (i, (chunk, group)) in parts.iter().rev().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    three_digits(*chunk, &mut out);
+                    out.push_str(GROUPS[*group]);
+                }
+                out
+            }
+            let mut words = alloc::string::String::new();
+            if negative {
+                words.push_str("minus ");
+            }
+            words.push_str(&spell(dollars));
+            words.push_str(if dollars == 1 { " dollar" } else { " dollars" });
+            words.push_str(" and ");
+            words.push_str(&spell(cents));
+            words.push_str(if cents == 1 { " cent" } else { " cents" });
+            // PG capitalizes the first letter.
+            let mut chars = words.chars();
+            let capitalized: alloc::string::String = match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => words,
+            };
+            Ok(Value::text(capitalized))
+        }
         // v7.37.17 (17.6 siblings) — PG 13+ numeric scale helpers.
         //   scale(numeric)      — declared scale of the value
         //   min_scale(numeric)  — minimum scale to represent exactly

@@ -181,6 +181,7 @@ mod e2e_cot_log2;
 mod e2e_ts_delete_filter;
 mod e2e_inet_merge;
 mod e2e_tsvector_array;
+mod e2e_cash_words;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.
