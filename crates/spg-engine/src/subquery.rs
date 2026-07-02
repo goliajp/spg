@@ -1721,6 +1721,7 @@ impl Engine {
         let body = SelectStatement {
             ctes: Vec::new(),
             distinct: false,
+            distinct_on: Vec::new(),
             items: alloc::vec![
                 SelectItem::Expr {
                     expr: jk_expr.clone(),

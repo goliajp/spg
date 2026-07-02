@@ -6603,6 +6603,7 @@ impl Parser {
                 head = SelectStatement {
                     ctes: Vec::new(),
                     distinct: false,
+                    distinct_on: Vec::new(),
                     items: alloc::vec![SelectItem::Wildcard],
                     from: Some(FromClause {
                         primary: TableRef {
@@ -6649,6 +6650,38 @@ impl Parser {
             true
         } else {
             false
+        };
+        // v7.37.17 (17.6 siblings) — `DISTINCT ON (expr [, …])`:
+        // keep the first row (per ORDER BY) of each group the
+        // expressions define. Django's .distinct('field') shape.
+        let distinct_on: Vec<Expr> = if distinct && matches!(self.peek(), Token::On) {
+            self.advance(); // ON
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' after DISTINCT ON, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut exprs = Vec::new();
+            loop {
+                exprs.push(self.parse_expr(0)?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in DISTINCT ON list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            self.advance(); // )
+            exprs
+        } else {
+            Vec::new()
         };
         let items = self.parse_select_list()?;
         let from = if matches!(self.peek(), Token::From) {
@@ -6700,6 +6733,7 @@ impl Parser {
         Ok(SelectStatement {
             ctes: Vec::new(),
             distinct,
+            distinct_on,
             items,
             from,
             where_,
@@ -9589,6 +9623,7 @@ impl Parser {
             row_selects.push(SelectStatement {
                 ctes: Vec::new(),
                 distinct: false,
+                distinct_on: Vec::new(),
                 items,
                 from: None,
                 where_: None,
@@ -9663,6 +9698,7 @@ impl Parser {
             let inner_select = crate::ast::SelectStatement {
                 ctes: Vec::new(),
                 distinct: false,
+                distinct_on: Vec::new(),
                 items: alloc::vec![
                     crate::ast::SelectItem::Expr {
                         expr: crate::ast::Expr::Column(crate::ast::ColumnName {
