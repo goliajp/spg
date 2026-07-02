@@ -6975,17 +6975,48 @@ fn apply_function_dispatch(
             }
             Ok(Value::BigInt(result))
         }
-        "greatest" | "least" => {
+        // textcat / byteacat — the catalog names behind the ||
+        // concatenation operator (strict: NULL in → NULL out,
+        // unlike the variadic concat() which skips NULLs).
+        "textcat" | "byteacat" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(a), Value::Text(b)) => {
+                    Ok(Value::text(alloc::format!("{a}{b}")))
+                }
+                (Value::Bytes(a), Value::Bytes(b)) => {
+                    let mut out =
+                        alloc::vec::Vec::with_capacity(a.len() + b.len());
+                    out.extend_from_slice(a);
+                    out.extend_from_slice(b);
+                    Ok(Value::Bytes(alloc::borrow::Cow::Owned(out)))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{name}() needs matching text/bytea args"
+                    ),
+                }),
+            }
+        }
+        // The *_larger / *_smaller catalog names are the pairwise
+        // internals PG's MAX/MIN aggregates reference in pg_proc —
+        // introspecting drivers occasionally call them by name.
+        // Same comparison machinery as greatest/least.
+        "greatest" | "least" | "text_larger" | "text_smaller"
+        | "bytea_larger" | "bytea_smaller" | "int2larger" | "int2smaller"
+        | "int4larger" | "int4smaller" | "int8larger" | "int8smaller"
+        | "float4larger" | "float4smaller" | "float8larger"
+        | "float8smaller" | "numeric_larger" | "numeric_smaller"
+        | "date_larger" | "date_smaller" | "timestamp_larger"
+        | "timestamp_smaller" | "interval_larger" | "interval_smaller" => {
             if args.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{lc}() takes at least 1 arg",
-                        lc = if name.eq_ignore_ascii_case("greatest") {
-                            "greatest"
-                        } else {
-                            "least"
-                        }
-                    ),
+                    detail: alloc::format!("{name}() takes at least 1 arg"),
                 });
             }
             let non_null: alloc::vec::Vec<&Value> =
@@ -6993,7 +7024,8 @@ fn apply_function_dispatch(
             if non_null.is_empty() {
                 return Ok(Value::Null);
             }
-            let is_greatest = name.eq_ignore_ascii_case("greatest");
+            let is_greatest = name.eq_ignore_ascii_case("greatest")
+                || name.ends_with("larger");
             let mut best: Value<'static> = non_null[0].clone().into_owned();
             for v in &non_null[1..] {
                 let ord = value_cmp_for_min_max(&best, v);
