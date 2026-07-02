@@ -201,6 +201,7 @@ mod e2e_mysql_component_fns;
 mod e2e_mysql_set_fns;
 mod e2e_mysql_session_fns;
 mod e2e_regexp_match;
+mod e2e_age_xid;
 mod e2e_domain_type;
 mod e2e_enum_type;
 // v7.38 元机制 D unit pins.

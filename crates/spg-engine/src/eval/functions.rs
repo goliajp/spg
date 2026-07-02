@@ -4707,6 +4707,13 @@ fn apply_function_dispatch(
             }
         }
         "age" => age(args),
+        // mxid_age(xid) — multixact wraparound distance. SPG has no
+        // multixact machinery (single-writer model) → honestly 0,
+        // same rationale as the age(xid) overload.
+        "mxid_age" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            _ => Ok(Value::Int(0)),
+        },
         "to_char" => to_char(args),
         // v7.37.17 (17.6 siblings) — PG's `to_number(text, fmt)`
         // parses a formatted numeric string. Real implementation
