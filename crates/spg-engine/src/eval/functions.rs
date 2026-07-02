@@ -6280,6 +6280,240 @@ fn apply_function_dispatch(
         }
         "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
         "jsonb_set" | "json_set" => crate::json::set(args),
+        // jsonb_set_lax — jsonb_set with configurable SQL-NULL
+        // new_value handling (PG 13+). Treatments:
+        //   use_json_null (default) / raise_exception /
+        //   return_target / delete_key
+        "jsonb_set_lax" => {
+            if !(3..=5).contains(&args.len()) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "jsonb_set_lax() takes 3-5 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null)
+            {
+                return Ok(Value::Null);
+            }
+            if !matches!(args[2], Value::Null) {
+                // Non-NULL new_value — plain jsonb_set.
+                return crate::json::set(&args[..args.len().min(4)]);
+            }
+            let treatment = match args.get(4) {
+                None | Some(Value::Null) => "use_json_null",
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(other) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_set_lax() treatment must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            match treatment {
+                "use_json_null" => {
+                    let mut adjusted: alloc::vec::Vec<Value<'_>> =
+                        args[..2].to_vec();
+                    adjusted.push(Value::json("null"));
+                    if let Some(create) = args.get(3) {
+                        adjusted.push(create.clone());
+                    }
+                    crate::json::set(&adjusted)
+                }
+                "raise_exception" => Err(EvalError::TypeMismatch {
+                    detail: "jsonb_set_lax(): JSON value must not be null"
+                        .into(),
+                }),
+                "return_target" => Ok(args[0].clone().into_owned()),
+                "delete_key" => crate::json::delete_path(&args[..2]),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_set_lax(): invalid null_value_treatment {other:?}"
+                    ),
+                }),
+            }
+        }
+        // json_to_tsvector / jsonb_to_tsvector — reduce a JSON doc
+        // to a tsvector using a filter: '"all"' or an array of
+        // "string" / "numeric" / "boolean" / "key". Optional
+        // leading config arg (3-arg form) is accepted and ignored
+        // (SPG's FTS pipeline is single-config).
+        "json_to_tsvector" | "jsonb_to_tsvector" => {
+            let (doc_arg, filter_arg) = match args.len() {
+                2 => (&args[0], &args[1]),
+                3 => (&args[1], &args[2]),
+                n => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() takes 2 or 3 args, got {n}"
+                        ),
+                    });
+                }
+            };
+            let doc_text = match doc_arg {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                Value::Json(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() needs json, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let filter_text = match filter_arg {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_ref(),
+                Value::Json(s) => s.as_ref(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}() filter must be json, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Parse the filter into flags.
+            let filter = crate::json::parse(filter_text).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("{name}(): invalid filter — {e}"),
+                }
+            })?;
+            let mut want_string = false;
+            let mut want_numeric = false;
+            let mut want_boolean = false;
+            let mut want_key = false;
+            let mut apply = |flag: &str| -> Result<(), EvalError> {
+                match flag {
+                    "all" => {
+                        want_string = true;
+                        want_numeric = true;
+                        want_boolean = true;
+                        want_key = true;
+                    }
+                    "string" => want_string = true,
+                    "numeric" => want_numeric = true,
+                    "boolean" => want_boolean = true,
+                    "key" => want_key = true,
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}(): unknown filter flag {other:?}"
+                            ),
+                        });
+                    }
+                }
+                Ok(())
+            };
+            match &filter {
+                crate::json::JsonValue::String(s) => apply(s)?,
+                crate::json::JsonValue::Array(items) => {
+                    for item in items {
+                        match item {
+                            crate::json::JsonValue::String(s) => apply(s)?,
+                            _ => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: alloc::format!(
+                                        "{name}(): filter array must hold strings"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{name}(): filter must be a string or string array"
+                        ),
+                    });
+                }
+            }
+            let doc = crate::json::parse(doc_text).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("{name}(): invalid JSON — {e}"),
+                }
+            })?;
+            fn collect(
+                node: &crate::json::JsonValue,
+                want: (bool, bool, bool, bool),
+                out: &mut alloc::vec::Vec<alloc::string::String>,
+            ) {
+                let (s, n, b, k) = want;
+                match node {
+                    crate::json::JsonValue::String(v) if s => {
+                        for word in v.split_whitespace() {
+                            out.push(word.to_lowercase());
+                        }
+                    }
+                    crate::json::JsonValue::Number(v) if n => {
+                        out.push(alloc::format!("{v}"));
+                    }
+                    crate::json::JsonValue::NumberText(v) if n => {
+                        out.push(v.clone());
+                    }
+                    crate::json::JsonValue::Bool(v) if b => {
+                        out.push(alloc::format!("{v}"));
+                    }
+                    crate::json::JsonValue::Array(items) => {
+                        for item in items {
+                            collect(item, want, out);
+                        }
+                    }
+                    crate::json::JsonValue::Object(entries) => {
+                        for (key, val) in entries {
+                            if k {
+                                for word in key.split_whitespace() {
+                                    out.push(word.to_lowercase());
+                                }
+                            }
+                            collect(val, want, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut lexemes = alloc::vec::Vec::new();
+            collect(
+                &doc,
+                (want_string, want_numeric, want_boolean, want_key),
+                &mut lexemes,
+            );
+            lexemes.sort();
+            lexemes.dedup();
+            Ok(Value::text(lexemes.join(" ")))
+        }
+        // pg_collation_for(any) — the collation of the argument's
+        // type. Text is collatable → PG's '"default"'; everything
+        // else errors like PG ("collations are not supported").
+        "pg_collation_for" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_collation_for() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(_) => {
+                    Ok(Value::text::<String>("\"default\"".into()))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "collations are not supported by type {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — jsonb_delete_path: function
         // form of the #- operator.
         "jsonb_delete_path" | "json_delete_path" => crate::json::delete_path(args),
