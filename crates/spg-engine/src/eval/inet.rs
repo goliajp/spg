@@ -191,6 +191,94 @@ pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     )))
 }
 
+/// v7.37.17 (17.6 siblings) — inet_merge(a, b) — the smallest
+/// network that includes both arguments (IPv4; IPv6 mixed input
+/// errors like PG's "cannot merge addresses from different
+/// families" when families differ, text passthrough of the first
+/// arg when both are IPv6).
+pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let (a, b) = match args {
+        [Value::Null, _] | [_, Value::Null] => return Ok(Value::Null),
+        [Value::Text(a), Value::Text(b)] => (a.as_ref(), b.as_ref()),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "inet_merge() takes 2 TEXT args".into(),
+            });
+        }
+    };
+    let fam = |s: &str| if s.split('/').next().unwrap_or("").contains(':') { 6 } else { 4 };
+    if fam(a) != fam(b) {
+        return Err(EvalError::TypeMismatch {
+            detail: "inet_merge(): cannot merge addresses from different families".into(),
+        });
+    }
+    if fam(a) == 6 {
+        // IPv6 — text passthrough until full v6 bit math lands.
+        return Ok(Value::text(a.to_string()));
+    }
+    let parse = |s: &str| -> Option<(u32, u32)> {
+        let mut split = s.splitn(2, '/');
+        let host = split.next()?;
+        let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
+        let octets: Vec<u32> = host.split('.').filter_map(|o| o.parse().ok()).collect();
+        if octets.len() != 4 {
+            return None;
+        }
+        Some((
+            (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3],
+            mask.min(32),
+        ))
+    };
+    let (Some((addr_a, mask_a)), Some((addr_b, mask_b))) = (parse(a), parse(b)) else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("inet_merge(): invalid inet input '{a}' / '{b}'"),
+        });
+    };
+    // Common prefix length, capped by both input masks.
+    let diff = addr_a ^ addr_b;
+    let common = diff.leading_zeros().min(mask_a).min(mask_b);
+    let net = if common == 0 { 0 } else { addr_a & (u32::MAX << (32 - common)) };
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}/{common}",
+        (net >> 24) & 0xFF,
+        (net >> 16) & 0xFF,
+        (net >> 8) & 0xFF,
+        net & 0xFF
+    )))
+}
+
+/// v7.37.17 (17.6 siblings) — macaddr8_set7bit(macaddr8) — sets
+/// the 7th bit (0x02, locally-administered) of the first byte,
+/// converting an EUI-64 into a modified EUI-64 for IPv6 autoconf.
+pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "macaddr8_set7bit() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let bytes: Vec<u8> = s
+        .split(|c| c == ':' || c == '-')
+        .filter_map(|part| u8::from_str_radix(part, 16).ok())
+        .collect();
+    if bytes.len() != 8 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("macaddr8_set7bit(): invalid macaddr8 '{s}'"),
+        });
+    }
+    let mut out = bytes;
+    out[0] |= 0x02;
+    let hex: Vec<alloc::string::String> =
+        out.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    Ok(Value::text(hex.join(":")))
+}
+
 /// v7.37.17 (17.6 siblings) — inet_same_family(a, b).
 pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     match args {

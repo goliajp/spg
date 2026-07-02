@@ -6395,6 +6395,34 @@ fn apply_function_dispatch(
         "hostmask" => super::inet::inet_hostmask(args),
         "broadcast" => super::inet::inet_broadcast(args),
         "inet_same_family" => super::inet::inet_same_family(args),
+        // inet_merge(a, b) — the smallest network including both.
+        "inet_merge" => super::inet::inet_merge(args),
+        // macaddr8_set7bit — EUI-64 → modified EUI-64.
+        "macaddr8_set7bit" => super::inet::macaddr8_set7bit(args),
+        // Connection-address probes. PG returns NULL for these on
+        // Unix-socket connections; SPG embedded has no TCP
+        // connection at all, so NULL is the honest PG-shaped
+        // answer (monitoring dashboards render it as "local").
+        "inet_client_addr" | "inet_server_addr" | "inet_client_port"
+        | "inet_server_port" => Ok(Value::Null),
+        // timeofday() — PG legacy wall-clock as formatted text
+        // ('Dow Mon DD HH24:MI:SS.US YYYY TZ'). Uses the same
+        // deterministic 2020-01-01 UTC anchor as the rest of the
+        // wall-clock stubs until v7.38 wall-clock plumbing.
+        "timeofday" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "timeofday() takes no args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            // 2020-01-01 00:00:00 UTC was a Wednesday.
+            Ok(Value::text::<String>(
+                "Wed Jan 01 00:00:00.000000 2020 UTC".into(),
+            ))
+        }
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
