@@ -132,36 +132,55 @@ fn write_json(v: &JsonValue, out: &mut String) {
 /// materialisation. Non-object inputs raise an error (PG's actual
 /// behaviour); `NULL` and empty object both produce 0 rows.
 pub fn jsonb_each_text_rows(arg: &Value) -> Result<Vec<(String, Option<String>)>, EvalError> {
+    each_rows(arg, true, "jsonb_each_text")
+}
+
+/// v7.37.17 (17.6 siblings) — shared body for the four `each` SRFs.
+/// `as_text` (the `*_each_text` forms) unwraps scalar values to
+/// their lexeme and maps JSON null → SQL NULL; the plain forms
+/// render every value (including JSON null) as compact JSON text,
+/// which the executor wraps as a jsonb-typed column.
+pub fn each_rows(
+    arg: &Value,
+    as_text: bool,
+    fn_name: &str,
+) -> Result<Vec<(String, Option<String>)>, EvalError> {
     let src = match arg {
         Value::Null => return Ok(Vec::new()),
         Value::Json(s) | Value::Text(s) => s.as_ref(),
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "jsonb_each_text: argument must be JSON / JSONB, got {:?}",
+                    "{fn_name}: argument must be JSON / JSONB, got {:?}",
                     other.data_type()
                 ),
             });
         }
     };
     let parsed = parse(src).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("jsonb_each_text: invalid JSON: {e}"),
+        detail: alloc::format!("{fn_name}: invalid JSON: {e}"),
     })?;
     match parsed {
         JsonValue::Object(entries) => {
             let mut out: Vec<(String, Option<String>)> = Vec::with_capacity(entries.len());
             for (k, v) in entries {
-                let text = match &v {
-                    JsonValue::Null => None,
-                    JsonValue::Bool(b) => Some(if *b {
-                        "true".to_string()
-                    } else {
-                        "false".to_string()
-                    }),
-                    JsonValue::Number(_) | JsonValue::NumberText(_) | JsonValue::String(_) => {
-                        Some(v.as_text())
+                let text = if as_text {
+                    match &v {
+                        JsonValue::Null => None,
+                        JsonValue::Bool(b) => Some(if *b {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        }),
+                        JsonValue::Number(_)
+                        | JsonValue::NumberText(_)
+                        | JsonValue::String(_) => Some(v.as_text()),
+                        JsonValue::Array(_) | JsonValue::Object(_) => {
+                            Some(v.to_json_text())
+                        }
                     }
-                    JsonValue::Array(_) | JsonValue::Object(_) => Some(v.to_json_text()),
+                } else {
+                    Some(v.to_json_text())
                 };
                 out.push((k, text));
             }
@@ -169,7 +188,7 @@ pub fn jsonb_each_text_rows(arg: &Value) -> Result<Vec<(String, Option<String>)>
         }
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "jsonb_each_text: argument must be a JSON object, got {other:?}"
+                "cannot call {fn_name} on a non-object ({other:?})"
             ),
         }),
     }

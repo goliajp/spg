@@ -2643,7 +2643,7 @@ fn substitute_outer_in_table_ref(
     outer_row: &Row<'static>,
     outer_schema: &[ColumnSchema],
 ) {
-    if let Some(arg) = t.jsonb_each_text_arg.as_deref_mut() {
+    if let Some((_, arg)) = t.jsonb_each_text_arg.as_mut() {
         substitute_outer_in_expr(arg, outer_row, outer_schema);
     }
     if let Some(arg) = t.unnest_expr.as_deref_mut() {

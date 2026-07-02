@@ -178,6 +178,17 @@ fn unreserved_keyword_text(tok: &Token) -> Option<String> {
 /// v7.13.0 — extended to recognise PG built-in / pg_trgm opclasses
 /// (mailrs round-5 G5). These are tokens-only acceptance — SPG
 /// doesn't change index behaviour based on them.
+/// v7.37.17 (17.6 siblings) — the four PG `each` SRFs share one
+/// FROM-clause pipeline; the stored name tells the executor whether
+/// the value column keeps JSON rendering (`jsonb_each` / `json_each`)
+/// or unwraps to text (`*_each_text`).
+fn is_json_each_name(s: &str) -> bool {
+    s.eq_ignore_ascii_case("jsonb_each_text")
+        || s.eq_ignore_ascii_case("jsonb_each")
+        || s.eq_ignore_ascii_case("json_each_text")
+        || s.eq_ignore_ascii_case("json_each")
+}
+
 fn is_vector_opclass_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
     matches!(
@@ -9402,24 +9413,26 @@ impl Parser {
         // materialisation. Sentori 0067 backfill is the dogfood
         // shape.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("jsonb_each_text"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s) | Token::QuotedIdent(s)) if is_json_each_name(s))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
         {
             self.advance(); // LATERAL
-            self.advance(); // jsonb_each_text
+            let each_fn = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => unreachable!(),
+            };
+            self.advance(); // jsonb_each[_text] / json_each[_text]
             self.advance(); // (
             let arg = self.parse_expr(0)?;
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(alloc::format!(
-                    "expected ')' after LATERAL jsonb_each_text() argument, got {:?}",
+                    "expected ')' after LATERAL {each_fn}() argument, got {:?}",
                     self.peek()
                 )));
             }
             self.advance();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
-            let alias = alias_ident
-                .clone()
-                .unwrap_or_else(|| "jsonb_each_text".to_string());
+            let alias = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             // Synthesise: SELECT __srf__.key AS <key_alias>, __srf__.value AS <value_alias>
             //               FROM jsonb_each_text(<arg>) AS __srf__
             // PG's `AS kv(key, value)` column-alias list maps
@@ -9462,7 +9475,7 @@ impl Parser {
                         unnest_column_aliases: Vec::new(),
                         generate_series_args: None,
                         lateral_subquery: None,
-                        jsonb_each_text_arg: Some(Box::new(arg)),
+                        jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                     },
                     joins: Vec::new(),
                 }),
@@ -9547,23 +9560,25 @@ impl Parser {
         // references a preceding FROM item (sentori migration
         // 0067 backfill shape: `CROSS JOIN LATERAL
         // jsonb_each_text(t.json_col) AS kv(key, value)`).
-        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("jsonb_each_text"))
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if is_json_each_name(s))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
-            self.advance(); // jsonb_each_text
+            let each_fn = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => unreachable!(),
+            };
+            self.advance(); // jsonb_each[_text] / json_each[_text]
             self.advance(); // (
             let arg = self.parse_expr(0)?;
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(alloc::format!(
-                    "expected ')' after jsonb_each_text() argument, got {:?}",
+                    "expected ')' after {each_fn}() argument, got {:?}",
                     self.peek()
                 )));
             }
             self.advance();
             let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
-            let name = alias_ident
-                .clone()
-                .unwrap_or_else(|| "jsonb_each_text".to_string());
+            let name = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
@@ -9572,7 +9587,7 @@ impl Parser {
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: None,
                 lateral_subquery: None,
-                jsonb_each_text_arg: Some(Box::new(arg)),
+                jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
             });
         }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
