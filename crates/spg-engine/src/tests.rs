@@ -1715,6 +1715,16 @@ fn in_tx_sees_own_insert_through_gated_window_path() {
 }
 
 #[test]
+fn mvcc_inplace_flag_defaults_off_and_toggles() {
+    let mut e = Engine::new();
+    assert!(!e.mvcc_inplace(), "in-place MVCC write path must default OFF");
+    e.set_mvcc_inplace(true);
+    assert!(e.mvcc_inplace());
+    e.set_mvcc_inplace(false);
+    assert!(!e.mvcc_inplace());
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};
