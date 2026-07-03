@@ -3242,19 +3242,37 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             if st.items.is_empty() {
                 return Value::Null;
             }
-            let mut out = String::from("{");
-            for (i, key) in st.items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                // Object keys are always JSON strings (PG coerces).
-                let key_text = match key {
+            // Object keys are always JSON strings (PG coerces).
+            let key_text = |key: &Value| -> String {
+                match key {
                     Value::Text(s) | Value::Json(s) => s.to_string(),
                     other => crate::json::value_to_json_text(other),
-                };
-                out.push_str(&crate::json::value_to_json_text(&Value::text(key_text)));
+                }
+            };
+            // jsonb dedups keys keeping the last value (jsonb is a
+            // map); json preserves every pair including duplicates.
+            let dedup = name == "jsonb_object_agg";
+            // (key, value-index) pairs in first-seen key order; for
+            // jsonb a repeated key updates its value-index in place.
+            let mut pairs: Vec<(String, usize)> = Vec::with_capacity(st.items.len());
+            for (i, key) in st.items.iter().enumerate() {
+                let kt = key_text(key);
+                if dedup {
+                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| *k == kt) {
+                        slot.1 = i;
+                        continue;
+                    }
+                }
+                pairs.push((kt, i));
+            }
+            let mut out = String::from("{");
+            for (n, (kt, i)) in pairs.iter().enumerate() {
+                if n > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&crate::json::value_to_json_text(&Value::text(kt.clone())));
                 out.push_str(": ");
-                let val = st.aux_items.get(i).unwrap_or(&Value::Null);
+                let val = st.aux_items.get(*i).unwrap_or(&Value::Null);
                 out.push_str(&crate::json::value_to_json_text(val));
             }
             out.push('}');
