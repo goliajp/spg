@@ -73,6 +73,33 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Advanced-SQL scout campaign (tasks #386-#388) — two scout rounds
+(window/CTE shapes, string/aggregate corners) drive three closures,
+one of them a pre-existing engine bug the pins caught (2980 e2e
+green):
+
+- **Window frame EXCLUDE (#386)**: the frame gains an
+  EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS} clause
+  (FrameExclusion on WindowFrame). NO OTHERS is the default no-op;
+  CURRENT ROW drops the current row from the aggregate frame so
+  sum/count/avg over the whole partition EXCLUDE CURRENT ROW see
+  everyone else. GROUP / TIES need peer-group awareness the
+  aggregate loop lacks, so they error honestly.
+- **VALUES-seed recursive CTE (#387)**: a VALUES seed can head the
+  set-operation chain inside a CTE body, so WITH RECURSIVE t(n) AS
+  (VALUES(1) UNION ALL SELECT n+1 FROM t WHERE n<5) parses like the
+  SELECT-seed form — the VALUES arm attaches trailing UNION /
+  INTERSECT / EXCEPT peers via the shared setop-chain parser.
+- **jsonb_object_agg dedup (#388)**: jsonb is a map, so
+  jsonb_object_agg over duplicate keys keeps the last value — it
+  used to emit an object with repeated keys (invalid jsonb). The
+  finalize now dedups keys in first-seen order, last value winning
+  for the jsonb variant; json_object_agg keeps every pair. The
+  scout's other fifteen probed shapes (lpad/rpad/left/right/
+  split_part/translate/repeat/btrim, string_agg, array_agg
+  DISTINCT ORDER BY, count DISTINCT, GROUPING SETS, bit_and/or,
+  ntile/row_number, HAVING) were all already supported.
+
 Operator/type scout campaign (tasks #381-#384) — three scout
 rounds (operator symbols, datetime units, type IO) drive four
 closures, two of them pre-existing engine bugs the pins caught
