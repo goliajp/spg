@@ -290,6 +290,12 @@ struct Parser {
     /// the stack (embed hosts die on overflow — it is an abort,
     /// not a catchable error).
     nest_depth: usize,
+    /// TABLESAMPLE lowering channel: the table-ref parser pushes a
+    /// `random() < p/100` predicate here; the enclosing SELECT
+    /// drains the list after its WHERE parses and ANDs the
+    /// predicates in. parse_bare_select save/restores around its
+    /// FROM+WHERE so nested selects only drain their own.
+    pending_sample_preds: Vec<Expr>,
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
@@ -322,6 +328,7 @@ impl Parser {
             tokens,
             pos: 0,
             nest_depth: 0,
+            pending_sample_preds: Vec::new(),
         }
     }
 
@@ -6743,18 +6750,34 @@ impl Parser {
             Vec::new()
         };
         let items = self.parse_select_list()?;
+        // Scope the TABLESAMPLE lowering channel to this SELECT:
+        // stash whatever an enclosing select accumulated, collect
+        // our own FROM's predicates, restore after the combine.
+        let enclosing_sample_preds = core::mem::take(&mut self.pending_sample_preds);
         let from = if matches!(self.peek(), Token::From) {
             self.advance();
             Some(self.parse_from_clause()?)
         } else {
             None
         };
+        let sample_preds = core::mem::take(&mut self.pending_sample_preds);
         let where_ = if matches!(self.peek(), Token::Where) {
             self.advance();
             Some(self.parse_expr(0)?)
         } else {
             None
         };
+        let where_ = sample_preds.into_iter().fold(where_, |acc, pred| {
+            Some(match acc {
+                Some(w) => Expr::Binary {
+                    lhs: Box::new(pred),
+                    op: crate::ast::BinOp::And,
+                    rhs: Box::new(w),
+                },
+                None => pred,
+            })
+        });
+        self.pending_sample_preds = enclosing_sample_preds;
         let mut group_by_all = false;
         // v7.37.17 (17.6 siblings) — ROLLUP / CUBE / GROUPING SETS
         // share one expansion: `grouping_sets` lists the key subsets
@@ -10505,7 +10528,69 @@ impl Parser {
         } else {
             None
         };
-        let alias = self.parse_optional_alias();
+        // TABLESAMPLE is not a reserved token — keep the bare-ident
+        // alias rule from swallowing it (`FROM t TABLESAMPLE …`).
+        let alias = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("tablesample"))
+        {
+            None
+        } else {
+            self.parse_optional_alias()
+        };
+        // `TABLESAMPLE BERNOULLI(p) | SYSTEM(p)` follows the alias
+        // (PG grammar). BERNOULLI lowers to a per-row
+        // `random() < p/100` conjunct on the enclosing SELECT's
+        // WHERE — exact row-level Bernoulli semantics. SYSTEM
+        // shares the lowering: SPG has no page structure to
+        // sample, and the row-level form returns the same expected
+        // fraction. REPEATABLE(seed) promises a deterministic
+        // sample SPG cannot honour yet — honest error rather than
+        // a silently ignored seed.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("tablesample")) {
+            self.advance();
+            let method = self.expect_ident_like()?;
+            if !method.eq_ignore_ascii_case("bernoulli") && !method.eq_ignore_ascii_case("system")
+            {
+                return Err(self.err(alloc::format!(
+                    "TABLESAMPLE method {method:?} not supported; use BERNOULLI or SYSTEM"
+                )));
+            }
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected '(' after TABLESAMPLE {}, got {:?}",
+                    method.to_ascii_uppercase(),
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let percent = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after TABLESAMPLE percentage, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("repeatable")) {
+                return Err(self.err(
+                    "TABLESAMPLE REPEATABLE(seed) requires deterministic per-row \
+                     sampling SPG does not support yet; drop REPEATABLE for a \
+                     non-deterministic sample"
+                        .into(),
+                ));
+            }
+            self.pending_sample_preds.push(Expr::Binary {
+                lhs: Box::new(Expr::FunctionCall {
+                    name: "random".to_string(),
+                    args: Vec::new(),
+                }),
+                op: crate::ast::BinOp::Lt,
+                rhs: Box::new(Expr::Binary {
+                    lhs: Box::new(percent),
+                    op: crate::ast::BinOp::Div,
+                    rhs: Box::new(Expr::Literal(crate::ast::Literal::Float(100.0))),
+                }),
+            });
+        }
         Ok(TableRef {
             name,
             alias,

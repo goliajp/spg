@@ -503,6 +503,7 @@ mod e2e_window_in_join;
 mod e2e_window_groups_frame;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;
+mod e2e_tablesample;
 mod e2e_unnest_multi;
 mod e2e_with_ordinality;
 mod e2e_writable_cte;
