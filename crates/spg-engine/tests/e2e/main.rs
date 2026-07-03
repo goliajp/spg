@@ -504,6 +504,7 @@ mod e2e_window_groups_frame;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;
 mod e2e_at_time_zone;
+mod e2e_orderby_using_operator;
 mod e2e_rows_from;
 mod e2e_table_shorthand_collate;
 mod e2e_tablesample;
