@@ -158,6 +158,7 @@ mod e2e_age_single_arg;
 mod e2e_pg_backend_start_time;
 mod e2e_pg_wal_lsn;
 mod e2e_similar_to_escape;
+mod e2e_similar_to_operator;
 mod e2e_pg_get_serial_sequence;
 mod e2e_more_privilege_probes;
 mod e2e_logging_replication_probes;

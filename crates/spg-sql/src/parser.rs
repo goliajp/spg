@@ -11918,7 +11918,8 @@ impl Parser {
             let negated = if matches!(self.peek(), Token::Not) {
                 let next = self.tokens.get(self.pos + 1);
                 matches!(next, Some(Token::Between | Token::In | Token::Like))
-                    || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike"))
+                    || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+                        || s.eq_ignore_ascii_case("similar"))
             } else {
                 false
             };
@@ -11931,6 +11932,34 @@ impl Parser {
             }
             if matches!(self.peek(), Token::In) {
                 expr = self.parse_in_tail(expr, negated)?;
+                continue;
+            }
+            // `x [NOT] SIMILAR TO p [ESCAPE e]` — lowers onto the
+            // existing pieces: similar_to_escape converts the
+            // SQL-standard pattern to a fully anchored regex and
+            // regexp_like matches it.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
+            {
+                self.advance(); // SIMILAR
+                self.advance(); // TO
+                let pattern = self.parse_expr(5)?;
+                let mut esc_args = alloc::vec![pattern];
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                    self.advance();
+                    esc_args.push(self.parse_expr(5)?);
+                }
+                let call = Expr::FunctionCall {
+                    name: "regexp_like".to_string(),
+                    args: alloc::vec![
+                        expr,
+                        Expr::FunctionCall {
+                            name: "similar_to_escape".to_string(),
+                            args: esc_args,
+                        },
+                    ],
+                };
+                expr = maybe_not(call, negated);
                 continue;
             }
             if matches!(self.peek(), Token::Like) {
