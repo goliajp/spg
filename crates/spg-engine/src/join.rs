@@ -850,6 +850,18 @@ impl Engine {
         let (primary_rows, primary_cols, primary_indices) = match primary_table {
             Some(t) => {
                 let idxs = self.filter_table_indices(t, &primary_alias, &primary_preds)?;
+                // Phase C.3 step 2b — MVCC read gate on the deferred-index
+                // primary seed. `idxs` are hot-tier physical indices into
+                // `t.rows()` (this arm is reached only when the primary has
+                // NO cold rows, see `has_cold_rows_fast()` filter above), so
+                // dropping the invisible ones here keeps a dead/old version
+                // out of the join without touching any cold-tier row. No-op
+                // today: every hot header is frozen/committed-alive.
+                let scan_snapshot = self.current_snapshot();
+                let idxs: Vec<usize> = idxs
+                    .into_iter()
+                    .filter(|&i| t.is_row_visible(i, &scan_snapshot))
+                    .collect();
                 (Vec::new(), t.schema().columns.clone(), Some(idxs))
             }
             None => {
@@ -1062,6 +1074,12 @@ impl Engine {
             };
         let stored = table.rows();
         let hot_len = stored.len();
+        // Phase C.3 step 2b — MVCC read gate for the INL probe. Snapshot
+        // computed once; a hot peer row (`ri < hot_len`) this snapshot
+        // cannot see is skipped so it never matches. Cold rows
+        // (`ri >= hot_len`) are frozen segment rows = always visible.
+        // No-op today: every hot header is frozen/committed-alive.
+        let scan_snapshot = self.current_snapshot();
         let (lpos0, _) = eq_pairs[0];
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
@@ -1089,6 +1107,9 @@ impl Engine {
                         }
                     };
                     let right_opt: Option<&Row<'static>> = if ri < hot_len {
+                        if !table.is_row_visible(ri, &scan_snapshot) {
+                            continue;
+                        }
                         stored.get(ri)
                     } else {
                         cold_rows.get(ri - hot_len)
@@ -1193,34 +1214,50 @@ impl Engine {
         // Owned source instead of borrowing `peer`, so the deferred
         // output can outlive this stage. Probe and hash-build read the
         // local `rights_src`.
-        let rights_src: JoinSrc<'a> = match peer.eager_rows.take() {
-            Some(rows) => JoinSrc::Owned(rows),
-            None => match peer
-                .join_table
-                .as_deref()
-                .and_then(|n| self.active_catalog().get(n))
-            {
-                // v7.36 — cold-bearing peer hashes through `Mixed`.
-                // Unlike INL, hash build doesn't consume the
-                // locator's key; it iterates the source via
-                // `len()/get()` and indexes each row by its
-                // eq_pairs values — works correctly for ANY join
-                // column (PK or secondary). No PK constraint.
-                Some(t) if t.has_cold_rows_fast() => {
-                    let (cold, map) = crate::constraints::iter_cold_rows_with_locator_map(
-                        self.active_catalog(),
-                        t,
-                    );
-                    JoinSrc::Mixed {
-                        hot: t.rows(),
-                        cold,
-                        cold_locator_map: map,
+        // Phase C.3 step 2b — MVCC read gate for the hash build side.
+        // `build_gate` carries the peer `Table` + its hot-row count when
+        // the build source is backed by the hot tier (`Stored`, or the
+        // hot prefix of `Mixed`); a build row `ri < hot_len` this
+        // snapshot cannot see is skipped so it never enters a bucket.
+        // `Owned` build rows were already materialised (and filtered)
+        // upstream, so they carry no physical hot index and stay ungated;
+        // cold rows (`ri >= hot_len` in `Mixed`) are frozen = visible.
+        // No-op today: every hot header is frozen/committed-alive.
+        let (rights_src, build_gate): (JoinSrc<'a>, Option<(&'a Table, usize)>) =
+            match peer.eager_rows.take() {
+                Some(rows) => (JoinSrc::Owned(rows), None),
+                None => match peer
+                    .join_table
+                    .as_deref()
+                    .and_then(|n| self.active_catalog().get(n))
+                {
+                    // v7.36 — cold-bearing peer hashes through `Mixed`.
+                    // Unlike INL, hash build doesn't consume the
+                    // locator's key; it iterates the source via
+                    // `len()/get()` and indexes each row by its
+                    // eq_pairs values — works correctly for ANY join
+                    // column (PK or secondary). No PK constraint.
+                    Some(t) if t.has_cold_rows_fast() => {
+                        let (cold, map) = crate::constraints::iter_cold_rows_with_locator_map(
+                            self.active_catalog(),
+                            t,
+                        );
+                        let hot = t.rows();
+                        let hot_len = hot.len();
+                        (
+                            JoinSrc::Mixed {
+                                hot,
+                                cold,
+                                cold_locator_map: map,
+                            },
+                            Some((t, hot_len)),
+                        )
                     }
-                }
-                Some(t) => JoinSrc::Stored(t.rows()),
-                None => JoinSrc::Owned(Vec::new()),
-            },
-        };
+                    Some(t) => (JoinSrc::Stored(t.rows()), Some((t, t.rows().len()))),
+                    None => (JoinSrc::Owned(Vec::new()), None),
+                },
+            };
+        let scan_snapshot = self.current_snapshot();
         let n_rights = rights_src.len();
         // v7.29 - hashbrown over BTreeMap: the ordered map paid
         // O(log n) string comparisons per insert/probe (24k-row build
@@ -1259,6 +1296,12 @@ impl Engine {
         // only on vacant, probes never allocate.
         let mut keystr = String::new();
         'build: for ri in 0..n_rights {
+            if let Some((gt, hot_len)) = build_gate
+                && ri < hot_len
+                && !gt.is_row_visible(ri, &scan_snapshot)
+            {
+                continue;
+            }
             let Some(right) = rights_src.get(ri) else {
                 continue;
             };
@@ -1884,9 +1927,18 @@ impl Engine {
                 _ => None,
             }
         };
+        // Phase C.3 step 2b — MVCC read gate for the anti-join count
+        // fast path. Both loops iterate hot-tier rows (`.rows()`) by
+        // physical index, so a row this snapshot cannot see must neither
+        // seed the antiset nor be counted. No-op today: every hot header
+        // is frozen/committed-alive.
+        let scan_snapshot = self.current_snapshot();
         let mut antiset: hashbrown::HashSet<i64> =
             hashbrown::HashSet::with_capacity(inner_table.row_count());
-        for row in inner_table.rows() {
+        for (i, row) in inner_table.rows().iter().enumerate() {
+            if !inner_table.is_row_visible(i, &scan_snapshot) {
+                continue;
+            }
             if let Some(v) = row.values.get(inner_pos)
                 && let Some(k) = read_int(v)
             {
@@ -1896,7 +1948,10 @@ impl Engine {
         // Walk outer; count rows whose key isn't in the set OR whose key
         // is NULL (a NULL outer key has no join match either way).
         let mut count: i64 = 0;
-        for row in outer_table.rows() {
+        for (i, row) in outer_table.rows().iter().enumerate() {
+            if !outer_table.is_row_visible(i, &scan_snapshot) {
+                continue;
+            }
             match row.values.get(outer_pos) {
                 Some(v) => match read_int(v) {
                     Some(k) => {
@@ -2141,6 +2196,12 @@ impl Engine {
             alloc::boxed::Box::new(order_index.iter_asc())
         };
         let primary_table_name = primary_table.schema().name.clone();
+        // Phase C.3 step 2b — MVCC read gate for the streamed-join
+        // walker's primary. Snapshot computed once; a hot primary row
+        // this snapshot cannot see is skipped so a dead/old version never
+        // drives a join tuple. Cold locators are frozen = always visible.
+        // No-op today: every hot header is frozen/committed-alive.
+        let scan_snapshot = self.current_snapshot();
         'walk: for (key, locators) in walker {
             cancel.check()?;
             for loc in locators {
@@ -2156,10 +2217,15 @@ impl Engine {
                 // ports the walker's early-stop across the tier
                 // boundary at ~µs per row.
                 let left_cow: Cow<'_, Row> = match *loc {
-                    spg_storage::RowLocator::Hot(i) => match primary_table.rows().get(i) {
-                        Some(r) => Cow::Borrowed(r),
-                        None => continue,
-                    },
+                    spg_storage::RowLocator::Hot(i) => {
+                        if !primary_table.is_row_visible(i, &scan_snapshot) {
+                            continue;
+                        }
+                        match primary_table.rows().get(i) {
+                            Some(r) => Cow::Borrowed(r),
+                            None => continue,
+                        }
+                    }
                     spg_storage::RowLocator::Cold { segment_id, .. } => {
                         match self.active_catalog().resolve_cold_locator(
                             &primary_table_name,

@@ -217,6 +217,13 @@ pub(crate) fn try_pk_walk_top_n<'a>(
         } else {
             Box::new(index.iter_asc())
         };
+    // Phase C.3 step 2b — MVCC read gate. Compute the reader's
+    // snapshot once; hot rows this snapshot cannot see are skipped so
+    // an in-place writer's dead/old version never surfaces on the
+    // BTree-walk fast path. Cold-tier locators are frozen segments =
+    // always visible, so they stay ungated. No-op today: every hot
+    // header is frozen/committed-alive, so `is_row_visible` is `true`.
+    let scan_snapshot = engine.current_snapshot();
     for (key, locators) in walker {
         for loc in locators {
             // v7.34.7 (mailrs prod #6 follow-up) — single-table walker
@@ -227,10 +234,15 @@ pub(crate) fn try_pk_walk_top_n<'a>(
             // and fell back to the legacy materialise + partial-sort
             // path on the 803 MB prod catalog.
             let row_cow: Cow<'a, Row> = match *loc {
-                spg_storage::RowLocator::Hot(row_idx) => match table.rows().get(row_idx) {
-                    Some(r) => Cow::Borrowed(r),
-                    None => continue,
-                },
+                spg_storage::RowLocator::Hot(row_idx) => {
+                    if !table.is_row_visible(row_idx, &scan_snapshot) {
+                        continue;
+                    }
+                    match table.rows().get(row_idx) {
+                        Some(r) => Cow::Borrowed(r),
+                        None => continue,
+                    }
+                }
                 spg_storage::RowLocator::Cold { segment_id, .. } => {
                     match catalog.resolve_cold_locator(table_name, segment_id, key) {
                         Some(r) => Cow::Owned(r),
