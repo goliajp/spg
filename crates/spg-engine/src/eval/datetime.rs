@@ -1015,6 +1015,56 @@ pub(super) fn get_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Eva
     Ok(Value::text(String::from(fmt)))
 }
 
+/// PG `timezone(zone, ts)` — the function form of `AT TIME ZONE`.
+/// UTC / GMT and explicit '±HH[:MM]' offsets shift for real: the
+/// input is treated as UTC-stored micros and the result is the
+/// zone-local naive timestamp (the dominant timestamptz →
+/// timestamp display direction; SPG's single timestamp
+/// representation cannot distinguish the reverse). Named zones
+/// error honestly — SPG carries no tzdata, and a silent no-op
+/// would misrender every non-UTC display.
+pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("timezone() takes 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(zone) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "timezone() zone must be text, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    let z = zone.trim();
+    let offset = if z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("gmt") {
+        0
+    } else if let Some(off) = parse_tz_offset(z) {
+        off
+    } else if let Ok(h) = z.parse::<i64>() {
+        // Bare numeric hours ('+5' parses above; '5' lands here).
+        if h.abs() > 14 {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("timezone(): offset {h} out of range"),
+            });
+        }
+        h * 3_600_000_000
+    } else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "timezone({z:?}): named time zones need tzdata SPG does not \
+                 carry; use UTC or an explicit '+HH:MM' offset"
+            ),
+        });
+    };
+    let ts = text_or_temporal_micros(&args[1], "timezone")?;
+    Ok(Value::Timestamp(ts + offset))
+}
+
 /// Parse a '+HH:MM' / '-HH:MM' timezone offset into micros.
 fn parse_tz_offset(s: &str) -> Option<i64> {
     let s = s.trim();

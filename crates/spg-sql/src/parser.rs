@@ -11726,6 +11726,26 @@ impl Parser {
                 };
                 continue;
             }
+            // `expr AT TIME ZONE zone` — lowers to PG's own function
+            // form timezone(zone, expr); the scalar implements the
+            // offset shift (named zones error there — no tzdata).
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("at"))
+                && matches!(self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
+                && matches!(self.tokens.get(self.pos + 2),
+                    Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+            {
+                self.advance(); // AT
+                self.advance(); // TIME
+                self.advance(); // ZONE
+                // Zone at comparison precedence so AND/OR stay out.
+                let zone = self.parse_expr(5)?;
+                expr = Expr::FunctionCall {
+                    name: "timezone".to_string(),
+                    args: alloc::vec![zone, expr],
+                };
+                continue;
+            }
             // `expr COLLATE "name"` — SPG's single text ordering IS
             // byte order, i.e. the C collation. The byte-order
             // spellings absorb as no-ops; a locale collation would
