@@ -73,6 +73,50 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+SQL-surface scout campaign (tasks #352-#362) — two scout rounds
+(temporary probe files sweeping 10-12 shapes each, deleted after
+harvest) drive eleven closures; every arc is a parse-time lowering
+or a small executor arm, verified against PG doc vectors where
+they exist (2919 e2e green):
+
+- **Parallel-zip SRFs (#352, #354)**: multi-arg unnest(a, b, …)
+  zips arrays NULL-padded to the longest through an internal
+  __unnest_zip marker + shared builder consumed by both the
+  primary executor and the join materialiser; ROWS FROM
+  (srf(), srf()) is the SQL-standard spelling over the same
+  channel (entries lower to their scalar array forms;
+  generate_series has none and errors honestly).
+- **TABLESAMPLE (#353)**: BERNOULLI(p) lowers to a per-row
+  random() < p/100 WHERE conjunct (exact row-level semantics;
+  SYSTEM shares it — no page structure to sample); REPEATABLE
+  errors honestly. Scoped through a pending-predicate channel
+  parse_bare_select save/restores around nested selects.
+- **Statement/clause idioms (#355-#357)**: TABLE name shorthand
+  (statement head + set-op peer positions via a shared builder);
+  COLLATE absorbs the byte-order spellings and errors on locale
+  collations (SPG's single ordering IS the C collation);
+  AT TIME ZONE lowers to timezone(zone, ts) — UTC/GMT and ±HH:MM
+  offsets shift for real, named zones error (no tzdata);
+  ORDER BY USING maps the btree operators onto ASC/DESC;
+  OPERATOR([schema.]op) reduces to the plain operator before
+  binary dispatch.
+- **Expression predicates (#358, #360)**: IS [NOT]
+  TRUE/FALSE/UNKNOWN via never-NULL CASE lowerings; LIKE ESCAPE
+  rewrites literal patterns to the backslash matcher; BETWEEN
+  SYMMETRIC ORs both bound orientations; SIMILAR TO composes
+  regexp_like over the anchored similar_to_escape regex (PG doc
+  vectors pin full-string anchoring).
+- **Named windows (#359)**: WINDOW w AS (…) definitions inline
+  into OVER w markers at parse time; the bare-ident alias rule
+  gains window/tablesample stopwords (both had been swallowed as
+  table aliases).
+- **Array slices (#361)**: arr[lo:hi] with clamped 1-based
+  inclusive bounds and open ends — a new Expr variant threaded
+  through all fourteen exhaustive Expr walkers.
+- **Row constructors (#362)**: (a, b) compared with = <> < <= >
+  >= expands lexicographically at parse time; (a, b) [NOT] IN
+  ((…), …) ORs row equalities. Arity mismatches error.
+
 Analytics + INSERT + SRF-correlation campaign (tasks #338-#350) —
 grouping analytics, the INSERT clause tail, and the SRF ordinality
 / correlation story close out, with two real engine gaps found and
