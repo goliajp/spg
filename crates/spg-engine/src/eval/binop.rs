@@ -224,6 +224,28 @@ pub(super) fn apply_binary(
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
         BinOp::JsonGetPathText => crate::json::path_walk(&l, &r, true),
+        // Array operands claim && / @> / <@ before the inet / JSON
+        // interpretations: ARRAY[1,2] && ARRAY[2,3] is the overlap
+        // test, ARRAY[1,2,3] @> ARRAY[2] the containment test.
+        BinOp::JsonContains
+            if array_scalar_elems(&l).is_some() && array_scalar_elems(&r).is_some() =>
+        {
+            Ok(Value::Bool(array_contains_all(&l, &r)))
+        }
+        BinOp::JsonContainedBy
+            if array_scalar_elems(&l).is_some() && array_scalar_elems(&r).is_some() =>
+        {
+            Ok(Value::Bool(array_contains_all(&r, &l)))
+        }
+        BinOp::InetOverlap
+            if array_scalar_elems(&l).is_some() && array_scalar_elems(&r).is_some() =>
+        {
+            let (a, _) = array_scalar_elems(&l).expect("guard checked");
+            let (b, _) = array_scalar_elems(&r).expect("guard checked");
+            Ok(Value::Bool(
+                a.iter().any(|x| b.iter().any(|y| x == y)),
+            ))
+        }
         BinOp::JsonContains => crate::json::contains(&l, &r),
         // v7.37.6-A `<@` reuses `@>` with swapped args.
         BinOp::JsonContainedBy => crate::json::contains(&r, &l),
@@ -983,6 +1005,49 @@ fn bitop(
             detail: format!("cannot apply {op_name} to {a:?} and {b:?}"),
         }),
     }
+}
+
+/// Elements of a scalar array Value normalised for equality
+/// (integers widen to BigInt so int4[] and int8[] compare), plus a
+/// flag for NULL elements. `None` for non-array operands.
+fn array_scalar_elems(v: &Value<'_>) -> Option<(Vec<Value<'static>>, bool)> {
+    fn collect<T: Clone>(
+        items: &[Option<T>],
+        f: impl Fn(T) -> Value<'static>,
+    ) -> (Vec<Value<'static>>, bool) {
+        let mut has_null = false;
+        let mut out = Vec::with_capacity(items.len());
+        for o in items {
+            match o {
+                Some(x) => out.push(f(x.clone())),
+                None => has_null = true,
+            }
+        }
+        (out, has_null)
+    }
+    Some(match v {
+        Value::TextArray(i) => collect(i, Value::text),
+        Value::IntArray(i) => collect(i, |x| Value::BigInt(i64::from(x))),
+        Value::SmallIntArray(i) => collect(i, |x| Value::BigInt(i64::from(x))),
+        Value::BigIntArray(i) => collect(i, Value::BigInt),
+        Value::FloatArray(i) => collect(i, Value::Float),
+        Value::BoolArray(i) => collect(i, Value::Bool),
+        Value::DateArray(i) => collect(i, Value::Date),
+        Value::TimestampArray(i) => collect(i, Value::Timestamp),
+        _ => return None,
+    })
+}
+
+/// `l @> r` for scalar arrays: every non-NULL element of `r` appears
+/// in `l`; a NULL element on the right can never be contained (PG
+/// semantics), and the empty array is contained in everything.
+fn array_contains_all(l: &Value<'_>, r: &Value<'_>) -> bool {
+    let (left, _) = array_scalar_elems(l).expect("caller guards array");
+    let (right, right_nulls) = array_scalar_elems(r).expect("caller guards array");
+    if right_nulls {
+        return false;
+    }
+    right.iter().all(|b| left.contains(b))
 }
 
 fn arith(
