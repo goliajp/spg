@@ -1677,6 +1677,14 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "int_array" | "integer_array" | "int4_array" => DataType::IntArray,
         "bigint_array" | "int8_array" => DataType::BigIntArray,
         "float_array" | "double_array" | "real_array" => DataType::FloatArray,
+        // Width-suffixed float spellings and OID — SPG has one
+        // float representation and OIDs are plain integers.
+        "float4" | "real" | "float8" | "double precision" | "float" => DataType::Float,
+        "oid" => DataType::BigInt,
+        // TIME [WITHOUT TIME ZONE] — first-class since the codec
+        // carries Value::Time; the coerce path parses HH:MM:SS.
+        "time" | "time without time zone" => DataType::Time,
+        "timetz" | "time with time zone" => DataType::TimeTz,
         "numeric_array" | "decimal_array" => DataType::NumericArray,
         "text_array" => DataType::TextArray,
         "date_array" => DataType::DateArray,
