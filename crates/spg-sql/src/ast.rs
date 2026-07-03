@@ -2692,6 +2692,34 @@ pub enum ExtractField {
     /// Seconds since 1970-01-01 00:00:00 UTC (PG returns numeric;
     /// SPG keeps the integer convention — truncated seconds).
     Epoch,
+    /// Day of week, 0 = Sunday … 6 = Saturday.
+    Dow,
+    /// ISO day of week, 1 = Monday … 7 = Sunday.
+    Isodow,
+    /// Day of year, 1-366.
+    Doy,
+    /// ISO 8601 week number, 1-53.
+    Week,
+    /// ISO 8601 week-numbering year (pairs with `Week`).
+    Isoyear,
+    /// Quarter, 1-4.
+    Quarter,
+    /// Year divided by 10 (floor).
+    Decade,
+    /// Century — 2001-2100 is century 21.
+    Century,
+    /// Millennium — 2001-3000 is millennium 3.
+    Millennium,
+    /// Julian day number (truncated for timestamps).
+    Julian,
+    /// Seconds and fraction in milliseconds (ss·1000 + frac).
+    Millisecond,
+    /// UTC offset in seconds — SPG sessions run UTC, so 0.
+    Timezone,
+    /// Hour component of the UTC offset — 0.
+    TimezoneHour,
+    /// Minute component of the UTC offset — 0.
+    TimezoneMinute,
 }
 
 impl fmt::Display for ExtractField {
@@ -2705,6 +2733,20 @@ impl fmt::Display for ExtractField {
             Self::Second => "SECOND",
             Self::Microsecond => "MICROSECOND",
             Self::Epoch => "EPOCH",
+            Self::Dow => "DOW",
+            Self::Isodow => "ISODOW",
+            Self::Doy => "DOY",
+            Self::Week => "WEEK",
+            Self::Isoyear => "ISOYEAR",
+            Self::Quarter => "QUARTER",
+            Self::Decade => "DECADE",
+            Self::Century => "CENTURY",
+            Self::Millennium => "MILLENNIUM",
+            Self::Julian => "JULIAN",
+            Self::Millisecond => "MILLISECOND",
+            Self::Timezone => "TIMEZONE",
+            Self::TimezoneHour => "TIMEZONE_HOUR",
+            Self::TimezoneMinute => "TIMEZONE_MINUTE",
         })
     }
 }
