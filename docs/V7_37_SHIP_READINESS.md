@@ -73,6 +73,52 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Expression-idiom scout campaign (tasks #375-#379) — three scout
+rounds (function syntax, date/time fields, operators) drive five
+closures, with two real engine bugs found and fixed by the
+campaign's own pins (2960 e2e green):
+
+- **SQL-standard function syntax (#375)**: TRIM([BOTH|LEADING|
+  TRAILING] [chars] FROM str) lowers onto btrim/ltrim/rtrim
+  (keyword forms upfront, keyword-less chars form via a first-arg
+  FROM hook, comma forms untouched); POSITION(sub IN str) lowers
+  onto strpos via a suppress_in_tail parser flag so IN reads as
+  the argument separator — regular IN-lists and the position(sub,
+  str) comma form (incl. bytea) unaffected. A NUMERIC operand
+  paired with an INTERVAL now reaches the interval scaling path
+  instead of erroring in fixed-point dispatch.
+- **ROW constructors (#376)**: bare ROW(a, b, …) renders as PG
+  record text (NULL fields empty, special characters
+  double-quoted); followed by a comparison or [NOT] IN the ROW
+  keyword joins the paren row-comparison machinery, whose RHS
+  sites absorb the keyword too — ROW(a,b) = ROW(c,d) works end to
+  end. Single-element ROW(x) is valid, matching PG.
+- **EXTRACT field completion (#377)**: DOW/ISODOW/DOY/WEEK/
+  ISOYEAR/QUARTER/DECADE/CENTURY/MILLENNIUM/JULIAN/MILLISECOND/
+  TIMEZONE[_HOUR|_MINUTE] join the original eight fields in both
+  EXTRACT and date_part. WEEK/ISOYEAR run the real ISO 8601
+  algorithm (52/53-week years, boundary days roll into the
+  neighbouring ISO year); CENTURY/MILLENNIUM count from year 1;
+  JULIAN anchors at JD 2440588; TIMEZONE is honestly 0 (UTC
+  sessions). Intervals gain the era/subsecond fields and error
+  honestly on day-of-week/week/julian. Verified against PG doc
+  vectors (2023-01-01 → week 52 of ISO year 2022, JD(2000-01-01)
+  = 2451545).
+- **OVERLAPS (#378)**: (S1, E1) OVERLAPS (S2, E2) joins the
+  row-constructor tail — endpoints normalise with least/greatest
+  and the predicate lowers to start1 < end2 AND start2 < end1
+  (touching endpoints do not overlap, PG's half-open periods).
+  The pins exposed a pre-existing bug: value_cmp_for_min_max fell
+  through to Equal for non-integer/float/text/bytes types, so
+  greatest()/least() over dates, timestamps, times, bools and
+  intervals silently returned their first argument — the ordered
+  types now compare for real.
+- **Array operators (#379)**: && overlap and @> / <@ containment
+  claim array operands ahead of the inet/JSON interpretations
+  (guarded arms; JSON containment on JSON operands untouched).
+  Integer arrays compare across widths, NULL elements never match,
+  and the empty array is contained in everything.
+
 DML-side + statement scout campaign (tasks #364-#373) — three
 scout rounds (DML shapes, types/casts, MySQL statements) drive ten
 closures riding existing machinery, with three real engine bugs
