@@ -4725,11 +4725,108 @@ impl Parser {
             }
             break;
         }
+        // `UPDATE t SET … FROM src [, …] WHERE cond` — PG's joined
+        // update. Lowers onto the correlated-subquery machinery:
+        // the WHERE becomes EXISTS(SELECT 1 FROM src WHERE cond)
+        // and each assignment that references a FROM-list table
+        // wraps into a correlated scalar subquery
+        // (SELECT expr FROM src WHERE cond). Equivalent for the
+        // unique-join shape (the overwhelmingly common one); a
+        // multi-match, which PG resolves by arbitrary pick,
+        // surfaces as a scalar-subquery cardinality error instead
+        // of a silent arbitrary result.
+        let from_clause = if matches!(self.peek(), Token::From) {
+            self.advance();
+            Some(self.parse_from_clause()?)
+        } else {
+            None
+        };
         let where_ = if matches!(self.peek(), Token::Where) {
             self.advance();
             Some(self.parse_expr(0)?)
         } else {
             None
+        };
+        let (assignments, where_) = if let Some(fc) = from_clause {
+            let names: Vec<String> = core::iter::once(&fc.primary)
+                .chain(fc.joins.iter().map(|j| &j.table))
+                .flat_map(|t| {
+                    t.alias
+                        .clone()
+                        .into_iter()
+                        .chain(core::iter::once(t.name.clone()))
+                })
+                .collect();
+            let refs_list = |e: &Expr| -> bool {
+                fn walk(e: &Expr, names: &[String]) -> bool {
+                    match e {
+                        Expr::Column(c) => c
+                            .qualifier
+                            .as_deref()
+                            .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q))),
+                        Expr::Binary { lhs, rhs, .. } => {
+                            walk(lhs, names) || walk(rhs, names)
+                        }
+                        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, names),
+                        Expr::FunctionCall { args, .. } => {
+                            args.iter().any(|a| walk(a, names))
+                        }
+                        Expr::Case {
+                            operand,
+                            branches,
+                            else_branch,
+                        } => {
+                            operand.as_deref().is_some_and(|o| walk(o, names))
+                                || branches
+                                    .iter()
+                                    .any(|(w, t)| walk(w, names) || walk(t, names))
+                                || else_branch.as_deref().is_some_and(|el| walk(el, names))
+                        }
+                        _ => false,
+                    }
+                }
+                walk(e, &names)
+            };
+            let sub_select = |items: Vec<SelectItem>| SelectStatement {
+                ctes: Vec::new(),
+                distinct: false,
+                distinct_on: Vec::new(),
+                items,
+                from: Some(fc.clone()),
+                where_: where_.clone(),
+                group_by: None,
+                group_by_all: false,
+                having: None,
+                unions: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                limit_with_ties: false,
+            };
+            let assignments = assignments
+                .into_iter()
+                .map(|(col, expr)| {
+                    if refs_list(&expr) {
+                        let sub = sub_select(alloc::vec![SelectItem::Expr {
+                            expr,
+                            alias: None,
+                        }]);
+                        (col, Expr::ScalarSubquery(Box::new(sub)))
+                    } else {
+                        (col, expr)
+                    }
+                })
+                .collect();
+            let exists = Expr::Exists {
+                subquery: Box::new(sub_select(alloc::vec![SelectItem::Expr {
+                    expr: Expr::Literal(Literal::Integer(1)),
+                    alias: None,
+                }])),
+                negated: false,
+            };
+            (assignments, Some(exists))
+        } else {
+            (assignments, where_)
         };
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Update(crate::ast::UpdateStatement {
@@ -4749,11 +4846,48 @@ impl Parser {
         }
         self.advance();
         let table = self.expect_ident_like()?;
+        // `DELETE FROM t USING src [, …] WHERE cond` — PG's joined
+        // delete. Same lowering as UPDATE … FROM: the WHERE
+        // becomes EXISTS(SELECT 1 FROM src WHERE cond), driven per
+        // target row by the correlated machinery.
+        let using_clause = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
+        {
+            self.advance();
+            Some(self.parse_from_clause()?)
+        } else {
+            None
+        };
         let where_ = if matches!(self.peek(), Token::Where) {
             self.advance();
             Some(self.parse_expr(0)?)
         } else {
             None
+        };
+        let where_ = if let Some(fc) = using_clause {
+            Some(Expr::Exists {
+                subquery: Box::new(SelectStatement {
+                    ctes: Vec::new(),
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    items: alloc::vec![SelectItem::Expr {
+                        expr: Expr::Literal(Literal::Integer(1)),
+                        alias: None,
+                    }],
+                    from: Some(fc),
+                    where_,
+                    group_by: None,
+                    group_by_all: false,
+                    having: None,
+                    unions: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    limit_with_ties: false,
+                }),
+                negated: false,
+            })
+        } else {
+            where_
         };
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Delete(crate::ast::DeleteStatement {

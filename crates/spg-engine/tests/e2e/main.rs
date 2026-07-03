@@ -515,6 +515,7 @@ mod e2e_rows_from;
 mod e2e_table_shorthand_collate;
 mod e2e_tablesample;
 mod e2e_unnest_multi;
+mod e2e_update_from_delete_using;
 mod e2e_with_ordinality;
 mod e2e_writable_cte;
 mod mailrs_round26;

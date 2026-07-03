@@ -931,6 +931,41 @@ impl Engine {
         let ts_cfg: Option<String> = self
             .session_param("default_text_search_config")
             .map(String::from);
+        // A WHERE containing subqueries (DELETE … USING lowers to
+        // EXISTS) cannot evaluate inside the &mut walk below — the
+        // correlated resolver re-enters the engine read path.
+        // Resolve the matching hot positions up front, immutably.
+        let subquery_hits: Option<Vec<usize>> = if stmt
+            .where_
+            .as_ref()
+            .is_some_and(|w| crate::subquery::expr_has_subquery(w))
+        {
+            let w = stmt.where_.as_ref().expect("guarded above");
+            let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+            let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+            let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+                .with_default_text_search_config(ts_cfg.as_deref());
+            let mut hits: Vec<usize> = Vec::new();
+            for i in 0..table.row_count() {
+                if i.is_multiple_of(256) {
+                    cancel.check()?;
+                }
+                let Some(row) = table.rows().get(i) else {
+                    continue;
+                };
+                let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, None)?;
+                if matches!(cond, Value::Bool(true)) {
+                    hits.push(i);
+                }
+            }
+            Some(hits)
+        } else {
+            None
+        };
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -970,7 +1005,9 @@ impl Engine {
             let Some(row) = table.rows().get(i) else {
                 continue;
             };
-            let keep = if let Some(w) = &stmt.where_ {
+            let keep = if let Some(hits) = &subquery_hits {
+                hits.binary_search(&i).is_err()
+            } else if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
                 !matches!(cond, Value::Bool(true))
             } else {
