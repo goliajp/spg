@@ -26,6 +26,7 @@ mod e2e_bool_agg;
 mod e2e_brin;
 mod e2e_bytea;
 mod e2e_bytea_ops;
+mod e2e_bit_string_literals;
 mod e2e_cast_targets;
 mod e2e_cast_targets_batch2;
 mod e2e_ceil;

@@ -11832,6 +11832,43 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        // `B'1010'` / `X'1F'` — SQL bit-string literals. The lexer
+        // splits them into an ident + string; recombine here and
+        // lower onto the existing `::bit` cast (the X form is the
+        // hex spelling — each digit expands to 4 bits).
+        if let Token::Ident(prefix) = self.peek()
+            && (prefix.eq_ignore_ascii_case("b") || prefix.eq_ignore_ascii_case("x"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::String(_)))
+        {
+            let is_hex = prefix.eq_ignore_ascii_case("x");
+            self.advance();
+            let Token::String(body) = self.advance() else {
+                unreachable!("guarded above");
+            };
+            let bits = if is_hex {
+                let mut out = String::with_capacity(body.len() * 4);
+                for c in body.chars() {
+                    let Some(d) = c.to_digit(16) else {
+                        return Err(self.err(alloc::format!(
+                            "invalid hexadecimal digit {c:?} in X'…' bit string"
+                        )));
+                    };
+                    out.push_str(&alloc::format!("{d:04b}"));
+                }
+                out
+            } else {
+                if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
+                    return Err(self.err(alloc::format!(
+                        "invalid binary digit {bad:?} in B'…' bit string"
+                    )));
+                }
+                body
+            };
+            return Ok(Expr::Cast {
+                expr: Box::new(Expr::Literal(Literal::String(bits))),
+                target: CastTarget::Named("bit".to_string()),
+            });
+        }
         let tok_pos = self.pos;
         match self.advance() {
             Token::Integer(n) => Ok(Expr::Literal(Literal::Integer(n))),
