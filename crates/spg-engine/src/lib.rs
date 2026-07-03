@@ -471,6 +471,17 @@ pub struct Engine {
     /// plumbing the write path consumes next. Rides on `Engine` like
     /// `active_writer_versions`; the sharded lock-free manager is C.5.
     locks: crate::locks::LockTable,
+    /// v7.37.15 (Phase C.3) — kill switch for the in-place MVCC write
+    /// path. `false` (default) = legacy physical semantics (DELETE
+    /// physically removes the row, UPDATE replaces in place). `true` =
+    /// the C.3 write path (DELETE tombstones via `mark_row_deleted`,
+    /// UPDATE tombstones the old version + appends the new one, both
+    /// keeping dead versions physically present for the now-uniformly-
+    /// gated readers until vacuum reclaims them). `no_std` engine can't
+    /// read env; the host (spg-server / spg-embedded) reads
+    /// `SPG_MVCC_INPLACE` and calls [`Self::set_mvcc_inplace`]. Off
+    /// until the write path + PG18 differential tests are proven.
+    mvcc_inplace: bool,
     /// v7.37.15 (Phase C) — TxId → writer version registry. When
     /// `exec_begin` opens an explicit transaction it allocates a
     /// fresh writer version (via [`Self::begin_writer_version`])
@@ -698,6 +709,7 @@ impl Engine {
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
             locks: crate::locks::LockTable::new(),
+            mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -903,6 +915,22 @@ impl Engine {
         self.locks.locked_row_count()
     }
 
+    /// v7.37.15 (Phase C.3) — is the in-place MVCC write path enabled?
+    /// `false` (default) keeps legacy physical DELETE/UPDATE. The C.3
+    /// writers consult this to choose tombstone-vs-physical.
+    #[must_use]
+    pub fn mvcc_inplace(&self) -> bool {
+        self.mvcc_inplace
+    }
+
+    /// v7.37.15 (Phase C.3) — enable/disable the in-place MVCC write
+    /// path. Called by the host after reading `SPG_MVCC_INPLACE` (the
+    /// `no_std` engine can't read the environment itself). Off until
+    /// the write path is proven against PG18 differential tests.
+    pub fn set_mvcc_inplace(&mut self, on: bool) {
+        self.mvcc_inplace = on;
+    }
+
     /// v7.37.15 (Phase C) — allocate a fresh version number for
     /// the next write. Always strictly monotonic + process-wide
     /// shared so concurrent engines on the same process agree on
@@ -957,6 +985,7 @@ impl Engine {
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
             locks: crate::locks::LockTable::new(),
+            mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -1035,6 +1064,7 @@ impl Engine {
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
             locks: crate::locks::LockTable::new(),
+            mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
                     clock: None,
                     salt_fn: None,
