@@ -1688,6 +1688,34 @@ fn xact_status_tracks_inflight_commit_and_abort() {
 }
 
 #[test]
+fn engine_row_locks_acquire_and_release() {
+    use crate::locks::{LockMode, LockOutcome, WaitPolicy};
+    use spg_storage::row_header::{RelId, RowId};
+    let mut e = Engine::new();
+    let rel = RelId(1);
+    let row = RowId(7);
+    // tx 100 takes an Exclusive lock.
+    assert_eq!(
+        e.acquire_row_lock(rel, row, LockMode::Exclusive, 100, WaitPolicy::Wait),
+        LockOutcome::Granted
+    );
+    assert_eq!(e.locked_row_count(), 1);
+    // tx 200 conflicts → blocks (or, under NoWait, unavailable).
+    assert_eq!(
+        e.acquire_row_lock(rel, row, LockMode::Exclusive, 200, WaitPolicy::NoWait),
+        LockOutcome::NotAvailable
+    );
+    // Releasing tx 100's locks frees the row for tx 200.
+    e.release_tx_locks(100);
+    assert_eq!(
+        e.acquire_row_lock(rel, row, LockMode::Exclusive, 200, WaitPolicy::Wait),
+        LockOutcome::Granted
+    );
+    e.release_tx_locks(200);
+    assert_eq!(e.locked_row_count(), 0);
+}
+
+#[test]
 fn rollback_marks_writer_version_aborted() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();

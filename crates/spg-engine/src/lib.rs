@@ -463,6 +463,14 @@ pub struct Engine {
     /// then it grows only with rolled-back transactions (a never-die
     /// follow-up, not a commit-path leak).
     aborted_versions: BTreeSet<u64>,
+    /// v7.37.15 (Phase C.4) — row-level lock table keyed on stable
+    /// `(RelId, RowId)`. The in-place write path (C.3) acquires a
+    /// tuple lock before stamping xmax; `exec_commit` / `exec_rollback`
+    /// release the whole transaction's locks at end. No writer acquires
+    /// yet at this commit — the field + delegating methods are the
+    /// plumbing the write path consumes next. Rides on `Engine` like
+    /// `active_writer_versions`; the sharded lock-free manager is C.5.
+    locks: crate::locks::LockTable,
     /// v7.37.15 (Phase C) — TxId → writer version registry. When
     /// `exec_begin` opens an explicit transaction it allocates a
     /// fresh writer version (via [`Self::begin_writer_version`])
@@ -689,6 +697,7 @@ impl Engine {
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
+            locks: crate::locks::LockTable::new(),
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -851,6 +860,37 @@ impl Engine {
         }
     }
 
+    /// v7.37.15 (Phase C.4) — acquire a tuple lock on a stable
+    /// `(RelId, RowId)` for writer `version`. The in-place write path
+    /// (C.3) calls this before stamping xmax; `SELECT ... FOR UPDATE`
+    /// wires here via the parser's lock-strength clause (C.4). Returns
+    /// the [`LockOutcome`](crate::locks::LockOutcome) the caller acts on
+    /// (grant / park / skip / fail / deadlock-abort).
+    pub fn acquire_row_lock(
+        &mut self,
+        rel: spg_storage::row_header::RelId,
+        row: spg_storage::row_header::RowId,
+        mode: crate::locks::LockMode,
+        version: u64,
+        policy: crate::locks::WaitPolicy,
+    ) -> crate::locks::LockOutcome {
+        self.locks.acquire(rel, row, mode, version, policy)
+    }
+
+    /// v7.37.15 (Phase C.4) — release every lock + wait held by
+    /// `version` at transaction end. Called from `exec_commit` /
+    /// `exec_rollback` alongside the writer-version bookkeeping.
+    pub fn release_tx_locks(&mut self, version: u64) {
+        self.locks.release_all(version);
+    }
+
+    /// v7.37.15 (Phase C.4) — number of rows currently locked, for the
+    /// `pg_locks` enumeration and tests.
+    #[must_use]
+    pub fn locked_row_count(&self) -> usize {
+        self.locks.locked_row_count()
+    }
+
     /// v7.37.15 (Phase C) — allocate a fresh version number for
     /// the next write. Always strictly monotonic + process-wide
     /// shared so concurrent engines on the same process agree on
@@ -904,6 +944,7 @@ impl Engine {
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
+            locks: crate::locks::LockTable::new(),
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -981,6 +1022,7 @@ impl Engine {
                     next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
+            locks: crate::locks::LockTable::new(),
             tx_writer_versions: BTreeMap::new(),
                     clock: None,
                     salt_fn: None,

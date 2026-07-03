@@ -78,6 +78,9 @@ impl Engine {
         // saw a begin (e.g. autocommit-only paths).
         if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
             self.commit_writer_version(v);
+            // v7.37.15 Phase C.4 — release the tx's row locks. No-op
+            // until the in-place write path (C.3) starts acquiring.
+            self.release_tx_locks(v);
         }
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with
@@ -104,6 +107,9 @@ impl Engine {
         // commit" shortcut here.
         if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
             self.abort_writer_version(v);
+            // v7.37.15 Phase C.4 — release the tx's row locks on abort
+            // too, so a rolled-back FOR UPDATE never leaves a row locked.
+            self.release_tx_locks(v);
         }
         // savepoints discarded with the TxState
         Ok(QueryResult::CommandOk {
