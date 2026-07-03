@@ -11443,6 +11443,25 @@ impl Parser {
                     }
                 } else {
                     let e = self.parse_expr(0)?;
+                    // `(a, b, …)` — a row constructor. Valid only
+                    // in front of a comparison operator or [NOT]
+                    // IN; both expand at parse time (lexicographic
+                    // comparison / OR'd row equalities).
+                    if matches!(self.peek(), Token::Comma) {
+                        let mut row = alloc::vec![e];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            row.push(self.parse_expr(0)?);
+                        }
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(alloc::format!(
+                                "expected ')' after row constructor, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        return self.parse_row_comparison_tail(row);
+                    }
                     match self.advance() {
                         Token::RParen => Ok(e),
                         other => Err(ParseError {
@@ -12093,6 +12112,176 @@ impl Parser {
             }
             return Ok(expr);
         }
+    }
+
+    /// Parse the operator tail after a `(a, b, …)` row constructor
+    /// and expand at parse time. `=` is the conjunction of element
+    /// equalities; `<>` its negation; the order operators expand
+    /// lexicographically; `[NOT] IN ( (row), … )` ORs the row
+    /// equalities. Anything else (a bare row value, a subquery
+    /// RHS) errors honestly — SPG has no composite runtime value.
+    fn parse_row_comparison_tail(&mut self, row: Vec<Expr>) -> Result<Expr, ParseError> {
+        fn row_eq(lhs: &[Expr], rhs: &[Expr]) -> Expr {
+            let mut it = lhs.iter().zip(rhs.iter()).map(|(l, r)| Expr::Binary {
+                lhs: Box::new(l.clone()),
+                op: BinOp::Eq,
+                rhs: Box::new(r.clone()),
+            });
+            let first = it.next().expect("row has at least two elements");
+            it.fold(first, |acc, e| Expr::Binary {
+                lhs: Box::new(acc),
+                op: BinOp::And,
+                rhs: Box::new(e),
+            })
+        }
+        // Lexicographic (a,b) OP (c,d):
+        //   a STRICT c OR (a = c AND (b OP d))  — recursing right.
+        fn row_lex(lhs: &[Expr], rhs: &[Expr], strict: BinOp, last: BinOp) -> Expr {
+            if lhs.len() == 1 {
+                return Expr::Binary {
+                    lhs: Box::new(lhs[0].clone()),
+                    op: last,
+                    rhs: Box::new(rhs[0].clone()),
+                };
+            }
+            let head_strict = Expr::Binary {
+                lhs: Box::new(lhs[0].clone()),
+                op: strict,
+                rhs: Box::new(rhs[0].clone()),
+            };
+            let head_eq = Expr::Binary {
+                lhs: Box::new(lhs[0].clone()),
+                op: BinOp::Eq,
+                rhs: Box::new(rhs[0].clone()),
+            };
+            Expr::Binary {
+                lhs: Box::new(head_strict),
+                op: BinOp::Or,
+                rhs: Box::new(Expr::Binary {
+                    lhs: Box::new(head_eq),
+                    op: BinOp::And,
+                    rhs: Box::new(row_lex(&lhs[1..], &rhs[1..], strict, last)),
+                }),
+            }
+        }
+        let negated_in = if matches!(self.peek(), Token::Not)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::In))
+        {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        if matches!(self.peek(), Token::In) {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected '(' after row IN, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut alternatives: Vec<Expr> = Vec::new();
+            loop {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' to open a row inside IN, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut rhs = alloc::vec![self.parse_expr(0)?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    rhs.push(self.parse_expr(0)?);
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after row inside IN, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if rhs.len() != row.len() {
+                    return Err(self.err(alloc::format!(
+                        "row IN arity mismatch: left has {}, right has {}",
+                        row.len(),
+                        rhs.len()
+                    )));
+                }
+                alternatives.push(row_eq(&row, &rhs));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' to close row IN list, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut it = alternatives.into_iter();
+            let first = it.next().expect("IN list has at least one row");
+            let combined = it.fold(first, |acc, e| Expr::Binary {
+                lhs: Box::new(acc),
+                op: BinOp::Or,
+                rhs: Box::new(e),
+            });
+            return Ok(maybe_not(combined, negated_in));
+        }
+        let op = match self.peek() {
+            Token::Eq => BinOp::Eq,
+            Token::NotEq => BinOp::NotEq,
+            Token::Lt => BinOp::Lt,
+            Token::LtEq => BinOp::LtEq,
+            Token::Gt => BinOp::Gt,
+            Token::GtEq => BinOp::GtEq,
+            other => {
+                return Err(self.err(alloc::format!(
+                    "row constructor must be followed by a comparison \
+                     operator or [NOT] IN; got {other:?}"
+                )));
+            }
+        };
+        self.advance();
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' to open the right-hand row, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut rhs = alloc::vec![self.parse_expr(0)?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            rhs.push(self.parse_expr(0)?);
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' after right-hand row, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        if rhs.len() != row.len() {
+            return Err(self.err(alloc::format!(
+                "row comparison arity mismatch: left has {}, right has {}",
+                row.len(),
+                rhs.len()
+            )));
+        }
+        Ok(match op {
+            BinOp::Eq => row_eq(&row, &rhs),
+            BinOp::NotEq => maybe_not(row_eq(&row, &rhs), true),
+            BinOp::Lt => row_lex(&row, &rhs, BinOp::Lt, BinOp::Lt),
+            BinOp::LtEq => row_lex(&row, &rhs, BinOp::Lt, BinOp::LtEq),
+            BinOp::Gt => row_lex(&row, &rhs, BinOp::Gt, BinOp::Gt),
+            BinOp::GtEq => row_lex(&row, &rhs, BinOp::Gt, BinOp::GtEq),
+            _ => unreachable!("op restricted above"),
+        })
     }
 
     /// `LIKE p ESCAPE 'c'` — rewrite the pattern so the custom
