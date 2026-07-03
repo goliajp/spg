@@ -6987,6 +6987,50 @@ impl Parser {
         } else {
             None
         };
+        // `WINDOW w AS ( <window-def> ) [, ...]` — named windows.
+        // OVER w parsed to a marker above; inline each definition
+        // into the referencing WindowFunction nodes.
+        let mut window_defs: Vec<(
+            String,
+            (
+                Vec<Expr>,
+                Vec<(Expr, bool, Option<bool>)>,
+                Option<WindowFrame>,
+            ),
+        )> = Vec::new();
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("window")) {
+            self.advance();
+            loop {
+                let wname = self.expect_ident_like()?;
+                if !matches!(self.peek(), Token::As) {
+                    return Err(self.err(format!(
+                        "expected AS after WINDOW {wname}, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let def = self.parse_over_clause()?;
+                window_defs.push((wname, def));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        let mut items = items;
+        if !window_defs.is_empty()
+            || items
+                .iter()
+                .any(|it| matches!(it, SelectItem::Expr { expr, .. } if Self::expr_has_named_window(expr)))
+        {
+            for it in &mut items {
+                if let SelectItem::Expr { expr, .. } = it {
+                    Self::substitute_named_windows(expr, &window_defs)
+                        .map_err(|m| self.err(m))?;
+                }
+            }
+        }
         let mut stmt = SelectStatement {
             ctes: Vec::new(),
             distinct,
@@ -10841,6 +10885,110 @@ impl Parser {
         }
     }
 
+    /// True when the expression tree contains an unresolved
+    /// `OVER w` marker (see parse_over_clause).
+    fn expr_has_named_window(e: &Expr) -> bool {
+        match e {
+            Expr::WindowFunction { partition_by, .. } => matches!(
+                partition_by.as_slice(),
+                [Expr::Column(c)] if c.qualifier.as_deref() == Some("__named_window__")
+            ),
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::expr_has_named_window(lhs) || Self::expr_has_named_window(rhs)
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                Self::expr_has_named_window(expr)
+            }
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_named_window),
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                operand.as_deref().is_some_and(Self::expr_has_named_window)
+                    || branches.iter().any(|(w, t)| {
+                        Self::expr_has_named_window(w) || Self::expr_has_named_window(t)
+                    })
+                    || else_branch.as_deref().is_some_and(Self::expr_has_named_window)
+            }
+            _ => false,
+        }
+    }
+
+    /// Inline named-window definitions into the `OVER w` markers.
+    /// An unknown name errors (PG: window "w" does not exist).
+    #[allow(clippy::type_complexity)]
+    fn substitute_named_windows(
+        e: &mut Expr,
+        defs: &[(
+            String,
+            (
+                Vec<Expr>,
+                Vec<(Expr, bool, Option<bool>)>,
+                Option<WindowFrame>,
+            ),
+        )],
+    ) -> Result<(), String> {
+        match e {
+            Expr::WindowFunction {
+                partition_by,
+                order_by,
+                frame,
+                ..
+            } => {
+                let named = match partition_by.as_slice() {
+                    [Expr::Column(c)] if c.qualifier.as_deref() == Some("__named_window__") => {
+                        Some(c.name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(wname) = named {
+                    let Some((_, def)) = defs
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&wname))
+                    else {
+                        return Err(alloc::format!("window {wname:?} does not exist"));
+                    };
+                    *partition_by = def.0.clone();
+                    *order_by = def.1.clone();
+                    *frame = def.2.clone();
+                }
+                Ok(())
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::substitute_named_windows(lhs, defs)?;
+                Self::substitute_named_windows(rhs, defs)
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                Self::substitute_named_windows(expr, defs)
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::substitute_named_windows(a, defs)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(op) = operand {
+                    Self::substitute_named_windows(op, defs)?;
+                }
+                for (w, t) in branches {
+                    Self::substitute_named_windows(w, defs)?;
+                    Self::substitute_named_windows(t, defs)?;
+                }
+                if let Some(el) = else_branch {
+                    Self::substitute_named_windows(el, defs)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// SQL-standard `TABLE name` shorthand — builds the equivalent
     /// `SELECT * FROM name` head. Callers own set-op chain / tail
     /// composition.
@@ -12741,6 +12889,22 @@ impl Parser {
         ),
         ParseError,
     > {
+        // `OVER w` — a named-window reference. The WINDOW clause
+        // parses after the select list, so the name rides out as a
+        // marker in partition_by; parse_bare_select substitutes the
+        // definition once the clause is known.
+        if let Token::Ident(w) | Token::QuotedIdent(w) = self.peek() {
+            let name = w.clone();
+            self.advance();
+            return Ok((
+                alloc::vec![Expr::Column(crate::ast::ColumnName {
+                    qualifier: Some("__named_window__".to_string()),
+                    name,
+                })],
+                Vec::new(),
+                None,
+            ));
+        }
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after OVER, got {:?}", self.peek())));
         }
@@ -13352,6 +13516,8 @@ fn is_alias_stopword(s: &str) -> bool {
             | "set"
             | "values"
             | "for"
+            | "window"
+            | "tablesample"
             | "lateral"
             | "left"
             | "right"
