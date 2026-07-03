@@ -130,6 +130,7 @@ mod e2e_intersect_except;
 mod e2e_cte_values_materialized;
 mod e2e_distinct_on;
 mod e2e_rollup;
+mod e2e_is_bool_escape_symmetric;
 mod e2e_is_json;
 mod e2e_insert_default_values;
 mod e2e_on_conflict_constraint;
