@@ -15,12 +15,54 @@ impl Table {
             schema,
             rows: PersistentVec::new(),
             headers: PersistentVec::new(),
+            rowids: PersistentVec::new(),
+            next_rowid: 1,
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
             cold_row_count_stale: false,
             redo_log: None,
         }
+    }
+
+    /// v7.37.15 (Phase C.1) — allocate the next stable [`RowId`] for
+    /// this relation. Monotonic, never reused. Callers push the
+    /// returned id onto `rowids` in lock-step with the `rows` /
+    /// `headers` append so `rowids[i]` names the row at slot `i`.
+    fn alloc_rowid(&mut self) -> crate::row_header::RowId {
+        let id = crate::row_header::RowId(self.next_rowid);
+        self.next_rowid += 1;
+        id
+    }
+
+    /// v7.37.15 (Phase C.1) — read-only access to the stable row ids
+    /// parallel to `rows()`. `rowids().len() == rows().len()` is the
+    /// load-bearing lock-step invariant (asserted in debug builds at
+    /// every mutation boundary alongside `headers`).
+    #[must_use]
+    pub fn rowids(&self) -> &PersistentVec<crate::row_header::RowId> {
+        &self.rowids
+    }
+
+    /// v7.37.15 (Phase C.1) — rebuild the `rowids` vec so it is dense
+    /// `1..=rows.len()` and reset the allocator above it. Used on the
+    /// load / snapshot-restore path where rows arrive without ids
+    /// (pre-V6 envelope): every row gets a fresh id, sufficient while
+    /// ids are process-local bookkeeping. Keeps the lock-step
+    /// invariant against the freshly-loaded `rows`.
+    pub fn assign_dense_rowids(&mut self) {
+        let n = self.rows.len();
+        let mut fresh: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
+        for i in 0..n {
+            fresh.push_mut(crate::row_header::RowId((i + 1) as u64));
+        }
+        self.rowids = fresh;
+        self.next_rowid = (n as u64) + 1;
+        debug_assert_eq!(
+            self.rows.len(),
+            self.rowids.len(),
+            "rowids must stay in lock-step with rows after assign_dense_rowids"
+        );
     }
 
     /// v7.37.15 (Phase A.2) — read-only access to the per-row
@@ -622,10 +664,21 @@ impl Table {
         // upgrades the inserter to stamp the writing tx's xmin.
         self.headers
             .push_mut(crate::row_header::RowHeader::frozen());
+        // v7.37.15 (Phase C.1) — allocate + push the stable RowId in
+        // lock-step with rows/headers. Index locators still address
+        // by physical slot at this commit; the id is additive
+        // bookkeeping the lock table / HOT chains / WAL migrate to.
+        let rid = self.alloc_rowid();
+        self.rowids.push_mut(rid);
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
             "headers must stay in lock-step with rows after insert"
+        );
+        debug_assert_eq!(
+            self.rows.len(),
+            self.rowids.len(),
+            "rowids must stay in lock-step with rows after insert"
         );
         // NSW updates after the push so the new row is visible to the
         // greedy search used during connect.
@@ -1393,6 +1446,11 @@ impl Table {
         self.rows = PersistentVec::new();
         // v7.37.15 (Phase A.2) — keep headers lock-step.
         self.headers = PersistentVec::new();
+        // v7.37.15 (Phase C.1) — clear rowids lock-step. `next_rowid`
+        // is NOT reset: ids stay globally monotonic within the
+        // relation so a post-truncate insert never reuses a pre-
+        // truncate id that a stale reference might still name.
+        self.rowids = PersistentVec::new();
         self.hot_bytes = 0;
         self.rebuild_indices();
     }
@@ -1442,6 +1500,10 @@ impl Table {
         }
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
         let mut new_headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
+        // v7.37.15 (Phase C.1) — survivors carry their stable RowId
+        // across the compaction so a held lock / redo reference keeps
+        // naming the same row while its physical slot shifts down.
+        let mut new_rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
         let mut removed_bytes: u64 = 0;
         for (i, row) in self.rows.iter().enumerate() {
             if to_remove[i] {
@@ -1459,10 +1521,21 @@ impl Table {
                 } else {
                     new_headers.push_mut(crate::row_header::RowHeader::frozen());
                 }
+                if let Some(rid) = self.rowids.get(i) {
+                    new_rowids.push_mut(*rid);
+                } else {
+                    // Should not happen once C.1 is wired everywhere;
+                    // allocate a fresh id as a defensive fallback so
+                    // the lock-step invariant survives a legacy path.
+                    let rid = crate::row_header::RowId(self.next_rowid);
+                    self.next_rowid += 1;
+                    new_rowids.push_mut(rid);
+                }
             }
         }
         self.rows = new_rows;
         self.headers = new_headers;
+        self.rowids = new_rowids;
         self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
         debug_assert_eq!(
             self.rows.len(),
@@ -1500,16 +1573,29 @@ impl Table {
         // default for replay (all visible to every snapshot).
         let mut new_headers: PersistentVec<crate::row_header::RowHeader> =
             PersistentVec::new();
+        // v7.37.15 (Phase C.1) — fresh monotonic ids for the
+        // replacement rows drawn from the relation allocator, so a
+        // post-replay id never collides with a pre-replay one.
+        let mut new_rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
         for _ in 0..new_rows.len() {
             new_headers.push_mut(crate::row_header::RowHeader::frozen());
+            let rid = crate::row_header::RowId(self.next_rowid);
+            self.next_rowid += 1;
+            new_rowids.push_mut(rid);
         }
         self.rows = new_rows;
         self.headers = new_headers;
+        self.rowids = new_rowids;
         self.hot_bytes = new_hot_bytes;
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
             "headers must stay in lock-step with rows after set_rows_and_rebuild_indices"
+        );
+        debug_assert_eq!(
+            self.rows.len(),
+            self.rowids.len(),
+            "rowids must stay in lock-step with rows after set_rows_and_rebuild_indices"
         );
         self.rebuild_indices();
     }
@@ -1540,10 +1626,19 @@ impl Table {
         // format ships.
         self.headers
             .push_mut(crate::row_header::RowHeader::frozen());
+        // v7.37.15 (Phase C.1) — RowId lock-step for the WAL-replay
+        // append path.
+        let rid = self.alloc_rowid();
+        self.rowids.push_mut(rid);
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
             "headers must stay in lock-step with rows after insert_no_index"
+        );
+        debug_assert_eq!(
+            self.rows.len(),
+            self.rowids.len(),
+            "rowids must stay in lock-step with rows after insert_no_index"
         );
         Ok(())
     }

@@ -2534,6 +2534,32 @@ pub struct Table {
     /// meaningful; until then the on-disk story is "the catalog
     /// is the set of visible rows."
     headers: PersistentVec<row_header::RowHeader>,
+    /// v7.37.15 (Phase C.1) — stable per-relation row identity
+    /// parallel to `rows` / `headers`. `rowids[i]` is the never-
+    /// reused [`RowId`](row_header::RowId) of the row physically at
+    /// slot `i`; `rowids.len() == rows.len()` joins the same load-
+    /// bearing lock-step invariant as `headers`. Compaction (delete
+    /// / vacuum) rebuilds all three vecs together so the id travels
+    /// with the row while the slot shifts.
+    ///
+    /// Introduced additively: allocated + kept lock-step, but index
+    /// locators still address rows by physical slot at this commit.
+    /// Later phases migrate the lock table (C.4), HOT chains (D),
+    /// and the WAL (Epic W) to address by `RowId`.
+    ///
+    /// Not yet serialised into the envelope — on load every row is
+    /// assigned a fresh dense id `1..=len` (see `next_rowid`), which
+    /// is sufficient while the id is process-local bookkeeping. The
+    /// V6 envelope (Phase C.6) will persist ids so a WAL redo can
+    /// name a row across restart.
+    rowids: PersistentVec<row_header::RowId>,
+    /// v7.37.15 (Phase C.1) — per-relation monotonic allocator for
+    /// `rowids`. Starts at 1 (0 is the `RowId::UNASSIGNED` sentinel);
+    /// every append takes `next_rowid` then increments. Never reused
+    /// even after the row is deleted / vacuumed, so a stale lock /
+    /// redo reference can be detected rather than silently aliasing a
+    /// later row that reused the slot.
+    next_rowid: u64,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the
