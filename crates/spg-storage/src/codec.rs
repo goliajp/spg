@@ -344,6 +344,13 @@ fn deserialize_rows(
         "headers must stay in lock-step with rows after snapshot restore"
     );
     t.hot_bytes = hot_bytes;
+    // v7.37.15 (Phase C.1) — assign fresh dense stable ids to the
+    // restored rows so `rowids` joins the lock-step invariant. Pre-V6
+    // envelopes carry no ids; a dense 1..=len assignment is correct
+    // while ids are process-local bookkeeping. The V6 envelope (Phase
+    // C.6) will round-trip real ids so a WAL redo can name a row
+    // across restart.
+    t.assign_dense_rowids();
     Ok(())
 }
 

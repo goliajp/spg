@@ -187,6 +187,47 @@ pub fn current_version() -> u64 {
     GLOBAL_VERSION.load(Ordering::Acquire)
 }
 
+/// v7.37.15 (Phase C.1) — stable per-relation row identity.
+///
+/// ## Why a stable id, separate from the physical index
+///
+/// Pre-Phase-C a row was addressed by its **physical index** into
+/// `Table::rows`. That index is invalidated the moment a delete /
+/// vacuum compacts the survivor vec — every surviving row after the
+/// hole shifts down. Physical indices therefore cannot serve as:
+///
+/// 1. a **row-lock key** (Phase C.4: `(RelId, RowId)` must survive
+///    concurrent compaction while a lock is held),
+/// 2. a **HOT-chain pointer** (Phase D: chain head → new version
+///    must not dangle after vacuum),
+/// 3. a **WAL redo identity** (Epic W: `RowChange` UPDATE/DELETE
+///    must name the row by a key that survives replay, not a slot
+///    that shifted — closing the position-fragility caveat on the
+///    `RowChange` doc).
+///
+/// `RowId` is per-relation, monotonic, and **never reused**. It
+/// lives in `Table::rowids: PersistentVec<RowId>` parallel to
+/// `rows` / `headers`, so `rowids[i]` is the stable id of the row
+/// physically at slot `i`. Compaction rebuilds all three vecs
+/// together, so the id travels with the row while the slot shifts.
+///
+/// Phase C.1 introduces the id additively (allocated + kept
+/// lock-step, but indices still address by physical slot); later
+/// phases migrate index locators, the lock table, and the WAL to
+/// address by `RowId`.
+///
+/// `u64`, never wraps (same rationale as `xmin`/`xmax`). Starts at
+/// 1 per relation; 0 is reserved as an "unassigned" sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct RowId(pub u64);
+
+impl RowId {
+    /// The "unassigned" sentinel. A real appended row never gets 0;
+    /// the per-relation allocator starts at 1.
+    pub const UNASSIGNED: RowId = RowId(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

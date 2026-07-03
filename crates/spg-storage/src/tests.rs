@@ -590,6 +590,54 @@ fn table_insert_happy_path_appends_row() {
 }
 
 #[test]
+fn rowid_monotonic_survives_delete_and_never_reused() {
+    use crate::row_header::RowId;
+    let mut cat = Catalog::new();
+    cat.create_table(make_users_schema()).unwrap();
+    let t = cat.get_mut("users").unwrap();
+    for i in 0..3 {
+        t.insert(Row::new(vec![
+            Value::Int(i),
+            Value::text("x"),
+            Value::Float(0.0),
+        ]))
+        .unwrap();
+    }
+    // Fresh appends allocate monotonic 1..=3 in lock-step with rows.
+    assert_eq!(t.rows().len(), t.rowids().len());
+    assert_eq!(
+        t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![RowId(1), RowId(2), RowId(3)]
+    );
+    // Delete the middle row: survivors keep their stable id while
+    // their physical slot shifts down (id 2 gone, 1 & 3 remain).
+    t.delete_rows(&[1]);
+    assert_eq!(t.rows().len(), 2);
+    assert_eq!(t.rows().len(), t.rowids().len());
+    assert_eq!(
+        t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![RowId(1), RowId(3)]
+    );
+    // A new insert never reuses the freed id 2 — it takes 4.
+    t.insert(Row::new(vec![Value::Int(9), Value::text("y"), Value::Float(0.0)]))
+        .unwrap();
+    assert_eq!(
+        t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![RowId(1), RowId(3), RowId(4)]
+    );
+    // Truncate clears the ids but the allocator stays monotonic: the
+    // next insert never collides with a pre-truncate id.
+    t.truncate();
+    assert_eq!(t.rowids().len(), 0);
+    t.insert(Row::new(vec![Value::Int(0), Value::text("z"), Value::Float(0.0)]))
+        .unwrap();
+    assert_eq!(
+        t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![RowId(5)]
+    );
+}
+
+#[test]
 fn table_insert_arity_mismatch() {
     let mut cat = Catalog::new();
     cat.create_table(make_users_schema()).unwrap();
