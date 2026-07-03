@@ -145,7 +145,20 @@ pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
 // (`spg_engine::Snapshot` / `spg_engine::RowHeader`) instead of every
 // caller threading through `spg_storage::snapshot::*` directly.
 pub use spg_storage::row_header::{RowHeader, XMAX_ALIVE, XMIN_FROZEN};
-pub use spg_storage::snapshot::{InProgressSet, Snapshot};
+pub use spg_storage::snapshot::{
+    AllCommitted, InProgressSet, Snapshot, XactStatus, XactStatusOracle,
+};
+
+/// v7.37.15 (Phase C.2) — the engine is its own visibility oracle.
+/// Scans hold `&Engine` while reading, so a scan site can pass `self`
+/// as the [`XactStatusOracle`] alongside its [`Snapshot`] when the
+/// visibility gate migrates from `visible` to `visible_with_status`
+/// (next Phase C step). Delegates to [`Engine::xact_status`].
+impl XactStatusOracle for Engine {
+    fn status(&self, version: u64) -> XactStatus {
+        self.xact_status(version)
+    }
+}
 // v7.37.14 (A2.5-stub) — re-export the silent-FOR-UPDATE telemetry
 // helper through the engine surface so downstream wrappers
 // (spg-embedded / spg-embedded-tokio / spgctl) and their tests
@@ -439,6 +452,16 @@ pub struct Engine {
     /// constructor expects the input sorted for binary-search
     /// `contains` correctness.
     active_writer_versions: BTreeSet<u64>,
+    /// v7.37.15 (Phase C.2) — writer versions that ABORTED (rolled
+    /// back). The engine-side visibility oracle ([`Self::xact_status`])
+    /// consults this to report `Aborted` for a version that left the
+    /// in-flight set via rollback rather than commit — the third state
+    /// the abort-aware [`spg_storage::snapshot::Snapshot::visible_with_status`]
+    /// needs once Phase C.3's in-place writes leave aborted stamps in
+    /// place. Pruned below `oldest_active` by vacuum (Phase D); until
+    /// then it grows only with rolled-back transactions (a never-die
+    /// follow-up, not a commit-path leak).
+    aborted_versions: BTreeSet<u64>,
     /// v7.37.15 (Phase C) — TxId → writer version registry. When
     /// `exec_begin` opens an explicit transaction it allocates a
     /// fresh writer version (via [`Self::begin_writer_version`])
@@ -664,6 +687,7 @@ impl Engine {
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            aborted_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -787,6 +811,45 @@ impl Engine {
         self.active_writer_versions.remove(&v);
     }
 
+    /// v7.37.15 (Phase C.2) — mark a previously-allocated writer
+    /// version as ABORTED (rolled back). Removes it from the in-flight
+    /// set and records it in `aborted_versions` so the visibility
+    /// oracle ([`Self::xact_status`]) reports `Aborted` rather than
+    /// silently treating it as committed once it leaves the in-flight
+    /// set. Phase C.3's in-place write path relies on this: a
+    /// rolled-back version's xmin/xmax stamps stay physically present
+    /// until vacuum reclaims them, and readers must NOT see them.
+    ///
+    /// Idempotent; a no-op if the version was never allocated.
+    pub fn abort_writer_version(&mut self, v: u64) {
+        self.active_writer_versions.remove(&v);
+        self.aborted_versions.insert(v);
+    }
+
+    /// v7.37.15 (Phase C.2) — the visibility oracle's terminal-status
+    /// lookup for one version. In-flight if still allocated, Aborted
+    /// if it rolled back, otherwise Committed (the default for a
+    /// version that left the in-flight set the normal way, and for
+    /// every frozen / pruned old version the engine no longer tracks).
+    ///
+    /// `aborted_versions` is bounded by pruning below `oldest_active`
+    /// during vacuum (Phase D): once no live snapshot can still see an
+    /// aborted version's stamps, its entry is dropped. Until Phase D
+    /// lands the set only grows with rolled-back transactions — noted
+    /// as a never-die follow-up, not a steady-state leak on the
+    /// commit path.
+    #[must_use]
+    pub fn xact_status(&self, v: u64) -> spg_storage::snapshot::XactStatus {
+        use spg_storage::snapshot::XactStatus;
+        if self.active_writer_versions.contains(&v) {
+            XactStatus::InProgress
+        } else if self.aborted_versions.contains(&v) {
+            XactStatus::Aborted
+        } else {
+            XactStatus::Committed
+        }
+    }
+
     /// v7.37.15 (Phase C) — allocate a fresh version number for
     /// the next write. Always strictly monotonic + process-wide
     /// shared so concurrent engines on the same process agree on
@@ -839,6 +902,7 @@ impl Engine {
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            aborted_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
             clock: None,
             salt_fn: None,
@@ -915,6 +979,7 @@ impl Engine {
                     last_sequence_used: None,
                     next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
+            aborted_versions: BTreeSet::new(),
             tx_writer_versions: BTreeMap::new(),
                     clock: None,
                     salt_fn: None,
