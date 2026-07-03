@@ -403,6 +403,113 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
     }
 }
 
+/// Coerce a numeric operand to f64 for the `to_char(number, fmt)`
+/// form. Returns `None` for non-numeric values so the date/timestamp
+/// path takes over.
+fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
+    match v {
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::Int(n) => Some(f64::from(*n)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale } => {
+            let mut div = 1.0_f64;
+            for _ in 0..*scale {
+                div *= 10.0;
+            }
+            Some((*scaled as f64) / div)
+        }
+        _ => None,
+    }
+}
+
+/// A pragmatic subset of PG's numeric `to_char` format: digit slots
+/// `9` (space-padded) and `0` (zero-padded), the decimal point `.`,
+/// the group separator `,`, and the `FM` fill-mode prefix that
+/// suppresses the leading blank / padding. A leading `S` renders the
+/// sign; without it a negative number gets a leading `-` and a
+/// positive one a leading space (PG's default), which FM strips.
+fn to_char_numeric(n: f64, fmt: &str) -> String {
+    let fill_mode = fmt.to_ascii_uppercase().starts_with("FM");
+    let pat = if fill_mode { &fmt[2..] } else { fmt };
+    let (int_pat, frac_pat) = match pat.find('.') {
+        Some(i) => (&pat[..i], &pat[i + 1..]),
+        None => (pat, ""),
+    };
+    let int_slots = int_pat.chars().filter(|c| matches!(c, '9' | '0')).count();
+    let frac_digits = frac_pat.chars().filter(|c| matches!(c, '9' | '0')).count();
+    let zero_slots = int_pat.chars().filter(|c| *c == '0').count();
+    let has_group = int_pat.contains(',');
+
+    let neg = n < 0.0;
+    // Round to the requested scale and split into integer / fraction.
+    let pow = 10_i128.pow(frac_digits as u32);
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = libm::round(n.abs() * pow as f64) as i128;
+    let int_part = scaled / pow;
+    let frac_part = scaled % pow;
+
+    // Integer text, zero-padded to the `0` slots at minimum.
+    let mut int_str = alloc::format!("{int_part}");
+    while int_str.chars().count() < zero_slots {
+        int_str.insert(0, '0');
+    }
+    if has_group {
+        int_str = group_thousands(&int_str);
+    }
+
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    } else if !fill_mode {
+        // PG reserves a leading blank for the sign in fixed-width mode.
+        out.push(' ');
+    }
+    // Space-pad (fixed width only) so the digits right-align in the
+    // `9` slots. FM drops this padding entirely.
+    if !fill_mode {
+        let width = int_slots.max(int_str.chars().count());
+        for _ in 0..width.saturating_sub(int_str.chars().count()) {
+            out.push(' ');
+        }
+    }
+    out.push_str(&int_str);
+    if frac_digits > 0 {
+        let mut fs = alloc::format!("{frac_part:0width$}", width = frac_digits);
+        if fill_mode {
+            // FM trims trailing zeros down to the `0` slots.
+            let keep = frac_pat.chars().filter(|c| *c == '0').count();
+            while fs.chars().count() > keep && fs.ends_with('0') {
+                fs.pop();
+            }
+        }
+        if !fs.is_empty() {
+            out.push('.');
+            out.push_str(&fs);
+        }
+    }
+    out
+}
+
+/// Insert commas every three digits from the right of the integer
+/// text (leading blanks preserved so column alignment survives).
+fn group_thousands(int_str: &str) -> String {
+    let trimmed = int_str.trim_start();
+    let lead = &int_str[..int_str.len() - trimmed.len()];
+    let bytes: alloc::vec::Vec<char> = trimmed.chars().collect();
+    let mut out = String::new();
+    let len = bytes.len();
+    for (idx, c) in bytes.iter().enumerate() {
+        if idx > 0 && (len - idx) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c);
+    }
+    alloc::format!("{lead}{out}")
+}
+
 pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
@@ -421,6 +528,10 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             ),
         });
     };
+    // Numeric form: to_char(number, 'FM9999.00' / '999,990.9' / …).
+    if let Some(n) = numeric_value_for_to_char(&args[0]) {
+        return Ok(Value::text(to_char_numeric(n, fmt)));
+    }
     let (days, day_micros) = match &args[0] {
         Value::Date(d) => (*d, 0_i64),
         Value::Timestamp(t) => {
@@ -433,7 +544,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "to_char() needs DATE or TIMESTAMP, got {:?}",
+                    "to_char() needs a number, DATE or TIMESTAMP, got {:?}",
                     other.data_type()
                 ),
             });
