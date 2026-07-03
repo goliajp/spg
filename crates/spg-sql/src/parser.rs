@@ -819,6 +819,30 @@ impl Parser {
             }
             Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(false),
+            // MySQL `DESCRIBE t` / `DESC t` — the SHOW COLUMNS
+            // spelling; route to the same handler. DESC is the
+            // reserved ORDER BY token, so it gets its own arm.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("describe")
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(_) | Token::QuotedIdent(_))
+                    ) =>
+            {
+                self.advance();
+                let table = self.expect_ident_like()?;
+                Ok(Statement::ShowColumns(table))
+            }
+            Token::Desc
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_))
+                ) =>
+            {
+                self.advance();
+                let table = self.expect_ident_like()?;
+                Ok(Statement::ShowColumns(table))
+            }
             // `COPY table [(cols)] TO STDOUT` — the export half of
             // pg_dump's COPY pair (the FROM stdin half rides the
             // embed import path). Options need a format design and
@@ -6671,7 +6695,17 @@ impl Parser {
             if self.consume_limit_unbounded_sentinel() {
                 None
             } else {
-                Some(self.parse_limit_expr("LIMIT")?)
+                let first = self.parse_limit_expr("LIMIT")?;
+                // MySQL `LIMIT offset, count` — the first number is
+                // the offset when a comma follows.
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    let count = self.parse_limit_expr("LIMIT")?;
+                    head.offset = Some(first);
+                    Some(count)
+                } else {
+                    Some(first)
+                }
             }
         } else {
             None
@@ -6685,7 +6719,9 @@ impl Parser {
             self.consume_optional_rows_keyword();
             Some(off)
         } else {
-            None
+            // Keep an offset the MySQL `LIMIT offset, count` form
+            // already assigned.
+            head.offset.take()
         };
         // v7.17.0 Phase 5.1 — `FETCH FIRST <int|$N> ROWS ONLY` is
         // the SQL-standard alias for LIMIT. PG accepts both
@@ -7330,6 +7366,33 @@ impl Parser {
                 }
             }
         }
+        // `GROUP BY 1` — positional keys substitute with the Nth
+        // select item's expression (same contract ORDER BY has had
+        // since v6.x). Out-of-range positions error.
+        let group_by = match group_by {
+            Some(mut keys) => {
+                for k in &mut keys {
+                    if let Expr::Literal(Literal::Integer(n)) = k {
+                        let idx = *n;
+                        if idx < 1 || idx as usize > items.len() {
+                            return Err(self.err(alloc::format!(
+                                "GROUP BY position {idx} is not in select list"
+                            )));
+                        }
+                        match &items[(idx - 1) as usize] {
+                            SelectItem::Expr { expr, .. } => *k = expr.clone(),
+                            SelectItem::Wildcard => {
+                                return Err(self.err(alloc::format!(
+                                    "GROUP BY position {idx} references a wildcard item"
+                                )));
+                            }
+                        }
+                    }
+                }
+                Some(keys)
+            }
+            None => None,
+        };
         let mut stmt = SelectStatement {
             ctes: Vec::new(),
             distinct,

@@ -311,6 +311,7 @@ mod e2e_fulltext_gin_seek;
 mod e2e_fulltext_index;
 mod e2e_fulltext_planner;
 mod e2e_generate_series;
+mod e2e_groupby_pos_describe_limit;
 mod e2e_generate_series_join;
 mod e2e_lateral_generate_series;
 mod e2e_lateral_unnest;
