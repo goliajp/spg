@@ -73,6 +73,34 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+Operator/type scout campaign (tasks #381-#384) — three scout
+rounds (operator symbols, datetime units, type IO) drive four
+closures, two of them pre-existing engine bugs the pins caught
+(2971 e2e green):
+
+- **PG operator symbols (#381)**: the regex match family ~ / ~* /
+  !~ / !~* (lexed as new tokens, lowered onto regexp_like with an
+  'i' flag for the case-insensitive variants and NOT wrapping for
+  the negated ones), ^@ starts-with, ^ power (binding tighter than
+  *), # integer XOR via (a|b)-(a&b), and integer << / >> shifts
+  claimed ahead of the inet containment interpretation. The pins
+  caught regexp_like ignoring its flags argument — ~* / !~* and
+  regexp_like(x, p, 'i') were all silently case-sensitive; now the
+  compiled tree folds case for the 'i' flag.
+- **date_trunc units (#382)**: week (truncates to the ISO Monday),
+  quarter, decade, and century/millennium (from year 1, no year 0)
+  plus milliseconds/microseconds join the original six units.
+- **Type conversions (#383)**: ::text[] accepts any scalar array
+  (int/bigint/smallint/bool/float), rendering each element as text;
+  TIME ± INTERVAL applies the sub-day microseconds and wraps modulo
+  24h (23:30 + 1h = 00:30).
+- **Unconstrained numeric cast (#384)**: bare ::numeric used to
+  rescale to 0 decimals, dropping the fraction (3.14::numeric → 3).
+  Precision 0 is the unambiguous unconstrained sentinel
+  (numeric(0,0) is invalid in PG), so both the float and text
+  coerce arms now keep the source scale when unconstrained;
+  constrained numeric(p,s) still rounds as before.
+
 Expression-idiom scout campaign (tasks #375-#379) — three scout
 rounds (function syntax, date/time fields, operators) drive five
 closures, with two real engine bugs found and fixed by the
