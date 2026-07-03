@@ -1911,6 +1911,19 @@ impl Engine {
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_update_cancel(&stmt, cancel))
     }
 
+    /// SELECT with a data-modifying CTE body (`WITH d AS (DELETE …
+    /// RETURNING …) SELECT … FROM d`) — the writes must land
+    /// transactionally, so the outer SELECT routes through the
+    /// same &mut temp-table machinery the DML outers use.
+    pub(crate) fn exec_select_with_modifying_ctes(
+        &mut self,
+        mut stmt: spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_select_cancel(&stmt, cancel))
+    }
+
     /// v7.37.43-T4.4 — DELETE counterpart of `exec_insert_with_ctes`.
     pub(crate) fn exec_delete_with_ctes(
         &mut self,
