@@ -3369,6 +3369,16 @@ impl Engine {
             }
             Ok(())
         };
+        // v7.37.15 (Phase C.3, step 2) — MVCC visibility gate for the
+        // load-bearing full-scan path. This is the primary single-table
+        // executor; pre-C.3 it read every hot-tier row raw. Once C.3's
+        // in-place writers retain dead/old versions, an ungated scan
+        // here would return them, so the gate must land BEFORE the
+        // writers flip (see the plan's activation-order rule). A no-op
+        // today: every hot row is frozen or committed-and-alive under
+        // the reader's snapshot, so `is_row_visible` returns true for
+        // all of them (verified by the full e2e suite staying green).
+        let scan_snapshot = self.current_snapshot();
         let mut emitted: usize = 0;
         if let Some(rows) = &indexed_rows {
             for (loop_idx, cow) in rows.iter().enumerate() {
@@ -3386,6 +3396,11 @@ impl Engine {
                     && emitted >= cap
                 {
                     break;
+                }
+                // Skip rows this snapshot cannot see (invisible rows do
+                // not count toward the LIMIT).
+                if !table.is_row_visible(i, &scan_snapshot) {
+                    continue;
                 }
                 process_row(&table.rows()[i], i)?;
                 emitted = emitted.saturating_add(1);
