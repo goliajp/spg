@@ -93,12 +93,17 @@ impl Engine {
         if self.tx_catalogs.remove(&tx_id).is_none() {
             return Err(EngineError::NoActiveTransaction);
         }
-        // v7.37.15 Phase C — release the writer version (treated
-        // as a commit for the in_progress set's purposes; the
-        // shadow catalog never made it into self.catalog so the
-        // rows the tx stamped never reached storage).
+        // v7.37.15 Phase C.2 — mark the writer version ABORTED. Under
+        // today's catalog-COW model the shadow catalog never reached
+        // self.catalog so the tx's rows never hit storage, making this
+        // observably equivalent to commit_writer_version; but recording
+        // the true terminal state is what Phase C.3's in-place write
+        // path needs (a rolled-back version's xmin/xmax stamps stay in
+        // place until vacuum, and the abort-aware visibility oracle
+        // must hide them). Fixes the long-standing "rollback treated as
+        // commit" shortcut here.
         if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
-            self.commit_writer_version(v);
+            self.abort_writer_version(v);
         }
         // savepoints discarded with the TxState
         Ok(QueryResult::CommandOk {

@@ -1655,3 +1655,54 @@ fn sql_injection_attach_off_feature_errors() {
         "off-feature build must refuse SQL injection-attach"
     );
 }
+
+// ---------------------------------------------------------------
+// v7.37.15 Phase C.2 — transaction status oracle
+// ---------------------------------------------------------------
+
+#[test]
+fn xact_status_tracks_inflight_commit_and_abort() {
+    let mut e = Engine::new();
+    // Unknown version → Committed (the engine no longer tracks it;
+    // frozen / pruned-old versions read as committed by definition).
+    assert_eq!(e.xact_status(999), XactStatus::Committed);
+
+    // Allocate → in-flight.
+    let v = e.begin_writer_version();
+    assert_eq!(e.xact_status(v), XactStatus::InProgress);
+
+    // Commit → leaves the in-flight set the normal way → Committed.
+    e.commit_writer_version(v);
+    assert_eq!(e.xact_status(v), XactStatus::Committed);
+
+    // A second version that aborts is reported Aborted, and the
+    // Engine-as-oracle path (XactStatusOracle::status) agrees.
+    let v2 = e.begin_writer_version();
+    e.abort_writer_version(v2);
+    assert_eq!(e.xact_status(v2), XactStatus::Aborted);
+    assert_eq!(
+        XactStatusOracle::status(&e, v2),
+        XactStatus::Aborted,
+        "Engine-as-oracle must delegate to xact_status"
+    );
+}
+
+#[test]
+fn rollback_marks_writer_version_aborted() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    e.execute("BEGIN").unwrap();
+    // Snapshot the in-flight writer version the tx allocated, then
+    // roll back and confirm the engine records it as Aborted (not
+    // silently committed as the old shortcut did).
+    let active_before: alloc::vec::Vec<u64> =
+        e.active_writer_versions.iter().copied().collect();
+    e.execute("ROLLBACK").unwrap();
+    for v in active_before {
+        assert_eq!(
+            e.xact_status(v),
+            XactStatus::Aborted,
+            "the rolled-back tx's writer version must read Aborted"
+        );
+    }
+}
