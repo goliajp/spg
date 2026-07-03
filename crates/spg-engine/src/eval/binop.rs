@@ -415,6 +415,18 @@ pub(crate) fn apply_binary_interval(
         detail: "INTERVAL micros overflows on negation".into(),
     })?;
     match lhs {
+        // TIME ± INTERVAL wraps within the day (PG semantics): only
+        // the sub-day microseconds apply, and the result is taken
+        // modulo 24 hours so it stays a valid time of day.
+        Value::Time(t) => {
+            const DAY_US: i64 = 86_400_000_000;
+            let shifted = t
+                .checked_add(signed_micros)
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "TIME ± INTERVAL overflows i64 microseconds".into(),
+                })?;
+            Ok(Some(Value::Time(shifted.rem_euclid(DAY_US))))
+        }
         Value::Timestamp(t) => Ok(Some(Value::Timestamp(add_interval_to_micros(
             *t,
             signed_months,

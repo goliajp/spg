@@ -94,9 +94,42 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         CastTarget::TextArray => match v {
             Value::TextArray(items) => Ok(Value::TextArray(items)),
             Value::Text(s) => decode_text_array_external(&s).map(Value::TextArray),
+            // Other scalar arrays cast element-wise, each element
+            // rendered as its own text (NULLs preserved). PG allows
+            // `ARRAY[1,2,3]::text[]`.
+            Value::IntArray(items) => Ok(Value::TextArray(
+                items
+                    .into_iter()
+                    .map(|o| o.map(|n| alloc::format!("{n}")))
+                    .collect(),
+            )),
+            Value::BigIntArray(items) => Ok(Value::TextArray(
+                items
+                    .into_iter()
+                    .map(|o| o.map(|n| alloc::format!("{n}")))
+                    .collect(),
+            )),
+            Value::SmallIntArray(items) => Ok(Value::TextArray(
+                items
+                    .into_iter()
+                    .map(|o| o.map(|n| alloc::format!("{n}")))
+                    .collect(),
+            )),
+            Value::BoolArray(items) => Ok(Value::TextArray(
+                items
+                    .into_iter()
+                    .map(|o| o.map(|b| String::from(if b { "t" } else { "f" })))
+                    .collect(),
+            )),
+            Value::FloatArray(items) => Ok(Value::TextArray(
+                items
+                    .into_iter()
+                    .map(|o| o.map(|x| value_to_text(&Value::Float(x))))
+                    .collect(),
+            )),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::TEXT[] only accepts TEXT / TEXT[] inputs, got {:?}",
+                    "::TEXT[] only accepts TEXT / array inputs, got {:?}",
                     other.data_type()
                 ),
             }),
