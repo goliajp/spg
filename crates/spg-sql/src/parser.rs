@@ -11703,9 +11703,56 @@ impl Parser {
                     };
                     continue;
                 }
+                // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
+                // three-valued boolean tests. IS TRUE/FALSE never
+                // return NULL, so they lower to CASE forms whose
+                // ELSE catches the NULL branch; IS UNKNOWN on a
+                // boolean is exactly IS NULL.
+                if matches!(self.peek(), Token::True | Token::False)
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unknown"))
+                {
+                    let tok = self.advance();
+                    let test = match tok {
+                        Token::True => Some(true),
+                        Token::False => Some(false),
+                        _ => None, // UNKNOWN
+                    };
+                    let lowered = match test {
+                        // IS TRUE: CASE WHEN x THEN t ELSE f END —
+                        // NULL and false both land in ELSE.
+                        Some(true) => Expr::Case {
+                            operand: None,
+                            branches: alloc::vec![(
+                                expr,
+                                Expr::Literal(Literal::Bool(!negated)),
+                            )],
+                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                        },
+                        // IS FALSE: CASE WHEN NOT x THEN t ELSE f
+                        // END — NOT NULL is NULL, so NULL lands in
+                        // ELSE alongside true.
+                        Some(false) => Expr::Case {
+                            operand: None,
+                            branches: alloc::vec![(
+                                Expr::Unary {
+                                    op: UnOp::Not,
+                                    expr: Box::new(expr),
+                                },
+                                Expr::Literal(Literal::Bool(!negated)),
+                            )],
+                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                        },
+                        None => Expr::IsNull {
+                            expr: Box::new(expr),
+                            negated,
+                        },
+                    };
+                    expr = lowered;
+                    continue;
+                }
                 if !matches!(self.peek(), Token::Null) {
                     return Err(self.err(format!(
-                        "expected NULL, DISTINCT or JSON after IS{}, got {:?}",
+                        "expected NULL, DISTINCT, JSON, TRUE, FALSE or UNKNOWN after IS{}, got {:?}",
                         if negated { " NOT" } else { "" },
                         self.peek()
                     )));
@@ -11742,7 +11789,17 @@ impl Parser {
                 self.advance();
                 // Pattern at the same precedence as other comparison RHSes —
                 // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
-                let pattern = self.parse_expr(5)?;
+                let mut pattern = self.parse_expr(5)?;
+                // `ESCAPE 'c'` — rewrite a literal pattern to the
+                // default backslash escape at parse time. Custom
+                // escapes on non-literal patterns would need
+                // matcher support; error honestly.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                    self.advance();
+                    let esc = self.parse_expr(5)?;
+                    pattern = Self::rewrite_like_escape(pattern, esc)
+                        .map_err(|m| self.err(m))?;
+                }
                 expr = Expr::Like {
                     expr: Box::new(expr),
                     pattern: Box::new(pattern),
@@ -11833,11 +11890,74 @@ impl Parser {
         }
     }
 
+    /// `LIKE p ESCAPE 'c'` — rewrite the pattern so the custom
+    /// escape character becomes the matcher's default backslash:
+    /// `c%` (escaped wildcard) → `\%`, `cc` (literal escape char)
+    /// → the char itself, and any pre-existing backslash escapes
+    /// itself so it stays literal. Both operands must be string
+    /// literals — a runtime pattern would need matcher support.
+    fn rewrite_like_escape(pattern: Expr, esc: Expr) -> Result<Expr, String> {
+        let (Expr::Literal(Literal::String(p)), Expr::Literal(Literal::String(e))) =
+            (&pattern, &esc)
+        else {
+            return Err(
+                "LIKE ... ESCAPE requires string-literal pattern and escape \
+                 (runtime escape characters are not supported yet)"
+                    .into(),
+            );
+        };
+        let mut ch_iter = e.chars();
+        let (Some(esc_ch), None) = (ch_iter.next(), ch_iter.next()) else {
+            return Err(alloc::format!(
+                "ESCAPE must be a single character, got {e:?}"
+            ));
+        };
+        let mut out = String::with_capacity(p.len() + 4);
+        let mut chars = p.chars();
+        while let Some(c) = chars.next() {
+            if c == esc_ch {
+                match chars.next() {
+                    // Escaped wildcard / escaped escape → keep the
+                    // next char literal via backslash.
+                    Some(next) => {
+                        out.push('\\');
+                        out.push(next);
+                    }
+                    None => {
+                        return Err("LIKE pattern ends with the escape character".into());
+                    }
+                }
+            } else if c == '\\' && esc_ch != '\\' {
+                // A raw backslash is literal under a custom escape —
+                // escape it for the backslash-based matcher.
+                out.push('\\');
+                out.push('\\');
+            } else {
+                out.push(c);
+            }
+        }
+        Ok(Expr::Literal(Literal::String(out)))
+    }
+
     /// `x BETWEEN low AND high`  →  `(x >= low) AND (x <= high)`, wrapped in
     /// `NOT` when `negated`. Bounds parse at precedence 5 so the trailing
     /// `AND` is not swallowed.
     fn parse_between_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
         self.advance(); // BETWEEN
+        // SYMMETRIC — the bounds may arrive in either order; both
+        // orientations OR together. ASYMMETRIC is the default and
+        // absorbs as noise.
+        let symmetric =
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("symmetric")) {
+                self.advance();
+                true
+            } else {
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("asymmetric"))
+                {
+                    self.advance();
+                }
+                false
+            };
         let low = self.parse_expr(5)?;
         if !matches!(self.peek(), Token::And) {
             return Err(self.err(format!(
@@ -11848,18 +11968,27 @@ impl Parser {
         self.advance();
         let high = self.parse_expr(5)?;
         let target = Box::new(expr);
-        let combined = Expr::Binary {
+        let range = |lo: Expr, hi: Expr| Expr::Binary {
             lhs: Box::new(Expr::Binary {
                 lhs: target.clone(),
                 op: BinOp::GtEq,
-                rhs: Box::new(low),
+                rhs: Box::new(lo),
             }),
             op: BinOp::And,
             rhs: Box::new(Expr::Binary {
-                lhs: target,
+                lhs: target.clone(),
                 op: BinOp::LtEq,
-                rhs: Box::new(high),
+                rhs: Box::new(hi),
             }),
+        };
+        let combined = if symmetric {
+            Expr::Binary {
+                lhs: Box::new(range(low.clone(), high.clone())),
+                op: BinOp::Or,
+                rhs: Box::new(range(high, low)),
+            }
+        } else {
+            range(low, high)
         };
         Ok(maybe_not(combined, negated))
     }
