@@ -2644,6 +2644,23 @@ pub struct WindowFrame {
     pub kind: FrameKind,
     pub start: FrameBound,
     pub end: Option<FrameBound>,
+    /// v7.37 (scout round 12) — `EXCLUDE {CURRENT ROW | GROUP |
+    /// TIES | NO OTHERS}` frame exclusion. NO OTHERS is the default
+    /// no-op; CURRENT ROW drops the current row from the frame.
+    pub exclude: FrameExclusion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameExclusion {
+    /// Default — exclude nothing.
+    #[default]
+    NoOthers,
+    /// Drop the current row from the frame.
+    CurrentRow,
+    /// Drop the current row's whole peer group.
+    Group,
+    /// Drop the current row's peers but keep the current row.
+    Ties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
