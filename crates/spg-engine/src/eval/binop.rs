@@ -41,6 +41,23 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 })
         }
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
+        (
+            UnOp::Neg,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => {
+            let overflow = || EvalError::TypeMismatch {
+                detail: "INTERVAL overflows on unary -".into(),
+            };
+            Ok(Value::Interval {
+                months: months.checked_neg().ok_or_else(overflow)?,
+                days: days.checked_neg().ok_or_else(overflow)?,
+                micros: micros.checked_neg().ok_or_else(overflow)?,
+            })
+        }
         (UnOp::Neg, other) => Err(EvalError::TypeMismatch {
             detail: format!("unary - applied to {:?}", other.data_type()),
         }),
@@ -308,6 +325,27 @@ pub(crate) fn apply_binary_interval(
     l: &Value<'static>,
     r: &Value<'static>,
 ) -> Result<Option<Value<'static>>, EvalError> {
+    // interval * numeric (either order) and interval / numeric scale
+    // the interval per PG's interval_mul: months and days truncate
+    // toward zero and their fractional remainders spill downward
+    // (fractional month → 30 days, fractional day → microseconds).
+    match (l, r, op) {
+        (Value::Interval { .. }, other, BinOp::Mul)
+        | (other, Value::Interval { .. }, BinOp::Mul)
+            if as_f64(other).is_ok() =>
+        {
+            let iv = if matches!(l, Value::Interval { .. }) { l } else { r };
+            return scale_interval(iv, as_f64(other)?).map(Some);
+        }
+        (Value::Interval { .. }, other, BinOp::Div) if as_f64(other).is_ok() => {
+            let divisor = as_f64(other)?;
+            if divisor == 0.0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            return scale_interval(l, 1.0 / divisor).map(Some);
+        }
+        _ => {}
+    }
     // Normalise so the interval (if any) is always on the right for Add;
     // Sub stays left-handed because it isn't commutative.
     let (lhs, rhs, sign): (&Value<'static>, &Value<'static>, i64) = match (l, r, op) {
@@ -426,6 +464,45 @@ pub(crate) fn apply_binary_interval(
             ),
         }),
     }
+}
+
+/// Scale an interval by a float factor per PG's `interval_mul`
+/// (timestamp.c): months and days truncate toward zero; the
+/// fractional month remainder spills into days at 30 days/month and
+/// the fractional day remainder spills into microseconds.
+fn scale_interval(iv: &Value<'static>, factor: f64) -> Result<Value<'static>, EvalError> {
+    let Value::Interval {
+        months,
+        days,
+        micros,
+    } = iv
+    else {
+        unreachable!("caller guarantees Interval");
+    };
+    if !factor.is_finite() {
+        return Err(EvalError::TypeMismatch {
+            detail: "INTERVAL scale factor must be finite".into(),
+        });
+    }
+    let m = f64::from(*months) * factor;
+    let new_months = m.trunc();
+    let d = f64::from(*days) * factor + (m - new_months) * 30.0;
+    let new_days = d.trunc();
+    let new_micros = (*micros as f64) * factor + (d - new_days) * 86_400_000_000.0;
+    let months_ok = new_months >= f64::from(i32::MIN) && new_months <= f64::from(i32::MAX);
+    let days_ok = new_days >= f64::from(i32::MIN) && new_days <= f64::from(i32::MAX);
+    let micros_ok = new_micros >= -9.3e18 && new_micros <= 9.3e18;
+    if !(months_ok && days_ok && micros_ok) {
+        return Err(EvalError::TypeMismatch {
+            detail: "INTERVAL out of range after scaling".into(),
+        });
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(Value::Interval {
+        months: new_months as i32,
+        days: new_days as i32,
+        micros: libm::rint(new_micros) as i64,
+    })
 }
 
 /// Shift a `Date` by a signed number of months using the PG clamp rule.
