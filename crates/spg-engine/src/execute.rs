@@ -484,7 +484,13 @@ impl Engine {
                 self.exec_delete_cancel(&s, cancel)
             }
             Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
-            Statement::Select(s) => self.exec_select_cancel(&s, cancel),
+            Statement::Select(s) => {
+                if s.ctes.iter().any(|c| c.body.is_modifying()) {
+                    self.exec_select_with_modifying_ctes(s, cancel)
+                } else {
+                    self.exec_select_cancel(&s, cancel)
+                }
+            }
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),

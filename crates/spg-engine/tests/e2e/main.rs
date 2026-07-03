@@ -519,6 +519,7 @@ mod e2e_update_from_delete_using;
 mod e2e_update_set_forms;
 mod e2e_with_ordinality;
 mod e2e_writable_cte;
+mod e2e_writable_cte_select;
 mod mailrs_round26;
 mod mailrs_round30;
 mod mailrs_round31;
