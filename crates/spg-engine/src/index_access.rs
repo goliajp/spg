@@ -35,6 +35,7 @@ pub(crate) fn try_nsw_knn(
     table: &Table,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<usize>> {
     if stmt.distinct {
         return None;
@@ -88,6 +89,13 @@ pub(crate) fn try_nsw_knn(
         let ctx = EvalContext::new(schema_cols, Some(table_alias));
         let mut kept: Vec<usize> = Vec::with_capacity(limit);
         for i in candidates {
+            // Phase C.3 step 2c — MVCC read gate. Skip hot rows this
+            // snapshot cannot see so an in-place writer's dead/old
+            // version never surfaces on the NSW kNN fast path, and an
+            // invisible row never counts toward LIMIT. No-op today.
+            if !table.is_row_visible(i, snapshot) {
+                continue;
+            }
             let row = &table.rows()[i];
             let cond = eval::eval_expr(where_expr, row, &ctx).ok()?;
             if matches!(cond, Value::Bool(true)) {
@@ -99,9 +107,16 @@ pub(crate) fn try_nsw_knn(
         }
         Some(kept)
     } else {
-        Some(spg_storage::nsw_query(
-            table, &idx.name, &query, limit, metric,
-        ))
+        // Phase C.3 step 2c — MVCC read gate on the WHERE-less kNN
+        // path too: drop hot rows this snapshot cannot see so a
+        // writer's dead/old version never surfaces. No-op today (every
+        // hot header is committed-alive so `is_row_visible` is `true`).
+        Some(
+            spg_storage::nsw_query(table, &idx.name, &query, limit, metric)
+                .into_iter()
+                .filter(|&i| table.is_row_visible(i, snapshot))
+                .collect(),
+        )
     }
 }
 
@@ -378,6 +393,7 @@ pub(crate) fn try_index_seek<'a>(
     catalog: &'a Catalog,
     table: &'a Table,
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     // v7.11.3 — recurse through top-level `AND` so a PG-style
     // composite predicate like `WHERE id = 1 AND created_at > $1`
@@ -393,16 +409,19 @@ pub(crate) fn try_index_seek<'a>(
     {
         // Try LHS first (typical convention: leading equality on
         // the indexed column comes first in user-written SQL).
-        if let Some(rows) = try_index_seek(lhs, schema_cols, catalog, table, table_alias) {
+        if let Some(rows) = try_index_seek(lhs, schema_cols, catalog, table, table_alias, snapshot)
+        {
             return Some(rows);
         }
-        return try_index_seek(rhs, schema_cols, catalog, table, table_alias);
+        return try_index_seek(rhs, schema_cols, catalog, table, table_alias, snapshot);
     }
     // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeks each literal
     // and unions the rows (PG's bitmap index scan) instead of a full scan
     // + per-row membership test. The single-table path otherwise tested a
     // 60-element list against every row (24k × 60 string compares ~66 ms).
-    if let Some(rows) = try_inlist_seek(where_expr, schema_cols, catalog, table, table_alias) {
+    if let Some(rows) =
+        try_inlist_seek(where_expr, schema_cols, catalog, table, table_alias, snapshot)
+    {
         return Some(rows);
     }
     let Expr::Binary {
@@ -430,6 +449,11 @@ pub(crate) fn try_index_seek<'a>(
     for loc in locators {
         match *loc {
             spg_storage::RowLocator::Hot(i) => {
+                // Phase C.3 step 2c — MVCC read gate: skip hot rows this
+                // snapshot cannot see. No-op today.
+                if !table.is_row_visible(i, snapshot) {
+                    continue;
+                }
                 if let Some(row) = table.rows().get(i) {
                     out.push(Cow::Borrowed(row));
                 }
@@ -458,6 +482,7 @@ fn try_inlist_seek<'a>(
     catalog: &'a Catalog,
     table: &'a Table,
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     let Expr::InList {
         expr,
@@ -493,6 +518,10 @@ fn try_inlist_seek<'a>(
         for loc in idx.lookup_eq(key) {
             match *loc {
                 spg_storage::RowLocator::Hot(i) => {
+                    // Phase C.3 step 2c — MVCC read gate. No-op today.
+                    if !table.is_row_visible(i, snapshot) {
+                        continue;
+                    }
                     if let Some(row) = table.rows().get(i) {
                         out.push(Cow::Borrowed(row));
                     }
@@ -533,6 +562,7 @@ pub(crate) fn try_gin_seek<'a>(
     table: &'a Table,
     table_alias: &str,
     ctx: &eval::EvalContext<'_>,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
@@ -540,10 +570,12 @@ pub(crate) fn try_gin_seek<'a>(
         rhs,
     } = where_expr
     {
-        if let Some(rows) = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx) {
+        if let Some(rows) =
+            try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx, snapshot)
+        {
             return Some(rows);
         }
-        return try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx);
+        return try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx, snapshot);
     }
     // v7.17.0 Phase 3.P0-44 — MySQL `MATCH(col1, col2) AGAINST (...)`
     // desugars into `(to_tsvector(col1) @@ q) OR (to_tsvector(col2) @@ q)`
@@ -559,8 +591,8 @@ pub(crate) fn try_gin_seek<'a>(
         rhs,
     } = where_expr
     {
-        let left = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx)?;
-        let right = try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx)?;
+        let left = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx, snapshot)?;
+        let right = try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx, snapshot)?;
         let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(left.len() + right.len());
         out.extend(left);
         out.extend(right);
@@ -596,6 +628,10 @@ pub(crate) fn try_gin_seek<'a>(
     for loc in candidates {
         match loc {
             spg_storage::RowLocator::Hot(i) => {
+                // Phase C.3 step 2c — MVCC read gate. No-op today.
+                if !table.is_row_visible(i, snapshot) {
+                    continue;
+                }
                 if let Some(row) = table.rows().get(i) {
                     out.push(Cow::Borrowed(row));
                 }
@@ -624,6 +660,7 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
     schema_cols: &[ColumnSchema],
     table: &'a Table,
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
@@ -631,10 +668,10 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
         rhs,
     } = where_expr
     {
-        if let Some(rows) = try_gin_jsonb_seek(lhs, schema_cols, table, table_alias) {
+        if let Some(rows) = try_gin_jsonb_seek(lhs, schema_cols, table, table_alias, snapshot) {
             return Some(rows);
         }
-        return try_gin_jsonb_seek(rhs, schema_cols, table, table_alias);
+        return try_gin_jsonb_seek(rhs, schema_cols, table, table_alias, snapshot);
     }
     let Expr::Binary {
         lhs,
@@ -693,7 +730,9 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
     }
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
     for loc in candidates {
+        // Phase C.3 step 2c — MVCC read gate on the Hot arm. No-op today.
         if let spg_storage::RowLocator::Hot(i) = loc
+            && table.is_row_visible(i, snapshot)
             && let Some(row) = table.rows().get(i)
         {
             out.push(Cow::Borrowed(row));
@@ -766,6 +805,7 @@ pub(crate) fn try_trgm_seek<'a>(
     schema_cols: &[ColumnSchema],
     table: &'a Table,
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
@@ -773,10 +813,10 @@ pub(crate) fn try_trgm_seek<'a>(
         rhs,
     } = where_expr
     {
-        if let Some(rows) = try_trgm_seek(lhs, schema_cols, table, table_alias) {
+        if let Some(rows) = try_trgm_seek(lhs, schema_cols, table, table_alias, snapshot) {
             return Some(rows);
         }
-        return try_trgm_seek(rhs, schema_cols, table, table_alias);
+        return try_trgm_seek(rhs, schema_cols, table, table_alias, snapshot);
     }
     // LIKE node is what carries the column reference + pattern.
     // ILIKE is the same AST node — PG's LIKE/ILIKE both lower
@@ -848,7 +888,9 @@ pub(crate) fn try_trgm_seek<'a>(
     }
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(acc.len());
     for loc in acc {
+        // Phase C.3 step 2c — MVCC read gate on the Hot arm. No-op today.
         if let spg_storage::RowLocator::Hot(i) = loc
+            && table.is_row_visible(i, snapshot)
             && let Some(row) = table.rows().get(i)
         {
             out.push(Cow::Borrowed(row));
