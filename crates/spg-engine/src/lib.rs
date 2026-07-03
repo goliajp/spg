@@ -54,6 +54,7 @@ mod index_access;
 mod join;
 mod joinfold;
 pub mod json;
+pub mod locks;
 mod maintenance;
 pub mod memoize;
 mod numeric;
