@@ -4709,6 +4709,96 @@ impl Parser {
         self.expect_keyword_ident("set")?;
         let mut assignments = Vec::new();
         loop {
+            // `SET (a, b) = (e1, e2)` / `SET (a, b) = (SELECT x, y
+            // …)` — the parenthesized multi-assignment. Expressions
+            // assign positionally; a subquery RHS clones per column
+            // keeping only the Nth projection item.
+            if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                let mut cols = alloc::vec![self.expect_ident_like()?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    cols.push(self.expect_ident_like()?);
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' after SET column list, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(format!(
+                        "expected `=` after SET column list, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(format!(
+                        "expected '(' after SET (…) =, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if matches!(self.peek(), Token::Select) {
+                    let inner = match self.parse_select_stmt()? {
+                        Statement::Select(s) => s,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected SELECT in SET (…) = (SELECT …), got {other:?}"
+                            )));
+                        }
+                    };
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after SET subquery, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if inner.items.len() != cols.len() {
+                        return Err(self.err(alloc::format!(
+                            "SET (…) = (SELECT …) arity mismatch: {} columns, {} items",
+                            cols.len(),
+                            inner.items.len()
+                        )));
+                    }
+                    for (i, col) in cols.into_iter().enumerate() {
+                        let mut sub = inner.clone();
+                        sub.items = alloc::vec![sub.items[i].clone()];
+                        assignments.push((col, Expr::ScalarSubquery(Box::new(sub))));
+                    }
+                } else {
+                    let mut exprs = alloc::vec![self.parse_expr(0)?];
+                    while matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        exprs.push(self.parse_expr(0)?);
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after SET row values, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if exprs.len() != cols.len() {
+                        return Err(self.err(alloc::format!(
+                            "SET (…) = (…) arity mismatch: {} columns, {} values",
+                            cols.len(),
+                            exprs.len()
+                        )));
+                    }
+                    for (col, e) in cols.into_iter().zip(exprs) {
+                        assignments.push((col, e));
+                    }
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             let col = self.expect_ident_like()?;
             if !matches!(self.peek(), Token::Eq) {
                 return Err(self.err(format!(
@@ -4717,7 +4807,18 @@ impl Parser {
                 )));
             }
             self.advance();
-            let value = self.parse_expr(0)?;
+            // `SET col = DEFAULT` — the column's declared default;
+            // rides out as a marker call the update executor
+            // resolves against the schema.
+            let value = if matches!(self.peek(), Token::Default) {
+                self.advance();
+                Expr::FunctionCall {
+                    name: "__column_default".to_string(),
+                    args: Vec::new(),
+                }
+            } else {
+                self.parse_expr(0)?
+            };
             assignments.push((col, value));
             if matches!(self.peek(), Token::Comma) {
                 self.advance();

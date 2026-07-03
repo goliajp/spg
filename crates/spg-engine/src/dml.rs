@@ -320,6 +320,15 @@ impl Engine {
             }
             let mut new_vals = row.values.clone();
             for (pos, expr) in &targets {
+                // `SET col = DEFAULT` — the parser's marker call;
+                // resolve the column's declared default here.
+                if matches!(expr, Expr::FunctionCall { name, args }
+                    if name == "__column_default" && args.is_empty())
+                {
+                    let v = resolve_column_default_free(&schema_cols[*pos], self.clock)?;
+                    new_vals[*pos] = v;
+                    continue;
+                }
                 // v7.31 (round-28) — correlated scalar subquery in
                 // SET (`SET c = (SELECT … WHERE x = target.col)`)
                 // binds the target row as its outer context. The
