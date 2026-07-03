@@ -1750,6 +1750,49 @@ fn mvcc_inplace_delete_tombstones_but_hides_row() {
 }
 
 #[test]
+fn mvcc_inplace_update_tombstones_old_and_shows_new() {
+    // Phase C.3 step 4b: with the in-place gate ON, UPDATE tombstones
+    // the old row version (stamps xmax) and appends a NEW version
+    // (stamps xmin) instead of an in-place replace. The now-gated
+    // primary scan hides the old version and shows the new one, so a
+    // fresh snapshot sees the updated value with the row count intact.
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let upd = e.execute("UPDATE t SET v = 99 WHERE id = 2").unwrap();
+    // affected count still reports 1 even though the old row is retained.
+    assert!(matches!(upd, QueryResult::CommandOk { affected: 1, .. }));
+    let r = e.execute("SELECT id, v FROM t ORDER BY id").unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    assert_eq!(
+        rows.len(),
+        3,
+        "gate-on UPDATE must keep the row count (old version hidden, new shown)"
+    );
+    // The visible row for id=2 carries the NEW value, not the old 20.
+    let row2 = rows
+        .iter()
+        .find(|row| row.values.first() == Some(&Value::Int(2)))
+        .expect("id=2 must be visible");
+    assert_eq!(
+        row2.values.get(1),
+        Some(&Value::Int(99)),
+        "gate-on UPDATE must expose the new value via the gated scan"
+    );
+    // The old value 20 must not be visible anywhere.
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.values.get(1) == Some(&Value::Int(20))),
+        "the tombstoned old version (v=20) must be hidden"
+    );
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};

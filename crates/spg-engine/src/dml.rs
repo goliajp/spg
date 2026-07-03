@@ -412,6 +412,15 @@ impl Engine {
         for step in &child_plan {
             apply_fk_child_step(self.active_catalog_mut(), step)?;
         }
+        // v7.37.15 (Phase C.3, step 4b) — read the in-place kill switch
+        // and the writer version BEFORE the table mut borrow. When on,
+        // UPDATE tombstones the old row version (xmax = v) and appends
+        // the new version (xmin = v) instead of an in-place replace; the
+        // now-uniformly-gated readers hide the old version and show the
+        // new one, vacuum reclaims the old later. Default OFF → legacy
+        // in-place update_row, byte-for-byte unchanged.
+        let inplace = self.mvcc_inplace();
+        let v = self.writer_version_for_current_stmt();
         // Stage 3b — apply the original UPDATE.
         let table = self
             .active_catalog_mut()
@@ -486,7 +495,17 @@ impl Engine {
         // only against the freshly-written row; v7.12.4-shape
         // assignment errors with a clear message.
         for (pos, new_row, old_row) in applied_after_before {
-            table.update_row(pos, new_row.values.clone())?;
+            if inplace {
+                // MVCC: tombstone the old version (xmax = v) + append the
+                // new version (xmin = v). Appending does not shift earlier
+                // physical positions, so later `pos` values stay valid.
+                let _ = table.mark_row_deleted(pos, v);
+                table
+                    .insert_with_xmin(Row::new(new_row.values.clone()), v)
+                    .map_err(EngineError::Storage)?;
+            } else {
+                table.update_row(pos, new_row.values.clone())?;
+            }
             for (fd, filter) in &after_update_triggers {
                 if !filter.is_empty()
                     && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
@@ -804,6 +823,12 @@ impl Engine {
         // self). Shared across MERGE INSERT / UPDATE / DELETE so
         // the whole statement commits atomically.
         let xmin = self.writer_version_for_current_stmt();
+        // v7.37.15 (Phase C.3, step 4b) — in-place kill switch, read
+        // before the table mut borrow (mirrors DELETE/UPDATE). When on,
+        // MERGE UPDATE tombstones the matched old version + appends the
+        // new version (both stamped with the shared `xmin`) instead of
+        // an in-place replace. Default OFF → legacy update_row.
+        let inplace = self.mvcc_inplace();
         // Apply the plan to the target table.
         let table = self
             .active_catalog_mut()
@@ -817,9 +842,19 @@ impl Engine {
         // then inserts. The storage API uses `update_row(pos,
         // new_values)`, `delete_rows(&[positions])`, and `insert(row)`.
         for (idx, new_vals) in &updates {
-            table
-                .update_row(*idx, new_vals.clone())
-                .map_err(EngineError::Storage)?;
+            if inplace {
+                // MVCC: tombstone old version (xmax = xmin) + append new
+                // version (xmin). Appending keeps earlier positions valid,
+                // so the remaining `idx` values in this loop stay correct.
+                let _ = table.mark_row_deleted(*idx, xmin);
+                table
+                    .insert_with_xmin(Row::new(new_vals.clone()), xmin)
+                    .map_err(EngineError::Storage)?;
+            } else {
+                table
+                    .update_row(*idx, new_vals.clone())
+                    .map_err(EngineError::Storage)?;
+            }
         }
         if !delete_indices.is_empty() {
             table.delete_rows(&delete_indices);
@@ -1474,6 +1509,10 @@ impl Engine {
         // across every row this statement inserts (atomic commit
         // at the tx boundary).
         let xmin_for_stmt = self.writer_version_for_current_stmt();
+        // v7.37.15 (Phase C.3, step 4b) — in-place kill switch for the
+        // ON CONFLICT DO UPDATE tombstone+insert path, read before the
+        // table mut borrow and threaded into insert_parsed_rows.
+        let inplace_for_stmt = self.mvcc_inplace();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1487,6 +1526,7 @@ impl Engine {
         let (returning_rows, deferred_embedded, affected) = insert_parsed_rows(
             table,
             xmin_for_stmt,
+            inplace_for_stmt,
             all_values,
             pending_updates,
             &before_insert_triggers,
@@ -2408,6 +2448,11 @@ fn parse_insert_rows(
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
     xmin: u64,
+    // v7.37.15 (Phase C.3, step 4b) — in-place kill switch, threaded
+    // from the caller (fetched before the table mut borrow). When on,
+    // the ON CONFLICT DO UPDATE pass below tombstones + inserts instead
+    // of in-place update_row. Default OFF → legacy update_row.
+    inplace: bool,
     all_values: Vec<Vec<Value<'static>>>,
     pending_updates: Vec<(usize, Vec<Value<'static>>)>,
     before_insert_triggers: &[spg_storage::FunctionDef],
@@ -2494,7 +2539,16 @@ fn insert_parsed_rows(
         if returning_enabled {
             returning_rows.push(new_row.clone());
         }
-        table.update_row(pos, new_row)?;
+        if inplace {
+            // MVCC: tombstone the conflicting old version (xmax = xmin)
+            // + append the DO UPDATE result as a new version (xmin).
+            let _ = table.mark_row_deleted(pos, xmin);
+            table
+                .insert_with_xmin(Row::new(new_row), xmin)
+                .map_err(EngineError::Storage)?;
+        } else {
+            table.update_row(pos, new_row)?;
+        }
         affected += 1;
     }
     Ok((returning_rows, deferred_embedded, affected))
