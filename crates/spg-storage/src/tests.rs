@@ -638,6 +638,31 @@ fn rowid_monotonic_survives_delete_and_never_reused() {
 }
 
 #[test]
+fn relid_assigned_monotonic_by_create_table() {
+    use crate::row_header::RelId;
+    // A bare Table::new is unassigned until the catalog stamps it.
+    let bare = Table::new(make_users_schema());
+    assert_eq!(bare.rel_id(), RelId::UNASSIGNED);
+
+    let mut cat = Catalog::new();
+    for n in ["a", "b", "c"] {
+        let mut s = make_users_schema();
+        s.name = n.into();
+        cat.create_table(s).unwrap();
+    }
+    // create_table stamps monotonic 1..=3, distinct and non-zero.
+    assert_eq!(cat.get("a").unwrap().rel_id(), RelId(1));
+    assert_eq!(cat.get("b").unwrap().rel_id(), RelId(2));
+    assert_eq!(cat.get("c").unwrap().rel_id(), RelId(3));
+    // Round-trip through the envelope re-assigns dense ids in
+    // insertion order (process-local bookkeeping, pre-V6 envelope).
+    let bytes = cat.serialize();
+    let restored = Catalog::deserialize(&bytes).unwrap();
+    assert_eq!(restored.get("a").unwrap().rel_id(), RelId(1));
+    assert_eq!(restored.get("c").unwrap().rel_id(), RelId(3));
+}
+
+#[test]
 fn table_insert_arity_mismatch() {
     let mut cat = Catalog::new();
     cat.create_table(make_users_schema()).unwrap();

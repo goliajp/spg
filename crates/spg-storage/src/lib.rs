@@ -2515,6 +2515,12 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
+    /// v7.37.15 (Phase C.1) — stable per-catalog relation identity.
+    /// [`RelId::UNASSIGNED`](row_header::RelId::UNASSIGNED) until
+    /// `Catalog::create_table` (or the deserialize dense-assign pass)
+    /// stamps a real id. Keys the Phase C.4 row-lock table and the
+    /// Phase C.5 `RelationStore`; survives `DROP TABLE` slot shifts.
+    rel_id: row_header::RelId,
     rows: PersistentVec<Row<'static>>,
     /// v7.37.15 (Phase A.2) — per-row MVCC visibility headers
     /// parallel to `rows`. `headers.len() == rows.len()` is the
@@ -2609,6 +2615,14 @@ pub struct Catalog {
     /// `name → tables[index]`. Kept in lock-step with `tables`.
     /// `create_table` is the only write path.
     by_name: BTreeMap<String, usize>,
+    /// v7.37.15 (Phase C.1) — monotonic allocator for stable
+    /// [`RelId`](row_header::RelId)s. Pre-incremented on each
+    /// `create_table` so real ids start at 1 (0 is `UNASSIGNED`);
+    /// never reused even after `DROP TABLE`, so a stale lock / redo
+    /// reference is detectable. Process-local bookkeeping — not yet
+    /// serialised; `deserialize` re-assigns dense ids on load (the
+    /// V6 envelope, Phase C.6, will round-trip real ids).
+    next_rel_id: u64,
     /// v5.1: in-memory cold-tier segments. Side-loaded via
     /// [`Catalog::load_segment_bytes`] — they live outside the
     /// catalog snapshot (caller persists them as separate files
@@ -3012,6 +3026,7 @@ impl Catalog {
         Self {
             tables: Vec::new(),
             by_name: BTreeMap::new(),
+            next_rel_id: 0,
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
             triggers: Vec::new(),
@@ -3511,6 +3526,13 @@ impl Catalog {
         let name = schema.name.clone();
         self.tables.push(Table::new(schema));
         self.by_name.insert(name, idx);
+        // v7.37.15 (Phase C.1) — stamp the new relation with a stable,
+        // monotonic, never-reused RelId. Pre-increment so ids start at
+        // 1 (0 = UNASSIGNED); a later DROP TABLE frees the slot but not
+        // the id.
+        self.next_rel_id += 1;
+        let rid = row_header::RelId(self.next_rel_id);
+        self.tables[idx].set_rel_id(rid);
         Ok(())
     }
 
@@ -6107,6 +6129,16 @@ impl Catalog {
         for _ in 0..table_count {
             deserialize_table(&mut cur, &mut cat, version)?;
         }
+        // v7.37.15 (Phase C.1) — stamp dense stable RelIds on load.
+        // Pre-V6 envelopes carry no ids; a dense 1..=N assignment is
+        // sufficient while RelId is process-local bookkeeping (the V6
+        // envelope, Phase C.6, will round-trip real ids). Sets the
+        // allocator above the loaded ids so a post-load CREATE TABLE
+        // never collides.
+        for (i, t) in cat.tables.iter_mut().enumerate() {
+            t.set_rel_id(row_header::RelId((i as u64) + 1));
+        }
+        cat.next_rel_id = cat.tables.len() as u64;
         // v7.12.4 — catalog-wide function + trigger appendix.
         // FILE_VERSION 22+ only; v21 and earlier catalogs stop
         // after the last table.

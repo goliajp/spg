@@ -13,6 +13,7 @@ impl Table {
     pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,
+            rel_id: crate::row_header::RelId::UNASSIGNED,
             rows: PersistentVec::new(),
             headers: PersistentVec::new(),
             rowids: PersistentVec::new(),
@@ -42,6 +43,21 @@ impl Table {
     #[must_use]
     pub fn rowids(&self) -> &PersistentVec<crate::row_header::RowId> {
         &self.rowids
+    }
+
+    /// v7.37.15 (Phase C.1) — this relation's stable identity.
+    /// [`RelId::UNASSIGNED`](crate::row_header::RelId::UNASSIGNED) for
+    /// a bare `Table::new`; a real id once the catalog stamps it.
+    #[must_use]
+    pub fn rel_id(&self) -> crate::row_header::RelId {
+        self.rel_id
+    }
+
+    /// v7.37.15 (Phase C.1) — stamp this relation's stable identity.
+    /// Called by `Catalog::create_table` and the deserialize
+    /// dense-assign pass; idempotent overwrite.
+    pub(crate) fn set_rel_id(&mut self, id: crate::row_header::RelId) {
+        self.rel_id = id;
     }
 
     /// v7.37.15 (Phase C.1) — rebuild the `rowids` vec so it is dense

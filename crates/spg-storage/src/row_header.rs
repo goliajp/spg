@@ -228,6 +228,45 @@ impl RowId {
     pub const UNASSIGNED: RowId = RowId(0);
 }
 
+/// v7.37.15 (Phase C.1) — stable per-catalog relation identity.
+///
+/// ## Why a stable id, separate from the table's `Vec` position
+///
+/// A `Catalog` stores tables in a `Vec<Table>`; a `DROP TABLE`
+/// removes one, shifting every later table's position down. So the
+/// physical `tables[i]` index cannot key:
+///
+/// 1. the **row-lock table** — Phase C.4 keys locks by
+///    `(RelId, RowId)`; a lock held across a concurrent `DROP TABLE`
+///    of an *unrelated* table must keep naming the same relation,
+/// 2. the **`RelationStore` shard map** — Phase C.5 splits the
+///    single catalog latch into a `DashMap<RelId, _>` of per-relation
+///    locks; the key must survive catalog mutation,
+/// 3. a **replication relation mapping** — Epic R maps a change to
+///    its relation by a stable id, not a shifting slot.
+///
+/// `RelId` is per-catalog, monotonic, and **never reused** even after
+/// the table is dropped, so a stale lock / redo reference is
+/// detectable rather than silently aliasing a table that reused the
+/// slot. It pairs with [`RowId`] to form the `(RelId, RowId)` tuple
+/// identity Phase C.4's lock table needs.
+///
+/// Introduced additively in Phase C.1: assigned at `CREATE TABLE`
+/// and stored on the table, but nothing consumes it yet. `u64`,
+/// never wraps; 0 is the `RelId::UNASSIGNED` sentinel, real ids start
+/// at 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct RelId(pub u64);
+
+impl RelId {
+    /// The "unassigned" sentinel. A table created through
+    /// `Catalog::create_table` always gets a real id ≥ 1; a bare
+    /// `Table::new` (test helpers, interim construction) starts
+    /// unassigned until the catalog stamps it.
+    pub const UNASSIGNED: RelId = RelId(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
