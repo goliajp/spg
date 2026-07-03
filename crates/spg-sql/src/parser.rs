@@ -818,7 +818,17 @@ impl Parser {
                 }))
             }
             Token::Create => self.parse_create_stmt(),
-            Token::Insert => self.parse_insert_stmt(),
+            Token::Insert => self.parse_insert_stmt(false),
+            // MySQL `REPLACE INTO t …` — delete-then-insert upsert.
+            // Shares the INSERT body; the replace flag lowers it
+            // onto ON CONFLICT DO UPDATE with an empty assignment
+            // list (engine: replace the whole row).
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("replace")
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Into)) =>
+            {
+                self.parse_insert_stmt(true)
+            }
             Token::Begin => {
                 self.advance();
                 // v7.38 轴 4 — PG-standard `BEGIN [WORK|TRANSACTION]
@@ -9687,8 +9697,12 @@ impl Parser {
         Ok(n)
     }
 
-    fn parse_insert_stmt(&mut self) -> Result<Statement, ParseError> {
-        debug_assert!(matches!(self.peek(), Token::Insert));
+    fn parse_insert_stmt(&mut self, replace: bool) -> Result<Statement, ParseError> {
+        debug_assert!(
+            matches!(self.peek(), Token::Insert)
+                || (replace
+                    && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("replace")))
+        );
         self.advance();
         if !matches!(self.peek(), Token::Into) {
             return Err(self.err(format!("expected INTO after INSERT, got {:?}", self.peek())));
@@ -9845,7 +9859,76 @@ impl Parser {
                 break;
             }
         }
-        let on_conflict = self.parse_optional_on_conflict()?;
+        // MySQL `ON DUPLICATE KEY UPDATE col = expr [, …]` — lowers
+        // to ON CONFLICT DO UPDATE with an empty conflict target
+        // (the engine picks the table's first unique index, which
+        // matches MySQL's any-unique-key behaviour for the common
+        // single-key case). `VALUES(col)` in the assignments is
+        // MySQL's spelling of EXCLUDED.col.
+        let mysql_dup = if matches!(self.peek(), Token::On)
+            && matches!(self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("duplicate"))
+        {
+            self.advance(); // ON
+            self.advance(); // DUPLICATE
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("key")) {
+                return Err(self.err(format!(
+                    "expected KEY after ON DUPLICATE, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("update")) {
+                return Err(self.err(format!(
+                    "expected UPDATE after ON DUPLICATE KEY, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut assignments: Vec<(String, Expr)> = Vec::new();
+            loop {
+                let col = self.expect_ident_like()?;
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(format!(
+                        "expected '=' in ON DUPLICATE KEY UPDATE, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut expr = self.parse_expr(0)?;
+                Self::rewrite_mysql_values_refs(&mut expr);
+                assignments.push((col, expr));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            Some(crate::ast::OnConflictClause {
+                target_columns: Vec::new(),
+                constraint_name: None,
+                action: crate::ast::OnConflictAction::Update {
+                    assignments,
+                    where_: None,
+                },
+            })
+        } else {
+            None
+        };
+        let on_conflict = if let Some(c) = mysql_dup {
+            Some(c)
+        } else if replace {
+            Some(crate::ast::OnConflictClause {
+                target_columns: Vec::new(),
+                constraint_name: None,
+                action: crate::ast::OnConflictAction::Update {
+                    assignments: Vec::new(),
+                    where_: None,
+                },
+            })
+        } else {
+            self.parse_optional_on_conflict()?
+        };
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
             ctes: Vec::new(),
@@ -9856,6 +9939,55 @@ impl Parser {
             on_conflict,
             returning,
         }))
+    }
+
+    /// MySQL's `VALUES(col)` inside ON DUPLICATE KEY UPDATE reads
+    /// the incoming row's value — exactly PG's EXCLUDED.col.
+    fn rewrite_mysql_values_refs(e: &mut Expr) {
+        match e {
+            Expr::FunctionCall { name, args }
+                if name.eq_ignore_ascii_case("values")
+                    && args.len() == 1
+                    && matches!(&args[0], Expr::Column(c) if c.qualifier.is_none()) =>
+            {
+                let Expr::Column(c) = &args[0] else {
+                    unreachable!("guarded above");
+                };
+                *e = Expr::Column(crate::ast::ColumnName {
+                    qualifier: Some("EXCLUDED".to_string()),
+                    name: c.name.clone(),
+                });
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::rewrite_mysql_values_refs(a);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::rewrite_mysql_values_refs(lhs);
+                Self::rewrite_mysql_values_refs(rhs);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                Self::rewrite_mysql_values_refs(expr);
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(op) = operand {
+                    Self::rewrite_mysql_values_refs(op);
+                }
+                for (w, t) in branches {
+                    Self::rewrite_mysql_values_refs(w);
+                    Self::rewrite_mysql_values_refs(t);
+                }
+                if let Some(el) = else_branch {
+                    Self::rewrite_mysql_values_refs(el);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// v7.9.7 — parse the optional `ON CONFLICT (cols) DO …`

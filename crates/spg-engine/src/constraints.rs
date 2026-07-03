@@ -391,6 +391,13 @@ pub(crate) fn apply_on_conflict_assignments(
             return Ok(None);
         }
     }
+    // REPLACE INTO lowering — an empty assignment list means
+    // "replace the whole row with the incoming one" (MySQL
+    // delete+insert semantics; the PG ON CONFLICT grammar never
+    // produces an empty list).
+    if assignments.is_empty() {
+        return Ok(Some(incoming.to_vec()));
+    }
     let mut new_values = existing.values.clone();
     for (col_name, expr) in assignments {
         let target_idx = schema_cols

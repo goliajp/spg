@@ -507,6 +507,7 @@ mod e2e_window_null_treatment;
 mod e2e_window_with_join;
 mod e2e_array_slice;
 mod e2e_at_time_zone;
+mod e2e_mysql_upsert;
 mod e2e_named_window;
 mod e2e_orderby_using_operator;
 mod e2e_row_comparison;
