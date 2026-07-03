@@ -6766,6 +6766,42 @@ fn apply_function_dispatch(
             }
             Ok(Value::text(out))
         }
+        // Bare ROW(a, b, …) constructor rendered as PG record text:
+        // fields comma-joined inside parens, NULL as empty, fields
+        // containing special characters double-quoted with `"`→`""`
+        // and `\`→`\\` escapes. (Comparison forms never reach here —
+        // the parser expands them fieldwise at parse time.)
+        "row" => {
+            let mut out = String::from("(");
+            for (i, v) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                let field = value_to_format_text(v);
+                let needs_quote = field.is_empty()
+                    || field.chars().any(|c| {
+                        matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace()
+                    });
+                if needs_quote {
+                    out.push('"');
+                    for c in field.chars() {
+                        match c {
+                            '"' => out.push_str("\"\""),
+                            '\\' => out.push_str("\\\\"),
+                            other => out.push(other),
+                        }
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(&field);
+                }
+            }
+            out.push(')');
+            Ok(Value::text(out))
+        }
         // PG `concat_ws(sep, val1 [, val2 ...])` — like concat but
         // with a separator inserted between each pair of NON-NULL
         // arguments. Critical semantic subtleties:

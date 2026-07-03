@@ -12766,6 +12766,12 @@ impl Parser {
             self.advance();
             let mut alternatives: Vec<Expr> = Vec::new();
             loop {
+                // Optional ROW keyword before the paren row.
+                if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("row"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+                {
+                    self.advance();
+                }
                 if !matches!(self.peek(), Token::LParen) {
                     return Err(self.err(alloc::format!(
                         "expected '(' to open a row inside IN, got {:?}",
@@ -12830,6 +12836,12 @@ impl Parser {
             }
         };
         self.advance();
+        // Optional ROW keyword before the paren row.
+        if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("row"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance();
+        }
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(alloc::format!(
                 "expected '(' to open the right-hand row, got {:?}",
@@ -14012,6 +14024,49 @@ impl Parser {
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 }
+            }
+            // `ROW(a, b, …)` keyword constructor. Followed by a
+            // comparison operator or [NOT] IN it joins the paren
+            // row-constructor machinery (fieldwise parse-time
+            // expansion); bare, it stays a `row` call the evaluator
+            // renders as PG record text.
+            if first.eq_ignore_ascii_case("row") {
+                let mut row_items = Vec::new();
+                if !matches!(self.peek(), Token::RParen) {
+                    loop {
+                        row_items.push(self.parse_expr(0)?);
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => break,
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected ',' or ')' in ROW(...), got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // ')'
+                let comparison_follows = matches!(
+                    self.peek(),
+                    Token::Eq
+                        | Token::NotEq
+                        | Token::Lt
+                        | Token::LtEq
+                        | Token::Gt
+                        | Token::GtEq
+                        | Token::In
+                ) || (matches!(self.peek(), Token::Not)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::In)));
+                if comparison_follows && !row_items.is_empty() {
+                    return self.parse_row_comparison_tail(row_items);
+                }
+                return Ok(Expr::FunctionCall {
+                    name: String::from("row"),
+                    args: row_items,
+                });
             }
             // SQL-standard `POSITION(sub IN str)` — lowers onto
             // strpos(str, sub). IN is the argument separator here,
