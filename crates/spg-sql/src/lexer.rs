@@ -162,8 +162,20 @@ pub enum Token {
     Pipe,
     /// Bitwise AND `&` (single amp — `&&` lexes as InetOverlap first).
     Amp,
-    /// Bitwise NOT `~` (prefix).
+    /// Bitwise NOT `~` (prefix); regex match in binary position.
     Tilde,
+    /// Case-insensitive regex match `~*`.
+    TildeStar,
+    /// Negated regex match `!~`.
+    NotTilde,
+    /// Negated case-insensitive regex match `!~*`.
+    NotTildeStar,
+    /// Power operator `^`.
+    Caret,
+    /// Starts-with operator `^@` (PG 11+).
+    CaretAt,
+    /// Integer XOR operator `#`.
+    Hash,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
     Is,
     Between,
@@ -437,7 +449,8 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                     single(&mut out, Token::Minus, &mut i);
                 }
             }
-            // v6.4.5: `#>>` and `#>` JSON path walk.
+            // v6.4.5: `#>>` and `#>` JSON path walk; bare `#` is
+            // the integer XOR operator.
             b'#' => {
                 if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::JsonGetPathText);
@@ -446,10 +459,7 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                     out.push(Token::JsonGetPath);
                     i += 2;
                 } else {
-                    return Err(LexError {
-                        kind: LexErrorKind::UnknownChar('#'),
-                        pos: i,
-                    });
+                    single(&mut out, Token::Hash, &mut i);
                 }
             }
             // v6.4.5: `@>` JSON containment.
@@ -583,8 +593,19 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b'|' => {
                 single(&mut out, Token::Pipe, &mut i);
             }
+            b'~' if peek_eq(bytes, i + 1, b'*') => {
+                out.push(Token::TildeStar);
+                i += 2;
+            }
             b'~' => {
                 single(&mut out, Token::Tilde, &mut i);
+            }
+            b'^' if peek_eq(bytes, i + 1, b'@') => {
+                out.push(Token::CaretAt);
+                i += 2;
+            }
+            b'^' => {
+                single(&mut out, Token::Caret, &mut i);
             }
             b'>' => {
                 if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
@@ -613,6 +634,14 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             }
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
+                i += 2;
+            }
+            b'!' if peek_eq(bytes, i + 1, b'~') && peek_eq(bytes, i + 2, b'*') => {
+                out.push(Token::NotTildeStar);
+                i += 3;
+            }
+            b'!' if peek_eq(bytes, i + 1, b'~') => {
+                out.push(Token::NotTilde);
                 i += 2;
             }
             // v7.9.27 — PG dollar-quoted string `$$ … $$` (or

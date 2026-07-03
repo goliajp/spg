@@ -517,6 +517,7 @@ mod e2e_row_constructor;
 mod e2e_extract_fields;
 mod e2e_overlaps;
 mod e2e_array_operators;
+mod e2e_operator_symbols;
 mod e2e_at_time_zone;
 mod e2e_mysql_upsert;
 mod e2e_named_window;
