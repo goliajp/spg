@@ -116,7 +116,12 @@ struct LockEntry {
 
 /// The row-lock table. Keyed on stable `(RelId, RowId)`; carries the
 /// wait-for graph used for deadlock detection.
-#[derive(Debug, Default)]
+///
+/// `Clone` to match the engine's other transient concurrency state
+/// (`active_writer_versions`) that rides on `Engine`; the shared
+/// (non-cloned) lock manager is Phase C.5, when the single engine lock
+/// is split.
+#[derive(Debug, Default, Clone)]
 pub struct LockTable {
     entries: BTreeMap<(RelId, RowId), LockEntry>,
     /// `waiter → versions it is blocked on`. Rebuilt as waits are
