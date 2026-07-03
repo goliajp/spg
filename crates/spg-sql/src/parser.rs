@@ -10361,6 +10361,124 @@ impl Parser {
                 jsonb_each_text_arg: None,
             });
         }
+        // `ROWS FROM ( srf(args) [, srf(args)]* )` — SQL-standard
+        // explicit parallel-zip syntax. Each entry lowers to its
+        // array-returning scalar form (unnest(x) → x itself; the
+        // FROM-SRF rewrite family → their scalar array calls) and
+        // the list rides the multi-arg unnest zip channel:
+        // NULL-padded to the longest, WITH ORDINALITY appends the
+        // counter. generate_series has no scalar array form and
+        // errors honestly.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rows"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::From))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
+        {
+            self.advance(); // ROWS
+            self.advance(); // FROM
+            self.advance(); // (
+            let mut entries: Vec<Expr> = Vec::new();
+            loop {
+                let fn_name = self.expect_ident_like()?.to_ascii_lowercase();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after {fn_name} in ROWS FROM, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut fn_args: Vec<Expr> = Vec::new();
+                if !matches!(self.peek(), Token::RParen) {
+                    loop {
+                        fn_args.push(self.parse_expr(0)?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after {fn_name}() arguments in ROWS FROM, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let entry = match fn_name.as_str() {
+                    "unnest" => {
+                        if fn_args.len() != 1 {
+                            return Err(self.err(
+                                "unnest inside ROWS FROM takes exactly one array".into(),
+                            ));
+                        }
+                        fn_args.pop().expect("len checked")
+                    }
+                    "jsonb_array_elements" | "json_array_elements"
+                    | "jsonb_array_elements_text" | "json_array_elements_text"
+                    | "jsonb_object_keys" | "json_object_keys" | "generate_subscripts" => {
+                        crate::ast::Expr::FunctionCall {
+                            name: fn_name,
+                            args: fn_args,
+                        }
+                    }
+                    "string_to_table" => crate::ast::Expr::FunctionCall {
+                        name: "string_to_array".to_string(),
+                        args: fn_args,
+                    },
+                    "regexp_split_to_table" => crate::ast::Expr::FunctionCall {
+                        name: "regexp_split_to_array".to_string(),
+                        args: fn_args,
+                    },
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "ROWS FROM supports unnest and the array-returning SRF \
+                             family; {other:?} is not supported here yet"
+                        )));
+                    }
+                };
+                entries.push(entry);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' to close ROWS FROM, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let with_ordinality = self.absorb_with_ordinality();
+            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident.clone().unwrap_or_else(|| "rows".to_string());
+            let correlated = entries.iter().any(Self::expr_has_qualified_column);
+            let expr = if entries.len() == 1 {
+                entries.pop().expect("len checked")
+            } else {
+                crate::ast::Expr::FunctionCall {
+                    name: "__unnest_zip".to_string(),
+                    args: entries,
+                }
+            };
+            let tref = TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: Some(Box::new(expr)),
+                unnest_column_aliases,
+                with_ordinality,
+                generate_series_args: None,
+                lateral_subquery: None,
+                jsonb_each_text_arg: None,
+            };
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
+            });
+        }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
         // source. Detect at the head before the bare-ident fallback;
         // unnest is not a reserved token.
