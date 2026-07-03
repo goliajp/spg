@@ -525,6 +525,7 @@ mod e2e_frame_exclude;
 mod e2e_recursive_cte_values;
 mod e2e_jsonb_object_agg_dedup;
 mod e2e_encode_bytea;
+mod e2e_to_char_numeric;
 mod e2e_at_time_zone;
 mod e2e_mysql_upsert;
 mod e2e_named_window;
