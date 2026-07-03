@@ -13254,7 +13254,13 @@ impl Parser {
                 // the shared rows helper onto a Select body.
                 Token::Values => {
                     self.advance(); // VALUES
-                    let head = self.parse_values_rows_body()?;
+                    let mut head = self.parse_values_rows_body()?;
+                    // A VALUES seed can head a set-operation chain —
+                    // WITH RECURSIVE t(n) AS (VALUES(1) UNION ALL
+                    // SELECT n+1 FROM t …). Attach any trailing
+                    // UNION / INTERSECT / EXCEPT peers so the
+                    // recursive-CTE body parses like the SELECT seed.
+                    self.parse_setop_chain_into(&mut head)?;
                     crate::ast::CteBody::Select(head)
                 }
                 Token::Insert => {
