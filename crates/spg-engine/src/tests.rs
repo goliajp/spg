@@ -1688,6 +1688,33 @@ fn xact_status_tracks_inflight_commit_and_abort() {
 }
 
 #[test]
+fn in_tx_sees_own_insert_through_gated_window_path() {
+    // Phase C.3 step 1: current_snapshot now stamps the tx's writer
+    // version as tx_id (set on the engine during in-tx statement
+    // execution), so a GATED scan — a window function routes through
+    // `scan_visible` — inside a transaction sees the tx's own
+    // uncommitted insert. Before step 1, tx_id=0 made `visible` hide
+    // the row (xmin=v ∈ in_progress). Exercised through the real
+    // execute() path so `current_tx` is set the way runtime sets it.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    let r = e
+        .execute("SELECT id, count(*) OVER () AS c FROM t ORDER BY id")
+        .unwrap();
+    e.execute("COMMIT").unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows from the windowed SELECT");
+    };
+    assert_eq!(
+        rows.len(),
+        2,
+        "transaction must see its own two inserts through the gated window path"
+    );
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};

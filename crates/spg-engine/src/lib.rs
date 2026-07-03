@@ -775,6 +775,18 @@ impl Engine {
         {
             return s.clone();
         }
+        // v7.37.15 (Phase C.3, step 1) — carry the current tx's writer
+        // version as the snapshot's `tx_id` so the visibility gate's
+        // self-write branch (`visible` step 1) recognises rows this
+        // transaction stamped (`xmin == v`, with `v` in
+        // `active_writer_versions`). Without this the tx's own
+        // uncommitted rows fall to the in-progress step and become
+        // invisible to itself on the gated read paths. Autocommit reads
+        // (no `tx_writer_versions` entry) keep `tx_id = 0`.
+        let reader_tx_id = self
+            .current_tx
+            .and_then(|t| self.tx_writer_versions.get(&t).copied())
+            .unwrap_or(0);
         let version = spg_storage::row_header::current_version();
         if self.active_writer_versions.is_empty() {
             // Hot path: no writer in flight. Snapshot::unbounded()
@@ -785,7 +797,7 @@ impl Engine {
                 version,
                 spg_storage::snapshot::InProgressSet::empty(),
                 version,
-                0,
+                reader_tx_id,
             );
         }
         let sorted: alloc::vec::Vec<u64> =
@@ -795,7 +807,7 @@ impl Engine {
             version,
             spg_storage::snapshot::InProgressSet::from_sorted(sorted),
             oldest,
-            0,
+            reader_tx_id,
         )
     }
 

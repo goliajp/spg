@@ -15,6 +15,17 @@ impl Engine {
         if self.tx_catalogs.contains_key(&tx_id) {
             return Err(EngineError::TransactionAlreadyOpen);
         }
+        // v7.37.15 Phase C — allocate the tx's writer version FIRST
+        // (before caching any snapshot). Concurrent readers that build
+        // snapshots between now and COMMIT see this version in
+        // `in_progress`, so they don't observe the tx's uncommitted
+        // writes. Ordering matters for Phase C.3: `current_snapshot`
+        // stamps the reader's own `tx_id` from `tx_writer_versions`, so
+        // the version must be registered before the RR/SER snapshot is
+        // cached below — otherwise the cached snapshot would carry
+        // `tx_id = 0` and the tx would not recognise its own writes.
+        let v = self.begin_writer_version();
+        self.tx_writer_versions.insert(tx_id, v);
         // v7.37.15 Phase E — cache an MVCC snapshot at BEGIN for
         // REPEATABLE READ / SERIALIZABLE so the tx sees a frozen
         // view across statements. READ COMMITTED (the default)
@@ -33,22 +44,6 @@ impl Engine {
                 cached_snapshot,
             },
         );
-        // v7.37.15 Phase C — allocate a writer version for the
-        // duration of this explicit transaction. Concurrent
-        // readers that build snapshots between now and COMMIT
-        // see this version in `in_progress`, so they don't
-        // observe the tx's uncommitted writes (when the tx's
-        // INSERT stamps `xmin = V`, snapshots taken before the
-        // exec_commit hides those rows). The version stays in
-        // `active_writer_versions` until exec_commit or
-        // exec_rollback fires.
-        let v = self.begin_writer_version();
-        // Stash the allocated version on the TxState so
-        // exec_commit / exec_rollback know which version to
-        // commit/discard. Reuse `next_tx_id` as a cheap registry —
-        // actual storage is on TxState but the lookup key is
-        // `tx_id`.
-        self.tx_writer_versions.insert(tx_id, v);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
