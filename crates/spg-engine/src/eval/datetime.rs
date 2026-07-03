@@ -53,6 +53,24 @@ pub(super) fn extract_field(
             // days count their own 86_400, PG's justify_interval
             // convention).
             F::Epoch => i64::from(months) * 30 * 86_400 + i64::from(days) * 86_400 + secs_total,
+            F::Quarter => i64::from(mons) / 3 + 1,
+            F::Decade => i64::from(years) / 10,
+            F::Century => i64::from(years) / 100,
+            F::Millennium => i64::from(years) / 1000,
+            F::Millisecond => (secs_total % 60) * 1_000 + frac / 1_000,
+            F::Dow
+            | F::Isodow
+            | F::Doy
+            | F::Week
+            | F::Isoyear
+            | F::Julian
+            | F::Timezone
+            | F::TimezoneHour
+            | F::TimezoneMinute => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("EXTRACT field {field} is not supported for INTERVAL"),
+                });
+            }
         };
         return Ok(Value::BigInt(result));
     }
@@ -89,8 +107,63 @@ pub(super) fn extract_field(
         // seconds since the unix epoch (truncated; PG returns
         // numeric with fraction — mailrs casts ::BIGINT anyway).
         F::Epoch => i64::from(days) * 86_400 + secs,
+        // 1970-01-01 was a Thursday: dow 4, isodow 4.
+        F::Dow => i64::from((days + 4).rem_euclid(7)),
+        F::Isodow => i64::from((days + 3).rem_euclid(7)) + 1,
+        F::Doy => i64::from(days - days_from_civil(y, 1, 1)) + 1,
+        F::Week => iso_week_and_year(days, y).0,
+        F::Isoyear => iso_week_and_year(days, y).1,
+        F::Quarter => i64::from((m - 1) / 3) + 1,
+        F::Decade => i64::from(y).div_euclid(10),
+        F::Century => era_bucket(y, 100),
+        F::Millennium => era_bucket(y, 1000),
+        // JD of 1970-01-01 is 2440588 (integer-day convention;
+        // truncated for timestamps — the BigInt shape of this file).
+        F::Julian => i64::from(days) + 2_440_588,
+        F::Millisecond => ss * 1_000 + frac / 1_000,
+        // SPG sessions run UTC — the offset is honestly zero.
+        F::Timezone | F::TimezoneHour | F::TimezoneMinute => 0,
     };
     Ok(Value::BigInt(result))
+}
+
+/// PG counts centuries/millennia from year 1 with no year 0:
+/// 2001-2100 is century 21; proleptic year 0 (1 BC) is century -1.
+fn era_bucket(y: i32, unit: i32) -> i64 {
+    if y > 0 {
+        i64::from((y - 1) / unit) + 1
+    } else {
+        i64::from(y / unit) - 1
+    }
+}
+
+/// ISO 8601 week number and week-numbering year for a day count
+/// (days since 1970-01-01) whose civil year is `y`. Week 1 is the
+/// week containing January 4th; weeks run Monday-Sunday.
+fn iso_week_and_year(days: i32, y: i32) -> (i64, i64) {
+    let isodow = (days + 3).rem_euclid(7) + 1; // 1 = Monday
+    let doy = days - days_from_civil(y, 1, 1) + 1;
+    let iso_weeks_in = |year: i32| -> i32 {
+        // 53-week years: Jan 1 is Thursday, or leap year with
+        // Jan 1 on Wednesday (equivalently Dec 31 is Thursday).
+        let jan1 = days_from_civil(year, 1, 1);
+        let dec31 = days_from_civil(year, 12, 31);
+        let jan1_isodow = (jan1 + 3).rem_euclid(7) + 1;
+        let dec31_isodow = (dec31 + 3).rem_euclid(7) + 1;
+        if jan1_isodow == 4 || dec31_isodow == 4 {
+            53
+        } else {
+            52
+        }
+    };
+    let w = (doy - isodow + 10).div_euclid(7);
+    if w < 1 {
+        (i64::from(iso_weeks_in(y - 1)), i64::from(y - 1))
+    } else if w > iso_weeks_in(y) {
+        (1, i64::from(y + 1))
+    } else {
+        (i64::from(w), i64::from(y))
+    }
 }
 
 /// Internal wrapper around the file-private `civil_from_days` so the
@@ -130,11 +203,27 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         "second" => F::Second,
         "microsecond" | "microseconds" => F::Microsecond,
         "epoch" => F::Epoch,
+        "dow" => F::Dow,
+        "isodow" => F::Isodow,
+        "doy" => F::Doy,
+        "week" => F::Week,
+        "isoyear" => F::Isoyear,
+        "quarter" => F::Quarter,
+        "decade" => F::Decade,
+        "century" => F::Century,
+        "millennium" => F::Millennium,
+        "julian" => F::Julian,
+        "millisecond" | "milliseconds" => F::Millisecond,
+        "timezone" => F::Timezone,
+        "timezone_hour" => F::TimezoneHour,
+        "timezone_minute" => F::TimezoneMinute,
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
                     "unknown date_part field {other:?}; \
-                     supported: year, month, day, hour, minute, second, microsecond"
+                     supported: year, month, day, hour, minute, second, microsecond, \
+                     millisecond, epoch, dow, isodow, doy, week, isoyear, quarter, \
+                     decade, century, millennium, julian, timezone[_hour|_minute]"
                 ),
             });
         }

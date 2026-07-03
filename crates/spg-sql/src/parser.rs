@@ -13494,10 +13494,26 @@ impl Parser {
             "second" => ExtractField::Second,
             "microsecond" | "microseconds" => ExtractField::Microsecond,
             "epoch" => ExtractField::Epoch,
+            "dow" => ExtractField::Dow,
+            "isodow" => ExtractField::Isodow,
+            "doy" => ExtractField::Doy,
+            "week" => ExtractField::Week,
+            "isoyear" => ExtractField::Isoyear,
+            "quarter" => ExtractField::Quarter,
+            "decade" => ExtractField::Decade,
+            "century" => ExtractField::Century,
+            "millennium" => ExtractField::Millennium,
+            "julian" => ExtractField::Julian,
+            "millisecond" | "milliseconds" => ExtractField::Millisecond,
+            "timezone" => ExtractField::Timezone,
+            "timezone_hour" => ExtractField::TimezoneHour,
+            "timezone_minute" => ExtractField::TimezoneMinute,
             other => {
                 return Err(self.err(format!(
                     "unknown EXTRACT field {other:?}; \
-                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND, EPOCH"
+                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND, \
+                     MILLISECOND, EPOCH, DOW, ISODOW, DOY, WEEK, ISOYEAR, QUARTER, \
+                     DECADE, CENTURY, MILLENNIUM, JULIAN, TIMEZONE[_HOUR|_MINUTE]"
                 )));
             }
         };
