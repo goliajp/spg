@@ -255,6 +255,29 @@ impl Engine {
         eval::eval_expr(&e, row, ctx).map_err(EngineError::Eval)
     }
 
+    /// Quantified `op ANY / ALL (SELECT …)` — materialise every
+    /// row of the single-column subquery into an ARRAY[…] literal
+    /// the existing AnyAll three-valued eval consumes (empty
+    /// result → empty array: ANY false, ALL true — PG semantics).
+    pub(crate) fn materialize_quantified_rows(
+        &self,
+        inner: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<Expr, EngineError> {
+        let r = self.exec_select_cancel(inner, cancel)?;
+        let QueryResult::Rows { rows, .. } = r else {
+            return Err(EngineError::Unsupported(
+                "ANY/ALL subquery: inner did not return rows".into(),
+            ));
+        };
+        let mut items = alloc::vec::Vec::with_capacity(rows.len());
+        for r0 in rows {
+            let v = r0.values.into_iter().next().unwrap_or(Value::Null);
+            items.push(value_to_literal_expr(v)?);
+        }
+        Ok(Expr::Array(items))
+    }
+
     fn resolve_correlated_in_expr(
         &self,
         e: &mut Expr,
@@ -515,7 +538,15 @@ impl Engine {
             }
             Expr::AnyAll { expr, array, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
-                self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
+                // Quantified subquery — substitute the outer row's
+                // values and materialise all rows into an ARRAY.
+                if let Expr::ScalarSubquery(inner) = array.as_mut() {
+                    let mut s = (**inner).clone();
+                    substitute_outer_columns(&mut s, row, ctx);
+                    **array = self.materialize_quantified_rows(&s, cancel)?;
+                } else {
+                    self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
+                }
             }
             Expr::InList { expr, list, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;

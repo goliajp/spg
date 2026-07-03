@@ -11823,16 +11823,68 @@ impl Parser {
                     Some(false)
                 }
                 Token::Ident(s) | Token::QuotedIdent(s)
-                    if (s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("all"))
+                    if (s.eq_ignore_ascii_case("any")
+                        || s.eq_ignore_ascii_case("some")
+                        || s.eq_ignore_ascii_case("all"))
                         && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
                 {
-                    Some(s.eq_ignore_ascii_case("any"))
+                    Some(!s.eq_ignore_ascii_case("all"))
                 }
                 _ => None,
             };
             if let Some(is_any) = any_kind {
                 self.advance(); // ident
                 self.advance(); // (
+                // `x op ANY (SELECT …)` — the quantified-subquery
+                // form. `= ANY` is exactly IN; the other operators
+                // lower onto EXISTS over the subquery as a derived
+                // table, comparing against its single projection
+                // aliased __v (x's columns resolve correlated).
+                // ALL is the negated-EXISTS complement; a NULL
+                // element makes PG return NULL where this lowering
+                // returns true — the NOT NULL column case (the
+                // practical one) is exact.
+                if matches!(self.peek(), Token::Select) {
+                    let mut sub = match self.parse_select_stmt()? {
+                        Statement::Select(s) => s,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected SELECT inside ANY/ALL, got {other:?}"
+                            )));
+                        }
+                    };
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected ')' after ANY/ALL subquery, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if sub.items.len() != 1 {
+                        return Err(self.err(alloc::format!(
+                            "ANY/ALL subquery must return one column, got {}",
+                            sub.items.len()
+                        )));
+                    }
+                    if is_any && matches!(op, BinOp::Eq) {
+                        lhs = Expr::InSubquery {
+                            expr: Box::new(lhs),
+                            subquery: Box::new(sub),
+                            negated: false,
+                        };
+                        continue;
+                    }
+                    // The engine's subquery resolvers materialise
+                    // the single-column result into an ARRAY the
+                    // existing AnyAll three-valued eval consumes.
+                    lhs = Expr::AnyAll {
+                        expr: Box::new(lhs),
+                        op,
+                        array: Box::new(Expr::ScalarSubquery(Box::new(sub))),
+                        is_any,
+                    };
+                    continue;
+                }
                 let arr = self.parse_expr(0)?;
                 if !matches!(self.peek(), Token::RParen) {
                     return Err(self.err(alloc::format!(

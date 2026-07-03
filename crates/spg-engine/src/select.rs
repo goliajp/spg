@@ -1315,7 +1315,17 @@ impl Engine {
             }
             Expr::AnyAll { expr, array, .. } => {
                 self.resolve_expr_subqueries(expr, cancel)?;
-                self.resolve_expr_subqueries(array, cancel)?;
+                // Quantified subquery — an uncorrelated one
+                // materialises up front; a correlated one stays for
+                // the per-row resolver.
+                if let Expr::ScalarSubquery(inner) = array.as_mut() {
+                    if !crate::subquery::select_is_correlated(inner) {
+                        let s = (**inner).clone();
+                        **array = self.materialize_quantified_rows(&s, cancel)?;
+                    }
+                } else {
+                    self.resolve_expr_subqueries(array, cancel)?;
+                }
             }
             Expr::Case {
                 operand,
@@ -2721,7 +2731,24 @@ impl Engine {
         let empty_schema: Vec<ColumnSchema> = Vec::new();
         let ctx = self.ev_ctx(&empty_schema, None);
         let projection = build_projection(&stmt.items, &empty_schema, "")?;
+        // `SELECT … WHERE cond` with no FROM — the one conceptual
+        // row survives only when the condition is true (previously
+        // the WHERE was silently ignored: `SELECT 1 WHERE false`
+        // returned a row).
         let dummy_row = Row::new(Vec::new());
+        if let Some(w) = &stmt.where_ {
+            let cond = eval::eval_expr(w, &dummy_row, &ctx)?;
+            if !matches!(cond, Value::Bool(true)) {
+                let columns: Vec<ColumnSchema> = projection
+                    .into_iter()
+                    .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+                    .collect();
+                return Ok(QueryResult::Rows {
+                    columns,
+                    rows: Vec::new(),
+                });
+            }
+        }
         let mut values = Vec::with_capacity(projection.len());
         for p in &projection {
             values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
