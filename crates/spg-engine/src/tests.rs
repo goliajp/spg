@@ -1725,6 +1725,31 @@ fn mvcc_inplace_flag_defaults_off_and_toggles() {
 }
 
 #[test]
+fn mvcc_inplace_delete_tombstones_but_hides_row() {
+    // Phase C.3 step 4a: with the in-place gate ON, DELETE tombstones
+    // the row (stamps xmax, keeps it physically present) instead of
+    // physically removing it. The now-gated primary scan hides the
+    // tombstoned row from a fresh snapshot, so the visible result is
+    // identical to a physical delete: the two survivors.
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let del = e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    // affected count still reports 1 even though the row is retained.
+    assert!(matches!(del, QueryResult::CommandOk { affected: 1, .. }));
+    let r = e.execute("SELECT id FROM t ORDER BY id").unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    assert_eq!(
+        rows.len(),
+        2,
+        "gate-on DELETE must hide the tombstoned row via the gated scan"
+    );
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};

@@ -1100,6 +1100,22 @@ impl Engine {
         // statement so all tombstones commit atomically.
         let xmax = self.writer_version_for_current_stmt();
         let _ = xmax; // pre-fetched; consumed below
+        // v7.37.15 (Phase C.3, step 4a) — read the in-place kill switch
+        // before the table mut borrow. When on, DELETE tombstones the
+        // rows (xmax stamped, kept physically present) instead of
+        // physically removing them: the now-uniformly-gated readers
+        // skip them and vacuum reclaims later, giving concurrent
+        // snapshots a consistent view. Default OFF → legacy physical
+        // delete, byte-for-byte unchanged.
+        //
+        // KNOWN follow-ups before this gate can flip in production
+        // (see plan appendix B): (6) WAL redo capture for the tombstone
+        // — `mark_row_deleted` does not record a RowChange, so gate-on
+        // is in-memory-only until Epic W wires tombstone redo; (1)
+        // unique/FK constraint checks must adopt MVCC/dirty-snapshot
+        // semantics so a re-insert of a tombstoned key succeeds; (8)
+        // cold-tier tombstoning via the cold overlay (step 6).
+        let inplace = self.mvcc_inplace();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1116,7 +1132,18 @@ impl Engine {
             // also no-op on bad positions).
             let _ = table.mark_row_deleted(pos, xmax);
         }
-        let affected = table.delete_rows(&positions) + cold_shadow_count;
+        let affected = if inplace {
+            // Tombstone-only: rows stay in `table.rows()` with xmax set;
+            // count the distinct positions we tombstoned (the WHERE scan
+            // that produced `positions` is itself gated, so every
+            // position is a live, visible row).
+            let mut uniq: Vec<usize> = positions.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            uniq.len() + cold_shadow_count
+        } else {
+            table.delete_rows(&positions) + cold_shadow_count
+        };
         let _ = table;
         // v7.12.5 — AFTER DELETE row-level triggers fire post-write
         // with NEW=None / OLD=pre-delete row (each from the
