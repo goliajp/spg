@@ -143,17 +143,28 @@ pub fn json_logging_enabled() -> bool {
     })
 }
 
+/// Build the single-line JSON object for one log event (no trailing
+/// newline). Split out from `log_event` purely so the escaping +
+/// field assembly are unit-testable without capturing stderr; the
+/// byte sequence it returns is exactly what `log_event` used to
+/// build inline (the caller appends the `\n`).
+fn format_json_event(level: &str, msg: &str, kvs: &[(&str, &str)]) -> String {
+    let mut line = format!("{{\"level\":\"{level}\",\"msg\":\"{}\"", json_escape(msg));
+    for (k, v) in kvs {
+        line.push_str(&format!(",\"{k}\":\"{}\"", json_escape(v)));
+    }
+    line.push('}');
+    line
+}
+
 /// Emit a log line. When `SPG_LOG_FORMAT=json`, encode as
 /// `{"level":"...","msg":"...","key":"val",...}\n`; otherwise
 /// match the prior `eprintln!("spg-server: <msg> ...")` shape.
 #[allow(dead_code)] // wire-up to startup/auth events queued for follow-up commits
 pub fn log_event(level: &str, msg: &str, kvs: &[(&str, &str)]) {
     if json_logging_enabled() {
-        let mut line = format!("{{\"level\":\"{level}\",\"msg\":\"{}\"", json_escape(msg));
-        for (k, v) in kvs {
-            line.push_str(&format!(",\"{k}\":\"{}\"", json_escape(v)));
-        }
-        line.push_str("}\n");
+        let mut line = format_json_event(level, msg, kvs);
+        line.push('\n');
         let _ = std::io::stderr().write_all(line.as_bytes());
     } else {
         let mut line = format!("spg-server: {msg}");
@@ -684,4 +695,73 @@ fn write_response(
         body.len()
     );
     stream.write_all(response.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_json_event, json_escape};
+
+    #[test]
+    fn json_escape_plain_message_passes_through() {
+        assert_eq!(json_escape("hello world"), "hello world");
+        // Raw multibyte UTF-8 is valid inside a JSON string and must
+        // pass through verbatim (not be \u-escaped).
+        assert_eq!(json_escape("café — 日本語"), "café — 日本語");
+    }
+
+    #[test]
+    fn json_escape_handles_quote_backslash_and_whitespace() {
+        // The correctness-critical case: a message carrying a double
+        // quote, a backslash, and the three whitespace controls must
+        // not break the surrounding JSON string.
+        let raw = "a\"b\\c\nd\re\tf";
+        assert_eq!(json_escape(raw), "a\\\"b\\\\c\\nd\\re\\tf");
+    }
+
+    #[test]
+    fn json_escape_other_control_chars_use_u_escape() {
+        // NUL (0x00) and BEL (0x07) aren't among the named escapes, so
+        // they fall through to the \u00xx form.
+        assert_eq!(json_escape("\u{0}\u{7}"), "\\u0000\\u0007");
+    }
+
+    #[test]
+    fn format_json_event_plain_has_expected_fields_and_order() {
+        let line = format_json_event("warn", "slow_query", &[("elapsed_us", "123")]);
+        // Exact-string equality doubles as a validity check: this is a
+        // hand-verified well-formed JSON object. (The crate carries no
+        // serde_json dependency, so we assert the bytes directly rather
+        // than round-tripping through a parser.)
+        assert_eq!(
+            line,
+            r#"{"level":"warn","msg":"slow_query","elapsed_us":"123"}"#
+        );
+    }
+
+    #[test]
+    fn format_json_event_stays_single_line_with_hostile_value() {
+        // A value containing a double quote and a literal newline: the
+        // newline must be escaped to `\n` so the record stays on one
+        // physical line, and the quote must not terminate the string.
+        let line = format_json_event("error", "boom", &[("sql", "SELECT '\"' \n --x")]);
+        assert!(
+            !line.contains('\n'),
+            "log record must be a single physical line, got: {line}"
+        );
+        assert_eq!(
+            line,
+            r#"{"level":"error","msg":"boom","sql":"SELECT '\"' \n --x"}"#
+        );
+    }
+
+    #[test]
+    fn format_json_event_severity_label_is_carried_verbatim() {
+        // The `level` string maps straight into the `error_severity`
+        // analogue field — assert a couple of the levels used by call
+        // sites land unmodified.
+        for lvl in ["info", "warn", "error"] {
+            let line = format_json_event(lvl, "m", &[]);
+            assert_eq!(line, format!(r#"{{"level":"{lvl}","msg":"m"}}"#));
+        }
+    }
 }
