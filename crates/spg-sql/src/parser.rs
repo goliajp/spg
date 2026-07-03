@@ -12821,6 +12821,68 @@ impl Parser {
             });
             return Ok(maybe_not(combined, negated_in));
         }
+        // SQL-standard `(S1, E1) OVERLAPS (S2, E2)` — true when the
+        // two periods share at least one time point. Each pair is
+        // normalised with least/greatest (PG accepts the endpoints
+        // in either order), then lowered to the standard
+        // `start1 < end2 AND start2 < end1` form.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("overlaps")) {
+            if row.len() != 2 {
+                return Err(self.err(alloc::format!(
+                    "OVERLAPS needs (start, end) pairs; left side has {} elements",
+                    row.len()
+                )));
+            }
+            self.advance();
+            if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("row"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                self.advance();
+            }
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected '(' after OVERLAPS, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let r0 = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::Comma) {
+                return Err(self.err(alloc::format!(
+                    "OVERLAPS needs (start, end) on the right, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let r1 = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after OVERLAPS pair, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let pair_fn = |name: &str, a: &Expr, b: &Expr| Expr::FunctionCall {
+                name: String::from(name),
+                args: alloc::vec![a.clone(), b.clone()],
+            };
+            let lt = |lhs: Expr, rhs: Expr| Expr::Binary {
+                lhs: Box::new(lhs),
+                op: BinOp::Lt,
+                rhs: Box::new(rhs),
+            };
+            return Ok(Expr::Binary {
+                lhs: Box::new(lt(
+                    pair_fn("least", &row[0], &row[1]),
+                    pair_fn("greatest", &r0, &r1),
+                )),
+                op: BinOp::And,
+                rhs: Box::new(lt(
+                    pair_fn("least", &r0, &r1),
+                    pair_fn("greatest", &row[0], &row[1]),
+                )),
+            });
+        }
         let op = match self.peek() {
             Token::Eq => BinOp::Eq,
             Token::NotEq => BinOp::NotEq,
@@ -14075,7 +14137,8 @@ impl Parser {
                         | Token::GtEq
                         | Token::In
                 ) || (matches!(self.peek(), Token::Not)
-                    && matches!(self.tokens.get(self.pos + 1), Some(Token::In)));
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::In)))
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("overlaps"));
                 if comparison_follows && !row_items.is_empty() {
                     return self.parse_row_comparison_tail(row_items);
                 }

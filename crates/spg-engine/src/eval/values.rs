@@ -36,10 +36,42 @@ pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value) -> core::cmp::Ordering
     if let (Some(av), Some(bv)) = (a_f, b_f) {
         return av.partial_cmp(&bv).unwrap_or(Ordering::Equal);
     }
-    // Text/Text.
+    // Text/Text and the remaining ordered types. The fallthrough
+    // used to swallow dates/timestamps/intervals as Equal, making
+    // greatest()/least() silently keep the first argument.
     match (a, b) {
         (Value::Text(av), Value::Text(bv)) => av.cmp(bv),
         (Value::Bytes(av), Value::Bytes(bv)) => av.cmp(bv),
+        (Value::Date(av), Value::Date(bv)) => av.cmp(bv),
+        (Value::Timestamp(av), Value::Timestamp(bv)) => av.cmp(bv),
+        // Date vs timestamp: lift the date to midnight micros.
+        (Value::Date(av), Value::Timestamp(bv)) => {
+            (i64::from(*av).saturating_mul(86_400_000_000)).cmp(bv)
+        }
+        (Value::Timestamp(av), Value::Date(bv)) => {
+            av.cmp(&i64::from(*bv).saturating_mul(86_400_000_000))
+        }
+        (Value::Time(av), Value::Time(bv)) => av.cmp(bv),
+        (Value::Bool(av), Value::Bool(bv)) => av.cmp(bv),
+        // Intervals order by their justified total microseconds
+        // (months at 30 days, PG's comparison convention).
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) => {
+            let total = |m: i32, d: i32, u: i64| -> i128 {
+                i128::from(m) * 30 * 86_400_000_000 + i128::from(d) * 86_400_000_000 + i128::from(u)
+            };
+            total(*am, *ad, *au).cmp(&total(*bm, *bd, *bu))
+        }
         _ => Ordering::Equal,
     }
 }
