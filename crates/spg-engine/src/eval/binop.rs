@@ -190,7 +190,12 @@ pub(super) fn apply_binary(
     }
     // NUMERIC arithmetic and comparisons run in fixed-point; promote
     // integers to a common NUMERIC scale and stay in i128 throughout.
-    if matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }) {
+    // A NUMERIC paired with an INTERVAL is interval scaling, not
+    // numeric math — let the calendar path below take it.
+    if (matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }))
+        && !matches!(l, Value::Interval { .. })
+        && !matches!(r, Value::Interval { .. })
+    {
         return apply_binary_numeric(op, l, r);
     }
     // Date / Timestamp arithmetic. PG semantics:

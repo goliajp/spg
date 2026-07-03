@@ -296,6 +296,10 @@ struct Parser {
     /// predicates in. parse_bare_select save/restores around its
     /// FROM+WHERE so nested selects only drain their own.
     pending_sample_preds: Vec<Expr>,
+    /// POSITION(sub IN str) — while parsing the needle, the IN
+    /// keyword is the argument separator, not a membership test.
+    /// The postfix loop leaves IN unconsumed when this is set.
+    suppress_in_tail: bool,
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
@@ -329,6 +333,7 @@ impl Parser {
             pos: 0,
             nest_depth: 0,
             pending_sample_preds: Vec::new(),
+            suppress_in_tail: false,
         }
     }
 
@@ -12523,6 +12528,11 @@ impl Parser {
                 continue;
             }
             if matches!(self.peek(), Token::In) {
+                if self.suppress_in_tail && !negated {
+                    // POSITION(sub IN str) — IN belongs to the
+                    // enclosing function syntax; stop here.
+                    return Ok(expr);
+                }
                 expr = self.parse_in_tail(expr, negated)?;
                 continue;
             }
@@ -14003,6 +14013,89 @@ impl Parser {
                     self.advance();
                 }
             }
+            // SQL-standard `POSITION(sub IN str)` — lowers onto
+            // strpos(str, sub). IN is the argument separator here,
+            // so the needle parses with the IN-tail suppressed.
+            if first.eq_ignore_ascii_case("position") && !matches!(self.peek(), Token::RParen) {
+                let saved = self.suppress_in_tail;
+                self.suppress_in_tail = true;
+                let needle = self.parse_expr(0);
+                self.suppress_in_tail = saved;
+                let needle = needle?;
+                if matches!(self.peek(), Token::In) {
+                    self.advance();
+                    let haystack = self.parse_expr(0)?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' to close POSITION, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    return Ok(Expr::FunctionCall {
+                        name: String::from("strpos"),
+                        args: alloc::vec![haystack, needle],
+                    });
+                }
+                // position(sub, str) comma form (incl. bytea) —
+                // hand the parsed first arg to the generic list.
+                args.push(needle);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                }
+            }
+            // SQL-standard `TRIM([BOTH|LEADING|TRAILING] [chars]
+            // FROM str)` — lowers onto btrim / ltrim / rtrim. The
+            // plain comma forms TRIM(str) / TRIM(str, chars) keep
+            // riding the generic argument list below.
+            if first.eq_ignore_ascii_case("trim") {
+                let mode = match self.peek() {
+                    Token::Ident(k) if k.eq_ignore_ascii_case("both") => {
+                        self.advance();
+                        Some("btrim")
+                    }
+                    Token::Ident(k) if k.eq_ignore_ascii_case("leading") => {
+                        self.advance();
+                        Some("ltrim")
+                    }
+                    Token::Ident(k) if k.eq_ignore_ascii_case("trailing") => {
+                        self.advance();
+                        Some("rtrim")
+                    }
+                    _ => None,
+                };
+                if mode.is_some() || matches!(self.peek(), Token::From) {
+                    // TRIM([mode] FROM str) — no strip-chars.
+                    let chars = if matches!(self.peek(), Token::From) {
+                        None
+                    } else {
+                        Some(self.parse_expr(0)?)
+                    };
+                    if !matches!(self.peek(), Token::From) {
+                        return Err(self.err(format!(
+                            "expected FROM in TRIM([BOTH|LEADING|TRAILING] [chars] FROM str), got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let target = self.parse_expr(0)?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' to close TRIM, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut trim_args = alloc::vec![target];
+                    if let Some(c) = chars {
+                        trim_args.push(c);
+                    }
+                    return Ok(Expr::FunctionCall {
+                        name: String::from(mode.unwrap_or("btrim")),
+                        args: trim_args,
+                    });
+                }
+            }
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     args.push(self.parse_expr(0)?);
@@ -14055,6 +14148,28 @@ impl Parser {
                         return Ok(Expr::FunctionCall {
                             name: first.to_ascii_lowercase(),
                             args,
+                        });
+                    }
+                    // `TRIM(chars FROM str)` — the keyword-less
+                    // spelling lands here after the chars parse
+                    // (the keyword forms return earlier).
+                    if first.eq_ignore_ascii_case("trim")
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::From)
+                    {
+                        self.advance();
+                        let target = self.parse_expr(0)?;
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close TRIM(chars FROM str), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let chars = args.pop().expect("one arg");
+                        return Ok(Expr::FunctionCall {
+                            name: String::from("btrim"),
+                            args: alloc::vec![target, chars],
                         });
                     }
                     // v7.24 (round-16 A) — aggregate-internal
