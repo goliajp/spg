@@ -812,9 +812,64 @@ pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     let Some(pat) = pat else {
         return Ok(Value::Null);
     };
-    let node = re_compile(&pat)?;
+    // Optional flags — 'i' folds every literal / class to match
+    // either case (used by the `~*` / `!~*` operators).
+    let case_insensitive = match args.get(2) {
+        Some(v) => match text_arg(v)? {
+            Some(flags) => flags.contains('i'),
+            None => return Ok(Value::Null),
+        },
+        None => false,
+    };
+    let mut node = re_compile(&pat)?;
+    if case_insensitive {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     Ok(Value::Bool(re_find(&node, &chars, 0).is_some()))
+}
+
+/// Rewrite a compiled regex so every ASCII-letter literal and class
+/// member matches either case — the engine has no case-insensitive
+/// match flag, so we fold at the tree level for `~*` / `!~*`.
+fn fold_case(node: &mut ReNode) {
+    match node {
+        ReNode::Literal(c) if c.is_ascii_alphabetic() => {
+            *node = ReNode::Class {
+                members: alloc::vec![
+                    ClassMember::Single(c.to_ascii_lowercase()),
+                    ClassMember::Single(c.to_ascii_uppercase()),
+                ],
+                negated: false,
+            };
+        }
+        ReNode::Class { members, .. } => {
+            let mut extra: Vec<ClassMember> = Vec::new();
+            for m in members.iter() {
+                match m {
+                    ClassMember::Single(c) if c.is_ascii_alphabetic() => {
+                        extra.push(ClassMember::Single(c.to_ascii_lowercase()));
+                        extra.push(ClassMember::Single(c.to_ascii_uppercase()));
+                    }
+                    ClassMember::Range(a, b)
+                        if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() =>
+                    {
+                        extra.push(ClassMember::Range(a.to_ascii_lowercase(), b.to_ascii_lowercase()));
+                        extra.push(ClassMember::Range(a.to_ascii_uppercase(), b.to_ascii_uppercase()));
+                    }
+                    _ => {}
+                }
+            }
+            members.extend(extra);
+        }
+        ReNode::Quant { inner, .. } => fold_case(inner),
+        ReNode::Concat(items) | ReNode::Alt(items) => {
+            for it in items.iter_mut() {
+                fold_case(it);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// v7.37.17 (17.6 siblings) — PG 15+ `regexp_count(source, pattern)`

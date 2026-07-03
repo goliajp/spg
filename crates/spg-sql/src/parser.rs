@@ -11789,6 +11789,101 @@ impl Parser {
         Some((i + 2, op_tok))
     }
 
+    /// PG operator symbols that lower onto function calls in
+    /// binary position: `~` / `~*` / `!~` / `!~*` (regex match
+    /// family → regexp_like, comparison rung), `^@` (starts_with,
+    /// comparison rung), `^` (power, tighter than `*`), `#`
+    /// (integer XOR via `(a|b) - (a&b)` — the AND bits are a
+    /// subset of the OR bits so the subtraction never borrows).
+    fn try_symbol_operator(
+        &mut self,
+        lhs: &Expr,
+        min_prec: u8,
+    ) -> Result<Option<Expr>, ParseError> {
+        enum Sym {
+            Regex { ci: bool, negated: bool },
+            StartsWith,
+            Power,
+            Xor,
+        }
+        let (sym, prec): (Sym, u8) = match self.peek() {
+            Token::Tilde => (
+                Sym::Regex {
+                    ci: false,
+                    negated: false,
+                },
+                4,
+            ),
+            Token::TildeStar => (
+                Sym::Regex {
+                    ci: true,
+                    negated: false,
+                },
+                4,
+            ),
+            Token::NotTilde => (
+                Sym::Regex {
+                    ci: false,
+                    negated: true,
+                },
+                4,
+            ),
+            Token::NotTildeStar => (
+                Sym::Regex {
+                    ci: true,
+                    negated: true,
+                },
+                4,
+            ),
+            Token::CaretAt => (Sym::StartsWith, 4),
+            Token::Caret => (Sym::Power, 8),
+            Token::Hash => (Sym::Xor, 6),
+            _ => return Ok(None),
+        };
+        if prec < min_prec {
+            return Ok(None);
+        }
+        self.advance();
+        let rhs = self.parse_expr(prec + 1)?;
+        let out = match sym {
+            Sym::Regex { ci, negated } => {
+                let mut args = alloc::vec![lhs.clone(), rhs];
+                if ci {
+                    args.push(Expr::Literal(Literal::String(String::from("i"))));
+                }
+                maybe_not(
+                    Expr::FunctionCall {
+                        name: String::from("regexp_like"),
+                        args,
+                    },
+                    negated,
+                )
+            }
+            Sym::StartsWith => Expr::FunctionCall {
+                name: String::from("starts_with"),
+                args: alloc::vec![lhs.clone(), rhs],
+            },
+            Sym::Power => Expr::FunctionCall {
+                name: String::from("power"),
+                args: alloc::vec![lhs.clone(), rhs],
+            },
+            Sym::Xor => Expr::Binary {
+                lhs: Box::new(Expr::Binary {
+                    lhs: Box::new(lhs.clone()),
+                    op: BinOp::BitOr,
+                    rhs: Box::new(rhs.clone()),
+                }),
+                op: BinOp::Sub,
+                rhs: Box::new(Expr::Binary {
+                    lhs: Box::new(lhs.clone()),
+                    op: BinOp::BitAnd,
+                    rhs: Box::new(rhs),
+                }),
+            },
+        };
+        Ok(Some(out))
+    }
+
     fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
         let mut chain_len = 0usize;
@@ -11800,7 +11895,19 @@ impl Parser {
                 Some((_, tok)) => binop_from(tok),
                 None => binop_from(self.peek()),
             };
-            let Some((op, prec)) = dispatch else { break };
+            let Some((op, prec)) = dispatch else {
+                if let Some(e) = self.try_symbol_operator(&lhs, min_prec)? {
+                    lhs = e;
+                    chain_len += 1;
+                    if chain_len > MAX_BINARY_CHAIN {
+                        return Err(self.err(alloc::format!(
+                            "more than {MAX_BINARY_CHAIN} chained binary operators"
+                        )));
+                    }
+                    continue;
+                }
+                break;
+            };
             if prec < min_prec {
                 break;
             }

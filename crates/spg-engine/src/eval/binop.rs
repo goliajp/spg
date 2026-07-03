@@ -255,6 +255,26 @@ pub(super) fn apply_binary(
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // Integer operands claim << / >> as bit shifts before the
+        // inet containment interpretation (PG int4/int8 shift ops).
+        BinOp::InetContainedBy | BinOp::InetContains
+            if int_operand(&l).is_some() && int_operand(&r).is_some() =>
+        {
+            let a = int_operand(&l).expect("guard checked");
+            let n = int_operand(&r).expect("guard checked");
+            let shifted = if matches!(op, BinOp::InetContainedBy) {
+                // PG masks the shift count to the operand width.
+                a.wrapping_shl((n & 63) as u32)
+            } else {
+                a.wrapping_shr((n & 63) as u32)
+            };
+            if matches!(l, Value::BigInt(_)) {
+                Ok(Value::BigInt(shifted))
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(Value::Int(shifted as i32))
+            }
+        }
         // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
         BinOp::InetContainedBy
         | BinOp::InetContainedByEq
@@ -1004,6 +1024,18 @@ fn bitop(
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!("cannot apply {op_name} to {a:?} and {b:?}"),
         }),
+    }
+}
+
+/// The i64 value of an integer-family operand (SmallInt/Int/BigInt),
+/// or `None` for anything else — used to claim bit-shift ops for
+/// integers before the inet interpretation.
+fn int_operand(v: &Value<'_>) -> Option<i64> {
+    match v {
+        Value::SmallInt(n) => Some(i64::from(*n)),
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::BigInt(n) => Some(*n),
+        _ => None,
     }
 }
 
