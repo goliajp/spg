@@ -543,6 +543,22 @@ impl Parser {
                 self.parse_select_tail_into(&mut head)?;
                 Ok(Statement::Select(head))
             }
+            // SQL-standard `TABLE name` shorthand for
+            // `SELECT * FROM name` — pg_dump never emits it, but
+            // psql users and PG docs use it constantly. Set-op
+            // chains and the ORDER BY/LIMIT tail compose like any
+            // SELECT head.
+            Token::Table
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_))
+                ) =>
+            {
+                let mut head = self.parse_table_shorthand()?;
+                self.parse_setop_chain_into(&mut head)?;
+                self.parse_select_tail_into(&mut head)?;
+                Ok(Statement::Select(head))
+            }
             // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. The
             // body is a dollar-quoted plpgsql block (lexer already
             // collapsed `$$…$$` into a single Token::String).
@@ -6704,6 +6720,16 @@ impl Parser {
             self.advance();
             return Ok(head);
         }
+        // `TABLE name` shorthand as a query block — valid anywhere
+        // a SELECT head is (set-op peers included).
+        if matches!(self.peek(), Token::Table)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+        {
+            return self.parse_table_shorthand();
+        }
         if !matches!(self.peek(), Token::Select) {
             return Err(self.err(format!(
                 "expected SELECT to start a query block, got {:?}",
@@ -10796,6 +10822,44 @@ impl Parser {
         }
     }
 
+    /// SQL-standard `TABLE name` shorthand — builds the equivalent
+    /// `SELECT * FROM name` head. Callers own set-op chain / tail
+    /// composition.
+    fn parse_table_shorthand(&mut self) -> Result<SelectStatement, ParseError> {
+        debug_assert!(matches!(self.peek(), Token::Table));
+        self.advance(); // TABLE
+        let tname = self.expect_ident_like()?;
+        Ok(SelectStatement {
+            ctes: Vec::new(),
+            distinct: false,
+            distinct_on: Vec::new(),
+            items: alloc::vec![SelectItem::Wildcard],
+            from: Some(FromClause {
+                primary: TableRef {
+                    name: tname,
+                    alias: None,
+                    as_of_segment: None,
+                    unnest_expr: None,
+                    unnest_column_aliases: Vec::new(),
+                    with_ordinality: false,
+                    generate_series_args: None,
+                    lateral_subquery: None,
+                    jsonb_each_text_arg: None,
+                },
+                joins: Vec::new(),
+            }),
+            where_: None,
+            group_by: None,
+            group_by_all: false,
+            having: None,
+            unions: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_with_ties: false,
+        })
+    }
+
     /// Absorb `WITH ORDINALITY` after an SRF call in FROM position.
     /// Returns true when the clause was present. `WITH` alone (a
     /// CTE can never start here) is not enough — the ORDINALITY
@@ -11660,6 +11724,32 @@ impl Parser {
                     target: Box::new(expr),
                     index: Box::new(index),
                 };
+                continue;
+            }
+            // `expr COLLATE "name"` — SPG's single text ordering IS
+            // byte order, i.e. the C collation. The byte-order
+            // spellings absorb as no-ops; a locale collation would
+            // silently sort differently from PG, so it errors
+            // honestly instead.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
+                self.advance();
+                let cname = match self.advance() {
+                    Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected collation name after COLLATE, got {other:?}"
+                        )));
+                    }
+                };
+                let lc = cname.to_ascii_lowercase();
+                if !matches!(lc.as_str(), "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8")
+                {
+                    return Err(self.err(alloc::format!(
+                        "COLLATE {cname:?}: SPG orders text by bytes (the C \
+                         collation); locale collations are not supported yet — \
+                         use COLLATE \"C\" or drop the clause"
+                    )));
+                }
                 continue;
             }
             return Ok(expr);
