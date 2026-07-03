@@ -27,6 +27,7 @@ mod e2e_brin;
 mod e2e_bytea;
 mod e2e_bytea_ops;
 mod e2e_cast_targets;
+mod e2e_cast_targets_batch2;
 mod e2e_ceil;
 mod e2e_cold_rows_per_table;
 mod e2e_collate;

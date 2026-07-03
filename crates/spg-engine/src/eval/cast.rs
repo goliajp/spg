@@ -182,6 +182,19 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     detail: alloc::format!("unsupported cast target `::{name}`"),
                 }
             })?;
+            // PG semantics: an EXPLICIT varchar(n) / char(n) cast
+            // truncates to n characters — only column assignment
+            // errors on overflow. Truncate up front so the coerce
+            // path's length contract never fires here.
+            let v = match (&dt, v) {
+                (
+                    spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n),
+                    Value::Text(s),
+                ) if *n > 0 && s.chars().count() > *n as usize => {
+                    Value::text(s.chars().take(*n as usize).collect::<alloc::string::String>())
+                }
+                (_, v) => v,
+            };
             crate::conversions::coerce_value(v, dt, &name, 0).map_err(|e| EvalError::TypeMismatch {
                 detail: alloc::format!("{e}"),
             })
