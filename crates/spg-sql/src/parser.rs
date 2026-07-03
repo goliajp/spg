@@ -819,6 +819,60 @@ impl Parser {
             }
             Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(false),
+            // `COPY table [(cols)] TO STDOUT` — the export half of
+            // pg_dump's COPY pair (the FROM stdin half rides the
+            // embed import path). Options need a format design and
+            // error honestly.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("copy")
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(_) | Token::QuotedIdent(_))
+                    ) =>
+            {
+                self.advance(); // COPY
+                let table = self.expect_ident_like()?;
+                let columns = if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let mut cols = alloc::vec![self.expect_ident_like()?];
+                    while matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        cols.push(self.expect_ident_like()?);
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after COPY column list, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    Some(cols)
+                } else {
+                    None
+                };
+                if !matches!(self.peek(), Token::To) {
+                    return Err(self.err(format!(
+                        "COPY: only TO STDOUT is supported here (FROM stdin \
+                         rides the import path); got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("stdout")) {
+                    return Err(self.err(format!(
+                        "COPY TO supports STDOUT only (no file endpoints), got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Eof | Token::Semicolon) {
+                    return Err(self.err(format!(
+                        "COPY TO STDOUT options are not supported yet, got {:?}",
+                        self.peek()
+                    )));
+                }
+                Ok(Statement::CopyTo { table, columns })
+            }
             // MySQL `REPLACE INTO t …` — delete-then-insert upsert.
             // Shares the INSERT body; the replace flag lowers it
             // onto ON CONFLICT DO UPDATE with an empty assignment

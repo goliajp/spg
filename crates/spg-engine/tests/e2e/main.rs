@@ -78,6 +78,7 @@ mod e2e_load_call_pg_dump_compat;
 mod e2e_pg_catalog_probe_funcs;
 mod e2e_quote_and_meta_funcs;
 mod e2e_clock_family;
+mod e2e_copy_to_stdout;
 mod e2e_pg_sleep_and_wal_probes;
 mod e2e_pg_settings_widened;
 mod e2e_bit_length;

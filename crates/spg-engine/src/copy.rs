@@ -288,3 +288,35 @@ mod tests {
         );
     }
 }
+
+/// Encode one row's selected cells as a COPY text-format line —
+/// the inverse of [`decode_copy_text_row`]: tab-separated, `\N`
+/// for NULL, C-style backslash escapes for the control characters
+/// the decoder understands.
+#[must_use]
+pub fn encode_copy_text_cells(cells: &[Option<String>]) -> String {
+    let mut out = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push('\t');
+        }
+        match cell {
+            None => out.push_str("\\N"),
+            Some(s) => {
+                for c in s.chars() {
+                    match c {
+                        '\\' => out.push_str("\\\\"),
+                        '\t' => out.push_str("\\t"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\u{08}' => out.push_str("\\b"),
+                        '\u{0c}' => out.push_str("\\f"),
+                        '\u{0b}' => out.push_str("\\v"),
+                        other => out.push(other),
+                    }
+                }
+            }
+        }
+    }
+    out
+}
