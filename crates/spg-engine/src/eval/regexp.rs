@@ -103,6 +103,29 @@ const REPEAT_MAX: u32 = 0x0000_FFFF; // 65535
 /// tokens, not hundreds).
 const MATCH_DEPTH_LIMIT: u32 = 500;
 
+/// Maximum total number of backtracking steps (matcher entries) the
+/// engine will spend on a single `re_find` invocation before it aborts
+/// with a clean "too complex" error.
+///
+/// v7.37.16 Epic Rx P0 — this is the TIME bound, independent of and
+/// complementary to `MATCH_DEPTH_LIMIT` (the STACK bound). Catastrophic
+/// backtracking (`(a+)+$`, `(a|aa)*b`, …) recurses only shallowly but
+/// explores exponentially many paths, so a depth cap alone leaves the
+/// matcher able to burn CPU without limit. A single monotonic counter,
+/// incremented once per `re_match_at`/`re_match_seq` entry and shared
+/// across ALL backtracking branches and ALL start positions of one
+/// find, caps the total work so a runaway pattern fails fast instead of
+/// hanging the connection thread.
+///
+/// Chosen generously: 10 million steps is orders of magnitude above any
+/// legitimate pattern×input (a linear, non-pathological match spends
+/// roughly O(pattern × input) entries — thousands, not millions, even
+/// for large inputs), yet a modern core executes it in well under a
+/// second, so an exponential backtracker aborts near-instantly. The
+/// `redos_catastrophic_backtracking_returns_err_fast` test proves a
+/// classic ReDoS pattern trips this bound quickly rather than hanging.
+const MATCH_STEP_LIMIT: u64 = 10_000_000;
+
 #[derive(Debug, Clone)]
 enum ReNode {
     /// Single literal byte. ASCII fast-path; non-ASCII falls through
@@ -456,10 +479,21 @@ fn re_match_at(
     s: &[char],
     pos: usize,
     depth: u32,
+    steps: &mut u64,
 ) -> Result<Option<usize>, EvalError> {
     // v7.37.16 Epic Rx P0 — abort before the recursive descent can
     // overflow the Rust call stack on an adversarial pattern.
     if depth > MATCH_DEPTH_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    // v7.37.16 Epic Rx P0 — total-work (time) bound: this counter is
+    // monotonic across every backtracking branch and start position, so
+    // a catastrophic backtracker (shallow depth, exponential paths)
+    // fails fast instead of hanging.
+    *steps += 1;
+    if *steps > MATCH_STEP_LIMIT {
         return Err(EvalError::TypeMismatch {
             detail: "invalid regular expression: regular expression is too complex".into(),
         });
@@ -489,10 +523,10 @@ fn re_match_at(
         // backtracking sequence matcher so quantifiers can shrink
         // when the tail fails ('bar.*que' now matches 'barbeque';
         // the old v7.17 stop-gap was greedy-without-backtracking).
-        ReNode::Concat(items) => re_match_seq(items, s, pos, d),
+        ReNode::Concat(items) => re_match_seq(items, s, pos, d, steps),
         ReNode::Alt(branches) => {
             for b in branches {
-                if let Some(p) = re_match_at(b, s, pos, d)? {
+                if let Some(p) = re_match_at(b, s, pos, d, steps)? {
                     return Ok(Some(p));
                 }
             }
@@ -510,7 +544,7 @@ fn re_match_at(
                         break;
                     }
                 }
-                match re_match_at(inner, s, p, d)? {
+                match re_match_at(inner, s, p, d, steps)? {
                     Some(np) if np > p => {
                         p = np;
                         count += 1;
@@ -535,9 +569,17 @@ fn re_match_seq(
     s: &[char],
     pos: usize,
     depth: u32,
+    steps: &mut u64,
 ) -> Result<Option<usize>, EvalError> {
     // v7.37.16 Epic Rx P0 — same stack-overflow guard as re_match_at.
     if depth > MATCH_DEPTH_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    // v7.37.16 Epic Rx P0 — total-work (time) bound; see re_match_at.
+    *steps += 1;
+    if *steps > MATCH_STEP_LIMIT {
         return Err(EvalError::TypeMismatch {
             detail: "invalid regular expression: regular expression is too complex".into(),
         });
@@ -559,7 +601,7 @@ fn re_match_seq(
                         break;
                     }
                 }
-                match re_match_at(inner, s, p, d)? {
+                match re_match_at(inner, s, p, d, steps)? {
                     Some(np) if np > p => {
                         p = np;
                         count += 1;
@@ -572,7 +614,7 @@ fn re_match_seq(
                 if reps < *min {
                     break;
                 }
-                if let Some(e) = re_match_seq(rest, s, end, d)? {
+                if let Some(e) = re_match_seq(rest, s, end, d, steps)? {
                     return Ok(Some(e));
                 }
             }
@@ -582,8 +624,8 @@ fn re_match_seq(
             for b in branches {
                 // Each branch may itself contain quantifiers —
                 // match it standalone, then retry the tail.
-                if let Some(p) = re_match_at(b, s, pos, d)? {
-                    if let Some(e) = re_match_seq(rest, s, p, d)? {
+                if let Some(p) = re_match_at(b, s, pos, d, steps)? {
+                    if let Some(e) = re_match_seq(rest, s, p, d, steps)? {
                         return Ok(Some(e));
                     }
                 }
@@ -597,10 +639,10 @@ fn re_match_seq(
                 alloc::vec::Vec::with_capacity(nested.len() + rest.len());
             combined.extend(nested.iter().cloned());
             combined.extend(rest.iter().cloned());
-            re_match_seq(&combined, s, pos, d)
+            re_match_seq(&combined, s, pos, d, steps)
         }
-        other => match re_match_at(other, s, pos, d)? {
-            Some(p) => re_match_seq(rest, s, p, d),
+        other => match re_match_at(other, s, pos, d, steps)? {
+            Some(p) => re_match_seq(rest, s, p, d, steps),
             None => Ok(None),
         },
     }
@@ -609,9 +651,13 @@ fn re_match_seq(
 /// Find the first match of `node` in `s`, starting at or after
 /// `from`. Returns the (start, end) char positions of the match.
 fn re_find(node: &ReNode, s: &[char], from: usize) -> Result<Option<(usize, usize)>, EvalError> {
+    // v7.37.16 Epic Rx P0 — one monotonic step budget shared across
+    // every start position of this find, so total backtracking WORK
+    // (time), not just recursion depth, is bounded.
+    let mut steps: u64 = 0;
     let mut start = from;
     loop {
-        if let Some(end) = re_match_at(node, s, start, 0)? {
+        if let Some(end) = re_match_at(node, s, start, 0, &mut steps)? {
             return Ok(Some((start, end)));
         }
         if start >= s.len() {
@@ -1122,6 +1168,10 @@ mod redos_tests {
         core::iter::repeat(c).take(n).collect()
     }
 
+    fn repeat_char_str(s: &str, n: usize) -> String {
+        core::iter::repeat(s).take(n).collect()
+    }
+
     // (a) A deeply-nested pattern hits the parser recursion cap and
     // returns a clean Err instead of overflowing the parser stack.
     #[test]
@@ -1200,5 +1250,65 @@ mod redos_tests {
     fn redos_moderate_nesting_ok() {
         let pat = alloc::format!("{}a{}", repeat_char('(', 50), repeat_char(')', 50));
         assert!(super::re_compile(&pat).is_ok());
+    }
+
+    // (a — TIME bound) A catastrophic-backtracking pattern on a long
+    // non-matching input recurses only shallowly (so the depth cap never
+    // fires) but explores super-linearly many paths. The total-step
+    // budget must abort it with a clean Err *fast* — if this test ever
+    // hangs, the step counter is not wired into the hot backtracking
+    // loop.
+    //
+    // NB: this matcher matches a *standalone* quantifier greedily without
+    // backtracking, so the textbook nested-quantifier bomb `(a+)+$` is
+    // already defused (the inner `a+` grabs the whole run at once). The
+    // residual hazard is *sequential* quantifiers: `a*a*…a*b` on an all-
+    // `a` string with no `b` forces the seq matcher to enumerate every
+    // non-decreasing split of the run across the k stars — C(N+k, k)
+    // combinations, ~7.5e10 here — before it can conclude "no match".
+    // That is unbounded CPU without a work budget.
+    #[test]
+    fn redos_catastrophic_backtracking_returns_err_fast() {
+        use std::time::Instant;
+        // 10 sequential `a*` then a literal `b`; input is 50 `a`s and no
+        // `b`, so every combination must be tried and all fail.
+        let pat = alloc::format!("{}b", repeat_char_str("a*", 10));
+        let node = super::re_compile(&pat).expect("compiles");
+        let hay = chars(&repeat_char('a', 50));
+        let t0 = Instant::now();
+        let res = super::re_find(&node, &hay, 0);
+        let elapsed = t0.elapsed();
+        assert!(
+            res.is_err(),
+            "catastrophic backtracking must abort with a clean budget error, got {:?}",
+            res
+        );
+        // The budget aborts at MATCH_STEP_LIMIT (10M) steps regardless of
+        // how large the combinatorial space is, so this is well under a
+        // second; a generous ceiling guards against a wiring regression
+        // (an unbounded matcher would run for many minutes / never).
+        assert!(
+            elapsed.as_secs() < 10,
+            "budget-exceeded abort must be fast, took {:?}",
+            elapsed
+        );
+    }
+
+    // (b) A long but non-pathological input matches correctly — a linear
+    // pattern spends only O(input) steps, orders of magnitude under the
+    // step budget, so the budget never trips and results are unchanged.
+    #[test]
+    fn redos_normal_long_input_still_matches() {
+        // `^a+b$` on 10000 'a's + 'b' matches (greedy '+' then one 'b').
+        let node = super::re_compile("^a+b$").expect("compiles");
+        let hay = chars(&alloc::format!("{}b", repeat_char('a', 10_000)));
+        assert_eq!(
+            super::re_find(&node, &hay, 0).unwrap(),
+            Some((0, 10_001)),
+            "a legitimate long match must succeed — budget must not trip"
+        );
+        // Same pattern, no trailing 'b' → clean non-match (not an error).
+        let miss = chars(&repeat_char('a', 10_000));
+        assert_eq!(super::re_find(&node, &miss, 0).unwrap(), None);
     }
 }
