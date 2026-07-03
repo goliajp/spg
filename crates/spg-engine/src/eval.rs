@@ -546,6 +546,60 @@ pub fn eval_expr(
                 }),
             }
         }
+        // Array slice `arr[lo:hi]` — PG 1-based, both ends
+        // inclusive, out-of-range bounds clamp, missing bounds
+        // extend to the array's ends. Result keeps the element
+        // type; an empty window yields an empty array.
+        Expr::ArraySlice { target, lo, hi } => {
+            let target_v = eval_expr(target, row, ctx)?;
+            if matches!(target_v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let bound = |e: Option<&Expr>| -> Result<Option<i64>, EvalError> {
+                match e {
+                    None => Ok(None),
+                    Some(b) => match eval_expr(b, row, ctx)? {
+                        Value::Null => Ok(None),
+                        Value::Int(n) => Ok(Some(i64::from(n))),
+                        Value::BigInt(n) => Ok(Some(n)),
+                        Value::SmallInt(n) => Ok(Some(i64::from(n))),
+                        other => Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "array slice bound must be integer, got {:?}",
+                                other.data_type()
+                            ),
+                        }),
+                    },
+                }
+            };
+            let lo_b = bound(lo.as_deref())?;
+            let hi_b = bound(hi.as_deref())?;
+            fn window(len: usize, lo: Option<i64>, hi: Option<i64>) -> (usize, usize) {
+                let start = lo.map_or(0, |l| (l.max(1) - 1) as usize).min(len);
+                let end = hi.map_or(len, |h| h.max(0) as usize).min(len);
+                (start, end.max(start))
+            }
+            match target_v {
+                Value::TextArray(items) => {
+                    let (s, e) = window(items.len(), lo_b, hi_b);
+                    Ok(Value::TextArray(items[s..e].to_vec()))
+                }
+                Value::IntArray(items) => {
+                    let (s, e) = window(items.len(), lo_b, hi_b);
+                    Ok(Value::IntArray(items[s..e].to_vec()))
+                }
+                Value::BigIntArray(items) => {
+                    let (s, e) = window(items.len(), lo_b, hi_b);
+                    Ok(Value::BigIntArray(items[s..e].to_vec()))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "slice target must be an array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.10.12 — `x op ANY(arr)` / `x op ALL(arr)`. PG
         // 3VL: ANY → true if any element compares-true; NULL if
         // no true but some NULL; false otherwise. ALL: false if

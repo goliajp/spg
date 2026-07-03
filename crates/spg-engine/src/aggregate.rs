@@ -88,6 +88,11 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::ArraySubscript { target, index } => {
             contains_aggregate(target) || contains_aggregate(index)
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            contains_aggregate(target)
+                || lo.as_deref().is_some_and(contains_aggregate)
+                || hi.as_deref().is_some_and(contains_aggregate)
+        }
         Expr::AnyAll { expr, array, .. } => contains_aggregate(expr) || contains_aggregate(array),
         Expr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
@@ -2681,6 +2686,15 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(target, out);
             collect_aggregates(index, out);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            collect_aggregates(target, out);
+            if let Some(l) = lo {
+                collect_aggregates(l, out);
+            }
+            if let Some(h) = hi {
+                collect_aggregates(h, out);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             collect_aggregates(expr, out);
             collect_aggregates(array, out);
@@ -3676,6 +3690,15 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         Expr::ArraySubscript { target, index } => Expr::ArraySubscript {
             target: Box::new(rewrite_expr(target, group_exprs, aggs)),
             index: Box::new(rewrite_expr(index, group_exprs, aggs)),
+        },
+        Expr::ArraySlice { target, lo, hi } => Expr::ArraySlice {
+            target: Box::new(rewrite_expr(target, group_exprs, aggs)),
+            lo: lo
+                .as_ref()
+                .map(|b| Box::new(rewrite_expr(b, group_exprs, aggs))),
+            hi: hi
+                .as_ref()
+                .map(|b| Box::new(rewrite_expr(b, group_exprs, aggs))),
         },
         Expr::AnyAll {
             expr,

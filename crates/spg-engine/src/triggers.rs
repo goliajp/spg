@@ -1241,6 +1241,15 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             substitute_locals(target, locals);
             substitute_locals(index, locals);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            substitute_locals(target, locals);
+            if let Some(l) = lo {
+                substitute_locals(l, locals);
+            }
+            if let Some(h) = hi {
+                substitute_locals(h, locals);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             substitute_locals(expr, locals);
             substitute_locals(array, locals);
@@ -1366,6 +1375,15 @@ fn substitute_new_old(
         Expr::ArraySubscript { target, index } => {
             substitute_new_old(target, new_row, old_row, columns)?;
             substitute_new_old(index, new_row, old_row, columns)?;
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            substitute_new_old(target, new_row, old_row, columns)?;
+            if let Some(l) = lo {
+                substitute_new_old(l, new_row, old_row, columns)?;
+            }
+            if let Some(h) = hi {
+                substitute_new_old(h, new_row, old_row, columns)?;
+            }
         }
         Expr::AnyAll { expr, array, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;

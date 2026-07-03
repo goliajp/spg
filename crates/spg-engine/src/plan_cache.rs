@@ -316,6 +316,15 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             collect_expr(target, out);
             collect_expr(index, out);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            collect_expr(target, out);
+            if let Some(l) = lo {
+                collect_expr(l, out);
+            }
+            if let Some(h) = hi {
+                collect_expr(h, out);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             collect_expr(expr, out);
             collect_expr(array, out);

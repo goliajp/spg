@@ -12003,7 +12003,35 @@ impl Parser {
             // chain: `a[i][j]` parses left-to-right.
             if matches!(self.peek(), Token::LBracket) {
                 self.advance();
-                let index = self.parse_expr(0)?;
+                // `[lo:hi]` / `[:hi]` / `[lo:]` — array slice. A
+                // bare index stays a subscript.
+                let lo = if matches!(self.peek(), Token::Colon) {
+                    None
+                } else {
+                    Some(self.parse_expr(0)?)
+                };
+                if matches!(self.peek(), Token::Colon) {
+                    self.advance();
+                    let hi = if matches!(self.peek(), Token::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr(0)?))
+                    };
+                    if !matches!(self.peek(), Token::RBracket) {
+                        return Err(self.err(alloc::format!(
+                            "expected ']' after array slice, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    expr = Expr::ArraySlice {
+                        target: Box::new(expr),
+                        lo: lo.map(Box::new),
+                        hi,
+                    };
+                    continue;
+                }
+                let index = lo.expect("non-colon branch parsed an index");
                 if !matches!(self.peek(), Token::RBracket) {
                     return Err(self.err(alloc::format!(
                         "expected ']' after array index, got {:?}",

@@ -49,6 +49,11 @@ fn expr_has_window(e: &Expr) -> bool {
         | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(expr_has_window),
         Expr::ArraySubscript { target, index } => expr_has_window(target) || expr_has_window(index),
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_window(target)
+                || lo.as_deref().is_some_and(expr_has_window)
+                || hi.as_deref().is_some_and(expr_has_window)
+        }
         Expr::AnyAll { expr, array, .. } => expr_has_window(expr) || expr_has_window(array),
         Expr::InList { expr, list, .. } => {
             expr_has_window(expr) || list.iter().any(expr_has_window)

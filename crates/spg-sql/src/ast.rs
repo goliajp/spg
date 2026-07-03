@@ -2581,6 +2581,15 @@ pub enum Expr {
         target: Box<Expr>,
         index: Box<Expr>,
     },
+    /// Array slice `arr[lo:hi]` — PG 1-based, both ends
+    /// inclusive; a missing bound extends to that end of the
+    /// array and out-of-range bounds clamp. Returns an array of
+    /// the same element type.
+    ArraySlice {
+        target: Box<Expr>,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+    },
     /// v7.10.12 — `expr op ANY(arr)` and `expr op ALL(arr)`. The
     /// operator is the comparison binary op (Eq / Ne / Lt / …);
     /// the engine desugars: `ANY` returns true if any element
@@ -4938,6 +4947,17 @@ impl fmt::Display for Expr {
                 f.write_str("]")
             }
             Self::ArraySubscript { target, index } => write!(f, "({target}[{index}])"),
+            Self::ArraySlice { target, lo, hi } => {
+                write!(f, "({target}[")?;
+                if let Some(l) = lo {
+                    write!(f, "{l}")?;
+                }
+                write!(f, ":")?;
+                if let Some(h) = hi {
+                    write!(f, "{h}")?;
+                }
+                write!(f, "])")
+            }
             Self::AnyAll {
                 expr,
                 op,

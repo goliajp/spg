@@ -185,6 +185,15 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
             visit_expr_columns_and_subqueries(target, on_col, on_sub);
             visit_expr_columns_and_subqueries(index, on_col, on_sub);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            visit_expr_columns_and_subqueries(target, on_col, on_sub);
+            if let Some(l) = lo {
+                visit_expr_columns_and_subqueries(l, on_col, on_sub);
+            }
+            if let Some(h) = hi {
+                visit_expr_columns_and_subqueries(h, on_col, on_sub);
+            }
+        }
         // v7.37.7 K02 root-cause fix (mailrs cascade 4th recurrence):
         // missing arm caused `Expr::InList` to fall through to the
         // exotic "_" arm which emits a BAIL ColumnName with no
@@ -308,6 +317,11 @@ pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
         }
         Expr::ArraySubscript { target: t, index } => {
             expr_refers_to(t, target) || expr_refers_to(index, target)
+        }
+        Expr::ArraySlice { target: t, lo, hi } => {
+            expr_refers_to(t, target)
+                || lo.as_deref().is_some_and(|l| expr_refers_to(l, target))
+                || hi.as_deref().is_some_and(|h| expr_refers_to(h, target))
         }
         Expr::AnyAll { expr, array, .. } => {
             expr_refers_to(expr, target) || expr_refers_to(array, target)

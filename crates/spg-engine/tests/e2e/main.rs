@@ -505,6 +505,7 @@ mod e2e_window_in_join;
 mod e2e_window_groups_frame;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;
+mod e2e_array_slice;
 mod e2e_at_time_zone;
 mod e2e_named_window;
 mod e2e_orderby_using_operator;
