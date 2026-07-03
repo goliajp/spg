@@ -565,18 +565,41 @@ pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     let day_micros = micros.rem_euclid(86_400_000_000);
     let day_i32 = i32::try_from(days).unwrap_or(i32::MAX);
     let (y, m, _) = civil_from_days(day_i32);
+    const DAY: i64 = 86_400_000_000;
     let truncated = match unit_lc.as_str() {
-        "year" => i64::from(days_from_civil(y, 1, 1)) * 86_400_000_000,
-        "month" => i64::from(days_from_civil(y, m, 1)) * 86_400_000_000,
-        "day" => days * 86_400_000_000,
-        "hour" => days * 86_400_000_000 + (day_micros / 3_600_000_000) * 3_600_000_000,
-        "minute" => days * 86_400_000_000 + (day_micros / 60_000_000) * 60_000_000,
-        "second" => days * 86_400_000_000 + (day_micros / 1_000_000) * 1_000_000,
+        "millennium" => {
+            // Millennia run 2001-3000; truncate to the first year.
+            let my = if y > 0 { (y - 1) / 1000 * 1000 + 1 } else { y / 1000 * 1000 - 999 };
+            i64::from(days_from_civil(my, 1, 1)) * DAY
+        }
+        "century" => {
+            let cy = if y > 0 { (y - 1) / 100 * 100 + 1 } else { y / 100 * 100 - 99 };
+            i64::from(days_from_civil(cy, 1, 1)) * DAY
+        }
+        "decade" => i64::from(days_from_civil(y.div_euclid(10) * 10, 1, 1)) * DAY,
+        "year" => i64::from(days_from_civil(y, 1, 1)) * DAY,
+        "quarter" => {
+            let qm = (m - 1) / 3 * 3 + 1;
+            i64::from(days_from_civil(y, qm, 1)) * DAY
+        }
+        "month" => i64::from(days_from_civil(y, m, 1)) * DAY,
+        // ISO week starts Monday; 1970-01-01 was a Thursday (isodow 4).
+        "week" => {
+            let isodow = (day_i32 + 3).rem_euclid(7); // 0 = Monday
+            i64::from(day_i32 - isodow) * DAY
+        }
+        "day" => days * DAY,
+        "hour" => days * DAY + (day_micros / 3_600_000_000) * 3_600_000_000,
+        "minute" => days * DAY + (day_micros / 60_000_000) * 60_000_000,
+        "second" => days * DAY + (day_micros / 1_000_000) * 1_000_000,
+        "milliseconds" | "millisecond" => days * DAY + (day_micros / 1_000) * 1_000,
+        "microseconds" | "microsecond" => micros,
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "unknown date_trunc unit {other:?}; \
-                     supported: year, month, day, hour, minute, second"
+                    "unknown date_trunc unit {other:?}; supported: millennium, \
+                     century, decade, year, quarter, month, week, day, hour, \
+                     minute, second, milliseconds, microseconds"
                 ),
             });
         }
