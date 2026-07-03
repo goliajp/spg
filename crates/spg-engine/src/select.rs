@@ -2342,7 +2342,11 @@ impl Engine {
         // WHERE and an NSW index on `col` skips the full scan. The
         // walk returns rows already in ascending-distance order, so
         // ORDER BY / LIMIT are honoured implicitly.
-        if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias) {
+        // Phase C.3 step 2c — compute the reader's MVCC snapshot once
+        // and thread it into every index-seek fast path below. No-op
+        // today (every hot header is committed-alive).
+        let seek_snapshot = self.current_snapshot();
+        if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias, &seek_snapshot) {
             // NSW kNN dispatches against the hot-tier vector index only
             // (vector cells aren't promoted to cold segments), so wrap
             // the returned row indices as `Cow::Borrowed` for the
@@ -2394,14 +2398,22 @@ impl Engine {
         let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
             // BTree / col=literal seek first — covers the v7.11.3 multi-
             // column AND case and the leading-column equality lookup.
-            try_index_seek(w, schema_cols, self.active_catalog(), table, alias)
+            try_index_seek(w, schema_cols, self.active_catalog(), table, alias, &seek_snapshot)
                 .or_else(|| {
                     // v7.12.3 — GIN-accelerated `WHERE col @@
                     // tsquery` when the column has a `USING gin`
                     // index. Returns an over-approximate candidate
                     // set; the WHERE re-eval loop below verifies
                     // the full `@@` predicate per row.
-                    try_gin_seek(w, schema_cols, self.active_catalog(), table, alias, &ctx)
+                    try_gin_seek(
+                        w,
+                        schema_cols,
+                        self.active_catalog(),
+                        table,
+                        alias,
+                        &ctx,
+                        &seek_snapshot,
+                    )
                 })
                 .or_else(|| {
                     // v7.15.0 — trigram-GIN-accelerated
@@ -2409,7 +2421,7 @@ impl Engine {
                     // column has a `gin_trgm_ops` GIN index.
                     // Over-approximate candidate set; the WHERE
                     // re-eval verifies the LIKE per row.
-                    try_trgm_seek(w, schema_cols, table, alias)
+                    try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot)
                 })
                 .or_else(|| {
                     // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
@@ -2418,7 +2430,7 @@ impl Engine {
                     // posting-list intersection returns an over-
                     // approximate candidate set; the WHERE re-eval
                     // verifies the full `@>` predicate per row.
-                    try_gin_jsonb_seek(w, schema_cols, table, alias)
+                    try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot)
                 })
         });
 

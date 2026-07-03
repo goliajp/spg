@@ -423,7 +423,16 @@ pub(crate) fn explain_select(
             {
                 let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
                 let cols = &table.schema().columns;
-                if try_index_seek(w, cols, engine.active_catalog(), table, alias).is_some() {
+                if try_index_seek(
+                    w,
+                    cols,
+                    engine.active_catalog(),
+                    table,
+                    alias,
+                    &engine.current_snapshot(),
+                )
+                .is_some()
+                {
                     tag.push_str(" [index seek]");
                 } else {
                     tag.push_str(" [full scan]");
