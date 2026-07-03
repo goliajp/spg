@@ -210,9 +210,19 @@ impl Snapshot {
     ///    this reader's snapshot).
     #[must_use]
     pub fn visible(&self, h: &RowHeader) -> bool {
-        // Step 1: see your own writes.
-        if self.tx_id != 0 && h.xmin == self.tx_id {
-            return h.xmax == XMAX_ALIVE || h.xmax == self.tx_id;
+        // Step 1: your own writes. A row THIS transaction deleted is
+        // invisible to it (whatever inserted it) — PG's "you don't see
+        // what you deleted"; a row this transaction inserted and has
+        // not deleted is visible. (If `xmin == tx_id` and it isn't the
+        // deleter, `xmax` can only be ALIVE — no other transaction can
+        // delete a row this uncommitted tx inserted.)
+        if self.tx_id != 0 {
+            if h.xmax == self.tx_id {
+                return false;
+            }
+            if h.xmin == self.tx_id {
+                return true;
+            }
         }
         // Step 2: future.
         if h.xmin > self.version {
@@ -257,9 +267,16 @@ impl Snapshot {
         h: &RowHeader,
         xact: &O,
     ) -> bool {
-        // Step 1: see your own writes.
-        if self.tx_id != 0 && h.xmin == self.tx_id {
-            return h.xmax == XMAX_ALIVE || h.xmax == self.tx_id;
+        // Step 1: your own writes (see `visible` for the rationale). A
+        // row this tx deleted is invisible; a row it inserted and has
+        // not deleted is visible.
+        if self.tx_id != 0 {
+            if h.xmax == self.tx_id {
+                return false;
+            }
+            if h.xmin == self.tx_id {
+                return true;
+            }
         }
         // Frozen fast path: frozen + alive is visible to everyone and
         // never consults the oracle (a frozen xmin is committed-and-old
@@ -359,16 +376,26 @@ mod tests {
     }
 
     #[test]
-    fn reader_sees_its_own_writes() {
+    fn reader_sees_its_own_insert_but_not_its_own_delete() {
         let s = Snapshot::new(100, ips(&[]), 100, 42);
-        let own_write = RowHeader::alive(42);
-        assert!(s.visible(&own_write));
-        let own_delete = RowHeader {
+        // A row I inserted and have not deleted: visible.
+        let own_insert = RowHeader::alive(42);
+        assert!(s.visible(&own_insert));
+        // A row I inserted AND deleted (BEGIN; INSERT; DELETE; SELECT):
+        // invisible — you don't see what you deleted (PG semantics).
+        let own_insert_then_delete = RowHeader {
             xmin: 42,
             xmax: 42,
             flags: 0,
         };
-        assert!(s.visible(&own_delete));
+        assert!(!s.visible(&own_insert_then_delete));
+        // A committed row I deleted (xmin other, xmax me): invisible.
+        let other_insert_i_deleted = RowHeader {
+            xmin: 7,
+            xmax: 42,
+            flags: 0,
+        };
+        assert!(!s.visible(&other_insert_i_deleted));
     }
 
     #[test]
