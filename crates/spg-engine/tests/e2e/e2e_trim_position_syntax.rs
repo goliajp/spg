@@ -64,13 +64,15 @@ fn numeric_operand_interval_scaling() {
         } => (months, days, micros),
         other => panic!("expected Interval, got {other:?}"),
     };
+    // 1.5::numeric is 1.5 (unconstrained numeric keeps its scale),
+    // so 2 hours * 1.5 = 3 hours.
     assert_eq!(
         iv(one(&mut e, "SELECT INTERVAL '2 hours' * 1.5::numeric")),
-        (0, 0, 4 * 3_600_000_000)
+        (0, 0, 3 * 3_600_000_000)
     );
     assert_eq!(
         iv(one(&mut e, "SELECT 1.5::numeric * INTERVAL '2 hours'")),
-        (0, 0, 4 * 3_600_000_000)
+        (0, 0, 3 * 3_600_000_000)
     );
     assert_eq!(
         iv(one(&mut e, "SELECT INTERVAL '1 hour' / 2.0::numeric")),

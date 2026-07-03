@@ -1990,7 +1990,25 @@ pub(crate) fn coerce_value(
             col_name,
         )?),
         (Value::Float(x), DataType::Numeric { precision, scale }) => {
-            Some(numeric_from_float(x, precision, scale, col_name)?)
+            // Unconstrained `numeric` (precision 0 is the sentinel —
+            // numeric(0,0) is invalid in PG) keeps the value's
+            // natural scale instead of truncating to 0 decimals.
+            // Route the float through its shortest round-trip decimal
+            // text so `3.14::numeric` stays 3.14, not 3.
+            if precision == 0 && scale == 0 && x.is_finite() {
+                if let Some((mantissa, src_scale)) =
+                    parse_numeric_text(&alloc::format!("{x}"))
+                {
+                    Some(Value::Numeric {
+                        scaled: mantissa,
+                        scale: src_scale,
+                    })
+                } else {
+                    Some(numeric_from_float(x, precision, scale, col_name)?)
+                }
+            } else {
+                Some(numeric_from_float(x, precision, scale, col_name)?)
+            }
         }
         // v7.17.0 Phase 3.P0-67 — Text → NUMERIC. Parse a
         // canonical decimal text (`"-1234.56"` / `"42"` /
@@ -2008,9 +2026,17 @@ pub(crate) fn coerce_value(
                     detail: alloc::format!("cannot parse {s:?} as NUMERIC for column `{col_name}`"),
                 }));
             };
-            Some(numeric_rescale(
-                mantissa, src_scale, precision, scale, col_name,
-            )?)
+            // Unconstrained `numeric` keeps the parsed scale as-is.
+            if precision == 0 && scale == 0 {
+                Some(Value::Numeric {
+                    scaled: mantissa,
+                    scale: src_scale,
+                })
+            } else {
+                Some(numeric_rescale(
+                    mantissa, src_scale, precision, scale, col_name,
+                )?)
+            }
         }
         // Text → DATE / TIMESTAMP: parse canonical text forms.
         (Value::Text(s), DataType::Date) => {
