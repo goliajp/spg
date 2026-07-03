@@ -36,7 +36,7 @@ mod regexp;
 mod resolve;
 mod strings;
 mod textsearch;
-mod values;
+pub(crate) mod values;
 
 pub use crate::conversions::format_money_array;
 pub(crate) use binop::{and_3vl, apply_binary_by_ref, apply_binary_interval};

@@ -491,6 +491,9 @@ impl Engine {
                     self.exec_select_cancel(&s, cancel)
                 }
             }
+            Statement::CopyTo { table, columns } => {
+                self.exec_copy_to(&table, columns.as_deref(), cancel)
+            }
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -777,5 +780,70 @@ impl Engine {
             }
         };
         self.enforce_row_limit(result)
+    }
+}
+
+impl Engine {
+    /// `COPY table [(cols)] TO STDOUT` — render the visible rows
+    /// in COPY text format (tab-separated, `\N` nulls, backslash
+    /// escapes) as a single-text-column result set. Embedded
+    /// consumers read the lines directly; the wire layer streams
+    /// CopyData frames from them.
+    fn exec_copy_to(
+        &mut self,
+        table_name: &str,
+        columns: Option<&[String]>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self.active_catalog().get(table_name).ok_or_else(|| {
+            EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                name: alloc::string::String::from(table_name),
+            })
+        })?;
+        let schema_cols = table.schema().columns.clone();
+        let positions: alloc::vec::Vec<usize> = match columns {
+            Some(cols) => cols
+                .iter()
+                .map(|c| {
+                    schema_cols
+                        .iter()
+                        .position(|s| s.name.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| {
+                            EngineError::Eval(crate::eval::EvalError::ColumnNotFound {
+                                name: c.clone(),
+                            })
+                        })
+                })
+                .collect::<Result<_, _>>()?,
+            None => (0..schema_cols.len()).collect(),
+        };
+        let snap = self.current_snapshot();
+        let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
+        let encode = |row: &spg_storage::Row<'static>| {
+            let cells: alloc::vec::Vec<Option<alloc::string::String>> = positions
+                .iter()
+                .map(|&p| match row.values.get(p) {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::eval::values::value_to_text(v)),
+                })
+                .collect();
+            crate::copy::encode_copy_text_cells(&cells)
+        };
+        for (_, row) in table.scan_visible(&snap) {
+            cancel.check()?;
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(encode(row))]));
+        }
+        for row in self.iter_cold_rows_of_table(table) {
+            cancel.check()?;
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(encode(&row))]));
+        }
+        Ok(QueryResult::Rows {
+            columns: alloc::vec![spg_storage::ColumnSchema::new(
+                alloc::string::String::from("copy"),
+                spg_storage::DataType::Text,
+                false,
+            )],
+            rows: out_rows,
+        })
     }
 }

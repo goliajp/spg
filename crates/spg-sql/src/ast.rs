@@ -37,6 +37,14 @@ pub enum Statement {
     /// pg_dump / mysqldump preambles (`SET NAMES utf8mb4`
     /// wrapped in conditional comments, etc.) load cleanly.
     Empty,
+    /// `COPY table [(cols)] TO STDOUT` — the engine renders the
+    /// visible rows in COPY text format (tab-separated, `\N`
+    /// nulls, backslash escapes) as a single-text-column result
+    /// set; the wire layer streams CopyData from it.
+    CopyTo {
+        table: String,
+        columns: Option<Vec<String>>,
+    },
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
     /// v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
@@ -2957,6 +2965,7 @@ impl Statement {
     pub fn is_readonly(&self) -> bool {
         match self {
             Statement::Select(_)
+            | Statement::CopyTo { .. }
             | Statement::Explain(_)
             | Statement::ShowTables
             | Statement::ShowDatabases
@@ -3034,6 +3043,13 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            Self::CopyTo { table, columns } => {
+                write!(f, "COPY {table}")?;
+                if let Some(cols) = columns {
+                    write!(f, " ({})", cols.join(", "))?;
+                }
+                write!(f, " TO STDOUT")
+            }
             Self::Truncate {
                 tables,
                 restart_identity,
