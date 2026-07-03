@@ -6651,6 +6651,8 @@ fn apply_function_dispatch(
         "timestampdiff" => super::datetime::timestampdiff_mysql(args),
         "get_format" => super::datetime::get_format_mysql(args),
         "convert_tz" => super::datetime::convert_tz_mysql(args),
+        // PG timezone(zone, ts) — the function form of AT TIME ZONE.
+        "timezone" => super::datetime::timezone_pg(args),
         "unix_timestamp" => unix_timestamp_of(args),
         "from_unixtime" => from_unixtime(args),
         // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.
