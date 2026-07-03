@@ -126,6 +126,23 @@ const MATCH_DEPTH_LIMIT: u32 = 500;
 /// classic ReDoS pattern trips this bound quickly rather than hanging.
 const MATCH_STEP_LIMIT: u64 = 10_000_000;
 
+/// v7.37.16 Epic Rx P2-⑧ (`checkmatchall`) — the largest input length
+/// for which the dot-repetition length short-circuit is engaged.
+///
+/// The short-circuit replaces the backtracker for a whole-string match
+/// against a fully-anchored pure dot-repetition (`^.*$`, `^.{m,n}$`, …).
+/// It must produce byte-for-byte the SAME answer the backtracker would —
+/// including the backtracker's ReDoS `MATCH_STEP_LIMIT` behavior. For a
+/// pattern with at most one variable-width quantifier (the restriction
+/// `matchall_length_bounds` enforces) the backtracker spends O(len)
+/// steps, so gating the short-circuit at a length well below the step
+/// budget guarantees the backtracker would NOT have erred at this input —
+/// hence the short-circuit's bool is exactly the backtracker's bool.
+/// Above this length we fall through to the backtracker unchanged, so
+/// whatever it does (match / non-match / step-budget error) is preserved.
+/// 2_000_000 leaves a ~5× margin under the 10M step budget.
+const MATCHALL_SAFE_LEN: u64 = 2_000_000;
+
 #[derive(Debug, Clone)]
 enum ReNode {
     /// Single literal byte. ASCII fast-path; non-ASCII falls through
@@ -667,6 +684,78 @@ fn re_find(node: &ReNode, s: &[char], from: usize) -> Result<Option<(usize, usiz
     }
 }
 
+/// v7.37.16 Epic Rx P2-⑧ — PG's `checkmatchall` (regexec.c). If the
+/// ENTIRE compiled pattern is `^ <dot-repetition> $` — fully anchored,
+/// with nothing but `.` and dot-quantifiers between the anchors — then a
+/// whole-string match reduces to a length test and no backtracking is
+/// needed: the string matches iff its CHARACTER length lies in
+/// `[min, max]` (`max == None` = unbounded) AND — because SPG's `.`
+/// excludes `\n` (see `ReNode::AnyChar` in `re_match_at`) — the string
+/// contains no newline. Returns `Some((min, max))` for such a pattern,
+/// or `None` to leave everything else on the backtracker.
+///
+/// Equivalence argument (why the caller's length test is byte-for-byte
+/// identical to the backtracker):
+///
+///  * Fully anchored `^…$` forces the dot-run to span the WHOLE string,
+///    so exactly `len` dots must match, one per character. Every `.`
+///    requires a non-`\n` char, so a match needs the whole string to be
+///    newline-free; and the reachable total-length set of a sequence of
+///    integer ranges `[aᵢ,bᵢ]` is the contiguous interval `[Σaᵢ, Σbᵢ]`
+///    (Minkowski sum of consecutive-integer intervals), so `len ∈
+///    [Σmin, Σmax]` is exactly decomposability. Hence match ⇔
+///    `Σmin ≤ len ≤ Σmax ∧ no '\n'`.
+///  * The "at most one variable-width quantifier" gate keeps the
+///    backtracker's cost at O(len) (two or more free `.*`/`.{m,n}` in
+///    sequence can enumerate combinatorially on a non-matching input and
+///    trip the ReDoS step budget), so the caller's `MATCHALL_SAFE_LEN`
+///    length gate can cheaply prove the backtracker would not have erred
+///    at this input — the short-circuit therefore never converts a
+///    backtracker step-budget error into a bool.
+///
+/// Only `regexp_like` (which backs `~`, `~*`, `SIMILAR TO`) asks the pure
+/// yes/no whole-string question; the span-returning functions
+/// (`regexp_match`/`replace`/`substr`/…) still use the backtracker
+/// because they need the actual match span, not just its existence.
+fn matchall_length_bounds(node: &ReNode) -> Option<(usize, Option<usize>)> {
+    // Must be a fully-anchored concatenation: first `^`, last `$`.
+    let ReNode::Concat(items) = node else {
+        return None;
+    };
+    if items.len() < 2
+        || !matches!(items.first(), Some(ReNode::Start))
+        || !matches!(items.last(), Some(ReNode::End))
+    {
+        return None;
+    }
+    let mut min_sum: usize = 0;
+    let mut max_sum: Option<usize> = Some(0);
+    let mut flexible = 0u32;
+    // Everything strictly between the anchors must be a dot-repetition
+    // atom (a bare `.` or a quantifier whose inner node is `.`).
+    for atom in &items[1..items.len() - 1] {
+        let (amin, amax) = match atom {
+            ReNode::AnyChar => (1usize, Some(1usize)),
+            ReNode::Quant { inner, min, max } if matches!(**inner, ReNode::AnyChar) => {
+                (*min, *max)
+            }
+            _ => return None,
+        };
+        if amax != Some(amin) {
+            flexible += 1;
+        }
+        min_sum = min_sum.saturating_add(amin);
+        max_sum = match (max_sum, amax) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            _ => None,
+        };
+    }
+    if flexible > 1 {
+        return None;
+    }
+    Some((min_sum, max_sum))
+}
+
 /// v7.17.0 Phase 3.7 — `regexp_matches(s, pat)` returns the FIRST
 /// match as a single-element TEXT[]. (PG returns one row per match
 /// across all captures; SPG simplifies to first-match-only TEXT[].
@@ -1045,6 +1134,22 @@ pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         fold_case(&mut node);
     }
     let chars: Vec<char> = text.chars().collect();
+    // v7.37.16 Epic Rx P2-⑧ — checkmatchall. When the whole pattern is a
+    // fully-anchored dot-repetition, a whole-string match is an O(1)
+    // length test (plus an O(len) newline scan) with no backtracking. The
+    // length gate keeps the answer byte-for-byte identical to the
+    // backtracker, including its ReDoS step-budget behavior — see
+    // `matchall_length_bounds`. `fold_case` (for `~*`) leaves `.` / dot-
+    // quantifiers untouched, so detecting on the folded node is valid.
+    if let Some((min, max)) = matchall_length_bounds(&node) {
+        let len = chars.len();
+        if (len as u64) <= MATCHALL_SAFE_LEN {
+            let matched = min <= len
+                && max.map_or(true, |mx| len <= mx)
+                && !chars.contains(&'\n');
+            return Ok(Value::Bool(matched));
+        }
+    }
     Ok(Value::Bool(re_find(&node, &chars, 0)?.is_some()))
 }
 
@@ -1310,5 +1415,161 @@ mod redos_tests {
         // Same pattern, no trailing 'b' → clean non-match (not an error).
         let miss = chars(&repeat_char('a', 10_000));
         assert_eq!(super::re_find(&node, &miss, 0).unwrap(), None);
+    }
+}
+
+// ─── v7.37.16 Epic Rx P2-⑧ — checkmatchall (dot-repetition) tests ──────
+#[cfg(test)]
+mod matchall_tests {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use spg_storage::Value;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    fn repeat_char(c: char, n: usize) -> String {
+        core::iter::repeat(c).take(n).collect()
+    }
+
+    // Detector recognizes the fully-anchored dot-repetition shapes and
+    // returns their exact [min, max] length window.
+    #[test]
+    fn matchall_detects_dot_repetition_shapes() {
+        fn bounds(pat: &str) -> Option<(usize, Option<usize>)> {
+            super::matchall_length_bounds(&super::re_compile(pat).unwrap())
+        }
+        assert_eq!(bounds("^.*$"), Some((0, None)));
+        assert_eq!(bounds("^.+$"), Some((1, None)));
+        assert_eq!(bounds("^.$"), Some((1, Some(1))));
+        assert_eq!(bounds("^.{2,4}$"), Some((2, Some(4))));
+        assert_eq!(bounds("^.{3}$"), Some((3, Some(3))));
+        assert_eq!(bounds("^.{2,}$"), Some((2, None)));
+        // Multi-atom: two fixed dots + a star → [1+.., ..] with a single
+        // flexible quantifier is still recognized.
+        assert_eq!(bounds("^..*$"), Some((1, None)));
+        // Fixed multi-atom `..` = exactly length 2.
+        assert_eq!(bounds("^..$"), Some((2, Some(2))));
+        // Empty anchored pattern matches only the empty string.
+        assert_eq!(bounds("^$"), Some((0, Some(0))));
+    }
+
+    // Patterns that must NOT take the fast path (stay on the backtracker).
+    #[test]
+    fn matchall_rejects_non_dot_or_unanchored() {
+        fn bounds(pat: &str) -> Option<(usize, Option<usize>)> {
+            super::matchall_length_bounds(&super::re_compile(pat).unwrap())
+        }
+        // A literal in the pattern → not pure dot-repetition.
+        assert_eq!(bounds("^a.*b$"), None);
+        // Not fully anchored (either end missing) → not a whole-string
+        // length question.
+        assert_eq!(bounds(".*"), None);
+        assert_eq!(bounds("^.*"), None);
+        assert_eq!(bounds(".*$"), None);
+        // Two variable-width quantifiers in sequence — excluded so the
+        // backtracker's step cost stays O(len) and the length gate can
+        // prove equivalence.
+        assert_eq!(bounds("^.*.*$"), None);
+        assert_eq!(bounds("^.{2,4}.{1,3}$"), None);
+        // A character class is not `.` (it may exclude chars a `.` allows).
+        assert_eq!(bounds("^[abc]*$"), None);
+    }
+
+    // `.*` matches any length including the empty string.
+    #[test]
+    fn matchall_star_matches_any_length() {
+        let node = super::re_compile("^.*$").unwrap();
+        let (min, max) = super::matchall_length_bounds(&node).unwrap();
+        for s in ["", "a", "abc", "hello world"] {
+            let cs = chars(s);
+            let len = cs.len();
+            let fast = min <= len && max.map_or(true, |mx| len <= mx) && !cs.contains(&'\n');
+            assert!(fast, "`.*` must match {s:?}");
+        }
+    }
+
+    // `.{2,4}` matches lengths 2/3/4 but not 1 or 5.
+    #[test]
+    fn matchall_bounded_matches_window_only() {
+        let node = super::re_compile("^.{2,4}$").unwrap();
+        let (min, max) = super::matchall_length_bounds(&node).unwrap();
+        let verdict = |s: &str| {
+            let cs = chars(s);
+            let len = cs.len();
+            min <= len && max.map_or(true, |mx| len <= mx) && !cs.contains(&'\n')
+        };
+        assert!(!verdict("a")); // len 1
+        assert!(verdict("ab")); // len 2
+        assert!(verdict("abc")); // len 3
+        assert!(verdict("abcd")); // len 4
+        assert!(!verdict("abcde")); // len 5
+    }
+
+    // A NON-dot pattern like `a.*b` is not taken by the fast path — and
+    // going through the real backtracker still gives the correct answer.
+    #[test]
+    fn matchall_non_dot_pattern_uses_backtracker_correctly() {
+        let node = super::re_compile("^a.*b$").unwrap();
+        assert_eq!(super::matchall_length_bounds(&node), None);
+        assert!(super::re_find(&node, &chars("axxxb"), 0).unwrap().is_some());
+        assert!(super::re_find(&node, &chars("axxxc"), 0).unwrap().is_none());
+    }
+
+    // Differential: for every fast-pathed pattern the length short-circuit
+    // must agree with a forced-backtracking match on a spread of inputs —
+    // INCLUDING newline-containing inputs (SPG's `.` excludes `\n`, so a
+    // pure length check would be wrong without the newline guard).
+    #[test]
+    fn matchall_fast_path_agrees_with_backtracker() {
+        let pats = [
+            "^.*$", "^.+$", "^.$", "^.{2,4}$", "^.{3}$", "^.{2,}$", "^..*$", "^..$", "^$",
+        ];
+        let inputs = [
+            "", "a", "ab", "abc", "abcd", "abcde", "a\nb", "\n", "ab\n", "\n\n", "hello",
+        ];
+        for pat in pats {
+            let node = super::re_compile(pat).unwrap();
+            let (min, max) =
+                super::matchall_length_bounds(&node).expect("pattern must be fast-pathed");
+            for s in inputs {
+                let cs = chars(s);
+                let len = cs.len();
+                let fast =
+                    min <= len && max.map_or(true, |mx| len <= mx) && !cs.contains(&'\n');
+                let slow = super::re_find(&node, &cs, 0).unwrap().is_some();
+                assert_eq!(
+                    fast, slow,
+                    "fast/slow disagree for pat {pat:?} input {s:?}: fast={fast} slow={slow}"
+                );
+            }
+        }
+    }
+
+    // End-to-end through `regexp_like` (the `~` / `SIMILAR TO` entry point):
+    // the fast path must yield the same bool the backtracker would, incl.
+    // the newline case.
+    #[test]
+    fn matchall_regexp_like_end_to_end() {
+        let like = |text: &str, pat: &str| -> bool {
+            match super::regexp_like(&[Value::text(text), Value::text(pat)]).unwrap() {
+                Value::Bool(b) => b,
+                other => panic!("regexp_like returned {other:?}"),
+            }
+        };
+        // `^.*$` (what `SIMILAR TO '%'` lowers to) matches anything with no
+        // newline; a newline defeats it (SPG's `.` excludes `\n`).
+        assert!(like("", "^.*$"));
+        assert!(like("anything at all", "^.*$"));
+        assert!(!like("two\nlines", "^.*$"));
+        // `^.{2,4}$` window.
+        assert!(!like("a", "^.{2,4}$"));
+        assert!(like("abc", "^.{2,4}$"));
+        assert!(!like("abcde", "^.{2,4}$"));
+        // Non-fast-pathed pattern still works.
+        assert!(like("axxxb", "^a.*b$"));
+        assert!(!like("axxxc", "^a.*b$"));
     }
 }
