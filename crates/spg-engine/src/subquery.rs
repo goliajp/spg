@@ -504,6 +504,15 @@ impl Engine {
                 self.resolve_correlated_in_expr(target, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(index, row, ctx, cancel, memo.as_deref_mut())?;
             }
+            Expr::ArraySlice { target, lo, hi } => {
+                self.resolve_correlated_in_expr(target, row, ctx, cancel, memo.as_deref_mut())?;
+                if let Some(l) = lo {
+                    self.resolve_correlated_in_expr(l, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+                if let Some(h) = hi {
+                    self.resolve_correlated_in_expr(h, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+            }
             Expr::AnyAll { expr, array, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
@@ -4064,6 +4073,15 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             substitute_in_expr(target, row, ctx, outer_alias);
             substitute_in_expr(index, row, ctx, outer_alias);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            substitute_in_expr(target, row, ctx, outer_alias);
+            if let Some(l) = lo {
+                substitute_in_expr(l, row, ctx, outer_alias);
+            }
+            if let Some(h) = hi {
+                substitute_in_expr(h, row, ctx, outer_alias);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             substitute_in_expr(expr, row, ctx, outer_alias);
             substitute_in_expr(array, row, ctx, outer_alias);
@@ -4145,6 +4163,11 @@ pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().any(expr_has_subquery),
         Expr::ArraySubscript { target, index } => {
             expr_has_subquery(target) || expr_has_subquery(index)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_subquery(target)
+                || lo.as_deref().is_some_and(expr_has_subquery)
+                || hi.as_deref().is_some_and(expr_has_subquery)
         }
         Expr::AnyAll { expr, array, .. } => expr_has_subquery(expr) || expr_has_subquery(array),
         Expr::InList { expr, list, .. } => {

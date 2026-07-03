@@ -253,6 +253,15 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
             rewrite_column_in_expr(target, old, new);
             rewrite_column_in_expr(index, old, new);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            rewrite_column_in_expr(target, old, new);
+            if let Some(l) = lo {
+                rewrite_column_in_expr(l, old, new);
+            }
+            if let Some(h) = hi {
+                rewrite_column_in_expr(h, old, new);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             rewrite_column_in_expr(expr, old, new);
             rewrite_column_in_expr(array, old, new);
@@ -682,6 +691,15 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
         Expr::ArraySubscript { target, index } => {
             substitute_expr(target, params)?;
             substitute_expr(index, params)?;
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            substitute_expr(target, params)?;
+            if let Some(l) = lo {
+                substitute_expr(l, params)?;
+            }
+            if let Some(h) = hi {
+                substitute_expr(h, params)?;
+            }
         }
         Expr::AnyAll { expr, array, .. } => {
             substitute_expr(expr, params)?;

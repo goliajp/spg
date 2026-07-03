@@ -153,6 +153,11 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
         Expr::ArraySubscript { target, index } => {
             expr_has_scalar_subquery(target) || expr_has_scalar_subquery(index)
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_scalar_subquery(target)
+                || lo.as_deref().is_some_and(expr_has_scalar_subquery)
+                || hi.as_deref().is_some_and(expr_has_scalar_subquery)
+        }
         Expr::AnyAll { expr, array, .. } => {
             expr_has_scalar_subquery(expr) || expr_has_scalar_subquery(array)
         }
@@ -218,6 +223,11 @@ fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().any(expr_has_streaming_disqualifier),
         Expr::ArraySubscript { target, index } => {
             expr_has_streaming_disqualifier(target) || expr_has_streaming_disqualifier(index)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_streaming_disqualifier(target)
+                || lo.as_deref().is_some_and(expr_has_streaming_disqualifier)
+                || hi.as_deref().is_some_and(expr_has_streaming_disqualifier)
         }
         Expr::AnyAll { expr, array, .. } => {
             expr_has_streaming_disqualifier(expr) || expr_has_streaming_disqualifier(array)

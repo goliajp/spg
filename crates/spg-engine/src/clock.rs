@@ -204,6 +204,15 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(target, now);
             rewrite_expr_clock(index, now);
         }
+        Expr::ArraySlice { target, lo, hi } => {
+            rewrite_expr_clock(target, now);
+            if let Some(l) = lo {
+                rewrite_expr_clock(l, now);
+            }
+            if let Some(h) = hi {
+                rewrite_expr_clock(h, now);
+            }
+        }
         Expr::AnyAll { expr, array, .. } => {
             rewrite_expr_clock(expr, now);
             rewrite_expr_clock(array, now);

@@ -1304,6 +1304,15 @@ impl Engine {
                 self.resolve_expr_subqueries(target, cancel)?;
                 self.resolve_expr_subqueries(index, cancel)?;
             }
+            Expr::ArraySlice { target, lo, hi } => {
+                self.resolve_expr_subqueries(target, cancel)?;
+                if let Some(l) = lo {
+                    self.resolve_expr_subqueries(l, cancel)?;
+                }
+                if let Some(h) = hi {
+                    self.resolve_expr_subqueries(h, cancel)?;
+                }
+            }
             Expr::AnyAll { expr, array, .. } => {
                 self.resolve_expr_subqueries(expr, cancel)?;
                 self.resolve_expr_subqueries(array, cancel)?;

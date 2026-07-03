@@ -283,6 +283,8 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 nullable: true,
             })
         }
+        // arr[lo:hi] — slice keeps the array type.
+        Expr::ArraySlice { target, .. } => return describe_expr(target, schema_cols),
         // v7.37.43-T4 — `$N` placeholders in a projection. Pre-T4 this
         // arm fell through to `_ => None`, which made
         // `describe_select_items` return an empty Vec, which made
@@ -627,6 +629,15 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         Expr::ArraySubscript { target, index } => {
             walk_expr(target, f);
             walk_expr(index, f);
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            walk_expr(target, f);
+            if let Some(l) = lo {
+                walk_expr(l, f);
+            }
+            if let Some(h) = hi {
+                walk_expr(h, f);
+            }
         }
         Expr::AnyAll { expr, array, .. } => {
             walk_expr(expr, f);
