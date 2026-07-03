@@ -25,11 +25,14 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
+    // PG's signature is `encode(bytea, format)`; SPG also accepts a
+    // Text value whose bytes are encoded directly.
     let bytes: &[u8] = match &args[0] {
+        Value::Bytes(b) => b.as_ref(),
         Value::Text(s) => s.as_bytes(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("encode() expects text bytes, got {:?}", other.data_type()),
+                detail: format!("encode() expects bytea / text, got {:?}", other.data_type()),
             });
         }
     };
