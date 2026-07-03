@@ -6322,6 +6322,25 @@ impl Parser {
                 } else if matches!(self.peek(), Token::Asc) {
                     self.advance();
                     false
+                } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
+                {
+                    // `ORDER BY x USING <op>` — PG's operator-class
+                    // spelling. SPG has one ordering per type, so
+                    // the btree comparison operators map onto it:
+                    // < / <= are ASC, > / >= are DESC. Any other
+                    // operator would need a custom operator class —
+                    // honest error.
+                    self.advance();
+                    match self.advance() {
+                        Token::Lt | Token::LtEq => false,
+                        Token::Gt | Token::GtEq => true,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "ORDER BY USING supports the btree comparison \
+                                 operators (< <= > >=); got {other:?}"
+                            )));
+                        }
+                    }
                 } else {
                     false
                 };
@@ -11108,10 +11127,43 @@ impl Parser {
         r
     }
 
+    /// `OPERATOR([schema.]<op>)` — PG's explicit-operator spelling.
+    /// When the upcoming tokens form one, return the underlying
+    /// operator token and the position just past the closing paren
+    /// so the binary loop can dispatch on the plain operator.
+    fn peek_explicit_operator(&self) -> Option<(usize, Token)> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("operator")) {
+            return None;
+        }
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
+            return None;
+        }
+        let mut i = self.pos + 2;
+        // Optional schema qualifier (pg_catalog.<op> etc.).
+        if matches!(self.tokens.get(i), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(i + 1), Some(Token::Dot))
+        {
+            i += 2;
+        }
+        let op_tok = self.tokens.get(i)?.clone();
+        if !matches!(self.tokens.get(i + 1), Some(Token::RParen)) {
+            return None;
+        }
+        Some((i + 2, op_tok))
+    }
+
     fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
         let mut chain_len = 0usize;
-        while let Some((op, prec)) = binop_from(self.peek()) {
+        loop {
+            // OPERATOR([schema.]op) reduces to its underlying
+            // operator token before the normal dispatch.
+            let explicit = self.peek_explicit_operator();
+            let dispatch = match &explicit {
+                Some((_, tok)) => binop_from(tok),
+                None => binop_from(self.peek()),
+            };
+            let Some((op, prec)) = dispatch else { break };
             if prec < min_prec {
                 break;
             }
@@ -11124,7 +11176,12 @@ impl Parser {
                     "more than {MAX_BINARY_CHAIN} chained binary operators; rewrite long OR-equality chains as IN (…)"
                 )));
             }
-            self.advance();
+            match explicit {
+                Some((end_pos, _)) => self.pos = end_pos,
+                None => {
+                    self.advance();
+                }
+            }
             // v7.10.12 — `x <op> ANY(arr)` / `x <op> ALL(arr)`.
             // ANY is a bare ident; ALL is a reserved Token. Both
             // require an immediate `(` to disambiguate from
