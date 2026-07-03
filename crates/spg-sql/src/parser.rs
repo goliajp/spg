@@ -21,7 +21,8 @@ use crate::ast::{
     AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
-    FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
+    FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
+    FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
     IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare,
     PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem,
@@ -14029,7 +14030,7 @@ impl Parser {
     /// (`ROWS UNBOUNDED PRECEDING`, `ROWS 5 PRECEDING`, etc.) which
     /// PG normalises to `BETWEEN <bound> AND CURRENT ROW`.
     fn parse_frame_tail(&mut self, kind: FrameKind) -> Result<WindowFrame, ParseError> {
-        if matches!(self.peek(), Token::Between) {
+        let (start, end) = if matches!(self.peek(), Token::Between) {
             self.advance();
             let start = self.parse_frame_bound()?;
             if !matches!(self.peek(), Token::And) {
@@ -14037,18 +14038,60 @@ impl Parser {
             }
             self.advance();
             let end = self.parse_frame_bound()?;
-            Ok(WindowFrame {
-                kind,
-                start,
-                end: Some(end),
-            })
+            (start, Some(end))
         } else {
-            let start = self.parse_frame_bound()?;
-            Ok(WindowFrame {
-                kind,
-                start,
-                end: None,
-            })
+            (self.parse_frame_bound()?, None)
+        };
+        let exclude = self.parse_frame_exclusion()?;
+        Ok(WindowFrame {
+            kind,
+            start,
+            end,
+            exclude,
+        })
+    }
+
+    /// Optional `EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}`
+    /// after a frame spec. NO OTHERS is the default no-op.
+    fn parse_frame_exclusion(&mut self) -> Result<FrameExclusion, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exclude")) {
+            return Ok(FrameExclusion::NoOthers);
+        }
+        self.advance(); // EXCLUDE
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("current") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(r) if r.eq_ignore_ascii_case("row")) {
+                    return Err(self.err(format!(
+                        "expected ROW after EXCLUDE CURRENT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                Ok(FrameExclusion::CurrentRow)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("group") => {
+                self.advance();
+                Ok(FrameExclusion::Group)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("ties") => {
+                self.advance();
+                Ok(FrameExclusion::Ties)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("no") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(r) if r.eq_ignore_ascii_case("others")) {
+                    return Err(self.err(format!(
+                        "expected OTHERS after EXCLUDE NO, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                Ok(FrameExclusion::NoOthers)
+            }
+            other => Err(self.err(format!(
+                "expected CURRENT ROW / GROUP / TIES / NO OTHERS after EXCLUDE, got {other:?}"
+            ))),
         }
     }
 

@@ -11,7 +11,9 @@
 
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, FrameBound, FrameKind, SelectItem, SelectStatement, WindowFrame};
+use spg_sql::ast::{
+    Expr, FrameBound, FrameExclusion, FrameKind, SelectItem, SelectStatement, WindowFrame,
+};
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -269,6 +271,7 @@ pub(crate) fn compute_window_partition(
             // overrides the implicit default (running for ordered,
             // whole-partition for unordered).
             let eff = effective_frame(frame, ordered)?;
+            let exclude = frame_exclusion(frame)?;
             #[allow(clippy::needless_range_loop)]
             for i in 0..slice.len() {
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
@@ -279,6 +282,11 @@ pub(crate) fn compute_window_partition(
                 let mut row_count: i64 = 0;
                 if lo <= hi {
                     for j in lo..=hi {
+                        // EXCLUDE CURRENT ROW drops the current row
+                        // from the aggregate frame.
+                        if exclude == FrameExclusion::CurrentRow && j == i {
+                            continue;
+                        }
                         let v = &arg_values[j];
                         match lower.as_str() {
                             "count_star" => row_count += 1,
@@ -589,6 +597,19 @@ pub(crate) fn compute_window_partition(
 /// unordered ⇒ ROWS UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING.
 /// Single-bound shorthand (e.g. `ROWS 5 PRECEDING`) normalises
 /// end → CURRENT ROW per the PG spec.
+/// The frame's EXCLUDE mode. GROUP / TIES need peer-group awareness
+/// that the aggregate loop doesn't have yet, so they error honestly;
+/// CURRENT ROW and the default NO OTHERS are supported.
+fn frame_exclusion(frame: Option<&WindowFrame>) -> Result<FrameExclusion, EngineError> {
+    let ex = frame.map_or(FrameExclusion::NoOthers, |f| f.exclude);
+    if matches!(ex, FrameExclusion::Group | FrameExclusion::Ties) {
+        return Err(EngineError::Unsupported(
+            "EXCLUDE GROUP / TIES is not supported yet (only CURRENT ROW / NO OTHERS)".into(),
+        ));
+    }
+    Ok(ex)
+}
+
 fn effective_frame(
     frame: Option<&WindowFrame>,
     ordered: bool,
