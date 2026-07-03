@@ -73,6 +73,62 @@ Real implementations, not stubs. Total shipped this cycle:
 known vectors or reference values where possible (MySQL and
 PG doc vectors, openssl cross-checks, RFC test vectors).
 
+DML-side + statement scout campaign (tasks #364-#373) — three
+scout rounds (DML shapes, types/casts, MySQL statements) drive ten
+closures riding existing machinery, with three real engine bugs
+found and fixed by the campaign's own pins (2947 e2e green):
+
+- **MySQL upserts (#364)**: INSERT … ON DUPLICATE KEY UPDATE
+  lowers onto ON CONFLICT machinery (empty conflict target
+  resolves to the first unique index; VALUES(col) rewrites to
+  EXCLUDED.col); REPLACE INTO rides the same channel with empty
+  assignments meaning whole-row replace.
+- **Multi-table DML (#365)**: UPDATE … FROM and DELETE … USING
+  lower the FROM/USING list into EXISTS(SELECT 1 …) WHERE
+  conjuncts; SET expressions referencing list tables become
+  correlated scalar subqueries. The pins exposed a pre-existing
+  gap — DELETE with any subquery in WHERE hit the &mut borrow
+  walk and errored — fixed with an immutable pre-pass computing
+  hit positions probed by binary search in the hot walk.
+- **UPDATE SET forms (#366)**: SET (a, b) = (row/subquery)
+  destructures at parse time; SET col = DEFAULT lowers to a
+  __column_default marker resolved against the column's catalog
+  default at execution.
+- **Writable-CTE outer SELECT (#367)**: WITH d AS (DML …
+  RETURNING) SELECT … FROM d routes the outer SELECT through the
+  transactional CTE-temps machinery (previously only outer DML).
+- **COPY TO STDOUT (#368)**: COPY table [(cols)] TO STDOUT
+  streams text-format rows via encode_copy_text_cells — the
+  exact inverse of the COPY FROM decoder.
+- **Cast targets (#369)**: ::time / ::timetz / ::float4 /
+  ::float8 / ::real / ::oid resolve; explicit varchar(n)/char(n)
+  casts truncate per PG (bare column definitions still reject
+  overlong strings honestly).
+- **Literals + statement idioms (#370, #371)**: B'1010' / X'1F'
+  bit-string literals pre-lex onto ::bit casts (hex digits expand
+  to 4 bits each); GROUP BY 1 positional substitutes the
+  projection expression; DESCRIBE/DESC route to SHOW COLUMNS;
+  MySQL LIMIT offset, count maps both clauses — the pin caught
+  offset-clobbering when only a count was present (fixed with
+  take()).
+- **Quantified subqueries (#372)**: x op ANY/SOME/ALL (SELECT …)
+  — = ANY lowers to InSubquery; other operators parse to AnyAll
+  over a ScalarSubquery whose single-column result both resolvers
+  materialise into an ARRAY literal for the existing three-valued
+  AnyAll eval (uncorrelated upfront, correlated per-row after
+  outer substitution; empty → ANY false / ALL true). The pins
+  exposed the constant-SELECT path (no FROM) silently ignoring
+  WHERE — SELECT 1 WHERE false returned a row — now the one
+  conceptual row survives only on a true condition.
+- **Interval scaling (#373)**: interval * numeric (either order)
+  and interval / numeric per PG interval_mul — months/days
+  truncate toward zero, fractional month remainder spills into
+  days at 30 days/month, fractional day remainder into
+  microseconds ('1 day' * 2.5 = 2 days 12:00:00); division by
+  zero errors honestly (previously any interval division
+  mis-reported DivisionByZero); unary minus negates all three
+  fields checked.
+
 SQL-surface scout campaign (tasks #352-#362) — two scout rounds
 (temporary probe files sweeping 10-12 shapes each, deleted after
 harvest) drive eleven closures; every arc is a parse-time lowering
