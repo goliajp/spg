@@ -700,3 +700,18 @@ fn mod_on_numeric() {
     ck(&mut e, r#"mod(7, 3)"#, r#"1"#);
     ck(&mut e, r#"mod(-5, 3)"#, r#"-2"#);
 }
+
+/// Range `-` difference operator (`+` union and `*` intersection already
+/// worked). Errors when the removal would split the range in two. PG18.4-verified.
+#[test]
+fn range_difference_operator() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(int4range(1,10) - int4range(5,15))::text"#, r#"[1,5)"#);
+    ck(&mut e, r#"(int4range(1,5) - int4range(4,10))::text"#, r#"[1,4)"#);
+    ck(&mut e, r#"(int4range(5,15) - int4range(1,10))::text"#, r#"[10,15)"#);
+    ck(&mut e, r#"(int4range(1,10) - int4range(1,10))::text"#, r#"empty"#);
+    ck(&mut e, r#"(int4range(1,10) - int4range(20,30))::text"#, r#"[1,10)"#);
+    // control: union/intersect still work.
+    ck(&mut e, r#"(int4range(1,5) + int4range(4,10))::text"#, r#"[1,10)"#);
+    ck(&mut e, r#"(int4range(1,10) * int4range(5,15))::text"#, r#"[5,10)"#);
+}
