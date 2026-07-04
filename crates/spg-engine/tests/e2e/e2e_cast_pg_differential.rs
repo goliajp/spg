@@ -1016,3 +1016,12 @@ fn geometric_accessors() {
     ck(&mut e, "isvertical('[(0,0),(0,4)]'::lseg)::text", "true");
     ck(&mut e, "ishorizontal('[(0,0),(3,0)]'::lseg)::text", "true");
 }
+
+/// npoints(path | polygon) — vertex count. PG18.4-verified.
+#[test]
+fn npoints_path_polygon() {
+    let mut e = Engine::new();
+    ck(&mut e, "npoints('[(0,0),(1,1),(2,2)]'::path)::text", "3");
+    ck(&mut e, "npoints('((0,0),(1,1),(2,0),(3,1))'::polygon)::text", "4");
+    ck(&mut e, "npoints('((0,0),(1,1),(2,0))'::polygon)::text", "3");
+}

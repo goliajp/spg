@@ -1880,6 +1880,19 @@ fn apply_function_dispatch(
             })?;
             Ok(Value::Point(spg_storage::Point2D { x, y }))
         }
+        // npoints(path | polygon) — the vertex count.
+        "npoints" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Path { points, .. } => Ok(Value::Int(
+                i32::try_from(points.len()).unwrap_or(i32::MAX),
+            )),
+            Value::Polygon(points) => Ok(Value::Int(
+                i32::try_from(points.len()).unwrap_or(i32::MAX),
+            )),
+            v => Err(EvalError::TypeMismatch {
+                detail: alloc::format!("npoints() not defined for {:?}", v.data_type()),
+            }),
+        },
         // Geometric accessors over box / circle / lseg. (`length(lseg)` is
         // handled in the `length` arm above, which the text form shares.)
         "area" | "width" | "height" | "center" | "radius" | "diameter"
