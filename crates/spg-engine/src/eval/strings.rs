@@ -623,9 +623,41 @@ fn to_char_interval(months: i64, days: i64, micros: i128, fmt: &str) -> String {
     out
 }
 
+/// PG `to_char(n, 'RN')` — Roman numerals. Valid for 1..=3999; anything else
+/// (including 0 and negatives) renders as 15 `#`. Without `FM` the result is
+/// right-justified in a 15-character field; `FM` trims it.
+fn to_char_roman(n: f64, fill_mode: bool) -> String {
+    #[allow(clippy::cast_possible_truncation)]
+    let v = libm::round(n) as i64;
+    if !(1..=3999).contains(&v) {
+        return core::iter::repeat('#').take(15).collect();
+    }
+    const VALS: [(i64, &str); 13] = [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+        (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ];
+    let mut out = String::new();
+    let mut rem = v;
+    for (val, sym) in VALS {
+        while rem >= val {
+            out.push_str(sym);
+            rem -= val;
+        }
+    }
+    if fill_mode {
+        out
+    } else {
+        alloc::format!("{out:>15}")
+    }
+}
+
 fn to_char_numeric(n: f64, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
+    // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
+    if pat.eq_ignore_ascii_case("RN") {
+        return to_char_roman(n, fill_mode);
+    }
     // `PR` suffix: PG's accounting-negative notation — a negative value is
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a
     // non-negative one gets a trailing space where the `>` would sit.

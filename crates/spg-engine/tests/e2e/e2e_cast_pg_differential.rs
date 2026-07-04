@@ -1462,3 +1462,19 @@ fn unary_minus_numeric_smallint() {
     // control: existing int / float unary minus unchanged.
     ck(&mut e, "(-5)::text", "-5");
 }
+
+
+
+
+/// v7.37 D — to_char(n, 'RN') renders Roman numerals (1..=3999), 15-char
+/// right-justified; `FM` trims; out-of-range → 15 `#`. PG18.4-verified.
+#[test]
+fn to_char_roman_numerals() {
+    let mut e = Engine::new();
+    ck(&mut e, "to_char(42, 'FMRN')", "XLII");
+    ck(&mut e, "to_char(3999, 'FMRN')", "MMMCMXCIX");
+    ck(&mut e, "to_char(1, 'FMRN')", "I");
+    ck(&mut e, "to_char(42, 'RN')", "           XLII");
+    ck(&mut e, "to_char(4000, 'FMRN')", "###############");
+    ck(&mut e, "to_char(0, 'FMRN')", "###############");
+}
