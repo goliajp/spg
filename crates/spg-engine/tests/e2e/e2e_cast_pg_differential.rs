@@ -607,3 +607,19 @@ fn cast_to_typed_array_family() {
     ck(&mut e, r#"(ARRAY[1,2]::smallint[])::text"#, r#"{1,2}"#);
     ck(&mut e, r#"(ARRAY[1,2]::int[])::text"#, r#"{1,2}"#);
 }
+
+/// PG: `date ± interval` always yields TIMESTAMP (the interval may carry a
+/// time component), rendered at midnight when it has no sub-day part. SPG kept
+/// it a DATE when the interval was pure-days. PG18.4-verified. (`date ± integer`
+/// stays DATE — a different operator.)
+#[test]
+fn date_interval_promotes_to_timestamp() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"date '2024-03-01' - interval '1 day'"#, r#"2024-02-29 00:00:00"#);
+    ck(&mut e, r#"date '2024-03-01' + interval '1 day'"#, r#"2024-03-02 00:00:00"#);
+    ck(&mut e, r#"date '2024-03-01' + interval '2 hours'"#, r#"2024-03-01 02:00:00"#);
+    ck(&mut e, r#"date '2024-03-01' - interval '1 month'"#, r#"2024-02-01 00:00:00"#);
+    // date ± integer stays a date.
+    ck(&mut e, r#"date '2024-03-01' + 5"#, r#"2024-03-06"#);
+    ck(&mut e, r#"date '2024-03-01' - 5"#, r#"2024-02-25"#);
+}
