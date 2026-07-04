@@ -685,3 +685,18 @@ fn stat_agg_on_numeric() {
     assert_eq!(q(&mut e, "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v)::text FROM s"), "2");
     assert_eq!(q(&mut e, "SELECT corr(v, v)::text FROM s"), "1");
 }
+
+/// mod() accepts NUMERIC / FLOAT operands, not just integers — PG returns an
+/// exact numeric remainder (`mod(7.5, 2.0) = 1.5`). Was "needs integer" ERR.
+/// PG18.4-verified.
+#[test]
+fn mod_on_numeric() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"mod(7.5::numeric, 2.0::numeric)"#, r#"1.5"#);
+    ck(&mut e, r#"mod(10.5::numeric, 3::numeric)"#, r#"1.5"#);
+    ck(&mut e, r#"mod((-7.5)::numeric, 2.0::numeric)"#, r#"-1.5"#);
+    ck(&mut e, r#"mod(7.5::float8, 2.0::float8)"#, r#"1.5"#);
+    // integer mod unaffected.
+    ck(&mut e, r#"mod(7, 3)"#, r#"1"#);
+    ck(&mut e, r#"mod(-5, 3)"#, r#"-2"#);
+}
