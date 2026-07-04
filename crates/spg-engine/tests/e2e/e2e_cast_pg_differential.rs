@@ -1184,3 +1184,19 @@ fn orderby_interval() {
     assert_eq!(rows(&mut e, &["CREATE TABLE iv2 (x interval)","INSERT INTO iv2 VALUES ('1 day'),('1 hour'),('1 month')"], "SELECT x::text FROM iv2 ORDER BY x DESC"),
         "Text(\"1 mon\"),Text(\"1 day\"),Text(\"01:00:00\")");
 }
+
+/// Comparison / BETWEEN / IN between a typed scalar and a string literal —
+/// PG implicitly coerces the literal to the operand type. PG18.4-verified.
+#[test]
+fn cmp_text_coercion() {
+    let mut e = Engine::new();
+    ck(&mut e, "('12:00'::time BETWEEN '10:00' AND '14:00')::text", "true");
+    ck(&mut e, "('\\x80'::bytea BETWEEN '\\x01' AND '\\xff')::text", "true");
+    ck(&mut e, "('172.16.0.1'::inet BETWEEN '10.0.0.1' AND '192.168.1.1')::text", "true");
+    ck(&mut e, "('10.0.0.1'::inet IN ('10.0.0.1','192.168.1.1'))::text", "true");
+    ck(&mut e, "('1 day'::interval BETWEEN '1 hour' AND '1 month')::text", "true");
+    ck(&mut e, "('14:00'::time > '10:00')::text", "true");
+    ck(&mut e, "('10:00'::time = '10:00')::text", "true");
+    // control: existing numeric-vs-text and text-vs-text unaffected.
+    ck(&mut e, "('abc' < 'abd')::text", "true");
+}
