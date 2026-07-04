@@ -1157,8 +1157,15 @@ pub fn parse_path_text(s: &str) -> Option<(Vec<spg_storage::Point2D>, bool)> {
 /// v7.37.5 ε — parse Polygon text `((x,y),...)` (implicit closed).
 pub fn parse_polygon_text(s: &str) -> Option<Vec<spg_storage::Point2D>> {
     let s = s.trim();
-    let inner = s.strip_prefix('(').and_then(|x| x.strip_suffix(')'))?;
-    parse_point_list(inner)
+    // The outer parens are optional in PG — `((0,0),(1,1))` and `(0,0),(1,1)`
+    // both parse. Try stripping one wrapping layer first (the `((...))` form);
+    // if that doesn't yield a valid point list, parse the bare list directly.
+    if let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        if let Some(pts) = parse_point_list(inner) {
+            return Some(pts);
+        }
+    }
+    parse_point_list(s)
 }
 
 /// v7.37.5 ζ-A — render an INET/CIDR address as canonical PG text:

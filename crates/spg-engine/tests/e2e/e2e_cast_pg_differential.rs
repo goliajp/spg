@@ -1325,3 +1325,17 @@ fn temporal_plus_text() {
     // date + text stays an error (ambiguous) — matches PG.
     assert_eq!(cast(&mut e, "'2024-01-01'::date + '5 days'"), "ERR");
 }
+
+
+
+/// v7.37 D.5 — polygon text accepts the bare (no outer-paren) point list, like
+/// PG: both `(0,0),(1,1)` and `((0,0),(1,1))`. Unblocks npoints(polygon) and
+/// the `#` operator's functional equivalent. PG18.4-verified.
+#[test]
+fn polygon_bare_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "('(0,0),(4,0),(4,3),(0,3)'::polygon)::text", "((0,0),(4,0),(4,3),(0,3))");
+    ck(&mut e, "('((0,0),(4,0),(4,3),(0,3))'::polygon)::text", "((0,0),(4,0),(4,3),(0,3))");
+    ck(&mut e, "npoints('(0,0),(4,0),(4,3),(0,3)'::polygon)::text", "4");
+    ck(&mut e, "npoints('((0,0),(1,1))'::polygon)::text", "2");
+}
