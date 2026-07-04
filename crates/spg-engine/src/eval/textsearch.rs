@@ -318,7 +318,8 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
         };
         let need_parens = own_prec < parent_prec;
         if need_parens {
-            out.push('(');
+            // PG spaces the inside of every auto-added group: `( 'a' | 'b' )`.
+            out.push_str("( ");
         }
         match ast {
             TsQueryAst::Term { word, .. } => {
@@ -357,7 +358,7 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
         }
         write_self(out);
         if need_parens {
-            out.push(')');
+            out.push_str(" )");
         }
     }
     let mut out = String::new();
