@@ -1143,15 +1143,21 @@ pub fn parse_circle_text(s: &str) -> Option<(spg_storage::Point2D, f64)> {
 /// `((x,y),...)` (closed). The leading bracket pins openness.
 pub fn parse_path_text(s: &str) -> Option<(Vec<spg_storage::Point2D>, bool)> {
     let s = s.trim();
-    let (closed, inner) = if let Some(i) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-        (false, i)
-    } else if let Some(i) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
-        (true, i)
-    } else {
-        return None;
-    };
-    let pts = parse_point_list(inner)?;
-    Some((pts, closed))
+    // `[...]` = open path, `(...)` = closed. A bare point list (no brackets)
+    // is a closed path in PG. Strip a wrapping layer only when it yields a
+    // valid point list; otherwise parse the bare list directly as closed
+    // (stripping unconditionally would mangle `(0,0),(1,1)` into `0,0),(1,1`).
+    if let Some(i) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        if let Some(pts) = parse_point_list(i) {
+            return Some((pts, false));
+        }
+    }
+    if let Some(i) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        if let Some(pts) = parse_point_list(i) {
+            return Some((pts, true));
+        }
+    }
+    parse_point_list(s).map(|pts| (pts, true))
 }
 
 /// v7.37.5 ε — parse Polygon text `((x,y),...)` (implicit closed).
