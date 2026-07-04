@@ -346,6 +346,7 @@ mod e2e_int_array;
 mod e2e_interval_array;
 mod e2e_interval_cast;
 mod e2e_interval_column_storage;
+mod e2e_join_pg_differential;
 mod e2e_join_peer_predicate;
 mod e2e_join_using;
 mod e2e_json_build;
