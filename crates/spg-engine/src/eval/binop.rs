@@ -779,9 +779,9 @@ fn apply_binary_numeric(
                 }
             }
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                let ord = af.partial_cmp(&bf).ok_or(EvalError::TypeMismatch {
-                    detail: "NaN in NUMERIC/Float comparison".into(),
-                })?;
+                // PG's total float order: NaN == NaN and NaN > any number,
+                // so the comparison is total (never errors on NaN).
+                let ord = float_pg_cmp(af, bf);
                 Ok(Value::Bool(cmp_to_bool(op, ord)))
             }
             BinOp::Concat => Ok(text_concat(&l, &r)),
@@ -2028,9 +2028,8 @@ pub(super) fn compare(
         {
             let af = as_f64(a)?;
             let bf = as_f64(b)?;
-            af.partial_cmp(&bf).ok_or(EvalError::TypeMismatch {
-                detail: "NaN in comparison".into(),
-            })?
+            // PG total float order: NaN == NaN, NaN > any number.
+            float_pg_cmp(af, bf)
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),

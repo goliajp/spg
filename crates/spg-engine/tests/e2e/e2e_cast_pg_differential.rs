@@ -506,3 +506,18 @@ fn typed_literals_scalar_family() {
     ck(&mut e, r#"date '2024-01-15'"#, r#"2024-01-15"#);
     ck(&mut e, r#"timestamp '2024-01-15 10:30:00'"#, r#"2024-01-15 10:30:00"#);
 }
+
+/// PG's total float order: NaN == NaN and NaN > every number, so scalar
+/// float comparisons never error on NaN (were `ERR`). PG18.4-verified.
+#[test]
+fn float_nan_comparison_total_order() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"'NaN'::float8 = 'NaN'::float8"#, r#"true"#);
+    ck(&mut e, r#"'NaN'::float8 > 1"#, r#"true"#);
+    ck(&mut e, r#"'NaN'::float8 >= 'Infinity'::float8"#, r#"true"#);
+    ck(&mut e, r#"1 < 'NaN'::float8"#, r#"true"#);
+    ck(&mut e, r#"'NaN'::float8 <> 1"#, r#"true"#);
+    ck(&mut e, r#"'NaN'::float8 = 1"#, r#"false"#);
+    // sanity: ordinary float comparison unaffected.
+    ck(&mut e, r#"1.5::float8 < 2.5::float8"#, r#"true"#);
+}
