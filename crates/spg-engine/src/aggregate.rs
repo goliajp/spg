@@ -326,6 +326,14 @@ struct AggState {
     sum_num_scaled: i128,
     sum_num_scale: u8,
     use_numeric: bool,
+    /// v7.37 — component-wise accumulator for `sum(interval)` /
+    /// `avg(interval)`. Gated by `use_interval`; the numeric/int/float
+    /// paths never touch these. `micros` is i128 to avoid overflow when
+    /// avg spills month/day remainders into the time field.
+    sum_iv_months: i64,
+    sum_iv_days: i64,
+    sum_iv_micros: i128,
+    use_interval: bool,
     /// v7.17.0 — running collection for string_agg / array_agg.
     /// Each entry is one row's contribution (NULL preserved as
     /// `Value::Null`; string_agg's finalize step drops them, but
@@ -1151,6 +1159,11 @@ fn accumulate_groups(
         let mut num_scaled: i128 = 0;
         let mut num_scale: u8 = 0;
         let mut use_numeric = false;
+        // Interval accumulator (sum/avg over an interval column).
+        let mut sum_iv_months: i64 = 0;
+        let mut sum_iv_days: i64 = 0;
+        let mut sum_iv_micros: i128 = 0;
+        let mut use_interval = false;
         let mut count: i64 = 0;
         // Borrow-aware fast inner: avoid the per-row clone when arg
         // is a bound column position.
@@ -1183,6 +1196,13 @@ fn accumulate_groups(
                         num_scaled = s;
                         num_scale = sc;
                         use_numeric = true;
+                        count += 1;
+                    }
+                    Value::Interval { months, days, micros } => {
+                        sum_iv_months += i64::from(*months);
+                        sum_iv_days += i64::from(*days);
+                        sum_iv_micros += i128::from(*micros);
+                        use_interval = true;
                         count += 1;
                     }
                     other => {
@@ -1256,6 +1276,13 @@ fn accumulate_groups(
                         use_numeric = true;
                         count += 1;
                     }
+                    Value::Interval { months, days, micros } => {
+                        sum_iv_months += i64::from(months);
+                        sum_iv_days += i64::from(days);
+                        sum_iv_micros += i128::from(micros);
+                        use_interval = true;
+                        count += 1;
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -1272,6 +1299,10 @@ fn accumulate_groups(
         state.sum_num_scaled = num_scaled;
         state.sum_num_scale = num_scale;
         state.use_numeric = use_numeric;
+        state.sum_iv_months = sum_iv_months;
+        state.sum_iv_days = sum_iv_days;
+        state.sum_iv_micros = sum_iv_micros;
+        state.use_interval = use_interval;
         return Ok(order);
     }
     // v7.37.x (mailrs Track A 100k attack) — tight inlined loop for
@@ -2804,6 +2835,12 @@ fn update_state(
                     st.sum_num_scaled = s;
                     st.sum_num_scale = sc;
                 }
+                Value::Interval { months, days, micros } => {
+                    st.use_interval = true;
+                    st.sum_iv_months += i64::from(*months);
+                    st.sum_iv_days += i64::from(*days);
+                    st.sum_iv_micros += i128::from(*micros);
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -3078,13 +3115,19 @@ fn update_state(
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn finalize(name: &str, st: &AggState) -> Value<'static> {
     match name {
         "count" | "count_star" => Value::BigInt(st.count),
         "sum" => {
             if st.count == 0 {
                 Value::Null
+            } else if st.use_interval {
+                Value::Interval {
+                    months: st.sum_iv_months as i32,
+                    days: st.sum_iv_days as i32,
+                    micros: st.sum_iv_micros as i64,
+                }
             } else if st.use_numeric {
                 // Exact NUMERIC sum (PG18: sum(numeric) → numeric). Fold
                 // any integer contributions (scale 0) into the running
@@ -3106,6 +3149,27 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         "avg" => {
             if st.count == 0 {
                 Value::Null
+            } else if st.use_interval {
+                // PG interval_div: the month quotient truncates and its
+                // remainder spills into DAYS (a month = 30 days), taking the
+                // whole-day part into the day field and only the sub-day
+                // fraction into time; the day remainder then spills into time.
+                let n = i128::from(st.count);
+                let day_us = 86_400_000_000i128;
+                let months = i128::from(st.sum_iv_months);
+                let days = i128::from(st.sum_iv_days);
+                let month_out = months / n;
+                let mrem_days_total = (months % n) * 30; // days (still over n)
+                let days_from_month = mrem_days_total / n;
+                let mrem_frac_us = (mrem_days_total % n) * day_us / n;
+                let day_out = days / n;
+                let drem_us = (days % n) * day_us / n;
+                let micros = st.sum_iv_micros / n + mrem_frac_us + drem_us;
+                Value::Interval {
+                    months: month_out as i32,
+                    days: (day_out + days_from_month) as i32,
+                    micros: micros as i64,
+                }
             } else if st.use_numeric {
                 // Exact NUMERIC avg = numeric_div(sum, count) at PG's
                 // display scale (select_div_scale).
