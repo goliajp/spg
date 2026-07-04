@@ -159,6 +159,10 @@ enum ReNode {
     Start,
     /// Anchor end.
     End,
+    /// Word-boundary zero-width assertion (PG ARE `\y \m \M \b \B \Y`).
+    /// Consumes no input; asserts on the word-ness of the chars flanking
+    /// the current position. See `WordBoundaryKind`.
+    WordBoundary(WordBoundaryKind),
     /// Greedy quantifier.
     Quant {
         inner: Box<ReNode>,
@@ -175,6 +179,30 @@ enum ReNode {
 enum ClassMember {
     Single(char),
     Range(char, char),
+}
+
+/// PG ARE word-boundary assertion flavours (regc_locale.c semantics).
+/// A "word character" is `[[:alnum:]_]`; `before`/`after` = whether the
+/// char immediately left/right of the position is a word char (false at a
+/// string edge). All are zero-width — they match a position, not a char.
+/// (PG's `\b`/`\B` are NOT word boundaries in ARE — they are the backspace
+/// char and a literal backslash respectively — so they are not here.)
+#[derive(Debug, Clone, Copy)]
+enum WordBoundaryKind {
+    /// `\y` — at a word boundary: `before != after`.
+    Boundary,
+    /// `\Y` — NOT a word boundary: `before == after`.
+    NonBoundary,
+    /// `\m` — beginning of a word: `!before && after`.
+    BegWord,
+    /// `\M` — end of a word: `before && !after`.
+    EndWord,
+}
+
+/// PG word character: alphanumeric or underscore. ASCII-scoped to match
+/// this engine's `\w`/`[[:alnum:]]` handling (both ASCII-only here).
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
@@ -397,6 +425,18 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                     ],
                     negated: true,
                 }),
+                // PG ARE word-boundary assertions (constraint escapes,
+                // regc_lex.c). Only `\m \M \y \Y` are word boundaries.
+                // Verified against live PG18: `\b`/`\B` are NOT boundaries
+                // in ARE — `\b` is the backspace char and `\B` is a literal
+                // backslash (character-entry escapes). See below.
+                'y' => Ok(ReNode::WordBoundary(WordBoundaryKind::Boundary)),
+                'Y' => Ok(ReNode::WordBoundary(WordBoundaryKind::NonBoundary)),
+                'm' => Ok(ReNode::WordBoundary(WordBoundaryKind::BegWord)),
+                'M' => Ok(ReNode::WordBoundary(WordBoundaryKind::EndWord)),
+                // Character-entry escapes matching PG ARE semantics.
+                'b' => Ok(ReNode::Literal('\u{08}')), // backspace
+                'B' => Ok(ReNode::Literal('\\')),     // literal backslash
                 other => Ok(ReNode::Literal(other)),
             }
         }
@@ -536,6 +576,18 @@ fn re_match_at(
         },
         ReNode::Start => Ok(if pos == 0 { Some(pos) } else { None }),
         ReNode::End => Ok(if pos == s.len() { Some(pos) } else { None }),
+        ReNode::WordBoundary(kind) => {
+            // Zero-width: assert on the flanking chars, consume nothing.
+            let before = pos > 0 && is_word_char(s[pos - 1]);
+            let after = pos < s.len() && is_word_char(s[pos]);
+            let ok = match kind {
+                WordBoundaryKind::Boundary => before != after,
+                WordBoundaryKind::NonBoundary => before == after,
+                WordBoundaryKind::BegWord => !before && after,
+                WordBoundaryKind::EndWord => before && !after,
+            };
+            Ok(if ok { Some(pos) } else { None })
+        }
         // v7.37.17 (17.6 siblings) — Concat delegates to the
         // backtracking sequence matcher so quantifiers can shrink
         // when the tail fails ('bar.*que' now matches 'barbeque';
@@ -1571,5 +1623,54 @@ mod matchall_tests {
         // Non-fast-pathed pattern still works.
         assert!(like("axxxb", "^a.*b$"));
         assert!(!like("axxxc", "^a.*b$"));
+    }
+
+    // Regex P1 — PG ARE word-boundary assertions (\y \m \M \Y) and the
+    // character-entry escapes \b (backspace) / \B (backslash). Every
+    // expected value below was captured from live PostgreSQL 18
+    // (docker spg-bench-postgres) so this is a true differential fixture:
+    // SPG's result must equal PG18's for each case.
+    #[test]
+    fn word_boundary_assertions_match_pg18() {
+        let like = |text: &str, pat: &str| -> bool {
+            match super::regexp_like(&[Value::text(text), Value::text(pat)]).unwrap() {
+                Value::Bool(b) => b,
+                other => panic!("regexp_like returned {other:?}"),
+            }
+        };
+        // (text, pattern, PG18 result)
+        let cases: &[(&str, &str, bool)] = &[
+            // \y — beginning OR end of word.
+            ("foobar", r"\yfoo\y", false),   // foo not at a word edge on the right
+            ("foo bar", r"\yfoo\y", true),   // foo is a whole word
+            ("a.b", r"\ya\y", true),         // '.' is a non-word char → boundaries
+            ("hello world", r"\yworld\y", true),
+            ("foobar", r"\yfoo", true),      // \y at string start before a word
+            ("foobar", r"bar\y", true),      // \y at string end after a word
+            ("foobar", r"foo\ybar", false),  // o|b both word → no boundary
+            ("foo_bar", r"foo\ybar", false), // '_' is a word char → no boundary
+            // \m — beginning of a word only.
+            ("foo bar", r"\mbar", true),
+            ("foobar", r"\mfoo", true),
+            // \M — end of a word only.
+            ("foo bar", r"foo\M", true),
+            ("foobar", r"foo\M", false),
+            // \Y — NOT a word boundary.
+            ("foobar", r"oo\Yba", true),     // o|b both word → non-boundary
+            ("foo bar", r"foo\Y bar", false), // o|space is a boundary → \Y fails
+            // \b = backspace char (NOT a word boundary in PG ARE).
+            ("foo bar", "foo\\bbar", false), // needs a literal backspace → no match
+            ("a\u{08}c", "a\\bc", true),     // backspace present → matches
+            // \B = literal backslash (NOT a word boundary in PG ARE).
+            ("foobar", r"foo\Bbar", false),  // needs a literal '\' → no match
+            ("a\\c", r"a\Bc", true),         // literal backslash present → matches
+        ];
+        for &(text, pat, expected) in cases {
+            assert_eq!(
+                like(text, pat),
+                expected,
+                "SPG disagrees with PG18 for {text:?} ~ {pat:?} (PG18={expected})"
+            );
+        }
     }
 }
