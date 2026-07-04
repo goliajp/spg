@@ -1284,3 +1284,17 @@ fn autocommit_under_conn_tx() {
     assert_eq!(cnt(&mut e, IMPLICIT_TX), "BigInt(1)", "IMPLICIT_TX sees it too");
     assert!(!e.is_tx_open(conn_a), "autocommit leaves no open shadow under conn_a");
 }
+
+/// v7.37 D.1 — COALESCE result-type coercion: a typed sibling branch coerces
+/// an untyped string-literal branch to that type. PG18.4-verified.
+#[test]
+fn coalesce_result_type() {
+    let mut e = Engine::new();
+    ck(&mut e, "COALESCE(NULL::time, '12:00')::text", "12:00:00");
+    ck(&mut e, "COALESCE(NULL::date, '2024-06-01')::text", "2024-06-01");
+    ck(&mut e, "COALESCE(NULL::timestamp, '2024-06-01 09:30')::text", "2024-06-01 09:30:00");
+    ck(&mut e, "COALESCE('14:30'::time, '09:00')::text", "14:30:00");
+    // control: all-text COALESCE returns the raw text unchanged.
+    ck(&mut e, "COALESCE(NULL, 'hello')::text", "hello");
+    ck(&mut e, "COALESCE(NULL::int, 42)::text", "42");
+}

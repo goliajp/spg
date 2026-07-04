@@ -20,7 +20,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::{BinOp, ColumnName, Expr, Literal};
+use spg_sql::ast::{BinOp, CastTarget, ColumnName, Expr, Literal};
 use spg_storage::{ColumnSchema, Row, Value};
 
 mod binop;
@@ -340,6 +340,28 @@ pub fn eval_expr(
                         _ => {}
                     }
                 }
+            }
+            // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
+            // common type of its branches, so a typed sibling (`NULL::time`,
+            // `col::time`) makes the whole expression that type and an untyped
+            // string-literal branch is coerced to it. Without this,
+            // `COALESCE(NULL::time, '12:00')::text` rendered the raw `12:00`
+            // instead of `12:00:00`. Only kicks in when the picked value is a
+            // bare Text and a non-text cast-target sibling exists.
+            if name.eq_ignore_ascii_case("coalesce") && !args.is_empty() {
+                let evaluated: Result<Vec<Value<'static>>, _> =
+                    args.iter().map(|a| eval_expr(a, row, ctx)).collect();
+                let evaluated = evaluated?;
+                let result = evaluated
+                    .into_iter()
+                    .find(|v| !matches!(v, Value::Null))
+                    .unwrap_or(Value::Null);
+                if matches!(result, Value::Text(_)) {
+                    if let Some(target) = args.iter().find_map(coalesce_type_hint) {
+                        return crate::eval::cast::cast_value(result, target);
+                    }
+                }
+                return Ok(result);
             }
             let evaluated: Result<Vec<Value<'static>>, _> =
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
@@ -727,6 +749,17 @@ pub fn eval_expr(
 /// so we widen by stringifying. NUMERIC formatting goes through
 /// the existing canonical helpers to stay consistent with
 /// `format_numeric` / `format_date` etc.
+/// v7.37 D.1 — the COALESCE result-type hint: a sibling branch's explicit
+/// cast target (`NULL::time`, `col::time`), unless it is Text (Text carries no
+/// coercion). Returns the first non-Text `CastTarget` found, mirroring PG's
+/// left-to-right common-type resolution for the common single-typed-branch case.
+fn coalesce_type_hint(e: &Expr) -> Option<CastTarget> {
+    match e {
+        Expr::Cast { target, .. } if !matches!(target, CastTarget::Text) => Some(target.clone()),
+        _ => None,
+    }
+}
+
 fn value_to_text_for_array(v: &Value) -> String {
     match v {
         Value::Text(s) | Value::Json(s) => s.to_string(),
