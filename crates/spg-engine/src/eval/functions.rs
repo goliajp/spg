@@ -7957,6 +7957,61 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // NUMERIC operands: PG returns an exact numeric remainder
+            // (`mod(7.5, 2.0) = 1.5`). Align the two scales, then take the
+            // truncated i128 remainder (sign of the dividend, like `%`).
+            if matches!(args[0], Value::Numeric { .. }) || matches!(args[1], Value::Numeric { .. })
+            {
+                let as_num = |v: &Value| -> Option<(i128, u8)> {
+                    match v {
+                        Value::SmallInt(n) => Some((i128::from(*n), 0)),
+                        Value::Int(n) => Some((i128::from(*n), 0)),
+                        Value::BigInt(n) => Some((i128::from(*n), 0)),
+                        Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+                        _ => None,
+                    }
+                };
+                if let (Some((ys, ysc)), Some((xs, xsc))) = (as_num(&args[0]), as_num(&args[1])) {
+                    let common = ysc.max(xsc);
+                    let ya = ys.checked_mul(10i128.pow(u32::from(common - ysc)));
+                    let xa = xs.checked_mul(10i128.pow(u32::from(common - xsc)));
+                    if let (Some(ya), Some(xa)) = (ya, xa) {
+                        if xa == 0 {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "mod(): division by zero".into(),
+                            });
+                        }
+                        return Ok(Value::Numeric {
+                            scaled: ya.wrapping_rem(xa),
+                            scale: common,
+                        });
+                    }
+                }
+            }
+            // FLOAT operands: C-style `fmod` (sign of the dividend).
+            if matches!(args[0], Value::Float(_)) || matches!(args[1], Value::Float(_)) {
+                #[allow(clippy::cast_precision_loss)]
+                let as_f = |v: &Value| -> Option<f64> {
+                    match v {
+                        Value::SmallInt(n) => Some(f64::from(*n)),
+                        Value::Int(n) => Some(f64::from(*n)),
+                        Value::BigInt(n) => Some(*n as f64),
+                        Value::Float(x) => Some(*x),
+                        Value::Numeric { scaled, scale } => {
+                            Some((*scaled as f64) / (10i128.pow(u32::from(*scale)) as f64))
+                        }
+                        _ => None,
+                    }
+                };
+                if let (Some(a), Some(b)) = (as_f(&args[0]), as_f(&args[1])) {
+                    if b == 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "mod(): division by zero".into(),
+                        });
+                    }
+                    return Ok(Value::Float(a % b));
+                }
+            }
             let to_i64 = |v: &Value| -> Result<i64, EvalError> {
                 match v {
                     Value::SmallInt(x) => Ok(i64::from(*x)),
