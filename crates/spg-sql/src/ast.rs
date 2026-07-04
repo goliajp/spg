@@ -2427,6 +2427,23 @@ pub struct FromJoin {
     pub table: TableRef,
     /// Required for INNER/LEFT; must be `None` for CROSS / comma-list.
     pub on: Option<Expr>,
+    /// v7.37.16 — `JOIN … USING (c1, c2, …)`. When `Some`, records the
+    /// USING column list so the executor can perform PG's column-merge
+    /// (the join columns collapse to a single unqualified output column,
+    /// `t1.c` for INNER/LEFT, `t2.c` for RIGHT, `COALESCE(t1.c,t2.c)` for
+    /// FULL, and appear first in `SELECT *`). The parser ALSO desugars
+    /// USING into an equivalent `on` predicate so the join filter/count
+    /// path works unchanged; `using_cols` drives only the output-shape
+    /// rewrite. Empty/`None` for `ON` and CROSS joins.
+    pub using_cols: Option<Vec<String>>,
+    /// v7.37.16 — `NATURAL [INNER|LEFT|RIGHT|FULL] JOIN`. The common
+    /// column names are not known until the table schemas are available
+    /// (parse time is schema-less), so the parser only sets this flag and
+    /// leaves `on`/`using_cols` empty; the engine resolves the common
+    /// columns at execution time, synthesises the `on` predicate + the
+    /// USING column-merge, and clears the flag. If there are no common
+    /// columns PG treats it as a CROSS join.
+    pub natural: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

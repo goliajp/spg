@@ -555,6 +555,8 @@ fn rewrite_from_with_trailing(
             kind: JoinKind::Inner,
             table: tables[table_idx].clone(),
             on: Some(on),
+            using_cols: None,
+            natural: false,
         });
     }
     // v7.38 — re-append preserved trailing LEFT/CROSS joins.

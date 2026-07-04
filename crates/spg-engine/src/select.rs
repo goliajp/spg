@@ -2240,6 +2240,14 @@ impl Engine {
         // error and SPG mirrors the surface so the same DDL/app
         // path behaves identically on cutover.
         check_with_ties_requires_order_by(stmt)?;
+        // v7.37.16 — resolve `USING` column-merge + `NATURAL JOIN` into an
+        // equivalent statement the regular executor handles (merged join
+        // columns collapse to a single unqualified output column; NATURAL
+        // gets its common-column ON synthesised). The rewrite clears the
+        // flags, so this re-entrant call is a no-op on the second pass.
+        if let Some(rewritten) = self.desugar_using_natural(stmt)? {
+            return self.exec_bare_select_cancel(&rewritten, cancel);
+        }
         // v7.16.2 — same meta-view dispatch as
         // `exec_select_cancel`, applied here too because
         // `subquery_replacement` enters this function directly

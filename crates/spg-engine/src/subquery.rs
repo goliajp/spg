@@ -1811,6 +1811,8 @@ impl Engine {
                 op: BinOp::Eq,
                 rhs: alloc::boxed::Box::new(Expr::Column(outer_col)),
             }),
+            using_cols: None,
+            natural: false,
         };
         let repl = ColumnName {
             qualifier: Some(cte_name),
@@ -2076,6 +2078,8 @@ impl Engine {
                 jsonb_each_text_arg: None,
             },
             on: Some(on),
+            using_cols: None,
+            natural: false,
         };
         let repl = ColumnName {
             qualifier: Some(fresh),
@@ -2604,6 +2608,8 @@ impl Engine {
                 jsonb_each_text_arg: None,
             },
             on: Some(on),
+            using_cols: None,
+            natural: false,
         };
         let residual = if negated {
             // anti-join: pick the FIRST inner key as the IS NULL probe.
