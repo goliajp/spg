@@ -19,8 +19,9 @@ use crate::eval::{EvalContext, EvalError};
 use crate::join::RowRef;
 use crate::system_catalog::collect_view_refs;
 use crate::{
-    ByteBudget, CancelToken, Engine, EngineError, QueryResult, aggregate, apply_offset_and_limit,
-    apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys, collect_meta_view_names,
+    ByteBudget, CancelToken, Engine, EngineError, OrderKey, QueryResult, aggregate,
+    apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
+    collect_meta_view_names,
     collect_qualified_refs, collect_scalar_subqueries, collect_window_nodes,
     compute_window_partition, eval, expr_tree_has_subquery, materialise_in_order,
     materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp, partial_sort_tagged,
@@ -256,7 +257,7 @@ impl Engine {
         // works for the projection's per-row column references.
         let ext_ctx = EvalContext::new(&ext_cols, alias_opt);
         let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
-        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(n_rows);
+        let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
             if i.is_multiple_of(256) {
                 cancel.check()?;
@@ -1757,7 +1758,7 @@ impl Engine {
                 })
                 .collect();
             let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
-            let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(rows.len());
+            let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
                 let keys = build_order_keys(&resolved_order, &r, &synth_ctx)?;
                 tagged.push((keys, r));
@@ -3268,7 +3269,7 @@ impl Engine {
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
-        let mut tagged: Vec<(Vec<f64>, Row<'static>)> = Vec::new();
+        let mut tagged: Vec<(Vec<OrderKey>, Row<'static>)> = Vec::new();
         // v7.33 (C1, ceiling-first/never-die) — charge each accumulated
         // output row to the per-query byte budget as it is built, so a
         // fat single-table scan / sort REJECTS with QueryBytesExceeded
@@ -3855,7 +3856,7 @@ impl Engine {
         // ORDER BY (when present) still evaluates against a materialised
         // Row — keep the order-key encoder correct rather than fork it.
         let need_eval_row = !all_proj_bound || !stmt.order_by.is_empty();
-        let mut tagged: Vec<(Vec<f64>, Row<'static>)> = Vec::new();
+        let mut tagged: Vec<(Vec<OrderKey>, Row<'static>)> = Vec::new();
         let mut proj_memo = memoize::MemoizeCache::default();
         let sources_ref = &deferred.sources;
         let stride = deferred.stride;
@@ -4084,44 +4085,60 @@ fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
 /// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;
 /// NULL sorts last (treated as `+∞`); booleans are 0.0 / 1.0; text uses lex
 /// order via the byte values; vectors are not sortable.
-pub(crate) fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
-    match v {
-        Value::Null => Ok(f64::INFINITY),
-        Value::SmallInt(n) => Ok(f64::from(*n)),
-        Value::Int(n) => Ok(f64::from(*n)),
-        Value::Date(d) => Ok(f64::from(*d)),
+pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
+    // v7.37.16 — TEXT rides a FULL-precision key: carry the whole string
+    // so values sharing a ≥6-byte common prefix (`product_001` vs
+    // `product_002`, ISO timestamps stored as text, prefixed IDs / SKUs)
+    // order by their exact bytes instead of the old lossy f64 coarse key.
+    // Comparison is byte-lexicographic (see `order_key_elem_cmp`), which
+    // matches PG's default C / binary text collation. Every other type
+    // keeps the lossless-enough `f64` fast path below.
+    if let Value::Text(s) = v {
+        return Ok(OrderKey::Text(s.as_ref().into()));
+    }
+    let num = match v {
+        Value::Null => f64::INFINITY,
+        Value::SmallInt(n) => f64::from(*n),
+        Value::Int(n) => f64::from(*n),
+        Value::Date(d) => f64::from(*d),
         #[allow(clippy::cast_precision_loss)]
-        Value::Timestamp(t) => Ok(*t as f64),
+        Value::Timestamp(t) => *t as f64,
         // v7.17.0 Phase 3.P0-32 — PG TIME ordered by underlying
         // i64 microseconds (matches wall-clock ordering).
         #[allow(clippy::cast_precision_loss)]
-        Value::Time(us) => Ok(*us as f64),
+        Value::Time(us) => *us as f64,
         // v7.17.0 Phase 3.P0-33 — MySQL YEAR ordered by underlying
         // u16 (matches calendar ordering; zero-year sentinel
         // sorts before 1901).
-        Value::Year(y) => Ok(f64::from(*y)),
+        Value::Year(y) => f64::from(*y),
         // v7.17.0 Phase 3.P0-34 — PG TIMETZ ordered by the
         // UTC-equivalent microseconds (local wall - offset). Two
         // values for the same physical instant in different zones
         // sort equal — matches PG TIMETZ index behaviour.
         #[allow(clippy::cast_precision_loss)]
-        Value::TimeTz { us, offset_secs } => Ok((us - i64::from(*offset_secs) * 1_000_000) as f64),
+        Value::TimeTz { us, offset_secs } => (us - i64::from(*offset_secs) * 1_000_000) as f64,
         // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
         #[allow(clippy::cast_precision_loss)]
-        Value::Money(c) => Ok(*c as f64),
+        Value::Money(c) => *c as f64,
         // v7.17.0 Phase 3.P0-38 — range ordering is not supported
         // in v7.17.0 (needs lex-then-inclusivity tiebreak).
-        Value::Range { .. } => Err(EngineError::Unsupported(
-            "ORDER BY of a range value is not supported in v7.17.0".into(),
-        )),
+        Value::Range { .. } => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of a range value is not supported in v7.17.0".into(),
+            ));
+        }
         // v7.17.0 Phase 3.P0-39 — hstore is not orderable.
-        Value::Hstore(_) => Err(EngineError::Unsupported(
-            "ORDER BY of a hstore value is not supported".into(),
-        )),
+        Value::Hstore(_) => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of a hstore value is not supported".into(),
+            ));
+        }
         // v7.17.0 Phase 3.P0-40 — 2D arrays not orderable.
-        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => Err(
-            EngineError::Unsupported("ORDER BY of a 2D array is not supported in v7.17.0".into()),
-        ),
+        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of a 2D array is not supported in v7.17.0".into(),
+            ));
+        }
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -4133,54 +4150,45 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
             for _ in 0..*scale {
                 divisor *= 10.0;
             }
-            Ok((*scaled as f64) / divisor)
+            (*scaled as f64) / divisor
         }
         #[allow(clippy::cast_precision_loss)]
-        Value::BigInt(n) => Ok(*n as f64),
-        Value::Float(x) => Ok(*x),
-        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::Text(s) => {
-            // Lex order by codepoints. Pack the first 8 bytes into a u64
-            // key that PRESERVES codepoint order. The bytes must be
-            // LEFT-justified (fixed 8-byte field, zero-padded on the
-            // right): a shorter string occupies the high bytes and pads
-            // the low ones with 0x00, so 'app' < 'apple' and the key
-            // magnitude tracks content, not length. The old code shifted
-            // in only the present bytes, so a shorter string landed in
-            // the low bits and ALWAYS sorted before a longer one — an
-            // ORDER BY on text ordered by string length, not value
-            // (e.g. 'date' before 'apple'). Beyond ~6 bytes the f64
-            // mantissa can no longer distinguish keys, so tail-only
-            // differences tie (a coarse-key limitation of this fast
-            // path; a real string comparator would remove it).
-            let bytes = s.as_bytes();
-            let mut key: u64 = 0;
-            for i in 0..8 {
-                key = (key << 8) | u64::from(bytes.get(i).copied().unwrap_or(0));
+        Value::BigInt(n) => *n as f64,
+        Value::Float(x) => *x,
+        Value::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
             }
-            #[allow(clippy::cast_precision_loss)]
-            Ok(key as f64)
         }
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
-            Err(EngineError::Unsupported(
+            return Err(EngineError::Unsupported(
                 "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
-            ))
+            ));
         }
-        Value::Interval { .. } => Err(EngineError::Unsupported(
-            "ORDER BY of an INTERVAL is not supported in v2.11 \
-             (months vs micros has no single canonical ordering)"
-                .into(),
-        )),
-        Value::Json(_) => Err(EngineError::Unsupported(
-            "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
-        )),
+        Value::Interval { .. } => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of an INTERVAL is not supported in v2.11 \
+                 (months vs micros has no single canonical ordering)"
+                    .into(),
+            ));
+        }
+        Value::Json(_) => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
+            ));
+        }
         // v7.5.0 — Value is #[non_exhaustive]; future variants need
         // an explicit ORDER BY mapping. Surface as Unsupported until
         // engine support is added.
-        _ => Err(EngineError::Unsupported(
-            "ORDER BY of this value type is not supported".into(),
-        )),
-    }
+        _ => {
+            return Err(EngineError::Unsupported(
+                "ORDER BY of this value type is not supported".into(),
+            ));
+        }
+    };
+    Ok(OrderKey::Num(num))
 }
 
 /// Find the schema entry that a SELECT-list `Expr::Column` refers to.
