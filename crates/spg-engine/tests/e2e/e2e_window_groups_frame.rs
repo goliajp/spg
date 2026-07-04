@@ -57,12 +57,15 @@ fn groups_current_row_to_unbounded_following_matches_range() {
 }
 
 #[test]
-fn groups_offset_bounds_error() {
+fn groups_offset_bounds_supported() {
+    // v7.37 D — GROUPS with an integer offset is now supported (peer-group
+    // counted frame). A lone row's frame is just its own group. PG18: 10.
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT, v INT)");
     ddl(&mut e, "INSERT INTO t VALUES (1, 10)");
-    let err = e.execute(
+    let out = rows(
+        &mut e,
         "SELECT SUM(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
     );
-    assert!(err.is_err(), "GROUPS with integer offset should error");
+    assert_eq!(out, vec![vec![Value::Float(10.0)]]);
 }
