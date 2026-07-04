@@ -1286,6 +1286,34 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
     }
 }
 
+/// Element-wise ordering of one array element pair. PG's `array_cmp`
+/// (the btree support routine backing `=` / `<` / `>` on arrays)
+/// treats a NULL element as *greater* than any non-NULL, and two
+/// NULLs as equal — a total order, unlike scalar `NULL = NULL`
+/// which is unknown. This is why `ARRAY[1,NULL] = ARRAY[1,NULL]`
+/// is `t` and `ARRAY[1,2] < ARRAY[1,NULL]` is `t`.
+fn cmp_array_elem<T: Ord>(a: &Option<T>, b: &Option<T>) -> core::cmp::Ordering {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    match (a, b) {
+        (None, None) => Equal,
+        (None, Some(_)) => Greater,
+        (Some(_), None) => Less,
+        (Some(x), Some(y)) => x.cmp(y),
+    }
+}
+
+/// Lexicographic array comparison: first differing element decides;
+/// when one array is a prefix of the other, the shorter is less.
+fn cmp_array<T: Ord>(a: &[Option<T>], b: &[Option<T>]) -> core::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let c = cmp_array_elem(x, y);
+        if c != core::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -1382,6 +1410,27 @@ pub(super) fn compare(
                 detail: format!("invalid input syntax for type uuid: {a:?}"),
             })?;
             au.cmp(b)
+        }
+        // v7.37.16 — element-wise array ordering for `=` / `<>` /
+        // `<` / `<=` / `>` / `>=`. PG compares same-type arrays with
+        // `array_cmp`; see `cmp_array` for the NULL / length rules.
+        (Value::IntArray(a), Value::IntArray(b)) => cmp_array(a, b),
+        (Value::BigIntArray(a), Value::BigIntArray(b)) => cmp_array(a, b),
+        (Value::SmallIntArray(a), Value::SmallIntArray(b)) => cmp_array(a, b),
+        (Value::TextArray(a), Value::TextArray(b)) => cmp_array(a, b),
+        (Value::VarcharArray(a), Value::VarcharArray(b)) => cmp_array(a, b),
+        (Value::BoolArray(a), Value::BoolArray(b)) => cmp_array(a, b),
+        (Value::DateArray(a), Value::DateArray(b)) => cmp_array(a, b),
+        (Value::TimestampArray(a), Value::TimestampArray(b)) => cmp_array(a, b),
+        // Int / BigInt arrays cross-compare after widening the
+        // narrower side (mirrors the `||` widening rules).
+        (Value::IntArray(a), Value::BigIntArray(b)) => {
+            let aw: alloc::vec::Vec<Option<i64>> = a.iter().map(|o| o.map(i64::from)).collect();
+            cmp_array(&aw, b)
+        }
+        (Value::BigIntArray(a), Value::IntArray(b)) => {
+            let bw: alloc::vec::Vec<Option<i64>> = b.iter().map(|o| o.map(i64::from)).collect();
+            cmp_array(a, &bw)
         }
         (a, b) => {
             return Err(EvalError::TypeMismatch {

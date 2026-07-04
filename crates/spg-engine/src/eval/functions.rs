@@ -2800,7 +2800,9 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            if dim != 1 {
+            // PG: an empty array has *no* dimensions, so
+            // `array_length('{}'::int[], 1)` is NULL — not 0.
+            if dim != 1 || len == 0 {
                 return Ok(Value::Null);
             }
             let n = i32::try_from(len).unwrap_or(i32::MAX);
@@ -2929,8 +2931,20 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            // PG compares with IS NOT DISTINCT FROM semantics, so a
+            // NULL search value matches a NULL array element:
+            // `array_position(ARRAY[1,NULL,2], NULL)` → 2.
             if matches!(args[1], Value::Null) {
-                return Ok(Value::Null);
+                let first_null = match &args[0] {
+                    Value::TextArray(items) => items.iter().position(Option::is_none),
+                    Value::IntArray(items) => items.iter().position(Option::is_none),
+                    Value::BigIntArray(items) => items.iter().position(Option::is_none),
+                    _ => None,
+                };
+                return Ok(match first_null {
+                    Some(idx) => Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)),
+                    None => Value::Null,
+                });
             }
             match (&args[0], &args[1]) {
                 (Value::TextArray(items), Value::Text(needle)) => {
