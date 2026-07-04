@@ -1519,6 +1519,101 @@ fn range_eq(
     a == b
 }
 
+/// A canonicalised range span: (lower, lower_inc, upper, upper_inc).
+type CanonSpan = (Option<Value<'static>>, bool, Option<Value<'static>>, bool);
+
+/// Compare two range-element bound values of the same range kind.
+fn bound_cmp(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Numeric { scaled: xs, scale: xc }, Value::Numeric { scaled: ys, scale: yc }) => {
+            numeric_pair_cmp((*xs, *xc), (*ys, *yc))
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+/// Sort key for range lowers: `None` (−∞) first, then by value, then an
+/// inclusive lower before an exclusive one at the same value.
+fn lower_cmp(al: &Option<Value<'static>>, ali: bool, bl: &Option<Value<'static>>, bli: bool) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (al, bl) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => bound_cmp(x, y).then(bli.cmp(&ali)), // inclusive(true) first
+    }
+}
+
+/// Does a span ending at `(au, aui)` reach a following span starting at
+/// `(bl, bli)` — i.e. they overlap or are adjacent (no gap)?
+fn upper_reaches_lower(au: &Option<Value<'static>>, aui: bool, bl: &Option<Value<'static>>, bli: bool) -> bool {
+    use core::cmp::Ordering;
+    match (au, bl) {
+        (None, _) => true,   // +∞ upper reaches anything
+        (_, None) => true,   // following span starts at −∞
+        (Some(u), Some(l)) => match bound_cmp(u, l) {
+            Ordering::Greater => true,       // overlap
+            Ordering::Equal => aui || bli,   // adjacent iff the touching point is covered
+            Ordering::Less => false,         // gap
+        },
+    }
+}
+
+/// Is upper `(au, aui)` strictly greater than upper `(bu, bui)`?
+fn upper_greater(au: &Option<Value<'static>>, aui: bool, bu: &Option<Value<'static>>, bui: bool) -> bool {
+    use core::cmp::Ordering;
+    match (au, bu) {
+        (None, None) => false,
+        (None, Some(_)) => true, // +∞ greatest
+        (Some(_), None) => false,
+        (Some(x), Some(y)) => match bound_cmp(x, y) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => aui && !bui, // inclusive upper > exclusive upper
+        },
+    }
+}
+
+/// Normalise a multirange's spans to PG's canonical form: canonicalise each
+/// (discrete `[)`), drop empties, sort by lower, then merge any overlapping
+/// or adjacent spans. Two multiranges are equal iff their normal forms match.
+fn normalize_multirange(kind: spg_storage::RangeKind, spans: &[spg_storage::RangeSpan]) -> alloc::vec::Vec<CanonSpan> {
+    let mut cs: alloc::vec::Vec<CanonSpan> = spans
+        .iter()
+        .filter(|s| !s.empty)
+        .map(|s| range_canonical(kind, &s.lower, &s.upper, s.lower_inc, s.upper_inc))
+        .collect();
+    cs.sort_by(|a, b| lower_cmp(&a.0, a.1, &b.0, b.1));
+    let mut out: alloc::vec::Vec<CanonSpan> = alloc::vec::Vec::new();
+    for s in cs {
+        if let Some(last) = out.last_mut() {
+            if upper_reaches_lower(&last.2, last.3, &s.0, s.1) {
+                if upper_greater(&s.2, s.3, &last.2, last.3) {
+                    last.2 = s.2;
+                    last.3 = s.3;
+                }
+                continue;
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+fn multirange_eq(
+    ak: spg_storage::RangeKind,
+    aranges: &[spg_storage::RangeSpan],
+    bk: spg_storage::RangeKind,
+    branges: &[spg_storage::RangeSpan],
+) -> bool {
+    ak == bk && normalize_multirange(ak, aranges) == normalize_multirange(bk, branges)
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -1768,6 +1863,20 @@ pub(super) fn compare(
                 BinOp::NotEq => Ok(Value::Bool(!eq)),
                 _ => Err(EvalError::TypeMismatch {
                     detail: "range ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
+                }),
+            };
+        }
+        // v7.37 — MULTIRANGE equality (=/<>). Normalise both to PG's
+        // canonical form (canonicalise each span, drop empties, sort, merge
+        // overlapping/adjacent spans) and compare. Ordering is deferred.
+        (Value::Multirange { kind: ak, ranges: ar }, Value::Multirange { kind: bk, ranges: br }) => {
+            let eq = multirange_eq(*ak, ar, *bk, br);
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "multirange ordering (<, <=, >, >=) not yet supported; only = / <>"
+                        .into(),
                 }),
             };
         }
