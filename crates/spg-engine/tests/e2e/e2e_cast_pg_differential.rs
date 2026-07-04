@@ -1845,3 +1845,22 @@ fn percentile_cont_array() {
     assert_eq!(q(&mut e, "SELECT (percentile_cont(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"), "{1.75,2.5,3.25}");
     assert_eq!(q(&mut e, "SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"), "2.5");
 }
+
+/// v7.37 D — percentile_disc(ARRAY[...]) returns an array of the ordered-column
+/// element type (one selected value per requested percentile). PG18.4-verified.
+#[test]
+fn percentile_disc_array() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(), o => format!("{o:?}"),
+            },
+            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT (percentile_disc(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (10),(20),(30),(40)) t(v)"), "{10,20,30}");
+    assert_eq!(q(&mut e, "SELECT (percentile_disc(ARRAY[0.5,1.0]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES ('a'),('b'),('c')) t(v)"), "{b,c}");
+    // scalar form unchanged
+    assert_eq!(q(&mut e, "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1),(2),(3),(4)) t(v)"), "2");
+}

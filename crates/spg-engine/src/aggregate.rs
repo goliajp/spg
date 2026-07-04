@@ -3483,6 +3483,45 @@ fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<f64>> {
     }
 }
 
+/// Build an array Value from a list of scalar values, dispatching on the first
+/// non-NULL element's type (mirrors array_agg's finalize). Used by the array
+/// form of `percentile_disc`, whose result is an array of the ordered-column
+/// element type.
+fn values_to_array(picked: &[Value<'_>]) -> Value<'static> {
+    let probe = picked.iter().find(|v| !v.is_null());
+    match probe.and_then(spg_storage::Value::data_type) {
+        Some(DataType::Int) | Some(DataType::SmallInt) => Value::IntArray(
+            picked
+                .iter()
+                .map(|v| match v {
+                    Value::Int(n) => Some(*n),
+                    Value::SmallInt(n) => Some(i32::from(*n)),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Some(DataType::BigInt) => Value::BigIntArray(
+            picked
+                .iter()
+                .map(|v| match v {
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => Value::TextArray(
+            picked
+                .iter()
+                .map(|v| match v {
+                    Value::Text(s) => Some(s.to_string()),
+                    Value::Null => None,
+                    other => Some(format!("{other:?}")),
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// NUMERIC → f64 for the float-math aggregates (stddev / variance / corr /
 /// percentile_cont). `scaled × 10^-scale`; `10^scale` fits in i128 for the
 /// NUMERIC scale range, so no `f64::powi` (unavailable under no_std) is needed.
@@ -3578,20 +3617,27 @@ fn finalize_ordered_set(
             }
             items[best_i].clone()
         }
-        // The first value whose cumulative fraction reaches `f`.
+        // The first value whose cumulative fraction reaches `f`. PG accepts
+        // both a scalar fraction (→ the element) and an array of fractions (→
+        // an array of the ordered-column element type).
         "percentile_disc" => {
-            let f = fraction
-                .and_then(agg_value_to_f64)
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
-            let idx = if f <= 0.0 {
-                0
-            } else {
-                (crate::eval::f64_ceil(f * n as f64) as usize)
-                    .saturating_sub(1)
-                    .min(n - 1)
+            let idx_at = |f: f64| -> usize {
+                let f = f.clamp(0.0, 1.0);
+                if f <= 0.0 {
+                    0
+                } else {
+                    (crate::eval::f64_ceil(f * n as f64) as usize)
+                        .saturating_sub(1)
+                        .min(n - 1)
+                }
             };
-            items[idx].clone()
+            if let Some(fracs) = percentile_fraction_array(fraction) {
+                let picked: Vec<Value> =
+                    fracs.iter().map(|f| items[idx_at(*f)].clone()).collect();
+                return values_to_array(&picked);
+            }
+            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0);
+            items[idx_at(f)].clone()
         }
         // Linear interpolation between the two bracketing values. PG accepts
         // both a scalar fraction (→ float) and an array of fractions (→ a
