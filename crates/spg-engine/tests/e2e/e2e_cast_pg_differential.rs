@@ -1727,3 +1727,16 @@ fn circle_circle_distance() {
     // control: point <-> circle still works.
     ck(&mut e, "('(0,0)'::point <-> '<(5,0),1>'::circle)::text", "4");
 }
+
+/// v7.37 D — cidr ± integer behaves as PG's implicit cidr->inet cast then
+/// shifts the address. Previously errored. PG18.4-verified.
+#[test]
+fn cidr_int_arithmetic() {
+    let mut e = Engine::new();
+    ck(&mut e, "host('192.168.1.0/24'::cidr + 5)", "192.168.1.5");
+    ck(&mut e, "masklen('192.168.1.0/24'::cidr + 5)::text", "24");
+    ck(&mut e, "host('192.168.2.0/24'::cidr - 256)", "192.168.1.0");
+    ck(&mut e, "host('10.0.0.0/8'::cidr + 300)", "10.0.1.44");
+    // control: inet + int still works.
+    ck(&mut e, "host('192.168.1.5'::inet + 10)", "192.168.1.15");
+}
