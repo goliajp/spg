@@ -9123,6 +9123,23 @@ impl Parser {
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
             "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
+            // pg_dump's canonical spellings: `character varying(n)` = varchar,
+            // `character(n)` = char, bare `character` = char(1). Unbounded
+            // `character varying` maps to text.
+            "character" => {
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("varying")) {
+                    self.advance();
+                    if matches!(self.peek(), Token::LParen) {
+                        ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?)
+                    } else {
+                        ColumnTypeName::Text
+                    }
+                } else if matches!(self.peek(), Token::LParen) {
+                    ColumnTypeName::Char(self.parse_paren_size("CHAR")?)
+                } else {
+                    ColumnTypeName::Char(1)
+                }
+            }
             "vector" => {
                 let dim = self.parse_paren_size("VECTOR")?;
                 let encoding = self.parse_optional_vector_encoding()?;
@@ -9136,6 +9153,11 @@ impl Parser {
             // MySQL's `DATETIME` is the same domain as standard
             // `TIMESTAMP` — accept both spellings.
             "timestamp" | "datetime" => {
+                // pg_dump emits `TIMESTAMP(6) WITH TIME ZONE` — the optional
+                // fractional-seconds precision comes BEFORE the `WITH/WITHOUT
+                // TIME ZONE` clause, so consume it first. SPG stores µs always;
+                // accept + discard the precision.
+                self.consume_optional_paren_size();
                 // v7.14.0 — PG canonical `TIMESTAMP WITH TIME ZONE`
                 // / `TIMESTAMP WITHOUT TIME ZONE`. pg_dump emits
                 // the full form. SPG canonicalises:
@@ -9168,7 +9190,10 @@ impl Parser {
             // v7.9.2 — `TIMESTAMPTZ` and full PG spelling
             // `TIMESTAMP WITH TIME ZONE`. Same storage as TIMESTAMP;
             // only PG-wire OID differs.
-            "timestamptz" => ColumnTypeName::Timestamptz,
+            "timestamptz" => {
+                self.consume_optional_paren_size();
+                ColumnTypeName::Timestamptz
+            }
             // v4.9: JSON / JSONB. Stored as raw text — no parse-time
             // validation. We accept the JSONB spelling too because
             // most PG clients default to it; SPG doesn't distinguish
@@ -9200,10 +9225,46 @@ impl Parser {
             // Storage = three-field {months, days, micros}, catalog
             // tag 34, FILE_VERSION 48+, wire OID 1186. Prior to this
             // line `INTERVAL` was parser-rejected at CREATE TABLE.
-            "interval" => ColumnTypeName::Interval,
+            "interval" => {
+                // pg_dump emits field-qualified forms like `INTERVAL DAY TO
+                // SECOND` and an optional `(p)` precision. SPG stores the full
+                // {months,days,micros}; consume + ignore the qualifier/precision.
+                while matches!(self.peek(), Token::To)
+                    || matches!(self.peek(), Token::Ident(s) if matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "year" | "month" | "day" | "hour" | "minute" | "second"
+                    ))
+                {
+                    self.advance();
+                }
+                self.consume_optional_paren_size();
+                ColumnTypeName::Interval
+            }
             // v7.17.0 Phase 3.P0-32 — PG `TIME` (without time zone).
             // i64 microseconds since 00:00:00. Wire OID 1083.
-            "time" => ColumnTypeName::Time,
+            // pg_dump emits `TIME(6)` and `TIME(6) WITH TIME ZONE`.
+            "time" => {
+                self.consume_optional_paren_size();
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    ColumnTypeName::TimeTz
+                } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("without"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    ColumnTypeName::Time
+                } else {
+                    ColumnTypeName::Time
+                }
+            }
             // v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in
             // 1901..=2155 + zero-year sentinel 0. Wire = INT4.
             "year" => ColumnTypeName::Year,
