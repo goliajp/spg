@@ -179,6 +179,14 @@ enum ReNode {
 enum ClassMember {
     Single(char),
     Range(char, char),
+    /// A shortcut-class complement used *inside* a bracket expression:
+    /// `[\D]`, `[\W]`, `[\S]`. Matches iff the char is NOT in any of the
+    /// held sub-members. PG ARE recognises these shortcuts within
+    /// `[...]` (e.g. `[\D]` = a non-digit); the positive forms
+    /// (`\d`/`\w`/`\s`) expand inline into ordinary Single/Range members
+    /// and need no variant. Union semantics across the whole class are
+    /// preserved: `[a\D]` matches `'a'` OR any non-digit.
+    NotInSet(Vec<ClassMember>),
 }
 
 /// PG ARE word-boundary assertion flavours (regc_locale.c semantics).
@@ -332,33 +340,7 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
             *p += 1;
             Ok(inner)
         }
-        '[' => {
-            *p += 1;
-            let mut negated = false;
-            if *p < chars.len() && chars[*p] == '^' {
-                negated = true;
-                *p += 1;
-            }
-            let mut members: Vec<ClassMember> = Vec::new();
-            while *p < chars.len() && chars[*p] != ']' {
-                let start = chars[*p];
-                *p += 1;
-                if *p + 1 < chars.len() && chars[*p] == '-' && chars[*p + 1] != ']' {
-                    let end = chars[*p + 1];
-                    *p += 2;
-                    members.push(ClassMember::Range(start, end));
-                } else {
-                    members.push(ClassMember::Single(start));
-                }
-            }
-            if *p >= chars.len() {
-                return Err(EvalError::TypeMismatch {
-                    detail: "regex compile: unmatched '['".into(),
-                });
-            }
-            *p += 1; // consume ]
-            Ok(ReNode::Class { members, negated })
-        }
+        '[' => re_parse_class(chars, p),
         '.' => {
             *p += 1;
             Ok(ReNode::AnyChar)
@@ -408,21 +390,11 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                     negated: true,
                 }),
                 's' => Ok(ReNode::Class {
-                    members: alloc::vec![
-                        ClassMember::Single(' '),
-                        ClassMember::Single('\t'),
-                        ClassMember::Single('\n'),
-                        ClassMember::Single('\r'),
-                    ],
+                    members: shortcut_members('s'),
                     negated: false,
                 }),
                 'S' => Ok(ReNode::Class {
-                    members: alloc::vec![
-                        ClassMember::Single(' '),
-                        ClassMember::Single('\t'),
-                        ClassMember::Single('\n'),
-                        ClassMember::Single('\r'),
-                    ],
+                    members: shortcut_members('s'),
                     negated: true,
                 }),
                 // PG ARE word-boundary assertions (constraint escapes,
@@ -434,6 +406,14 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                 'Y' => Ok(ReNode::WordBoundary(WordBoundaryKind::NonBoundary)),
                 'm' => Ok(ReNode::WordBoundary(WordBoundaryKind::BegWord)),
                 'M' => Ok(ReNode::WordBoundary(WordBoundaryKind::EndWord)),
+                // PG ARE string anchors (constraint escapes, regc_lex.c):
+                // `\A` matches only at the start of the string, `\Z` only
+                // at the end. This engine has no newline-sensitive mode,
+                // so `\A` ≡ `^` (Start) and `\Z` ≡ `$` (End) exactly.
+                // Verified against live PG18: `'foobar' ~ '\Afoo'` = t,
+                // `'xfoo' ~ '\Afoo'` = f, `'foobar' ~ 'bar\Z'` = t.
+                'A' => Ok(ReNode::Start),
+                'Z' => Ok(ReNode::End),
                 // Character-entry escapes matching PG ARE semantics.
                 'b' => Ok(ReNode::Literal('\u{08}')), // backspace
                 'B' => Ok(ReNode::Literal('\\')),     // literal backslash
@@ -445,6 +425,105 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
             Ok(ReNode::Literal(other))
         }
     }
+}
+
+/// v7.37.16 regex slice — parse a bracket expression `[...]` beginning
+/// at `chars[*p] == '['`. Extends the original member/range parser with
+/// the PG-ARE bracket features SQL apps rely on, all captured against
+/// live PG18:
+///
+///   * POSIX classes `[[:alpha:]]`, `[[:digit:]]`, … (unknown name or
+///     the `[:^name:]` negated form → "invalid character class", exactly
+///     as PG rejects them);
+///   * shortcut escapes inside the class — `[\d]`, `[\w]`, `[\s]` expand
+///     inline; the complements `[\D]`, `[\W]`, `[\S]` become a
+///     `NotInSet` member; char escapes `[\t]`, `[\n]`, `[\\]`, `[\]]`, …
+///     fold to a literal;
+///   * a `]` in the first member position is a literal `]` (`[]a]`,
+///     `[^]a]`), matching POSIX/PG.
+///
+/// A leading `]` is the only member-position special case; `-` range and
+/// trailing/leading-`-` handling is unchanged from the original parser.
+fn re_parse_class(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
+    debug_assert_eq!(chars.get(*p), Some(&'['));
+    *p += 1;
+    let mut negated = false;
+    if *p < chars.len() && chars[*p] == '^' {
+        negated = true;
+        *p += 1;
+    }
+    let mut members: Vec<ClassMember> = Vec::new();
+    let mut first = true;
+    while *p < chars.len() {
+        let c = chars[*p];
+        // `]` closes the class — except in the first member position,
+        // where POSIX/PG treat it as a literal `]`.
+        if c == ']' && !first {
+            *p += 1; // consume closing ]
+            return Ok(ReNode::Class { members, negated });
+        }
+        first = false;
+
+        // POSIX class `[:name:]` — requires a literal `[` (inside the
+        // outer bracket) immediately followed by `:`.
+        if c == '[' && chars.get(*p + 1) == Some(&':') {
+            let mut q = *p + 2;
+            let name_start = q;
+            while q < chars.len() && chars[q] != ':' {
+                q += 1;
+            }
+            // Must close with `:]`. A missing `:]`, or a `[:^name:]`
+            // (which scans a name of "^name" → unknown), is rejected as
+            // an invalid character class — the same error PG raises.
+            if q + 1 >= chars.len() || chars[q + 1] != ']' {
+                return Err(EvalError::TypeMismatch {
+                    detail: "invalid regular expression: invalid character class".into(),
+                });
+            }
+            let name: String = chars[name_start..q].iter().collect();
+            members.extend(posix_class_members(&name)?);
+            *p = q + 2; // consume through `:]`
+            continue;
+        }
+
+        // Escape inside the class: positive shortcuts expand inline, the
+        // complements become a NotInSet member, char escapes fold to a
+        // literal.
+        if c == '\\' && *p + 1 < chars.len() {
+            let esc = chars[*p + 1];
+            *p += 2;
+            match esc {
+                'd' | 'w' | 's' => members.extend(shortcut_members(esc)),
+                'D' => members.push(ClassMember::NotInSet(shortcut_members('d'))),
+                'W' => members.push(ClassMember::NotInSet(shortcut_members('w'))),
+                'S' => members.push(ClassMember::NotInSet(shortcut_members('s'))),
+                't' => members.push(ClassMember::Single('\t')),
+                'n' => members.push(ClassMember::Single('\n')),
+                'r' => members.push(ClassMember::Single('\r')),
+                'f' => members.push(ClassMember::Single('\u{0c}')),
+                'v' => members.push(ClassMember::Single('\u{0b}')),
+                'b' => members.push(ClassMember::Single('\u{08}')), // backspace
+                other => members.push(ClassMember::Single(other)),
+            }
+            continue;
+        }
+
+        // Ordinary char, possibly the start of a range `a-z`. A trailing
+        // `-` (next char is the closing `]`) is a literal `-`.
+        let start = c;
+        *p += 1;
+        if *p + 1 < chars.len() && chars[*p] == '-' && chars[*p + 1] != ']' {
+            let end = chars[*p + 1];
+            *p += 2;
+            members.push(ClassMember::Range(start, end));
+        } else {
+            members.push(ClassMember::Single(start));
+        }
+    }
+    // Fell off the end of the pattern without a closing `]`.
+    Err(EvalError::TypeMismatch {
+        detail: "regex compile: unmatched '['".into(),
+    })
 }
 
 /// v7.37.16 Epic Rx P0 — parse a `{m}` / `{m,}` / `{m,n}` counted
@@ -524,7 +603,90 @@ fn class_matches(member: &ClassMember, c: char) -> bool {
     match member {
         ClassMember::Single(s) => *s == c,
         ClassMember::Range(a, b) => c >= *a && c <= *b,
+        ClassMember::NotInSet(subs) => !subs.iter().any(|m| class_matches(m, c)),
     }
+}
+
+/// v7.37.16 regex slice — the ASCII member list of a `\d`/`\w`/`\s`
+/// shortcut, shared by the top-level escape parser (`re_parse_atom`) and
+/// the in-bracket parser (`re_parse_class`) so both stay byte-identical.
+/// `\v`/`\f` are included in the space set to match PG's `[[:space:]]`.
+fn shortcut_members(kind: char) -> Vec<ClassMember> {
+    match kind {
+        'd' | 'D' => alloc::vec![ClassMember::Range('0', '9')],
+        'w' | 'W' => alloc::vec![
+            ClassMember::Range('a', 'z'),
+            ClassMember::Range('A', 'Z'),
+            ClassMember::Range('0', '9'),
+            ClassMember::Single('_'),
+        ],
+        's' | 'S' => alloc::vec![
+            ClassMember::Single(' '),
+            ClassMember::Single('\t'),
+            ClassMember::Single('\n'),
+            ClassMember::Single('\r'),
+            ClassMember::Single('\u{0b}'), // vertical tab
+            ClassMember::Single('\u{0c}'), // form feed
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// v7.37.16 regex slice — the ASCII member list of a POSIX class name
+/// (`alpha`, `digit`, …) as it appears inside `[[:name:]]`. Returns
+/// `Err` for an unknown name, matching PG18's "invalid character class"
+/// compile error. Scoped to ASCII, consistent with this engine's
+/// ASCII-only `\w`/`\d` handling (the matcher does not decode UTF-8).
+fn posix_class_members(name: &str) -> Result<Vec<ClassMember>, EvalError> {
+    let members = match name {
+        "alpha" => alloc::vec![ClassMember::Range('a', 'z'), ClassMember::Range('A', 'Z')],
+        "digit" => alloc::vec![ClassMember::Range('0', '9')],
+        "alnum" => alloc::vec![
+            ClassMember::Range('a', 'z'),
+            ClassMember::Range('A', 'Z'),
+            ClassMember::Range('0', '9'),
+        ],
+        "upper" => alloc::vec![ClassMember::Range('A', 'Z')],
+        "lower" => alloc::vec![ClassMember::Range('a', 'z')],
+        "xdigit" => alloc::vec![
+            ClassMember::Range('0', '9'),
+            ClassMember::Range('a', 'f'),
+            ClassMember::Range('A', 'F'),
+        ],
+        "word" => alloc::vec![
+            ClassMember::Range('a', 'z'),
+            ClassMember::Range('A', 'Z'),
+            ClassMember::Range('0', '9'),
+            ClassMember::Single('_'),
+        ],
+        "space" => alloc::vec![
+            ClassMember::Single(' '),
+            ClassMember::Single('\t'),
+            ClassMember::Single('\n'),
+            ClassMember::Single('\r'),
+            ClassMember::Single('\u{0b}'),
+            ClassMember::Single('\u{0c}'),
+        ],
+        "blank" => alloc::vec![ClassMember::Single(' '), ClassMember::Single('\t')],
+        "cntrl" => alloc::vec![
+            ClassMember::Range('\u{00}', '\u{1f}'),
+            ClassMember::Single('\u{7f}'),
+        ],
+        "print" => alloc::vec![ClassMember::Range('\u{20}', '\u{7e}')],
+        "graph" => alloc::vec![ClassMember::Range('\u{21}', '\u{7e}')],
+        "punct" => alloc::vec![
+            ClassMember::Range('\u{21}', '\u{2f}'),
+            ClassMember::Range('\u{3a}', '\u{40}'),
+            ClassMember::Range('\u{5b}', '\u{60}'),
+            ClassMember::Range('\u{7b}', '\u{7e}'),
+        ],
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "invalid regular expression: invalid character class".into(),
+            });
+        }
+    };
+    Ok(members)
 }
 
 /// Try to match `node` starting at `pos` in `s`. Returns Some(end)
@@ -1672,5 +1834,200 @@ mod matchall_tests {
                 "SPG disagrees with PG18 for {text:?} ~ {pat:?} (PG18={expected})"
             );
         }
+    }
+}
+
+// ─── PG18 differential corpus (v7.37.16 regex slice) ──────────────────
+//
+// Every SAFE-ADDITIVE expectation below was captured from live
+// PostgreSQL 18.4 (docker spg-bench-postgres, `~` / `regexp_match`).
+// A `check`ed row asserts SPG == PG18: SPG must match PG's boolean /
+// span. The KNOWN-DEFERRED block at the bottom pins SPG's *current*
+// (divergent) behaviour for the SEMANTIC / ARCHITECTURAL gaps that this
+// slice deliberately does NOT close — so an accidental change to them is
+// caught, without falsely claiming parity.
+#[cfg(test)]
+mod pg18_differential_tests {
+    extern crate std;
+
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    use spg_storage::Value;
+
+    /// `text ~ pat` (optionally case-insensitive) through the real entry
+    /// point `regexp_like` — the function backing the `~` / `~*` ops.
+    fn like(text: &str, pat: &str, ci: bool) -> bool {
+        let mut args = alloc::vec![Value::text(text), Value::text(pat)];
+        if ci {
+            args.push(Value::text("i"));
+        }
+        match super::regexp_like(&args).unwrap() {
+            Value::Bool(b) => b,
+            other => panic!("regexp_like returned {other:?}"),
+        }
+    }
+
+    /// First-match span through `regexp_match` (the span-returning path
+    /// where leftmost/longest differences are visible).
+    fn span(text: &str, pat: &str) -> Option<String> {
+        match super::regexp_match(&[Value::text(text), Value::text(pat)]).unwrap() {
+            Value::Null => None,
+            Value::TextArray(v) => v.into_iter().next().flatten(),
+            other => panic!("regexp_match returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg18_differential_corpus() {
+        let mut fails: Vec<String> = Vec::new();
+
+        // (text, pat, PG18-bool) — SAFE-ADDITIVE boolean cases.
+        let bool_cases: &[(&str, &str, bool)] = &[
+            // ── POSIX character classes ─────────────────────────────
+            ("ab12", "^[[:alpha:]]+", true),
+            ("__", "[[:alnum:]]", false),
+            ("a", "[[:alnum:]]", true),
+            (" ", "[[:space:]]", true),
+            ("A", "[[:upper:]]", true),
+            ("A", "[[:lower:]]", false),
+            ("a", "[[:lower:]]", true),
+            ("!", "[[:punct:]]", true),
+            ("@", "[[:punct:]]", true),
+            ("_", "[[:punct:]]", true),
+            (" ", "[[:punct:]]", false),
+            ("f", "[[:xdigit:]]", true),
+            ("g", "[[:xdigit:]]", false),
+            ("_", "[[:word:]]", true),
+            (" ", "[[:word:]]", false),
+            ("\u{0b}", "[[:space:]]", true), // vertical tab
+            ("\u{0c}", "[[:space:]]", true), // form feed
+            (" ", "[[:blank:]]", true),
+            ("\t", "[[:blank:]]", true),
+            ("\n", "[[:blank:]]", false),
+            ("\u{01}", "[[:cntrl:]]", true),
+            ("a", "[[:cntrl:]]", false),
+            (" ", "[[:print:]]", true),
+            (" ", "[[:graph:]]", false),
+            ("a", "[[:graph:]]", true),
+            ("a", "[^[:digit:]]", true), // negated bracket around POSIX
+            ("5", "[^[:digit:]]", false),
+            // ── \A / \Z string anchors ──────────────────────────────
+            ("foobar", r"\Afoo", true),
+            ("xfoo", r"\Afoo", false),
+            ("foobar", r"bar\Z", true),
+            ("barx", r"bar\Z", false),
+            ("aAb", r"a\Ab", false), // \A only at string start
+            // ── \s now includes vertical-tab / form-feed (PG parity) ─
+            ("\u{0b}", r"\s", true),
+            ("\u{0c}", r"\s", true),
+            ("\u{0b}", r"\S", false),
+            // ── escapes / shortcuts inside bracket expressions ──────
+            ("5", r"[\d]", true),
+            ("a", r"[\d]", false),
+            ("_", r"[\w]", true),
+            ("a", r"[\D]", true),
+            ("5", r"[\D]", false),
+            ("A", r"[\dA]", true),
+            ("\t", r"[\t]", true),
+            ("\t", r"[\s]", true),
+            ("x", r"[\S]", true),
+            ("\t", r"[\S]", false),
+            ("5", r"[\w.]", true),
+            // ── bracket edge cases (']' / '[' / '.' literals) ───────
+            ("]", "[]a]", true),
+            ("a", "[]a]", true),
+            ("b", "[^]a]", true),
+            ("]", "[^]a]", false),
+            (".", "[.]", true),
+            ("a", "[.]", false),
+            ("[", "[[]", true),
+            ("a", "[a-]", true),
+            ("-", "[a-]", true),
+            ("-", "[-a]", true),
+            // ── controls (must already pass — regression guard) ─────
+            ("m", "[a-z]", true),
+            ("5", "[^a-z]", true),
+            ("color", "colou?r", true),
+            ("abc", "^abc$", true),
+            ("cat", "cat|dog", true),
+            ("a.b", r"a\.b", true),
+            ("axb", r"a\.b", false),
+            ("7", r"\d", true),
+            ("a", r"\D", true),
+            ("_", r"\w", true),
+        ];
+        for &(text, pat, want) in bool_cases {
+            let got = like(text, pat, false);
+            if got != want {
+                fails.push(alloc::format!(
+                    "BOOL {text:?} ~ {pat:?}: PG18={want} SPG={got}"
+                ));
+            }
+        }
+
+        // Case-insensitive control (`~*`).
+        if !like("HELLO", "hello", true) {
+            fails.push("BOOL(ci) 'HELLO' ~* 'hello': PG18=true SPG=false".to_string());
+        }
+
+        // (text, pat, PG18-span) — SAFE-ADDITIVE + control span cases.
+        let span_cases: &[(&str, &str, Option<&str>)] = &[
+            ("ab12cd", "[[:digit:]]+", Some("12")),
+            ("a1!", "[[:alpha:][:digit:]]+", Some("a1")),
+            ("a5", r"[\d]+", Some("5")),
+            // controls
+            ("aXbXb", "a.*b", Some("aXbXb")),
+            ("aaab", "a+", Some("aaa")),
+            ("aaaa", "a{2,3}", Some("aaa")),
+        ];
+        for &(text, pat, want) in span_cases {
+            let got = span(text, pat);
+            let want_owned = want.map(|s| s.to_string());
+            if got != want_owned {
+                fails.push(alloc::format!(
+                    "SPAN {text:?} ~ {pat:?}: PG18={want:?} SPG={got:?}"
+                ));
+            }
+        }
+
+        // Invalid POSIX-class forms are a compile ERROR in PG18 — SPG
+        // must likewise reject them, not silently mis-parse.
+        for pat in ["[[:notaclass:]]", "[[:^upper:]]"] {
+            if super::re_compile(pat).is_ok() {
+                fails.push(alloc::format!(
+                    "COMPILE {pat:?}: PG18=error SPG=compiled-ok"
+                ));
+            }
+        }
+
+        assert!(
+            fails.is_empty(),
+            "SPG diverges from PG18 on {} case(s):\n  {}",
+            fails.len(),
+            fails.join("\n  ")
+        );
+    }
+
+    // KNOWN-DEFERRED gaps — NOT closed by this slice. Each row pins
+    // SPG's *current* behaviour and records PG18's (divergent) answer in
+    // a comment. These are SEMANTIC (leftmost-vs-longest / greedy-only)
+    // or ARCHITECTURAL (backreferences) and need a focused slice each.
+    #[test]
+    fn pg18_known_deferred_divergences() {
+        // POSIX-longest alternation — the biggest known correctness gap.
+        // PG18: regexp_match('ab','a|ab') = {ab}  (longest overall)
+        // SPG : leftmost-first branch wins → {a}
+        assert_eq!(span("ab", "a|ab"), Some("a".to_string()));
+
+        // Lazy quantifiers are parsed but treated as greedy.
+        // PG18: regexp_match('axbxb','a.*?b') = {axb}
+        // SPG : greedy → {axbxb}
+        assert_eq!(span("axbxb", "a.*?b"), Some("axbxb".to_string()));
+
+        // Backreferences — architectural (ReNode has no capture state).
+        // PG18: 'abab' ~ '(ab)\1' = true
+        // SPG : \1 is a literal '1' → false
+        assert!(!like("abab", r"(ab)\1", false));
     }
 }
