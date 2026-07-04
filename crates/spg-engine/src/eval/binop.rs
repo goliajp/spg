@@ -41,6 +41,23 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 })
         }
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
+        (UnOp::Neg, Value::SmallInt(n)) => {
+            n.checked_neg()
+                .map(Value::SmallInt)
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "smallint overflow on unary -".into(),
+                })
+        }
+        (UnOp::Neg, Value::Numeric { scaled, scale }) => {
+            scaled
+                .checked_neg()
+                .map(|s| Value::Numeric { scaled: s, scale })
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "numeric overflow on unary -".into(),
+                })
+        }
+        // NOTE: PG has no `- money` operator (unary minus on money is an
+        // error there), so money is intentionally NOT handled here.
         (
             UnOp::Neg,
             Value::Interval {
