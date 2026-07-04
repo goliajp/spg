@@ -2763,6 +2763,53 @@ fn apply_function_dispatch(
             let n = i32::try_from(len).unwrap_or(i32::MAX);
             Ok(Value::Int(n))
         }
+        // PG `array_fill(value, dims [, lower_bounds])` — build an array of
+        // `dims[0]` copies of `value`. SPG stores 1-D arrays; multi-dim fill
+        // is an honest error. The optional lower-bounds arg is accepted and
+        // ignored (SPG arrays are 1-based).
+        "array_fill" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_fill() takes 2 or 3 args, got {}", args.len()),
+                });
+            }
+            let dims: &[Option<i32>] = match &args[1] {
+                Value::IntArray(d) => d,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_fill(): dimensions must be int[], got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if dims.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "array_fill(): only 1-dimensional fill is supported".into(),
+                });
+            }
+            let n = dims[0].unwrap_or(0);
+            if n < 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "array_fill(): dimension must be non-negative".into(),
+                });
+            }
+            let n = n as usize;
+            match &args[0] {
+                Value::Int(v) => Ok(Value::IntArray(alloc::vec![Some(*v); n])),
+                Value::SmallInt(v) => Ok(Value::IntArray(alloc::vec![Some(i32::from(*v)); n])),
+                Value::BigInt(v) => Ok(Value::BigIntArray(alloc::vec![Some(*v); n])),
+                Value::Text(s) => Ok(Value::TextArray(alloc::vec![Some(s.to_string()); n])),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_fill(): unsupported element type {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "array_length" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
