@@ -383,6 +383,30 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // PG `get_bit(bit/varbit, n)`: bit strings are MSB-first with bit 0
+            // the leftmost bit, and the range is the bit length (not bytes*8).
+            if let Value::BitString { nbits, bytes } = &args[0] {
+                let bit_idx = match &args[1] {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "get_bit(): index must be integer".into(),
+                        });
+                    }
+                };
+                if bit_idx < 0 || (bit_idx as u64) >= u64::from(*nbits) {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "get_bit(): index {bit_idx} out of range 0..{nbits}"
+                        ),
+                    });
+                }
+                let byte_idx = (bit_idx as usize) / 8;
+                let bit_off = (bit_idx as usize) % 8;
+                let bit = (bytes[byte_idx] >> (7 - bit_off)) & 1;
+                return Ok(Value::Int(i32::from(bit)));
+            }
             let b = match &args[0] {
                 Value::Bytes(b) => b,
                 other => {
@@ -482,6 +506,50 @@ fn apply_function_dispatch(
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
+            }
+            // PG `set_bit(bit/varbit, n, v)`: MSB-first, range is the bit
+            // length; returns the modified bit string (not a bytea).
+            if let Value::BitString { nbits, bytes } = &args[0] {
+                let bit_idx = match &args[1] {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "set_bit(): index must be integer".into(),
+                        });
+                    }
+                };
+                let val = match &args[2] {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "set_bit(): value must be integer".into(),
+                        });
+                    }
+                };
+                if bit_idx < 0 || (bit_idx as u64) >= u64::from(*nbits) {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "set_bit(): index {bit_idx} out of range 0..{nbits}"
+                        ),
+                    });
+                }
+                if val != 0 && val != 1 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("set_bit(): value {val} must be 0 or 1"),
+                    });
+                }
+                let mut out = bytes.to_vec();
+                let byte_idx = (bit_idx as usize) / 8;
+                let bit_off = (bit_idx as usize) % 8;
+                let mask = 1u8 << (7 - bit_off);
+                if val == 1 {
+                    out[byte_idx] |= mask;
+                } else {
+                    out[byte_idx] &= !mask;
+                }
+                return Ok(Value::BitString { nbits: *nbits, bytes: out.into() });
             }
             let b = match &args[0] {
                 Value::Bytes(b) => b.as_ref(),
