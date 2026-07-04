@@ -2337,6 +2337,10 @@ pub(crate) fn coerce_value(
         }
         // MONEY → Text canonical `$N,NNN.CC`.
         (Value::Money(c), DataType::Text) => Some(Value::text(eval::format_money(c))),
+        // MONEY → NUMERIC: integer cents become a scale-2 decimal (dollars).
+        (Value::Money(c), DataType::Numeric { .. }) => {
+            Some(Value::Numeric { scaled: i128::from(c), scale: 2 })
+        }
         // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
         // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
         // `'(a,b)'`, with empty lower or upper for unbounded.

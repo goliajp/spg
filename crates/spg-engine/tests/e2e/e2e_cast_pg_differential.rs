@@ -732,3 +732,20 @@ fn tsquery_bool_operators() {
     // matter, not a bug in the operator).
     ck(&mut e, r#"(to_tsvector('cats') || to_tsvector('dogs'))::text"#, r#"'cats':1 'dogs':2"#);
 }
+
+/// MONEY arithmetic (money±money, money×/÷ number, money/money ratio) and
+/// money::numeric cast — literal/render/compare already worked. PG18.4-verified.
+#[test]
+fn money_arithmetic() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"('$100.00'::money + '$50.00'::money)::text"#, r#"$150.00"#);
+    ck(&mut e, r#"('$100.00'::money - '$30.00'::money)::text"#, r#"$70.00"#);
+    ck(&mut e, r#"('$100.00'::money * 2)::text"#, r#"$200.00"#);
+    ck(&mut e, r#"(2 * '$100.00'::money)::text"#, r#"$200.00"#);
+    ck(&mut e, r#"('$100.00'::money / 4)::text"#, r#"$25.00"#);
+    ck(&mut e, r#"('$100.00'::money / '$50.00'::money)::text"#, r#"2"#);
+    ck(&mut e, r#"('$100.00'::money::numeric)::text"#, r#"100.00"#);
+    // controls: literal, render, compare unchanged.
+    ck(&mut e, r#"('$1,234.56'::money)::text"#, r#"$1,234.56"#);
+    ck(&mut e, r#"('$100.00'::money > '$50.00'::money)::text"#, r#"true"#);
+}

@@ -228,6 +228,10 @@ pub(super) fn apply_binary(
             });
         }
     }
+    // MONEY arithmetic (integer cents) before the generic numeric path.
+    if let Some(result) = money_arith(op, &l, &r) {
+        return result;
+    }
     // Range `*` intersection / `+` union / `-` difference claim Mul / Add / Sub
     // before numeric/date arithmetic.
     if op == BinOp::Mul || op == BinOp::Add || op == BinOp::Sub {
@@ -2068,6 +2072,49 @@ fn range_difference(
     } else {
         // Keep `a`'s right part: [b.upper, a.upper).
         Ok(mk(bu2.map(alloc::boxed::Box::new), au2.map(alloc::boxed::Box::new), !bui2, aui2))
+    }
+}
+
+/// MONEY arithmetic on integer cents (PG semantics): `money ± money → money`,
+/// `money × number → money`, `money ÷ number → money`, `money ÷ money → float8`
+/// ratio. Returns `None` when the operator/operand shape is not money math (let
+/// the caller fall through). Rounding is half-away-from-zero, no_std-friendly.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'static>, EvalError>> {
+    if !matches!(l, Value::Money(_)) && !matches!(r, Value::Money(_)) {
+        return None;
+    }
+    // A plain number that scales a money amount.
+    let factor = |v: &Value<'_>| -> Option<f64> {
+        match v {
+            Value::SmallInt(n) => Some(f64::from(*n)),
+            Value::Int(n) => Some(f64::from(*n)),
+            Value::BigInt(n) => Some(*n as f64),
+            Value::Float(x) => Some(*x),
+            Value::Numeric { scaled, scale } => {
+                Some(*scaled as f64 / 10i128.pow(u32::from(*scale)) as f64)
+            }
+            _ => None,
+        }
+    };
+    let round_cents = |v: f64| -> i64 {
+        if v >= 0.0 { (v + 0.5) as i64 } else { (v - 0.5) as i64 }
+    };
+    match (op, l, r) {
+        (BinOp::Add, Value::Money(a), Value::Money(b)) => Some(Ok(Value::Money(a.saturating_add(*b)))),
+        (BinOp::Sub, Value::Money(a), Value::Money(b)) => Some(Ok(Value::Money(a.saturating_sub(*b)))),
+        (BinOp::Div, Value::Money(a), Value::Money(b)) => Some(if *b == 0 {
+            Err(EvalError::DivisionByZero)
+        } else {
+            Ok(Value::Float(*a as f64 / *b as f64))
+        }),
+        (BinOp::Mul, Value::Money(a), other) | (BinOp::Mul, other, Value::Money(a)) => {
+            factor(other).map(|f| Ok(Value::Money(round_cents(*a as f64 * f))))
+        }
+        (BinOp::Div, Value::Money(a), other) => factor(other).map(|f| {
+            if f == 0.0 { Err(EvalError::DivisionByZero) } else { Ok(Value::Money(round_cents(*a as f64 / f))) }
+        }),
+        _ => None,
     }
 }
 
