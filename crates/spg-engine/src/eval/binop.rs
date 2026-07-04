@@ -1448,6 +1448,80 @@ pub(super) fn compare(
                 }),
             };
         }
+        // v7.37.17 — SMALLINT integer comparison. SmallInt↔Float goes
+        // through the Float branch above; SmallInt↔Numeric through
+        // `apply_binary_numeric`; only the pure-integer pairs land here.
+        // Widen to the common width and compare by value.
+        (Value::SmallInt(a), Value::SmallInt(b)) => i32::from(*a).cmp(&i32::from(*b)),
+        (Value::SmallInt(a), Value::Int(b)) => i32::from(*a).cmp(b),
+        (Value::Int(a), Value::SmallInt(b)) => a.cmp(&i32::from(*b)),
+        (Value::SmallInt(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
+        (Value::BigInt(a), Value::SmallInt(b)) => a.cmp(&i64::from(*b)),
+        // v7.37.17 — TIME / MONEY compare on their i64 storage repr
+        // (microseconds since midnight / integer cents). PG defines a
+        // full btree ordering for both.
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::Money(a), Value::Money(b)) => a.cmp(b),
+        // v7.37.17 — BYTEA bytewise unsigned comparison (PG `byteacmp`).
+        (Value::Bytes(a), Value::Bytes(b)) => a.as_ref().cmp(b.as_ref()),
+        // v7.37.17 — MACADDR / MACADDR8 bytewise comparison
+        // (PG `macaddr_cmp` / `macaddr8_cmp`).
+        (Value::Macaddr(a), Value::Macaddr(b)) => a.cmp(b),
+        (Value::Macaddr8(a), Value::Macaddr8(b)) => a.cmp(b),
+        // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
+        // `>=` for the remaining Ord-element array variants. PG's
+        // `array_cmp` total order = element-wise (`cmp_array`); uuid is
+        // bytewise, bytea bytewise, money by cents — all match PG's
+        // per-element btree ops. NUMERIC[] / FLOAT8[] / INTERVAL[] are
+        // NOT here: their element comparators are value-based (not the
+        // derived `Ord` on the stored repr) and are deferred.
+        (Value::UuidArray(a), Value::UuidArray(b)) => cmp_array(a, b),
+        (Value::BytesArray(a), Value::BytesArray(b)) => cmp_array(a, b),
+        (Value::MoneyArray(a), Value::MoneyArray(b)) => cmp_array(a, b),
+        // v7.37.17 — INET / CIDR equality (=/<>). Equal iff same family,
+        // netmask bits, and address bytes (PG `network_eq`). Ordering
+        // (< <= > >=) is DEFERRED: PG's `network_cmp` compares the common
+        // address prefix BEFORE the netmask length, which a plain
+        // field-by-field compare does not reproduce; wiring only equality
+        // keeps `<` from silently returning a wrong (non-PG) answer.
+        (
+            Value::Inet { family: af, bits: ab, addr: aa },
+            Value::Inet { family: bf, bits: bb, addr: ba },
+        )
+        | (
+            Value::Cidr { family: af, bits: ab, addr: aa },
+            Value::Cidr { family: bf, bits: bb, addr: ba },
+        ) => {
+            let eq = af == bf && ab == bb && aa == ba;
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "inet/cidr ordering (<, <=, >, >=) not yet supported; only = / <>"
+                        .into(),
+                }),
+            };
+        }
+        // v7.37.17 — BIT / BIT VARYING equality (=/<>). Equal iff same
+        // bit length and same packed bytes (the final byte is
+        // zero-padded at construction, so a byte compare is exact).
+        // Ordering DEFERRED: PG's `varbit_cmp` compares the data bytes
+        // then the bit length, and the padding-normalisation edge cases
+        // are unverified — only equality is wired.
+        (
+            Value::BitString { nbits: an, bytes: ab },
+            Value::BitString { nbits: bn, bytes: bb },
+        ) => {
+            let eq = an == bn && ab.as_ref() == bb.as_ref();
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "bit/varbit ordering (<, <=, >, >=) not yet supported; only = / <>"
+                        .into(),
+                }),
+            };
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(

@@ -7,6 +7,7 @@
 //! perf_* targets stay standalone (timing-sensitive).
 
 mod e2e;
+mod e2e_value_compare_pg_differential;
 mod e2e_window_pg_differential;
 mod e2e_agg_subquery_pullup;
 mod e2e_aggregate_pg_differential;
