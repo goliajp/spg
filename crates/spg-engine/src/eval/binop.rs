@@ -523,6 +523,33 @@ fn apply_binary_calendar(
             }
         }
     }
+    // PG resolves `<time|interval|timestamp> + <unknown-type string literal>`
+    // to `… + interval` (the only `+` those types have), so the literal is
+    // coerced to INTERVAL: `'10:00'::time + '30 minutes'` → 10:30:00. `date +`
+    // stays a "not unique" error (date+int and date+interval both exist),
+    // matching PG. Symmetric in operand order.
+    if op == BinOp::Add {
+        let plus_interval = |v: &Value| {
+            matches!(
+                v.data_type(),
+                Some(DataType::Time | DataType::Interval | DataType::Timestamp)
+            )
+        };
+        if let (Value::Text(s), true) = (l, plus_interval(r)) {
+            if let Ok(c) =
+                crate::conversions::coerce_value(Value::text(s.as_ref()), DataType::Interval, "", 0)
+            {
+                return apply_binary_calendar(op, &c, r);
+            }
+        }
+        if let (true, Value::Text(s)) = (plus_interval(l), r) {
+            if let Ok(c) =
+                crate::conversions::coerce_value(Value::text(s.as_ref()), DataType::Interval, "", 0)
+            {
+                return apply_binary_calendar(op, l, &c);
+            }
+        }
+    }
     // Most-specific cases first — DATE-DATE / TS-TS subtraction before
     // DATE-integer subtraction, otherwise the latter swallows the
     // former with an `int_value(Date) = None` no-op fall-through.
