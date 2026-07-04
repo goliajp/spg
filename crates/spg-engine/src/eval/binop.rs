@@ -457,6 +457,20 @@ pub(super) fn apply_binary(
                 alloc::boxed::Box::new(b.clone()),
             )))
         }
+        // PG `tsquery @> tsquery` / `<@` — containment by lexeme set: `a @> b`
+        // iff every lexeme in b appears in a (combining operators ignored).
+        BinOp::JsonContains | BinOp::JsonContainedBy
+            if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) =>
+        {
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
+            let (container, contained) =
+                if matches!(op, BinOp::JsonContains) { (a, b) } else { (b, a) };
+            let mut cont_lex = alloc::collections::BTreeSet::new();
+            tsquery_lexemes(container, &mut cont_lex);
+            let mut sub_lex = alloc::collections::BTreeSet::new();
+            tsquery_lexemes(contained, &mut sub_lex);
+            Ok(Value::Bool(sub_lex.is_subset(&cont_lex)))
+        }
         BinOp::InetOverlap
             if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
         {
@@ -2487,6 +2501,29 @@ fn point_geo_distance(p: &Value<'_>, geo: &Value<'_>) -> Option<f64> {
             Some((a * pt.x + b * pt.y + c).abs() / denom)
         }
         _ => None,
+    }
+}
+
+/// Collect every lexeme (Term word) appearing anywhere in a tsquery tree,
+/// ignoring the combining operators — the set used by `tsquery @> tsquery`.
+fn tsquery_lexemes(
+    q: &spg_storage::TsQueryAst,
+    out: &mut alloc::collections::BTreeSet<alloc::string::String>,
+) {
+    use spg_storage::TsQueryAst;
+    match q {
+        TsQueryAst::Term { word, .. } => {
+            out.insert(word.clone());
+        }
+        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
+            tsquery_lexemes(a, out);
+            tsquery_lexemes(b, out);
+        }
+        TsQueryAst::Not(a) => tsquery_lexemes(a, out),
+        TsQueryAst::Phrase { left, right, .. } => {
+            tsquery_lexemes(left, out);
+            tsquery_lexemes(right, out);
+        }
     }
 }
 

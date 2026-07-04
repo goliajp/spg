@@ -1803,3 +1803,14 @@ fn xmlforest_basic() {
     // nested xmlelement content stays verbatim inside the forest element.
     ck(&mut e, "(xmlforest(xmlelement(name s, 'x') AS wrap))::text", "<wrap><s>x</s></wrap>");
 }
+
+/// v7.37 D — tsquery @> / <@ tsquery containment by lexeme set. PG18.4-verified.
+#[test]
+fn tsquery_containment() {
+    let mut e = Engine::new();
+    ck(&mut e, "('cat & dog'::tsquery @> 'cat'::tsquery)::text", "true");
+    ck(&mut e, "('cat'::tsquery @> 'cat & dog'::tsquery)::text", "false");
+    ck(&mut e, "('cat & dog'::tsquery @> 'bird'::tsquery)::text", "false");
+    ck(&mut e, "('cat'::tsquery <@ 'cat & dog'::tsquery)::text", "true");
+    ck(&mut e, "('cat | dog'::tsquery @> 'dog'::tsquery)::text", "true");
+}
