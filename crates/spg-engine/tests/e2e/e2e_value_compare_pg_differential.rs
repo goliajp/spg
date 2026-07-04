@@ -15,13 +15,21 @@
 //! `spg-bench-postgres`, db `bench`) on 2026-07-04; every asserted case
 //! returns `t` / the shown value there.
 //!
+//! v7.37.18 extends this with NUMERIC[] / FLOAT8[] / INTERVAL[] `=` /
+//! `<>` via *value-based* element equality (PG `array_eq`): NUMERIC[] is
+//! scale-insensitive (`[1.10] = [1.1]`), FLOAT8[] follows PG's array/btree
+//! `NaN = NaN` and `+0.0 = -0.0`, INTERVAL[] compares by canonical span
+//! (`[1 day] = [24:00:00]`). A NULL element equals only another NULL
+//! (`ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`, NOT NULL — confirmed live).
+//!
 //! DEFERRED (still error in SPG, tracked at the bottom of this file):
 //!   * INET / CIDR / BIT ordering (`<` etc.) — PG's `network_cmp` /
 //!     `varbit_cmp` compare a common prefix before the length; a plain
 //!     field compare would silently return a non-PG answer, so only
 //!     equality is wired.
-//!   * NUMERIC[] / FLOAT8[] / INTERVAL[] `=` — value-based element
-//!     comparators (not the derived `Ord` on the stored repr).
+//!   * NUMERIC[] / FLOAT8[] / INTERVAL[] ordering (`<` etc.) — value-based
+//!     element comparators give a total order in PG, but only equality is
+//!     wired (ordering errors, not a wrong answer).
 //!   * range / multirange `=` — needs discrete-range canonicalisation.
 //!   * tsvector `=` — lexeme/position semantics unverified.
 
@@ -179,6 +187,116 @@ fn array_equality_and_order() {
     ck(&mut e, &format!("SELECT a.ma < b.ma {x}"), "t");
 }
 
+// ---- value-based element equality: NUMERIC[] / FLOAT8[] / INTERVAL[] ----
+// v7.37.18. Ground truth captured live from PG18 (mini `spg-bench-postgres`)
+// on 2026-07-04; each case returns the shown value there.
+//
+// These use *seeded typed columns*, not `SELECT ARRAY[..]::T[] = ..`.
+// An inline `ARRAY[..]` literal renders as a TEXT[] / FLOAT[] at eval time
+// (a separate, pre-existing ARRAY-literal-typing gap), so the operands
+// never become `Value::NumericArray` / `FloatArray` / `IntervalArray` and
+// the value-based arm is bypassed. Storing into a `numeric[]` / `float8[]`
+// / `interval[]` column coerces to the real array `Value` variant, which
+// on SELECT-back exercises the `compare()` arms under test. Each row is a
+// labelled operand; comparisons are a self-join on `id`.
+
+/// `a.a <op> b.a` between rows `i` and `j` of seeded table `t`.
+fn pair(e: &mut Engine, t: &str, i: i32, j: i32, op: &str) -> String {
+    cell(
+        e,
+        &format!("SELECT a.a {op} b.a FROM {t} a JOIN {t} b ON a.id={i} AND b.id={j}"),
+    )
+}
+
+#[test]
+fn numeric_array_value_equality() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE nv (id int, a numeric[])").unwrap();
+    for (id, v) in [
+        (10, "ARRAY[1.10::numeric, 2.0::numeric]"), // [1.10, 2.0]
+        (11, "ARRAY[1.1::numeric, 2.000::numeric]"), // value-equal, differing scale repr
+        (20, "ARRAY[1.10::numeric]"),
+        (21, "ARRAY[1.2::numeric]"),
+        (22, "ARRAY[1.1::numeric]"), // value-equal to 20
+        (30, "ARRAY[1::numeric, 2::numeric]"),
+        (31, "ARRAY[1::numeric]"), // length mismatch vs 30
+        (40, "ARRAY[1::numeric, NULL]"),
+        (41, "ARRAY[1::numeric, NULL]"), // NULL == NULL
+        (42, "ARRAY[1::numeric, 2::numeric]"), // NULL vs value
+        (43, "ARRAY[1::numeric]"),      // NULL + length mismatch
+    ] {
+        e.execute(&format!("INSERT INTO nv VALUES ({id}, {v})")).unwrap();
+    }
+    // Scale-insensitive value equality: [1.10, 2.0] == [1.1, 2.000].
+    assert_eq!(pair(&mut e, "nv", 10, 11, "="), "t");
+    // Genuine value inequality.
+    assert_eq!(pair(&mut e, "nv", 20, 21, "="), "f");
+    // Value-equal (differing scale) -> `<>` is false.
+    assert_eq!(pair(&mut e, "nv", 20, 22, "<>"), "f");
+    // Length mismatch -> not equal.
+    assert_eq!(pair(&mut e, "nv", 30, 31, "="), "f");
+    // NULL element equals only another NULL (PG array_eq): result is `t`,
+    // NOT NULL. (Confirmed live: `ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`.)
+    assert_eq!(pair(&mut e, "nv", 40, 41, "="), "t");
+    // NULL vs value at the same position -> not equal.
+    assert_eq!(pair(&mut e, "nv", 40, 42, "="), "f");
+    // NULL element + length mismatch -> not equal.
+    assert_eq!(pair(&mut e, "nv", 40, 43, "="), "f");
+}
+
+#[test]
+fn float8_array_value_equality() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE fv (id int, a float8[])").unwrap();
+    for (id, v) in [
+        (10, "ARRAY[1.5::float8]"),
+        (11, "ARRAY[1.5::float8]"),
+        (12, "ARRAY[2.5::float8]"),
+        (20, "ARRAY['NaN'::float8]"),
+        (21, "ARRAY['NaN'::float8]"),
+        (22, "ARRAY[1.0::float8]"),
+        (30, "ARRAY[0.0::float8]"),
+        (31, "ARRAY[(-0.0)::float8]"),
+        (40, "ARRAY[1.5::float8, NULL]"),
+        (41, "ARRAY[1.5::float8, NULL]"),
+    ] {
+        e.execute(&format!("INSERT INTO fv VALUES ({id}, {v})")).unwrap();
+    }
+    assert_eq!(pair(&mut e, "fv", 10, 11, "="), "t");
+    assert_eq!(pair(&mut e, "fv", 10, 12, "<>"), "t");
+    // PG array/btree semantics: NaN = NaN is `t`; NaN vs a number is `f`.
+    assert_eq!(pair(&mut e, "fv", 20, 21, "="), "t");
+    assert_eq!(pair(&mut e, "fv", 20, 22, "="), "f");
+    // +0.0 = -0.0.
+    assert_eq!(pair(&mut e, "fv", 30, 31, "="), "t");
+    // NULL element equal only to NULL.
+    assert_eq!(pair(&mut e, "fv", 40, 41, "="), "t");
+}
+
+#[test]
+fn interval_array_value_equality() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE iv (id int, a interval[])").unwrap();
+    for (id, v) in [
+        (10, "ARRAY['1 day'::interval]"),
+        (11, "ARRAY['24 hours'::interval]"), // 1 day == 24 hours
+        (12, "ARRAY['1 mon'::interval]"),
+        (13, "ARRAY['30 days'::interval]"), // 1 month == 30 days
+        (14, "ARRAY['23 hours'::interval]"),
+        (20, "ARRAY['1 day'::interval, NULL]"),
+        (21, "ARRAY['24 hours'::interval, NULL]"),
+    ] {
+        e.execute(&format!("INSERT INTO iv VALUES ({id}, {v})")).unwrap();
+    }
+    // Unit-equivalence by canonical span.
+    assert_eq!(pair(&mut e, "iv", 10, 11, "="), "t");
+    assert_eq!(pair(&mut e, "iv", 12, 13, "="), "t");
+    assert_eq!(pair(&mut e, "iv", 10, 14, "="), "f");
+    assert_eq!(pair(&mut e, "iv", 10, 14, "<>"), "t");
+    // NULL element equal only to NULL (value-equal elements + NULL == NULL).
+    assert_eq!(pair(&mut e, "iv", 20, 21, "="), "t");
+}
+
 // ---- deferred: ordering that PG supports but SPG intentionally errors ----
 
 #[test]
@@ -190,4 +308,25 @@ fn deferred_orderings_error() {
     assert_eq!(cell(&mut e, "SELECT '10.0.0.1'::inet < '10.0.0.2'::inet"), "<ERR>");
     assert_eq!(cell(&mut e, "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr"), "<ERR>");
     assert_eq!(cell(&mut e, "SELECT '1010'::bit(4) < '1011'::bit(4)"), "<ERR>");
+    // NUMERIC[] / FLOAT8[] / INTERVAL[] ordering is deferred (only = / <>);
+    // exercised on real typed columns so it hits the `eq_only_result` arm.
+    e.execute("CREATE TABLE ov (id int, na numeric[], fa float8[], ia interval[])")
+        .unwrap();
+    e.execute(
+        "INSERT INTO ov VALUES (1, ARRAY[1.1::numeric], ARRAY[1.5::float8], ARRAY['1 day'::interval])",
+    )
+    .unwrap();
+    e.execute(
+        "INSERT INTO ov VALUES (2, ARRAY[1.2::numeric], ARRAY[2.5::float8], ARRAY['2 days'::interval])",
+    )
+    .unwrap();
+    let ord = |e: &mut Engine, col: &str| {
+        cell(
+            e,
+            &format!("SELECT a.{col} < b.{col} FROM ov a JOIN ov b ON a.id=1 AND b.id=2"),
+        )
+    };
+    assert_eq!(ord(&mut e, "na"), "<ERR>");
+    assert_eq!(ord(&mut e, "fa"), "<ERR>");
+    assert_eq!(ord(&mut e, "ia"), "<ERR>");
 }
