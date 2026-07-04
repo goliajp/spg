@@ -521,3 +521,16 @@ fn float_nan_comparison_total_order() {
     // sanity: ordinary float comparison unaffected.
     ck(&mut e, r#"1.5::float8 < 2.5::float8"#, r#"true"#);
 }
+
+/// to_char `PR` accounting-negative notation: negatives wrap in angle
+/// brackets (no minus), non-negatives get a trailing space (where `>` sits),
+/// FM strips the padding. Was rendered with a plain `-`. PG18.4-verified.
+#[test]
+fn to_char_pr_notation() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"to_char(-1234.5, 'FM9999.00PR')"#, r#"<1234.50>"#);
+    ck(&mut e, r#"to_char(1234.5, 'FM9999.00PR')"#, r#"1234.50"#);
+    ck(&mut e, r#"to_char(-5, '999PR')"#, r#"  <5>"#);
+    ck(&mut e, r#"to_char(5, '999PR')"#, r#"   5 "#);
+    ck(&mut e, r#"to_char(0, 'FM9PR')"#, r#"0"#);
+}
