@@ -2200,6 +2200,41 @@ fn range_strictly_left(
     }
 }
 
+/// Range `-|-` "is adjacent to": `a` and `b` touch at exactly one bound with
+/// no gap and no overlap — one range's upper bound value equals the other's
+/// lower bound value, and exactly one of the two touching bounds is inclusive.
+pub(crate) fn range_adjacent_pair(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
+    use core::cmp::Ordering;
+    let (ak, al, au, ali, aui, ae) = match a {
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
+        }
+        _ => return None,
+    };
+    let (bk, bl, bu, bli, bui, be) = match b {
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
+        }
+        _ => return None,
+    };
+    if ae || be {
+        return Some(false);
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, &al, &au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, &bl, &bu, bli, bui);
+    // a's upper touches b's lower.
+    let a_left_of_b = match (&au2, &bl2) {
+        (Some(u), Some(l)) => bound_cmp(u, l) == Ordering::Equal && (aui2 != bli2),
+        _ => false,
+    };
+    // b's upper touches a's lower.
+    let b_left_of_a = match (&bu2, &al2) {
+        (Some(u), Some(l)) => bound_cmp(u, l) == Ordering::Equal && (bui2 != ali2),
+        _ => false,
+    };
+    Some(a_left_of_b || b_left_of_a)
+}
+
 /// `range_merge(a, b)` — the smallest range that contains both `a` and `b`.
 /// Unlike `+` union it never errors on a gap: the result spans it (earliest
 /// start to latest end). An empty operand contributes nothing. Returns `None`

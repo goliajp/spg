@@ -11995,6 +11995,7 @@ impl Parser {
             StartsWith,
             Power,
             Xor,
+            RangeAdjacent,
         }
         let (sym, prec): (Sym, u8) = match self.peek() {
             Token::Tilde => (
@@ -12028,6 +12029,7 @@ impl Parser {
             Token::CaretAt => (Sym::StartsWith, 4),
             Token::Caret => (Sym::Power, 8),
             Token::Hash => (Sym::Xor, 6),
+            Token::Adjacent => (Sym::RangeAdjacent, 4),
             _ => return Ok(None),
         };
         if prec < min_prec {
@@ -12064,6 +12066,11 @@ impl Parser {
                 lhs: Box::new(lhs.clone()),
                 op: BinOp::BitXor,
                 rhs: Box::new(rhs),
+            },
+            // range `-|-` "is adjacent to" — lowered to a catalog function.
+            Sym::RangeAdjacent => Expr::FunctionCall {
+                name: String::from("range_adjacent"),
+                args: alloc::vec![lhs.clone(), rhs],
             },
         };
         Ok(Some(out))
