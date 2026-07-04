@@ -725,11 +725,13 @@ fn value_to_text_for_array(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::SmallInt(n) => n.to_string(),
+        // PG renders booleans in array external form as `t` / `f`
+        // (the bool type's output function), not `true` / `false`.
         Value::Bool(b) => {
             if *b {
-                "true".into()
+                "t".into()
             } else {
-                "false".into()
+                "f".into()
             }
         }
         Value::Float(x) => format!("{x}"),
