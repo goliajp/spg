@@ -301,7 +301,19 @@ impl Engine {
             };
         match seeded {
             Some(ids) => {
+                // v7.37.15 (Phase C.3, step 2) — MVCC visibility gate for
+                // the index-seeded materialise path. The None branch below
+                // was gated in Phase B via `scan_visible`, but this seeded
+                // (index-seek) branch returns cloned rows straight into the
+                // join pipeline, so under gate-on it must likewise drop
+                // rows the reader's snapshot cannot see (an index entry can
+                // outlive its tombstoned hot row). No-op under the default
+                // gate-off: every hot row is frozen/alive.
+                let snap = self.current_snapshot();
                 for i in ids {
+                    if !table.is_row_visible(i, &snap) {
+                        continue;
+                    }
                     if let Some(row) = table.rows().get(i) {
                         push_if(row, &mut out)?;
                     }
@@ -502,7 +514,17 @@ impl Engine {
         let mut out: Vec<usize> = Vec::new();
         match seeded {
             Some(ids) => {
+                // v7.37.15 (Phase C.3, step 2) — MVCC visibility gate for
+                // the index-seeded branch, matching the Phase-B-gated None
+                // branch below. The sole caller (deferred-join primary
+                // seed) re-filters by `is_row_visible`, but keeping the two
+                // branches symmetric means this helper never hands back an
+                // invisible index. No-op under the default gate-off.
+                let snap = self.current_snapshot();
                 for i in ids {
+                    if !table.is_row_visible(i, &snap) {
+                        continue;
+                    }
                     if let Some(row) = table.rows().get(i)
                         && keep(row)?
                     {

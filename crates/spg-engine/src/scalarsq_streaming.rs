@@ -545,6 +545,17 @@ impl Engine {
                 {
                     break;
                 }
+                // v7.37.15 (Phase C.3, step 2) — MVCC visibility gate for
+                // the streaming single-table full-scan path. Mirrors the
+                // gate on `run_single_table_scan`: this is a user-query
+                // result path, so under gate-on (`SPG_MVCC_INPLACE`) it
+                // must skip rows the reader's snapshot cannot see. Reuses
+                // the `seek_snapshot` computed above. A no-op under the
+                // default gate-off (every hot row is frozen/alive). Cold
+                // rows are frozen (visible) by definition — left ungated.
+                if !table.is_row_visible(i, &seek_snapshot) {
+                    continue;
+                }
                 run_one(
                     self,
                     &table.rows()[i],

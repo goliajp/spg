@@ -3182,7 +3182,21 @@ impl Engine {
             Vec::new()
         };
         if indexed_rows.is_none() {
+            // v7.37.15 (Phase C.3, step 2) — MVCC visibility gate for the
+            // single-table aggregate full-scan path. Mirrors the gate on
+            // `run_single_table_scan`: this is a user-query result path,
+            // so under gate-on (`SPG_MVCC_INPLACE`) it must skip rows the
+            // reader's snapshot cannot see (e.g. tombstoned versions),
+            // otherwise COUNT/SUM/etc. would tally dead rows. A no-op
+            // under the default gate-off: every hot row is frozen or
+            // committed-and-alive, so `is_row_visible` returns true.
+            // Cold-tier rows are frozen (visible) by definition — left
+            // ungated, matching the plain-scan path.
+            let scan_snapshot = self.current_snapshot();
             for i in 0..table.row_count() {
+                if !table.is_row_visible(i, &scan_snapshot) {
+                    continue;
+                }
                 let row = &table.rows()[i];
                 if !row_passes_where(row, &mut eval_stack, &mut memo)? {
                     continue;
