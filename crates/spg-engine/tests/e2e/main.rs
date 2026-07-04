@@ -207,6 +207,7 @@ mod e2e_spg_version;
 mod e2e_pg_lsn_ops;
 mod e2e_num_nulls;
 mod e2e_numeric_cmp_pg_differential;
+mod e2e_numeric_fn_pg_differential;
 mod e2e_numeric_pg_differential;
 mod e2e_string_pg_differential;
 mod e2e_numeric_scale;
