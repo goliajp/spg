@@ -208,6 +208,10 @@ fn apply_function_dispatch(
                 Value::BitString { nbits, .. } => {
                     Ok(Value::Int(i32::try_from(*nbits).unwrap_or(i32::MAX)))
                 }
+                // PG length(tsvector) is the number of lexemes.
+                Value::TsVector(lexemes) => {
+                    Ok(Value::Int(i32::try_from(lexemes.len()).unwrap_or(i32::MAX)))
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("length() needs text or bytea, got {:?}", other.data_type()),
                 }),
@@ -10485,6 +10489,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                Value::TsVector(lexemes) => {
+                    Ok(Value::Int(i32::try_from(lexemes.len()).unwrap_or(i32::MAX)))
+                }
                 Value::Text(s) => {
                     Ok(Value::Int(s.split_whitespace().count() as i32))
                 }
