@@ -416,16 +416,32 @@ impl Engine {
         // first transaction-visibility test.
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
-        let result = self.execute_stmt_with_cancel(stmt, cancel);
+        // v7.38 Epic P (panic isolation) — Slice 2: route the
+        // prepared / extended-query path (the one sqlx / asyncpg / most
+        // drivers actually use via pgwire `Bind`+`Execute`) through the
+        // SAME `catch_unwind` firewall as the simple-query path (Slice 1,
+        // `execute_inner_catching`). A panic in an extended-protocol
+        // statement is caught inside the engine, the in-flight tx is
+        // rolled back (shared `discard_tx_on_panic`), and the caller sees
+        // an ordinary `EngineError::Internal` — never a poisoned write
+        // guard or an aborted process. `current_tx` is `Some(IMPLICIT_TX)`
+        // for the duration, so a caught panic rolls back the right tx; the
+        // `saved` restore below still runs because the catch converts the
+        // unwind into a normal `Result` return.
+        let result = self.execute_stmt_catching(stmt, cancel);
         self.current_tx = saved;
         result
     }
 
-    /// v7.38 Epic P (panic isolation) — run [`Self::execute_inner_with_cancel`]
-    /// under a `catch_unwind` firewall (hosted `std` builds). A panic that
-    /// unwinds out of statement execution is caught here and converted to
-    /// [`EngineError::Internal`] after discarding the in-flight tx's shadow,
-    /// so the caller sees a normal SQL error and the engine stays alive.
+    /// v7.38 Epic P (panic isolation) — shared `catch_unwind` firewall
+    /// (hosted `std` builds) used by both the simple-query
+    /// ([`Self::execute_inner_catching`]) and the prepared / extended-query
+    /// ([`Self::execute_stmt_catching`]) entry paths. Runs `run` under
+    /// `catch_unwind`; a panic that unwinds out of statement execution is
+    /// caught here and converted to [`EngineError::Internal`] after
+    /// discarding the in-flight tx's shadow, so the caller sees a normal SQL
+    /// error and the engine stays alive. This is the single place the
+    /// rollback-on-panic policy lives — neither entry path reimplements it.
     ///
     /// **Why the post-catch engine state is consistent (COW shadow argument):**
     /// every uncommitted write of the panicked statement lives in
@@ -443,15 +459,12 @@ impl Engine {
     /// caller-visible state a caught panic can leave behind is the discarded
     /// shadow, which is the correct rollback outcome, not a torn invariant.
     #[cfg(feature = "std")]
-    fn execute_inner_catching(
+    fn catch_stmt_panic(
         &mut self,
-        sql: &str,
-        cancel: CancelToken<'_>,
+        run: impl FnOnce(&mut Self) -> Result<QueryResult, EngineError>,
     ) -> Result<QueryResult, EngineError> {
         extern crate std;
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.execute_inner_with_cancel(sql, cancel)
-        }));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self)));
         match caught {
             Ok(result) => result,
             Err(payload) => {
@@ -467,6 +480,18 @@ impl Engine {
         }
     }
 
+    /// v7.38 Epic P (panic isolation) — simple-query path wrapper: run
+    /// [`Self::execute_inner_with_cancel`] behind the shared
+    /// [`Self::catch_stmt_panic`] firewall.
+    #[cfg(feature = "std")]
+    fn execute_inner_catching(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.catch_stmt_panic(|s| s.execute_inner_with_cancel(sql, cancel))
+    }
+
     /// `no_std` variant — there is no unwinding runtime, so statement
     /// execution runs directly with no catch.
     #[cfg(not(feature = "std"))]
@@ -476,6 +501,33 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         self.execute_inner_with_cancel(sql, cancel)
+    }
+
+    /// v7.38 Epic P (panic isolation) — Slice 2: prepared / extended-query
+    /// path wrapper. The extended-protocol path already holds a resolved
+    /// [`Statement`] (no re-parse), so it cannot reuse the `&str`-taking
+    /// [`Self::execute_inner_catching`]; instead it runs
+    /// [`Self::execute_stmt_with_cancel`] behind the SAME shared
+    /// [`Self::catch_stmt_panic`] firewall — identical rollback + error
+    /// semantics, zero duplicated policy.
+    #[cfg(feature = "std")]
+    fn execute_stmt_catching(
+        &mut self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.catch_stmt_panic(|s| s.execute_stmt_with_cancel(stmt, cancel))
+    }
+
+    /// `no_std` variant — there is no unwinding runtime, so statement
+    /// execution runs directly with no catch.
+    #[cfg(not(feature = "std"))]
+    fn execute_stmt_catching(
+        &mut self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_stmt_with_cancel(stmt, cancel)
     }
 
     /// v7.38 Epic P — discard an in-flight tx's shadow after a caught panic,
