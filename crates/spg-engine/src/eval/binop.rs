@@ -1314,6 +1314,76 @@ fn cmp_array<T: Ord>(a: &[Option<T>], b: &[Option<T>]) -> core::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// Element-wise array *value* equality (PG `array_eq`). Two arrays are
+/// equal iff same length and every element pair is equal by `elem_eq`.
+/// A NULL element is equal only to another NULL (PG `array_eq` treats
+/// two NULLs as equal — `ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`, not
+/// NULL), and NULL vs non-NULL is unequal. This is used for the array
+/// types whose element equality is *value-based* rather than the derived
+/// `Ord` on the stored repr (NUMERIC[] scale-insensitive, FLOAT8[] NaN,
+/// INTERVAL[] unit-equivalence), so `cmp_array`'s repr `Ord` is wrong.
+fn array_value_eq<T>(a: &[Option<T>], b: &[Option<T>], elem_eq: impl Fn(&T, &T) -> bool) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+            (None, None) => true,
+            (Some(p), Some(q)) => elem_eq(p, q),
+            _ => false,
+        })
+}
+
+/// Value equality of two NUMERIC elements `(scaled, scale)`. Scale-
+/// insensitive: `1.10` (scaled=110, scale=2) equals `1.1` (scaled=11,
+/// scale=1). Rescale both to the wider scale (always scaling *up*, so
+/// no rounding/precision loss) and compare the i128. This mirrors the
+/// scalar `numeric = numeric` path (`apply_binary_numeric`). Overflow on
+/// rescale (astronomically different scales) can't be equal — returns
+/// `false`.
+fn numeric_pair_eq(a: (i128, u8), b: (i128, u8)) -> bool {
+    let t = a.1.max(b.1);
+    matches!((rescale(a.0, a.1, t), rescale(b.0, b.1, t)), (Some(x), Some(y)) if x == y)
+}
+
+/// Value equality of two FLOAT8 elements under PG's btree/array
+/// semantics: `NaN = NaN` is *true* (`ARRAY['NaN'::float8] =
+/// ARRAY['NaN'::float8]` is `t`), NaN vs anything else is false, and
+/// `+0.0 = -0.0` is true. Rust's `==` gives the last two directly; the
+/// NaN-vs-NaN case is special-cased.
+fn float_pg_eq(a: f64, b: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        a.is_nan() && b.is_nan()
+    } else {
+        a == b
+    }
+}
+
+/// Value equality of two INTERVAL elements by PG's canonical microsecond
+/// span (months = 30 days, days = 24 hours), so `INTERVAL '1 mon' =
+/// INTERVAL '30 days'` and `INTERVAL '1 day' = INTERVAL '24:00:00'`.
+/// Mirrors the scalar interval compare arm; i128 keeps the product from
+/// overflowing i64.
+fn interval_span_eq(a: &spg_storage::IntervalSpan, b: &spg_storage::IntervalSpan) -> bool {
+    let span = |s: &spg_storage::IntervalSpan| -> i128 {
+        (i128::from(s.months) * 30 + i128::from(s.days)) * 86_400_000_000 + i128::from(s.micros)
+    };
+    span(a) == span(b)
+}
+
+/// `=` / `<>` result from a computed value-equality, for array types
+/// whose ordering (`<` `<=` `>` `>=`) is intentionally deferred (the
+/// value-based element comparator gives a total order in PG, but SPG
+/// only wires equality here). Any ordering op errors rather than
+/// silently returning a non-PG answer.
+fn eq_only_result(op: BinOp, eq: bool) -> Result<Value<'static>, EvalError> {
+    match op {
+        BinOp::Eq => Ok(Value::Bool(eq)),
+        BinOp::NotEq => Ok(Value::Bool(!eq)),
+        _ => Err(EvalError::TypeMismatch {
+            detail: "numeric/float/interval array ordering (<, <=, >, >=) not supported; only = / <>"
+                .into(),
+        }),
+    }
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -1472,12 +1542,30 @@ pub(super) fn compare(
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is
         // bytewise, bytea bytewise, money by cents — all match PG's
-        // per-element btree ops. NUMERIC[] / FLOAT8[] / INTERVAL[] are
-        // NOT here: their element comparators are value-based (not the
-        // derived `Ord` on the stored repr) and are deferred.
+        // per-element btree ops.
         (Value::UuidArray(a), Value::UuidArray(b)) => cmp_array(a, b),
         (Value::BytesArray(a), Value::BytesArray(b)) => cmp_array(a, b),
         (Value::MoneyArray(a), Value::MoneyArray(b)) => cmp_array(a, b),
+        // v7.37.18 — NUMERIC[] / FLOAT8[] / INTERVAL[] `=` / `<>` via
+        // *value-based* element equality (PG `array_eq`), because the
+        // stored repr's derived `Ord` is wrong for these element types:
+        //   * NUMERIC (scaled, scale): `1.10` (110,2) vs `1.1` (11,1)
+        //     differ in repr but are equal in value — must rescale.
+        //   * FLOAT8: `NaN = NaN` is `t` and `+0.0 = -0.0` is `t` in PG.
+        //   * INTERVAL: `1 day` = `24:00:00`, `1 mon` = `30 days` — equal
+        //     by canonical microsecond span, not by (months, days, micros).
+        // These use the SAME element comparators as the scalar `numeric =
+        // numeric` / `interval = interval` paths so array and scalar
+        // agree. Ordering (`<` etc.) is DEFERRED (`eq_only_result`).
+        (Value::NumericArray(a), Value::NumericArray(b)) => {
+            return eq_only_result(op, array_value_eq(a, b, |x, y| numeric_pair_eq(*x, *y)));
+        }
+        (Value::FloatArray(a), Value::FloatArray(b)) => {
+            return eq_only_result(op, array_value_eq(a, b, |x, y| float_pg_eq(*x, *y)));
+        }
+        (Value::IntervalArray(a), Value::IntervalArray(b)) => {
+            return eq_only_result(op, array_value_eq(a, b, interval_span_eq));
+        }
         // v7.37.17 — INET / CIDR equality (=/<>). Equal iff same family,
         // netmask bits, and address bytes (PG `network_eq`). Ordering
         // (< <= > >=) is DEFERRED: PG's `network_cmp` compares the common
