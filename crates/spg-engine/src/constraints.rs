@@ -579,7 +579,23 @@ pub(crate) fn enforce_uniqueness_inserts(
         };
         let mut seen: hashbrown::HashSet<String> =
             hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
-        for prow in table.rows() {
+        for (row_idx, prow) in table.rows().iter().enumerate() {
+            // v7.37.15 (Phase C.3) — under the gate-on in-place write
+            // path a DELETE tombstones the row (xmax stamped, row kept
+            // physically present) instead of removing it. A tombstoned
+            // key is freed, so it must NOT count toward the uniqueness
+            // set — otherwise re-inserting that key raises a false
+            // violation. `is_deleted()` is `xmax != XMAX_ALIVE`; under
+            // the default gate (physical delete) no header is ever
+            // tombstoned, so this skip is never taken and the gate-off
+            // path is byte-for-byte unchanged.
+            if table
+                .headers()
+                .get(row_idx)
+                .is_some_and(|h| h.is_deleted())
+            {
+                continue;
+            }
             let key = fold_key(&prow.values);
             if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
                 continue;
@@ -780,7 +796,19 @@ pub(crate) fn enforce_unique_index_inserts(
         // nested scans made bulk import O(n²).
         let mut seen: hashbrown::HashSet<String> =
             hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
-        for prow in table.rows() {
+        for (row_idx, prow) in table.rows().iter().enumerate() {
+            // v7.37.15 (Phase C.3) — skip gate-on tombstones so a
+            // re-insert of a freed key succeeds. See the twin guard in
+            // `enforce_uniqueness_inserts`; `is_deleted()` is never true
+            // under the default gate (physical delete), so the gate-off
+            // path is byte-for-byte unchanged.
+            if table
+                .headers()
+                .get(row_idx)
+                .is_some_and(|h| h.is_deleted())
+            {
+                continue;
+            }
             if !participates(&prow.values)? {
                 continue;
             }
