@@ -553,4 +553,5 @@ mod mailrs_round26;
 mod mailrs_round30;
 mod mailrs_round31;
 mod e2e_cast_pg_differential;
+mod e2e_query_clause_pg_differential;
 mod mvcc_pg_differential;
