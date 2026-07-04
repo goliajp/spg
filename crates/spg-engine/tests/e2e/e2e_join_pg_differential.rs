@@ -34,6 +34,10 @@ fn build() -> Engine {
     e.execute("CREATE TABLE s3 (k int, z text)").unwrap();
     e.execute("INSERT INTO s3 VALUES (2,'ZZ'),(3,'YY'),(5,'QQ')")
         .unwrap();
+    // v7.37.16 — disjoint-column table for the NATURAL-no-common-cols
+    // (→ CROSS) differential. Shares no column name with `l`/`r`.
+    e.execute("CREATE TABLE d (m int, p text)").unwrap();
+    e.execute("INSERT INTO d VALUES (7,'x'),(8,'y')").unwrap();
     e
 }
 
@@ -176,6 +180,50 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
         ("F05_full_null_render",
          "SELECT coalesce(string_agg(coalesce(l.k::text,'N')||coalesce(r.k::text,'N'), ',' ORDER BY coalesce(l.k,r.k) NULLS LAST, r.k NULLS LAST),'<empty>') FROM l FULL OUTER JOIN r ON l.k=r.k",
          "1N,22,33,N4,NN,NN"),
+        // ---- v7.37.16 — USING column-merge (promoted from known_gaps) ----
+        // PG merges the USING join column into ONE unqualified output
+        // column: `t1.k` for INNER/LEFT, `t2.k` for RIGHT,
+        // COALESCE(t1.k,t2.k) for FULL. `SELECT *` puts the merged column
+        // FIRST (before the tables' other cols), so `k/v/w` here proves
+        // the single-k shape AND the column order.
+        ("U01_using_star_render",
+         "SELECT coalesce(string_agg(k::text||'/'||v||'/'||w, ',' ORDER BY k),'X') FROM l JOIN r USING(k)",
+         "2/b/B,3/c/C"),
+        // Bare `SELECT k` is unambiguous under USING (was: ambiguous err).
+        ("U02_using_k_inner",
+         "SELECT coalesce(string_agg(k::text,',' ORDER BY k),'X') FROM l JOIN r USING(k)",
+         "2,3"),
+        // LEFT USING: merged k = left (l) side — unmatched-left rows keep
+        // l.k (NULL join key 'n' surfaces as N via the left col).
+        ("U03_using_k_left",
+         "SELECT coalesce(string_agg(coalesce(k::text,'N'),',' ORDER BY v),'X') FROM l LEFT JOIN r USING(k)",
+         "1,2,3,N"),
+        // RIGHT USING: merged k = right (r) side — unmatched-right row 4
+        // and the right NULL key surface via r.k.
+        ("U04_using_k_right",
+         "SELECT coalesce(string_agg(coalesce(k::text,'N'),',' ORDER BY w),'X') FROM l RIGHT JOIN r USING(k)",
+         "2,3,4,N"),
+        // FULL USING: merged k = COALESCE(l.k, r.k) — matched rows collapse
+        // to one k, unmatched either side keeps whichever side is non-NULL.
+        ("U05_using_k_full",
+         "SELECT coalesce(string_agg(coalesce(k::text,'N'),',' ORDER BY k NULLS LAST),'X') FROM l FULL JOIN r USING(k)",
+         "1,2,3,4,N,N"),
+        // ---- v7.37.16 — NATURAL JOIN (promoted from known_gaps) ----
+        // NATURAL = USING over every common column name (here `k`).
+        ("N01_natural_count",
+         "SELECT count(*) FROM l NATURAL JOIN r", "2"),
+        ("N02_natural_render",
+         "SELECT coalesce(string_agg(k::text||'/'||v||'/'||w, ',' ORDER BY k),'X') FROM l NATURAL JOIN r",
+         "2/b/B,3/c/C"),
+        ("N03_natural_left_count",
+         "SELECT count(*) FROM l NATURAL LEFT JOIN r", "4"),
+        ("N04_natural_left_render",
+         "SELECT coalesce(string_agg(coalesce(k::text,'N')||'/'||v||'/'||coalesce(w,'X'), ',' ORDER BY v),'X') FROM l NATURAL LEFT JOIN r",
+         "1/a/X,2/b/B,3/c/C,N/n/X"),
+        // NATURAL with NO common columns → PG falls back to a CROSS join.
+        // `d(m,p)` shares no column name with `l(k,v)` → 4×2 = 8 rows.
+        ("N05_natural_nocommon_cross",
+         "SELECT count(*) FROM l NATURAL JOIN d", "8"),
     ]
 }
 
@@ -200,39 +248,29 @@ fn join_pg18_differential_corpus() {
     );
 }
 
-/// Known join features SPG does not yet implement. These are NOT
-/// correctness divergences on supported syntax — they are missing
-/// grammar/executor surface that would need a parser + join-executor
-/// refactor (NATURAL is not parsed; USING does not merge the join
-/// column, leaving it ambiguous under `SELECT`). Pinning the CURRENT
+/// Known join features SPG does not yet implement. Pinning the CURRENT
 /// behaviour (an error) here means the day any of these lands, this test
 /// breaks and forces the author to promote the case into the green
-/// `corpus()` above with its live PG18 answer (recorded in the comment).
-/// This is a KNOWN-LIMITATION ledger, not an assertion that the SPG
-/// behaviour is correct.
+/// `corpus()` above with its live PG18 answer. This is a
+/// KNOWN-LIMITATION ledger, not an assertion that the SPG behaviour is
+/// correct.
 ///
 /// v7.37.16 — RIGHT JOIN, FULL OUTER JOIN, and FULL OUTER JOIN USING
-/// (count form) were PROMOTED out of this ledger into `corpus()` above:
-/// `JoinKind` gained `Right` / `FullOuter`, the parser recognises
-/// `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`, and the hash /
-/// nested-loop stages emit unmatched-peer rows (mirror of the LEFT
-/// unmatched-drive emission). USING *column-merge* under a bare
-/// `SELECT k` stays deferred (see below).
+/// (count) were promoted earlier. This sweep promoted the LAST THREE
+/// ledger entries into `corpus()`: `NATURAL JOIN` (N01/N02),
+/// `NATURAL LEFT JOIN` (N03/N04), and `USING column-merge` (U01–U05,
+/// plus the `SELECT *` shape asserted in `using_star_column_shape`).
+/// The parser now recognises `NATURAL [kind] JOIN` and records the
+/// `USING` column list; the engine resolves NATURAL common columns and
+/// applies PG's column-merge (single unqualified output column, first in
+/// `SELECT *`) via a statement rewrite. The ledger is currently EMPTY —
+/// every JOIN differential this corpus exercises matches PG18.
 #[test]
 fn join_pg18_known_gaps() {
     let mut e = build();
     // (label, sql, PG18-would-return) — each currently errors in SPG.
-    let gaps: &[(&str, &str, &str)] = &[
-        ("NATURAL JOIN",
-         "SELECT count(*) FROM l NATURAL JOIN r",
-         "PG18=2"),
-        ("NATURAL LEFT JOIN",
-         "SELECT count(*) FROM l NATURAL LEFT JOIN r",
-         "PG18=4"),
-        ("USING column-merge (unqualified join col)",
-         "SELECT k FROM l JOIN r USING(k) ORDER BY k",
-         "PG18: k merged to single column [2,3]; SPG: ambiguous column reference: k"),
-    ];
+    // EMPTY: all prior gaps promoted into corpus() as of v7.37.16.
+    let gaps: &[(&str, &str, &str)] = &[];
     for (feat, sql, note) in gaps {
         let r = e.execute(sql);
         assert!(
@@ -241,4 +279,18 @@ fn join_pg18_known_gaps() {
              with its live PG18 answer. {note}. sql=[{sql}]"
         );
     }
+}
+
+/// v7.37.16 — `SELECT *` over a `USING` join yields ONE merged column
+/// `k` (not two), positioned FIRST, followed by each table's other
+/// columns with bare names: exactly PG's `[k, v, w]`.
+#[test]
+fn using_star_column_shape() {
+    let mut e = build();
+    let r = e.execute("SELECT * FROM l JOIN r USING(k)").unwrap();
+    let QueryResult::Rows { columns, .. } = r else {
+        panic!("expected Rows");
+    };
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["k", "v", "w"], "USING(*) must merge k and emit [k,v,w]");
 }

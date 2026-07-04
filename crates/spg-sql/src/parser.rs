@@ -11613,8 +11613,20 @@ impl Parser {
                     kind: JoinKind::Cross,
                     table,
                     on: None,
+                    using_cols: None,
+                    natural: false,
                 });
                 continue;
+            }
+            // v7.37.16 — optional leading `NATURAL` before the join
+            // kind: `NATURAL JOIN`, `NATURAL LEFT JOIN`, etc. NATURAL is
+            // not a lexer keyword (it arrives as a bare Ident), so match
+            // it case-insensitively here. When present, no ON/USING
+            // clause is allowed — the common columns are resolved at
+            // execution time.
+            let natural = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("natural"));
+            if natural {
+                self.advance();
             }
             // Explicit JOIN syntax. Accept INNER JOIN, LEFT [OUTER] JOIN,
             // CROSS JOIN, and bare JOIN (defaults to INNER).
@@ -11698,7 +11710,23 @@ impl Parser {
             // sugar purposes the predicate-only form covers the
             // baseline corpus shape and chained `… JOIN x USING (k)
             // JOIN y USING (k)` calls.
+            // v7.37.16 — NATURAL joins carry no ON/USING clause; the
+            // common columns resolve at execution time.
+            if natural {
+                joins.push(FromJoin {
+                    kind,
+                    table,
+                    on: None,
+                    using_cols: None,
+                    natural: true,
+                });
+                continue;
+            }
             let using_match = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using"));
+            // v7.37.16 — capture the USING column list (in addition to
+            // the ON desugar below) so the executor can perform PG's
+            // column-merge on the output side.
+            let mut using_cols: Option<Vec<String>> = None;
             let on = if matches!(self.peek(), Token::On) {
                 self.advance();
                 Some(self.parse_expr(0)?)
@@ -11742,6 +11770,7 @@ impl Parser {
                 if cols.is_empty() {
                     return Err(self.err("USING (…) requires at least one column".to_string()));
                 }
+                using_cols = Some(cols.clone());
                 // Pick the left-side alias: prev join's table if any,
                 // else FROM primary. Use alias when present, else
                 // table name (PG-equivalent qualifier).
@@ -11786,7 +11815,13 @@ impl Parser {
                     self.peek()
                 )));
             };
-            joins.push(FromJoin { kind, table, on });
+            joins.push(FromJoin {
+                kind,
+                table,
+                on,
+                using_cols,
+                natural: false,
+            });
         }
         Ok(FromClause { primary, joins })
     }

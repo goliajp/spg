@@ -52,6 +52,7 @@ mod expr_analysis;
 pub mod fts;
 mod index_access;
 mod join;
+mod join_using;
 mod joinfold;
 pub mod json;
 pub mod locks;
