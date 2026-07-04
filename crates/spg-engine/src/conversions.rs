@@ -2093,6 +2093,31 @@ fn coerce_text_array_to(
     Ok(Some(out))
 }
 
+/// Parse a PG integer literal in text: decimal, plus the PG 16+ forms —
+/// radix prefixes (`0x1F` hex / `0o17` octal / `0b101` binary) and `_` digit
+/// separators (`1_000`). An optional leading sign applies to the magnitude.
+pub(crate) fn parse_pg_int(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s)
+    };
+    let cleaned: alloc::string::String = rest.chars().filter(|&c| c != '_').collect();
+    let mag: i64 = if let Some(h) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16).ok()?
+    } else if let Some(o) = cleaned.strip_prefix("0o").or_else(|| cleaned.strip_prefix("0O")) {
+        i64::from_str_radix(o, 8).ok()?
+    } else if let Some(b) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
+        i64::from_str_radix(b, 2).ok()?
+    } else {
+        cleaned.parse::<i64>().ok()?
+    };
+    Some(if neg { mag.checked_neg()? } else { mag })
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -2203,9 +2228,13 @@ pub(crate) fn coerce_value(
         // `'  256  '::int2` / `'  3.14  '::float8` (both of which route
         // through this generic coerce path, unlike `::int` / `::float`
         // that trim in the CAST helper) parse rather than error.
-        (Value::Text(s), DataType::SmallInt) => s.trim().parse::<i16>().ok().map(Value::SmallInt),
-        (Value::Text(s), DataType::Int) => s.trim().parse::<i32>().ok().map(Value::Int),
-        (Value::Text(s), DataType::BigInt) => s.trim().parse::<i64>().ok().map(Value::BigInt),
+        (Value::Text(s), DataType::SmallInt) => {
+            parse_pg_int(&s).and_then(|n| i16::try_from(n).ok()).map(Value::SmallInt)
+        }
+        (Value::Text(s), DataType::Int) => {
+            parse_pg_int(&s).and_then(|n| i32::try_from(n).ok()).map(Value::Int)
+        }
+        (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
         (Value::Text(s), DataType::Float) => s.trim().parse::<f64>().ok().map(Value::Float),
         (Value::Text(s), DataType::Bool) => match s.to_ascii_lowercase().as_str() {
             "0" | "false" | "f" | "no" | "off" => Some(Value::Bool(false)),
