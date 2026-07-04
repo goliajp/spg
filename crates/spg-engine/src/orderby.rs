@@ -448,6 +448,11 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 pub(crate) enum OrderKey {
     Num(f64),
     Text(alloc::string::String),
+    /// v7.37 — byte-orderable key for types PG sorts byte-wise but that
+    /// have no meaningful f64 projection: bytea, uuid, macaddr(8), inet/cidr
+    /// (encoded `[family, addr.., bits]`). Sorts after finite Num / Text in
+    /// the rare heterogeneous case; same-type is the load-bearing path.
+    Bytes(alloc::vec::Vec<u8>),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -462,20 +467,26 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
     match (a, b) {
         (OrderKey::Num(x), OrderKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (OrderKey::Text(x), OrderKey::Text(y)) => x.cmp(y),
-        (OrderKey::Num(x), OrderKey::Text(_)) => {
+        (OrderKey::Bytes(x), OrderKey::Bytes(y)) => x.cmp(y),
+        (OrderKey::Num(x), OrderKey::Text(_) | OrderKey::Bytes(_)) => {
+            // Finite Num sorts before Text/Bytes; the ±INF NULL sentinels ride
+            // to the far ends (`+INF` last, `-INF` first).
             if *x == f64::INFINITY {
                 Ordering::Greater
             } else {
                 Ordering::Less
             }
         }
-        (OrderKey::Text(_), OrderKey::Num(y)) => {
+        (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Num(y)) => {
             if *y == f64::INFINITY {
                 Ordering::Less
             } else {
                 Ordering::Greater
             }
         }
+        // Text sorts before Bytes in the rare heterogeneous case.
+        (OrderKey::Text(_), OrderKey::Bytes(_)) => Ordering::Less,
+        (OrderKey::Bytes(_), OrderKey::Text(_)) => Ordering::Greater,
     }
 }
 

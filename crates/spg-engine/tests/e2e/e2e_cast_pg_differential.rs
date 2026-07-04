@@ -1148,3 +1148,21 @@ fn maxmin_more_types() {
     assert_eq!(row(&mut e, &["CREATE TABLE it (x inet)","INSERT INTO it VALUES ('192.168.1.1'),('10.0.0.1')"], "SELECT min(x)::text FROM it"), "Text(\"10.0.0.1\")");
     assert_eq!(row(&mut e, &["CREATE TABLE bt (x bytea)","INSERT INTO bt VALUES ('\\x01'),('\\xff'),('\\x80')"], "SELECT max(x)::text FROM bt"), "Text(\"\\\\xff\")");
 }
+
+/// ORDER BY over inet / bytea / uuid — the sort-key extractor rejected these
+/// with "not supported"; they sort byte-wise in PG. PG18.4-verified.
+#[test]
+fn orderby_byte_types() {
+    let mut e = Engine::new();
+    let rows = |e: &mut Engine, setup: &[&str], q: &str| -> String {
+        for s in setup { e.execute(s).unwrap(); }
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows.iter().map(|r| format!("{:?}", r.values[0])).collect::<Vec<_>>().join(","),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(rows(&mut e, &["CREATE TABLE t2 (x inet)","INSERT INTO t2 VALUES ('192.168.1.1'),('10.0.0.1'),('172.16.0.1')"], "SELECT x::text FROM t2 ORDER BY x"), "Text(\"10.0.0.1\"),Text(\"172.16.0.1\"),Text(\"192.168.1.1\")");
+    assert_eq!(rows(&mut e, &["CREATE TABLE t3 (x bytea)","INSERT INTO t3 VALUES ('\\xff'),('\\x01'),('\\x80')"], "SELECT x::text FROM t3 ORDER BY x"), "Text(\"\\\\x01\"),Text(\"\\\\x80\"),Text(\"\\\\xff\")");
+    assert_eq!(rows(&mut e, &["CREATE TABLE t4 (x uuid)","INSERT INTO t4 VALUES ('550e8400-e29b-41d4-a716-446655440000'),('00000000-0000-0000-0000-000000000001')"], "SELECT x::text FROM t4 ORDER BY x"), "Text(\"00000000-0000-0000-0000-000000000001\"),Text(\"550e8400-e29b-41d4-a716-446655440000\")");
+    assert_eq!(rows(&mut e, &["CREATE TABLE t5 (x bytea)","INSERT INTO t5 VALUES ('\\xff'),('\\x01'),('\\x80')"], "SELECT x::text FROM t5 ORDER BY x DESC"), "Text(\"\\\\xff\"),Text(\"\\\\x80\"),Text(\"\\\\x01\")");
+}
