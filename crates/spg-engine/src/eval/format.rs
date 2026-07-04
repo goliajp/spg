@@ -145,7 +145,22 @@ pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
 /// `None` on shape / numeric failure; the engine surfaces that as a
 /// `TypeMismatch` with the original text included.
 pub fn parse_date_literal(s: &str) -> Option<i32> {
+    let s = s.trim();
+    // PG special date value.
+    if s.eq_ignore_ascii_case("epoch") {
+        return Some(days_from_civil(1970, 1, 1));
+    }
     let bytes = s.as_bytes();
+    // ISO 8601 basic (compact) form `YYYYMMDD` — no separators.
+    if bytes.len() == 8 && bytes.iter().all(u8::is_ascii_digit) {
+        let y: i32 = s[0..4].parse().ok()?;
+        let m: u32 = s[4..6].parse().ok()?;
+        let d: u32 = s[6..8].parse().ok()?;
+        if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
+            return None;
+        }
+        return Some(days_from_civil(y, m, d));
+    }
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
     }
@@ -169,6 +184,10 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
 /// pads with zeros to microseconds.
 pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
     let trimmed = s.trim();
+    // PG special timestamp value.
+    if trimmed.eq_ignore_ascii_case("epoch") {
+        return Some(0);
+    }
     let (date_part, time_part) = match trimmed.find([' ', 'T']) {
         Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
         None => (trimmed, None),
