@@ -1492,3 +1492,16 @@ fn format_width_spec() {
     ck(&mut e, "format('%1$s %1$s', 'x')", "x x");
     ck(&mut e, "format('%I', 'my table')", "\"my table\"");
 }
+
+/// v7.37 D.9 (slice 1) — non-capturing groups `(?:...)` parse correctly (the
+/// `?:` marker was previously parsed as regex atoms, so the group never
+/// matched). PG18.4-verified.
+#[test]
+fn regex_noncapturing_group() {
+    let mut e = Engine::new();
+    ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
+    ck(&mut e, "regexp_replace('xayaz', '(?:a)', 'Q', 'g')", "xQyQz");
+    ck(&mut e, "('foobar' ~ '(?:foo)(?:bar)')::text", "true");
+    // control: a plain capturing group still matches as before.
+    ck(&mut e, "('abcabc' ~ '(abc)+')::text", "true");
+}
