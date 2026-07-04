@@ -844,3 +844,25 @@ fn insert_text_into_interval_column() {
     assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"), "Text(\"00:00:45\")");
     assert!(e.execute("INSERT INTO ivt VALUES (4,'not an interval')").is_err());
 }
+
+/// BUG: `CREATE TABLE t (x bit(4))` failed to parse — the column-type parser
+/// accepted bare `bit`/`varbit` but not the `(N)` length modifier (nor
+/// `bit varying`). SPG carries bit width in the value, so the typmod is
+/// accepted and ignored. PG18.4-verified.
+#[test]
+fn create_table_bit_typmod() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE bc (a bit(4), b varbit(8), c bit varying(16), d bit)")
+        .expect("bit/varbit column types accept a length modifier");
+    e.execute("INSERT INTO bc VALUES ('1010','11110000','1','0')").unwrap();
+    let row = |e: &mut Engine, q: &str| -> String {
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(row(&mut e, "SELECT a::text FROM bc"), "Text(\"1010\")");
+    assert_eq!(row(&mut e, "SELECT b::text FROM bc"), "Text(\"11110000\")");
+}
