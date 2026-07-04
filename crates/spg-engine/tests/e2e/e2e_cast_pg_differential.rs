@@ -777,3 +777,17 @@ fn macaddr_trunc_and_widen() {
     ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr)::text"#, r#"true"#);
     ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text"#, r#"true"#);
 }
+
+/// point <-> point Euclidean distance + point ± point translation. point
+/// literal/render already worked; box/circle/line remain unimplemented.
+/// PG18.4-verified.
+#[test]
+fn point_distance_and_arith() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"('(0,0)'::point <-> '(3,4)'::point)::text"#, r#"5"#);
+    ck(&mut e, r#"('(1,2)'::point + '(3,4)'::point)::text"#, r#"(4,6)"#);
+    ck(&mut e, r#"('(4,6)'::point - '(1,2)'::point)::text"#, r#"(3,4)"#);
+    ck(&mut e, r#"('(1,1)'::point <-> '(1,1)'::point)::text"#, r#"0"#);
+    // control: point literal/render unchanged.
+    ck(&mut e, r#"('(1,2)'::point)::text"#, r#"(1,2)"#);
+}

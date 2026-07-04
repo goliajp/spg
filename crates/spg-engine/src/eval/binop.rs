@@ -228,6 +228,17 @@ pub(super) fn apply_binary(
             });
         }
     }
+    // PG `point ± point` translates a point by another's coordinates.
+    if let (Value::Point(a), Value::Point(b)) = (&l, &r) {
+        if op == BinOp::Add || op == BinOp::Sub {
+            let (x, y) = if op == BinOp::Add {
+                (a.x + b.x, a.y + b.y)
+            } else {
+                (a.x - b.x, a.y - b.y)
+            };
+            return Ok(Value::Point(spg_storage::Point2D { x, y }));
+        }
+    }
     // MONEY arithmetic (integer cents) before the generic numeric path.
     if let Some(result) = money_arith(op, &l, &r) {
         return result;
@@ -1354,6 +1365,12 @@ fn arith(
 /// raise `TypeMismatch`.
 #[allow(clippy::many_single_char_names)] // l, r, a, b, d are the natural names
 fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+    // PG `point <-> point` is the Euclidean distance between two points.
+    if let (Value::Point(a), Value::Point(b)) = (&l, &r) {
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        return Ok(Value::Float(sqrt_newton(dx * dx + dy * dy)));
+    }
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
