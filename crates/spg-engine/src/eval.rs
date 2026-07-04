@@ -722,6 +722,21 @@ pub fn eval_expr(
                 Some(o) => Some(eval_expr(o, row, ctx)?),
                 None => None,
             };
+            // v7.37 D.1 — CASE result-type coercion (same rule as COALESCE): a
+            // typed result branch (`... THEN '10:00'::time`) makes the whole
+            // CASE that type, so an untyped string-literal branch is coerced to
+            // it. Compute the hint once from every THEN/ELSE branch.
+            let case_hint = branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_branch.iter().map(|b| b.as_ref()))
+                .find_map(coalesce_type_hint);
+            let coerce = |v: Value<'static>| -> Result<Value<'static>, EvalError> {
+                match (&v, &case_hint) {
+                    (Value::Text(_), Some(target)) => cast::cast_value(v, target.clone()),
+                    _ => Ok(v),
+                }
+            };
             for (when_expr, then_expr) in branches {
                 let when_value = eval_expr(when_expr, row, ctx)?;
                 let matched = match &operand_value {
@@ -732,11 +747,11 @@ pub fn eval_expr(
                     ),
                 };
                 if matched {
-                    return eval_expr(then_expr, row, ctx);
+                    return coerce(eval_expr(then_expr, row, ctx)?);
                 }
             }
             match else_branch {
-                Some(e) => eval_expr(e, row, ctx),
+                Some(e) => coerce(eval_expr(e, row, ctx)?),
                 None => Ok(Value::Null),
             }
         }
