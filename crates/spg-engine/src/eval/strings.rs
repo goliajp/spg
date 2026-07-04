@@ -801,6 +801,20 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             i += 2;
             continue;
         }
+        // Double-quoted text is a literal — PG strips the quotes and emits the
+        // content verbatim (e.g. `HH24"h"MI"m"` → `14h30m`, `YYYY"年"` → `2024年`).
+        if bytes[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            out.push_str(&fmt[start..i]);
+            if i < bytes.len() {
+                i += 1; // consume the closing quote
+            }
+            continue;
+        }
         // Blank-padded name fields (Day / Month / RM): FM strips the
         // trailing blanks; the width is the longest member (9 for
         // day/month names, 4 for roman months).

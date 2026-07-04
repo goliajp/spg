@@ -623,3 +623,16 @@ fn date_interval_promotes_to_timestamp() {
     ck(&mut e, r#"date '2024-03-01' + 5"#, r#"2024-03-06"#);
     ck(&mut e, r#"date '2024-03-01' - 5"#, r#"2024-02-25"#);
 }
+
+/// to_char timestamp format: double-quoted text is a literal (quotes stripped),
+/// e.g. `HH24"h"MI"m"` → `14h30m`, `YYYY"年"MM"月"` → `2024年03月`. Was emitted
+/// with the quotes verbatim. PG18.4-verified.
+#[test]
+fn to_char_ts_quoted_literal() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'HH24"h"MI"m"')"#, r#"14h30m"#);
+    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY"年"MM"月"DD"日"')"#, r#"2024年03月05日"#);
+    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', '"at" HH24:MI')"#, r#"at 14:30"#);
+    // control: no quotes unaffected.
+    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY-MM-DD')"#, r#"2024-03-05"#);
+}
