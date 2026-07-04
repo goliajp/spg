@@ -22,11 +22,10 @@
 //! (`[1 day] = [24:00:00]`). A NULL element equals only another NULL
 //! (`ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`, NOT NULL — confirmed live).
 //!
+//! INET / CIDR ordering (PG `network_cmp`) and BIT / VARBIT ordering (PG
+//! `varbit_cmp`) are implemented — see `inet_ordering` / `bit_ordering`.
+//!
 //! DEFERRED (still error in SPG, tracked at the bottom of this file):
-//!   * INET / CIDR ordering (`<` etc.) — PG's `network_cmp` compares a
-//!     common address prefix before the netmask length; a plain field
-//!     compare would silently return a non-PG answer, so only equality is
-//!     wired. (BIT / VARBIT ordering IS implemented — see `bit_ordering`.)
 //!   * NUMERIC[] / FLOAT8[] / INTERVAL[] ordering (`<` etc.) — value-based
 //!     element comparators give a total order in PG, but only equality is
 //!     wired (ordering errors, not a wrong answer).
@@ -163,6 +162,27 @@ fn bit_ordering() {
     ck(&mut e, "SELECT '1010'::bit(4) < '1011'::bit(4)", "t");
     ck(&mut e, "SELECT '1011'::bit(4) >= '1010'::bit(4)", "t");
     ck(&mut e, "SELECT '10'::varbit <= '10'::varbit", "t");
+}
+
+#[test]
+fn inet_ordering() {
+    // v7.37 — INET / CIDR ordering (PG `network_cmp`): family (IPv4 < IPv6),
+    // then the common netmask prefix, then the netmask length, then the full
+    // address. All values captured live from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    // address compared before netmask (10.x < 192.x despite /8 < /16).
+    ck(&mut e, "SELECT '10.0.0.0/8'::inet < '192.168.0.0/16'::inet", "t");
+    // same address, shorter netmask is less.
+    ck(&mut e, "SELECT '10.0.0.0/8'::inet < '10.0.0.0/16'::inet", "t");
+    // plain host address ordering.
+    ck(&mut e, "SELECT '1.2.3.4'::inet < '1.2.3.5'::inet", "t");
+    ck(&mut e, "SELECT '1.2.3.5'::inet > '1.2.3.4'::inet", "t");
+    // family: IPv4 < IPv6.
+    ck(&mut e, "SELECT '10.0.0.0'::inet < '::1'::inet", "t");
+    // cidr follows the same comparator.
+    ck(&mut e, "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr", "t");
+    ck(&mut e, "SELECT '10.0.0.1'::inet <= '10.0.0.1'::inet", "t");
+    ck(&mut e, "SELECT '2001:db8::1'::inet > '2001:db8::'::inet", "t");
 }
 
 // ---- array comparisons via typed columns --------------------------------
@@ -318,11 +338,8 @@ fn interval_array_value_equality() {
 #[test]
 fn deferred_orderings_error() {
     let mut e = Engine::new();
-    // INET / CIDR ordering is deferred; must ERROR (not silently return a
-    // non-PG answer) until a PG-`network_cmp` comparator is wired. (BIT /
-    // VARBIT ordering is now implemented — see `bit_ordering`.)
-    assert_eq!(cell(&mut e, "SELECT '10.0.0.1'::inet < '10.0.0.2'::inet"), "<ERR>");
-    assert_eq!(cell(&mut e, "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr"), "<ERR>");
+    // (INET / CIDR and BIT / VARBIT ordering are now implemented — see
+    // `inet_ordering` / `bit_ordering`.)
     // NUMERIC[] / FLOAT8[] / INTERVAL[] ordering is deferred (only = / <>);
     // exercised on real typed columns so it hits the `eq_only_result` arm.
     e.execute("CREATE TABLE ov (id int, na numeric[], fa float8[], ia interval[])")
