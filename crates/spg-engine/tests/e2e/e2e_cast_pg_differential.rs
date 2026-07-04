@@ -715,3 +715,20 @@ fn range_difference_operator() {
     ck(&mut e, r#"(int4range(1,5) + int4range(4,10))::text"#, r#"[1,10)"#);
     ck(&mut e, r#"(int4range(1,10) * int4range(5,15))::text"#, r#"[5,10)"#);
 }
+
+/// tsquery `&&` (AND) and `||` (OR) operators — the function forms existed but
+/// the operators errored (`&&`) or hit text concat (`||` → 'quick''fox'). Now
+/// combine the two tsquery ASTs. PG18.4-verified.
+#[test]
+fn tsquery_bool_operators() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(to_tsquery('quick') || to_tsquery('fox'))::text"#, r#"'quick' | 'fox'"#);
+    ck(&mut e, r#"(to_tsquery('quick') && to_tsquery('fox'))::text"#, r#"'quick' & 'fox'"#);
+    // combined AST evaluates against a tsvector correctly.
+    ck(&mut e, r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') || to_tsquery('fox'))"#, r#"true"#);
+    ck(&mut e, r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') && to_tsquery('fox'))"#, r#"false"#);
+    // control: tsvector || tsvector concat still works (SPG's default Simple
+    // config does not stem, unlike PG's english default — a separate config
+    // matter, not a bug in the operator).
+    ck(&mut e, r#"(to_tsvector('cats') || to_tsvector('dogs'))::text"#, r#"'cats':1 'dogs':2"#);
+}

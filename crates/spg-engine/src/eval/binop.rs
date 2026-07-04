@@ -280,6 +280,14 @@ pub(super) fn apply_binary(
         BinOp::CosineDistance => cosine_distance(l, r),
         // PG `jsonb || jsonb` merges objects (right wins on dup keys) /
         // appends arrays. Text `||` stays text concatenation.
+        // tsquery `||` is boolean OR (claim it before text concatenation).
+        BinOp::Concat if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) => {
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
+            Ok(Value::TsQuery(spg_storage::TsQueryAst::Or(
+                alloc::boxed::Box::new(a.clone()),
+                alloc::boxed::Box::new(b.clone()),
+            )))
+        }
         BinOp::Concat if matches!(l, Value::Json(_)) || matches!(r, Value::Json(_)) => {
             crate::json::concat(&l, &r)
         }
@@ -312,6 +320,14 @@ pub(super) fn apply_binary(
                     range_contains_range(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae),
                 elem => range_contains_elem(*bk, bl, bu, *bli, *bui, *be, elem),
             }))
+        }
+        // tsquery `&&` is boolean AND (claim it before array / inet overlap).
+        BinOp::InetOverlap if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) => {
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
+            Ok(Value::TsQuery(spg_storage::TsQueryAst::And(
+                alloc::boxed::Box::new(a.clone()),
+                alloc::boxed::Box::new(b.clone()),
+            )))
         }
         BinOp::InetOverlap
             if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
