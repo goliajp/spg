@@ -447,9 +447,40 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                 // `'xfoo' ~ '\Afoo'` = f, `'foobar' ~ 'bar\Z'` = t.
                 'A' => Ok(ReNode::Start),
                 'Z' => Ok(ReNode::End),
-                // Character-entry escapes matching PG ARE semantics.
+                // Character-entry escapes matching PG ARE semantics (regc_lex.c).
+                'a' => Ok(ReNode::Literal('\u{07}')), // alert (BEL)
+                'e' => Ok(ReNode::Literal('\u{1b}')), // escape (ESC)
+                'f' => Ok(ReNode::Literal('\u{0c}')), // form feed
+                'n' => Ok(ReNode::Literal('\n')),
+                'r' => Ok(ReNode::Literal('\r')),
+                't' => Ok(ReNode::Literal('\t')),
+                'v' => Ok(ReNode::Literal('\u{0b}')), // vertical tab
                 'b' => Ok(ReNode::Literal('\u{08}')), // backspace
                 'B' => Ok(ReNode::Literal('\\')),     // literal backslash
+                // `\xHH` (1–2 hex digits) and `\uHHHH` (4 hex digits) numeric
+                // character escapes.
+                'x' | 'u' => {
+                    let want = if esc == 'x' { 2 } else { 4 };
+                    let mut hex = alloc::string::String::new();
+                    while hex.len() < want
+                        && *p < chars.len()
+                        && chars[*p].is_ascii_hexdigit()
+                    {
+                        hex.push(chars[*p]);
+                        *p += 1;
+                    }
+                    if hex.is_empty() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("regex compile: `\\{esc}` needs hex digits"),
+                        });
+                    }
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| {
+                        EvalError::TypeMismatch {
+                            detail: "regex compile: bad numeric escape".into(),
+                        }
+                    })?;
+                    Ok(ReNode::Literal(char::from_u32(code).unwrap_or('\u{fffd}')))
+                }
                 other => Ok(ReNode::Literal(other)),
             }
         }
