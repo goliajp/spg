@@ -316,6 +316,16 @@ struct AggState {
     sum_float: f64,
     extreme: Option<Value<'static>>,
     use_float: bool,
+    /// v7.37.16 — exact NUMERIC accumulator for `sum(numeric)` /
+    /// `avg(numeric)`. Only touched when a `Value::Numeric` flows
+    /// through the sum/avg path (`use_numeric` gates it); the
+    /// int/float fast path never reads or writes these, so the common
+    /// `sum(int)` / `sum(float8)` accumulation is byte-identical. Holds
+    /// the running sum as an integral mantissa at `sum_num_scale`
+    /// (aligned on the max input scale, so it stays exact — no f64).
+    sum_num_scaled: i128,
+    sum_num_scale: u8,
+    use_numeric: bool,
     /// v7.17.0 — running collection for string_agg / array_agg.
     /// Each entry is one row's contribution (NULL preserved as
     /// `Value::Null`; string_agg's finalize step drops them, but
@@ -1134,6 +1144,13 @@ fn accumulate_groups(
         let mut sum_int: i64 = 0;
         let mut sum_float: f64 = 0.0;
         let mut use_float = false;
+        // v7.37.16 — exact NUMERIC accumulator, only written when a
+        // Numeric cell appears. The int/float branches above are
+        // untouched (byte-identical), so the common int/float sum pays
+        // nothing for this.
+        let mut num_scaled: i128 = 0;
+        let mut num_scale: u8 = 0;
+        let mut use_numeric = false;
         let mut count: i64 = 0;
         // Borrow-aware fast inner: avoid the per-row clone when arg
         // is a bound column position.
@@ -1157,6 +1174,15 @@ fn accumulate_groups(
                     Value::Float(x) => {
                         sum_float += *x;
                         use_float = true;
+                        count += 1;
+                    }
+                    Value::Numeric { scaled, scale } => {
+                        let (s, sc) = crate::numeric::numeric_add(
+                            num_scaled, num_scale, *scaled, *scale,
+                        );
+                        num_scaled = s;
+                        num_scale = sc;
+                        use_numeric = true;
                         count += 1;
                     }
                     other => {
@@ -1221,6 +1247,15 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
+                    Value::Numeric { scaled, scale } => {
+                        let (s, sc) = crate::numeric::numeric_add(
+                            num_scaled, num_scale, scaled, scale,
+                        );
+                        num_scaled = s;
+                        num_scale = sc;
+                        use_numeric = true;
+                        count += 1;
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -1234,6 +1269,9 @@ fn accumulate_groups(
         state.sum_int = sum_int;
         state.sum_float = sum_float;
         state.use_float = use_float;
+        state.sum_num_scaled = num_scaled;
+        state.sum_num_scale = num_scale;
+        state.use_numeric = use_numeric;
         return Ok(order);
     }
     // v7.37.x (mailrs Track A 100k attack) — tight inlined loop for
@@ -2753,6 +2791,19 @@ fn update_state(
                     st.use_float = true;
                     st.sum_float += *x;
                 }
+                // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
+                // scales on the running max; result stays exact.
+                Value::Numeric { scaled, scale } => {
+                    st.use_numeric = true;
+                    let (s, sc) = crate::numeric::numeric_add(
+                        st.sum_num_scaled,
+                        st.sum_num_scale,
+                        *scaled,
+                        *scale,
+                    );
+                    st.sum_num_scaled = s;
+                    st.sum_num_scale = sc;
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -3040,6 +3091,18 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         "sum" => {
             if st.count == 0 {
                 Value::Null
+            } else if st.use_numeric {
+                // Exact NUMERIC sum (PG18: sum(numeric) → numeric). Fold
+                // any integer contributions (scale 0) into the running
+                // numeric accumulator — normally a group is single-typed,
+                // so sum_int is 0 here.
+                let (scaled, scale) = crate::numeric::numeric_add(
+                    st.sum_num_scaled,
+                    st.sum_num_scale,
+                    i128::from(st.sum_int),
+                    0,
+                );
+                Value::Numeric { scaled, scale }
             } else if st.use_float {
                 Value::Float(st.sum_float + (st.sum_int as f64))
             } else {
@@ -3049,6 +3112,18 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         "avg" => {
             if st.count == 0 {
                 Value::Null
+            } else if st.use_numeric {
+                // Exact NUMERIC avg = numeric_div(sum, count) at PG's
+                // display scale (select_div_scale).
+                let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
+                    st.sum_num_scaled,
+                    st.sum_num_scale,
+                    i128::from(st.sum_int),
+                    0,
+                );
+                let (scaled, scale) =
+                    crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
+                Value::Numeric { scaled, scale }
             } else {
                 let total = if st.use_float {
                     st.sum_float + (st.sum_int as f64)

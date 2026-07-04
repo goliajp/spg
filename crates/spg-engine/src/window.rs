@@ -276,6 +276,12 @@ pub(crate) fn compute_window_partition(
             for i in 0..slice.len() {
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
                 let mut sum: f64 = 0.0;
+                // v7.37.16 — exact NUMERIC accumulator for sum/avg over a
+                // Numeric frame (was deferred → NULL). Only written when a
+                // Numeric cell appears; the f64 path stays untouched.
+                let mut num_scaled: i128 = 0;
+                let mut num_scale: u8 = 0;
+                let mut use_numeric = false;
                 let mut count: i64 = 0;
                 // min/max compare the *actual* Value via value_cmp so
                 // they work on TEXT / DATE / NUMERIC (not just f64) and
@@ -306,12 +312,18 @@ pub(crate) fn compute_window_partition(
                                 if v.is_null() {
                                     continue;
                                 }
-                                // sum/avg accumulate in f64 (NUMERIC
-                                // stays deferred — value_to_f64 → None,
-                                // so a NUMERIC frame contributes nothing
-                                // and finalizes to NULL, matching the
-                                // main-path deferral, not a bogus 0).
-                                if let Some(x) = value_to_f64(v) {
+                                // sum/avg: exact NUMERIC accumulation for
+                                // Numeric cells (aligns scales, no f64);
+                                // int/float continue through the f64 path.
+                                if let Value::Numeric { scaled, scale } = v {
+                                    let (s, sc) = crate::numeric::numeric_add(
+                                        num_scaled, num_scale, *scaled, *scale,
+                                    );
+                                    num_scaled = s;
+                                    num_scale = sc;
+                                    use_numeric = true;
+                                    count += 1;
+                                } else if let Some(x) = value_to_f64(v) {
                                     sum += x;
                                     count += 1;
                                 }
@@ -341,6 +353,8 @@ pub(crate) fn compute_window_partition(
                     "sum" => {
                         if count == 0 {
                             Value::Null
+                        } else if use_numeric {
+                            Value::Numeric { scaled: num_scaled, scale: num_scale }
                         } else {
                             Value::Float(sum)
                         }
@@ -348,6 +362,13 @@ pub(crate) fn compute_window_partition(
                     "avg" => {
                         if count == 0 {
                             Value::Null
+                        } else if use_numeric {
+                            let (scaled, scale) = crate::numeric::numeric_avg(
+                                num_scaled,
+                                num_scale,
+                                i128::from(count),
+                            );
+                            Value::Numeric { scaled, scale }
                         } else {
                             Value::Float(sum / count as f64)
                         }

@@ -29,12 +29,16 @@
 //!   * json_object_agg: PG inserts spaces (`{ "a" : 10 }`); SPG is
 //!     compact (`{"a": 10}`). Same value.
 //!
-//! DEFERRED GAP (reported, not fixed — needs a dedicated change):
-//!   * sum(NUMERIC) / avg(NUMERIC) raise a TypeMismatch error; PG
-//!     returns an exact NUMERIC. A correct fix needs an arbitrary-
-//!     precision numeric accumulator + NUMERIC finalize (avg has
-//!     PG-specific result-scale rules) and touches the perf-critical
-//!     sum fast path — out of scope for a localized differential fix.
+//! CLOSED GAP (v7.37.16 — was DEFERRED across the aggregate + window
+//! differential sweeps, now fixed and asserted against live PG here):
+//!   * sum(NUMERIC) / avg(NUMERIC) previously raised a TypeMismatch;
+//!     PG returns an exact NUMERIC. Fixed with an exact i128-mantissa
+//!     accumulator (scales aligned on the max, no f64) + a NUMERIC
+//!     finalize; avg replicates PG's `select_div_scale` result scale
+//!     (e.g. `avg('1.50')` → `1.50000000000000000000`, 20 fractional
+//!     digits). The int/float sum fast path is byte-identical — the
+//!     numeric arm only fires on `Value::Numeric` cells. See
+//!     `sum_avg_numeric` below.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -274,6 +278,57 @@ fn ordered_set_and_orderby_numeric() {
         &mut e,
         "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY nm))::text FROM t3",
         "12.50",
+    );
+}
+
+// ---- CLOSED GAP: sum(NUMERIC) / avg(NUMERIC) exact, PG18-matched ----
+// Ground truth from live PG18 (2026-07-04): over numeric(10,2)
+// {12.50, 99.99, 5.25, NULL} and numeric(12,3) {1.100, 2.200, 3.300}.
+#[test]
+fn sum_avg_numeric() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE nd (id int, g text, nm numeric(10,2), n3 numeric(12,3))")
+        .unwrap();
+    for row in [
+        "(1,'a',12.50,1.100)",
+        "(2,'a',99.99,2.200)",
+        "(3,'b',5.25,3.300)",
+        "(4,'b',NULL,NULL)",
+    ] {
+        e.execute(&format!("INSERT INTO nd VALUES {row}")).unwrap();
+    }
+    // sum(numeric) → exact NUMERIC at the column scale (was TypeMismatch).
+    check(&mut e, "SELECT sum(nm)::text FROM nd", "117.74");
+    check(&mut e, "SELECT sum(n3)::text FROM nd", "6.600");
+    // avg(numeric) → NUMERIC at PG's select_div_scale display scale.
+    // PG: 117.74/3 carries 16 fractional digits.
+    check(&mut e, "SELECT avg(nm)::text FROM nd", "39.2466666666666667");
+    // PG: 6.600/3 = 2.2 padded to 16 fractional digits.
+    check(&mut e, "SELECT avg(n3)::text FROM nd", "2.2000000000000000");
+    // Mixed-scale exact add: 117.74 + 6.600 = 124.340 (scale aligns to 3).
+    check(&mut e, "SELECT (sum(nm)+sum(n3))::text FROM nd", "124.340");
+    // avg of a single 1.50 → 20 fractional digits (PG's qweight rule:
+    // equal leading digits push the result scale to 16+4).
+    check(
+        &mut e,
+        "SELECT avg(x)::text FROM (VALUES (1.50::numeric)) v(x)",
+        "1.50000000000000000000",
+    );
+    // avg of {1.50, 9.99} = 5.745 → 16 fractional digits.
+    check(
+        &mut e,
+        "SELECT avg(x)::text FROM (VALUES (1.50::numeric),(9.99::numeric)) v(x)",
+        "5.7450000000000000",
+    );
+    // Empty / all-NULL numeric group → NULL (not 0), preserved.
+    check(&mut e, "SELECT sum(nm)::text FROM nd WHERE false", "<NULL>");
+    check(&mut e, "SELECT avg(nm)::text FROM nd WHERE id=4", "<NULL>");
+    // GROUP BY numeric sum per group: 'a' {12.50,99.99}=112.49,
+    // 'b' {5.25,NULL}=5.25.
+    check(
+        &mut e,
+        "SELECT sum(nm)::text FROM nd GROUP BY g ORDER BY g",
+        "112.49|5.25",
     );
 }
 

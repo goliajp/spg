@@ -24,11 +24,15 @@
 //!     empty (see `rows_frame_out_of_range`).
 //!
 //! DOCUMENTED (not bugs / deferred):
-//!   * avg(...) OVER returns FLOAT; PG returns NUMERIC (prints trailing
-//!     zeros). Same value.
-//!   * sum(NUMERIC) / avg(NUMERIC) OVER return NULL (no exact numeric
-//!     accumulator — same deferral as the main aggregate path). PG
-//!     returns the exact numeric.
+//!   * avg(int/float) OVER returns FLOAT; PG returns NUMERIC (prints
+//!     trailing zeros). Same value.
+//!
+//! CLOSED GAP (v7.37.16 — was DEFERRED):
+//!   * sum(NUMERIC) / avg(NUMERIC) OVER previously returned NULL (no
+//!     exact accumulator). Now they use the exact i128-mantissa
+//!     accumulator + PG `select_div_scale` avg scale, matching PG18's
+//!     exact numeric running sum / partition avg (see
+//!     `numeric_agg_exact`).
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -181,11 +185,15 @@ fn min_max_text_numeric() {
     ck(&mut e, "min(y) OVER (PARTITION BY g)", "1.50|1.50|1.50|1.50|9.99|9.99|5.25");  // FIX: min(NUMERIC) OVER was NULL; now exact numeric min.
 }
 
+// CLOSED GAP (v7.37.16): sum/avg(NUMERIC) OVER now exact, PG18-matched.
 #[test]
-fn numeric_agg_deferred() {
+fn numeric_agg_exact() {
     let mut e = seed();
-    ck(&mut e, "sum(y) OVER (ORDER BY id)", "<NULL>|<NULL>|<NULL>|<NULL>|<NULL>|<NULL>|<NULL>");  // DOC: sum(NUMERIC) DEFERRED (no exact accumulator) -> NULL; PG exact numeric running sum. PG: 1.50|4.00|6.50|6.50|16.49|28.99|34.24
-    ck(&mut e, "avg(y) OVER (PARTITION BY g)", "<NULL>|<NULL>|<NULL>|<NULL>|<NULL>|<NULL>|<NULL>");  // DOC: avg(NUMERIC) DEFERRED -> NULL; PG exact numeric. PG: 2.1666666666666667|2.1666666666666667|2.1666666666666667|2.1666666666666667|11.2450000000000000|11.2450000000000000|5.2500000000000000
+    // Exact running numeric sum (was deferred → all NULL).
+    ck(&mut e, "sum(y) OVER (ORDER BY id)", "1.50|4.00|6.50|6.50|16.49|28.99|34.24");
+    // Exact numeric partition avg at PG's select_div_scale display scale
+    // (16 fractional digits here). 'a' 6.50/3, 'b' 22.49/2, 'c' 5.25/1.
+    ck(&mut e, "avg(y) OVER (PARTITION BY g)", "2.1666666666666667|2.1666666666666667|2.1666666666666667|2.1666666666666667|11.2450000000000000|11.2450000000000000|5.2500000000000000");
 }
 
 #[test]

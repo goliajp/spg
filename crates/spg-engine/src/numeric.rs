@@ -185,6 +185,136 @@ fn check_precision(scaled: i128, precision: u8, col_name: &str) -> Result<(), En
     Ok(())
 }
 
+/// Exact NUMERIC addition, aligning the two operands on the larger of
+/// their scales (scaling *up* never rounds, so the sum stays exact).
+/// Used by `sum(numeric)` / `avg(numeric)` accumulators — reuses the
+/// same integral-mantissa arithmetic the `+` binop does, no f64.
+/// Saturates on i128 overflow rather than panicking (extreme
+/// magnitudes are out of scope; representable-range sums are exact).
+pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, u8) {
+    if a_scale == b_scale {
+        (a.saturating_add(b), a_scale)
+    } else if a_scale > b_scale {
+        let f = pow10_sat(a_scale - b_scale);
+        (a.saturating_add(b.saturating_mul(f)), a_scale)
+    } else {
+        let f = pow10_sat(b_scale - a_scale);
+        (a.saturating_mul(f).saturating_add(b), b_scale)
+    }
+}
+
+/// PG-compatible `avg(numeric)` = `numeric_div(sum, count)`. Picks the
+/// division result scale via a faithful port of PostgreSQL's
+/// `select_div_scale` (base-10000 digit weights, `NUMERIC_MIN_SIG_DIGITS
+/// = 16`, `DEC_DIGITS = 4`), then rounds half-away-from-zero — matching
+/// PG18's exact avg output text including trailing digits. `count` must
+/// be > 0 (callers gate on `count == 0 → NULL`).
+pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128, u8) {
+    let rscale = select_div_scale(sum_scaled, sum_scale, count);
+    let (num, den) = if i32::from(rscale) >= i32::from(sum_scale) {
+        let k = rscale - sum_scale;
+        (sum_scaled.saturating_mul(pow10_sat(k)), count)
+    } else {
+        let k = sum_scale - rscale;
+        (sum_scaled, count.saturating_mul(pow10_sat(k)))
+    };
+    (div_round_half_away(num, den), rscale)
+}
+
+/// Port of PG `numeric.c:select_div_scale`. Returns the display scale
+/// PG would give `sum / count`, clamped to SPG's `u8` scale field
+/// (PG allows up to `NUMERIC_MAX_DISPLAY_SCALE = 1000`, but every
+/// `Value::Numeric` scale in SPG is `u8`; scales beyond 255 are a
+/// pre-existing SPG representation limit, not introduced here).
+fn select_div_scale(sum_scaled: i128, sum_scale: u8, count: i128) -> u8 {
+    let (w1, fd1) = base10000_weight_firstdigit(sum_scaled, sum_scale);
+    let (w2, fd2) = base10000_weight_firstdigit(count, 0);
+    // Estimate the weight of the quotient; if the two leading base-10000
+    // digits are equal we can't be sure, so PG assumes var1 < var2.
+    let mut qweight = w1 - w2;
+    if fd1 <= fd2 {
+        qweight -= 1;
+    }
+    // NUMERIC_MIN_SIG_DIGITS (16) - qweight * DEC_DIGITS (4), floored by
+    // both inputs' display scales and NUMERIC_MIN_DISPLAY_SCALE (0),
+    // capped at NUMERIC_MAX_DISPLAY_SCALE (1000).
+    let mut rscale = 16 - qweight * 4;
+    rscale = rscale.max(i32::from(sum_scale));
+    rscale = rscale.max(0);
+    rscale = rscale.min(1000);
+    // SPG stores scale as u8; clamp (see doc comment).
+    rscale.min(255) as u8
+}
+
+/// Base-10000 weight + leading digit of `|scaled / 10^scale|`, matching
+/// how PG normalizes a `NumericVar` (digits grouped in 4s anchored on
+/// the decimal point). Returns `(weight, first_digit)` where `weight`
+/// is in units of 10000 and `first_digit` is the most-significant
+/// non-zero base-10000 digit. Zero → `(0, 0)`.
+fn base10000_weight_firstdigit(scaled: i128, scale: u8) -> (i32, i32) {
+    let a = scaled.unsigned_abs();
+    if a == 0 {
+        return (0, 0);
+    }
+    let s = alloc::string::ToString::to_string(&a);
+    let ndigits = s.len() as i32;
+    let scale = i32::from(scale);
+    let int_digits = ndigits - scale;
+    if int_digits > 0 {
+        // Integer part present: the most-significant group sits at
+        // weight floor((int_digits - 1) / 4); its width is the leftover
+        // 1..=4 leading decimal digits.
+        let weight = (int_digits - 1) / 4;
+        let top_len = (int_digits - weight * 4) as usize;
+        let firstdigit: i32 = s[..top_len].parse().unwrap_or(0);
+        (weight, firstdigit)
+    } else {
+        // |value| < 1: count leading fractional zeros, group by 4 from
+        // the decimal point; the first non-zero group's index g gives
+        // weight = -(g + 1).
+        let lead_zeros = (-int_digits) as usize;
+        let g = (lead_zeros as i32) / 4;
+        let weight = -(g + 1);
+        let mut frac = alloc::string::String::with_capacity(lead_zeros + s.len());
+        for _ in 0..lead_zeros {
+            frac.push('0');
+        }
+        frac.push_str(&s);
+        let start = (4 * g) as usize;
+        let mut group: alloc::string::String = frac[start..].chars().take(4).collect();
+        while group.len() < 4 {
+            group.push('0');
+        }
+        let firstdigit: i32 = group.parse().unwrap_or(0);
+        (weight, firstdigit)
+    }
+}
+
+/// Divide `num / den` (den > 0) rounding half away from zero, matching
+/// PG's `round_var`.
+fn div_round_half_away(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    let r = num % den;
+    if r.unsigned_abs() * 2 >= den.unsigned_abs() {
+        if num >= 0 { q + 1 } else { q - 1 }
+    } else {
+        q
+    }
+}
+
+/// `10^p` as i128, saturating at `i128::MAX` instead of panicking on
+/// overflow (guards the avg-scale multiply for pathological scales).
+fn pow10_sat(p: u8) -> i128 {
+    let mut acc: i128 = 1;
+    for _ in 0..p {
+        match acc.checked_mul(10) {
+            Some(v) => acc = v,
+            None => return i128::MAX,
+        }
+    }
+    acc
+}
+
 const fn pow10_i128_const(p: u8) -> i128 {
     let mut acc: i128 = 1;
     let mut i = 0;
