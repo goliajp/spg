@@ -2413,12 +2413,15 @@ impl Index {
 ///    (empty for `Delete`) and `writer_version` with `0`. See the
 ///    codec version gate in [`encode_redo_log`]/[`decode_redo_log`].
 ///
-/// The `writer_version` is currently populated as `0` at every
-/// capture site: the storage layer stamps `RowHeader::frozen()` on
-/// insert and does not thread the writing transaction's `TxId` down
-/// to `Table::insert`/`delete_rows`/`update_row`, so the real
-/// `xmin`/`xmax` is not reachable here without a bigger change. The
-/// codec is ready to carry it the moment it becomes available.
+/// The `writer_version` is captured as `0` at the storage layer
+/// (`Table::insert`/`delete_rows`/`update_row` don't have the
+/// committing `TxId`), then **stamped with the real committing
+/// version by the engine** after it drains the statement's changes
+/// (Epic W slice 2 — [`RowChange::set_writer_version`], driven from
+/// `Engine::writer_version_for_current_stmt`). All changes from one
+/// statement share the one version. Replay still resolves by
+/// physical position and does not read `writer_version` — that is a
+/// later slice (header-preserving replay).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowChange {
     /// Append `row` to `table`.
@@ -2459,6 +2462,23 @@ pub enum RowChange {
         /// `TxId` is threaded to the storage layer (later slice).
         writer_version: u64,
     },
+}
+
+impl RowChange {
+    /// v7.37.15 (Epic W slice 2) — stamp the committing writer
+    /// version onto this change. Every change drained from a single
+    /// statement shares one version (the statement's `xmin`/`xmax`),
+    /// so the engine calls this on each drained change with the value
+    /// from [`Engine::writer_version_for_current_stmt`]. Additive
+    /// metadata only: replay still resolves by physical position and
+    /// does not read `writer_version` (that is a later slice).
+    pub fn set_writer_version(&mut self, v: u64) {
+        match self {
+            RowChange::Insert { writer_version, .. }
+            | RowChange::Update { writer_version, .. }
+            | RowChange::Delete { writer_version, .. } => *writer_version = v,
+        }
+    }
 }
 
 /// v7.37.15 (Epic W slice 1) — leading marker byte of the

@@ -145,6 +145,7 @@ pub use spg_sql::ast::{SelectStatement, Statement as ParsedStatement};
 // callers so the per-row MVCC types live behind one stable name
 // (`spg_engine::Snapshot` / `spg_engine::RowHeader`) instead of every
 // caller threading through `spg_storage::snapshot::*` directly.
+pub use spg_storage::RowChange;
 pub use spg_storage::row_header::{RowHeader, XMAX_ALIVE, XMIN_FROZEN};
 pub use spg_storage::snapshot::{
     AllCommitted, InProgressSet, Snapshot, XactStatus, XactStatusOracle,
@@ -166,7 +167,7 @@ impl XactStatusOracle for Engine {
 // don't need a direct `spg-sql` dep.
 use spg_sql::parser::ParseError;
 pub use spg_sql::silent_for_update_count;
-use spg_storage::{Catalog, ColumnSchema, Row, RowChange, StorageError};
+use spg_storage::{Catalog, ColumnSchema, Row, StorageError};
 
 use crate::eval::EvalError;
 
@@ -490,6 +491,20 @@ pub struct Engine {
     /// [`Self::commit_writer_version`] on the right entry. Empty
     /// when no explicit transactions are open.
     tx_writer_versions: BTreeMap<TxId, u64>,
+    /// v7.37.15 (Epic W slice 2) — the current statement's autocommit
+    /// writer version, memoized. In autocommit
+    /// [`Self::writer_version_for_current_stmt`] mints a fresh version
+    /// via `next_version()` (a `fetch_add`), so calling it a second
+    /// time — e.g. when the redo drain post-stamps `RowChange`s —
+    /// would allocate a *different* number than the writes actually
+    /// used. Memoizing the first allocation for the duration of one
+    /// statement makes the drain stamp read back the exact version the
+    /// rows were written with, without advancing the counter twice.
+    /// `None` outside a statement / before the first fetch; saved and
+    /// reset per `execute_in_with_cancel` so it never leaks across
+    /// statements. Explicit transactions bypass this (their version is
+    /// the deterministic `tx_writer_versions` entry).
+    stmt_writer_version: Option<u64>,
     /// v7.22 (round-13 T3) — session string-literal dialect. `false`
     /// (default) = PG semantics (backslash literal, `''` escape);
     /// `true` = MySQL semantics (`\'` etc.). Flipped by the
@@ -711,6 +726,7 @@ impl Engine {
             locks: crate::locks::LockTable::new(),
             mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
+            stmt_writer_version: None,
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -959,8 +975,17 @@ impl Engine {
     /// explicit-tx semantics where every row produced by the tx
     /// shares one xmin and concurrent readers don't see partial
     /// state until COMMIT.
-    #[must_use]
-    pub fn writer_version_for_current_stmt(&self) -> u64 {
+    ///
+    /// v7.37.15 (Epic W slice 2) — takes `&mut self` so the autocommit
+    /// branch can **memoize** its freshly-minted version in
+    /// `stmt_writer_version`. `next_writer_version()` is a `fetch_add`,
+    /// so without memoization a second call within one statement (the
+    /// redo drain post-stamps the captured `RowChange`s) would allocate
+    /// a *different* version than the writes used. Memoizing makes the
+    /// value stable for the statement's lifetime; it is reset per
+    /// `execute_in_with_cancel`, so the counter still advances exactly
+    /// once per autocommit statement — identical to before.
+    pub fn writer_version_for_current_stmt(&mut self) -> u64 {
         if let Some(tx_id) = self.current_tx
             && let Some(&v) = self.tx_writer_versions.get(&tx_id)
         {
@@ -968,8 +993,14 @@ impl Engine {
         }
         // Autocommit shape: fresh version, immediately "committed"
         // (no entry in active_writer_versions, so subsequent
-        // readers see the row).
-        self.next_writer_version()
+        // readers see the row). Memoized for the statement so the
+        // redo drain reads back the same version the writes used.
+        if let Some(v) = self.stmt_writer_version {
+            return v;
+        }
+        let v = self.next_writer_version();
+        self.stmt_writer_version = Some(v);
+        v
     }
 
     /// Construct an engine restored from a previously-snapshotted catalog
@@ -987,6 +1018,7 @@ impl Engine {
             locks: crate::locks::LockTable::new(),
             mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
+            stmt_writer_version: None,
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -1066,6 +1098,7 @@ impl Engine {
             locks: crate::locks::LockTable::new(),
             mvcc_inplace: false,
             tx_writer_versions: BTreeMap::new(),
+            stmt_writer_version: None,
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
