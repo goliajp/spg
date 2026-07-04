@@ -1952,3 +1952,25 @@ fn correlated_subq_over_derived() {
     // EXISTS correlated over derived outer
     assert_eq!(q(&mut e, "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE EXISTS (SELECT 1 FROM (VALUES (2),(3)) u(v) WHERE u.v=t.g)"), "2,3");
 }
+
+/// v7.37 D.22 — a bare set-returning function in the SELECT projection (no FROM)
+/// expands to rows, lowered to the equivalent FROM-position SRF. PG18.4-verified.
+#[test]
+fn srf_in_projection() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // bare unnest in projection (column named "unnest")
+    assert_eq!(q(&mut e, "SELECT string_agg(unnest::text,',' ORDER BY unnest) FROM (SELECT unnest(ARRAY[5,3])) x"), "3,5");
+    // aliased
+    assert_eq!(q(&mut e, "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v) x"), "3,5");
+    // generate_series in projection
+    assert_eq!(q(&mut e, "SELECT string_agg(generate_series::text,',' ORDER BY generate_series) FROM (SELECT generate_series(1,4)) x"), "1,2,3,4");
+    // UNION of two projection-SRFs (the D.22 trigger)
+    assert_eq!(q(&mut e, "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v UNION SELECT unnest(ARRAY[3,1])) z"), "1,3,5");
+}
