@@ -1071,6 +1071,27 @@ fn bitop(
     f: impl Fn(i64, i64) -> i64,
     op_name: &str,
 ) -> Result<Value<'static>, EvalError> {
+    // PG `bit(n) & / | bit(n)`: byte-wise over equal-length bit strings.
+    // Operands are MSB-packed and zero-padded, so `&`/`|` keep the padding
+    // zero. Differing lengths are an error, matching PG.
+    if let (Value::BitString { nbits: an, bytes: ab }, Value::BitString { nbits: bn, bytes: bb }) =
+        (&l, &r)
+    {
+        if an != bn {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("cannot {op_name} bit strings of different sizes"),
+            });
+        }
+        let out: alloc::vec::Vec<u8> = ab
+            .iter()
+            .zip(bb.iter())
+            .map(|(&x, &y)| f(i64::from(x), i64::from(y)) as u8)
+            .collect();
+        return Ok(Value::BitString {
+            nbits: *an,
+            bytes: alloc::borrow::Cow::Owned(out),
+        });
+    }
     let widen = |v: Value<'static>| -> Value<'static> {
         match v {
             Value::SmallInt(n) => Value::Int(i32::from(n)),

@@ -342,3 +342,16 @@ fn range_boolean_operators() {
     ck(&mut e, r#"int4range(1,10) @> 'empty'::int4range"#, r#"true"#);
     ck(&mut e, r#"'empty'::int4range && int4range(1,10)"#, r#"false"#);
 }
+
+/// bit-string bitwise & / | over equal-length bit(n) values (byte-wise;
+/// previously errored "cannot apply & to BitString"). PG18.4-verified.
+#[test]
+fn bit_string_bitwise_and_or() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"B'1010' & B'0110'"#, r#"0010"#);
+    ck(&mut e, r#"B'1010' | B'0110'"#, r#"1110"#);
+    ck(&mut e, r#"B'11001010' & B'10101010'"#, r#"10001010"#);
+    ck(&mut e, r#"B'11001010' | B'10101010'"#, r#"11101010"#);
+    // differing lengths error.
+    ck(&mut e, r#"B'1010' & B'101'"#, r#"ERR"#);
+}
