@@ -235,6 +235,38 @@ pub(super) fn apply_binary(
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
         BinOp::JsonGetPathText => crate::json::path_walk(&l, &r, true),
+        // v7.37 — RANGE operands claim @> / <@ / && ahead of the array /
+        // JSON / inet interpretations. `range @> elem|range`, `<@` swapped,
+        // `&&` overlap. Verified vs PG18.
+        BinOp::JsonContains if matches!(l, Value::Range { .. }) => {
+            let Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae } = &l
+            else { unreachable!() };
+            Ok(Value::Bool(match &r {
+                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be } =>
+                    range_contains_range(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be),
+                elem => range_contains_elem(*ak, al, au, *ali, *aui, *ae, elem),
+            }))
+        }
+        BinOp::JsonContainedBy if matches!(r, Value::Range { .. }) => {
+            let Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be } = &r
+            else { unreachable!() };
+            Ok(Value::Bool(match &l {
+                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae } =>
+                    range_contains_range(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae),
+                elem => range_contains_elem(*bk, bl, bu, *bli, *bui, *be, elem),
+            }))
+        }
+        BinOp::InetOverlap
+            if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
+        {
+            let (
+                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
+                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+            ) = (&l, &r) else { unreachable!() };
+            Ok(Value::Bool(range_overlaps(
+                *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+            )))
+        }
         // Array operands claim && / @> / <@ before the inet / JSON
         // interpretations: ARRAY[1,2] && ARRAY[2,3] is the overlap
         // test, ARRAY[1,2,3] @> ARRAY[2] the containment test.
@@ -1668,6 +1700,83 @@ fn multirange_cmp(
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// Is the interval bounded below by `(l, l_inc)` and above by `(u, u_inc)`
+/// non-empty? (`−∞` lower / `+∞` upper are always fine; equal finite bounds
+/// need both inclusive.)
+fn range_point_le(l: &Option<Value<'static>>, l_inc: bool, u: &Option<Value<'static>>, u_inc: bool) -> bool {
+    match (l, u) {
+        (None, _) | (_, None) => true,
+        (Some(lv), Some(uv)) => match bound_cmp(lv, uv) {
+            core::cmp::Ordering::Less => true,
+            core::cmp::Ordering::Greater => false,
+            core::cmp::Ordering::Equal => l_inc && u_inc,
+        },
+    }
+}
+
+/// Range `&&` overlap: the two ranges share at least one point. Empty
+/// overlaps nothing.
+#[allow(clippy::too_many_arguments)]
+fn range_overlaps(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> bool {
+    if ae || be {
+        return false;
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    range_point_le(&al2, ali2, &bu2, bui2) && range_point_le(&bl2, bli2, &au2, aui2)
+}
+
+/// Range `@>` range: `a` contains `b`. Empty is contained in everything;
+/// only empty contains empty.
+#[allow(clippy::too_many_arguments)]
+fn range_contains_range(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> bool {
+    if be {
+        return true;
+    }
+    if ae {
+        return false;
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    lower_cmp(&al2, ali2, &bl2, bli2) != core::cmp::Ordering::Greater
+        && upper_cmp(&au2, aui2, &bu2, bui2) != core::cmp::Ordering::Less
+}
+
+/// Range `@>` element: `a` contains the scalar `e`.
+fn range_contains_elem(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    e: &Value<'_>,
+) -> bool {
+    use core::cmp::Ordering;
+    if ae {
+        return false;
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let lower_ok = match &al2 {
+        None => true,
+        Some(lv) => match bound_cmp(e, lv) {
+            Ordering::Greater => true,
+            Ordering::Equal => ali2,
+            Ordering::Less => false,
+        },
+    };
+    let upper_ok = match &au2 {
+        None => true,
+        Some(uv) => match bound_cmp(e, uv) {
+            Ordering::Less => true,
+            Ordering::Equal => aui2,
+            Ordering::Greater => false,
+        },
+    };
+    lower_ok && upper_ok
 }
 
 pub(super) fn compare(

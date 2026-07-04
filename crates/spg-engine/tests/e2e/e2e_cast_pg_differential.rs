@@ -321,3 +321,24 @@ fn inet_functions_accept_inet_value() {
     // TEXT form still works (legacy path).
     ck(&mut e, r#"host('192.168.1.5/24')"#, r#"192.168.1.5"#);
 }
+
+/// Range boolean operators @> (contains elem/range), <@ (contained by), &&
+/// (overlap) — previously routed to json::contains and errored on ranges.
+/// PG18.4-verified (bool renders as true/false via ::text).
+#[test]
+fn range_boolean_operators() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"int4range(1,10) @> 5"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,10) @> 1"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,10) @> 10"#, r#"false"#);
+    ck(&mut e, r#"int4range(1,10) @> 20"#, r#"false"#);
+    ck(&mut e, r#"int4range(1,10) @> int4range(2,5)"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,10) @> int4range(5,15)"#, r#"false"#);
+    ck(&mut e, r#"int4range(2,5) <@ int4range(1,10)"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,5) && int4range(4,10)"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,5) && int4range(5,10)"#, r#"false"#);
+    ck(&mut e, r#"numrange(1,5,'[]') && numrange(5,10,'[]')"#, r#"true"#);
+    ck(&mut e, r#"'empty'::int4range <@ int4range(1,10)"#, r#"true"#);
+    ck(&mut e, r#"int4range(1,10) @> 'empty'::int4range"#, r#"true"#);
+    ck(&mut e, r#"'empty'::int4range && int4range(1,10)"#, r#"false"#);
+}
