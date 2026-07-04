@@ -8465,6 +8465,15 @@ fn apply_function_dispatch(
                             scale: 0,
                         })
                     }
+                    // PG `trunc(macaddr)` zeros the last 3 bytes (clears the
+                    // device-specific part, keeping the manufacturer prefix).
+                    Value::Macaddr(m) => {
+                        let mut out = *m;
+                        out[3] = 0;
+                        out[4] = 0;
+                        out[5] = 0;
+                        Ok(Value::Macaddr(out))
+                    }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
                             "trunc() needs numeric, got {:?}",

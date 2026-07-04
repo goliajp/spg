@@ -2440,6 +2440,11 @@ pub(crate) fn coerce_value(
         }
         (Value::Macaddr(m), DataType::Text) => Some(Value::text(format_macaddr(&m))),
         (Value::Macaddr8(m), DataType::Text) => Some(Value::text(format_macaddr8(&m))),
+        // MACADDR → MACADDR8: PG widens EUI-48 to EUI-64 by inserting the
+        // `ff:fe` marker in the middle (08:00:2b:01:02:03 → 08:00:2b:ff:fe:01:02:03).
+        (Value::Macaddr(m), DataType::Macaddr8) => Some(Value::Macaddr8([
+            m[0], m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5],
+        ])),
         (Value::BitString { nbits, bytes }, DataType::Text) => {
             Some(Value::text(format_bit_string(nbits, &bytes)))
         }
