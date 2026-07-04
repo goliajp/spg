@@ -289,24 +289,59 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     } else {
         (to_micros(&args[0])?, to_micros(&args[1])?)
     };
-    let delta = a.checked_sub(b).ok_or(EvalError::TypeMismatch {
-        detail: "age() subtraction overflows i64 microseconds".into(),
-    })?;
-    // v7.38 P1 (轴 1 pg_regress closure) — PG canonical AGE output
-    // splits whole days out of the microsecond residue so
-    // `AGE('2024-03-01'::TIMESTAMP, '2024-01-01'::TIMESTAMP)` reads
-    // `60 days` (not `1440:00:00`). Truncate toward zero so the day
-    // component carries delta's sign and micros retains the same sign
-    // — matches PG's interval normalisation for symmetric AGE diffs.
+    // PG's AGE is a *calendar* difference: it breaks the span into
+    // years/months/days by walking the civil calendar with borrows, so
+    // `age('2024-03-15','2024-01-10')` reads `2 mons 5 days`, not
+    // `65 days`. Compute the positive span (hi - lo) field-by-field, then
+    // negate every field if the arguments were reversed.
     const US_PER_DAY: i64 = 86_400_000_000;
-    let days_i64 = delta / US_PER_DAY;
-    let micros = delta % US_PER_DAY;
-    let days = i32::try_from(days_i64).map_err(|_| EvalError::TypeMismatch {
-        detail: "age() day count exceeds i32".into(),
-    })?;
+    let neg = a < b;
+    let (hi, lo) = if neg { (b, a) } else { (a, b) };
+    let split = |us: i64| -> (i32, i64) {
+        (
+            i32::try_from(us.div_euclid(US_PER_DAY)).unwrap_or(i32::MAX),
+            us.rem_euclid(US_PER_DAY),
+        )
+    };
+    let (hd, ht) = split(hi);
+    let (ld, lt) = split(lo);
+    let (y1, m1, d1) = civil_from_days(hd);
+    let (y2, m2, d2) = civil_from_days(ld);
+    // days in month (m) of year (y) — via civil day arithmetic, no leap
+    // table needed.
+    let dim = |y: i32, m: u32| -> i64 {
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        i64::from(days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1))
+    };
+    let mut micros = ht - lt;
+    let mut mday = i64::from(d1) - i64::from(d2);
+    let mut mon = i64::from(m1) - i64::from(m2);
+    let mut year = i64::from(y1) - i64::from(y2);
+    if micros < 0 {
+        micros += US_PER_DAY;
+        mday -= 1;
+    }
+    while mday < 0 {
+        mon -= 1;
+        mday += dim(y2, m2);
+    }
+    while mon < 0 {
+        mon += 12;
+        year -= 1;
+    }
+    let mut months = year * 12 + mon;
+    if neg {
+        months = -months;
+        mday = -mday;
+        micros = -micros;
+    }
     Ok(Value::Interval {
-        months: 0,
-        days,
+        months: i32::try_from(months).map_err(|_| EvalError::TypeMismatch {
+            detail: "age() month count exceeds i32".into(),
+        })?,
+        days: i32::try_from(mday).map_err(|_| EvalError::TypeMismatch {
+            detail: "age() day count exceeds i32".into(),
+        })?,
         micros,
     })
 }
