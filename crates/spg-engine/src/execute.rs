@@ -306,6 +306,21 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
+        // v7.38 Epic P (panic isolation) — Slice 3: route this read-only
+        // prepared-SELECT hot path (pgwire `Execute` with no bound params)
+        // through the SAME `catch_unwind` firewall as the write paths. A
+        // panic in `exec_select_cancel` is caught inside the engine and
+        // returned as `EngineError::Internal`, so it never unwinds through
+        // the caller's engine `RwLock` write guard (poisoning it) or aborts
+        // the process. This path is read-only, so the firewall's
+        // `discard_tx_on_panic` is a no-op (no shadow / writer version to
+        // drop) — exactly right: nothing to roll back, just catch + survive.
+        // `exec_select_cancel` materialises its `QueryResult` synchronously,
+        // so the whole result is produced inside the catch (statement
+        // boundary only — no per-row cost).
+        #[cfg(feature = "std")]
+        let result = self.catch_stmt_panic(|s| s.exec_select_cancel(stmt, cancel));
+        #[cfg(not(feature = "std"))]
         let result = self.exec_select_cancel(stmt, cancel);
         self.current_tx = saved;
         result
@@ -334,6 +349,29 @@ impl Engine {
     {
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
+        // v7.38 Epic P (panic isolation) — Slice 3: route the streaming
+        // read-only SELECT hot path through the SAME `catch_unwind` firewall.
+        //
+        // Catch SCOPE (verified): `exec_select_streaming` uses a *push*
+        // model — it drives the caller's `emit` callback synchronously via
+        // `?` for the header and every row (both the true-streaming
+        // `try_exec_joined_streaming` fast path and the materialising
+        // fall-back), and only returns once the whole result has been
+        // emitted. It does NOT hand a lazy iterator back to the wire layer to
+        // pull rows from later. Therefore a panic in the per-row streaming
+        // phase unwinds *inside* this call and IS caught by wrapping the one
+        // `exec_select_streaming` call — the entire streaming phase is
+        // covered, not just setup. This is a single statement-boundary catch
+        // (the `catch_unwind` landing pad is armed once, the whole emit loop
+        // runs inside it) — NOT a per-row catch, so there is no hot-path cost.
+        // Read-only, so `discard_tx_on_panic` is a no-op (correct: nothing to
+        // roll back). A panic caught mid-stream (after some rows were encoded
+        // into the wire buffer) leaves the same partial-`wbuf` + `Err` state
+        // the wire layer already handles when `emit` itself returns `Err`
+        // mid-stream, so no new torn-state concern is introduced.
+        #[cfg(feature = "std")]
+        let inner = self.catch_stmt_panic(|s| s.exec_select_streaming(stmt, cancel, &mut emit));
+        #[cfg(not(feature = "std"))]
         let inner = self.exec_select_streaming(stmt, cancel, &mut emit);
         self.current_tx = saved;
         inner
@@ -434,9 +472,11 @@ impl Engine {
     }
 
     /// v7.38 Epic P (panic isolation) — shared `catch_unwind` firewall
-    /// (hosted `std` builds) used by both the simple-query
-    /// ([`Self::execute_inner_catching`]) and the prepared / extended-query
-    /// ([`Self::execute_stmt_catching`]) entry paths. Runs `run` under
+    /// (hosted `std` builds) used by every engine statement entry path: the
+    /// simple-query ([`Self::execute_inner_catching`]), the prepared /
+    /// extended-query ([`Self::execute_stmt_catching`]), and the read-only
+    /// prepared-SELECT hot paths ([`Self::execute_prepared_select_no_params`]
+    /// / [`Self::execute_prepared_select_streaming`]). Runs `run` under
     /// `catch_unwind`; a panic that unwinds out of statement execution is
     /// caught here and converted to [`EngineError::Internal`] after
     /// discarding the in-flight tx's shadow, so the caller sees a normal SQL
@@ -458,11 +498,19 @@ impl Engine {
     /// `AssertUnwindSafe` is sound precisely because of the above — the only
     /// caller-visible state a caught panic can leave behind is the discarded
     /// shadow, which is the correct rollback outcome, not a torn invariant.
+    ///
+    /// Generic over the closure's success type `T` so the read-only
+    /// prepared-SELECT paths (which return a row count `usize`, not a
+    /// `QueryResult`) reuse the *same* firewall — no second `catch_unwind`
+    /// site. On those read-only paths `discard_tx_on_panic` is a no-op (a
+    /// SELECT opens no shadow / writer version), which is the correct outcome:
+    /// nothing to roll back, the point is purely to catch the unwind, return
+    /// `Internal`, and leave the caller's write guard un-poisoned.
     #[cfg(feature = "std")]
-    fn catch_stmt_panic(
+    fn catch_stmt_panic<T>(
         &mut self,
-        run: impl FnOnce(&mut Self) -> Result<QueryResult, EngineError>,
-    ) -> Result<QueryResult, EngineError> {
+        run: impl FnOnce(&mut Self) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
         extern crate std;
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self)));
         match caught {
