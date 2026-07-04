@@ -1840,6 +1840,77 @@ fn mvcc_inplace_aggregate_hides_tombstoned_row() {
 }
 
 #[test]
+fn mvcc_inplace_reinsert_of_tombstoned_key_succeeds() {
+    // Phase C.3: with the in-place gate ON, DELETE tombstones the row
+    // (xmax stamped, row kept physically present). The unique/PK scan in
+    // `constraints.rs` folds existing keys into a `seen` set by walking
+    // physical rows — UNGATED before this fix, so it saw the tombstoned
+    // id=2 and wrongly raised a PRIMARY KEY / UNIQUE violation on a
+    // re-INSERT of the freed key. The fix skips tombstoned headers, so
+    // re-inserting id=2 succeeds and exactly one id=2 is visible.
+    let visible_id2_count = |e: &Engine| -> usize {
+        let QueryResult::Rows { rows, .. } =
+            e.execute_readonly("SELECT id FROM t WHERE id = 2").unwrap()
+        else {
+            panic!("expected Rows");
+        };
+        rows.len()
+    };
+
+    // --- PRIMARY KEY, gate ON ---
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    e.execute("INSERT INTO t VALUES (2)").unwrap();
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    // The tombstoned key must NOT block the re-insert.
+    e.execute("INSERT INTO t VALUES (2)")
+        .expect("re-insert of a tombstoned PK must succeed under gate-on");
+    assert_eq!(
+        visible_id2_count(&e),
+        1,
+        "exactly one live id=2 after tombstone + re-insert (PK, gate-on)"
+    );
+
+    // --- UNIQUE, gate ON ---
+    let mut u = Engine::new();
+    u.set_mvcc_inplace(true);
+    u.execute("CREATE TABLE t (id INT UNIQUE)").unwrap();
+    u.execute("INSERT INTO t VALUES (2)").unwrap();
+    u.execute("DELETE FROM t WHERE id = 2").unwrap();
+    u.execute("INSERT INTO t VALUES (2)")
+        .expect("re-insert of a tombstoned UNIQUE key must succeed under gate-on");
+    assert_eq!(
+        visible_id2_count(&u),
+        1,
+        "exactly one live id=2 after tombstone + re-insert (UNIQUE, gate-on)"
+    );
+
+    // --- Gate-OFF control: physical delete frees the key too ---
+    let mut c = Engine::new();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    c.execute("INSERT INTO t VALUES (2)").unwrap();
+    c.execute("DELETE FROM t WHERE id = 2").unwrap();
+    c.execute("INSERT INTO t VALUES (2)")
+        .expect("re-insert after a physical delete must succeed (gate-off)");
+    assert_eq!(
+        visible_id2_count(&c),
+        1,
+        "exactly one id=2 after physical delete + re-insert (gate-off)"
+    );
+
+    // --- Gate-ON negative control: a live duplicate still violates ---
+    let mut d = Engine::new();
+    d.set_mvcc_inplace(true);
+    d.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    d.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert!(
+        d.execute("INSERT INTO t VALUES (2)").is_err(),
+        "a live (non-tombstoned) duplicate key must still raise a violation under gate-on"
+    );
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};
