@@ -210,6 +210,10 @@ pub(super) fn apply_binary(
     }
     match op {
         BinOp::Add => arith(l, r, i64::checked_add, |a, b| a + b, "+"),
+        // PG `jsonb - text` / `jsonb - int` / `jsonb - text[]` deletes an
+        // object key, an array element, or a set of object keys. Routes
+        // to the same code the `jsonb_delete` function uses.
+        BinOp::Sub if matches!(l, Value::Json(_)) => crate::json::delete_key(&l, &r),
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
@@ -217,7 +221,14 @@ pub(super) fn apply_binary(
         BinOp::L2Distance => l2_distance(l, r),
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),
+        // PG `jsonb || jsonb` merges objects (right wins on dup keys) /
+        // appends arrays. Text `||` stays text concatenation.
+        BinOp::Concat if matches!(l, Value::Json(_)) || matches!(r, Value::Json(_)) => {
+            crate::json::concat(&l, &r)
+        }
         BinOp::Concat => Ok(text_concat(&l, &r)),
+        // PG `jsonb #- text[]` deletes the value at a nested path.
+        BinOp::JsonDeletePath => crate::json::delete_path(&[l, r]),
         BinOp::BitOr => bitop(l, r, |a, b| a | b, "|"),
         BinOp::BitAnd => bitop(l, r, |a, b| a & b, "&"),
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
@@ -1411,6 +1422,7 @@ pub(super) fn compare(
         | BinOp::JsonKeyExists
         | BinOp::JsonKeysAny
         | BinOp::JsonKeysAll
+        | BinOp::JsonDeletePath
         | BinOp::TsMatch
         | BinOp::IsDistinctFrom
         | BinOp::IsNotDistinctFrom

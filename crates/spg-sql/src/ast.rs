@@ -2966,6 +2966,9 @@ pub enum BinOp {
     /// v7.37.6-A `json ?& keys` — all-keys-exist. RHS is TEXT[];
     /// returns BOOL.
     JsonKeysAll,
+    /// `jsonb #- path_text[]` — delete the value at a nested path.
+    /// RHS is a PG text-array literal like `'{a,b}'`; returns JSONB.
+    JsonDeletePath,
     /// v7.12.2 `tsvector @@ tsquery` — FTS match. Returns BOOL;
     /// 3VL on NULL. Symmetric: PG also accepts `tsquery @@
     /// tsvector` and engine eval normalises either ordering.
@@ -5212,6 +5215,7 @@ impl fmt::Display for BinOp {
             Self::JsonKeyExists => "?",
             Self::JsonKeysAny => "?|",
             Self::JsonKeysAll => "?&",
+            Self::JsonDeletePath => "#-",
             Self::TsMatch => "@@",
             Self::InetContainedBy => "<<",
             Self::InetContainedByEq => "<<=",
