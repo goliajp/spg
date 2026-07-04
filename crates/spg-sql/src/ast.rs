@@ -2962,6 +2962,8 @@ pub enum BinOp {
     BitOr,
     /// Bitwise AND `&` on integers.
     BitAnd,
+    /// Bitwise XOR `#` on integers and equal-length bit strings.
+    BitXor,
     /// v4.14 `json -> key` — element access by string key (object)
     /// or integer index (array). Returns a JSON value.
     JsonGet,
@@ -5235,6 +5237,7 @@ impl fmt::Display for BinOp {
             Self::Concat => "||",
             Self::BitOr => "|",
             Self::BitAnd => "&",
+            Self::BitXor => "#",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
             Self::JsonGetPath => "#>",

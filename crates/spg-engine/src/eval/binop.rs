@@ -311,6 +311,7 @@ pub(super) fn apply_binary(
         BinOp::JsonDeletePath => crate::json::delete_path(&[l, r]),
         BinOp::BitOr => bitop(l, r, |a, b| a | b, "|"),
         BinOp::BitAnd => bitop(l, r, |a, b| a & b, "&"),
+        BinOp::BitXor => bitop(l, r, |a, b| a ^ b, "#"),
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
@@ -2534,6 +2535,7 @@ pub(super) fn compare(
         | BinOp::Or
         | BinOp::BitOr
         | BinOp::BitAnd
+        | BinOp::BitXor
         | BinOp::Add
         | BinOp::Sub
         | BinOp::Mul

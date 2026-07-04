@@ -939,3 +939,15 @@ fn range_merge_typed() {
     // control: union of contiguous ranges still works.
     ck(&mut e, "(int4range(1,5) + int4range(4,10))::text", "[1,10)");
 }
+
+/// `#` bitwise XOR — was desugared to (a|b)-(a&b) (fine for ints, undefined
+/// for bit strings). Now a real BinOp::BitXor. PG18.4-verified.
+#[test]
+fn bit_xor_operator() {
+    let mut e = Engine::new();
+    ck(&mut e, "(B'1100' # B'1010')::text", "0110");
+    ck(&mut e, "(B'11110000' # B'00001111')::text", "11111111");
+    ck(&mut e, "(5 # 3)::text", "6");     // integer XOR unchanged
+    ck(&mut e, "(12 # 10)::text", "6");
+    ck(&mut e, "(255 # 0)::text", "255");
+}
