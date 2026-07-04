@@ -14486,6 +14486,42 @@ impl Parser {
                     args: row_items,
                 });
             }
+            // SQL/XML `XMLELEMENT(NAME ident [, content …])` — the NAME
+            // keyword introduces the element name (a bare or quoted
+            // identifier), then optional content expressions. Lower to a
+            // plain `xmlelement(name_text, content …)` call.
+            if first.eq_ignore_ascii_case("xmlelement")
+                && matches!(self.peek(), Token::Ident(kw) if kw.eq_ignore_ascii_case("name"))
+            {
+                self.advance(); // consume NAME
+                let elem_name = match self.peek().clone() {
+                    Token::Ident(n) | Token::QuotedIdent(n) => {
+                        self.advance();
+                        n
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected element name after XMLELEMENT NAME, got {other:?}"
+                        )));
+                    }
+                };
+                let mut args = alloc::vec![Expr::Literal(Literal::String(elem_name))];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    args.push(self.parse_expr(0)?);
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' to close XMLELEMENT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                return Ok(Expr::FunctionCall {
+                    name: String::from("xmlelement"),
+                    args,
+                });
+            }
             // SQL-standard `POSITION(sub IN str)` — lowers onto
             // strpos(str, sub). IN is the argument separator here,
             // so the needle parses with the IN-tail suppressed.

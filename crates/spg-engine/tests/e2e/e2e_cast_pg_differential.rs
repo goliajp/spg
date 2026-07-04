@@ -1776,3 +1776,17 @@ fn window_over_derived_table() {
     assert_eq!(q(&mut e, "SELECT (lag(v,1,0) OVER (ORDER BY v))::text FROM (SELECT v FROM (VALUES (5),(10),(15)) x(v)) s(v)"), "[0,5,10]");
     assert_eq!(q(&mut e, "SELECT (rank() OVER (ORDER BY v))::text FROM (VALUES (1),(1),(3)) t(v)"), "[1,1,3]");
 }
+
+/// v7.37 D — XMLELEMENT(NAME ident [, content …]) — parse the NAME-keyword
+/// syntax and build the element (self-closing when empty; xml content verbatim,
+/// text content escaped). PG18.4-verified.
+#[test]
+fn xmlelement_basic() {
+    let mut e = Engine::new();
+    ck(&mut e, "(xmlelement(name foo))::text", "<foo/>");
+    ck(&mut e, "(xmlelement(name foo, 'bar'))::text", "<foo>bar</foo>");
+    ck(&mut e, "(xmlelement(name foo, 'a', 'b', 'c'))::text", "<foo>abc</foo>");
+    ck(&mut e, "(xmlelement(name \"Foo-Bar\", 42))::text", "<Foo-Bar>42</Foo-Bar>");
+    ck(&mut e, "(xmlelement(name item, xmlelement(name sub, 'x')))::text", "<item><sub>x</sub></item>");
+    ck(&mut e, "(xmlelement(name t, '<b>'))::text", "<t>&lt;b&gt;</t>");
+}
