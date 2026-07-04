@@ -1391,3 +1391,17 @@ fn integer_radix_and_underscores() {
     // control: plain decimal unchanged.
     ck(&mut e, "('42'::int4)::text", "42");
 }
+
+
+/// v7.37 D — numeric text accepts scientific notation (`1e3`, `1.5e2`, `3E-4`),
+/// like PG; the exponent folds into the decimal scale. PG18.4-verified.
+#[test]
+fn numeric_scientific_notation() {
+    let mut e = Engine::new();
+    ck(&mut e, "('1e3'::numeric)::text", "1000");
+    ck(&mut e, "('1.5e2'::numeric)::text", "150");
+    ck(&mut e, "('1.5e-2'::numeric)::text", "0.015");
+    ck(&mut e, "('-2.5E3'::numeric)::text", "-2500");
+    // control: plain decimal unchanged.
+    ck(&mut e, "('3.14'::numeric)::text", "3.14");
+}
