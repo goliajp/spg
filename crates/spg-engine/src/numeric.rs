@@ -77,18 +77,38 @@ pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
     if s.is_empty() {
         return None;
     }
+    // Scientific notation (`1e3`, `1.5e2`, `3E-4`): split off the exponent
+    // and fold it into the decimal scale. PG accepts this in numeric input.
+    if let Some(idx) = s.find(['e', 'E']) {
+        let exp: i32 = s[idx + 1..].parse().ok()?;
+        let (mantissa, base_scale) = parse_plain_numeric(&s[..idx])?;
+        // Effective scale = base fractional digits minus the exponent.
+        let eff = i32::from(base_scale) - exp;
+        return if eff >= 0 {
+            Some((mantissa, u8::try_from(eff).ok()?))
+        } else {
+            // Negative scale → shift the mantissa up, land at scale 0.
+            let shift = u8::try_from(-eff).ok()?;
+            if shift > 38 {
+                return None;
+            }
+            Some((mantissa.checked_mul(pow10_i128(shift))?, 0))
+        };
+    }
+    parse_plain_numeric(s)
+}
+
+/// Parse a plain (no-exponent) decimal `[+-]int[.frac]` into `(mantissa, scale)`.
+fn parse_plain_numeric(s: &str) -> Option<(i128, u8)> {
+    if s.is_empty() {
+        return None;
+    }
     let (negative, rest) = match s.as_bytes()[0] {
         b'-' => (true, &s[1..]),
         b'+' => (false, &s[1..]),
         _ => (false, s),
     };
     if rest.is_empty() {
-        return None;
-    }
-    // Reject scientific notation — bigdecimal collapses it before
-    // hitting the wire, and we want a clear error if a stray `e`
-    // sneaks in.
-    if rest.bytes().any(|b| b == b'e' || b == b'E') {
         return None;
     }
     let (int_part, frac_part) = match rest.find('.') {
