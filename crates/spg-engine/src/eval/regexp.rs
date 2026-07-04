@@ -1138,7 +1138,12 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         return Ok(Value::Null);
     };
     let global = flags.contains('g');
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    // The `i` flag folds the compiled pattern to match either case, same as
+    // the `~*` operator path.
+    if flags.contains('i') {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut from = 0usize;

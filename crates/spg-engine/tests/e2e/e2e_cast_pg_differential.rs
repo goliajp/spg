@@ -534,3 +534,18 @@ fn to_char_pr_notation() {
     ck(&mut e, r#"to_char(5, '999PR')"#, r#"   5 "#);
     ck(&mut e, r#"to_char(0, 'FM9PR')"#, r#"0"#);
 }
+
+/// regexp_replace honours the `i` (case-insensitive) flag (was ignored — no
+/// match). PG18.4-verified. Backreferences in the replacement remain a
+/// separate deferred gap (needs regex capture-group support).
+#[test]
+fn regexp_replace_case_insensitive_flag() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"regexp_replace('HELLO', 'hello', 'x', 'i')"#, r#"x"#);
+    ck(&mut e, r#"regexp_replace('FooBar', 'o', 'O', 'gi')"#, r#"FOOBar"#);
+    ck(&mut e, r#"regexp_replace('ABC', 'abc', 'z', 'i')"#, r#"z"#);
+    // case-sensitive default still doesn't match.
+    ck(&mut e, r#"regexp_replace('HELLO', 'hello', 'x')"#, r#"HELLO"#);
+    // g flag unaffected.
+    ck(&mut e, r#"regexp_replace('hello world', 'o', 'O', 'g')"#, r#"hellO wOrld"#);
+}
