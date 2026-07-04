@@ -106,6 +106,14 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
             }
             Ok(Value::Macaddr(out))
         }
+        // PG `~ macaddr8`: complement all eight EUI-64 octets.
+        (UnOp::BitNot, Value::Macaddr8(a)) => {
+            let mut out = [0u8; 8];
+            for i in 0..8 {
+                out[i] = !a[i];
+            }
+            Ok(Value::Macaddr8(out))
+        }
         (UnOp::BitNot, other) => Err(EvalError::TypeMismatch {
             detail: format!("cannot apply ~ to {other:?}"),
         }),
@@ -1394,6 +1402,17 @@ fn bitop(
             }
         }
         return Ok(Value::Macaddr(out));
+    }
+    // PG `macaddr8 & / | macaddr8`: byte-wise over the eight EUI-64 octets.
+    if let (Value::Macaddr8(a), Value::Macaddr8(b)) = (&l, &r) {
+        let mut out = [0u8; 8];
+        for i in 0..8 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                out[i] = f(i64::from(a[i]), i64::from(b[i])) as u8;
+            }
+        }
+        return Ok(Value::Macaddr8(out));
     }
     let widen = |v: Value<'static>| -> Value<'static> {
         match v {
