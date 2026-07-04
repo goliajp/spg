@@ -209,16 +209,23 @@ pub(super) fn apply_binary(
     // integers to a common NUMERIC scale and stay in i128 throughout.
     // A NUMERIC paired with an INTERVAL is interval scaling, not
     // numeric math — let the calendar path below take it.
-    // Range `*` intersection claims Mul before numeric/date arithmetic.
-    if op == BinOp::Mul {
+    // Range `*` intersection / `+` union claim Mul / Add before numeric/date
+    // arithmetic.
+    if op == BinOp::Mul || op == BinOp::Add {
         if let (
             Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
             Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
         ) = (&l, &r)
         {
-            return Ok(range_intersect(
-                *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
-            ));
+            return if op == BinOp::Mul {
+                Ok(range_intersect(
+                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+                ))
+            } else {
+                range_union(
+                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+                )
+            };
         }
     }
     if (matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }))
@@ -1871,6 +1878,66 @@ fn range_intersect(
         upper_inc: up_inc,
         empty: false,
     }
+}
+
+/// Do bound `(up, up_inc)` and `(low, low_inc)` touch with no gap and no
+/// overlap? (equal values, exactly one side inclusive — the `[x) [x)` seam).
+fn bounds_touch(up: &Option<Value<'static>>, up_inc: bool, low: &Option<Value<'static>>, low_inc: bool) -> bool {
+    match (up, low) {
+        (Some(u), Some(l)) => bound_cmp(u, l) == core::cmp::Ordering::Equal && (up_inc != low_inc),
+        _ => false,
+    }
+}
+
+/// Range `+` union: the two ranges must overlap or be adjacent, else PG
+/// errors "result of range union would not be contiguous".
+#[allow(clippy::too_many_arguments)]
+fn range_union(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> Result<Value<'static>, EvalError> {
+    let mk = |k, lo: &Option<alloc::boxed::Box<Value<'static>>>, up: &Option<alloc::boxed::Box<Value<'static>>>, li, ui, e| Value::Range {
+        kind: k,
+        lower: lo.clone(),
+        upper: up.clone(),
+        lower_inc: li,
+        upper_inc: ui,
+        empty: e,
+    };
+    if ae {
+        return Ok(mk(bk, bl, bu, bli, bui, be));
+    }
+    if be {
+        return Ok(mk(ak, al, au, ali, aui, ae));
+    }
+    let overlap = range_overlaps(ak, al, au, ali, aui, ae, bk, bl, bu, bli, bui, be);
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    let adjacent = bounds_touch(&au2, aui2, &bl2, bli2) || bounds_touch(&bu2, bui2, &al2, ali2);
+    if !overlap && !adjacent {
+        return Err(EvalError::TypeMismatch {
+            detail: "result of range union would not be contiguous".into(),
+        });
+    }
+    // union lower = the earlier start, upper = the later end.
+    let (lo, lo_inc) = if lower_cmp(&al2, ali2, &bl2, bli2) == core::cmp::Ordering::Less {
+        (al2, ali2)
+    } else {
+        (bl2, bli2)
+    };
+    let (up, up_inc) = if upper_cmp(&au2, aui2, &bu2, bui2) == core::cmp::Ordering::Greater {
+        (au2, aui2)
+    } else {
+        (bu2, bui2)
+    };
+    Ok(Value::Range {
+        kind: ak,
+        lower: lo.map(alloc::boxed::Box::new),
+        upper: up.map(alloc::boxed::Box::new),
+        lower_inc: lo_inc,
+        upper_inc: up_inc,
+        empty: false,
+    })
 }
 
 pub(super) fn compare(
