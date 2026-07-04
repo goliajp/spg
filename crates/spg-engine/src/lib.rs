@@ -1306,6 +1306,17 @@ impl Engine {
         !self.tx_catalogs.is_empty()
     }
 
+    /// v7.37 C.5 (A.2) — per-connection in-transaction test. A given
+    /// connection is "in a transaction" iff its own `tx_id` has an open
+    /// shadow slot. Unlike [`in_transaction`] (which is true if *any* tx is
+    /// open), this lets concurrent connections each carry their own explicit
+    /// transaction without colliding on the global slot. `IMPLICIT_TX` never
+    /// has a persistent slot (autocommit reads/writes the main catalog), so
+    /// this is false for the autocommit id.
+    pub fn is_tx_open(&self, tx_id: TxId) -> bool {
+        self.tx_catalogs.contains_key(&tx_id)
+    }
+
     /// v4.41.1 allocate a fresh TX handle. Used by spg-server dispatch
     /// to scope each implicit-wrap BEGIN..stmt..COMMIT to its own slot
     /// in `tx_catalogs`. v4.42 — the commit-barrier leader allocates
