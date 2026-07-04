@@ -545,6 +545,206 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
     assert_eq!(ids, alloc::vec![1, 3], "gate-off replay keeps only survivors");
 }
 
+/// v7.37.16 (Epic W) — durability proof for the gate-on
+/// (`SPG_MVCC_INPLACE`) in-place UPDATE path. A gate-on UPDATE supersedes
+/// a row by tombstoning the old version (`Table::mark_row_deleted`, xmax =
+/// writer version) and appending the new version
+/// (`Table::insert_with_xmin`) — exactly what `Engine::update`'s in-place
+/// branch does (`dml.rs` ~line 498/849/2545). This test drives that
+/// two-step capture, round-trips the redo through the WAL codec, replays
+/// it into a FRESH catalog, and asserts the recovered state reproduces the
+/// live gate-on result: the OLD version is hidden (tombstoned), the NEW
+/// version is visible, survivors untouched, zero unresolved tombstones.
+///
+/// This is the W-3 slice's DELETE proof re-run for UPDATE: the ONLY
+/// difference is the extra `Insert(new)` that rides the same redo run.
+/// Because both the tombstone (old RowId) and the insert (new RowId) are
+/// produced within one run, the RowId post-pass resolves the tombstone
+/// against the run-start ids — no checkpoint boundary is crossed. The
+/// new version replays as a plain `Insert` (frozen header on replay), so
+/// for an all-committed recovered DB it is correctly visible — the same
+/// reasoning that already makes gate-off inserts durable.
+#[test]
+fn redo_update_tombstone_plus_insert_survives_replay() {
+    use crate::row_header::XMAX_ALIVE;
+    use crate::snapshot::Snapshot;
+
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        c.create_table(TableSchema::new(
+            "t",
+            vec![ColumnSchema::new("id", DataType::Int, false)],
+        ))
+        .unwrap();
+        c
+    }
+    let mk = |id: i32| Row::new(alloc::vec![Value::Int(id)]);
+    let snap = Snapshot::unbounded();
+
+    // --- Capture side: INSERT 3, then in-place UPDATE id=2 -> id=20. ---
+    // The gate-on UPDATE = tombstone old (xmax = V) + insert new (xmin =
+    // V), in that order, mirroring `Engine::update`'s in-place branch.
+    const STMT_V: u64 = 42;
+    const OLD_VAL: i32 = 2;
+    const NEW_VAL: i32 = 20;
+    let mut cap = fresh();
+    cap.enable_redo_all();
+    {
+        let t = cap.get_mut("t").unwrap();
+        t.insert(mk(1)).unwrap();
+        t.insert(mk(OLD_VAL)).unwrap();
+        t.insert(mk(3)).unwrap();
+        // In-place UPDATE of slot 1 (value=2): tombstone the old version…
+        t.mark_row_deleted(1, STMT_V).unwrap();
+        // …then append the new version with xmin = the same statement V.
+        t.insert_with_xmin(mk(NEW_VAL), STMT_V).unwrap();
+    }
+    let log = cap.drain_redo();
+
+    // The UPDATE must emit BOTH a Tombstone (old RowId, xmax=V) AND an
+    // Insert carrying the new values, and the tombstone must come first
+    // (old superseded before new appended).
+    let tomb_pos = log
+        .iter()
+        .position(|c| matches!(c, RowChange::Tombstone { .. }))
+        .expect("in-place UPDATE emits a Tombstone for the old version");
+    let (tomb_rowids, tomb_xmax) = match &log[tomb_pos] {
+        RowChange::Tombstone { rowids, xmax, .. } => (rowids.clone(), *xmax),
+        _ => unreachable!(),
+    };
+    assert_eq!(tomb_rowids.len(), 1, "one row superseded → one tombstone target");
+    assert_eq!(tomb_xmax, STMT_V, "tombstone carries the statement writer version");
+    // Exactly one tombstone total (no double-tombstone).
+    assert_eq!(
+        log.iter().filter(|c| matches!(c, RowChange::Tombstone { .. })).count(),
+        1,
+        "an in-place UPDATE tombstones the old version exactly once"
+    );
+    // The new version rides as an Insert AFTER the tombstone, carrying the
+    // new row values.
+    let new_ins_pos = log
+        .iter()
+        .position(|c| matches!(
+            c,
+            RowChange::Insert { row, .. } if row.values.first() == Some(&Value::Int(NEW_VAL))
+        ))
+        .expect("in-place UPDATE emits an Insert carrying the new values");
+    assert!(
+        tomb_pos < new_ins_pos,
+        "tombstone(old) must precede insert(new) in the redo run"
+    );
+
+    // --- Round-trip through the WAL codec (the real durability path). ---
+    let bytes = encode_redo_log(&log);
+    let decoded = decode_redo_log(&bytes).unwrap();
+    assert_eq!(decoded, log, "UPDATE tombstone+insert redo must round-trip the codec");
+
+    // --- Replay into a FRESH catalog (crash-recovery simulation). ---
+    let unresolved_before = crate::unresolved_tombstone_count();
+    let mut rep = fresh();
+    rep.apply_redo(&decoded).unwrap();
+    assert_eq!(
+        crate::unresolved_tombstone_count(),
+        unresolved_before,
+        "the UPDATE's tombstone must resolve by RowId within the replay run"
+    );
+
+    let t = rep.get("t").unwrap();
+    // 4 rows physically present: 3 originals (one now tombstoned) + the
+    // appended new version.
+    assert_eq!(t.rows().len(), 4, "in-place UPDATE keeps the old row + appends the new");
+    // Visible set (per the MVCC snapshot gate): survivors {1,3} + new {20};
+    // the OLD value {2} is hidden — exactly the live gate-on UPDATE result,
+    // reproduced from the WAL.
+    let mut visible: Vec<i32> = t
+        .scan_visible(&snap)
+        .filter_map(|(_, r)| match r.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    visible.sort_unstable();
+    assert_eq!(
+        visible,
+        alloc::vec![1, 3, NEW_VAL],
+        "old version hidden, new version visible, survivors intact"
+    );
+    assert!(
+        !visible.contains(&OLD_VAL),
+        "the superseded (old) value must NOT be visible after replay"
+    );
+
+    // The old (superseded) row is physically present with the tombstone
+    // xmax stamped and reads as deleted.
+    let old_idx = t
+        .rows()
+        .iter()
+        .position(|r| r.values.first() == Some(&Value::Int(OLD_VAL)))
+        .expect("old version physically present (tombstone keeps the slot)");
+    let old_h = t.headers().get(old_idx).expect("header lock-step");
+    assert_eq!(old_h.xmax, STMT_V, "superseded row must carry the tombstone xmax");
+    assert!(old_h.is_deleted(), "superseded row must read as deleted");
+    // The new version is a live, undeleted row.
+    let new_idx = t
+        .rows()
+        .iter()
+        .position(|r| r.values.first() == Some(&Value::Int(NEW_VAL)))
+        .expect("new version physically present");
+    let new_h = t.headers().get(new_idx).expect("header lock-step");
+    assert_eq!(new_h.xmax, XMAX_ALIVE, "new version must stay alive");
+    assert!(!new_h.is_deleted(), "new version must not read as deleted");
+    // Survivors (id 1, 3) stay alive.
+    for (i, r) in t.rows().iter().enumerate() {
+        match r.values.first() {
+            Some(&Value::Int(1)) | Some(&Value::Int(3)) => assert_eq!(
+                t.headers().get(i).unwrap().xmax,
+                XMAX_ALIVE,
+                "survivor {i} must stay alive"
+            ),
+            _ => {}
+        }
+    }
+
+    // --- Gate-off control: physical UPDATE replays in place, no tombstone.
+    let mut capc = fresh();
+    capc.enable_redo_all();
+    {
+        let t = capc.get_mut("t").unwrap();
+        t.insert(mk(1)).unwrap();
+        t.insert(mk(OLD_VAL)).unwrap();
+        t.insert(mk(3)).unwrap();
+        t.update_row(1, alloc::vec![Value::Int(NEW_VAL)]).unwrap(); // physical (gate-off)
+    }
+    let logc = capc.drain_redo();
+    assert!(
+        logc.iter().all(|c| !matches!(c, RowChange::Tombstone { .. })),
+        "gate-off UPDATE must NOT emit a Tombstone redo"
+    );
+    assert!(
+        logc.iter().any(|c| matches!(c, RowChange::Update { .. })),
+        "gate-off UPDATE emits an in-place Update redo"
+    );
+    let mut repc = fresh();
+    repc.apply_redo(&decode_redo_log(&encode_redo_log(&logc)).unwrap())
+        .unwrap();
+    let tc = repc.get("t").unwrap();
+    assert_eq!(tc.rows().len(), 3, "gate-off UPDATE replays in place (no extra row)");
+    let mut ids: Vec<i32> = tc
+        .rows()
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        alloc::vec![1, 3, NEW_VAL],
+        "gate-off replay updates the row in place to the new value"
+    );
+}
+
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the
 /// escape: a > 64 KiB BYTEA cell and a > 64 KiB TEXT[] element
 /// round-trip through snapshot serialise/deserialise (the BYTEA
