@@ -1715,3 +1715,15 @@ fn path_length_and_concat() {
     // control: npoints still works.
     ck(&mut e, "(npoints('[(0,0),(3,4),(5,5)]'::path))::text", "3");
 }
+
+/// v7.37 D — circle <-> circle distance is the boundary gap (centre distance
+/// minus both radii, clamped to 0 on overlap). Previously errored. PG18.4-verified.
+#[test]
+fn circle_circle_distance() {
+    let mut e = Engine::new();
+    ck(&mut e, "('<(0,0),2>'::circle <-> '<(10,0),2>'::circle)::text", "6");
+    // overlapping circles: gap clamped to 0.
+    ck(&mut e, "('<(0,0),3>'::circle <-> '<(4,0),3>'::circle)::text", "0");
+    // control: point <-> circle still works.
+    ck(&mut e, "('(0,0)'::point <-> '<(5,0),1>'::circle)::text", "4");
+}
