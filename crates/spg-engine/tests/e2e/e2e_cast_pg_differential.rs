@@ -387,3 +387,17 @@ fn range_intersection_operator() {
     ck(&mut e, r#"int4range(1,5) * int4range(5,10)"#, r#"empty"#);
     ck(&mut e, r#"int4range(1,10) * 'empty'::int4range"#, r#"empty"#);
 }
+
+/// Range `+` union returns the merged range (overlap/adjacent/contained) or
+/// errors when the operands leave a gap. PG18.4-verified.
+#[test]
+fn range_union_operator() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"int4range(1,5) + int4range(4,10)"#, r#"[1,10)"#);
+    ck(&mut e, r#"int4range(1,5) + int4range(5,10)"#, r#"[1,10)"#);
+    ck(&mut e, r#"int4range(1,10) + int4range(3,7)"#, r#"[1,10)"#);
+    ck(&mut e, r#"'empty'::int4range + int4range(1,10)"#, r#"[1,10)"#);
+    ck(&mut e, r#"int4range(1,10) + 'empty'::int4range"#, r#"[1,10)"#);
+    // a gap between the operands is a contiguity error.
+    ck(&mut e, r#"int4range(1,5) + int4range(10,20)"#, r#"ERR"#);
+}
