@@ -461,6 +461,12 @@ pub(super) fn apply_binary(
         BinOp::JsonContainedBy if geo_contains_point(&r, &l).is_some() => {
             Ok(Value::Bool(geo_contains_point(&r, &l).expect("guard checked")))
         }
+        BinOp::JsonContains if geo_contains_box(&l, &r).is_some() => {
+            Ok(Value::Bool(geo_contains_box(&l, &r).expect("guard checked")))
+        }
+        BinOp::JsonContainedBy if geo_contains_box(&r, &l).is_some() => {
+            Ok(Value::Bool(geo_contains_box(&r, &l).expect("guard checked")))
+        }
         // Array operands claim && / @> / <@ before the inet / JSON
         // interpretations: ARRAY[1,2] && ARRAY[2,3] is the overlap
         // test, ARRAY[1,2,3] @> ARRAY[2] the containment test.
@@ -2419,8 +2425,27 @@ fn point_geo_distance(p: &Value<'_>, geo: &Value<'_>) -> Option<f64> {
             let d = sqrt_newton(dx * dx + dy * dy) - radius;
             Some(if d < 0.0 { 0.0 } else { d })
         }
+        // Point-to-line distance for the line `a*x + b*y + c = 0`:
+        // |a*px + b*py + c| / sqrt(a^2 + b^2).
+        Value::Line { a, b, c } => {
+            let denom = sqrt_newton(a * a + b * b);
+            if denom == 0.0 {
+                return None;
+            }
+            Some((a * pt.x + b * pt.y + c).abs() / denom)
+        }
         _ => None,
     }
+}
+
+/// Geometric containment `container @> box` for a box container: the argument
+/// box lies inside (or on the boundary of) the container box. `None` unless
+/// both operands are boxes.
+fn geo_contains_box(container: &Value<'_>, inner: &Value<'_>) -> Option<bool> {
+    let (Value::PgBox(cur, cll), Value::PgBox(iur, ill)) = (container, inner) else {
+        return None;
+    };
+    Some(ill.x >= cll.x && iur.x <= cur.x && ill.y >= cll.y && iur.y <= cur.y)
 }
 
 /// Geometric overlap `a && b` for same-type box or circle: boxes overlap when

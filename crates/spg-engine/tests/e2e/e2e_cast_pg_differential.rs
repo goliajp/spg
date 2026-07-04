@@ -1617,3 +1617,18 @@ fn lseg_double_paren_input() {
     ck(&mut e, "('[(0,0),(4,0)]'::lseg)::text", "[(0,0),(4,0)]");
     ck(&mut e, "('(0,0),(4,0)'::lseg)::text", "[(0,0),(4,0)]");
 }
+
+/// v7.37 D — point <-> line distance and box @> / <@ box containment
+/// (extending point-to-{lseg,box,circle} distance and box @> point
+/// containment). PG18.4-verified.
+#[test]
+fn geo_line_distance_and_box_containment() {
+    let mut e = Engine::new();
+    // point-to-line distance: point (0,0), line x - 5 = 0 → distance 5.
+    ck(&mut e, "(('(0,0)'::point) <-> ('{1,0,-5}'::line))::text", "5");
+    ck(&mut e, "('((0,0),(2,2))'::box @> '((0.5,0.5),(1,1))'::box)::text", "true");
+    ck(&mut e, "('((0.5,0.5),(1,1))'::box <@ '((0,0),(2,2))'::box)::text", "true");
+    ck(&mut e, "('((0,0),(2,2))'::box @> '((1,1),(3,3))'::box)::text", "false");
+    // control: box @> point still works.
+    ck(&mut e, "('((0,0),(2,2))'::box @> '(1,1)'::point)::text", "true");
+}
