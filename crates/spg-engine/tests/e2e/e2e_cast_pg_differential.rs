@@ -1565,3 +1565,18 @@ fn inet_int_arithmetic() {
     // control: inet - inet still yields the address count.
     ck(&mut e, "('192.168.1.20'::inet - '192.168.1.5'::inet)::text", "15");
 }
+
+/// v7.37 D — box accepts the fully-wrapped `((x1,y1),(x2,y2))` form (only the
+/// bare and single-paren forms parsed before), so `box @> point` /
+/// `point <@ box` on such literals now work. PG18.4-verified.
+#[test]
+fn box_double_paren_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "('((0,0),(2,2))'::box)::text", "(2,2),(0,0)");
+    ck(&mut e, "('((0,0),(2,2))'::box @> '(1,1)'::point)::text", "true");
+    ck(&mut e, "('(1,1)'::point <@ '((0,0),(2,2))'::box)::text", "true");
+    ck(&mut e, "(area('((0,0),(2,2))'::box))::text", "4");
+    // control: the bare + single-paren forms still parse.
+    ck(&mut e, "('(0,0),(2,2)'::box)::text", "(2,2),(0,0)");
+    ck(&mut e, "('0,0,2,2'::box)::text", "(2,2),(0,0)");
+}
