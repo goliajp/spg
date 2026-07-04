@@ -273,11 +273,17 @@ pub(super) fn apply_binary(
                 _ => None,
             }
         };
+        // A cidr operand behaves as PG's implicit cidr->inet cast: the result
+        // is an inet shifted the same way.
         let arith = match (&l, &r) {
-            (Value::Inet { family, bits, addr }, other) => {
+            (Value::Inet { family, bits, addr }, other)
+            | (Value::Cidr { family, bits, addr }, other) => {
                 as_int(other).map(|n| (*family, *bits, *addr, if op == BinOp::Sub { -n } else { n }))
             }
-            (other, Value::Inet { family, bits, addr }) if op == BinOp::Add => {
+            (other, Value::Inet { family, bits, addr })
+            | (other, Value::Cidr { family, bits, addr })
+                if op == BinOp::Add =>
+            {
                 as_int(other).map(|n| (*family, *bits, *addr, n))
             }
             _ => None,
