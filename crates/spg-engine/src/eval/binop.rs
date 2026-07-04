@@ -379,6 +379,11 @@ pub(super) fn apply_binary(
     if (matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }))
         && !matches!(l, Value::Interval { .. })
         && !matches!(r, Value::Interval { .. })
+        // A range containment/overlap op (`range @> numeric`, `<@`, `&&`) keeps
+        // a Numeric element — don't let the numeric fast-path claim it; the
+        // range arms below handle it.
+        && !matches!(l, Value::Range { .. })
+        && !matches!(r, Value::Range { .. })
     {
         return apply_binary_numeric(op, l, r);
     }
