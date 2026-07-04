@@ -285,3 +285,24 @@ fn timestamp_interval_arithmetic() {
     ck(&mut e, r#"interval '2 days' - interval '1 day'"#, r#"1 day"#);
     ck(&mut e, r#"'2024-01-01'::date - 5"#, r#"2023-12-27"#);
 }
+/// Array + bytea function edge cases. `POSITION(bytea IN bytea)` lowered to
+/// strpos and did a rendered-text search (finding the literal `\x..`
+/// substring, i.e. 0) instead of PG's byte-level search. Fixed here.
+/// Ground truth captured live from PostgreSQL 18.4.
+#[test]
+fn array_bytea_edge_cases() {
+    let mut e = Engine::new();
+    // the fix: byte-level POSITION.
+    ck(&mut e, r#"position('\x34'::bytea in '\x1234'::bytea)"#, r#"2"#);
+    ck(&mut e, r#"position('\xff'::bytea in '\x1234'::bytea)"#, r#"0"#);
+    ck(&mut e, r#"position('\x1234'::bytea in '\x001234ab'::bytea)"#, r#"2"#);
+    // controls that already matched PG.
+    ck(&mut e, r#"array_length(ARRAY[]::int[], 1)"#, r#"<NULL>"#);
+    ck(&mut e, r#"cardinality(ARRAY[]::int[])"#, r#"0"#);
+    ck(&mut e, r#"(ARRAY[1,2,3])[5]"#, r#"<NULL>"#);
+    ck(&mut e, r#"array_position(ARRAY[10,20,30], 99)"#, r#"<NULL>"#);
+    ck(&mut e, r#"array_remove(ARRAY[1,2,2,3], 2)"#, r#"{1,3}"#);
+    ck(&mut e, r#"'\x12'::bytea || '\x34'::bytea"#, r#"\x1234"#);
+    ck(&mut e, r#"get_byte('\x1234'::bytea, 0)"#, r#"18"#);
+    ck(&mut e, r#"substring('\x1234abcd'::bytea from 2 for 2)"#, r#"\x34ab"#);
+}
