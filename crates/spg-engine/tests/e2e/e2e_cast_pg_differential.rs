@@ -425,3 +425,14 @@ fn inet_minus_inet_bigint() {
     ck(&mut e, r#"'10.0.0.0'::inet - '10.0.0.0'::inet"#, r#"0"#);
     ck(&mut e, r#"'192.168.1.0'::inet - '192.168.0.0'::inet"#, r#"256"#);
 }
+
+/// array_fill(value, ARRAY[n]) builds a 1-D array of n copies (previously
+/// errored). PG18.4-verified.
+#[test]
+fn array_fill_one_dim() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"array_fill(7, ARRAY[3])"#, r#"{7,7,7}"#);
+    ck(&mut e, r#"array_fill(0, ARRAY[0])"#, r#"{}"#);
+    ck(&mut e, r#"array_fill(9::bigint, ARRAY[2])"#, r#"{9,9}"#);
+    ck(&mut e, r#"array_fill('x', ARRAY[3])"#, r#"{x,x,x}"#);
+}
