@@ -909,3 +909,19 @@ fn agg_interval_sum_avg() {
     assert_eq!(row(&mut e, "SELECT sum(iv)::text FROM ait2"), "Text(\"3 mons\")");
     assert_eq!(row(&mut e, "SELECT avg(iv)::text FROM ait2"), "Text(\"1 mon 15 days\")");
 }
+
+/// Range `<<` (strictly left of) and `>>` (strictly right of). Boundary rule:
+/// at an equal touching value they must not both be inclusive. PG18.4-verified.
+#[test]
+fn range_strictly_left_right() {
+    let mut e = Engine::new();
+    ck(&mut e, "(int4range(1,10) << int4range(20,30))::text", "true");
+    ck(&mut e, "(int4range(1,10) << int4range(10,20))::text", "true"); // excl upper meets incl lower
+    ck(&mut e, "(int4range(1,10) << int4range(5,20))::text", "false"); // overlap
+    ck(&mut e, "('[1,10]'::int4range << '[10,20]'::int4range)::text", "false"); // both incl at 10
+    ck(&mut e, "(int4range(20,30) >> int4range(1,10))::text", "true");
+    ck(&mut e, "(int4range(1,10) >> int4range(20,30))::text", "false");
+    ck(&mut e, "(numrange(1.5,3.5) << numrange(3.5,5.5))::text", "true");
+    // control: overlap/union unaffected.
+    ck(&mut e, "(int4range(1,5) && int4range(4,10))::text", "true");
+}
