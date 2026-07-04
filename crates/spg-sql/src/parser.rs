@@ -14998,7 +14998,75 @@ fn extract_numeric_literal(e: &Expr) -> Option<f32> {
 /// as its own dimension so `INTERVAL '1 day'` ≠ `INTERVAL '24 hours'`
 /// (PG-canonical: DST and month-boundary semantics depend on this).
 /// `week` rolls into `days` (× 7). Sub-day units flow into `micros`.
+/// ISO 8601 duration input for INTERVAL: `P1Y2M3DT4H5M6S`. Before the `T`,
+/// `M` is months; after it, `M` is minutes. Returns `(months, days, micros)`.
+#[allow(clippy::cast_possible_truncation)]
+fn parse_iso8601_interval(rest: &str) -> Option<(i32, i32, i64)> {
+    let mut months: i64 = 0;
+    let mut days: i64 = 0;
+    let mut micros: i64 = 0;
+    let mut in_time = false;
+    let mut num = alloc::string::String::new();
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' {
+            num.push(ch);
+            continue;
+        }
+        if ch == 'T' || ch == 't' {
+            if !num.is_empty() {
+                return None;
+            }
+            in_time = true;
+            continue;
+        }
+        let n: f64 = num.parse().ok()?;
+        num.clear();
+        match (ch, in_time) {
+            ('Y' | 'y', false) => months += (n * 12.0) as i64,
+            ('M', false) => months += n as i64,
+            ('W' | 'w', false) => days += (n * 7.0) as i64,
+            ('D' | 'd', false) => days += n as i64,
+            ('H' | 'h', true) => micros += (n * 3_600_000_000.0) as i64,
+            ('M', true) => micros += (n * 60_000_000.0) as i64,
+            ('S' | 's', true) => micros += (n * 1_000_000.0) as i64,
+            _ => return None,
+        }
+    }
+    if !num.is_empty() {
+        return None;
+    }
+    Some((i32::try_from(months).ok()?, i32::try_from(days).ok()?, micros))
+}
+
+/// PG year-month shorthand for INTERVAL: `1-2` = 1 year 2 mons (an optional
+/// leading `-` negates the whole value). Rejects date-like strings.
+fn parse_year_month_interval(s: &str) -> Option<(i32, i32, i64)> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, s),
+    };
+    let (y, m) = body.split_once('-')?;
+    let years: i32 = y.parse().ok()?;
+    let mons: i32 = m.parse().ok()?;
+    if years < 0 || mons < 0 {
+        return None;
+    }
+    let total = years.checked_mul(12)?.checked_add(mons)?;
+    Some((if neg { -total } else { total }, 0, 0))
+}
+
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
+    let trimmed = s.trim();
+    // ISO 8601 duration (`P1Y2M3DT4H`) and PG's year-month shorthand (`1-2`)
+    // are single tokens, not the `<n> <unit>` pair form handled below.
+    if let Some(rest) = trimmed.strip_prefix(['P', 'p']) {
+        return parse_iso8601_interval(rest);
+    }
+    if !trimmed.contains(char::is_whitespace) && trimmed.contains('-') {
+        if let Some(iv) = parse_year_month_interval(trimmed) {
+            return Some(iv);
+        }
+    }
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.is_empty() || !parts.len().is_multiple_of(2) {
         return None;
