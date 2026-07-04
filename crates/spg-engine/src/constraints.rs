@@ -270,6 +270,22 @@ pub(crate) fn resolve_on_conflict_columns(
     Ok((out, nnd))
 }
 
+/// v7.37.15 (Phase C.3) — does this BTree index locator point at a
+/// gate-on tombstone? A `RowLocator::Hot(i)` indexes into
+/// `table.headers()`; if that header is `is_deleted()` (`xmax !=
+/// XMAX_ALIVE`) the row was DELETE-tombstoned under the in-place
+/// write path (kept physically present, index entry left behind), so
+/// index-based existence checks (FK parent lookup, ON CONFLICT
+/// single-column) must treat it as ABSENT. Cold locators cannot be
+/// tombstoned in place, so they always count as present. Under the
+/// default gate (physical delete) no header is ever tombstoned, so
+/// this returns `false` for every hot locator and the gate-off path
+/// is byte-for-byte unchanged.
+fn locator_is_tombstoned(table: &spg_storage::Table, loc: &spg_storage::RowLocator) -> bool {
+    loc.as_hot()
+        .is_some_and(|i| table.headers().get(i).is_some_and(|h| h.is_deleted()))
+}
+
 /// v7.9.8 — check whether the BTree index on `column_pos` of
 /// `table_name` already has a row with this key.
 fn on_conflict_key_exists(
@@ -288,7 +304,14 @@ fn on_conflict_key_exists(
         matches!(idx.kind, spg_storage::IndexKind::BTree(_))
             && idx.column_position == column_pos
             && idx.partial_predicate.is_none()
-            && !idx.lookup_eq(&idx_key).is_empty()
+            // v7.37.15 (Phase C.3) — a tombstoned index hit is not a
+            // live conflict: the key was freed by a gate-on DELETE, so
+            // re-inserting it must NOT trip ON CONFLICT. Gate-off has no
+            // tombstones → every locator counts → unchanged.
+            && idx
+                .lookup_eq(&idx_key)
+                .iter()
+                .any(|loc| !locator_is_tombstoned(table, loc))
     })
 }
 
@@ -304,11 +327,21 @@ pub(crate) fn lookup_row_position_by_keys(
     key: &[&Value],
 ) -> Option<usize> {
     let table = catalog.get(table_name)?;
-    table.rows().iter().position(|r| {
-        column_positions
-            .iter()
-            .enumerate()
-            .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
+    // v7.37.15 (Phase C.3) — skip gate-on tombstones: a DELETE-
+    // tombstoned row is not a live conflict target, so ON CONFLICT DO
+    // UPDATE must not resolve onto it (it would resurrect a dead row).
+    // `.position()` over `.enumerate()` yields the row index, so the
+    // header check reuses the same index. `is_deleted()` is never true
+    // under the default gate → gate-off path byte-for-byte unchanged.
+    table.rows().iter().enumerate().position(|(row_idx, r)| {
+        !table
+            .headers()
+            .get(row_idx)
+            .is_some_and(|h| h.is_deleted())
+            && column_positions
+                .iter()
+                .enumerate()
+                .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
     })
 }
 
@@ -334,7 +367,19 @@ pub(crate) fn on_conflict_keys_exist(
             .enumerate()
             .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
     };
-    if table.rows().iter().any(&matches) {
+    // v7.37.15 (Phase C.3) — a gate-on DELETE-tombstoned hot row is not
+    // a live conflict, so skip it (else re-inserting the freed composite
+    // key would falsely trip ON CONFLICT). Cold rows below cannot be
+    // tombstoned in place. `is_deleted()` is never true under the
+    // default gate → gate-off path byte-for-byte unchanged.
+    let hot_hit = table.rows().iter().enumerate().any(|(row_idx, r)| {
+        !table
+            .headers()
+            .get(row_idx)
+            .is_some_and(|h| h.is_deleted())
+            && matches(r)
+    });
+    if hot_hit {
         return true;
     }
     // v7.36 (cold-tier coverage) — composite ON CONFLICT key
@@ -1181,7 +1226,16 @@ pub(crate) fn enforce_fk_inserts(
                     matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                         && idx.column_position == parent_col
                         && idx.partial_predicate.is_none()
-                        && !idx.lookup_eq(&key).is_empty()
+                        // v7.37.15 (Phase C.3) — a tombstoned parent index
+                        // hit means the parent was DELETE-tombstoned under
+                        // the gate-on in-place path; the parent is gone, so
+                        // the child FK insert must FAIL "no parent" (PG
+                        // agrees — a deleted parent violates the FK). Gate-off
+                        // has no tombstones → every locator counts → unchanged.
+                        && idx
+                            .lookup_eq(&key)
+                            .iter()
+                            .any(|loc| !locator_is_tombstoned(parent, loc))
                 });
                 // v7.6.7 self-ref widening: also accept a match
                 // against earlier rows in this same batch when the
@@ -1220,8 +1274,20 @@ pub(crate) fn enforce_fk_inserts(
                         .enumerate()
                         .all(|(i, &pi)| prow.values.get(pi) == Some(local[i]))
                 };
-                let parent_match_committed = parent.rows().iter().any(&matches_parent_row)
-                    || cold_parent_rows.iter().any(&matches_parent_row);
+                // v7.37.15 (Phase C.3) — a gate-on DELETE-tombstoned hot
+                // parent row is gone, so it must not satisfy the composite
+                // FK (mirror of the single-column fast path above). Cold
+                // parent rows cannot be tombstoned in place. `is_deleted()`
+                // is never true under the default gate → gate-off unchanged.
+                let hot_parent_match = parent.rows().iter().enumerate().any(|(row_idx, prow)| {
+                    !parent
+                        .headers()
+                        .get(row_idx)
+                        .is_some_and(|h| h.is_deleted())
+                        && matches_parent_row(prow)
+                });
+                let parent_match_committed =
+                    hot_parent_match || cold_parent_rows.iter().any(&matches_parent_row);
                 let parent_match_in_batch = parent_is_self
                     && rows[..batch_idx].iter().any(|earlier| {
                         fk.parent_columns
