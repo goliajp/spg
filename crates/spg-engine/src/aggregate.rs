@@ -3459,6 +3459,30 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
     }
 }
 
+/// The array form of a `percentile_cont/disc` direct argument
+/// (`percentile_cont(ARRAY[0.25,0.5,0.75])`), as f64 fractions. `None` when the
+/// direct argument is a plain scalar fraction. NULL elements resolve to 0.0
+/// (PG rejects NULL fractions; we clamp rather than error).
+fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<f64>> {
+    match v? {
+        Value::FloatArray(a) => Some(a.iter().map(|x| x.unwrap_or(0.0)).collect()),
+        Value::NumericArray(a) => Some(
+            a.iter()
+                .map(|x| x.map_or(0.0, |(scaled, scale)| numeric_to_f64(scaled, scale)))
+                .collect(),
+        ),
+        Value::IntArray(a) => Some(a.iter().map(|x| f64::from(x.unwrap_or(0))).collect()),
+        // Array literals (`ARRAY[0.25,0.5,0.75]`) evaluate to a TextArray of the
+        // element renderings; parse each back to f64.
+        Value::TextArray(a) => Some(
+            a.iter()
+                .map(|x| x.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// NUMERIC → f64 for the float-math aggregates (stddev / variance / corr /
 /// percentile_cont). `scaled × 10^-scale`; `10^scale` fits in i128 for the
 /// NUMERIC scale range, so no `f64::powi` (unavailable under no_std) is needed.
@@ -3569,12 +3593,10 @@ fn finalize_ordered_set(
             };
             items[idx].clone()
         }
-        // Linear interpolation between the two bracketing values.
+        // Linear interpolation between the two bracketing values. PG accepts
+        // both a scalar fraction (→ float) and an array of fractions (→ a
+        // float array, one interpolated value per requested percentile).
         "percentile_cont" => {
-            let f = fraction
-                .and_then(agg_value_to_f64)
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
             let Some(nums) = items
                 .iter()
                 .map(agg_value_to_f64)
@@ -3582,14 +3604,22 @@ fn finalize_ordered_set(
             else {
                 return Value::Null; // non-numeric ordered set
             };
-            if n == 1 {
-                return Value::Float(nums[0]);
+            let at = |f: f64| -> f64 {
+                let f = f.clamp(0.0, 1.0);
+                if n == 1 {
+                    return nums[0];
+                }
+                let rank = f * (n as f64 - 1.0);
+                let lo = crate::eval::f64_floor(rank) as usize;
+                let hi = crate::eval::f64_ceil(rank) as usize;
+                let frac = rank - lo as f64;
+                nums[lo] + (nums[hi] - nums[lo]) * frac
+            };
+            if let Some(fracs) = percentile_fraction_array(fraction) {
+                return Value::FloatArray(fracs.iter().map(|f| Some(at(*f))).collect());
             }
-            let rank = f * (n as f64 - 1.0);
-            let lo = crate::eval::f64_floor(rank) as usize;
-            let hi = crate::eval::f64_ceil(rank) as usize;
-            let frac = rank - lo as f64;
-            Value::Float(nums[lo] + (nums[hi] - nums[lo]) * frac)
+            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0);
+            Value::Float(at(f))
         }
         _ => unreachable!(),
     }
