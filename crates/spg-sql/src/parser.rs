@@ -14522,6 +14522,53 @@ impl Parser {
                     args,
                 });
             }
+            // SQL/XML `XMLFOREST(value [AS name], …)` — each `value AS name`
+            // becomes a `<name>value</name>` element; a bare column infers its
+            // own name. Lower to `xmlforest(name1, val1, name2, val2, …)`.
+            if first.eq_ignore_ascii_case("xmlforest") && !matches!(self.peek(), Token::RParen) {
+                let mut args: Vec<Expr> = Vec::new();
+                loop {
+                    let val = self.parse_expr(0)?;
+                    let name = if matches!(self.peek(), Token::As) {
+                        self.advance();
+                        match self.peek().clone() {
+                            Token::Ident(n) | Token::QuotedIdent(n) => {
+                                self.advance();
+                                n
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected name after AS in XMLFOREST, got {other:?}"
+                                )));
+                            }
+                        }
+                    } else if let Expr::Column(c) = &val {
+                        c.name.clone()
+                    } else {
+                        return Err(
+                            self.err("XMLFOREST element without a column name needs AS".into())
+                        );
+                    };
+                    args.push(Expr::Literal(Literal::String(name)));
+                    args.push(val);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' to close XMLFOREST, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                return Ok(Expr::FunctionCall {
+                    name: String::from("xmlforest"),
+                    args,
+                });
+            }
             // SQL-standard `POSITION(sub IN str)` — lowers onto
             // strpos(str, sub). IN is the argument separator here,
             // so the needle parses with the IN-tail suppressed.

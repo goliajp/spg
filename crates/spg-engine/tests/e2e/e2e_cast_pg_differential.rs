@@ -1790,3 +1790,16 @@ fn xmlelement_basic() {
     ck(&mut e, "(xmlelement(name item, xmlelement(name sub, 'x')))::text", "<item><sub>x</sub></item>");
     ck(&mut e, "(xmlelement(name t, '<b>'))::text", "<t>&lt;b&gt;</t>");
 }
+
+/// v7.37 D — XMLFOREST(value AS name, …) builds a concatenation of named
+/// elements. PG18.4-verified.
+#[test]
+fn xmlforest_basic() {
+    let mut e = Engine::new();
+    ck(&mut e, "(xmlforest('a' AS foo, 'b' AS bar))::text", "<foo>a</foo><bar>b</bar>");
+    ck(&mut e, "(xmlforest(42 AS num))::text", "<num>42</num>");
+    ck(&mut e, "(xmlforest('x' AS \"My-Col\"))::text", "<My-Col>x</My-Col>");
+    ck(&mut e, "(xmlforest('<b>' AS t))::text", "<t>&lt;b&gt;</t>");
+    // nested xmlelement content stays verbatim inside the forest element.
+    ck(&mut e, "(xmlforest(xmlelement(name s, 'x') AS wrap))::text", "<wrap><s>x</s></wrap>");
+}

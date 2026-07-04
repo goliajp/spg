@@ -6377,6 +6377,43 @@ fn apply_function_dispatch(
             };
             Ok(Value::Xml(alloc::borrow::Cow::Owned(xml)))
         }
+        // xmlforest(name1, val1, name2, val2, …) — the parser lowers
+        // `XMLFOREST(value AS name, …)` to alternating name/value args. Each
+        // pair yields a `<name>value</name>` element (value text-escaped);
+        // a NULL value omits its element. Result is the concatenation.
+        "xmlforest" => {
+            if args.len() % 2 != 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "xmlforest() expects name/value pairs".into(),
+                });
+            }
+            let mut out = alloc::string::String::new();
+            for pair in args.chunks_exact(2) {
+                let name = match &pair[0] {
+                    Value::Text(s) => s.to_string(),
+                    other => value_to_format_text(other),
+                };
+                match &pair[1] {
+                    Value::Null => {}
+                    Value::Xml(s) => {
+                        out.push_str(&alloc::format!("<{name}>{s}</{name}>"));
+                    }
+                    other => {
+                        let mut body = alloc::string::String::new();
+                        for c in value_to_format_text(other).chars() {
+                            match c {
+                                '&' => body.push_str("&amp;"),
+                                '<' => body.push_str("&lt;"),
+                                '>' => body.push_str("&gt;"),
+                                o => body.push(o),
+                            }
+                        }
+                        out.push_str(&alloc::format!("<{name}>{body}</{name}>"));
+                    }
+                }
+            }
+            Ok(Value::Xml(alloc::borrow::Cow::Owned(out)))
+        }
         // xmlconcat(xml, ...) — variadic fragment concatenation.
         // NULL args are skipped; all-NULL → NULL (PG semantics).
         "xmlconcat" => {
