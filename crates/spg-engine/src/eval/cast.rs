@@ -15,10 +15,23 @@ use alloc::vec::Vec;
 use spg_sql::ast::CastTarget;
 use spg_storage::Value;
 
+use super::math::f64_round_half_away;
 use super::{
     EvalError, decode_tsquery_external, decode_tsvector_external, parse_date_literal,
     parse_timestamp_literal, value_to_text,
 };
+
+/// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
+/// integer, half-away-from-zero — PG's `numeric → int` coercion rule.
+fn numeric_round_to_i128(scaled: i128, scale: u8) -> i128 {
+    let factor = 10_i128.pow(u32::from(scale));
+    let neg = scaled < 0;
+    let abs = scaled.unsigned_abs() as i128;
+    let q = abs / factor;
+    let r = abs % factor;
+    let mag = if 2 * r >= factor { q + 1 } else { q };
+    if neg { -mag } else { mag }
+}
 
 /// PG-style `expr::TYPE` coercion. NULL always casts as NULL.
 pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static>, EvalError> {
@@ -534,8 +547,18 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             .map_err(|_| EvalError::TypeMismatch {
                 detail: format!("bigint {n} does not fit in int"),
             }),
+        // PG rounds (half-away) when coercing a real number to an
+        // integer — 1.9::int = 2, 2.5::int = 3, not truncation.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::Int(x as i32)),
+        Value::Float(x) => Ok(Value::Int(f64_round_half_away(x) as i32)),
+        Value::Numeric { scaled, scale } => {
+            let rounded = numeric_round_to_i128(scaled, scale);
+            i32::try_from(rounded)
+                .map(Value::Int)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: format!("numeric {rounded} does not fit in int"),
+                })
+        }
         Value::Text(s) => {
             s.trim()
                 .parse::<i32>()
@@ -555,8 +578,17 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Int(n) => Ok(Value::BigInt(i64::from(n))),
         Value::BigInt(n) => Ok(Value::BigInt(n)),
+        // PG rounds (half-away) coercing a real number to bigint.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::BigInt(x as i64)),
+        Value::Float(x) => Ok(Value::BigInt(f64_round_half_away(x) as i64)),
+        Value::Numeric { scaled, scale } => {
+            let rounded = numeric_round_to_i128(scaled, scale);
+            i64::try_from(rounded)
+                .map(Value::BigInt)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: format!("numeric {rounded} does not fit in bigint"),
+                })
+        }
         Value::Text(s) => {
             s.trim()
                 .parse::<i64>()
