@@ -4204,6 +4204,25 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             };
             tot(*xm, *xd, *xu).cmp(&tot(*ym, *yd, *yu))
         }
+        // Remaining ordered scalar types — each was falling to the
+        // `_ => Equal` fallback, so min/max over these columns kept whichever
+        // row arrived first. Natural PG ordering: time/timestamptz by the i64,
+        // bytea/uuid/macaddr byte-wise, inet by (family, address, netmask).
+        // (Text/Bool already have arms further down.)
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Macaddr(x), Value::Macaddr(y)) => x.cmp(y),
+        (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
+        (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
+        (
+            Value::Inet { family: xf, bits: xb, addr: xa },
+            Value::Inet { family: yf, bits: yb, addr: ya },
+        )
+        | (
+            Value::Cidr { family: xf, bits: xb, addr: xa },
+            Value::Cidr { family: yf, bits: yb, addr: ya },
+        ) => (xf, xa, xb).cmp(&(yf, ya, yb)),
         // Cross integer widths — min/max over a column whose cells
         // land in mixed integer variants (literal-seeded rows, casts).
         (Value::SmallInt(x), Value::Int(y)) => i32::from(*x).cmp(y),

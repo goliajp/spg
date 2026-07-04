@@ -1130,3 +1130,21 @@ fn sum_money_agg() {
     // superset avg(money): (1000+2050+525)/3 = 1191.67c → $11.92 (rounded).
     assert_eq!(row(&mut e, "SELECT avg(m)::text FROM mt"), "Text(\"$11.92\")");
 }
+
+/// min/max over time / inet / bytea — value_cmp had no arms for these, so they
+/// fell to `_ => Equal` and kept the first row. PG18.4-verified.
+#[test]
+fn maxmin_more_types() {
+    let mut e = Engine::new();
+    let row = |e: &mut Engine, setup: &[&str], q: &str| -> String {
+        for s in setup { e.execute(s).unwrap(); }
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(row(&mut e, &["CREATE TABLE tt (x time)","INSERT INTO tt VALUES ('10:00'),('14:00'),('02:30')"], "SELECT max(x)::text FROM tt"), "Text(\"14:00:00\")");
+    assert_eq!(row(&mut e, &["CREATE TABLE tt2 (x time)","INSERT INTO tt2 VALUES ('10:00'),('14:00'),('02:30')"], "SELECT min(x)::text FROM tt2"), "Text(\"02:30:00\")");
+    assert_eq!(row(&mut e, &["CREATE TABLE it (x inet)","INSERT INTO it VALUES ('192.168.1.1'),('10.0.0.1')"], "SELECT min(x)::text FROM it"), "Text(\"10.0.0.1\")");
+    assert_eq!(row(&mut e, &["CREATE TABLE bt (x bytea)","INSERT INTO bt VALUES ('\\x01'),('\\xff'),('\\x80')"], "SELECT max(x)::text FROM bt"), "Text(\"\\\\xff\")");
+}
