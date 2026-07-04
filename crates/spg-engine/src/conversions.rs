@@ -1082,7 +1082,24 @@ pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Po
 /// any two-corner input into upper-right + lower-left; we do
 /// the same.
 pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Point2D)> {
-    let pts = parse_point_list(s)?;
+    // PG box input: `(x1,y1),(x2,y2)` or the bare `x1,y1,x2,y2` — four raw
+    // numbers with no point parens. Try the point-list form first, then fall
+    // back to four comma-separated floats.
+    let pts = match parse_point_list(s) {
+        Some(p) if p.len() == 2 => p,
+        _ => {
+            let nums: Option<alloc::vec::Vec<f64>> =
+                s.trim().split(',').map(|t| t.trim().parse::<f64>().ok()).collect();
+            let nums = nums?;
+            if nums.len() != 4 {
+                return None;
+            }
+            alloc::vec![
+                spg_storage::Point2D { x: nums[0], y: nums[1] },
+                spg_storage::Point2D { x: nums[2], y: nums[3] },
+            ]
+        }
+    };
     if pts.len() != 2 {
         return None;
     }
@@ -1116,10 +1133,13 @@ pub fn parse_line_text(s: &str) -> Option<(f64, f64, f64)> {
 /// v7.37.5 ε — parse Circle text `<(x,y),r>` or `((x,y),r)`.
 pub fn parse_circle_text(s: &str) -> Option<(spg_storage::Point2D, f64)> {
     let s = s.trim();
+    // PG circle input: `<(x,y),r>`, `((x,y),r)`, `(x,y),r`, or bare `x,y,r`.
     let inner = if let Some(i) = s.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
         i
+    } else if let Some(i) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        i
     } else {
-        s.strip_prefix('(').and_then(|x| x.strip_suffix(')'))?
+        s
     };
     // The last comma at depth 0 splits the center from the radius.
     let bytes = inner.as_bytes();
