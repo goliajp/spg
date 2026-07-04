@@ -50,12 +50,16 @@ fn percent_l_null_renders_as_NULL_literal() {
 
 #[test]
 fn percent_capital_i_quoted_identifier() {
+    // PG's %I uses quote_identifier: a safe unquoted identifier like
+    // `mytable` is emitted verbatim, NOT wrapped in double quotes.
+    // (Live PG18: `format('SELECT FROM %I','mytable')` = `SELECT FROM
+    // mytable`.)
     let mut e = Engine::new();
     let r = rows(
         e.execute("SELECT format('SELECT FROM %I', 'mytable')")
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::Text(r#"SELECT FROM "mytable""#.into()));
+    assert_eq!(r[0][0], Value::Text("SELECT FROM mytable".into()));
 }
 
 #[test]
@@ -95,9 +99,11 @@ fn dynamic_sql_assembly_pattern() {
         )
         .unwrap(),
     );
+    // Live PG18: `users` / `name` are safe unquoted identifiers, so
+    // %I leaves them bare; only %L quotes the literal.
     assert_eq!(
         r[0][0],
-        Value::Text(r#"INSERT INTO "users" ("name") VALUES ('alice')"#.into())
+        Value::Text("INSERT INTO users (name) VALUES ('alice')".into())
     );
 }
 

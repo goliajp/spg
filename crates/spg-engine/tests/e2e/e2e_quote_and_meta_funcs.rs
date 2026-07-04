@@ -15,8 +15,10 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 #[test]
 fn quote_ident_wraps_in_double_quotes() {
     let mut e = Engine::new();
+    // PG's quote_ident leaves a safe unquoted identifier verbatim.
+    // (Live PG18: `quote_ident('foo')` = `foo`, not `"foo"`.)
     match first(&mut e, "SELECT quote_ident('foo')") {
-        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "\"foo\""),
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "foo"),
         other => panic!("got {other:?}"),
     }
     match first(&mut e, "SELECT quote_ident('foo\"bar')") {

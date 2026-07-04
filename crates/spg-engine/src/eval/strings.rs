@@ -234,6 +234,76 @@ pub(super) fn string_trim(
 ///   * `%%` — literal `%`
 ///   * `%n$X` — argument position (1-based) before the specifier
 ///     character (e.g. `%2$s` picks the 2nd arg)
+/// PostgreSQL keywords whose `pg_get_keywords().catcode <> 'U'`
+/// (reserved / type-func-name / col-name categories). `quote_ident`
+/// / `quote_identifier` quote any of these even when the character
+/// class is otherwise identifier-safe. Sorted ascending for
+/// `binary_search`. Captured live from PG 18.4.
+const PG_QUOTE_KEYWORDS: &[&str] = &[
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
+    "asymmetric", "authorization", "between", "bigint", "binary", "bit", "boolean", "both",
+    "case", "cast", "char", "character", "check", "coalesce", "collate", "collation",
+    "column", "concurrently", "constraint", "create", "cross", "current_catalog", "current_date", "current_role",
+    "current_schema", "current_time", "current_timestamp", "current_user", "dec", "decimal", "default", "deferrable",
+    "desc", "distinct", "do", "else", "end", "except", "exists", "extract",
+    "false", "fetch", "float", "for", "foreign", "freeze", "from", "full",
+    "grant", "greatest", "group", "grouping", "having", "ilike", "in", "initially",
+    "inner", "inout", "int", "integer", "intersect", "interval", "into", "is",
+    "isnull", "join", "json", "json_array", "json_arrayagg", "json_exists", "json_object", "json_objectagg",
+    "json_query", "json_scalar", "json_serialize", "json_table", "json_value", "lateral", "leading", "least",
+    "left", "like", "limit", "localtime", "localtimestamp", "merge_action", "national", "natural",
+    "nchar", "none", "normalize", "not", "notnull", "null", "nullif", "numeric",
+    "offset", "on", "only", "or", "order", "out", "outer", "overlaps",
+    "overlay", "placing", "position", "precision", "primary", "real", "references", "returning",
+    "right", "row", "select", "session_user", "setof", "similar", "smallint", "some",
+    "substring", "symmetric", "system_user", "table", "tablesample", "then", "time", "timestamp",
+    "to", "trailing", "treat", "trim", "true", "union", "unique", "user",
+    "using", "values", "varchar", "variadic", "verbose", "when", "where", "window",
+    "with", "xmlattributes", "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse",
+    "xmlpi", "xmlroot", "xmlserialize", "xmltable",
+];
+
+/// True when `s` must be double-quoted to survive as a SQL
+/// identifier, mirroring PG's `quote_identifier`: an unquoted
+/// identifier must be non-empty, start with `[a-z_]`, contain only
+/// `[a-z0-9_]`, and not collide with a non-unreserved keyword.
+fn ident_needs_quotes(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return true; // empty → always quote ("")
+    };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return true;
+    }
+    if s.chars()
+        .any(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+    {
+        return true;
+    }
+    // All-lowercase identifier-safe text: quote iff it is a keyword
+    // PG would otherwise reinterpret.
+    PG_QUOTE_KEYWORDS.binary_search(&s).is_ok()
+}
+
+/// PG `quote_ident` / `quote_identifier`: return `s` unchanged when
+/// it is a safe unquoted identifier, otherwise wrap it in double
+/// quotes with embedded `"` doubled.
+pub(super) fn pg_quote_ident(s: &str) -> String {
+    if !ident_needs_quotes(s) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
 pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() {
         return Err(EvalError::TypeMismatch {
@@ -330,16 +400,7 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                 }
                 v => {
                     let s = value_to_format_text(&v);
-                    out.push('"');
-                    for ch in s.chars() {
-                        if ch == '"' {
-                            out.push('"');
-                            out.push('"');
-                        } else {
-                            out.push(ch);
-                        }
-                    }
-                    out.push('"');
+                    out.push_str(&pg_quote_ident(&s));
                 }
             },
             'L' => match arg {
