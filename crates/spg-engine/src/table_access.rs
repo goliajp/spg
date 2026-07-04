@@ -29,7 +29,7 @@ impl Engine {
     /// using the same dispatch as `exec_select_unnest`. Used by
     /// the joined-select path so UNNEST can appear in any FROM
     /// position, not just as the primary.
-    fn materialise_table_ref(
+    pub(crate) fn materialise_table_ref(
         &self,
         tref: &TableRef,
     ) -> Result<(Vec<Row<'static>>, Vec<ColumnSchema>), EngineError> {

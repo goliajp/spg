@@ -72,6 +72,36 @@ impl Engine {
         let filtered: Vec<Row<'static>>;
         if from.joins.is_empty() {
             let primary = &from.primary;
+            // v7.37 D.13 — window functions over a derived table (subquery /
+            // VALUES / unnest / generate_series). The catalog-by-name lookup
+            // below only finds real tables, so a derived primary threw
+            // TableNotFound. Materialise the derived rows + schema through the
+            // same helper the non-window FROM-primary path uses, then WHERE-
+            // filter and feed the identical window pipeline.
+            let is_derived = primary.lateral_subquery.is_some()
+                || primary.unnest_expr.is_some()
+                || primary.generate_series_args.is_some()
+                || primary.jsonb_each_text_arg.is_some();
+            if is_derived {
+                let (drows, dcols) = self.materialise_table_ref(primary)?;
+                schema_cols_owned = dcols;
+                alias_opt = primary.alias.as_deref();
+                let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
+                let mut owned: Vec<Row<'static>> = Vec::new();
+                for (i, row) in drows.into_iter().enumerate() {
+                    if i.is_multiple_of(256) {
+                        cancel.check()?;
+                    }
+                    if let Some(w) = &stmt.where_ {
+                        let cond = eval::eval_expr(w, &row, &ctx)?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            continue;
+                        }
+                    }
+                    owned.push(row);
+                }
+                filtered = owned;
+            } else {
             let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
                 StorageError::TableNotFound {
                     name: primary.name.clone(),
@@ -118,6 +148,7 @@ impl Engine {
                 emit(row, hot_len + offset)?;
             }
             filtered = owned;
+            }
         } else {
             let deferred = self.build_joined_filtered_rows(
                 from,
