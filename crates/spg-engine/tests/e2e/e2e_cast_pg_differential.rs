@@ -765,3 +765,15 @@ fn bit_string_length_and_int_cast() {
     ck(&mut e, r#"(B'1010' & B'1100')::text"#, r#"1000"#);
     ck(&mut e, r#"(B'1010' = B'1010')::text"#, r#"true"#);
 }
+
+/// trunc(macaddr) zeros the last 3 bytes; macaddr→macaddr8 inserts ff:fe.
+/// macaddr comparison/equality already worked. PG18.4-verified.
+#[test]
+fn macaddr_trunc_and_widen() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"trunc('08:00:2b:01:02:03'::macaddr)::text"#, r#"08:00:2b:00:00:00"#);
+    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr::macaddr8)::text"#, r#"08:00:2b:ff:fe:01:02:03"#);
+    // controls: comparison + equality unchanged.
+    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr)::text"#, r#"true"#);
+    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text"#, r#"true"#);
+}
