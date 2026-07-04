@@ -1505,3 +1505,17 @@ fn regex_noncapturing_group() {
     // control: a plain capturing group still matches as before.
     ck(&mut e, "('abcabc' ~ '(abc)+')::text", "true");
 }
+
+/// v7.37 D.9 (slice 1b) — leading inline option group `(?i)` applies
+/// case-insensitive matching to the whole pattern (other flags accepted +
+/// ignored). PG18.4-verified. Verifies `(?:...)` is NOT mistaken for a flag group.
+#[test]
+fn regex_inline_flags() {
+    let mut e = Engine::new();
+    ck(&mut e, "('ABC' ~ '(?i)abc')::text", "true");
+    ck(&mut e, "('abc' ~ '(?i)ABC')::text", "true");
+    ck(&mut e, "regexp_replace('AbCd', '(?i)[a-z]', 'Q', 'g')", "QQQQ");
+    // control: case-sensitive without the flag; `(?:...)` still non-capturing.
+    ck(&mut e, "('ABC' ~ 'abc')::text", "false");
+    ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
+}
