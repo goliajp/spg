@@ -1687,3 +1687,17 @@ fn bit_position() {
     // control: text + bytea position still work.
     ck(&mut e, "position('cd' in 'abcd')::text", "3");
 }
+
+/// v7.37 D — substring(bit FROM s FOR l) does a bit-level slice (MSB-first,
+/// 1-based), repacked into a bit string. Previously errored. PG18.4-verified.
+#[test]
+fn bit_substring() {
+    let mut e = Engine::new();
+    ck(&mut e, "substring(B'10110' from 2 for 3)::text", "011");
+    ck(&mut e, "substring(B'10110' from 3)::text", "110");
+    ck(&mut e, "substring(B'10110' for 2)::text", "10");
+    ck(&mut e, "substring(B'10110' from 2 for 10)::text", "0110");
+    // control: text substring (FROM/FOR + FOR-only) works too.
+    ck(&mut e, "substring('abcdef' from 2 for 3)::text", "bcd");
+    ck(&mut e, "substring('abcdef' for 3)::text", "abc");
+}

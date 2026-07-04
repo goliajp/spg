@@ -14601,11 +14601,17 @@ impl Parser {
                     if (first.eq_ignore_ascii_case("substring")
                         || first.eq_ignore_ascii_case("substr"))
                         && args.len() == 1
-                        && matches!(self.peek(), Token::From)
+                        && matches!(self.peek(), Token::From | Token::For)
                     {
-                        self.advance();
-                        let start = self.parse_expr(0)?;
-                        args.push(start);
+                        // `substring(str FROM pos [FOR len])`, or the FOR-only
+                        // `substring(str FOR len)` which PG treats as FROM 1.
+                        if matches!(self.peek(), Token::From) {
+                            self.advance();
+                            let start = self.parse_expr(0)?;
+                            args.push(start);
+                        } else {
+                            args.push(Expr::Literal(Literal::Integer(1)));
+                        }
                         if matches!(self.peek(), Token::For) {
                             self.advance();
                             let length = self.parse_expr(0)?;

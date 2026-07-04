@@ -4112,6 +4112,9 @@ fn apply_function_dispatch(
                         return Ok(match &args[0] {
                             Value::Text(_) => Value::text(String::new()),
                             Value::Bytes(_) => Value::bytes(Vec::new()),
+                            Value::BitString { .. } => {
+                                Value::BitString { nbits: 0, bytes: alloc::borrow::Cow::Owned(Vec::new()) }
+                            }
                             other => {
                                 return Err(EvalError::TypeMismatch {
                                     detail: format!(
@@ -4154,6 +4157,33 @@ fn apply_function_dispatch(
                         None => b.len() - skip,
                     };
                     Ok(Value::bytes(b[skip..skip + take].to_vec()))
+                }
+                // PG substring(bit/varbit FROM s FOR l) — bit-level slice
+                // (MSB-first, 1-based), repacked into a new bit string.
+                Value::BitString { nbits, bytes } => {
+                    let skip = (effective_start - 1) as usize;
+                    let total = *nbits as usize;
+                    if skip >= total {
+                        return Ok(Value::BitString {
+                            nbits: 0,
+                            bytes: alloc::borrow::Cow::Owned(Vec::new()),
+                        });
+                    }
+                    let take = match effective_length {
+                        Some(n) => (n as usize).min(total - skip),
+                        None => total - skip,
+                    };
+                    let bit_at = |i: usize| -> u8 { (bytes[i / 8] >> (7 - i % 8)) & 1 };
+                    let mut out = alloc::vec![0u8; take.div_ceil(8)];
+                    for j in 0..take {
+                        if bit_at(skip + j) == 1 {
+                            out[j / 8] |= 1u8 << (7 - j % 8);
+                        }
+                    }
+                    Ok(Value::BitString {
+                        nbits: u32::try_from(take).unwrap_or(u32::MAX),
+                        bytes: alloc::borrow::Cow::Owned(out),
+                    })
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
