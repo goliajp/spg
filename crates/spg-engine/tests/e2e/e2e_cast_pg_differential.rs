@@ -448,3 +448,14 @@ fn age_calendar_breakdown() {
     ck(&mut e, r#"age(timestamp '2024-01-10', timestamp '2024-03-15')"#, r#"-2 mons -5 days"#);
     ck(&mut e, r#"age(timestamp '2024-03-15 14:30:00', timestamp '2024-01-10 10:00:00')"#, r#"2 mons 5 days 04:30:00"#);
 }
+
+/// time - time returns the signed interval between them (was ERR). PG18.4.
+#[test]
+fn time_minus_time_interval() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"'10:30:00'::time - '08:15:00'::time"#, r#"02:15:00"#);
+    ck(&mut e, r#"'08:15:00'::time - '10:30:00'::time"#, r#"-02:15:00"#);
+    ck(&mut e, r#"'12:00:00'::time - '12:00:00'::time"#, r#"00:00:00"#);
+    ck(&mut e, r#"'23:59:59'::time - '00:00:00'::time"#, r#"23:59:59"#);
+}
+
