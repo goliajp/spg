@@ -2392,32 +2392,120 @@ impl Index {
 /// key. (Caveat handled at replay integration: a post-checkpoint cold-tier
 /// freeze shifts hot positions and must itself be logged or fenced by a
 /// checkpoint — see `row-level-redo-design`.)
+/// ## v7.37.15 (Epic W slice 1) — additive MVCC identity metadata
+///
+/// Each variant now also carries, additively, the stable
+/// [`RowId`](row_header::RowId) of the affected row(s) and the
+/// **writer version** (`xmin` for an insert, `xmax` for a
+/// delete/update). This is the codec foundation for making
+/// in-place MVCC tombstones durable across crash/upgrade recovery.
+///
+/// Two important properties for the durability path:
+///
+/// 1. **Replay resolution is UNCHANGED.** `apply_redo_run_on_table`
+///    still resolves every change by physical `pos`/`positions`
+///    exactly as before. The new metadata is *carried but unused*
+///    by replay in this slice; resolving-by-`RowId` and
+///    header-preserving replay are later slices.
+/// 2. **Backward compatibility.** A redo payload written by
+///    pre-Epic-W code carries no metadata; [`decode_redo_log`]
+///    fills `rowid`/`rowids` with [`RowId::UNASSIGNED`](row_header::RowId::UNASSIGNED)
+///    (empty for `Delete`) and `writer_version` with `0`. See the
+///    codec version gate in [`encode_redo_log`]/[`decode_redo_log`].
+///
+/// The `writer_version` is currently populated as `0` at every
+/// capture site: the storage layer stamps `RowHeader::frozen()` on
+/// insert and does not thread the writing transaction's `TxId` down
+/// to `Table::insert`/`delete_rows`/`update_row`, so the real
+/// `xmin`/`xmax` is not reachable here without a bigger change. The
+/// codec is ready to carry it the moment it becomes available.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowChange {
     /// Append `row` to `table`.
-    Insert { table: String, row: Row<'static> },
+    Insert {
+        table: String,
+        row: Row<'static>,
+        /// Epic W: stable id the appended row will receive.
+        /// [`RowId::UNASSIGNED`](row_header::RowId::UNASSIGNED) when
+        /// decoded from a pre-Epic-W redo payload.
+        rowid: row_header::RowId,
+        /// Epic W: writer version (`xmin`). `0` until the writing
+        /// `TxId` is threaded to the storage layer (later slice).
+        writer_version: u64,
+    },
     /// Replace the row at physical `pos` in `table` with `new_row`.
     Update {
         table: String,
         pos: usize,
         new_row: Vec<Value<'static>>,
+        /// Epic W: stable id of the row at `pos`.
+        /// [`RowId::UNASSIGNED`](row_header::RowId::UNASSIGNED) when
+        /// decoded from a pre-Epic-W redo payload.
+        rowid: row_header::RowId,
+        /// Epic W: writer version (`xmax` of the superseded tuple).
+        /// `0` until the writing `TxId` is threaded (later slice).
+        writer_version: u64,
     },
     /// Remove the rows at the given physical `positions` from `table`.
     Delete {
         table: String,
         positions: Vec<usize>,
+        /// Epic W: stable ids parallel to `positions` (same length,
+        /// [`RowId::UNASSIGNED`](row_header::RowId::UNASSIGNED) for an
+        /// out-of-bounds input position). **Empty** when decoded from
+        /// a pre-Epic-W redo payload (no metadata was recorded).
+        rowids: Vec<row_header::RowId>,
+        /// Epic W: writer version (`xmax`). `0` until the writing
+        /// `TxId` is threaded to the storage layer (later slice).
+        writer_version: u64,
     },
 }
 
-/// v7.34 (crash-recovery P0 #2) — encode a row-level redo log to bytes for
-/// a WAL record. Self-describing: the writer's `FILE_VERSION` leads so a
-/// later spg can decode it via the version-gated value codec. Layout:
-/// `[u8 version][u32 count]` then per change `[u8 op][str table]` and,
-/// per op, `Insert [u32 n][value×n]`, `Update [u32 pos][u32 n][value×n]`,
-/// `Delete [u32 n][u32 pos×n]`. Positions are physical (u32 ≤ 4 G rows).
+/// v7.37.15 (Epic W slice 1) — leading marker byte of the
+/// metadata-carrying redo layout. A **pre-Epic-W** redo payload leads
+/// with `FILE_VERSION` (8..=52 today, rising ~1 per release); this
+/// marker is `0xFF` and can therefore never collide with a real
+/// `FILE_VERSION`, so [`decode_redo_log`] tells the two layouts apart
+/// by inspecting the first byte alone. The compile-time assertion
+/// below makes the "never collide" invariant a hard build gate: if
+/// `FILE_VERSION` ever climbs toward `0xFF` the build breaks and forces
+/// a redesign long before an ambiguity could ship.
+const REDO_META_MARKER: u8 = 0xFF;
+/// v7.37.15 (Epic W slice 1) — version of the metadata-carrying redo
+/// layout that follows [`REDO_META_MARKER`]. Bumped when the per-change
+/// metadata shape changes; an unknown value is a hard decode error.
+const REDO_META_VERSION: u8 = 1;
+// Provably-unambiguous old/new distinction: the pre-Epic-W layout's
+// first byte is `FILE_VERSION`, which must stay strictly below the
+// marker forever.
+const _: () = assert!(FILE_VERSION < REDO_META_MARKER);
+
+/// v7.34 (crash-recovery P0 #2), extended v7.37.15 (Epic W slice 1) —
+/// encode a row-level redo log to bytes for a WAL record.
+///
+/// ## Layout (Epic W metadata-carrying form, always emitted now)
+///
+/// `[u8 REDO_META_MARKER=0xFF][u8 REDO_META_VERSION][u8 FILE_VERSION]
+/// [u32 count]` then per change `[u8 op][str table]` and, per op:
+/// - `Insert [u32 n][value×n][u64 rowid][u64 writer_version]`
+/// - `Update [u32 pos][u32 n][value×n][u64 rowid][u64 writer_version]`
+/// - `Delete [u32 n][u32 pos×n][u64 rowid×n][u64 writer_version]`
+///
+/// Positions are physical (u32 ≤ 4 G rows). The `FILE_VERSION` byte
+/// still rides along (now the 3rd byte) so the value codec decodes
+/// string / BYTEA escapes exactly as before.
+///
+/// ## Backward compatibility
+///
+/// The **pre-Epic-W** layout was `[u8 FILE_VERSION][u32 count]…` with
+/// no per-change metadata. [`decode_redo_log`] still decodes that form
+/// (first byte < `0xFF`) byte-for-byte identically — every WAL file
+/// written by released code replays unchanged.
 #[must_use]
 pub fn encode_redo_log(changes: &[RowChange]) -> Vec<u8> {
     let mut out = Vec::new();
+    out.push(REDO_META_MARKER);
+    out.push(REDO_META_VERSION);
     out.push(FILE_VERSION);
     codec::write_u32(&mut out, changes.len() as u32);
     let write_values = |out: &mut Vec<u8>, vals: &[Value<'static>]| {
@@ -2428,44 +2516,105 @@ pub fn encode_redo_log(changes: &[RowChange]) -> Vec<u8> {
     };
     for change in changes {
         match change {
-            RowChange::Insert { table, row } => {
+            RowChange::Insert {
+                table,
+                row,
+                rowid,
+                writer_version,
+            } => {
                 out.push(0);
                 codec::write_str(&mut out, table);
                 write_values(&mut out, &row.values);
+                codec::write_u64(&mut out, rowid.0);
+                codec::write_u64(&mut out, *writer_version);
             }
             RowChange::Update {
                 table,
                 pos,
                 new_row,
+                rowid,
+                writer_version,
             } => {
                 out.push(1);
                 codec::write_str(&mut out, table);
                 codec::write_u32(&mut out, *pos as u32);
                 write_values(&mut out, new_row);
+                codec::write_u64(&mut out, rowid.0);
+                codec::write_u64(&mut out, *writer_version);
             }
-            RowChange::Delete { table, positions } => {
+            RowChange::Delete {
+                table,
+                positions,
+                rowids,
+                writer_version,
+            } => {
                 out.push(2);
                 codec::write_str(&mut out, table);
                 codec::write_u32(&mut out, positions.len() as u32);
                 for p in positions {
                     codec::write_u32(&mut out, *p as u32);
                 }
+                // Epic W: one RowId per position (parallel). Capture
+                // sites always produce `rowids.len() == positions.len()`;
+                // this assertion pins that invariant at encode time so a
+                // mismatch is a loud bug, not a silently short payload.
+                debug_assert_eq!(
+                    rowids.len(),
+                    positions.len(),
+                    "redo Delete: rowids must be parallel to positions"
+                );
+                for rid in rowids {
+                    codec::write_u64(&mut out, rid.0);
+                }
+                codec::write_u64(&mut out, *writer_version);
             }
         }
     }
     out
 }
 
-/// v7.34 — decode a row-level redo log written by [`encode_redo_log`].
-/// A truncated / corrupt buffer is a hard error (the embedding layer
-/// frames each record with its own length + CRC; a frame that decodes
-/// short is corruption, not a torn tail).
+/// v7.34, extended v7.37.15 (Epic W slice 1) — decode a row-level redo
+/// log written by [`encode_redo_log`].
+///
+/// Decodes **both** the Epic W metadata-carrying layout (first byte
+/// `REDO_META_MARKER = 0xFF`) and the pre-Epic-W layout (first byte is
+/// `FILE_VERSION`, always `< 0xFF`). For the old layout the per-change
+/// metadata is absent, so `rowid`/`rowids` come back
+/// [`RowId::UNASSIGNED`](row_header::RowId::UNASSIGNED) (empty for
+/// `Delete`) and `writer_version` comes back `0`.
+///
+/// A truncated / corrupt buffer is a hard error — never a panic — the
+/// embedding layer frames each record with its own length + CRC, so a
+/// frame that decodes short is corruption, not a torn tail.
 pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
-    let version = *bytes
+    let first = *bytes
         .first()
         .ok_or_else(|| StorageError::Corrupt("redo log: empty".into()))?;
-    let mut cur = codec::Cursor::new(bytes).with_codec_version(version);
-    let _version = cur.read_u8()?;
+    // Epic W: `0xFF` marker ⇒ metadata-carrying layout; anything else
+    // is a pre-Epic-W `FILE_VERSION` byte (old layout, no metadata).
+    let has_meta = first == REDO_META_MARKER;
+    let (codec_version, header_len) = if has_meta {
+        let meta_version = *bytes
+            .get(1)
+            .ok_or_else(|| StorageError::Corrupt("redo log: short header".into()))?;
+        if meta_version != REDO_META_VERSION {
+            return Err(StorageError::Corrupt(alloc::format!(
+                "redo log: unknown metadata version {meta_version}"
+            )));
+        }
+        let file_version = *bytes
+            .get(2)
+            .ok_or_else(|| StorageError::Corrupt("redo log: short header".into()))?;
+        // header = [marker][meta_version][file_version]
+        (file_version, 3usize)
+    } else {
+        // Old layout: the first byte IS the FILE_VERSION.
+        (first, 1usize)
+    };
+    let mut cur = codec::Cursor::new(bytes).with_codec_version(codec_version);
+    for _ in 0..header_len {
+        cur.read_u8()?;
+    }
     let count = cur.read_u32()? as usize;
     let mut read_values =
         |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value<'static>>, StorageError> {
@@ -2481,16 +2630,34 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
         let op = cur.read_u8()?;
         let table = cur.read_str()?;
         let change = match op {
-            0 => RowChange::Insert {
-                table,
-                row: Row::new(read_values(&mut cur)?),
-            },
+            0 => {
+                let row = Row::new(read_values(&mut cur)?);
+                let (rowid, writer_version) = if has_meta {
+                    (row_header::RowId(cur.read_u64()?), cur.read_u64()?)
+                } else {
+                    (row_header::RowId::UNASSIGNED, 0)
+                };
+                RowChange::Insert {
+                    table,
+                    row,
+                    rowid,
+                    writer_version,
+                }
+            }
             1 => {
                 let pos = cur.read_u32()? as usize;
+                let new_row = read_values(&mut cur)?;
+                let (rowid, writer_version) = if has_meta {
+                    (row_header::RowId(cur.read_u64()?), cur.read_u64()?)
+                } else {
+                    (row_header::RowId::UNASSIGNED, 0)
+                };
                 RowChange::Update {
                     table,
                     pos,
-                    new_row: read_values(&mut cur)?,
+                    new_row,
+                    rowid,
+                    writer_version,
                 }
             }
             2 => {
@@ -2499,7 +2666,22 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
                 for _ in 0..n {
                     positions.push(cur.read_u32()? as usize);
                 }
-                RowChange::Delete { table, positions }
+                let (rowids, writer_version) = if has_meta {
+                    let mut rowids = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        rowids.push(row_header::RowId(cur.read_u64()?));
+                    }
+                    (rowids, cur.read_u64()?)
+                } else {
+                    // Old layout carried no RowId metadata.
+                    (Vec::new(), 0)
+                };
+                RowChange::Delete {
+                    table,
+                    positions,
+                    rowids,
+                    writer_version,
+                }
             }
             other => {
                 return Err(StorageError::Corrupt(alloc::format!(

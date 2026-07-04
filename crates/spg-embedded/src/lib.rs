@@ -6707,23 +6707,32 @@ mod tests {
             cat
         }
 
+        use spg_storage::row_header::RowId;
         let changes: Vec<RowChange> = vec![
             RowChange::Delete {
                 table: "t".to_string(),
                 positions: vec![5, 7, 9],
+                rowids: vec![RowId::UNASSIGNED; 3],
+                writer_version: 0,
             },
             RowChange::Insert {
                 table: "t".to_string(),
                 row: Row::new(vec![Value::Int(999), Value::Int(1998), Value::Int(2997)]),
+                rowid: RowId::UNASSIGNED,
+                writer_version: 0,
             },
             RowChange::Update {
                 table: "t".to_string(),
                 pos: 3,
                 new_row: vec![Value::Int(42), Value::Int(84), Value::Int(126)],
+                rowid: RowId::UNASSIGNED,
+                writer_version: 0,
             },
             RowChange::Delete {
                 table: "t".to_string(),
                 positions: vec![0, 1],
+                rowids: vec![RowId::UNASSIGNED; 2],
+                writer_version: 0,
             },
         ];
 
@@ -6738,7 +6747,7 @@ mod tests {
         let mut cat_legacy = build_seed_catalog();
         for change in &changes {
             match change {
-                RowChange::Insert { table, row } => {
+                RowChange::Insert { table, row, .. } => {
                     cat_legacy
                         .get_mut(table)
                         .unwrap()
@@ -6749,6 +6758,7 @@ mod tests {
                     table,
                     pos,
                     new_row,
+                    ..
                 } => {
                     cat_legacy
                         .get_mut(table)
@@ -6756,7 +6766,9 @@ mod tests {
                         .update_row(*pos, new_row.clone())
                         .unwrap();
                 }
-                RowChange::Delete { table, positions } => {
+                RowChange::Delete {
+                    table, positions, ..
+                } => {
                     cat_legacy.get_mut(table).unwrap().delete_rows(positions);
                 }
             }
@@ -6830,6 +6842,8 @@ mod tests {
             .map(|_| RowChange::Delete {
                 table: "t".to_string(),
                 positions: (0..ROWS_PER_RECORD).collect(),
+                rowids: Vec::new(),
+                writer_version: 0,
             })
             .collect();
 
