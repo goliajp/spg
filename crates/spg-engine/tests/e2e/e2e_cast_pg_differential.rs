@@ -866,3 +866,20 @@ fn create_table_bit_typmod() {
     assert_eq!(row(&mut e, "SELECT a::text FROM bc"), "Text(\"1010\")");
     assert_eq!(row(&mut e, "SELECT b::text FROM bc"), "Text(\"11110000\")");
 }
+
+/// pg_dump-compat column type spellings that previously failed to parse at
+/// CREATE TABLE: precision on time/timestamptz, precision before WITH TIME
+/// ZONE, interval field qualifiers, and `character varying`. PG18.4-verified.
+#[test]
+fn create_table_datetime_typmods() {
+    let mut e = Engine::new();
+    e.execute(
+        "CREATE TABLE dtm (a time(3), b timestamptz(6), c timestamp(3) with time zone, \
+         d time(3) with time zone, f interval day to second, g interval(3), \
+         h character varying(20), i character(4), j character varying)",
+    )
+    .expect("pg_dump-canonical datetime/character column typmods parse");
+    e.execute("INSERT INTO dtm (h) VALUES ('hello')").unwrap();
+    let r = e.execute("SELECT h FROM dtm");
+    assert!(matches!(r, Ok(spg_engine::QueryResult::Rows { .. })));
+}
