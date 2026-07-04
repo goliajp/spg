@@ -1096,3 +1096,18 @@ fn geo_overlap() {
     // control: array overlap unaffected.
     ck(&mut e, "(ARRAY[1,2] && ARRAY[2,3])::text", "true");
 }
+
+/// Cross-type `<->` distance: point to lseg / box / circle. PG18.4-verified.
+#[test]
+fn point_geo_distance() {
+    let mut e = Engine::new();
+    ck(&mut e, "(point(0,0) <-> '(3,0),(4,0)'::lseg)::text", "3");
+    ck(&mut e, "(point(0,4) <-> '(0,0),(3,0)'::lseg)::text", "4");
+    ck(&mut e, "(point(2,2) <-> '(0,0),(4,0)'::lseg)::text", "2");
+    ck(&mut e, "(point(5,5) <-> '(3,4),(5,6)'::box)::text", "0");
+    ck(&mut e, "(point(0,0) <-> '(3,4),(5,6)'::box)::text", "5");
+    ck(&mut e, "(point(10,0) <-> '<(0,0),5>'::circle)::text", "5");
+    // both orders + point<->point control.
+    ck(&mut e, "('(3,0),(4,0)'::lseg <-> point(0,0))::text", "3");
+    ck(&mut e, "(point(0,0) <-> point(3,4))::text", "5");
+}

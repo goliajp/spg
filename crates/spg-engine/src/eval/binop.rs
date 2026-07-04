@@ -1420,6 +1420,11 @@ fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, E
         let dy = a.y - b.y;
         return Ok(Value::Float(sqrt_newton(dx * dx + dy * dy)));
     }
+    // PG `point <-> {lseg|box|circle}` (either order) — distance from the
+    // point to the nearest point of the geometry.
+    if let Some(d) = point_geo_distance(&l, &r).or_else(|| point_geo_distance(&r, &l)) {
+        return Ok(Value::Float(d));
+    }
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
@@ -2227,6 +2232,41 @@ fn range_strictly_left(
             Ordering::Equal => !(aui2 && bli2),
             Ordering::Greater => false,
         },
+    }
+}
+
+/// Distance from a point to a segment, box, or circle (`point <-> geo`).
+/// `None` unless the first operand is a point and the second is one of those
+/// geometries.
+fn point_geo_distance(p: &Value<'_>, geo: &Value<'_>) -> Option<f64> {
+    let Value::Point(pt) = p else { return None };
+    match geo {
+        Value::Lseg(a, b) => {
+            // Nearest point on the segment: project pt, clamp t to [0,1].
+            let (vx, vy) = (b.x - a.x, b.y - a.y);
+            let len2 = vx * vx + vy * vy;
+            let t = if len2 == 0.0 {
+                0.0
+            } else {
+                (((pt.x - a.x) * vx + (pt.y - a.y) * vy) / len2).clamp(0.0, 1.0)
+            };
+            let (nx, ny) = (a.x + t * vx, a.y + t * vy);
+            let (dx, dy) = (pt.x - nx, pt.y - ny);
+            Some(sqrt_newton(dx * dx + dy * dy))
+        }
+        Value::PgBox(ur, ll) => {
+            // Clamp the point into the box; distance to the clamped point.
+            let nx = pt.x.clamp(ll.x, ur.x);
+            let ny = pt.y.clamp(ll.y, ur.y);
+            let (dx, dy) = (pt.x - nx, pt.y - ny);
+            Some(sqrt_newton(dx * dx + dy * dy))
+        }
+        Value::Circle { center, radius } => {
+            let (dx, dy) = (pt.x - center.x, pt.y - center.y);
+            let d = sqrt_newton(dx * dx + dy * dy) - radius;
+            Some(if d < 0.0 { 0.0 } else { d })
+        }
+        _ => None,
     }
 }
 
