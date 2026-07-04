@@ -16,9 +16,25 @@ use spg_storage::Value;
 
 use super::EvalError;
 
+/// A network-address function argument: accept the legacy TEXT form OR a
+/// real INET / CIDR value (rendered to its canonical text first). Fixes the
+/// inet builtins erroring when handed an actual inet/cidr column value.
+fn inet_arg_text(v: &Value<'_>) -> Option<alloc::string::String> {
+    match v {
+        Value::Text(s) => Some(s.to_string()),
+        Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+            Some(crate::conversions::format_inet(*family, *bits, addr))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn inet_host(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -33,6 +49,9 @@ pub(super) fn inet_host(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
 pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -76,6 +95,9 @@ pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 pub(super) fn inet_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -96,6 +118,9 @@ pub(super) fn inet_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -126,6 +151,9 @@ pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -155,6 +183,9 @@ pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -296,6 +327,9 @@ pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 pub(super) fn inet_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let s = match args {
         [Value::Text(s)] => s.clone(),
+        [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
+            alloc::borrow::Cow::Owned(crate::conversions::format_inet(*family, *bits, addr))
+        }
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {

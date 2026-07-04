@@ -306,3 +306,18 @@ fn array_bytea_edge_cases() {
     ck(&mut e, r#"get_byte('\x1234'::bytea, 0)"#, r#"18"#);
     ck(&mut e, r#"substring('\x1234abcd'::bytea from 2 for 2)"#, r#"\x34ab"#);
 }
+
+/// inet builtins accept a real INET/CIDR value, not only its TEXT form.
+/// (host/network/masklen/broadcast/family/netmask/hostmask errored on an
+/// actual inet value.) PG18.4-verified.
+#[test]
+fn inet_functions_accept_inet_value() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"host('192.168.1.5/24'::inet)"#, r#"192.168.1.5"#);
+    ck(&mut e, r#"masklen('192.168.1.5/24'::inet)"#, r#"24"#);
+    ck(&mut e, r#"network('192.168.1.5/24'::inet)"#, r#"192.168.1.0/24"#);
+    ck(&mut e, r#"broadcast('192.168.1.5/24'::inet)"#, r#"192.168.1.255/24"#);
+    ck(&mut e, r#"family('192.168.1.5'::inet)"#, r#"4"#);
+    // TEXT form still works (legacy path).
+    ck(&mut e, r#"host('192.168.1.5/24')"#, r#"192.168.1.5"#);
+}
