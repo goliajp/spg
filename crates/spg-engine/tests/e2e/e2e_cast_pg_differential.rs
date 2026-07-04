@@ -1519,3 +1519,18 @@ fn regex_inline_flags() {
     ck(&mut e, "('ABC' ~ 'abc')::text", "false");
     ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
 }
+
+/// v7.37 D — regex numeric + character-entry escapes: `\xHH`/`\uHHHH` and
+/// `\t \n \r \f \v \a \e`. Previously these fell through to a literal letter.
+/// PG18.4-verified.
+#[test]
+fn regex_char_escapes() {
+    let mut e = Engine::new();
+    ck(&mut e, "('A' ~ '^\\x41$')::text", "true");
+    ck(&mut e, "('AB' ~ '^\\x41\\x42$')::text", "true");
+    ck(&mut e, "(E'\\t' ~ '^\\t$')::text", "true");
+    ck(&mut e, "(E'\\n' ~ '^\\n$')::text", "true");
+    ck(&mut e, "('A' ~ '^\\u0041$')::text", "true");
+    // control: an unknown escape is still the literal char.
+    ck(&mut e, "('q' ~ '^\\q$')::text", "true");
+}
