@@ -1259,3 +1259,28 @@ fn concurrent_tx_isolation() {
     e.execute_in("ROLLBACK", tx2).unwrap();
     assert!(!e.is_tx_open(tx2), "tx2 closed after rollback");
 }
+
+/// v7.37 C.5 (A.2b groundwork) — proves the "Design A" server-wiring plan:
+/// a connection may pass its own stable `tx_id` for EVERY statement. An
+/// autocommit statement (no BEGIN) under a per-connection tx_id behaves exactly
+/// like IMPLICIT_TX — it writes the main catalog, is visible to all other
+/// connections, and leaves no open shadow. This lets the server give each
+/// connection a unique tx_id at accept without a BEGIN/COMMIT detection step.
+#[test]
+fn autocommit_under_conn_tx() {
+    use spg_engine::IMPLICIT_TX;
+    let mut e = Engine::new();
+    let conn_a = e.alloc_tx_id();
+    let conn_b = e.alloc_tx_id();
+    e.execute_in("CREATE TABLE t (x int)", conn_a).unwrap();
+    e.execute_in("INSERT INTO t VALUES (1)", conn_a).unwrap();
+    let cnt = |e: &mut Engine, tx| -> String {
+        match e.execute_in("SELECT count(*) FROM t", tx) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(cnt(&mut e, conn_b), "BigInt(1)", "conn_b sees conn_a's autocommit write");
+    assert_eq!(cnt(&mut e, IMPLICIT_TX), "BigInt(1)", "IMPLICIT_TX sees it too");
+    assert!(!e.is_tx_open(conn_a), "autocommit leaves no open shadow under conn_a");
+}
