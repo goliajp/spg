@@ -653,3 +653,35 @@ fn encode_escape_and_decode_bytea() {
     ck(&mut e, r#"encode('abc'::bytea, 'hex')"#, r#"616263"#);
     ck(&mut e, r#"encode('abc'::bytea, 'base64')"#, r#"YWJj"#);
 }
+
+/// Statistical aggregates (stddev/variance/percentile_cont/corr) on a NUMERIC
+/// column — the value→f64 conversion was missing the Numeric arm, so they
+/// errored or returned NULL. PG18.4-verified.
+#[test]
+fn stat_agg_on_numeric() {
+    use spg_engine::QueryResult;
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE s(v numeric)").unwrap();
+    e.execute("INSERT INTO s VALUES (1),(2),(3),(4),(5)").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                spg_storage::Value::Null => "<NULL>".into(),
+                spg_storage::Value::Text(t) => t.to_string(),
+                other => format!("{other:?}"),
+            },
+            Err(err) => format!("ERR:{err:?}"),
+            _ => "<x>".into(),
+        }
+    };
+    // The core fix: these now COMPUTE on a NUMERIC column instead of erroring
+    // (stddev/variance) or returning NULL (percentile_cont/corr). Values are
+    // numerically PG-correct; the trailing-zero padding on round(float,4)
+    // (2.5 vs PG's 2.5000) is the separate numeric-scale deferral.
+    assert_eq!(q(&mut e, "SELECT round(stddev(v),4)::text FROM s"), "1.5811");
+    assert_eq!(q(&mut e, "SELECT round(variance(v),4)::text FROM s"), "2.5");
+    assert_eq!(q(&mut e, "SELECT round(var_pop(v),4)::text FROM s"), "2");
+    assert_eq!(q(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::text FROM s"), "3");
+    assert_eq!(q(&mut e, "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v)::text FROM s"), "2");
+    assert_eq!(q(&mut e, "SELECT corr(v, v)::text FROM s"), "1");
+}
