@@ -228,22 +228,24 @@ pub(super) fn apply_binary(
             });
         }
     }
-    // Range `*` intersection / `+` union claim Mul / Add before numeric/date
-    // arithmetic.
-    if op == BinOp::Mul || op == BinOp::Add {
+    // Range `*` intersection / `+` union / `-` difference claim Mul / Add / Sub
+    // before numeric/date arithmetic.
+    if op == BinOp::Mul || op == BinOp::Add || op == BinOp::Sub {
         if let (
             Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
             Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
         ) = (&l, &r)
         {
-            return if op == BinOp::Mul {
-                Ok(range_intersect(
+            return match op {
+                BinOp::Mul => Ok(range_intersect(
                     *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
-                ))
-            } else {
-                range_union(
+                )),
+                BinOp::Add => range_union(
                     *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
-                )
+                ),
+                _ => range_difference(
+                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+                ),
             };
         }
     }
@@ -1989,6 +1991,68 @@ fn range_union(
         upper_inc: up_inc,
         empty: false,
     })
+}
+
+/// Range `-` difference: the part of `a` not covered by `b`. PG errors when
+/// removing `b` would split `a` into two disjoint ranges.
+#[allow(clippy::too_many_arguments)]
+fn range_difference(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> Result<Value<'static>, EvalError> {
+    let empty = Value::Range {
+        kind: ak,
+        lower: None,
+        upper: None,
+        lower_inc: false,
+        upper_inc: false,
+        empty: true,
+    };
+    let mk = |lo: Option<alloc::boxed::Box<Value<'static>>>, up: Option<alloc::boxed::Box<Value<'static>>>, li, ui| Value::Range {
+        kind: ak,
+        lower: lo,
+        upper: up,
+        lower_inc: li,
+        upper_inc: ui,
+        empty: false,
+    };
+    if ae {
+        return Ok(empty);
+    }
+    let a_unchanged = || Value::Range {
+        kind: ak,
+        lower: al.clone(),
+        upper: au.clone(),
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    };
+    if be || !range_overlaps(ak, al, au, ali, aui, ae, bk, bl, bu, bli, bui, be) {
+        return Ok(a_unchanged());
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    // `b` covers `a` entirely → empty.
+    let b_starts_at_or_before_a = lower_cmp(&al2, ali2, &bl2, bli2) != core::cmp::Ordering::Less;
+    let b_ends_at_or_after_a = upper_cmp(&au2, aui2, &bu2, bui2) != core::cmp::Ordering::Greater;
+    if b_starts_at_or_before_a && b_ends_at_or_after_a {
+        return Ok(empty);
+    }
+    let a_extends_left = lower_cmp(&al2, ali2, &bl2, bli2) == core::cmp::Ordering::Less;
+    let a_extends_right = upper_cmp(&au2, aui2, &bu2, bui2) == core::cmp::Ordering::Greater;
+    // `b` sits strictly inside `a` → the difference would be two ranges.
+    if a_extends_left && a_extends_right {
+        return Err(EvalError::TypeMismatch {
+            detail: "result of range difference would not be contiguous".into(),
+        });
+    }
+    if a_extends_left {
+        // Keep `a`'s left part: [a.lower, b.lower).
+        Ok(mk(al2.map(alloc::boxed::Box::new), bl2.map(alloc::boxed::Box::new), ali2, !bli2))
+    } else {
+        // Keep `a`'s right part: [b.upper, a.upper).
+        Ok(mk(bu2.map(alloc::boxed::Box::new), au2.map(alloc::boxed::Box::new), !bui2, aui2))
+    }
 }
 
 /// The numeric value of an inet/cidr address (IPv4 in the low 4 bytes,
