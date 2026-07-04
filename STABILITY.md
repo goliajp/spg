@@ -495,8 +495,19 @@ async-commit write path. Stable wire contract:
   opt-in keyword set is deliberately narrow so a typo lands in
   the safe direction.
 - Companion knob `SPG_FLUSHER_INTERVAL_US` (default 200,
-  minimum 10) tunes the flusher cadence; values < 10 µs are
-  silently clamped to the floor.
+  minimum 10) tunes the **server** flusher cadence; values
+  < 10 µs are silently clamped to the floor.
+- The **embedded** crate (`spg-embedded`) uses a separate knob,
+  `SPG_WAL_WRITER_DELAY_MS` (default 200 ms — PG's
+  `wal_writer_delay` default, must be `> 0`), for its own
+  background flusher (`lib.rs:3074-3086`). The embedded flusher
+  calls `flush_now()` (write + fsync of the pending group
+  buffer) each tick rather than emitting `durability_checkpoint`
+  markers, but the loss bound is identical in shape: ≤ one
+  cadence of confirmed-but-unsynced commits. Note the two
+  defaults differ by 1000× (server 200 µs vs embedded 200 ms) —
+  the embedded default matches PG's on-disk-WAL analogue, the
+  server default is tuned for the high-throughput wire path.
 
 In async mode the WAL write path's `sync_data` call is skipped
 on the client's hot path. A background flusher thread emits

@@ -81,8 +81,19 @@ one-to-one to a PG GUC with the matching unit-of-measure.
 | `SPG_REPLAY_UPTO`             | unset         | Replay WAL only up to this LSN at recovery. |
 | `SPG_COMMIT_DELAY_US`         | `0`           | Group-commit delay (matches PG `commit_delay`). |
 | `SPG_COMMIT_GROUP_MAX`        | `200`         | Group-commit batch cap. |
-| `SPG_FLUSHER_INTERVAL_US`     | `200`         | WAL flusher tick interval. |
-| `SPG_SYNCHRONOUS_COMMIT`      | `on`          | Matches PG `synchronous_commit`; `off` skips fsync, `local` skips replica wait. |
+| `SPG_FLUSHER_INTERVAL_US`     | `200`         | **Server** async-commit flusher tick interval (µs). Minimum 10 µs; values below are clamped. Only consulted when `SPG_SYNCHRONOUS_COMMIT=off`. |
+| `SPG_WAL_WRITER_DELAY_MS`     | `200`         | **Embedded** async-commit flusher tick interval (ms). Matches PG `wal_writer_delay`. Must be `> 0`; unset/0 falls back to 200. Only consulted when `SPG_SYNCHRONOUS_COMMIT=off`. |
+| `SPG_SYNCHRONOUS_COMMIT`      | `on`          | Matches PG `synchronous_commit`; `off` skips the per-commit fsync (bounded-loss async mode — see below), `local` skips replica wait. |
+
+### Durability / crash-loss window
+
+| Mode | Bound | Loss on crash (SIGKILL / power-cut) |
+|------|-------|--------------------------------------|
+| **`SPG_SYNCHRONOUS_COMMIT=on` (DEFAULT)** | — | **Nothing.** Every acknowledged commit is `fsync`ed before the client/caller is told it committed. Server: `crates/spg-server/src/wal.rs:384` + `:791` (`f.sync_data()` on the commit path). Embedded: `crates/spg-embedded/src/lib.rs:1057-1062` (`WalTicket::wait` → `group.wait_flushed`, blocks until fsynced). |
+| **`SPG_SYNCHRONOUS_COMMIT=off` (server / pgwire)** | ≤ one `SPG_FLUSHER_INTERVAL_US` (default **200 µs**) | Up to one flusher interval of acknowledged-but-unflushed commits. A background flusher fsyncs and emits a `durability_checkpoint` marker every interval; only WAL bytes appended since the last marker can be lost. Bound in code: `crates/spg-server/src/flusher.rs:42,46`. |
+| **`SPG_SYNCHRONOUS_COMMIT=off` (embedded)** | ≤ one `SPG_WAL_WRITER_DELAY_MS` (default **200 ms**) | Up to one flusher interval of acknowledged-but-unflushed commits. A background thread calls `flush_now()` (write + fsync of the pending group buffer) every interval. Bound in code: `crates/spg-embedded/src/lib.rs:1201-1210` (cadence) + `:3074-3086` (loop). |
+
+Async mode never loses a commit across a **clean** shutdown: `Drop`/`CHECKPOINT` always force a final flush (embedded `lib.rs:4841-4860`; server `CHECKPOINT` fsyncs regardless of the knob). The loss window above applies **only** to an abrupt kill between two flusher ticks. Operators can shrink an async window by lowering the interval at the cost of more fsyncs/sec; the default (sync) mode has no window at all.
 
 ## Auto-maintenance
 
