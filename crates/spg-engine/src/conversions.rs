@@ -1065,16 +1065,25 @@ fn parse_point_list(s: &str) -> Option<Vec<spg_storage::Point2D>> {
 /// v7.37.5 ε — parse Lseg text `[(x1,y1),(x2,y2)]`.
 pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Point2D)> {
     let s = s.trim();
-    // PG accepts both the bracketed `[(x1,y1),(x2,y2)]` and the bare
-    // `(x1,y1),(x2,y2)` spellings; the brackets are optional.
+    // PG accepts the bracketed `[(x1,y1),(x2,y2)]`, the fully-wrapped
+    // `((x1,y1),(x2,y2))`, and the bare `(x1,y1),(x2,y2)` spellings.
     let inner = s
         .strip_prefix('[')
         .and_then(|x| x.strip_suffix(']'))
         .unwrap_or(s);
-    let pts = parse_point_list(inner)?;
-    if pts.len() != 2 {
+    let two_points =
+        |v: Option<alloc::vec::Vec<spg_storage::Point2D>>| v.filter(|p| p.len() == 2);
+    let pts = if let Some(p) = two_points(parse_point_list(inner)) {
+        p
+    } else if let Some(p) = inner
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .and_then(|w| two_points(parse_point_list(w)))
+    {
+        p
+    } else {
         return None;
-    }
+    };
     Some((pts[0], pts[1]))
 }
 
