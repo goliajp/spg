@@ -1432,6 +1432,22 @@ pub(super) fn compare(
             let bw: alloc::vec::Vec<Option<i64>> = b.iter().map(|o| o.map(i64::from)).collect();
             cmp_array(a, &bw)
         }
+        // v7.37.16 — `jsonb = jsonb` / `jsonb <> jsonb` structural
+        // equality (PG18-compatible: object keys compared order-free,
+        // array elements order-sensitive, numbers by value). PG defines
+        // a total order on jsonb, but the ordering operators (< <= > >=)
+        // are DEFERRED here — only equality is wired. Returns early
+        // because jsonb equality is not expressible as an `Ordering`.
+        (Value::Json(_), Value::Json(_)) => {
+            let eq = crate::json::equals(l, r)?;
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "jsonb ordering (<, <=, >, >=) not supported; only = / <>".into(),
+                }),
+            };
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(

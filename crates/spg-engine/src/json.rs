@@ -493,6 +493,49 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     Ok(Value::Bool(result))
 }
 
+/// `jsonb = jsonb` structural equality (PG18-compatible). PG's jsonb
+/// equality is order-INDEPENDENT for object keys but order-SENSITIVE
+/// for array elements, and it compares numbers by value (so
+/// `'1'::jsonb = '1.0'::jsonb`). `json_eq` already encodes exactly
+/// those rules; this just parses both operands and delegates.
+///
+/// Two documented representation divergences (tracked by the jsonb
+/// normalization slices, out of scope here) can make SPG disagree
+/// with PG on corner inputs: SPG preserves DUPLICATE object keys
+/// where PG keeps only the last, so `'{"a":1,"a":2}' = '{"a":2}'` is
+/// PG-true but SPG-false. Non-dup, well-formed documents match PG.
+pub fn equals(lhs: &Value, rhs: &Value) -> Result<bool, EvalError> {
+    let lhs_text = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "jsonb =: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let rhs_text = match rhs {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "jsonb =: right side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let lhs_doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of =: {e}"),
+    })?;
+    let rhs_doc = parse(rhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on right of =: {e}"),
+    })?;
+    Ok(json_eq(&lhs_doc, &rhs_doc))
+}
+
 fn json_contains(lhs: &JsonValue, rhs: &JsonValue) -> bool {
     match (lhs, rhs) {
         (JsonValue::Object(l), JsonValue::Object(r)) => r

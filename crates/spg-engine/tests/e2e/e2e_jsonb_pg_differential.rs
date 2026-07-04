@@ -105,6 +105,58 @@ fn jsonb_containment_and_exists() {
     check(&mut e, "SELECT ('{\"a\":1}'::jsonb ?& array['a','b'])", "f");
 }
 
+// ---- FIXED: = / <> equality operator (was a type error) ----
+// Ground truth captured from live PostgreSQL 18.4 on 2026-07-04.
+// jsonb equality is structural: object keys compared order-FREE,
+// array elements order-SENSITIVE, numbers by value. Before the fix
+// `jsonb = jsonb` raised TypeMismatch (no Value::Json arm in compare).
+#[test]
+fn jsonb_equality_operator() {
+    let mut e = Engine::new();
+    // identical -> true
+    check(&mut e, "SELECT '{\"a\":1}'::jsonb = '{\"a\":1}'::jsonb", "t");
+    // key-order-independent -> PG true (the headline fix)
+    check(&mut e, "SELECT '{\"a\":1,\"b\":2}'::jsonb = '{\"b\":2,\"a\":1}'::jsonb", "t");
+    // unequal value -> false
+    check(&mut e, "SELECT '{\"a\":1}'::jsonb = '{\"a\":2}'::jsonb", "f");
+    // <> negation
+    check(&mut e, "SELECT '{\"a\":1}'::jsonb <> '{\"a\":2}'::jsonb", "t");
+    check(&mut e, "SELECT '{\"a\":1}'::jsonb <> '{\"a\":1}'::jsonb", "f");
+    // nested objects, keys shuffled at depth -> true
+    check(&mut e, "SELECT '{\"a\":{\"x\":1,\"y\":2}}'::jsonb = '{\"a\":{\"y\":2,\"x\":1}}'::jsonb", "t");
+    // arrays are ORDERED: reversed -> false
+    check(&mut e, "SELECT '[1,2,3]'::jsonb = '[3,2,1]'::jsonb", "f");
+    check(&mut e, "SELECT '[1,2,3]'::jsonb = '[1,2,3]'::jsonb", "t");
+    // scalars
+    check(&mut e, "SELECT '\"foo\"'::jsonb = '\"foo\"'::jsonb", "t");
+    check(&mut e, "SELECT 'true'::jsonb = 'true'::jsonb", "t");
+    check(&mut e, "SELECT 'null'::jsonb = 'null'::jsonb", "t");
+    check(&mut e, "SELECT '5'::jsonb = '5'::jsonb", "t");
+    // different top-level types -> false (object vs array)
+    check(&mut e, "SELECT '{}'::jsonb = '[]'::jsonb", "f");
+    // through real jsonb columns
+    e.execute("CREATE TABLE je (id INT NOT NULL, o JSONB)").unwrap();
+    e.execute("INSERT INTO je VALUES (1, '{\"a\":1,\"b\":2}')").unwrap();
+    check(&mut e, "SELECT o = '{\"b\":2,\"a\":1}'::jsonb FROM je", "t");
+    check(&mut e, "SELECT o = '{\"a\":9}'::jsonb FROM je", "f");
+    // numeric = still works (compare arm untouched for non-Json)
+    check(&mut e, "SELECT 1 = 1", "t");
+    check(&mut e, "SELECT 'ab' = 'ab'", "t");
+
+    // ---- DIVERGENCES tied to the jsonb normalization slices (OOS) ----
+    // DIVERGENCE (number canonicalisation, Slice 3): PG canonicalises
+    // jsonb numbers so `'1' = '1.0'` is PG-TRUE. SPG preserves the
+    // numeric lexeme (NumberText) and compares it textually -> false.
+    check(&mut e, "SELECT '1'::jsonb = '1.0'::jsonb", "f"); // PG: t
+    // DIVERGENCE (duplicate object key, Slice 2): PG keeps only the
+    // LAST value so `{"a":1,"a":2}` collapses to `{"a":2}` and the
+    // equality is PG-TRUE. SPG preserves both keys (len 2 vs 1) -> false.
+    check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb = '{\"a\":2}'::jsonb", "f"); // PG: t
+    // NOTE (ordering deferred): PG defines a total order on jsonb so
+    // `'1'::jsonb < '2'::jsonb` is PG-TRUE, but SPG's compare wires
+    // only = / <> for jsonb; the ordering operators stay a type error.
+}
+
 // ---- FIXED: || concat operator (was string concatenation) ----
 #[test]
 fn jsonb_concat_operator() {
