@@ -1646,3 +1646,18 @@ fn box_box_distance() {
     // control: point <-> point distance still works.
     ck(&mut e, "('(0,0)'::point <-> '(3,4)'::point)::text", "5");
 }
+
+/// v7.37 D — get_bit / set_bit accept bit/varbit operands (MSB-first, bit 0
+/// leftmost), not just bytea. PG18.4-verified.
+#[test]
+fn bit_get_set_bit() {
+    let mut e = Engine::new();
+    ck(&mut e, "get_bit(B'10110', 1)::text", "0");
+    ck(&mut e, "get_bit(B'10110', 0)::text", "1");
+    ck(&mut e, "get_bit(B'10110', 4)::text", "0");
+    ck(&mut e, "(set_bit(B'10110', 1, 1))::text", "11110");
+    ck(&mut e, "(set_bit(B'10110', 0, 0))::text", "00110");
+    ck(&mut e, "(set_bit(B'10110', 0, 1))::text", "10110");
+    // control: get_bit/set_bit on bytea still work.
+    ck(&mut e, "get_bit('\\x00'::bytea, 0)::text", "0");
+}
