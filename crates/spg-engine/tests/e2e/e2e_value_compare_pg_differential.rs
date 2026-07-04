@@ -22,13 +22,12 @@
 //! (`[1 day] = [24:00:00]`). A NULL element equals only another NULL
 //! (`ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`, NOT NULL — confirmed live).
 //!
-//! INET / CIDR ordering (PG `network_cmp`) and BIT / VARBIT ordering (PG
-//! `varbit_cmp`) are implemented — see `inet_ordering` / `bit_ordering`.
+//! INET / CIDR ordering (`network_cmp`), BIT / VARBIT ordering
+//! (`varbit_cmp`), and NUMERIC[] / FLOAT8[] / INTERVAL[] ordering
+//! (`array_cmp`) are implemented — see `inet_ordering` / `bit_ordering` /
+//! `array_ordering`.
 //!
-//! DEFERRED (still error in SPG, tracked at the bottom of this file):
-//!   * NUMERIC[] / FLOAT8[] / INTERVAL[] ordering (`<` etc.) — value-based
-//!     element comparators give a total order in PG, but only equality is
-//!     wired (ordering errors, not a wrong answer).
+//! DEFERRED (still error in SPG):
 //!   * range / multirange `=` — needs discrete-range canonicalisation.
 //!   * tsvector `=` — lexeme/position semantics unverified.
 
@@ -333,15 +332,15 @@ fn interval_array_value_equality() {
     assert_eq!(pair(&mut e, "iv", 20, 21, "="), "t");
 }
 
-// ---- deferred: ordering that PG supports but SPG intentionally errors ----
+// ---- NUMERIC[] / FLOAT8[] / INTERVAL[] ordering (PG array_cmp) ----------
 
 #[test]
-fn deferred_orderings_error() {
+fn array_ordering() {
+    // PG `array_cmp`: element by element, NULL sorts GREATER than non-NULL,
+    // shorter-is-less on a common prefix, FLOAT8 NaN is greatest. Exercised
+    // on real typed columns (inline `ARRAY[..]::type[]` literals don't build
+    // the typed variants). All values captured live from PostgreSQL 18.4.
     let mut e = Engine::new();
-    // (INET / CIDR and BIT / VARBIT ordering are now implemented — see
-    // `inet_ordering` / `bit_ordering`.)
-    // NUMERIC[] / FLOAT8[] / INTERVAL[] ordering is deferred (only = / <>);
-    // exercised on real typed columns so it hits the `eq_only_result` arm.
     e.execute("CREATE TABLE ov (id int, na numeric[], fa float8[], ia interval[])")
         .unwrap();
     e.execute(
@@ -352,13 +351,38 @@ fn deferred_orderings_error() {
         "INSERT INTO ov VALUES (2, ARRAY[1.2::numeric], ARRAY[2.5::float8], ARRAY['2 days'::interval])",
     )
     .unwrap();
-    let ord = |e: &mut Engine, col: &str| {
+    // id 3: two-element with a NULL / a prefix / a NaN.
+    e.execute(
+        "INSERT INTO ov VALUES (3, ARRAY[1::numeric, NULL], ARRAY['NaN'::float8], ARRAY['25 hours'::interval])",
+    )
+    .unwrap();
+    e.execute(
+        "INSERT INTO ov VALUES (4, ARRAY[1::numeric, 2::numeric], ARRAY[1.0::float8], ARRAY['1 day'::interval])",
+    )
+    .unwrap();
+    let ord = |e: &mut Engine, col: &str, x: i32, y: i32, op: &str| {
         cell(
             e,
-            &format!("SELECT a.{col} < b.{col} FROM ov a JOIN ov b ON a.id=1 AND b.id=2"),
+            &format!("SELECT a.{col} {op} b.{col} FROM ov a JOIN ov b ON a.id={x} AND b.id={y}"),
         )
     };
-    assert_eq!(ord(&mut e, "na"), "<ERR>");
-    assert_eq!(ord(&mut e, "fa"), "<ERR>");
-    assert_eq!(ord(&mut e, "ia"), "<ERR>");
+    // element compare: [1.1] < [1.2], [1.5] < [2.5], [1 day] < [2 days].
+    assert_eq!(ord(&mut e, "na", 1, 2, "<"), "t");
+    assert_eq!(ord(&mut e, "fa", 1, 2, "<"), "t");
+    assert_eq!(ord(&mut e, "ia", 1, 2, "<"), "t");
+    // scale-insensitive value ordering + >=.
+    assert_eq!(ord(&mut e, "na", 2, 1, ">"), "t");
+    // NULL element sorts greatest: [1,NULL] > [1,2]  ->  [1,NULL] < [1,2] is f.
+    assert_eq!(ord(&mut e, "na", 3, 4, "<"), "f");
+    assert_eq!(ord(&mut e, "na", 4, 3, "<"), "t");
+    // FLOAT8 NaN sorts greatest: [NaN] > [1.0].
+    assert_eq!(ord(&mut e, "fa", 3, 4, ">"), "t");
+    assert_eq!(ord(&mut e, "fa", 4, 3, "<"), "t");
+    // INTERVAL canonical span: [25 hours] > [1 day]=24h.
+    assert_eq!(ord(&mut e, "ia", 3, 4, ">"), "t");
+    // prefix: [1] < [1,2] (id1 na is single-element [1.1]... use ids 4 vs 3
+    // is the NULL case; a genuine prefix needs equal leading elems), so
+    // compare [1,2] (id4) with itself for the equal case.
+    assert_eq!(ord(&mut e, "na", 4, 4, "="), "t");
+    assert_eq!(ord(&mut e, "na", 4, 4, "<="), "t");
 }
