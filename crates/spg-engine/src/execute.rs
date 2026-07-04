@@ -68,6 +68,12 @@ impl Engine {
         let _inj = self.enter_injection_scope();
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
+        // v7.37.15 (Epic W slice 2) — memoized autocommit writer version
+        // is scoped to one statement. Save + reset like `current_tx` so
+        // a re-entrant execute (e.g. deferred trigger SQL) can't leak its
+        // version into ours, and ours never leaks to the next statement.
+        let saved_stmt_wv = self.stmt_writer_version;
+        self.stmt_writer_version = None;
         // v7.34 (crash-recovery P0 #2) — row-level redo capture. Arm the
         // active catalog before dispatch; on success drain the physical
         // changes into `last_redo` for the embedding layer's WAL, on
@@ -78,12 +84,27 @@ impl Engine {
         }
         let result = self.execute_inner_with_cancel(sql, cancel);
         if self.redo_capture {
-            let drained = self.active_catalog_mut().drain_redo();
+            let mut drained = self.active_catalog_mut().drain_redo();
             if result.is_ok() {
+                // v7.37.15 (Epic W slice 2) — stamp the real committing
+                // writer version onto every change this statement
+                // produced. All changes from one statement share the one
+                // version (the statement's xmin/xmax): in autocommit it's
+                // the memoized value the writes already used; inside an
+                // explicit tx it's the deterministic tx entry. Purely
+                // additive metadata — replay still resolves by physical
+                // position and ignores `writer_version` (later slice).
+                if !drained.is_empty() {
+                    let v = self.writer_version_for_current_stmt();
+                    for change in &mut drained {
+                        change.set_writer_version(v);
+                    }
+                }
                 self.last_redo = drained;
             }
         }
         self.current_tx = saved;
+        self.stmt_writer_version = saved_stmt_wv;
         result
     }
 
