@@ -4140,12 +4140,23 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Float(x) => Ok(*x),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
         Value::Text(s) => {
-            // Lex order by codepoints — good enough for ORDER BY name.
-            // Map first 8 bytes packed into u64 as a coarse key; ties fall to
-            // partial_cmp Equal. v1.x can swap in a real string comparator.
+            // Lex order by codepoints. Pack the first 8 bytes into a u64
+            // key that PRESERVES codepoint order. The bytes must be
+            // LEFT-justified (fixed 8-byte field, zero-padded on the
+            // right): a shorter string occupies the high bytes and pads
+            // the low ones with 0x00, so 'app' < 'apple' and the key
+            // magnitude tracks content, not length. The old code shifted
+            // in only the present bytes, so a shorter string landed in
+            // the low bits and ALWAYS sorted before a longer one — an
+            // ORDER BY on text ordered by string length, not value
+            // (e.g. 'date' before 'apple'). Beyond ~6 bytes the f64
+            // mantissa can no longer distinguish keys, so tail-only
+            // differences tie (a coarse-key limitation of this fast
+            // path; a real string comparator would remove it).
+            let bytes = s.as_bytes();
             let mut key: u64 = 0;
-            for &b in s.as_bytes().iter().take(8) {
-                key = (key << 8) | u64::from(b);
+            for i in 0..8 {
+                key = (key << 8) | u64::from(bytes.get(i).copied().unwrap_or(0));
             }
             #[allow(clippy::cast_precision_loss)]
             Ok(key as f64)
