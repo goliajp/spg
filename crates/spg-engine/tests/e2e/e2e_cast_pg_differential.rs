@@ -1604,3 +1604,16 @@ fn macaddr8_bitwise() {
     // control: macaddr8 comparison still works.
     ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 = '08:00:2b:01:02:03:04:05'::macaddr8)::text", "true");
 }
+
+/// v7.37 D — lseg accepts the fully-wrapped `((x1,y1),(x2,y2))` form (only
+/// bracketed + bare parsed before), matching the box fix. PG18.4-verified
+/// (lseg renders in [ ] canonical form; point <-> lseg distance works).
+#[test]
+fn lseg_double_paren_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "('((0,0),(4,0))'::lseg)::text", "[(0,0),(4,0)]");
+    ck(&mut e, "('(1,1)'::point <-> '((0,0),(4,0))'::lseg)::text", "1");
+    // control: the bracketed + bare forms still parse.
+    ck(&mut e, "('[(0,0),(4,0)]'::lseg)::text", "[(0,0),(4,0)]");
+    ck(&mut e, "('(0,0),(4,0)'::lseg)::text", "[(0,0),(4,0)]");
+}
