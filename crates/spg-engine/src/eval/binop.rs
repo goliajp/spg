@@ -1445,6 +1445,80 @@ fn network_cmp(
     bitncmp(aa, ba, maxbits)
 }
 
+/// The successor of a discrete range bound (`+1` for int4/int8, `+1 day`
+/// for date). `None` on overflow (PG errors; a comparison can just treat
+/// the un-canonicalisable bound as-is). Continuous kinds return `None`.
+fn range_step_up(kind: spg_storage::RangeKind, v: &Value<'_>) -> Option<Value<'static>> {
+    use spg_storage::RangeKind as K;
+    match (kind, v) {
+        (K::Int4, Value::Int(n)) => n.checked_add(1).map(Value::Int),
+        (K::Int8, Value::BigInt(n)) => n.checked_add(1).map(Value::BigInt),
+        (K::Date, Value::Date(d)) => d.checked_add(1).map(Value::Date),
+        _ => None,
+    }
+}
+
+/// Canonicalise a range to PG's `[)` form for the DISCRETE kinds
+/// (int4/int8/date): an exclusive lower becomes inclusive lower+1, an
+/// inclusive upper becomes exclusive upper+1. Continuous kinds
+/// (num/ts/tstz) are returned unchanged, so `[1,5)` != `[1,5]`.
+fn range_canonical(
+    kind: spg_storage::RangeKind,
+    lower: &Option<alloc::boxed::Box<Value<'static>>>,
+    upper: &Option<alloc::boxed::Box<Value<'static>>>,
+    lower_inc: bool,
+    upper_inc: bool,
+) -> (Option<Value<'static>>, bool, Option<Value<'static>>, bool) {
+    use spg_storage::RangeKind as K;
+    let mut lo = lower.as_ref().map(|b| (**b).clone());
+    let mut li = lower_inc;
+    let mut up = upper.as_ref().map(|b| (**b).clone());
+    let mut ui = upper_inc;
+    if matches!(kind, K::Int4 | K::Int8 | K::Date) {
+        if let (Some(l), false) = (lo.as_ref(), li) {
+            if let Some(l2) = range_step_up(kind, l) {
+                lo = Some(l2);
+                li = true;
+            }
+        }
+        if let (Some(u), true) = (up.as_ref(), ui) {
+            if let Some(u2) = range_step_up(kind, u) {
+                up = Some(u2);
+                ui = false;
+            }
+        }
+    }
+    (lo, li, up, ui)
+}
+
+/// PG range equality: two empties are equal (an empty is never equal to a
+/// non-empty); otherwise the canonical `[)` forms must match exactly.
+#[allow(clippy::too_many_arguments)]
+fn range_eq(
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
+) -> bool {
+    if ak != bk {
+        return false;
+    }
+    if ae || be {
+        return ae == be;
+    }
+    let a = range_canonical(ak, al, au, ali, aui);
+    let b = range_canonical(bk, bl, bu, bli, bui);
+    a == b
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -1677,6 +1751,23 @@ pub(super) fn compare(
                 BinOp::GtEq => Ok(Value::Bool(ord.is_ge())),
                 _ => Err(EvalError::TypeMismatch {
                     detail: "bit/varbit supports only comparison operators".into(),
+                }),
+            };
+        }
+        // v7.37 — RANGE equality (=/<>). Discrete kinds (int4/int8/date)
+        // canonicalise to `[)` before comparing, so `int4range(1,5)` equals
+        // `'[1,4]'`; continuous kinds compare bounds verbatim. Ordering
+        // (< <= > >=) is deferred. Verified vs PG18.
+        (
+            Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
+            Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+        ) => {
+            let eq = range_eq(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be);
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "range ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
                 }),
             };
         }
