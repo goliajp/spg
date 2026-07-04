@@ -5795,7 +5795,32 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     lands here (not as a per-table appendix) so dropping the
 ///     composite type registers globally and DROP TYPE can find it
 ///     without a table scan.
-const FILE_VERSION: u8 = 52;
+/// v53 introduces (v7.37.16 Epic W — cross-checkpoint tombstone
+///   durability):
+///   * Trailing per-table MVCC appendix carrying, for every row,
+///     its `RowHeader` (`xmin:u64`, `xmax:u64`, `flags:u8`) and its
+///     stable `RowId` (`u64`), followed by the relation's
+///     `next_rowid:u64`. Layout per table (after the v50
+///     generated_stored_expr block, before the table loop closes):
+///       `[u32 row_count]` (== `Table::rows().len()`, cross-check)
+///       per row in physical order:
+///         `[u64 xmin][u64 xmax][u8 flags][u64 rowid]`
+///       `[u64 next_rowid]`
+///     v52-and-below catalogs never wrote this block; their reader
+///     stops after the last per-table appendix and
+///     `deserialize_rows` leaves every row `RowHeader::frozen()`
+///     with dense 1..=N ids — the exact pre-v53 contract. A v53
+///     reader instead reconstructs headers + ids VERBATIM, so a
+///     tombstone-redo naming a row inserted before the last
+///     checkpoint resolves by `RowId` across the base-snapshot
+///     boundary (closing the coupling the Epic W WAL slices deferred
+///     to this format bump). Because the reader routes on `version`,
+///     the block is strictly backward-compatible: old images load
+///     byte-for-byte as before. `SPG_MVCC_INPLACE` is unaffected —
+///     a gate-off database's rows are all frozen/alive, so
+///     persisting + restoring their headers is observationally a
+///     no-op.
+const FILE_VERSION: u8 = 53;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6328,6 +6353,39 @@ impl Catalog {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, src);
             }
+            // v7.37.16 (Epic W) — per-row MVCC header + stable RowId
+            // appendix (FILE_VERSION 53+). Persists xmin/xmax/flags +
+            // RowId for every row so a tombstone naming a pre-checkpoint
+            // row survives a serialize→deserialize base restore
+            // (cross-checkpoint tombstone durability). `headers` /
+            // `rowids` are lock-step parallel to `rows` (invariant held
+            // at every mutation boundary), so the count is `rows.len()`
+            // and the zipped walk visits them in physical row order —
+            // the same order the rows block above was written in. v52
+            // readers never reach this block (the writer also moves to
+            // v53 in lock-step); a v53 reader restores headers + ids
+            // verbatim instead of freezing + dense-assigning.
+            debug_assert_eq!(
+                t.rows.len(),
+                t.headers.len(),
+                "headers must be lock-step with rows at serialize"
+            );
+            debug_assert_eq!(
+                t.rows.len(),
+                t.rowids.len(),
+                "rowids must be lock-step with rows at serialize"
+            );
+            write_u32(
+                &mut out,
+                u32::try_from(t.rows.len()).expect("≤ 4G rows/table"),
+            );
+            for (h, rid) in t.headers.iter().zip(t.rowids.iter()) {
+                out.extend_from_slice(&h.xmin.to_le_bytes());
+                out.extend_from_slice(&h.xmax.to_le_bytes());
+                out.push(h.flags);
+                out.extend_from_slice(&rid.0.to_le_bytes());
+            }
+            out.extend_from_slice(&t.next_rowid.to_le_bytes());
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier

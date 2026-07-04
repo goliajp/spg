@@ -302,7 +302,72 @@ pub(crate) fn deserialize_table(
             }
         }
     }
+    // v7.37.16 (Epic W) — per-row MVCC header + stable RowId appendix
+    // (FILE_VERSION 53+). Overwrites the frozen headers + dense rowids
+    // that `deserialize_rows` installed above, restoring xmin/xmax/flags
+    // + real ids verbatim so a cross-checkpoint tombstone redo resolves
+    // by RowId. v52-and-below catalogs skip this entirely (their reader
+    // stops after the generated_stored_expr block); the frozen/dense
+    // state left by `deserialize_rows` is the exact pre-v53 contract.
+    if version >= 53 {
+        read_mvcc_header_appendix(cur, t)?;
+    }
     let _ = table_name;
+    Ok(())
+}
+
+/// v7.37.16 (Epic W) — parse the FILE_VERSION 53+ per-row MVCC header +
+/// stable RowId appendix and reconstruct `Table::headers` / `rowids` /
+/// `next_rowid` verbatim (replacing the frozen/dense placeholders
+/// `deserialize_rows` installed). See the FILE_VERSION 53 docstring for
+/// the on-disk layout. Every field read goes through `Cursor` helpers,
+/// which return `StorageError::Corrupt` on a short/truncated image — no
+/// panic on untrusted bytes.
+fn read_mvcc_header_appendix(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), StorageError> {
+    let count = cur.read_u32()? as usize;
+    // Cross-check against the rows block already decoded. A mismatch means
+    // the appendix desynced from the row stream (corruption) — refuse
+    // rather than silently mis-pair headers with rows.
+    if count != t.rows.len() {
+        return Err(StorageError::Corrupt(format!(
+            "MVCC header appendix row count {count} != decoded rows {} \
+             for table {:?}",
+            t.rows.len(),
+            t.schema.name
+        )));
+    }
+    let mut headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
+    let mut rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
+    let mut max_id: u64 = 0;
+    for _ in 0..count {
+        let xmin = cur.read_u64()?;
+        let xmax = cur.read_u64()?;
+        let flags = cur.read_u8()?;
+        let rowid = cur.read_u64()?;
+        headers.push_mut(crate::row_header::RowHeader { xmin, xmax, flags });
+        rowids.push_mut(crate::row_header::RowId(rowid));
+        if rowid > max_id {
+            max_id = rowid;
+        }
+    }
+    let persisted_next_rowid = cur.read_u64()?;
+    t.headers = headers;
+    t.rowids = rowids;
+    // Keep `next_rowid` strictly above every loaded id so a future alloc
+    // can never collide with a restored row. Trust the persisted cursor,
+    // but clamp up defensively: a corrupt image that under-states it must
+    // not hand out a colliding id.
+    t.next_rowid = persisted_next_rowid.max(max_id + 1);
+    debug_assert_eq!(
+        t.rows.len(),
+        t.headers.len(),
+        "headers must be lock-step with rows after MVCC appendix restore"
+    );
+    debug_assert_eq!(
+        t.rows.len(),
+        t.rowids.len(),
+        "rowids must be lock-step with rows after MVCC appendix restore"
+    );
     Ok(())
 }
 

@@ -102,6 +102,15 @@ impl Table {
         &mut self.headers
     }
 
+    /// v7.37.16 (Epic W) — `#[cfg(test)]`-only read of the relation's
+    /// next-RowId allocator cursor, so the snapshot round-trip tests can
+    /// assert it is restored correctly (strictly above every persisted
+    /// id) without a public accessor on the hot path.
+    #[cfg(test)]
+    pub(crate) fn next_rowid_for_test(&self) -> u64 {
+        self.next_rowid
+    }
+
     /// v7.37.15 (Phase C) — engine writer path. Same as [`insert`]
     /// but stamps `xmin` on the new row's header with the writing
     /// transaction's id (caller-supplied; obtained from the engine's
