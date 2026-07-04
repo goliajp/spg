@@ -2387,6 +2387,20 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
+        // INSERT / assignment of a text literal into an INTERVAL column
+        // parses it, matching the `::interval` cast (mirrors macaddr/inet).
+        (Value::Text(s), DataType::Interval) => {
+            match spg_sql::parser::parse_interval_text(&s) {
+                Some((months, days, micros)) => Some(Value::Interval { months, days, micros }),
+                None => {
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "invalid input syntax for INTERVAL: {s:?} (column `{col_name}`)"
+                        ),
+                    }));
+                }
+            }
+        }
         (Value::Text(s), DataType::Macaddr) => match parse_macaddr_text(&s) {
             Some(m) => Some(Value::Macaddr(m)),
             None => {

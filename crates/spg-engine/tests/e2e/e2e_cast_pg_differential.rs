@@ -819,3 +819,28 @@ fn numrange_contains_float_element() {
     // control: integer range containment unchanged.
     ck(&mut e, r#"(int4range(1,10) @> 5)::text"#, r#"true"#);
 }
+
+/// BUG: INSERT / assignment of a text literal into an INTERVAL column failed
+/// with a type mismatch — coerce_value had no Text→Interval arm, though the
+/// `::interval` cast worked. Common for pg_dump reloads and ORMs. PG18.4-verified.
+#[test]
+fn insert_text_into_interval_column() {
+    let mut e = Engine::new();
+    let row = |e: &mut Engine, q: &str| -> String {
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
+            other => format!("{other:?}"),
+        }
+    };
+    e.execute("CREATE TABLE ivt (a int, iv interval)").unwrap();
+    e.execute("INSERT INTO ivt VALUES (1,'1 day'),(2,'2 hours 30 minutes'),(3,'1 mon 5 days')")
+        .expect("text literals coerce into an interval column");
+    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"), "Text(\"1 day\")");
+    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=2"), "Text(\"02:30:00\")");
+    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=3"), "Text(\"1 mon 5 days\")");
+    e.execute("UPDATE ivt SET iv='45 seconds' WHERE a=1").unwrap();
+    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"), "Text(\"00:00:45\")");
+    assert!(e.execute("INSERT INTO ivt VALUES (4,'not an interval')").is_err());
+}
