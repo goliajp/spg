@@ -168,6 +168,13 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         Value::SmallInt(n) => format!("{n}"),
         Value::Int(n) => format!("{n}"),
         Value::BigInt(n) => format!("{n}"),
+        // PG's `float8out` spells the non-finite values `Infinity` /
+        // `-Infinity` / `NaN`. Rust's `{}` already yields `NaN` but
+        // `inf` / `-inf`, so special-case the infinities to match the
+        // wire text a PG client expects.
+        Value::Float(x) if x.is_infinite() => {
+            (if *x > 0.0 { "Infinity" } else { "-Infinity" }).into()
+        }
         Value::Float(x) => format!("{x}"),
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
         Value::Text(s) | Value::Json(s) => s.to_string(),

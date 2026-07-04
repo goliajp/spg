@@ -203,7 +203,10 @@ fn numeric_ops_unchanged() {
 //   * 1.0/3.0, 0.1+0.2, 2.00*3.000 — PG keeps exact NUMERIC scale
 //     (0.33333333333333333333, 0.3, 6.00000); SPG evaluates decimal
 //     literals as f64 (SEMANTIC: arbitrary-precision numeric core).
-//   * sqrt(2), power(2.0,0.5), 'inf'::float8 — float text rendering
-//     differs (SPG shortest-round-trip vs PG 17-digit / "Infinity").
+//   * sqrt(2), power(2.0,0.5) — finite float text rendering differs
+//     (SPG shortest-round-trip vs PG 17-digit). NOTE: the non-finite
+//     `'inf'::float8` / `'-inf'::float8` rendering was FIXED in the
+//     cast-differential sweep (now `Infinity` / `-Infinity`, matching
+//     PG `float8out`); only the finite-precision choice remains.
 //   * `numeric '1.10'` typed-literal syntax and the `@` / `|/` / `||/`
 //     prefix operators do not parse in SPG (parser gaps).

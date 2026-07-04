@@ -1559,7 +1559,12 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     let mut parts = hms.split(':');
     let hh: u32 = parts.next()?.parse().ok()?;
     let mm: u32 = parts.next()?.parse().ok()?;
-    let ss: u32 = parts.next()?.parse().ok()?;
+    // PG accepts the seconds-optional `HH:MM` form for TIME
+    // (`'10:30'::time` → `10:30:00`); missing seconds default to 0.
+    let ss: u32 = match parts.next() {
+        Some(x) => x.parse().ok()?,
+        None => 0,
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -2053,10 +2058,14 @@ pub(crate) fn coerce_value(
         // form to the column's numeric / bool type at DEFAULT-
         // installation time so the storage check sees a typed
         // value. Parse failures fall through to TypeMismatch.
-        (Value::Text(s), DataType::SmallInt) => s.parse::<i16>().ok().map(Value::SmallInt),
-        (Value::Text(s), DataType::Int) => s.parse::<i32>().ok().map(Value::Int),
-        (Value::Text(s), DataType::BigInt) => s.parse::<i64>().ok().map(Value::BigInt),
-        (Value::Text(s), DataType::Float) => s.parse::<f64>().ok().map(Value::Float),
+        // PG trims surrounding whitespace on numeric text input, so
+        // `'  256  '::int2` / `'  3.14  '::float8` (both of which route
+        // through this generic coerce path, unlike `::int` / `::float`
+        // that trim in the CAST helper) parse rather than error.
+        (Value::Text(s), DataType::SmallInt) => s.trim().parse::<i16>().ok().map(Value::SmallInt),
+        (Value::Text(s), DataType::Int) => s.trim().parse::<i32>().ok().map(Value::Int),
+        (Value::Text(s), DataType::BigInt) => s.trim().parse::<i64>().ok().map(Value::BigInt),
+        (Value::Text(s), DataType::Float) => s.trim().parse::<f64>().ok().map(Value::Float),
         (Value::Text(s), DataType::Bool) => match s.to_ascii_lowercase().as_str() {
             "0" | "false" | "f" | "no" | "off" => Some(Value::Bool(false)),
             "1" | "true" | "t" | "yes" | "on" => Some(Value::Bool(true)),
