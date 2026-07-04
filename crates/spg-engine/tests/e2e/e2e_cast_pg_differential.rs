@@ -354,4 +354,8 @@ fn bit_string_bitwise_and_or() {
     ck(&mut e, r#"B'11001010' | B'10101010'"#, r#"11101010"#);
     // differing lengths error.
     ck(&mut e, r#"B'1010' & B'101'"#, r#"ERR"#);
+    // ~ NOT flips bits + re-zeros the padding.
+    ck(&mut e, r#"~ B'1010'"#, r#"0101"#);
+    ck(&mut e, r#"~ B'11001010'"#, r#"00110101"#);
+    ck(&mut e, r#"~ B'111'"#, r#"000"#);
 }

@@ -64,6 +64,23 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::Int(!i32::from(n))),
         (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
         (UnOp::BitNot, Value::BigInt(n)) => Ok(Value::BigInt(!n)),
+        (UnOp::BitNot, Value::BitString { nbits, bytes }) => {
+            // PG `~ bit(n)`: flip every bit, then re-zero the padding bits
+            // past `nbits` so the value stays canonical (MSB-packed).
+            let mut out: Vec<u8> = bytes.iter().map(|b| !b).collect();
+            let used = nbits as usize;
+            let full = used / 8;
+            let rem = used % 8;
+            if rem != 0 {
+                if let Some(byte) = out.get_mut(full) {
+                    *byte &= 0xffu8 << (8 - rem);
+                }
+            }
+            Ok(Value::BitString {
+                nbits,
+                bytes: alloc::borrow::Cow::Owned(out),
+            })
+        }
         (UnOp::BitNot, other) => Err(EvalError::TypeMismatch {
             detail: format!("cannot apply ~ to {other:?}"),
         }),
