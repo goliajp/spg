@@ -631,6 +631,14 @@ pub fn eval_expr(
                     });
                 }
             };
+            // PG: `x op ANY (empty)` → false and `x op ALL (empty)` →
+            // true, decided purely by emptiness — the comparison is
+            // never evaluated, so a NULL LHS is irrelevant. This must
+            // short-circuit before `saw_null` is seeded from the LHS,
+            // otherwise `NULL op ANY/ALL (empty)` wrongly yields NULL.
+            if elems.is_empty() {
+                return Ok(Value::Bool(!*is_any));
+            }
             let mut saw_null = matches!(lhs, Value::Null);
             let mut saw_match = false;
             let mut saw_mismatch = false;

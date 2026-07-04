@@ -526,6 +526,7 @@ mod e2e_overlaps;
 mod e2e_array_operators;
 mod e2e_array_pg_differential;
 mod e2e_null_logic_pg_differential;
+mod e2e_subquery_pg_differential;
 mod e2e_operator_symbols;
 mod e2e_date_trunc_units;
 mod e2e_cast_time_arith;
