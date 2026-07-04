@@ -232,6 +232,17 @@ pub enum EngineError {
     /// is discarded; the caller should surface this as a timeout
     /// to the client.
     Cancelled,
+    /// v7.38 Epic P (panic isolation): a panic unwound out of
+    /// statement execution and was caught at the engine's
+    /// `execute_*` boundary (see `execute_in_with_cancel`). The
+    /// in-flight transaction's shadow was discarded (rollback) and
+    /// the engine left consistent; the caller sees this ordinary
+    /// error instead of a crashed process / poisoned lock. NOTE:
+    /// under the release `panic = "abort"` profile the process
+    /// aborts before any unwind, so this variant only ever surfaces
+    /// in dev/test (`panic = "unwind"`) — and in production once a
+    /// later slice flips the release profile to unwind.
+    Internal(String),
 }
 
 impl fmt::Display for EngineError {
@@ -256,6 +267,7 @@ impl fmt::Display for EngineError {
                 )
             }
             Self::Cancelled => f.write_str("query cancelled (timeout or client request)"),
+            Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
 }

@@ -23,6 +23,29 @@ use crate::{
     plan_cache, reorder, resolve_order_by_position, rewrite_clock_calls, substitute_placeholders,
 };
 
+/// v7.38 Epic P — turn a caught panic payload into an
+/// [`EngineError::Internal`]. Recovers a human-readable detail from the
+/// common payload shapes (`&str` / `String`, and the injection framework's
+/// typed `InjectedError`) so the wire layer sends a clean message; falls
+/// back to a generic string when the payload type is opaque.
+#[cfg(feature = "std")]
+fn panic_payload_to_engine_error(payload: &(dyn core::any::Any + Send)) -> EngineError {
+    // The injection framework panics with a typed error; surface its
+    // message so tests get a deterministic, informative string.
+    #[cfg(feature = "injection-points")]
+    if let Some(inj) = payload.downcast_ref::<crate::testkit::injection::InjectedError>() {
+        return EngineError::Internal(alloc::format!("query aborted by internal error: {inj}"));
+    }
+    let detail = payload
+        .downcast_ref::<&'static str>()
+        .map(|s| String::from(*s))
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match detail {
+        Some(d) => EngineError::Internal(alloc::format!("query aborted by internal error: {d}")),
+        None => EngineError::Internal(String::from("query aborted by internal error")),
+    }
+}
+
 impl Engine {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
         self.execute_in_with_cancel(sql, IMPLICIT_TX, CancelToken::none())
@@ -82,7 +105,16 @@ impl Engine {
         if self.redo_capture {
             self.active_catalog_mut().enable_redo_all();
         }
-        let result = self.execute_inner_with_cancel(sql, cancel);
+        // v7.38 Epic P (panic isolation) — run statement execution
+        // behind a catch_unwind firewall so a panic in query
+        // processing surfaces as an ordinary `EngineError` (after
+        // rolling the in-flight tx back) instead of unwinding through
+        // the server's engine `RwLock` write guard (which would poison
+        // it) or aborting the process. NO-OP under the release
+        // `panic = "abort"` profile — the process aborts before any
+        // unwind reaches here; active in dev/test (`panic = "unwind"`)
+        // and once a later slice flips the release profile.
+        let result = self.execute_inner_catching(sql, cancel);
         if self.redo_capture {
             let mut drained = self.active_catalog_mut().drain_redo();
             if result.is_ok() {
@@ -387,6 +419,82 @@ impl Engine {
         let result = self.execute_stmt_with_cancel(stmt, cancel);
         self.current_tx = saved;
         result
+    }
+
+    /// v7.38 Epic P (panic isolation) — run [`Self::execute_inner_with_cancel`]
+    /// under a `catch_unwind` firewall (hosted `std` builds). A panic that
+    /// unwinds out of statement execution is caught here and converted to
+    /// [`EngineError::Internal`] after discarding the in-flight tx's shadow,
+    /// so the caller sees a normal SQL error and the engine stays alive.
+    ///
+    /// **Why the post-catch engine state is consistent (COW shadow argument):**
+    /// every uncommitted write of the panicked statement lives in
+    /// `tx_catalogs[current_tx].catalog` — a per-tx *shadow* catalog that is
+    /// only merged into the committed `self.catalog` at COMMIT (see
+    /// `exec_commit`). The committed catalog is therefore never touched
+    /// mid-statement, so dropping the shadow (mirroring `exec_rollback`)
+    /// discards all half-applied work and leaves `self.catalog` exactly as it
+    /// was before the statement. Redo-capture buffers live inside the
+    /// shadow's tables and die with it, so no partial `RowChange` leaks into
+    /// `last_redo` either (the caller publishes `last_redo` only on `Ok`).
+    ///
+    /// The `catch_unwind` closure holds `&mut self`; wrapping it in
+    /// `AssertUnwindSafe` is sound precisely because of the above — the only
+    /// caller-visible state a caught panic can leave behind is the discarded
+    /// shadow, which is the correct rollback outcome, not a torn invariant.
+    #[cfg(feature = "std")]
+    fn execute_inner_catching(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        extern crate std;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.execute_inner_with_cancel(sql, cancel)
+        }));
+        match caught {
+            Ok(result) => result,
+            Err(payload) => {
+                // The panic unwound past every `?`-return in the executor.
+                // `current_tx` is Some here (set by the caller); roll that tx
+                // back by discarding its shadow. A statement that panicked in
+                // autocommit before any shadow was opened simply has nothing
+                // to drop (`discard_tx_on_panic` is infallible).
+                let tx_id = self.current_tx.unwrap_or(IMPLICIT_TX);
+                self.discard_tx_on_panic(tx_id);
+                Err(panic_payload_to_engine_error(payload.as_ref()))
+            }
+        }
+    }
+
+    /// `no_std` variant — there is no unwinding runtime, so statement
+    /// execution runs directly with no catch.
+    #[cfg(not(feature = "std"))]
+    fn execute_inner_catching(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_inner_with_cancel(sql, cancel)
+    }
+
+    /// v7.38 Epic P — discard an in-flight tx's shadow after a caught panic,
+    /// mirroring the state cleanup of [`Engine::exec_rollback`] but
+    /// infallibly. Drops the shadow catalog, marks the tx's writer version
+    /// aborted, and releases its row locks. Leaves the committed
+    /// `self.catalog` untouched (the COW model kept every uncommitted change
+    /// inside the shadow), so this is a full rollback of the panicked
+    /// statement's work.
+    #[cfg(feature = "std")]
+    fn discard_tx_on_panic(&mut self, tx_id: TxId) {
+        self.tx_catalogs.remove(&tx_id);
+        if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+            self.abort_writer_version(v);
+            self.release_tx_locks(v);
+        }
+        // Per-statement scratch: reset so no stale writer version leaks into
+        // the next statement (the caller also restores the saved value).
+        self.stmt_writer_version = None;
     }
 
     fn execute_inner_with_cancel(
