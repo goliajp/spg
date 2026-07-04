@@ -4096,6 +4096,24 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     if let Value::Text(s) = v {
         return Ok(OrderKey::Text(s.as_ref().into()));
     }
+    // v7.37 — byte-orderable types PG sorts byte-wise but that have no
+    // meaningful f64 projection. bytea/uuid/macaddr sort by their raw bytes;
+    // inet/cidr by `[family, addr.., bits]` (family, then address, then mask),
+    // matching PG's network ordering.
+    match v {
+        Value::Bytes(b) => return Ok(OrderKey::Bytes(b.as_ref().to_vec())),
+        Value::Uuid(u) => return Ok(OrderKey::Bytes(u.to_vec())),
+        Value::Macaddr(m) => return Ok(OrderKey::Bytes(m.to_vec())),
+        Value::Macaddr8(m) => return Ok(OrderKey::Bytes(m.to_vec())),
+        Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+            let mut key = alloc::vec::Vec::with_capacity(18);
+            key.push(*family);
+            key.extend_from_slice(addr);
+            key.push(*bits);
+            return Ok(OrderKey::Bytes(key));
+        }
+        _ => {}
+    }
     let num = match v {
         Value::Null => f64::INFINITY,
         Value::SmallInt(n) => f64::from(*n),
