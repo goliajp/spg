@@ -1673,3 +1673,17 @@ fn tsvector_length_ops() {
     // control: length(text) unchanged.
     ck(&mut e, "length('abcd')::text", "4");
 }
+
+/// v7.37 D.12 — position(bit in bit) → strpos does a bit-level MSB-first search
+/// (was byte-comparing the MSB-packed forms → wrong 0). PG18.4-verified.
+#[test]
+fn bit_position() {
+    let mut e = Engine::new();
+    ck(&mut e, "position(B'11' in B'0110')::text", "2");
+    ck(&mut e, "position(B'01' in B'0110')::text", "1");
+    ck(&mut e, "position(B'10' in B'0110')::text", "3");
+    ck(&mut e, "position(B'111' in B'0110')::text", "0");
+    ck(&mut e, "position(B'0' in B'0110')::text", "1");
+    // control: text + bytea position still work.
+    ck(&mut e, "position('cd' in 'abcd')::text", "3");
+}

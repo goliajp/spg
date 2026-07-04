@@ -8892,6 +8892,29 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // PG `POSITION(bit IN bit)` — bit-level search (MSB-first), 1-based.
+            // Must precede any text/byte fallback: the MSB-packed byte forms
+            // would otherwise mis-match (B'11'=[0xC0] not found in B'0110'=[0x60]).
+            if let (
+                Value::BitString { nbits: h_nbits, bytes: h_bytes },
+                Value::BitString { nbits: n_nbits, bytes: n_bytes },
+            ) = (&args[0], &args[1])
+            {
+                if *n_nbits == 0 {
+                    return Ok(Value::Int(1));
+                }
+                if n_nbits > h_nbits {
+                    return Ok(Value::Int(0));
+                }
+                let bit_at = |bytes: &[u8], i: usize| -> u8 { (bytes[i / 8] >> (7 - i % 8)) & 1 };
+                let (hn, nn) = (*h_nbits as usize, *n_nbits as usize);
+                for start in 0..=(hn - nn) {
+                    if (0..nn).all(|j| bit_at(h_bytes, start + j) == bit_at(n_bytes, j)) {
+                        return Ok(Value::Int(i32::try_from(start + 1).unwrap_or(i32::MAX)));
+                    }
+                }
+                return Ok(Value::Int(0));
+            }
             // PG `POSITION(bytea IN bytea)` lowers here as strpos(str, sub);
             // it is a byte-level search, not a rendered-text search.
             if let (Value::Bytes(haystack), Value::Bytes(needle)) = (&args[0], &args[1]) {
