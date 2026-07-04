@@ -348,6 +348,7 @@ mod e2e_join_using;
 mod e2e_json_build;
 mod e2e_json_path;
 mod e2e_jsonb;
+mod e2e_jsonb_pg_differential;
 mod e2e_jsonb_epic6;
 mod e2e_jsonb_path_query;
 mod e2e_key_column;

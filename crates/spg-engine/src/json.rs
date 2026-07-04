@@ -476,7 +476,21 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let rhs_doc = parse(rhs_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON on right of @>: {e}"),
     })?;
-    Ok(Value::Bool(json_contains(&lhs_doc, &rhs_doc)))
+    // PG special case: a top-level array `@>` a non-array scalar is
+    // true when the scalar equals any element (flat equality). This
+    // applies ONLY at the top level — inside array/array containment
+    // PG still requires a scalar RHS element to match a *scalar* LHS
+    // element, so it must NOT be folded into `json_contains`'s
+    // recursion (`'[1,[2,3]]' @> '[2,3]'` stays false).
+    let result = match (&lhs_doc, &rhs_doc) {
+        (JsonValue::Array(items), scalar)
+            if !matches!(scalar, JsonValue::Array(_) | JsonValue::Object(_)) =>
+        {
+            items.iter().any(|it| json_eq(it, scalar))
+        }
+        _ => json_contains(&lhs_doc, &rhs_doc),
+    };
+    Ok(Value::Bool(result))
 }
 
 fn json_contains(lhs: &JsonValue, rhs: &JsonValue) -> bool {
@@ -1290,6 +1304,14 @@ pub fn delete_key(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError>
             let filtered: Vec<(String, JsonValue)> = entries
                 .into_iter()
                 .filter(|(k, _)| k != key.as_ref())
+                .collect();
+            JsonValue::Object(filtered)
+        }
+        // PG `jsonb - text[]` removes every listed key from an object.
+        (JsonValue::Object(entries), Value::TextArray(keys)) => {
+            let filtered: Vec<(String, JsonValue)> = entries
+                .into_iter()
+                .filter(|(k, _)| !keys.iter().any(|kk| kk.as_deref() == Some(k.as_str())))
                 .collect();
             JsonValue::Object(filtered)
         }

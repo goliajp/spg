@@ -121,6 +121,9 @@ pub enum Token {
     JsonGetPath,
     /// v6.4.5 `#>>` — same walk, returns text.
     JsonGetPathText,
+    /// `#-` — delete the value at a nested JSON path. RHS is a PG
+    /// text-array literal `{a,b}`.
+    JsonDeletePath,
     /// v6.4.5 `@>` — JSON containment. `j @> sub` returns true if
     /// every key/value in `sub` is present in `j` with structural
     /// containment for objects + arrays.
@@ -457,6 +460,9 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                     i += 3;
                 } else if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::JsonGetPath);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'-') {
+                    out.push(Token::JsonDeletePath);
                     i += 2;
                 } else {
                     single(&mut out, Token::Hash, &mut i);
