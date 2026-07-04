@@ -1350,3 +1350,14 @@ fn path_bare_input() {
     ck(&mut e, "('(0,0),(1,1),(2,0)'::path)::text", "((0,0),(1,1),(2,0))");
     ck(&mut e, "npoints('(0,0),(1,1),(2,0)'::path)::text", "3");
 }
+
+/// v7.37 D.5 — circle and box accept the bare (unwrapped) numeric input like PG:
+/// circle `x,y,r`, box `x1,y1,x2,y2`. PG18.4-verified.
+#[test]
+fn circle_box_bare_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "('1,1,5'::circle)::text", "<(1,1),5>");
+    ck(&mut e, "('((1,1),5)'::circle)::text", "<(1,1),5>");
+    ck(&mut e, "('0,0,2,2'::box)::text", "(2,2),(0,0)");
+    ck(&mut e, "('(0,0),(2,2)'::box)::text", "(2,2),(0,0)");
+}
