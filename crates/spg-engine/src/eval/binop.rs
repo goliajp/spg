@@ -1584,6 +1584,16 @@ fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, E
     if let Some(d) = point_geo_distance(&l, &r).or_else(|| point_geo_distance(&r, &l)) {
         return Ok(Value::Float(d));
     }
+    // PG `box <-> box` is the distance between the two box centres (verified
+    // vs PG18.4: overlapping boxes still return the centre distance, not 0).
+    if let (Value::PgBox(aur, all), Value::PgBox(bur, bll)) = (&l, &r) {
+        let acx = (aur.x + all.x) / 2.0;
+        let acy = (aur.y + all.y) / 2.0;
+        let bcx = (bur.x + bll.x) / 2.0;
+        let bcy = (bur.y + bll.y) / 2.0;
+        let (dx, dy) = (acx - bcx, acy - bcy);
+        return Ok(Value::Float(sqrt_newton(dx * dx + dy * dy)));
+    }
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
@@ -1605,13 +1615,10 @@ fn sqrt_newton(x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
-    let mut g = x;
-    // 10 iterations is conservative; 6 already converges to ulp for typical
-    // distances.
-    for _ in 0..10 {
-        g = 0.5 * (g + x / g);
-    }
-    g
+    // libm's correctly-rounded sqrt matches PG's libc sqrt to the last ULP;
+    // the former hand-rolled Newton iteration was one ULP low on irrational
+    // results (e.g. box <-> box centre distance sqrt(2)).
+    libm::sqrt(x)
 }
 
 /// v7.37.7 C.1.7 — PG integer modulo. PG's `%` (like C and the SQL

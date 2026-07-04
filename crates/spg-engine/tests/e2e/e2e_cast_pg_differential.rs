@@ -1632,3 +1632,17 @@ fn geo_line_distance_and_box_containment() {
     // control: box @> point still works.
     ck(&mut e, "('((0,0),(2,2))'::box @> '(1,1)'::point)::text", "true");
 }
+
+/// v7.37 D — box <-> box distance is the distance between box centres (PG18.4:
+/// overlapping boxes still return the centre distance, not 0). Closes the
+/// geometric-distance operator family. PG18.4-verified.
+#[test]
+fn box_box_distance() {
+    let mut e = Engine::new();
+    ck(&mut e, "('((0,0),(2,2))'::box <-> '((10,0),(12,2))'::box)::text", "10");
+    ck(&mut e, "('((0,0),(2,2))'::box <-> '((0,10),(2,12))'::box)::text", "10");
+    // overlapping boxes: centre distance sqrt(2), not 0.
+    ck(&mut e, "('((0,0),(2,2))'::box <-> '((1,1),(3,3))'::box)::text", "1.4142135623730951");
+    // control: point <-> point distance still works.
+    ck(&mut e, "('(0,0)'::point <-> '(3,4)'::point)::text", "5");
+}
