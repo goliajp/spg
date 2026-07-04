@@ -559,14 +559,12 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
                     detail: format!("numeric {rounded} does not fit in int"),
                 })
         }
-        Value::Text(s) => {
-            s.trim()
-                .parse::<i32>()
-                .map(Value::Int)
-                .map_err(|_| EvalError::TypeMismatch {
-                    detail: format!("cannot parse {s:?} as int"),
-                })
-        }
+        Value::Text(s) => crate::conversions::parse_pg_int(&s)
+            .and_then(|n| i32::try_from(n).ok())
+            .map(Value::Int)
+            .ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {s:?} as int"),
+            }),
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
         // PG `bit`/`varbit` → int is the MSB-first bit value.
         #[allow(clippy::cast_possible_truncation)]
@@ -594,14 +592,11 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
                     detail: format!("numeric {rounded} does not fit in bigint"),
                 })
         }
-        Value::Text(s) => {
-            s.trim()
-                .parse::<i64>()
-                .map(Value::BigInt)
-                .map_err(|_| EvalError::TypeMismatch {
-                    detail: format!("cannot parse {s:?} as bigint"),
-                })
-        }
+        Value::Text(s) => crate::conversions::parse_pg_int(&s)
+            .map(Value::BigInt)
+            .ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {s:?} as bigint"),
+            }),
         Value::Bool(b) => Ok(Value::BigInt(i64::from(b))),
         // PG `bit`/`varbit` → bigint is the MSB-first bit value.
         Value::BitString { nbits, bytes } => {

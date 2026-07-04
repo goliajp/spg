@@ -1374,3 +1374,20 @@ fn interval_iso8601_and_yearmonth() {
     // control: the `<n> <unit>` word form still works.
     ck(&mut e, "('1 year 2 mons 3 days'::interval)::text", "1 year 2 mons 3 days");
 }
+
+
+/// v7.37 D — integer text accepts PG 16+ radix prefixes (0x/0o/0b) and `_`
+/// digit separators, both via `::int` cast and the generic coerce path.
+/// PG18.4-verified.
+#[test]
+fn integer_radix_and_underscores() {
+    let mut e = Engine::new();
+    ck(&mut e, "('0x1F'::int4)::text", "31");
+    ck(&mut e, "('1_000'::int4)::text", "1000");
+    ck(&mut e, "('0o17'::int4)::text", "15");
+    ck(&mut e, "('0b101'::int4)::text", "5");
+    ck(&mut e, "('-0x10'::bigint)::text", "-16");
+    ck(&mut e, "('1_000_000'::bigint)::text", "1000000");
+    // control: plain decimal unchanged.
+    ck(&mut e, "('42'::int4)::text", "42");
+}
