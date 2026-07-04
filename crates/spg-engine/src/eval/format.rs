@@ -152,7 +152,12 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     let y: i32 = s[0..4].parse().ok()?;
     let m: u32 = s[5..7].parse().ok()?;
     let d: u32 = s[8..10].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // PG validates the day against the actual (leap-aware) month
+    // length: `'2024-02-30'::date` / `'2024-04-31'::date` /
+    // `'2023-02-29'::date` all raise "date/time field value out of
+    // range". Without this bound the fixed-position parser silently
+    // rolls the overflow forward (Feb 30 → Mar 1) and corrupts data.
+    if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
         return None;
     }
     Some(days_from_civil(y, m, d))
@@ -220,12 +225,23 @@ fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
         None => (core, None),
     };
     let bytes = time.as_bytes();
-    if bytes.len() != 8 || bytes[2] != b':' || bytes[5] != b':' {
+    // PG accepts both `HH:MM:SS` and the seconds-optional `HH:MM`
+    // form in a TIMESTAMP literal (`'2024-01-15 10:30'::timestamp`
+    // → `10:30:00`); hour-only (`'... 10'`) stays a parse error.
+    let (hh, mm, ss): (i64, i64, i64) = if bytes.len() == 8
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+    {
+        (
+            time[0..2].parse().ok()?,
+            time[3..5].parse().ok()?,
+            time[6..8].parse().ok()?,
+        )
+    } else if bytes.len() == 5 && bytes[2] == b':' {
+        (time[0..2].parse().ok()?, time[3..5].parse().ok()?, 0)
+    } else {
         return None;
-    }
-    let hh: i64 = time[0..2].parse().ok()?;
-    let mm: i64 = time[3..5].parse().ok()?;
-    let ss: i64 = time[6..8].parse().ok()?;
+    };
     if !(0..24).contains(&hh) || !(0..60).contains(&mm) || !(0..60).contains(&ss) {
         return None;
     }
