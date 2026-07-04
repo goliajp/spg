@@ -414,3 +414,14 @@ fn bit_string_shift_operators() {
     ck(&mut e, r#"B'1010' >> 5"#, r#"0000"#);
     ck(&mut e, r#"B'1010' << -1"#, r#"0101"#);
 }
+
+/// inet - inet returns the bigint count of addresses between them
+/// (previously errored). PG18.4-verified.
+#[test]
+fn inet_minus_inet_bigint() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"'192.168.1.5'::inet - '192.168.1.1'::inet"#, r#"4"#);
+    ck(&mut e, r#"'192.168.1.1'::inet - '192.168.1.5'::inet"#, r#"-4"#);
+    ck(&mut e, r#"'10.0.0.0'::inet - '10.0.0.0'::inet"#, r#"0"#);
+    ck(&mut e, r#"'192.168.1.0'::inet - '192.168.0.0'::inet"#, r#"256"#);
+}
