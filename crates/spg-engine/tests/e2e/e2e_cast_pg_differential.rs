@@ -1740,3 +1740,16 @@ fn cidr_int_arithmetic() {
     // control: inet + int still works.
     ck(&mut e, "host('192.168.1.5'::inet + 10)", "192.168.1.15");
 }
+
+/// v7.37 D — numeric % numeric rescales to the shared scale then takes the
+/// truncated remainder. Previously errored. PG18.4-verified.
+#[test]
+fn numeric_modulo() {
+    let mut e = Engine::new();
+    ck(&mut e, "(12.5::numeric % 5)::text", "2.5");
+    ck(&mut e, "(10.75::numeric % 2.5)::text", "0.75");
+    ck(&mut e, "((-12.5)::numeric % 5)::text", "-2.5");
+    ck(&mut e, "(100::numeric % 7)::text", "2");
+    // control: integer modulo unchanged.
+    ck(&mut e, "(17 % 5)::text", "2");
+}

@@ -1039,6 +1039,25 @@ fn apply_binary_numeric(
                 scale: target_scale,
             })
         }
+        BinOp::Mod => {
+            // PG `numeric % numeric`: rescale both to the shared scale, then
+            // take the truncated remainder (sign of the dividend). Result keeps
+            // that scale. 12.5 % 5 -> 125 % 50 = 25 @scale1 = 2.5.
+            let target_scale = sa.max(sb);
+            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            if rhs == 0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            Ok(Value::Numeric {
+                scaled: lhs.wrapping_rem(rhs),
+                scale: target_scale,
+            })
+        }
         BinOp::Mul => {
             let scaled = a.checked_mul(b).ok_or(EvalError::TypeMismatch {
                 detail: "NUMERIC overflow on *".into(),
