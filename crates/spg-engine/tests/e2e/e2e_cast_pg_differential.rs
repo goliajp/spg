@@ -1298,3 +1298,14 @@ fn coalesce_result_type() {
     ck(&mut e, "COALESCE(NULL, 'hello')::text", "hello");
     ck(&mut e, "COALESCE(NULL::int, 42)::text", "42");
 }
+
+/// v7.37 D.1 — CASE result-type coercion (same rule as COALESCE). PG18.4-verified.
+#[test]
+fn case_result_type() {
+    let mut e = Engine::new();
+    ck(&mut e, "(CASE WHEN false THEN '10:00'::time ELSE '11:30' END)::text", "11:30:00");
+    ck(&mut e, "(CASE WHEN true THEN '10:00'::time ELSE '11:30' END)::text", "10:00:00");
+    ck(&mut e, "(CASE WHEN false THEN '2024-01-01'::date ELSE '2024-06-01' END)::text", "2024-06-01");
+    // control: all-text CASE unchanged.
+    ck(&mut e, "(CASE WHEN true THEN 'a' ELSE 'b' END)::text", "a");
+}
