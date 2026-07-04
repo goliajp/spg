@@ -1384,6 +1384,49 @@ fn eq_only_result(op: BinOp, eq: bool) -> Result<Value<'static>, EvalError> {
     }
 }
 
+/// Compare the first `nbits` bits of two big-endian (MSB-first) byte
+/// arrays, PG `bitncmp`. Full common bytes compared bytewise; the final
+/// partial byte compared under a top-`rem`-bits mask.
+fn bitncmp(a: &[u8; 16], b: &[u8; 16], nbits: u8) -> core::cmp::Ordering {
+    let nbytes = (nbits / 8) as usize;
+    let ord = a[..nbytes].cmp(&b[..nbytes]);
+    if ord != core::cmp::Ordering::Equal {
+        return ord;
+    }
+    let rem = nbits % 8;
+    if rem == 0 {
+        return core::cmp::Ordering::Equal;
+    }
+    let mask = 0xffu8 << (8 - rem);
+    (a[nbytes] & mask).cmp(&(b[nbytes] & mask))
+}
+
+/// PG `network_cmp`: family first (IPv4 < IPv6), then the common netmask
+/// prefix of the addresses, then the netmask length, then the full address.
+fn network_cmp(
+    af: u8,
+    ab: u8,
+    aa: &[u8; 16],
+    bf: u8,
+    bb: u8,
+    ba: &[u8; 16],
+) -> core::cmp::Ordering {
+    if af != bf {
+        return af.cmp(&bf);
+    }
+    let common = ab.min(bb);
+    let ord = bitncmp(aa, ba, common);
+    if ord != core::cmp::Ordering::Equal {
+        return ord;
+    }
+    let ord = ab.cmp(&bb);
+    if ord != core::cmp::Ordering::Equal {
+        return ord;
+    }
+    let maxbits = if af == 4 { 32 } else { 128 };
+    bitncmp(aa, ba, maxbits)
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -1566,12 +1609,11 @@ pub(super) fn compare(
         (Value::IntervalArray(a), Value::IntervalArray(b)) => {
             return eq_only_result(op, array_value_eq(a, b, interval_span_eq));
         }
-        // v7.37.17 — INET / CIDR equality (=/<>). Equal iff same family,
-        // netmask bits, and address bytes (PG `network_eq`). Ordering
-        // (< <= > >=) is DEFERRED: PG's `network_cmp` compares the common
-        // address prefix BEFORE the netmask length, which a plain
-        // field-by-field compare does not reproduce; wiring only equality
-        // keeps `<` from silently returning a wrong (non-PG) answer.
+        // v7.37.17 — INET / CIDR comparison (=/<> and ordering). PG
+        // `network_cmp`: family first (IPv4 < IPv6), then the common
+        // netmask prefix of the addresses, then the netmask length, then
+        // the full address. Live PG18.4-verified: 10.0.0.0/8 < 192.168/16,
+        // 10.0.0.0/8 < 10.0.0.0/16, 1.2.3.4 < 1.2.3.5, IPv4 < IPv6.
         (
             Value::Inet { family: af, bits: ab, addr: aa },
             Value::Inet { family: bf, bits: bb, addr: ba },
@@ -1580,13 +1622,16 @@ pub(super) fn compare(
             Value::Cidr { family: af, bits: ab, addr: aa },
             Value::Cidr { family: bf, bits: bb, addr: ba },
         ) => {
-            let eq = af == bf && ab == bb && aa == ba;
+            let ord = network_cmp(*af, *ab, aa, *bf, *bb, ba);
             return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                BinOp::Eq => Ok(Value::Bool(ord.is_eq())),
+                BinOp::NotEq => Ok(Value::Bool(ord.is_ne())),
+                BinOp::Lt => Ok(Value::Bool(ord.is_lt())),
+                BinOp::LtEq => Ok(Value::Bool(ord.is_le())),
+                BinOp::Gt => Ok(Value::Bool(ord.is_gt())),
+                BinOp::GtEq => Ok(Value::Bool(ord.is_ge())),
                 _ => Err(EvalError::TypeMismatch {
-                    detail: "inet/cidr ordering (<, <=, >, >=) not yet supported; only = / <>"
-                        .into(),
+                    detail: "inet/cidr supports only comparison operators".into(),
                 }),
             };
         }
