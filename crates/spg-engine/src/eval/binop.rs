@@ -1322,64 +1322,82 @@ fn cmp_array<T: Ord>(a: &[Option<T>], b: &[Option<T>]) -> core::cmp::Ordering {
 /// types whose element equality is *value-based* rather than the derived
 /// `Ord` on the stored repr (NUMERIC[] scale-insensitive, FLOAT8[] NaN,
 /// INTERVAL[] unit-equivalence), so `cmp_array`'s repr `Ord` is wrong.
-fn array_value_eq<T>(a: &[Option<T>], b: &[Option<T>], elem_eq: impl Fn(&T, &T) -> bool) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
-            (None, None) => true,
-            (Some(p), Some(q)) => elem_eq(p, q),
-            _ => false,
-        })
+/// Value comparison of two arrays under PG `array_cmp`: element by element
+/// with the element comparator; the first non-equal pair decides. A NULL
+/// element sorts GREATER than any non-NULL (two NULLs are equal). If every
+/// common element is equal, the shorter array is less. Verified vs PG18:
+/// `[1,NULL] > [1,2]`, `[1] < [1,2]`.
+fn array_value_cmp<T>(
+    a: &[Option<T>],
+    b: &[Option<T>],
+    elem_cmp: impl Fn(&T, &T) -> core::cmp::Ordering,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = match (x, y) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(p), Some(q)) => elem_cmp(p, q),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
-/// Value equality of two NUMERIC elements `(scaled, scale)`. Scale-
-/// insensitive: `1.10` (scaled=110, scale=2) equals `1.1` (scaled=11,
-/// scale=1). Rescale both to the wider scale (always scaling *up*, so
-/// no rounding/precision loss) and compare the i128. This mirrors the
-/// scalar `numeric = numeric` path (`apply_binary_numeric`). Overflow on
-/// rescale (astronomically different scales) can't be equal — returns
-/// `false`.
-fn numeric_pair_eq(a: (i128, u8), b: (i128, u8)) -> bool {
+/// Value comparison of two NUMERIC elements `(scaled, scale)`. Scale-
+/// insensitive (`1.10` == `1.1`): rescale both up to the wider scale
+/// (exact, no precision loss) and compare the i128. Mirrors the scalar
+/// `numeric` compare (`apply_binary_numeric`). Rescale overflow
+/// (astronomically different scales) falls back to the raw-scaled compare.
+fn numeric_pair_cmp(a: (i128, u8), b: (i128, u8)) -> core::cmp::Ordering {
     let t = a.1.max(b.1);
-    matches!((rescale(a.0, a.1, t), rescale(b.0, b.1, t)), (Some(x), Some(y)) if x == y)
-}
-
-/// Value equality of two FLOAT8 elements under PG's btree/array
-/// semantics: `NaN = NaN` is *true* (`ARRAY['NaN'::float8] =
-/// ARRAY['NaN'::float8]` is `t`), NaN vs anything else is false, and
-/// `+0.0 = -0.0` is true. Rust's `==` gives the last two directly; the
-/// NaN-vs-NaN case is special-cased.
-fn float_pg_eq(a: f64, b: f64) -> bool {
-    if a.is_nan() || b.is_nan() {
-        a.is_nan() && b.is_nan()
-    } else {
-        a == b
+    match (rescale(a.0, a.1, t), rescale(b.0, b.1, t)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.0.cmp(&b.0),
     }
 }
 
-/// Value equality of two INTERVAL elements by PG's canonical microsecond
-/// span (months = 30 days, days = 24 hours), so `INTERVAL '1 mon' =
-/// INTERVAL '30 days'` and `INTERVAL '1 day' = INTERVAL '24:00:00'`.
-/// Mirrors the scalar interval compare arm; i128 keeps the product from
-/// overflowing i64.
-fn interval_span_eq(a: &spg_storage::IntervalSpan, b: &spg_storage::IntervalSpan) -> bool {
+/// Value comparison of two FLOAT8 elements under PG's btree/array order:
+/// `NaN` is the greatest value (`NaN == NaN`, `NaN >` any number) and
+/// `+0.0 == -0.0`. `partial_cmp` gives the finite case (incl. signed-zero
+/// equality); the NaN cases are special-cased.
+fn float_pg_cmp(a: f64, b: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Value comparison of two INTERVAL elements by PG's canonical microsecond
+/// span (months = 30 days, days = 24 hours), so `1 mon` == `30 days` and
+/// `1 day` == `24:00:00`. i128 keeps the product from overflowing i64.
+fn interval_span_cmp(
+    a: &spg_storage::IntervalSpan,
+    b: &spg_storage::IntervalSpan,
+) -> core::cmp::Ordering {
     let span = |s: &spg_storage::IntervalSpan| -> i128 {
         (i128::from(s.months) * 30 + i128::from(s.days)) * 86_400_000_000 + i128::from(s.micros)
     };
-    span(a) == span(b)
+    span(a).cmp(&span(b))
 }
 
-/// `=` / `<>` result from a computed value-equality, for array types
-/// whose ordering (`<` `<=` `>` `>=`) is intentionally deferred (the
-/// value-based element comparator gives a total order in PG, but SPG
-/// only wires equality here). Any ordering op errors rather than
-/// silently returning a non-PG answer.
-fn eq_only_result(op: BinOp, eq: bool) -> Result<Value<'static>, EvalError> {
+/// Map a computed `Ordering` to the boolean result of a comparison op.
+fn cmp_result(op: BinOp, ord: core::cmp::Ordering) -> Result<Value<'static>, EvalError> {
     match op {
-        BinOp::Eq => Ok(Value::Bool(eq)),
-        BinOp::NotEq => Ok(Value::Bool(!eq)),
+        BinOp::Eq => Ok(Value::Bool(ord.is_eq())),
+        BinOp::NotEq => Ok(Value::Bool(ord.is_ne())),
+        BinOp::Lt => Ok(Value::Bool(ord.is_lt())),
+        BinOp::LtEq => Ok(Value::Bool(ord.is_le())),
+        BinOp::Gt => Ok(Value::Bool(ord.is_gt())),
+        BinOp::GtEq => Ok(Value::Bool(ord.is_ge())),
         _ => Err(EvalError::TypeMismatch {
-            detail: "numeric/float/interval array ordering (<, <=, >, >=) not supported; only = / <>"
-                .into(),
+            detail: "array supports only comparison operators".into(),
         }),
     }
 }
@@ -1601,13 +1619,13 @@ pub(super) fn compare(
         // numeric` / `interval = interval` paths so array and scalar
         // agree. Ordering (`<` etc.) is DEFERRED (`eq_only_result`).
         (Value::NumericArray(a), Value::NumericArray(b)) => {
-            return eq_only_result(op, array_value_eq(a, b, |x, y| numeric_pair_eq(*x, *y)));
+            return cmp_result(op, array_value_cmp(a, b, |x, y| numeric_pair_cmp(*x, *y)));
         }
         (Value::FloatArray(a), Value::FloatArray(b)) => {
-            return eq_only_result(op, array_value_eq(a, b, |x, y| float_pg_eq(*x, *y)));
+            return cmp_result(op, array_value_cmp(a, b, |x, y| float_pg_cmp(*x, *y)));
         }
         (Value::IntervalArray(a), Value::IntervalArray(b)) => {
-            return eq_only_result(op, array_value_eq(a, b, interval_span_eq));
+            return cmp_result(op, array_value_cmp(a, b, interval_span_cmp));
         }
         // v7.37.17 — INET / CIDR comparison (=/<> and ordering). PG
         // `network_cmp`: family first (IPv4 < IPv6), then the common
