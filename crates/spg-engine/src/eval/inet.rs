@@ -344,6 +344,65 @@ pub(super) fn inet_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     Ok(Value::Int(mask))
 }
 
+/// `set_masklen(inet|cidr, n)` — change the prefix length, keeping the address
+/// and the argument's type. PG clamps to the family's maximum.
+pub(super) fn inet_set_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let (family, addr, is_cidr) = match args.first() {
+        Some(Value::Inet { family, addr, .. }) => (*family, *addr, false),
+        Some(Value::Cidr { family, addr, .. }) => (*family, *addr, true),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "set_masklen() first arg must be inet/cidr".into(),
+            });
+        }
+    };
+    let n = match args.get(1) {
+        Some(Value::SmallInt(v)) => i64::from(*v),
+        Some(Value::Int(v)) => i64::from(*v),
+        Some(Value::BigInt(v)) => *v,
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "set_masklen() second arg must be an integer".into(),
+            });
+        }
+    };
+    let max = if family == 4 { 32 } else { 128 };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bits = n.clamp(0, max) as u8;
+    if is_cidr {
+        Ok(Value::Cidr { family, bits, addr })
+    } else {
+        Ok(Value::Inet { family, bits, addr })
+    }
+}
+
+/// `abbrev(cidr)` — the shortest text form, dropping octets past the prefix
+/// (`192.168.1.0/24` → `192.168.1/24`, `10.0.0.0/8` → `10/8`). IPv6 falls
+/// back to the full text form.
+pub(super) fn inet_abbrev(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    let (family, bits, addr) = match args.first() {
+        Some(Value::Cidr { family, bits, addr } | Value::Inet { family, bits, addr }) => {
+            (*family, *bits, *addr)
+        }
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "abbrev() arg must be inet/cidr".into(),
+            });
+        }
+    };
+    if family != 4 {
+        return Ok(Value::text(crate::conversions::format_inet(family, bits, &addr)));
+    }
+    let sig = ((usize::from(bits) + 7) / 8).max(1);
+    let parts: alloc::vec::Vec<alloc::string::String> =
+        addr[0..sig].iter().map(alloc::string::ToString::to_string).collect();
+    Ok(Value::text(alloc::format!("{}/{}", parts.join("."), bits)))
+}
+
 // ─── v7.17.0 Phase 3.P0-47 — INET / CIDR containment + overlap ────────
 //
 // SPG stores INET / CIDR as Text (Phase 7 design); these helpers parse

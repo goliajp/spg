@@ -9958,6 +9958,8 @@ fn apply_function_dispatch(
         "host" => inet_host(args),
         "network" => inet_network(args),
         "masklen" => inet_masklen(args),
+        "set_masklen" => super::inet::inet_set_masklen(args),
+        "abbrev" => super::inet::inet_abbrev(args),
         // v7.37.17 (17.6 siblings) — completing the INET family.
         "family" => super::inet::inet_family(args),
         "netmask" => super::inet::inet_netmask(args),

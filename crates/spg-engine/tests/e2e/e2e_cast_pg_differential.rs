@@ -791,3 +791,16 @@ fn point_distance_and_arith() {
     // control: point literal/render unchanged.
     ck(&mut e, r#"('(1,2)'::point)::text"#, r#"(1,2)"#);
 }
+
+/// set_masklen(inet/cidr, n) + abbrev(cidr). host/network/masklen/inet-inet
+/// already worked. PG18.4-verified.
+#[test]
+fn inet_set_masklen_and_abbrev() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"set_masklen('192.168.1.5/24'::inet, 16)::text"#, r#"192.168.1.5/16"#);
+    ck(&mut e, r#"abbrev('192.168.1.0/24'::cidr)"#, r#"192.168.1/24"#);
+    ck(&mut e, r#"abbrev('10.0.0.0/8'::cidr)"#, r#"10/8"#);
+    // controls: host/network/masklen unchanged.
+    ck(&mut e, r#"host('192.168.1.5/24'::inet)"#, r#"192.168.1.5"#);
+    ck(&mut e, r#"masklen('192.168.1.5/24'::inet)::text"#, r#"24"#);
+}
