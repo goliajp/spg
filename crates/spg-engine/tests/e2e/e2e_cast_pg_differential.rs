@@ -1053,3 +1053,15 @@ fn geometric_typed_literals() {
     // it composes with operators now.
     ck(&mut e, "(circle '<(0,0),5>' @> point '(3,3)')::text", "true");
 }
+
+/// Range/multirange `TYPE 'literal'` typed-literal-prefix spelling. PG18.4-verified.
+#[test]
+fn range_typed_literals() {
+    let mut e = Engine::new();
+    ck(&mut e, "(int4range '[1,5)')::text", "[1,5)");
+    ck(&mut e, "(int8range '[1,9)')::text", "[1,9)");
+    ck(&mut e, "(numrange '[1.5,3.5)')::text", "[1.5,3.5)");
+    ck(&mut e, "(daterange '[2024-01-01,2024-02-01)')::text", "[2024-01-01,2024-02-01)");
+    // composes with operators.
+    ck(&mut e, "(int4range '[1,5)' @> 3)::text", "true");
+}
