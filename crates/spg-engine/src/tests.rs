@@ -2070,3 +2070,155 @@ fn rollback_marks_writer_version_aborted() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// v7.37.15 (Phase D) — engine-level vacuum: physically reclaim
+// committed-tombstoned rows under gate-on, provable no-op under
+// gate-off, RowId-stable across the compaction.
+// ---------------------------------------------------------------------
+
+/// Extract the rows of a `SELECT` result as `Vec<Vec<Value>>`.
+fn select_values(e: &mut Engine, sql: &str) -> alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> {
+    match e.execute(sql).unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| r.values.iter().cloned().collect())
+            .collect(),
+        QueryResult::CommandOk { .. } => panic!("expected Rows from `{sql}`"),
+    }
+}
+
+/// Gate-on: INSERT 3, DELETE 1 (tombstone stays physically present),
+/// then `vacuum_pass` reclaims the committed tombstone. Survivors keep
+/// their stable RowIds + values and are still visible via SELECT.
+#[test]
+fn v7_37_15_phase_d_engine_vacuum_reclaims_committed_tombstone_gate_on() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    e.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    e.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    // DELETE tombstones the row but keeps it physically present.
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    assert_eq!(
+        e.catalog().get("t").unwrap().row_count(),
+        3,
+        "gate-on DELETE tombstones — row stays physically present"
+    );
+    // The deleted row is already invisible to SELECT (visibility gate).
+    let before = select_values(&mut e, "SELECT id FROM t ORDER BY id");
+    assert_eq!(before.len(), 2, "SELECT hides the tombstoned row pre-vacuum");
+
+    // Capture the survivors' stable RowIds before the compaction.
+    let survivors_before: alloc::vec::Vec<spg_storage::row_header::RowId> = {
+        let t = e.catalog().get("t").unwrap();
+        (0..t.row_count())
+            .filter(|&i| {
+                // survivors = rows still alive (xmax == XMAX_ALIVE)
+                t.headers().get(i).map(|h| h.xmax == spg_storage::row_header::XMAX_ALIVE).unwrap_or(false)
+            })
+            .filter_map(|i| t.rowids().get(i).copied())
+            .collect()
+    };
+    assert_eq!(survivors_before.len(), 2);
+
+    // Vacuum. After the DELETE committed (autocommit), no writer is in
+    // flight, so oldest_active == current_version() > the delete's xmax
+    // → the tombstone is reclaimable.
+    let report = e.vacuum_pass(false);
+    assert_eq!(report.rows_reclaimed, 1, "the committed tombstone is reclaimed");
+
+    let t = e.catalog().get("t").unwrap();
+    assert_eq!(t.row_count(), 2, "dead row is physically gone after vacuum");
+    // RowId stability: the two survivors keep their exact RowIds.
+    let survivors_after: alloc::vec::Vec<spg_storage::row_header::RowId> =
+        t.rowids().iter().copied().collect();
+    assert_eq!(
+        survivors_after, survivors_before,
+        "survivors keep their stable RowIds across the vacuum compaction"
+    );
+
+    // Values + visibility preserved: SELECT still returns rows 1 and 3.
+    let after = select_values(&mut e, "SELECT id, name FROM t ORDER BY id");
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0][0], Value::Int(1));
+    assert_eq!(after[0][1], Value::text("a"));
+    assert_eq!(after[1][0], Value::Int(3));
+    assert_eq!(after[1][1], Value::text("c"));
+}
+
+/// Gate-on conservative bound: a tombstone whose `xmax >= oldest_active`
+/// (a reader could still see it) is NOT reclaimed. Holding an in-flight
+/// writer version drags `oldest_active` below the delete's version;
+/// once that version commits, the floor rises and the row IS reclaimed.
+#[test]
+fn v7_37_15_phase_d_engine_vacuum_spares_still_visible_tombstone() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+    e.execute("INSERT INTO t VALUES (1)").unwrap();
+    e.execute("INSERT INTO t VALUES (2)").unwrap();
+    e.execute("INSERT INTO t VALUES (3)").unwrap();
+
+    // Pin a low floor: an in-flight writer version W held open. Any
+    // later delete is stamped at a version > W, so `oldest_active`
+    // (== min == W) leaves it unreclaimable.
+    let w = e.begin_writer_version();
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    assert!(
+        e.vacuum_oldest_active() <= w,
+        "an in-flight writer drags oldest_active down to its version"
+    );
+
+    let dry = e.vacuum_pass(true);
+    assert_eq!(
+        dry.rows_reclaimed, 0,
+        "a tombstone a live reader could still see is NOT reclaimed"
+    );
+    assert_eq!(
+        e.catalog().get("t").unwrap().row_count(),
+        3,
+        "no-op vacuum leaves the tombstone physically present"
+    );
+
+    // Commit the held version → floor rises to current_version(), now
+    // strictly above the delete's xmax → the row becomes reclaimable.
+    e.commit_writer_version(w);
+    let real = e.vacuum_pass(false);
+    assert_eq!(real.rows_reclaimed, 1, "reclaimable once the floor advances");
+    assert_eq!(e.catalog().get("t").unwrap().row_count(), 2);
+}
+
+/// Gate-off control: physical delete leaves no tombstone, so
+/// `vacuum_pass` is a provable no-op and the results are unchanged.
+#[test]
+fn v7_37_15_phase_d_engine_vacuum_is_noop_gate_off() {
+    let mut e = Engine::new();
+    // gate stays OFF (default).
+    e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+    e.execute("INSERT INTO t VALUES (1)").unwrap();
+    e.execute("INSERT INTO t VALUES (2)").unwrap();
+    e.execute("INSERT INTO t VALUES (3)").unwrap();
+    // gate-off DELETE removes the row physically — no tombstone.
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    assert_eq!(
+        e.catalog().get("t").unwrap().row_count(),
+        2,
+        "gate-off DELETE physically removes the row"
+    );
+
+    let report = e.vacuum_pass(false);
+    assert_eq!(report.rows_reclaimed, 0, "gate-off vacuum finds nothing to reclaim");
+    assert_eq!(report.rows_examined, 0, "gate-off vacuum does not walk tables");
+    assert_eq!(
+        e.catalog().get("t").unwrap().row_count(),
+        2,
+        "gate-off vacuum leaves the table byte-for-byte unchanged"
+    );
+
+    let rows = select_values(&mut e, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[1][0], Value::Int(3));
+}

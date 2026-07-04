@@ -3517,10 +3517,27 @@ fn v7_37_15_phase_d_vacuum_reclaims_only_safe_rows() {
     assert_eq!(dry.rows_reclaimed, 1, "dry-run counts safe-to-reclaim only");
     assert_eq!(t.row_count(), 5, "dry-run does not mutate");
 
+    // Capture the survivors' stable RowIds before the compaction.
+    // Rows are 1-based (positions 0..5 → rowids 1..=5); position 1
+    // (rowid 2) is the one that will be reclaimed.
+    let expected_survivor_rowids: alloc::vec::Vec<crate::row_header::RowId> = (0..t.row_count())
+        .filter(|&i| i != 1)
+        .filter_map(|i| t.rowids().get(i).copied())
+        .collect();
+
     // Real pass. Row 1 reclaimed; the other 4 remain.
     let real = t.vacuum(150, false);
     assert_eq!(real.rows_reclaimed, 1);
     assert_eq!(t.row_count(), 4);
+    // RowId stability: the four survivors keep their exact RowIds and
+    // stay in order after the compaction shifts their physical slots.
+    let survivor_rowids: alloc::vec::Vec<crate::row_header::RowId> =
+        t.rowids().iter().copied().collect();
+    assert_eq!(
+        survivor_rowids, expected_survivor_rowids,
+        "survivors keep their stable RowIds across vacuum compaction"
+    );
+    assert_eq!(t.rowids().len(), t.rows().len(), "rowids lock-step with rows");
 }
 
 /// v7.37.15 (Phase D TDD) — `Catalog::vacuum_all` aggregates per-

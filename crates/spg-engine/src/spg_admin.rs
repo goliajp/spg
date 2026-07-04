@@ -957,4 +957,98 @@ impl Engine {
         }
         Ok(candidates)
     }
+
+    /// v7.37.15 (Phase D) — dead-tuple vacuum pass. The engine-level
+    /// companion to [`Self::autoanalyze_pass`]: physically reclaims
+    /// committed-tombstoned rows so a gate-on
+    /// (`SPG_MVCC_INPLACE`) in-place table's storage stays bounded.
+    ///
+    /// Under gate-on a DELETE stamps `xmax` and keeps the row
+    /// physically present (an UPDATE tombstones the old version and
+    /// appends the new one); those dead rows accumulate until vacuum
+    /// removes them. SPG's `xmin` / `xmax` are u64 with no wraparound,
+    /// so this is pure dead-tuple reclamation — no anti-wraparound
+    /// freeze is ever needed.
+    ///
+    /// # Safety predicate
+    /// A tombstoned row (`xmax != XMAX_ALIVE`) is reclaimed iff its
+    /// delete-commit version is **strictly below** `oldest_active` —
+    /// the floor of every version any live reader could still resolve
+    /// as visible (see [`Self::vacuum_oldest_active`]). `xmax <
+    /// oldest_active` means every current and future snapshot already
+    /// observes the delete, so no reader can still see the row. When in
+    /// doubt the row is left in place — never reclaim a row that could
+    /// still be visible.
+    ///
+    /// # Gate-off (default) is a provable no-op
+    /// Under the default gate-off path DELETE removes rows *physically*,
+    /// so no header ever carries a non-`XMAX_ALIVE` `xmax` and there is
+    /// nothing to reclaim. The explicit guard below returns an empty
+    /// report without walking any table, so gate-off behaviour is
+    /// byte-for-byte unchanged.
+    ///
+    /// # RowId stability
+    /// Reclaiming compacts `rows` / `headers` / `rowids` lock-step
+    /// (via `Table::delete_rows_no_index`): every surviving row keeps
+    /// its stable, never-reused `RowId`, so held row-locks and
+    /// tombstone-redo references stay attached to the same row while its
+    /// physical slot shifts down. Indices are rebuilt against the
+    /// compacted rows.
+    ///
+    /// # Not a daemon (follow-up)
+    /// This ships the callable primitive only. Wiring a background
+    /// thread that calls it on a cadence (PG's `autovacuum_naptime`) is
+    /// a separate concern — a host schedules it under the engine write
+    /// lock, mirroring how it drives [`Self::autoanalyze_pass`]. Noted
+    /// as a follow-up, not built in this slice.
+    ///
+    /// `dry_run = true` counts the reclaimable rows without mutating.
+    pub fn vacuum_pass(&mut self, dry_run: bool) -> spg_storage::vacuum::VacuumReport {
+        // Gate-off: physical delete leaves no tombstones. Provable
+        // no-op — do not even walk the tables so the default path is
+        // byte-for-byte unchanged.
+        if !self.mvcc_inplace {
+            return spg_storage::vacuum::VacuumReport::default();
+        }
+        let oldest_active = self.vacuum_oldest_active();
+        self.catalog.vacuum_all(oldest_active, dry_run)
+    }
+
+    /// v7.37.15 (Phase D) — the conservative vacuum floor: the smallest
+    /// version any live reader could still resolve as visible. A
+    /// tombstone with `xmax < this` is dead to every reader — current
+    /// and future — so it is safe to reclaim.
+    ///
+    /// Computed as the **minimum** of:
+    ///   * `current_version()` — a *fresh* reader's floor: any new
+    ///     snapshot is taken at (or after) the live cursor and sees
+    ///     every delete stamped at or below it, so nothing below the
+    ///     cursor can be resurrected by a future reader;
+    ///   * `min(active_writer_versions)` — an in-flight writer reads at
+    ///     its own version and can still see rows deleted *after* it;
+    ///   * `min(cached RR/SER reader snapshot versions)` — a held
+    ///     REPEATABLE READ / SERIALIZABLE snapshot froze its view at
+    ///     capture and can still see rows deleted after that point.
+    ///
+    /// Taking the minimum is deliberately conservative: any live reader
+    /// drags the floor down, leaving a row that *might* still be visible
+    /// in place. Under SPG's single-global-`current_tx` serialized model
+    /// there is at most one in-flight writer, so in the common quiescent
+    /// case this collapses to `current_version()`.
+    #[must_use]
+    pub fn vacuum_oldest_active(&self) -> u64 {
+        let mut floor = spg_storage::row_header::current_version();
+        // In-flight writers: `active_writer_versions` is a BTreeSet, so
+        // `.iter().next()` is its minimum.
+        if let Some(&min_writer) = self.active_writer_versions.iter().next() {
+            floor = floor.min(min_writer);
+        }
+        // Held REPEATABLE READ / SERIALIZABLE reader snapshots.
+        for st in self.tx_catalogs.values() {
+            if let Some(s) = st.cached_snapshot.as_ref() {
+                floor = floor.min(s.version);
+            }
+        }
+        floor
+    }
 }
