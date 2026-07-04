@@ -1580,3 +1580,15 @@ fn box_double_paren_input() {
     ck(&mut e, "('(0,0),(2,2)'::box)::text", "(2,2),(0,0)");
     ck(&mut e, "('0,0,2,2'::box)::text", "(2,2),(0,0)");
 }
+
+/// v7.37 D — macaddr bitwise operators `&` / `|` (byte-wise) and unary `~`.
+/// PG18.4-verified.
+#[test]
+fn macaddr_bitwise() {
+    let mut e = Engine::new();
+    ck(&mut e, "('08:00:2b:01:02:03'::macaddr & '00:00:00:ff:ff:ff'::macaddr)::text", "00:00:00:01:02:03");
+    ck(&mut e, "('08:00:2b:01:02:03'::macaddr | '00:00:00:ff:ff:ff'::macaddr)::text", "08:00:2b:ff:ff:ff");
+    ck(&mut e, "(~ '08:00:2b:01:02:03'::macaddr)::text", "f7:ff:d4:fe:fd:fc");
+    // control: macaddr comparison still works.
+    ck(&mut e, "('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text", "true");
+}
