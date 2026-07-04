@@ -33,9 +33,14 @@
 //!     bytes. Existing text-order tests never caught it because their
 //!     fixtures had length correlated with alphabetical order
 //!     (`Apple`(5) < `banana`(6) = `cherry`(6)). (`select.rs`,
-//!     `value_to_order_key`.) Residual: beyond ~6 bytes the f64 mantissa
-//!     can no longer distinguish keys, so tail-only differences tie — a
-//!     pre-existing limitation of the f64 fast key, not addressed here.
+//!     `value_to_order_key`.) The former residual — beyond ~6 bytes the
+//!     f64 mantissa could no longer distinguish keys, so long-common-prefix
+//!     values (`product_001` vs `product_002`, ISO timestamps stored as
+//!     text, prefixed IDs / SKUs) tied — is FIXED in v7.37.16: TEXT order
+//!     keys now carry the FULL string (`OrderKey::Text`) and compare
+//!     byte-lexicographically (PG C / binary collation), while numeric /
+//!     int / date / numeric keep the lossless `f64` fast path
+//!     (`OrderKey::Num`). Locked by `order_by_text_full_precision` below.
 //!
 //! REPORTED divergences (SPG laxer than PG — NOT fixed, out of scope for a
 //! localized clause fix; asserted against SPG's current behaviour to lock
@@ -150,6 +155,62 @@ fn order_by_nulls_default_and_keys() {
     // so it is out of scope for this localized clause fix. Asserted
     // against SPG's current behaviour to lock it.
     ck(&mut e, "SELECT a FROM t ORDER BY 5", "3|1|<NULL>|1|2|3|<NULL>");
+}
+
+/// v7.37.16 — full-precision TEXT ORDER BY. The old f64 coarse key
+/// packed only the first 8 bytes into an f64 mantissa and could not
+/// distinguish keys past ~6 bytes, so values sharing a long common
+/// prefix tied / misordered (`product_001` vs `product_002`, ISO
+/// timestamps stored as text, prefixed IDs / SKUs). Text keys now
+/// carry the FULL string (`OrderKey::Text`) and compare
+/// byte-lexicographically, matching PG's C / binary collation (SPG's
+/// text collation is byte order). Every expected string below is the
+/// row order live PostgreSQL 18.4 returns for the SAME query with an
+/// explicit `COLLATE "C"` (captured from the `spg-bench-postgres`
+/// container); the tie-break `, id` makes the order total on both
+/// sides. Numeric / int / date ORDER BY is unchanged (still the `f64`
+/// fast path) — see `order_by_nulls_default_and_keys`.
+#[test]
+fn order_by_text_full_precision() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ord (id int, txt text)").unwrap();
+    for row in [
+        "(1,'product_001')", "(2,'product_010')", "(3,'product_002')",
+        "(4,'product_012')", "(5,'product_009')", "(6,'2024-01-15T10:30:09')",
+        "(7,'2024-01-15T10:30:01')", "(8,'2024-01-15T10:30:15')", "(9,'aaaaaaaaY')",
+        "(10,'aaaaaaaaX')", "(11,'aaaaaaaaX2')", "(12,'apple')", "(13,'app')",
+        "(14,NULL)", "(15,'Zebra')", "(16,'café')", "(17,'cafe')", "(18,'caff')",
+    ] {
+        e.execute(&format!("INSERT INTO ord (id,txt) VALUES {row}")).unwrap();
+    }
+    // Full corpus, ASC (default NULLS LAST). The long-common-prefix
+    // groups order correctly: product_001<_002<_009<_010<_012 (1,3,5,2,4),
+    // aaaaaaaaX<aaaaaaaaX2<aaaaaaaaY (10,11,9), cafe<caff<café (17,18,16,
+    // 'é'=0xC3 sorts after 'f'=0x66), app<apple (13,12), 2024…01<09<15.
+    ck(&mut e, "SELECT id FROM ord ORDER BY txt ASC, id",
+        "7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4|14");
+    // DESC (default NULLS FIRST).
+    ck(&mut e, "SELECT id FROM ord ORDER BY txt DESC, id",
+        "14|4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7");
+    // product_* subset — the canonical long-common-prefix case the old
+    // ~6-byte f64 key tied on (all share the 8-byte prefix "product_").
+    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'product%' ORDER BY txt ASC, id",
+        "1|3|5|2|4");
+    // ISO timestamps stored as text (19-byte common-prefix-heavy).
+    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE '2024-%' ORDER BY txt ASC, id",
+        "7|6|8");
+    // >8-byte common prefix — beyond the entire old 8-byte f64 window.
+    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'aaaaaaaa%' ORDER BY txt ASC, id",
+        "10|11|9");
+    // multibyte / unicode tail (café vs cafe/caff).
+    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'caf%' ORDER BY txt ASC, id",
+        "17|18|16");
+    // Full corpus, explicit ASC NULLS FIRST.
+    ck(&mut e, "SELECT id FROM ord ORDER BY txt ASC NULLS FIRST, id",
+        "14|7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4");
+    // Full corpus, explicit DESC NULLS LAST.
+    ck(&mut e, "SELECT id FROM ord ORDER BY txt DESC NULLS LAST, id",
+        "4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7|14");
 }
 
 #[test]

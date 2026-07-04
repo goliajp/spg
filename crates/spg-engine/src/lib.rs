@@ -111,9 +111,10 @@ use expr_analysis::*;
 use index_access::*;
 pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
 pub(crate) use orderby::{
-    apply_offset_and_limit, apply_offset_and_limit_tagged, build_order_keys, canonical_value_repr,
-    expand_group_by_all, order_by_value_cmp, partial_sort_tagged, render_histogram_bounds,
-    resolve_order_by_position, sort_by_keys, sort_values_for_histogram, value_cmp, value_to_f64,
+    OrderKey, apply_offset_and_limit, apply_offset_and_limit_tagged, build_order_keys,
+    canonical_value_repr, cmp_multi_key, expand_group_by_all, order_by_value_cmp,
+    partial_sort_tagged, render_histogram_bounds, resolve_order_by_position, sort_by_keys,
+    sort_values_for_histogram, value_cmp, value_to_f64,
 };
 pub(crate) use select::{build_projection, infer_column_types, value_to_order_key};
 pub(crate) use show::render_create_table;

@@ -16,10 +16,11 @@ use spg_storage::{ColumnSchema, DataType, Row, Table, Value};
 
 use crate::eval::EvalContext;
 use crate::{
-    ByteBudget, CancelToken, Engine, EngineError, QueryResult, aggregate, apply_offset_and_limit,
-    approx_row_bytes, approx_rows_bytes, approx_value_bytes, build_order_keys, build_projection,
-    collect_column_qualifiers, collect_qualified_refs, eval, expr_has_subquery, memoize, reorder,
-    value_cmp, value_to_literal_expr,
+    ByteBudget, CancelToken, Engine, EngineError, OrderKey, QueryResult, aggregate,
+    apply_offset_and_limit, approx_row_bytes, approx_rows_bytes, approx_value_bytes,
+    build_order_keys, build_projection, cmp_multi_key, collect_column_qualifiers,
+    collect_qualified_refs, eval, expr_has_subquery, memoize, reorder, value_cmp,
+    value_to_literal_expr,
 };
 
 /// v7.17.0 Phase 3.P0-41 — LATERAL peer descriptor. Either eagerly
@@ -445,29 +446,23 @@ pub(crate) fn approx_tuple_bytes(
 }
 
 /// v7.30.3 (mailrs round-26) — bounded top-N sink entry for the
-/// streamed single-join path. `keys` carry per-key DESC pre-encoded
-/// by negation, so ordering is plain ascending lexicographic (the
-/// negation commutes with `cmp_multi_key`'s per-key reverse,
-/// including the ±INF NULL placements `build_order_keys` emits).
-/// `seq` is production order: ties keep the earliest-produced rows,
-/// matching what the general path's stable in-budget sort yields.
-/// The `BinaryHeap` is a max-heap, so `peek()` is the worst kept row.
+/// streamed single-join path. `keys` are the `OrderKey`s
+/// `build_order_keys` emits; `descs` (shared across all entries via
+/// `Rc`) drives the per-key reverse so ordering matches the general
+/// path's `cmp_multi_key` exactly (including the ±INF NULL placements
+/// and full-precision text keys). `seq` is production order: ties keep
+/// the earliest-produced rows, matching what the general path's stable
+/// in-budget sort yields. The `BinaryHeap` is a max-heap, so `peek()`
+/// is the worst kept row.
+///
+/// v7.37.16 — `keys` moved from `Vec<f64>` (DESC pre-encoded by
+/// negation) to `Vec<OrderKey>`: text keys can't be negated, so DESC
+/// is now applied by `cmp_multi_key` via the carried `descs`.
 struct TopNEntry {
-    keys: Vec<f64>,
+    keys: Vec<OrderKey>,
+    descs: alloc::rc::Rc<[bool]>,
     seq: u64,
     row: Row<'static>,
-}
-
-impl TopNEntry {
-    fn cmp_keys(a: &[f64], b: &[f64]) -> core::cmp::Ordering {
-        for (ka, kb) in a.iter().zip(b.iter()) {
-            let ord = ka.partial_cmp(kb).unwrap_or(core::cmp::Ordering::Equal);
-            if ord != core::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        core::cmp::Ordering::Equal
-    }
 }
 
 impl PartialEq for TopNEntry {
@@ -483,7 +478,7 @@ impl PartialOrd for TopNEntry {
 }
 impl Ord for TopNEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        Self::cmp_keys(&self.keys, &other.keys).then(self.seq.cmp(&other.seq))
+        cmp_multi_key(&self.keys, &other.keys, &self.descs).then(self.seq.cmp(&other.seq))
     }
 }
 
@@ -2640,7 +2635,8 @@ impl Engine {
             .map(|c| !prunable || needed.contains(&(primary_alias.clone(), c.name.clone())))
             .collect();
         let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
-        let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+        let descs: alloc::rc::Rc<[bool]> =
+            stmt.order_by.iter().map(|o| o.desc).collect::<Vec<bool>>().into();
         let mut where_memo = memoize::MemoizeCache::default();
         let mut heap: alloc::collections::BinaryHeap<TopNEntry> =
             alloc::collections::BinaryHeap::new();
@@ -2727,20 +2723,10 @@ impl Engine {
                         break 'scan;
                     }
                 } else {
-                    let raw = build_order_keys(&stmt.order_by, &combined, &ctx)?;
-                    let keys: Vec<f64> = raw
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, k)| {
-                            if descs.get(i).copied().unwrap_or(false) {
-                                -k
-                            } else {
-                                k
-                            }
-                        })
-                        .collect();
+                    let keys = build_order_keys(&stmt.order_by, &combined, &ctx)?;
                     let entry = TopNEntry {
                         keys,
+                        descs: alloc::rc::Rc::clone(&descs),
                         seq,
                         row: combined,
                     };

@@ -392,12 +392,59 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 ///
 /// `tagged` holds `(Option<f64>, Row)` (the SELECT path) — `None` keys
 /// sort last in ascending order, mirroring NULL-sorts-last in SQL.
+/// v7.37.16 — one ORDER BY sort-key component. Numeric-shaped values
+/// (int / float / date / numeric / time / money / …) keep the
+/// lossless-enough `f64` fast path; TEXT carries the FULL string so
+/// values sharing a long common prefix (`product_001` vs
+/// `product_002`, ISO timestamps stored as text, prefixed IDs / SKUs)
+/// order by their exact bytes rather than the old ~6-byte f64 coarse
+/// key (which packed only the first 8 bytes into an f64 mantissa and
+/// tied past ~6 bytes). Text comparison is byte-lexicographic, which
+/// matches PG's default C / binary collation (SPG's collations are
+/// byte-order). NULLs continue to ride the `Num(±INFINITY)` sentinel
+/// the builders emit, so NULLS FIRST/LAST placement is unchanged.
+#[derive(Clone, PartialEq)]
+pub(crate) enum OrderKey {
+    Num(f64),
+    Text(alloc::string::String),
+}
+
+/// Compare two sort-key components (before any per-key DESC reverse).
+/// Same-type pairs use the exact comparator; the only cross-type pairs
+/// in practice are a NULL sentinel (`Num(±INF)`) meeting a `Text` value
+/// (a NULL in a text column) — `+INF` sorts last, `-INF` first. A
+/// finite `Num` vs `Text` (heterogeneous ORDER BY expression) is given
+/// a deterministic total order (Num before Text) so the sort stays
+/// total + stable.
+fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a, b) {
+        (OrderKey::Num(x), OrderKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (OrderKey::Text(x), OrderKey::Text(y)) => x.cmp(y),
+        (OrderKey::Num(x), OrderKey::Text(_)) => {
+            if *x == f64::INFINITY {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (OrderKey::Text(_), OrderKey::Num(y)) => {
+            if *y == f64::INFINITY {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+    }
+}
+
 pub(crate) fn partial_sort_tagged(
-    tagged: &mut Vec<(Vec<f64>, Row)>,
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     keep: Option<usize>,
     descs: &[bool],
 ) {
-    let cmp = |a: &(Vec<f64>, Row), b: &(Vec<f64>, Row)| cmp_multi_key(&a.0, &b.0, descs);
+    let cmp =
+        |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
     match keep {
         Some(k) if k < tagged.len() && k > 0 => {
             let pivot = k - 1;
@@ -411,17 +458,19 @@ pub(crate) fn partial_sort_tagged(
     }
 }
 
-pub(crate) fn sort_by_keys(tagged: &mut [(Vec<f64>, Row)], descs: &[bool]) {
+pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) {
     tagged.sort_by(|a, b| cmp_multi_key(&a.0, &b.0, descs));
 }
 
 /// v6.4.0 — multi-key ORDER BY comparator. Each key's per-key DESC
 /// flag is honored independently. NULL is encoded as `f64::INFINITY`
 /// so it sorts last in ASC and first in DESC (matches PG default).
-fn cmp_multi_key(a: &[f64], b: &[f64], descs: &[bool]) -> core::cmp::Ordering {
+/// v7.37.16 — keys are `OrderKey` (numeric fast path OR full text);
+/// see `order_key_elem_cmp`.
+pub(crate) fn cmp_multi_key(a: &[OrderKey], b: &[OrderKey], descs: &[bool]) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for (i, (ka, kb)) in a.iter().zip(b.iter()).enumerate() {
-        let ord = ka.partial_cmp(kb).unwrap_or(Ordering::Equal);
+        let ord = order_key_elem_cmp(ka, kb);
         let ord = if descs.get(i).copied().unwrap_or(false) {
             ord.reverse()
         } else {
@@ -440,7 +489,7 @@ pub(crate) fn build_order_keys(
     order_by: &[OrderBy],
     row: &Row<'static>,
     ctx: &EvalContext,
-) -> Result<Vec<f64>, EngineError> {
+) -> Result<Vec<OrderKey>, EngineError> {
     let mut keys = Vec::with_capacity(order_by.len());
     for o in order_by {
         let v = eval::eval_expr(&o.expr, row, ctx)?;
@@ -452,11 +501,11 @@ pub(crate) fn build_order_keys(
         // first), nf != desc → -INF (the explicit flips).
         if matches!(v, Value::Null) {
             let nf = o.nulls_first.unwrap_or(o.desc);
-            keys.push(if nf == o.desc {
+            keys.push(OrderKey::Num(if nf == o.desc {
                 f64::INFINITY
             } else {
                 f64::NEG_INFINITY
-            });
+            }));
         } else {
             keys.push(value_to_order_key(&v)?);
         }
@@ -496,7 +545,7 @@ pub(crate) fn apply_offset_and_limit(
 /// computed via `build_order_keys`; equal-key detection therefore
 /// matches the sort comparator exactly.
 pub(crate) fn apply_offset_and_limit_tagged(
-    tagged: &mut Vec<(Vec<f64>, Row)>,
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     offset: Option<u32>,
     limit: Option<u32>,
     with_ties: bool,
