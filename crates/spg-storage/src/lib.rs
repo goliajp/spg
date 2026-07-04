@@ -2462,6 +2462,32 @@ pub enum RowChange {
         /// `TxId` is threaded to the storage layer (later slice).
         writer_version: u64,
     },
+    /// v7.37.15 (Epic W durable-tombstone slice) — an **in-place MVCC
+    /// delete**: the row(s) named by `rowids` are NOT physically
+    /// removed; their header `xmax` is stamped so newer snapshots stop
+    /// seeing them (vacuum reclaims later). This is the redo shape of
+    /// the gate-on (`SPG_MVCC_INPLACE`) DELETE / UPDATE-old-version /
+    /// ON-CONFLICT paths, which call [`Table::mark_row_deleted`]
+    /// instead of `delete_rows`.
+    ///
+    /// Unlike `Delete`, the target is named by **stable `RowId`**, not
+    /// physical position: a tombstone keeps the slot, so position would
+    /// be ambiguous after later compaction, and the header-preserving
+    /// replay must re-find the exact row the writer tombstoned. On
+    /// replay the id is matched against the ids the same redo run
+    /// produced (an `Insert`'s `rowid`, or the table's ids snapshotted
+    /// at run start); an id that cannot be resolved is skipped and
+    /// counted (see `apply_redo_run_on_table`) — this is the documented
+    /// cross-checkpoint limitation until the V6 envelope persists ids.
+    Tombstone {
+        table: String,
+        /// Stable ids of the tombstoned rows (from `self.rowids()[pos]`
+        /// at capture). Never empty for a recorded tombstone.
+        rowids: Vec<row_header::RowId>,
+        /// The version stamped into each target row's header `xmax`
+        /// (the deleting statement's writer version).
+        xmax: u64,
+    },
 }
 
 impl RowChange {
@@ -2477,6 +2503,19 @@ impl RowChange {
             RowChange::Insert { writer_version, .. }
             | RowChange::Update { writer_version, .. }
             | RowChange::Delete { writer_version, .. } => *writer_version = v,
+            // A tombstone captures `xmax` directly from the deleting
+            // statement's version at record time (via
+            // `mark_row_deleted`), so it already equals `v`. Keep the
+            // "one statement, one version" invariant mechanical by
+            // asserting agreement in debug builds rather than silently
+            // overwriting a possibly-different value.
+            RowChange::Tombstone { xmax, .. } => {
+                debug_assert_eq!(
+                    *xmax, v,
+                    "tombstone xmax must match the statement writer version"
+                );
+                *xmax = v;
+            }
         }
     }
 }
@@ -2495,6 +2534,25 @@ const REDO_META_MARKER: u8 = 0xFF;
 /// layout that follows [`REDO_META_MARKER`]. Bumped when the per-change
 /// metadata shape changes; an unknown value is a hard decode error.
 const REDO_META_VERSION: u8 = 1;
+
+/// v7.37.15 (Epic W durable-tombstone slice) — process-wide count of
+/// [`RowChange::Tombstone`] targets that `apply_redo` could NOT resolve
+/// to a row by `RowId`. A non-zero value is expected only across a
+/// checkpoint boundary (the table's ids are reassigned on deserialize
+/// and the V6 envelope does not yet persist them), where a tombstone
+/// naming a pre-checkpoint row is left visible rather than mis-applied.
+/// Surfaced for observability; never affects correctness of the resolved
+/// tombstones. Read via [`unresolved_tombstone_count`].
+static UNRESOLVED_TOMBSTONES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.15 (Epic W durable-tombstone slice) — read the process-wide
+/// count of redo tombstones that could not be resolved to a row by
+/// `RowId` during `apply_redo`. See [`UNRESOLVED_TOMBSTONES`].
+#[must_use]
+pub fn unresolved_tombstone_count() -> u64 {
+    UNRESOLVED_TOMBSTONES.load(core::sync::atomic::Ordering::Relaxed)
+}
 // Provably-unambiguous old/new distinction: the pre-Epic-W layout's
 // first byte is `FILE_VERSION`, which must stay strictly below the
 // marker forever.
@@ -2510,6 +2568,9 @@ const _: () = assert!(FILE_VERSION < REDO_META_MARKER);
 /// - `Insert [u32 n][value×n][u64 rowid][u64 writer_version]`
 /// - `Update [u32 pos][u32 n][value×n][u64 rowid][u64 writer_version]`
 /// - `Delete [u32 n][u32 pos×n][u64 rowid×n][u64 writer_version]`
+/// - `Tombstone [u32 n][u64 rowid×n][u64 xmax]` (op byte 3; only ever
+///   emitted under the metadata-carrying layout — the pre-Epic-W layout
+///   had no in-place tombstone, so a legacy stream can never carry it)
 ///
 /// Positions are physical (u32 ≤ 4 G rows). The `FILE_VERSION` byte
 /// still rides along (now the 3rd byte) so the value codec decodes
@@ -2587,6 +2648,19 @@ pub fn encode_redo_log(changes: &[RowChange]) -> Vec<u8> {
                     codec::write_u64(&mut out, rid.0);
                 }
                 codec::write_u64(&mut out, *writer_version);
+            }
+            RowChange::Tombstone {
+                table,
+                rowids,
+                xmax,
+            } => {
+                out.push(3);
+                codec::write_str(&mut out, table);
+                codec::write_u32(&mut out, rowids.len() as u32);
+                for rid in rowids {
+                    codec::write_u64(&mut out, rid.0);
+                }
+                codec::write_u64(&mut out, *xmax);
             }
         }
     }
@@ -2701,6 +2775,23 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
                     positions,
                     rowids,
                     writer_version,
+                }
+            }
+            // Op 3 is the Epic W in-place tombstone — it only exists in
+            // the metadata-carrying layout. Guarding on `has_meta` means
+            // a legacy stream that happens to contain a `3` byte here is
+            // reported as an unknown op (corruption), never mis-decoded.
+            3 if has_meta => {
+                let n = cur.read_u32()? as usize;
+                let mut rowids = Vec::with_capacity(n);
+                for _ in 0..n {
+                    rowids.push(row_header::RowId(cur.read_u64()?));
+                }
+                let xmax = cur.read_u64()?;
+                RowChange::Tombstone {
+                    table,
+                    rowids,
+                    xmax,
                 }
             }
             other => {
@@ -3807,7 +3898,8 @@ impl Catalog {
             let table = match change {
                 RowChange::Insert { table, .. }
                 | RowChange::Update { table, .. }
-                | RowChange::Delete { table, .. } => table.clone(),
+                | RowChange::Delete { table, .. }
+                | RowChange::Tombstone { table, .. } => table.clone(),
             };
             if runs.last().map(|(t, _)| t.as_str()) != Some(table.as_str()) {
                 runs.push((table, alloc::vec::Vec::new()));
@@ -3852,6 +3944,30 @@ impl Catalog {
         // original_rows.len()). Map -> new values.
         let mut overlay: alloc::collections::BTreeMap<usize, alloc::vec::Vec<Value<'static>>> =
             alloc::collections::BTreeMap::new();
+        // v7.37.15 (Epic W durable-tombstone slice) — extra bookkeeping
+        // ONLY when this run actually carries an in-place `Tombstone`.
+        // A tombstone keeps its row physically present but stamps `xmax`
+        // on the header; the run finalizer `set_rows_and_rebuild_indices`
+        // freezes every header (and reassigns ids), so we must re-stamp
+        // in a post-pass keyed by RowId. When the run has no tombstone
+        // (every default gate-off replay) this is all skipped and the
+        // path below stays byte-for-byte the legacy one.
+        let has_tomb = run
+            .iter()
+            .any(|c| matches!(c, RowChange::Tombstone { .. }));
+        // Ids of the pre-existing rows, snapshotted parallel to
+        // `original_rows`, and ids of the tail rows filled from each
+        // `Insert`'s carried `rowid`. Together they let a tombstone name
+        // the exact row the writer stamped, independent of the ids the
+        // finalizer will hand out. (When `!has_tomb`, both stay empty.)
+        let orig_rowids: alloc::vec::Vec<row_header::RowId> = if has_tomb {
+            table.rowids().iter().copied().collect()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let mut tail_rowids: alloc::vec::Vec<row_header::RowId> = alloc::vec::Vec::new();
+        // (RowId, xmax) of every row this run tombstones.
+        let mut tomb_targets: alloc::vec::Vec<(row_header::RowId, u64)> = alloc::vec::Vec::new();
         // Helper: given a "current" position (i.e. position in
         // the post-prior-deletes layout), translate to the
         // ABSOLUTE position in the unified live + tail space
@@ -3881,7 +3997,7 @@ impl Catalog {
         }
         for change in run {
             match *change {
-                RowChange::Insert { row, .. } => {
+                RowChange::Insert { row, rowid, .. } => {
                     // Validate against schema before recording the
                     // change so a corrupt log surfaces as an error
                     // rather than silently mis-applying.
@@ -3892,6 +4008,12 @@ impl Catalog {
                         });
                     }
                     tail.push(row.clone());
+                    if has_tomb {
+                        // Keep the id lock-step with `tail` so a later
+                        // tombstone in this same run can find the row by
+                        // the id the writer captured for it.
+                        tail_rowids.push(*rowid);
+                    }
                 }
                 RowChange::Update { pos, new_row, .. } => {
                     if new_row.len() != table.schema().columns.len() {
@@ -3975,11 +4097,28 @@ impl Catalog {
                     to_flip_tail.dedup();
                     for off in to_flip_tail.into_iter().rev() {
                         tail.remove(off);
+                        if has_tomb {
+                            // Keep the id vector lock-step with `tail`
+                            // so a tombstone still resolves correctly
+                            // when a physical Delete precedes it in the
+                            // same run.
+                            tail_rowids.remove(off);
+                        }
                         // Re-key tail-relative overlay entries that
                         // were past `off` — in practice tail edits
                         // are applied directly so the overlay map
                         // only holds existing-row keys; nothing to
                         // do here.
+                    }
+                }
+                RowChange::Tombstone { rowids, xmax, .. } => {
+                    // An in-place tombstone leaves the row physically
+                    // present — it does not touch `live` / `tail` /
+                    // `overlay`. Record the (id, xmax) targets; the
+                    // post-finalizer pass re-stamps `xmax` onto the
+                    // matching row's (otherwise-frozen) header.
+                    for rid in rowids {
+                        tomb_targets.push((*rid, *xmax));
                     }
                 }
             }
@@ -3990,6 +4129,10 @@ impl Catalog {
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
         let mut new_hot_bytes: u64 = 0;
         let schema_snapshot = table.schema().clone();
+        // Parallel to `new_rows` (only built when `has_tomb`): the RowId
+        // of each row in its FINAL slot, so the post-pass can map a
+        // tombstone target id → the slot to re-stamp `xmax` on.
+        let mut final_rowids: alloc::vec::Vec<row_header::RowId> = alloc::vec::Vec::new();
         for (i, row) in original_rows.into_iter().enumerate() {
             if !live[i] {
                 continue;
@@ -4002,13 +4145,73 @@ impl Catalog {
             new_hot_bytes = new_hot_bytes
                 .saturating_add(row_body_encoded_len(&final_row, &schema_snapshot) as u64);
             new_rows.push_mut(final_row);
+            if has_tomb {
+                final_rowids.push(
+                    orig_rowids
+                        .get(i)
+                        .copied()
+                        .unwrap_or(row_header::RowId::UNASSIGNED),
+                );
+            }
         }
-        for row in tail {
+        for (off, row) in tail.into_iter().enumerate() {
             new_hot_bytes =
                 new_hot_bytes.saturating_add(row_body_encoded_len(&row, &schema_snapshot) as u64);
             new_rows.push_mut(row);
+            if has_tomb {
+                final_rowids.push(
+                    tail_rowids
+                        .get(off)
+                        .copied()
+                        .unwrap_or(row_header::RowId::UNASSIGNED),
+                );
+            }
         }
         table.set_rows_and_rebuild_indices(new_rows, new_hot_bytes);
+        // v7.37.15 (Epic W durable-tombstone slice) — header-preserving
+        // re-stamp. `set_rows_and_rebuild_indices` above froze every
+        // header, so any row this run tombstoned is currently all-
+        // visible again. Re-apply the `xmax` stamp by matching the
+        // tombstone's target RowId against the final-slot id map. This
+        // is what makes a gate-on DELETE durable across replay without
+        // changing the on-disk snapshot format (headers/ids are still
+        // NOT serialised — that is the deferred V6 coupling; see below).
+        if has_tomb && !tomb_targets.is_empty() {
+            let mut id_to_slot: alloc::collections::BTreeMap<row_header::RowId, usize> =
+                alloc::collections::BTreeMap::new();
+            for (slot, rid) in final_rowids.iter().enumerate() {
+                if *rid != row_header::RowId::UNASSIGNED {
+                    id_to_slot.insert(*rid, slot);
+                }
+            }
+            let table = self.get_mut(table_name).ok_or_else(|| {
+                StorageError::Corrupt(alloc::format!("redo: unknown table {table_name:?}"))
+            })?;
+            for (rid, xmax) in &tomb_targets {
+                match id_to_slot.get(rid) {
+                    Some(&slot) => {
+                        // First-deleter-wins + bounds handled inside.
+                        let _ = table.mark_row_deleted(slot, *xmax);
+                    }
+                    None => {
+                        // The target row was not produced by THIS redo
+                        // run and its id was not in the run-start
+                        // snapshot — the documented cross-checkpoint
+                        // limitation: after a checkpoint restore the
+                        // table's ids are reassigned (not yet persisted
+                        // in the envelope), so a tombstone naming a
+                        // pre-checkpoint row cannot be resolved by id.
+                        // Skipping leaves the row visible (identical to
+                        // the pre-Epic-W non-durable behaviour); it is
+                        // never a correctness regression, only an
+                        // unclosed durability gap the V6 envelope slice
+                        // closes. Counted for observability.
+                        UNRESOLVED_TOMBSTONES
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
