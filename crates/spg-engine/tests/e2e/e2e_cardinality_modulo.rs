@@ -86,12 +86,12 @@ fn modulo_precedence_with_multiplication() {
 }
 
 #[test]
-fn modulo_on_negative_uses_rem_euclid() {
+fn modulo_on_negative_takes_sign_of_dividend() {
     let mut e = Engine::new();
-    // `rem_euclid` semantics: result has the sign of the divisor.
-    //   (-7) rem_euclid 3 = 2
+    // PG `%` is truncated-division remainder: the sign follows the
+    // DIVIDEND, so `(-7) % 3 = -1` (PG18.4-verified), not the Euclidean 2.
     let r = e.execute("SELECT (-7) % 3").expect("negative dividend");
-    assert_eq!(first_value(r), Value::Int(2));
+    assert_eq!(first_value(r), Value::Int(-1));
 }
 
 #[test]

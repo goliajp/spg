@@ -563,3 +563,18 @@ fn regexp_family_case_insensitive_flag() {
     ck(&mut e, r#"regexp_count('AbAb', 'a')"#, r#"0"#);
     ck(&mut e, r#"regexp_substr('HELLO', 'l+', 1, 1)"#, r#"<NULL>"#);
 }
+
+/// The `%` operator is truncated-division remainder (sign of the dividend),
+/// matching PG / C / the mod() function — was Euclidean (always non-negative),
+/// so `-5 % 3` returned 1 instead of -2. PG18.4-verified.
+#[test]
+fn modulo_operator_sign_of_dividend() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(-5 % 3)"#, r#"-2"#);
+    ck(&mut e, r#"(5 % -3)"#, r#"2"#);
+    ck(&mut e, r#"(-5 % -3)"#, r#"-2"#);
+    ck(&mut e, r#"(5 % 3)"#, r#"2"#);
+    // mod() function already matched and stays consistent.
+    ck(&mut e, r#"mod(-5, 3)"#, r#"-2"#);
+    ck(&mut e, r#"mod(-5, 3) = (-5 % 3)"#, r#"true"#);
+}
