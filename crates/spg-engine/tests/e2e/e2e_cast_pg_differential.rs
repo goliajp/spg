@@ -1361,3 +1361,16 @@ fn circle_box_bare_input() {
     ck(&mut e, "('0,0,2,2'::box)::text", "(2,2),(0,0)");
     ck(&mut e, "('(0,0),(2,2)'::box)::text", "(2,2),(0,0)");
 }
+
+/// v7.37 D — INTERVAL accepts ISO 8601 durations (`P1Y2M3DT4H`) and PG's
+/// year-month shorthand (`1-2`). PG18.4-verified.
+#[test]
+fn interval_iso8601_and_yearmonth() {
+    let mut e = Engine::new();
+    ck(&mut e, "('P1Y2M3DT4H'::interval)::text", "1 year 2 mons 3 days 04:00:00");
+    ck(&mut e, "('P1Y2M3D'::interval)::text", "1 year 2 mons 3 days");
+    ck(&mut e, "('PT1H30M'::interval)::text", "01:30:00");
+    ck(&mut e, "('1-2'::interval)::text", "1 year 2 mons");
+    // control: the `<n> <unit>` word form still works.
+    ck(&mut e, "('1 year 2 mons 3 days'::interval)::text", "1 year 2 mons 3 days");
+}
