@@ -535,6 +535,11 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
 fn to_char_numeric(n: f64, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
+    // `PR` suffix: PG's accounting-negative notation — a negative value is
+    // wrapped in angle brackets with no minus sign (`<1234.50>`), a
+    // non-negative one gets a trailing space where the `>` would sit.
+    let has_pr = pat.len() >= 2 && pat[pat.len() - 2..].eq_ignore_ascii_case("PR");
+    let pat = if has_pr { &pat[..pat.len() - 2] } else { pat };
     let has_sign_tok = pat.chars().any(|c| c == 'S' || c == 's');
 
     // Split around the decimal separator ('.', 'D', or 'd').
@@ -577,7 +582,10 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     let value_is_zero = scaled == 0;
     // A value that rounds to exactly zero carries no sign in PG.
     let neg = n < 0.0 && !value_is_zero;
-    let sign_str: &str = if neg {
+    let sign_str: &str = if has_pr {
+        // PR shows the sign via brackets, applied as a post-pass below.
+        ""
+    } else if neg {
         "-"
     } else if has_sign_tok {
         "+"
@@ -654,6 +662,19 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
         } else if frac_digits > 0 {
             out.push('.');
             out.push_str(&fs);
+        }
+    }
+    if has_pr {
+        if neg {
+            // Consume the reserved sign column with `<` and append `>`.
+            let trimmed = out.trim_start();
+            let lead = out.chars().count() - trimmed.chars().count();
+            out = alloc::format!(
+                "{}<{trimmed}>",
+                " ".repeat(lead.saturating_sub(1))
+            );
+        } else if !fill_mode {
+            out.push(' ');
         }
     }
     out
