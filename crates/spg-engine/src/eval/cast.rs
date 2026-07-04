@@ -568,6 +568,11 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
                 })
         }
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
+        // PG `bit`/`varbit` → int is the MSB-first bit value.
+        #[allow(clippy::cast_possible_truncation)]
+        Value::BitString { nbits, bytes } => {
+            Ok(Value::Int(crate::conversions::bit_string_to_i64(nbits, &bytes) as i32))
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to int", other.data_type()),
         }),
@@ -598,6 +603,10 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
                 })
         }
         Value::Bool(b) => Ok(Value::BigInt(i64::from(b))),
+        // PG `bit`/`varbit` → bigint is the MSB-first bit value.
+        Value::BitString { nbits, bytes } => {
+            Ok(Value::BigInt(crate::conversions::bit_string_to_i64(nbits, &bytes)))
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to bigint", other.data_type()),
         }),

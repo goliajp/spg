@@ -12196,7 +12196,10 @@ impl Parser {
                 }
                 body
             };
-            return Ok(Expr::Cast {
+            // Route through the postfix-cast loop so a chained cast like
+            // `B'1010'::int` attaches onto the implicit `::bit` cast instead
+            // of erroring at the `::`.
+            return self.finish_postfix_casts(Expr::Cast {
                 expr: Box::new(Expr::Literal(Literal::String(bits))),
                 target: CastTarget::Named("bit".to_string()),
             });

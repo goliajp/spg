@@ -199,6 +199,10 @@ fn apply_function_dispatch(
                     let n = i32::try_from(b.len()).unwrap_or(i32::MAX);
                     Ok(Value::Int(n))
                 }
+                // PG length(bit) is the number of bits.
+                Value::BitString { nbits, .. } => {
+                    Ok(Value::Int(i32::try_from(*nbits).unwrap_or(i32::MAX)))
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("length() needs text or bytea, got {:?}", other.data_type()),
                 }),
@@ -2717,6 +2721,10 @@ fn apply_function_dispatch(
                     let bits = bytes.saturating_mul(8);
                     let n = i32::try_from(bits).unwrap_or(i32::MAX);
                     Ok(Value::Int(n))
+                }
+                // PG bit_length(bit) is the bit count itself, not ×8.
+                Value::BitString { nbits, .. } => {
+                    Ok(Value::Int(i32::try_from(*nbits).unwrap_or(i32::MAX)))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
