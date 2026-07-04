@@ -12246,6 +12246,16 @@ impl Parser {
                     expr: Box::new(e),
                 })
             }
+            Token::DoubleBang => {
+                self.advance();
+                // tsquery `!!` prefix negation — lowered to the catalog
+                // function. Binds like unary minus.
+                let e = self.parse_expr(8)?;
+                Ok(Expr::FunctionCall {
+                    name: String::from("tsquery_not"),
+                    args: alloc::vec![e],
+                })
+            }
             _ => self.parse_atom(),
         }
     }

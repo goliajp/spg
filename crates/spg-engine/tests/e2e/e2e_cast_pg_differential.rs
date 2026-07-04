@@ -964,3 +964,15 @@ fn range_adjacent_operator() {
     // control: subtraction still works (a-b), not mislexed as -|-.
     ck(&mut e, "(10 - 3)::text", "7");
 }
+
+/// tsquery `!!` prefix negation — new lexer token, lowers to tsquery_not.
+/// PG18.4-verified.
+#[test]
+fn tsquery_double_bang() {
+    let mut e = Engine::new();
+    ck(&mut e, "(!! 'cat'::tsquery)::text", "!'cat'");
+    ck(&mut e, "(!! 'cat & dog'::tsquery)::text", "!( 'cat' & 'dog' )");
+    ck(&mut e, "('cat'::tsquery && !! 'dog'::tsquery)::text", "'cat' & !'dog'");
+    // control: != still works (not mislexed as !!).
+    ck(&mut e, "(1 != 2)::text", "true");
+}

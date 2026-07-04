@@ -181,6 +181,8 @@ pub enum Token {
     Hash,
     /// Range "is adjacent to" operator `-|-`.
     Adjacent,
+    /// tsquery prefix negation operator `!!`.
+    DoubleBang,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
     Is,
     Between,
@@ -646,6 +648,11 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             }
             b'&' => {
                 single(&mut out, Token::Amp, &mut i);
+            }
+            b'!' if peek_eq(bytes, i + 1, b'!') => {
+                // tsquery `!!` prefix negation. Two bangs, ahead of `!=`/`!~`.
+                out.push(Token::DoubleBang);
+                i += 2;
             }
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
