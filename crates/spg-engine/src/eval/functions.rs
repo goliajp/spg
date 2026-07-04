@@ -1857,6 +1857,24 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(core::f64::consts::PI))
         }
+        // point(x, y) — the geometric-point constructor.
+        "point" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("point() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let x = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "point() needs numeric x".into(),
+            })?;
+            let y = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "point() needs numeric y".into(),
+            })?;
+            Ok(Value::Point(spg_storage::Point2D { x, y }))
+        }
         "gcd" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {

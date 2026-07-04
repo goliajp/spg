@@ -228,15 +228,32 @@ pub(super) fn apply_binary(
             });
         }
     }
-    // PG `point ± point` translates a point by another's coordinates.
+    // PG `point ± point` translates a point by another's coordinates;
+    // `point * point` / `point / point` are complex-number multiply/divide
+    // (PG treats a point as the complex number x + yi).
     if let (Value::Point(a), Value::Point(b)) = (&l, &r) {
-        if op == BinOp::Add || op == BinOp::Sub {
-            let (x, y) = if op == BinOp::Add {
-                (a.x + b.x, a.y + b.y)
-            } else {
-                (a.x - b.x, a.y - b.y)
-            };
-            return Ok(Value::Point(spg_storage::Point2D { x, y }));
+        match op {
+            BinOp::Add => {
+                return Ok(Value::Point(spg_storage::Point2D { x: a.x + b.x, y: a.y + b.y }));
+            }
+            BinOp::Sub => {
+                return Ok(Value::Point(spg_storage::Point2D { x: a.x - b.x, y: a.y - b.y }));
+            }
+            BinOp::Mul => {
+                // (a.x + a.y i)(b.x + b.y i)
+                return Ok(Value::Point(spg_storage::Point2D {
+                    x: a.x * b.x - a.y * b.y,
+                    y: a.x * b.y + a.y * b.x,
+                }));
+            }
+            BinOp::Div => {
+                let denom = b.x * b.x + b.y * b.y;
+                return Ok(Value::Point(spg_storage::Point2D {
+                    x: (a.x * b.x + a.y * b.y) / denom,
+                    y: (a.y * b.x - a.x * b.y) / denom,
+                }));
+            }
+            _ => {}
         }
     }
     // MONEY arithmetic (integer cents) before the generic numeric path.

@@ -976,3 +976,15 @@ fn tsquery_double_bang() {
     // control: != still works (not mislexed as !!).
     ck(&mut e, "(1 != 2)::text", "true");
 }
+
+/// point(x, y) constructor + point `*` (complex multiply) / `/` (complex
+/// divide). Distance `<->` and `+`/`-` already worked. PG18.4-verified.
+#[test]
+fn point_constructor_and_mul() {
+    let mut e = Engine::new();
+    ck(&mut e, "point(1,2)::text", "(1,2)");
+    ck(&mut e, "(point(0,0) <-> point(3,4))::text", "5");
+    ck(&mut e, "(point(1,2) + point(3,4))::text", "(4,6)");
+    ck(&mut e, "(point(2,3) * point(1,0))::text", "(2,3)");
+    ck(&mut e, "(point(1,1) * point(0,1))::text", "(-1,1)"); // i*(1+i) = -1+i
+}
