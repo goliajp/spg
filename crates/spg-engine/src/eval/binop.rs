@@ -1124,14 +1124,17 @@ fn arith(
     let r = widen(r);
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
+            // PG: int4 <op> int4 -> int4; a result that doesn't fit int4 is
+            // "integer out of range", NOT a silent widening to bigint. This
+            // matches SPG's own `::int` cast, which already errors on
+            // overflow — the arithmetic path must agree.
             let result = int_op(i64::from(a), i64::from(b)).ok_or(EvalError::TypeMismatch {
                 detail: format!("integer overflow on {op_name}"),
             })?;
-            if let Ok(small) = i32::try_from(result) {
-                Ok(Value::Int(small))
-            } else {
-                Ok(Value::BigInt(result))
-            }
+            let small = i32::try_from(result).map_err(|_| EvalError::TypeMismatch {
+                detail: "integer out of range".into(),
+            })?;
+            Ok(Value::Int(small))
         }
         (Value::Int(a), Value::BigInt(b)) | (Value::BigInt(b), Value::Int(a)) => {
             let result = int_op(i64::from(a), b).ok_or(EvalError::TypeMismatch {
