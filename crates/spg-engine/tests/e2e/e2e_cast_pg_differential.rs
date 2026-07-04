@@ -1039,3 +1039,17 @@ fn geo_containment() {
     // control: array containment unaffected.
     ck(&mut e, "(ARRAY[1,2,3] @> ARRAY[2])::text", "true");
 }
+
+/// Geometric `TYPE 'literal'` typed-literal-prefix spelling (point '(1,2)'
+/// == '(1,2)'::point). PG18.4-verified.
+#[test]
+fn geometric_typed_literals() {
+    let mut e = Engine::new();
+    ck(&mut e, "(point '(1,2)')::text", "(1,2)");
+    ck(&mut e, "(circle '<(0,0),5>')::text", "<(0,0),5>");
+    ck(&mut e, "(lseg '[(0,0),(1,1)]')::text", "[(0,0),(1,1)]");
+    ck(&mut e, "(polygon '((0,0),(1,1),(2,0))')::text", "((0,0),(1,1),(2,0))");
+    ck(&mut e, "(box '(1,1),(2,2)')::text", "(2,2),(1,1)");
+    // it composes with operators now.
+    ck(&mut e, "(circle '<(0,0),5>' @> point '(3,3)')::text", "true");
+}

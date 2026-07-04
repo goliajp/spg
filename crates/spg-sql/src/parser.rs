@@ -15109,7 +15109,11 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
         // generic Named path (engine resolves via column_type_to_data_type).
         "time" | "timetz" | "smallint" | "int2" | "numeric" | "decimal"
         | "real" | "float4" | "inet" | "cidr" | "macaddr" | "macaddr8"
-        | "money" | "bit" | "varbit" => CastTarget::Named(alloc::string::String::from(ident)),
+        | "money" | "bit" | "varbit"
+        // Geometric types accept the `TYPE 'literal'` prefix spelling too.
+        | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
+            CastTarget::Named(alloc::string::String::from(ident))
+        }
         _ => return None,
     })
 }
