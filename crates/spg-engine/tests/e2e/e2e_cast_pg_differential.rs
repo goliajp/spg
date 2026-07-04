@@ -489,3 +489,20 @@ fn interval_fractional_units() {
     ck(&mut e, r#"interval '1.5 years'"#, r#"1 year 6 mons"#);
     ck(&mut e, r#"interval '1.5 months 2.5 hours'"#, r#"1 mon 15 days 02:30:00"#);
 }
+
+/// PG `TYPE 'literal'` typed literals for the scalar type family (== the
+/// `'literal'::TYPE` cast). Only date/timestamp/timestamptz/interval worked
+/// before; time/bool/int/numeric/uuid errored. PG18.4-verified.
+#[test]
+fn typed_literals_scalar_family() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"time '10:30:00'"#, r#"10:30:00"#);
+    ck(&mut e, r#"bool 'true'"#, r#"true"#);
+    ck(&mut e, r#"int '42'"#, r#"42"#);
+    ck(&mut e, r#"bigint '9000000000'"#, r#"9000000000"#);
+    ck(&mut e, r#"numeric '3.14'"#, r#"3.14"#);
+    ck(&mut e, r#"uuid '00000000-0000-0000-0000-000000000001'"#, r#"00000000-0000-0000-0000-000000000001"#);
+    // regression: the datetime typed literals still work.
+    ck(&mut e, r#"date '2024-01-15'"#, r#"2024-01-15"#);
+    ck(&mut e, r#"timestamp '2024-01-15 10:30:00'"#, r#"2024-01-15 10:30:00"#);
+}

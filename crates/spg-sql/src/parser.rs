@@ -12299,16 +12299,11 @@ impl Parser {
             // string must follow immediately, else the ident stays a
             // plain column reference.
             Token::Ident(s)
-                if matches!(
-                    s.to_ascii_lowercase().as_str(),
-                    "date" | "timestamp" | "timestamptz"
-                ) && matches!(self.peek(), Token::String(_)) =>
+                if typed_literal_cast_target(&s.to_ascii_lowercase()).is_some()
+                    && matches!(self.peek(), Token::String(_)) =>
             {
-                let target = match s.to_ascii_lowercase().as_str() {
-                    "date" => CastTarget::Date,
-                    "timestamp" => CastTarget::Timestamp,
-                    _ => CastTarget::Timestamptz,
-                };
+                let target = typed_literal_cast_target(&s.to_ascii_lowercase())
+                    .expect("guard checked");
                 let Token::String(lit) = self.advance() else {
                     unreachable!("peek guaranteed a string token");
                 };
@@ -14990,6 +14985,33 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
         i += 2;
     }
     Some((months, days, micros))
+}
+
+/// v7.37 — map a scalar type keyword to its [`CastTarget`] for the PG
+/// `TYPE 'literal'` typed-literal syntax (`time '10:30'` == `'10:30'::time`).
+/// `interval` is intentionally absent (handled by its own parser arm).
+/// Returns `None` for names that aren't sensible as a bare typed literal, so
+/// the caller falls back to treating the ident as a column reference.
+fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
+    Some(match ident {
+        "date" => CastTarget::Date,
+        "timestamp" | "datetime" => CastTarget::Timestamp,
+        "timestamptz" => CastTarget::Timestamptz,
+        "bool" | "boolean" => CastTarget::Bool,
+        "int" | "integer" | "int4" => CastTarget::Int,
+        "bigint" | "int8" => CastTarget::BigInt,
+        "float8" | "double precision" => CastTarget::Float,
+        "uuid" => CastTarget::Uuid,
+        "bytea" => CastTarget::Bytea,
+        "json" => CastTarget::Json,
+        "jsonb" => CastTarget::Jsonb,
+        // Types without a dedicated CastTarget variant flow through the
+        // generic Named path (engine resolves via column_type_to_data_type).
+        "time" | "timetz" | "smallint" | "int2" | "numeric" | "decimal"
+        | "real" | "float4" | "inet" | "cidr" | "macaddr" | "macaddr8"
+        | "money" | "bit" | "varbit" => CastTarget::Named(alloc::string::String::from(ident)),
+        _ => return None,
+    })
 }
 
 /// v7.12.4 — map a bare type-name identifier (the form that
