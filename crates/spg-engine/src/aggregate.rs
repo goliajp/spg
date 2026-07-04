@@ -334,6 +334,10 @@ struct AggState {
     sum_iv_days: i64,
     sum_iv_micros: i128,
     use_interval: bool,
+    /// v7.37 — `sum(money)` accumulator (integer cents). PG has `sum(money)`
+    /// but no `avg(money)`. Gated by `use_money`.
+    sum_money: i128,
+    use_money: bool,
     /// v7.17.0 — running collection for string_agg / array_agg.
     /// Each entry is one row's contribution (NULL preserved as
     /// `Value::Null`; string_agg's finalize step drops them, but
@@ -1164,6 +1168,8 @@ fn accumulate_groups(
         let mut sum_iv_days: i64 = 0;
         let mut sum_iv_micros: i128 = 0;
         let mut use_interval = false;
+        let mut sum_money: i128 = 0;
+        let mut use_money = false;
         let mut count: i64 = 0;
         // Borrow-aware fast inner: avoid the per-row clone when arg
         // is a bound column position.
@@ -1203,6 +1209,11 @@ fn accumulate_groups(
                         sum_iv_days += i64::from(*days);
                         sum_iv_micros += i128::from(*micros);
                         use_interval = true;
+                        count += 1;
+                    }
+                    Value::Money(c) => {
+                        sum_money += i128::from(*c);
+                        use_money = true;
                         count += 1;
                     }
                     other => {
@@ -1283,6 +1294,11 @@ fn accumulate_groups(
                         use_interval = true;
                         count += 1;
                     }
+                    Value::Money(c) => {
+                        sum_money += i128::from(c);
+                        use_money = true;
+                        count += 1;
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -1303,6 +1319,8 @@ fn accumulate_groups(
         state.sum_iv_days = sum_iv_days;
         state.sum_iv_micros = sum_iv_micros;
         state.use_interval = use_interval;
+        state.sum_money = sum_money;
+        state.use_money = use_money;
         return Ok(order);
     }
     // v7.37.x (mailrs Track A 100k attack) — tight inlined loop for
@@ -2841,6 +2859,10 @@ fn update_state(
                     st.sum_iv_days += i64::from(*days);
                     st.sum_iv_micros += i128::from(*micros);
                 }
+                Value::Money(c) => {
+                    st.use_money = true;
+                    st.sum_money += i128::from(*c);
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
@@ -3128,6 +3150,8 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     days: st.sum_iv_days as i32,
                     micros: st.sum_iv_micros as i64,
                 }
+            } else if st.use_money {
+                Value::Money(st.sum_money as i64)
             } else if st.use_numeric {
                 // Exact NUMERIC sum (PG18: sum(numeric) → numeric). Fold
                 // any integer contributions (scale 0) into the running
@@ -3170,6 +3194,12 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     days: (day_out + days_from_month) as i32,
                     micros: micros as i64,
                 }
+            } else if st.use_money {
+                // PG has no avg(money); we accept it as a sensible superset —
+                // average of the cent totals, rounded half-away-from-zero.
+                let n = i128::from(st.count);
+                let q = (st.sum_money * 2 + if st.sum_money >= 0 { n } else { -n }) / (2 * n);
+                Value::Money(q as i64)
             } else if st.use_numeric {
                 // Exact NUMERIC avg = numeric_div(sum, count) at PG's
                 // display scale (select_div_scale).
@@ -4161,6 +4191,19 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::SmallInt(x), Value::SmallInt(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        // Money (integer cents) — without this arm min/max(money) fell to the
+        // `_ => Equal` fallback and kept whichever row arrived first.
+        (Value::Money(x), Value::Money(y)) => x.cmp(y),
+        (Value::Interval { months: xm, days: xd, micros: xu },
+         Value::Interval { months: ym, days: yd, micros: yu }) => {
+            // Compare on total micros (a month = 30 days), matching PG ordering.
+            let tot = |mo: i32, d: i32, u: i64| -> i128 {
+                i128::from(mo) * 30 * 86_400_000_000
+                    + i128::from(d) * 86_400_000_000
+                    + i128::from(u)
+            };
+            tot(*xm, *xd, *xu).cmp(&tot(*ym, *yd, *yu))
+        }
         // Cross integer widths — min/max over a column whose cells
         // land in mixed integer variants (literal-seeded rows, casts).
         (Value::SmallInt(x), Value::Int(y)) => i32::from(*x).cmp(y),
