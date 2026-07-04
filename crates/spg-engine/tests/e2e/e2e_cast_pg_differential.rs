@@ -804,3 +804,18 @@ fn inet_set_masklen_and_abbrev() {
     ck(&mut e, r#"host('192.168.1.5/24'::inet)"#, r#"192.168.1.5"#);
     ck(&mut e, r#"masklen('192.168.1.5/24'::inet)::text"#, r#"24"#);
 }
+
+/// BUG: numrange @> a float element returned false (bound_cmp fell through to
+/// Equal for mixed numeric/float, wrongly excluding the exclusive upper).
+/// PG18.4-verified.
+#[test]
+fn numrange_contains_float_element() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(numrange(1.5,3.5) @> 2.5)::text"#, r#"true"#);
+    ck(&mut e, r#"(numrange(1.5,3.5) @> 3.5)::text"#, r#"false"#); // exclusive upper
+    ck(&mut e, r#"(numrange(1.5,3.5) @> 1.5)::text"#, r#"true"#);  // inclusive lower
+    ck(&mut e, r#"(numrange(1.5,3.5) @> 0.5)::text"#, r#"false"#);
+    ck(&mut e, r#"(2.5 <@ numrange(1.5,3.5))::text"#, r#"true"#);
+    // control: integer range containment unchanged.
+    ck(&mut e, r#"(int4range(1,10) @> 5)::text"#, r#"true"#);
+}

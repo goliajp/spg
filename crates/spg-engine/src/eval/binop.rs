@@ -1751,7 +1751,28 @@ fn bound_cmp(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
         (Value::Numeric { scaled: xs, scale: xc }, Value::Numeric { scaled: ys, scale: yc }) => {
             numeric_pair_cmp((*xs, *xc), (*ys, *yc))
         }
-        _ => Ordering::Equal,
+        // Mixed real-number bounds/elements (e.g. `numrange(1.5,3.5) @> 2.5`
+        // where the literal lexes as float but the range bounds are numeric):
+        // compare as f64 so containment doesn't silently fall through to Equal.
+        _ => match (num_as_f64(a), num_as_f64(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            _ => Ordering::Equal,
+        },
+    }
+}
+
+/// The f64 value of any real-number scalar, for cross-type bound comparison.
+#[allow(clippy::cast_precision_loss)]
+fn num_as_f64(v: &Value<'_>) -> Option<f64> {
+    match v {
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::Int(n) => Some(f64::from(*n)),
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        Value::Numeric { scaled, scale } => {
+            Some(*scaled as f64 / 10i128.pow(u32::from(*scale)) as f64)
+        }
+        _ => None,
     }
 }
 
