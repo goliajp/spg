@@ -15111,7 +15111,11 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
         | "real" | "float4" | "inet" | "cidr" | "macaddr" | "macaddr8"
         | "money" | "bit" | "varbit"
         // Geometric types accept the `TYPE 'literal'` prefix spelling too.
-        | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
+        | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+        // Range / multirange types likewise.
+        | "int4range" | "int8range" | "numrange" | "daterange" | "tsrange"
+        | "tstzrange" | "int4multirange" | "int8multirange" | "nummultirange"
+        | "datemultirange" | "tsmultirange" | "tstzmultirange" => {
             CastTarget::Named(alloc::string::String::from(ident))
         }
         _ => return None,
