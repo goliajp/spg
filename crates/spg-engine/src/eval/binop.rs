@@ -566,35 +566,21 @@ pub(crate) fn apply_binary_interval(
             signed_micros,
         )?))),
         Value::Date(d) => {
-            // Date + interval stays a date when the interval has zero
-            // sub-day microseconds; otherwise promote to TIMESTAMP at
-            // midnight of the (months-shifted, days-shifted) date.
-            if signed_micros == 0 {
-                let shifted = shift_date_by_months(*d, signed_months)?;
-                let new_days =
-                    i64::from(shifted)
-                        .checked_add(signed_days)
-                        .ok_or(EvalError::TypeMismatch {
-                            detail: "DATE ± INTERVAL overflows DATE range".into(),
-                        })?;
-                let days32 = i32::try_from(new_days).map_err(|_| EvalError::TypeMismatch {
-                    detail: "DATE ± INTERVAL overflows DATE range".into(),
+            // PG: `date ± interval` ALWAYS yields TIMESTAMP (rendered at
+            // midnight when the interval has no sub-day part), because the
+            // interval may carry a time component. `date ± integer` stays a
+            // date, but that is a different operator handled elsewhere.
+            let base = i64::from(*d)
+                .checked_mul(86_400_000_000)
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
                 })?;
-                Ok(Some(Value::Date(days32)))
-            } else {
-                let base =
-                    i64::from(*d)
-                        .checked_mul(86_400_000_000)
-                        .ok_or(EvalError::TypeMismatch {
-                            detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
-                        })?;
-                Ok(Some(Value::Timestamp(add_interval_to_micros(
-                    base,
-                    signed_months,
-                    signed_days,
-                    signed_micros,
-                )?)))
-            }
+            Ok(Some(Value::Timestamp(add_interval_to_micros(
+                base,
+                signed_months,
+                signed_days,
+                signed_micros,
+            )?)))
         }
         Value::Interval {
             months: lhs_months,
@@ -2406,8 +2392,8 @@ mod tests {
     }
 
     #[test]
-    fn interval_date_plus_pure_days_stays_date() {
-        // DATE + INTERVAL '7 days' must stay DATE.
+    fn interval_date_plus_pure_days_lifts_to_timestamp() {
+        // PG: DATE + INTERVAL '7 days' yields TIMESTAMP at midnight, not DATE.
         let d = days_from_civil(2024, 6, 1);
         let lhs = Value::Date(d);
         let rhs = Value::Interval {
@@ -2418,8 +2404,8 @@ mod tests {
         let v = apply_binary_interval(BinOp::Add, &lhs, &rhs)
             .unwrap()
             .unwrap();
-        let expected = days_from_civil(2024, 6, 8);
-        assert_eq!(v, Value::Date(expected));
+        let expected = i64::from(days_from_civil(2024, 6, 8)) * 86_400_000_000;
+        assert_eq!(v, Value::Timestamp(expected));
     }
 
     #[test]
