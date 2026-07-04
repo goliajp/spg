@@ -308,6 +308,15 @@ pub(super) fn apply_binary(
             return Ok(Value::Inet { family, bits, addr: new_addr });
         }
     }
+    // PG `path + path` concatenates the two point lists (both taken open);
+    // the result is an open path. Verified vs PG18.4.
+    if op == BinOp::Add {
+        if let (Value::Path { points: pa, .. }, Value::Path { points: pb, .. }) = (&l, &r) {
+            let mut points = pa.clone();
+            points.extend_from_slice(pb);
+            return Ok(Value::Path { points, closed: false });
+        }
+    }
     // PG `point ± point` translates a point by another's coordinates;
     // `point * point` / `point / point` are complex-number multiply/divide
     // (PG treats a point as the complex number x + yi).

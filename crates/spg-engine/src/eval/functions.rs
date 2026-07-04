@@ -182,6 +182,22 @@ fn apply_function_dispatch(
                     let (dx, dy) = (b.x - a.x, b.y - a.y);
                     Ok(Value::Float(f64_sqrt(dx * dx + dy * dy)))
                 }
+                // `length(path)` — total length of the polyline; a closed path
+                // adds the wrap-around segment (last -> first).
+                Value::Path { points, closed } => {
+                    let seg = |a: &spg_storage::Point2D, b: &spg_storage::Point2D| {
+                        let (dx, dy) = (b.x - a.x, b.y - a.y);
+                        f64_sqrt(dx * dx + dy * dy)
+                    };
+                    let mut total = 0.0;
+                    for w in points.windows(2) {
+                        total += seg(&w[0], &w[1]);
+                    }
+                    if *closed && points.len() >= 2 {
+                        total += seg(&points[points.len() - 1], &points[0]);
+                    }
+                    Ok(Value::Float(total))
+                }
                 Value::Text(s) => {
                     // v7.36 (perf — mailrs Ask 1) — ASCII fast path.
                     // `s.is_ascii()` is SIMD-vectorised; for the 1 KB
