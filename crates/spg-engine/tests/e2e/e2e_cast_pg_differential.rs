@@ -951,3 +951,16 @@ fn bit_xor_operator() {
     ck(&mut e, "(12 # 10)::text", "6");
     ck(&mut e, "(255 # 0)::text", "255");
 }
+
+/// Range `-|-` "is adjacent to" — new lexer token + operator. PG18.4-verified.
+#[test]
+fn range_adjacent_operator() {
+    let mut e = Engine::new();
+    ck(&mut e, "(int4range(1,5) -|- int4range(5,10))::text", "true");
+    ck(&mut e, "(int4range(1,5) -|- int4range(6,10))::text", "false"); // gap
+    ck(&mut e, "(int4range(1,5) -|- int4range(4,10))::text", "false"); // overlap
+    ck(&mut e, "('[1,5]'::int4range -|- '[6,10]'::int4range)::text", "true");
+    ck(&mut e, "(numrange(1.0,5.0) -|- numrange(5.0,9.0))::text", "true");
+    // control: subtraction still works (a-b), not mislexed as -|-.
+    ck(&mut e, "(10 - 3)::text", "7");
+}

@@ -12781,6 +12781,24 @@ fn apply_function_dispatch(
             };
             Ok(Value::Bool(result))
         }
+        // range_adjacent(a, b) — the `-|-` operator: the ranges touch at
+        // exactly one bound with no gap and no overlap.
+        "range_adjacent" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("range_adjacent() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            match super::binop::range_adjacent_pair(&args[0], &args[1]) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Err(EvalError::TypeMismatch {
+                    detail: "range_adjacent() takes 2 range args".into(),
+                }),
+            }
+        }
         // range_merge(a, b) — the smallest range containing both.
         // Numeric bounds compare numerically, others lexically.
         "range_merge" => {

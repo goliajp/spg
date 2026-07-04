@@ -179,6 +179,8 @@ pub enum Token {
     CaretAt,
     /// Integer XOR operator `#`.
     Hash,
+    /// Range "is adjacent to" operator `-|-`.
+    Adjacent,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
     Is,
     Between,
@@ -442,9 +444,14 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             }
             b'?' => single(&mut out, Token::JsonKeyExists, &mut i),
             b'-' => {
+                // Range `-|-` "is adjacent to" — longest match ahead of `->`.
+                if peek_eq(bytes, i + 1, b'|') && peek_eq(bytes, i + 2, b'-') {
+                    out.push(Token::Adjacent);
+                    i += 3;
+                }
                 // v4.14: `->>` and `->` for JSON path access. `->>`
                 // must be tried before `->` (longest match).
-                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
+                else if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::JsonGetText);
                     i += 3;
                 } else if peek_eq(bytes, i + 1, b'>') {
