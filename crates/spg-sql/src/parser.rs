@@ -9240,8 +9240,32 @@ impl Parser {
             "cidr" => ColumnTypeName::Cidr,
             "macaddr" => ColumnTypeName::Macaddr,
             "macaddr8" => ColumnTypeName::Macaddr8,
-            "bit" => ColumnTypeName::Bit,
-            "varbit" => ColumnTypeName::BitVarying,
+            // `bit`, `bit(N)`, `bit varying`, `bit varying(N)`. SPG carries the
+            // width in the value, so the optional `(N)` typmod is accepted and
+            // ignored (the column stores whatever width it's given).
+            "bit" => {
+                let varying = matches!(
+                    self.peek(),
+                    Token::Ident(k) if k.eq_ignore_ascii_case("varying")
+                );
+                if varying {
+                    self.advance();
+                }
+                if matches!(self.peek(), Token::LParen) {
+                    let _ = self.parse_paren_size("BIT")?;
+                }
+                if varying {
+                    ColumnTypeName::BitVarying
+                } else {
+                    ColumnTypeName::Bit
+                }
+            }
+            "varbit" => {
+                if matches!(self.peek(), Token::LParen) {
+                    let _ = self.parse_paren_size("VARBIT")?;
+                }
+                ColumnTypeName::BitVarying
+            }
             "xml" => ColumnTypeName::Xml,
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
             "hstore" => ColumnTypeName::Hstore,
