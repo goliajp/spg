@@ -386,6 +386,24 @@ pub(super) fn apply_binary(
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // range `<<` / `>>` — strictly left / right of. Claims the operator
+        // ahead of the bitstring / integer-shift / inet interpretations when
+        // both operands are ranges.
+        BinOp::InetContainedBy | BinOp::InetContains
+            if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
+        {
+            let (
+                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
+                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+            ) = (&l, &r) else { unreachable!() };
+            // `a >> b` is `b << a`.
+            let strictly_left = if matches!(op, BinOp::InetContainedBy) {
+                range_strictly_left(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
+            } else {
+                range_strictly_left(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae)
+            };
+            Ok(Value::Bool(strictly_left))
+        }
         // bit(n) << / >> k: shift within the fixed-width bit string. Claims
         // the operator ahead of the integer-shift and inet interpretations.
         BinOp::InetContainedBy | BinOp::InetContains
@@ -2153,6 +2171,31 @@ fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'
             if f == 0.0 { Err(EvalError::DivisionByZero) } else { Ok(Value::Money(round_cents(*a as f64 / f))) }
         }),
         _ => None,
+    }
+}
+
+/// Range `<<` "strictly left of": every point of `a` is less than every point
+/// of `b`. True when `a`'s upper bound value is below `b`'s lower bound value;
+/// at an equal boundary they must not both be inclusive (else the shared point
+/// overlaps). Unbounded sides on the touching edges make it false.
+#[allow(clippy::too_many_arguments)]
+fn range_strictly_left(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> bool {
+    use core::cmp::Ordering;
+    if ae || be {
+        return false;
+    }
+    let (_, _, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, _, _) = range_canonical(bk, bl, bu, bli, bui);
+    match (&au2, &bl2) {
+        (None, _) | (_, None) => false,
+        (Some(u), Some(l)) => match bound_cmp(u, l) {
+            Ordering::Less => true,
+            Ordering::Equal => !(aui2 && bli2),
+            Ordering::Greater => false,
+        },
     }
 }
 
