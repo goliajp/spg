@@ -1405,3 +1405,16 @@ fn numeric_scientific_notation() {
     // control: plain decimal unchanged.
     ck(&mut e, "('3.14'::numeric)::text", "3.14");
 }
+
+
+/// v7.37 D — DATE accepts the compact ISO basic form `YYYYMMDD` and both DATE
+/// and TIMESTAMP accept the special value `epoch`. PG18.4-verified.
+#[test]
+fn date_compact_and_epoch() {
+    let mut e = Engine::new();
+    ck(&mut e, "('20240115'::date)::text", "2024-01-15");
+    ck(&mut e, "('epoch'::date)::text", "1970-01-01");
+    ck(&mut e, "('epoch'::timestamp)::text", "1970-01-01 00:00:00");
+    // control: hyphenated date unchanged; invalid compact rejected downstream.
+    ck(&mut e, "('2024-01-15'::date)::text", "2024-01-15");
+}
