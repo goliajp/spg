@@ -1309,3 +1309,19 @@ fn case_result_type() {
     // control: all-text CASE unchanged.
     ck(&mut e, "(CASE WHEN true THEN 'a' ELSE 'b' END)::text", "a");
 }
+
+/// v7.37 D.2 — `<time|interval|timestamp> + <string literal>` coerces the
+/// literal to INTERVAL (the only `+` those types have). PG18.4-verified.
+/// `date + text` stays a "not unique" error, matching PG.
+#[test]
+fn temporal_plus_text() {
+    let mut e = Engine::new();
+    ck(&mut e, "('10:00'::time + '30 minutes')::text", "10:30:00");
+    ck(&mut e, "('1 day'::interval + '12 hours')::text", "1 day 12:00:00");
+    ck(&mut e, "('30 minutes' + '10:00'::time)::text", "10:30:00");
+    ck(&mut e, "('2024-01-01 10:00'::timestamp + '1 hour')::text", "2024-01-01 11:00:00");
+    // control: time + interval (typed) still works.
+    ck(&mut e, "('10:00'::time + '30 minutes'::interval)::text", "10:30:00");
+    // date + text stays an error (ambiguous) — matches PG.
+    assert_eq!(cast(&mut e, "'2024-01-01'::date + '5 days'"), "ERR");
+}
