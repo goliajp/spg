@@ -1166,3 +1166,21 @@ fn orderby_byte_types() {
     assert_eq!(rows(&mut e, &["CREATE TABLE t4 (x uuid)","INSERT INTO t4 VALUES ('550e8400-e29b-41d4-a716-446655440000'),('00000000-0000-0000-0000-000000000001')"], "SELECT x::text FROM t4 ORDER BY x"), "Text(\"00000000-0000-0000-0000-000000000001\"),Text(\"550e8400-e29b-41d4-a716-446655440000\")");
     assert_eq!(rows(&mut e, &["CREATE TABLE t5 (x bytea)","INSERT INTO t5 VALUES ('\\xff'),('\\x01'),('\\x80')"], "SELECT x::text FROM t5 ORDER BY x DESC"), "Text(\"\\\\xff\"),Text(\"\\\\x80\"),Text(\"\\\\x01\")");
 }
+
+/// ORDER BY interval — was explicitly rejected; PG orders by total time
+/// (month = 30 days). PG18.4-verified: 1hr < 90min < 1day < 1mon.
+#[test]
+fn orderby_interval() {
+    let mut e = Engine::new();
+    let rows = |e: &mut Engine, setup: &[&str], q: &str| -> String {
+        for s in setup { e.execute(s).unwrap(); }
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows.iter().map(|r| format!("{:?}", r.values[0])).collect::<Vec<_>>().join(","),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(rows(&mut e, &["CREATE TABLE iv (x interval)","INSERT INTO iv VALUES ('1 day'),('1 hour'),('1 month'),('90 minutes')"], "SELECT x::text FROM iv ORDER BY x"),
+        "Text(\"01:00:00\"),Text(\"01:30:00\"),Text(\"1 day\"),Text(\"1 mon\")");
+    assert_eq!(rows(&mut e, &["CREATE TABLE iv2 (x interval)","INSERT INTO iv2 VALUES ('1 day'),('1 hour'),('1 month')"], "SELECT x::text FROM iv2 ORDER BY x DESC"),
+        "Text(\"1 mon\"),Text(\"1 day\"),Text(\"01:00:00\")");
+}

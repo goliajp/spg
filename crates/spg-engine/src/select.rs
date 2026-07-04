@@ -4185,12 +4185,17 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                 "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
             ));
         }
-        Value::Interval { .. } => {
-            return Err(EngineError::Unsupported(
-                "ORDER BY of an INTERVAL is not supported in v2.11 \
-                 (months vs micros has no single canonical ordering)"
-                    .into(),
-            ));
+        // v7.37 — PG orders INTERVAL by its total time, treating a month as
+        // 30 days (`1 hour < 90 min < 1 day < 1 mon`). Project to total micros;
+        // f64 is exact for any interval under ~285 years, and only ORDER BY
+        // tie-breaks past that magnitude lose precision. Matches the
+        // min/max(interval) comparator in aggregate.rs.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Interval { months, days, micros } => {
+            let total = i128::from(*months) * 30 * 86_400_000_000
+                + i128::from(*days) * 86_400_000_000
+                + i128::from(*micros);
+            total as f64
         }
         Value::Json(_) => {
             return Err(EngineError::Unsupported(
