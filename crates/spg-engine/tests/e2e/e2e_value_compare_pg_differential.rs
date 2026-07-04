@@ -488,3 +488,16 @@ fn multirange_ordering() {
         "t",
     ); // 2nd span upper decides
 }
+
+#[test]
+fn tsvector_equality() {
+    // PG tsvector `=`: lexemes are sorted + deduped with their positions, so
+    // equality is order-independent but position-sensitive. Captured live
+    // from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    ck(&mut e, "SELECT 'foo bar'::tsvector = 'foo bar'::tsvector", "t");
+    ck(&mut e, "SELECT 'bar foo'::tsvector = 'foo bar'::tsvector", "t"); // order-independent
+    ck(&mut e, "SELECT 'foo:1'::tsvector = 'foo:2'::tsvector", "f"); // positions matter
+    ck(&mut e, "SELECT 'foo foo bar'::tsvector = 'foo bar'::tsvector", "t"); // deduped
+    ck(&mut e, "SELECT 'foo'::tsvector <> 'bar'::tsvector", "t");
+}
