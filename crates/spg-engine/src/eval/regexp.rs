@@ -23,7 +23,9 @@ use super::{EvalError, text_arg};
 //   * literal characters (with `\.`, `\*`, `\+`, `\?`, `\(`, `\)`,
 //     `\[`, `\]`, `\\`, `\^`, `\$`, `\|` escapes)
 //   * `.` — any single character
-//   * `*`, `+`, `?` — greedy quantifiers
+//   * `*`, `+`, `?` — greedy quantifiers, plus their lazy /
+//     non-greedy `*?` `+?` `??` forms (match the fewest reps, take
+//     more only when the continuation fails; PG18-compatible)
 //   * counted repetition `{m}`, `{m,}`, `{m,n}` (v7.37.16 Epic Rx;
 //     repetition counts are capped at 65535 — PG's `DUPMAX` — and a
 //     bound above that is rejected as an invalid regular expression
@@ -39,10 +41,6 @@ use super::{EvalError, text_arg};
 //   * lookaround `(?=…)` `(?<=…)`
 //   * named captures
 //   * inline flag groups `(?i)`
-//   * lazy quantifiers `*?` `+?` `??` — patterns containing `?` after
-//     a quantifier are accepted but interpreted as the greedy form
-//     (this is the v7.17 stop-gap; customers needing lazy semantics
-//     should preprocess the pattern)
 //
 // The matcher uses a backtracking NFA-shaped walk; performance is fine
 // for the small strings PG regex functions usually operate on.
@@ -163,11 +161,19 @@ enum ReNode {
     /// Consumes no input; asserts on the word-ness of the chars flanking
     /// the current position. See `WordBoundaryKind`.
     WordBoundary(WordBoundaryKind),
-    /// Greedy quantifier.
+    /// Repetition quantifier. `greedy` = the PG default (`X*`, `X+`,
+    /// `X?`, `X{m,n}`): match as MANY reps as possible, give back on
+    /// backtrack. `greedy == false` is the lazy / non-greedy form (the
+    /// `?`-suffixed `X*?`, `X+?`, `X??`, `X{m,n}?`): match as FEW reps
+    /// as possible, take more only when the continuation fails. Both
+    /// forms reach the SAME set of end positions and run under the SAME
+    /// ReDoS step/depth guards — only the order the matcher tries those
+    /// positions differs (longest-first vs shortest-first).
     Quant {
         inner: Box<ReNode>,
         min: usize,
         max: Option<usize>,
+        greedy: bool,
     },
     /// Concatenation of sub-nodes.
     Concat(Vec<ReNode>),
@@ -258,35 +264,37 @@ fn re_parse_concat(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, 
             match chars[*p] {
                 '*' => {
                     *p += 1;
-                    // v7.17 stop-gap: tolerate `*?` lazy quantifier
-                    // by treating it as greedy. Skip the trailing
-                    // `?` if present.
-                    if *p < chars.len() && chars[*p] == '?' {
-                        *p += 1;
-                    }
+                    // A trailing `?` makes the quantifier lazy
+                    // (non-greedy): `X*?`. Consume it and record the
+                    // laziness on the node.
+                    let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
                         inner: Box::new(atom),
                         min: 0,
                         max: None,
+                        greedy,
                     }
                 }
                 '+' => {
                     *p += 1;
-                    if *p < chars.len() && chars[*p] == '?' {
-                        *p += 1;
-                    }
+                    let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
                         inner: Box::new(atom),
                         min: 1,
                         max: None,
+                        greedy,
                     }
                 }
                 '?' => {
                     *p += 1;
+                    // `X??` — lazy optional. The second `?` is the
+                    // laziness marker, not a literal.
+                    let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
                         inner: Box::new(atom),
                         min: 0,
                         max: Some(1),
+                        greedy,
                     }
                 }
                 '{' => {
@@ -298,15 +306,14 @@ fn re_parse_concat(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, 
                     // unaffected.
                     match re_parse_bound(chars, p)? {
                         Some((min, max)) => {
-                            // Tolerate a lazy suffix `{m,n}?` as greedy,
-                            // matching this module's `*?` / `+?` stop-gap.
-                            if *p < chars.len() && chars[*p] == '?' {
-                                *p += 1;
-                            }
+                            // A trailing `?` makes the counted
+                            // repetition lazy: `X{m,n}?`.
+                            let greedy = !consume_lazy_suffix(chars, p);
                             ReNode::Quant {
                                 inner: Box::new(atom),
                                 min,
                                 max,
+                                greedy,
                             }
                         }
                         None => atom,
@@ -599,6 +606,19 @@ fn re_scan_count(chars: &[char], p: &mut usize) -> (usize, usize) {
     (val, digits)
 }
 
+/// If the character at `*p` is a `?` (a lazy / non-greedy marker
+/// immediately after a quantifier), consume it and return `true`;
+/// otherwise leave `*p` unchanged and return `false`. The caller sets
+/// `greedy = !consume_lazy_suffix(...)`.
+fn consume_lazy_suffix(chars: &[char], p: &mut usize) -> bool {
+    if *p < chars.len() && chars[*p] == '?' {
+        *p += 1;
+        true
+    } else {
+        false
+    }
+}
+
 fn class_matches(member: &ClassMember, c: char) -> bool {
     match member {
         ClassMember::Single(s) => *s == c,
@@ -763,13 +783,25 @@ fn re_match_at(
             }
             Ok(None)
         }
-        ReNode::Quant { inner, min, max } => {
-            // Standalone quantifier (no tail) — the longest match
-            // IS correct here; tail interaction is handled by
-            // re_match_seq.
+        ReNode::Quant {
+            inner,
+            min,
+            max,
+            greedy,
+        } => {
+            // Standalone quantifier (no tail). Greedy → the LONGEST
+            // match (match as many reps as fit). Lazy → the FEWEST
+            // (match exactly `min` reps, then stop). Tail interaction is
+            // handled by re_match_seq; here there is nothing to satisfy
+            // beyond the quantifier, so both directions collapse to a
+            // single answer.
             let mut count = 0usize;
             let mut p = pos;
             loop {
+                // Lazy: once the minimum is reached, take no more reps.
+                if !*greedy && count >= *min {
+                    break;
+                }
                 if let Some(cap) = max {
                     if count >= *cap {
                         break;
@@ -820,9 +852,19 @@ fn re_match_seq(
         return Ok(Some(pos));
     };
     match first {
-        ReNode::Quant { inner, min, max } => {
+        ReNode::Quant {
+            inner,
+            min,
+            max,
+            greedy,
+        } => {
             // Enumerate every reachable end position (0, 1, 2, ...
-            // repetitions), then try the tail longest-first.
+            // repetitions). The reachable set is identical for greedy
+            // and lazy; only the ORDER in which we try the tail against
+            // those ends differs — greedy tries longest-first (max reps,
+            // give back), lazy tries shortest-first (min reps, take
+            // more only when the tail fails). Both honor the same
+            // `[min, max]` bound and the same step/depth guards.
             let mut ends = alloc::vec![pos];
             let mut p = pos;
             let mut count = 0usize;
@@ -841,11 +883,24 @@ fn re_match_seq(
                     _ => break,
                 }
             }
-            for (reps, &end) in ends.iter().enumerate().rev() {
+            // Try the tail at each reachable rep count. Greedy walks
+            // high→low (longest first, give back); lazy walks low→high
+            // (shortest first, take more). A single loop keeps this
+            // recursive frame small — the P0 `MATCH_DEPTH_LIMIT` no-
+            // overflow proof (`redos_deep_match_returns_err_not_overflow`)
+            // is calibrated against this frame size.
+            let n = ends.len(); // entries for reps = 0 ..= count
+            for i in 0..n {
+                let reps = if *greedy { n - 1 - i } else { i };
                 if reps < *min {
-                    break;
+                    // Greedy descends past min → done; lazy ascends past
+                    // the below-min reps → skip and keep climbing.
+                    if *greedy {
+                        break;
+                    }
+                    continue;
                 }
-                if let Some(e) = re_match_seq(rest, s, end, d, steps)? {
+                if let Some(e) = re_match_seq(rest, s, ends[reps], d, steps)? {
                     return Ok(Some(e));
                 }
             }
@@ -950,9 +1005,12 @@ fn matchall_length_bounds(node: &ReNode) -> Option<(usize, Option<usize>)> {
     for atom in &items[1..items.len() - 1] {
         let (amin, amax) = match atom {
             ReNode::AnyChar => (1usize, Some(1usize)),
-            ReNode::Quant { inner, min, max } if matches!(**inner, ReNode::AnyChar) => {
-                (*min, *max)
-            }
+            // Greedy vs lazy is irrelevant to a whole-string length
+            // test — the reachable length window is the same — so the
+            // `greedy` flag is ignored here.
+            ReNode::Quant {
+                inner, min, max, ..
+            } if matches!(**inner, ReNode::AnyChar) => (*min, *max),
             _ => return None,
         };
         if amax != Some(amin) {
@@ -1976,10 +2034,25 @@ mod pg18_differential_tests {
             ("ab12cd", "[[:digit:]]+", Some("12")),
             ("a1!", "[[:alpha:][:digit:]]+", Some("a1")),
             ("a5", r"[\d]+", Some("5")),
-            // controls
+            // controls (greedy)
             ("aXbXb", "a.*b", Some("aXbXb")),
             ("aaab", "a+", Some("aaa")),
             ("aaaa", "a{2,3}", Some("aaa")),
+            // ── lazy (non-greedy) quantifiers — PG18-captured spans ──
+            // Every span below was read from live PG18 (regexp_match /
+            // substring); the greedy control immediately above proves
+            // greedy semantics are unchanged by the lazy addition.
+            ("axbxb", "a.*?b", Some("axb")), // lazy `.*?` stops at first b
+            ("aaa", "a+?", Some("a")),       // lazy `+?` takes the minimum 1
+            ("<a><b>", "<.*?>", Some("<a>")),
+            ("abcabc", "a.*?c", Some("abc")), // substring(... from ...) span
+            ("a", "a??", Some("")),           // lazy optional prefers 0 → empty
+            ("xaa", "xa??", Some("x")),       // 0 reps of the lazy optional
+            ("abc", ".*?", Some("")),         // lazy star prefers empty match
+            ("abc", ".+?", Some("a")),        // lazy plus takes one char
+            ("aaaa", "a{2,5}?", Some("aa")),  // lazy bound takes the minimum 2
+            ("aaaab", "a{2,5}?b", Some("aaaab")), // takes more until tail fits
+            ("abab", "(ab)+?", Some("ab")),   // lazy group takes one rep
         ];
         for &(text, pat, want) in span_cases {
             let got = span(text, pat);
@@ -2020,10 +2093,9 @@ mod pg18_differential_tests {
         // SPG : leftmost-first branch wins → {a}
         assert_eq!(span("ab", "a|ab"), Some("a".to_string()));
 
-        // Lazy quantifiers are parsed but treated as greedy.
-        // PG18: regexp_match('axbxb','a.*?b') = {axb}
-        // SPG : greedy → {axbxb}
-        assert_eq!(span("axbxb", "a.*?b"), Some("axbxb".to_string()));
+        // (Lazy / non-greedy quantifiers `*? +? ?? {m,n}?` are now
+        //  implemented — see the lazy span cases in
+        //  `pg18_differential_corpus`. No longer deferred.)
 
         // Backreferences — architectural (ReNode has no capture state).
         // PG18: 'abab' ~ '(ab)\1' = true
