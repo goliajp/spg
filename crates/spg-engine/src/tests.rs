@@ -1793,6 +1793,53 @@ fn mvcc_inplace_update_tombstones_old_and_shows_new() {
 }
 
 #[test]
+fn mvcc_inplace_aggregate_hides_tombstoned_row() {
+    // Phase C.3 step 2: with the in-place gate ON, DELETE tombstones a
+    // row instead of physically removing it. The single-table aggregate
+    // full-scan path (`run_single_table_aggregate`) was ungated before
+    // this step, so COUNT/SUM tallied the tombstoned row. Now gated, the
+    // aggregate must exclude it: count(*)=2 and sum(id) omits id=2.
+    let read_int = |v: &Value| -> i64 {
+        match v {
+            Value::Int(n) => i64::from(*n),
+            Value::BigInt(n) => *n,
+            other => panic!("expected integer aggregate, got {other:?}"),
+        }
+    };
+    let agg_scalar = |e: &Engine, sql: &str| -> i64 {
+        let QueryResult::Rows { rows, .. } = e.execute_readonly(sql).unwrap() else {
+            panic!("expected Rows from {sql}");
+        };
+        read_int(&rows[0].values[0])
+    };
+
+    // Gate-ON: the tombstoned row must be excluded from the aggregate.
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    assert_eq!(
+        agg_scalar(&e, "SELECT count(*) FROM t"),
+        2,
+        "gate-on aggregate must not count the tombstoned row"
+    );
+    assert_eq!(
+        agg_scalar(&e, "SELECT sum(id) FROM t"),
+        4,
+        "gate-on sum(id) must exclude the tombstoned id=2 (1+3=4)"
+    );
+
+    // Gate-OFF control: physical delete, count/sum equally correct.
+    let mut c = Engine::new();
+    c.execute("CREATE TABLE t (id INT)").unwrap();
+    c.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    c.execute("DELETE FROM t WHERE id = 2").unwrap();
+    assert_eq!(agg_scalar(&c, "SELECT count(*) FROM t"), 2);
+    assert_eq!(agg_scalar(&c, "SELECT sum(id) FROM t"), 4);
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};
