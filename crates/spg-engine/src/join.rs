@@ -662,7 +662,22 @@ impl Engine {
                 // NULL-padded outer context. The probe gives us the
                 // projection's column shape; rows materialise per
                 // left-row below.
-                let schema = self.lateral_probe_schema(inner_box)?;
+                let mut schema = self.lateral_probe_schema(inner_box)?;
+                // v7.37.16 — `AS y(a, b)` column-alias list renames the
+                // derived table's columns positionally, exactly as the
+                // FROM-primary derived-table path does (select.rs). The
+                // probe returns the inner SELECT's own column names
+                // (`column1` for a VALUES list, the inner projection
+                // name for a subquery); without this rename a join
+                // right-operand derived table left `y.a` unresolved
+                // while `y.column1` / the inner name worked — a PG
+                // divergence (PG applies the alias list identically in
+                // FROM-primary and join-operand positions).
+                for (i, new_name) in j.table.unnest_column_aliases.iter().enumerate() {
+                    if let Some(col) = schema.get_mut(i) {
+                        col.name = new_name.clone();
+                    }
+                }
                 joined.push(JoinedPeer {
                     eager_rows: None,
                     cols: schema,
