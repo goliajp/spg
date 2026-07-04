@@ -883,3 +883,29 @@ fn create_table_datetime_typmods() {
     let r = e.execute("SELECT h FROM dtm");
     assert!(matches!(r, Ok(spg_engine::QueryResult::Rows { .. })));
 }
+
+/// sum(interval) / avg(interval) — the aggregate accumulator had no interval
+/// state and rejected them. avg uses PG interval_div (month/day remainders
+/// spill into the time field). PG18.4-verified.
+#[test]
+fn agg_interval_sum_avg() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ait (iv interval)").unwrap();
+    e.execute("INSERT INTO ait VALUES ('1 day'),('2 hours'),('30 minutes')").unwrap();
+    let row = |e: &mut Engine, q: &str| -> String {
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(row(&mut e, "SELECT sum(iv)::text FROM ait"), "Text(\"1 day 02:30:00\")");
+    assert_eq!(row(&mut e, "SELECT avg(iv)::text FROM ait"), "Text(\"08:50:00\")");
+    assert_eq!(row(&mut e, "SELECT max(iv)::text FROM ait"), "Text(\"1 day\")");
+    // month component: sum('1 mon','2 mons') = 3 mons; avg = 1 mon 15 days.
+    e.execute("CREATE TABLE ait2 (iv interval)").unwrap();
+    e.execute("INSERT INTO ait2 VALUES ('1 mon'),('2 mons')").unwrap();
+    assert_eq!(row(&mut e, "SELECT sum(iv)::text FROM ait2"), "Text(\"3 mons\")");
+    assert_eq!(row(&mut e, "SELECT avg(iv)::text FROM ait2"), "Text(\"1 mon 15 days\")");
+}
