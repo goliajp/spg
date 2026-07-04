@@ -447,6 +447,8 @@ pub(crate) fn explain_select(
                 spg_sql::ast::JoinKind::Inner => "INNER JOIN",
                 spg_sql::ast::JoinKind::Left => "LEFT JOIN",
                 spg_sql::ast::JoinKind::Cross => "CROSS JOIN",
+                spg_sql::ast::JoinKind::Right => "RIGHT JOIN",
+                spg_sql::ast::JoinKind::FullOuter => "FULL OUTER JOIN",
             };
             let mut s = alloc::format!("{child}{kind}: {}", j.table.name);
             if let Some(alias) = &j.table.alias {

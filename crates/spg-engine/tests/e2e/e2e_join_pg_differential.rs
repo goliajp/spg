@@ -133,6 +133,49 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
         ("P32_left_join_or_on",
          "SELECT coalesce(string_agg(l.v||'-'||coalesce(r.w,'X'), ',' ORDER BY l.v, r.w),'<empty>') FROM l LEFT JOIN r ON l.k=r.k OR l.k=r.k-1",
          "a-B,b-B,b-C,c-C,c-D,n-X"),
+        // v7.37.16 — RIGHT JOIN (promoted from known_gaps). Keeps every
+        // right (r) row; unmatched right rows NULL-fill the left cols.
+        // Output column order is unchanged (l cols then r cols).
+        ("R01_right_count",
+         "SELECT count(*) FROM l RIGHT JOIN r ON l.k=r.k", "4"),
+        ("R02_right_render",
+         "SELECT coalesce(string_agg(coalesce(l.k::text,'N')||':'||coalesce(l.v,'X')||'-'||r.w, ',' ORDER BY r.w),'<empty>') FROM l RIGHT JOIN r ON l.k=r.k",
+         "2:b-B,3:c-C,N:X-D,N:X-m"),
+        // Multi-col ON over two VALUES-derived tables, RIGHT-driven.
+        ("R03_right_multicol",
+         "SELECT coalesce(string_agg(coalesce(x.a::text,'N')||'-'||y.c, ',' ORDER BY y.c, coalesce(x.a::text,'N')),'<empty>') FROM (VALUES (1,10,'a'),(2,20,'b')) AS x(a,b,lab) RIGHT JOIN (VALUES (1,10,'c'),(2,99,'d')) AS y(a,b,c) ON x.a=y.a AND x.b=y.b",
+         "1-c,N-d"),
+        // RIGHT + WHERE filters the joined (incl. NULL-filled) output.
+        ("R04_right_where",
+         "SELECT coalesce(string_agg(coalesce(l.v,'X')||'-'||r.w, ',' ORDER BY r.w),'<empty>') FROM l RIGHT JOIN r ON l.k=r.k WHERE r.k >= 3",
+         "c-C,X-D"),
+        // WHERE l.k IS NULL selects exactly the NULL-filled-left rows.
+        ("R05_right_where_leftnull",
+         "SELECT count(*) FROM l RIGHT JOIN r ON l.k=r.k WHERE l.k IS NULL", "2"),
+        // v7.37.16 — FULL OUTER JOIN (promoted from known_gaps). Keeps
+        // every row from both sides; unmatched either side NULL-fills the
+        // other side's cols.
+        ("F01_full_count",
+         "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k=r.k", "6"),
+        ("F02_full_render",
+         "SELECT coalesce(string_agg(coalesce(l.k::text,'N')||':'||coalesce(l.v,'X')||'-'||coalesce(r.w,'Y'), ',' ORDER BY coalesce(l.k,r.k), l.v, r.w),'<empty>') FROM l FULL OUTER JOIN r ON l.k=r.k",
+         "1:a-Y,2:b-B,3:c-C,N:X-D,N:n-Y,N:X-m"),
+        // Tiebreak on integer keys (x.b/y.b), not text, to stay
+        // collation-agnostic: the join produces {a-c, b-Y, X-d} either
+        // way; a text tiebreak would sort under PG's en_US.utf8 locale
+        // vs SPG's bytewise order and diverge on that axis alone.
+        ("F03_full_multicol",
+         "SELECT coalesce(string_agg(coalesce(x.lab,'X')||'-'||coalesce(y.c,'Y'), ',' ORDER BY coalesce(x.a,y.a), coalesce(x.b,y.b)),'<empty>') FROM (VALUES (1,10,'a'),(2,20,'b')) AS x(a,b,lab) FULL OUTER JOIN (VALUES (1,10,'c'),(2,99,'d')) AS y(a,b,c) ON x.a=y.a AND x.b=y.b",
+         "a-c,b-Y,X-d"),
+        // FULL OUTER JOIN USING(k) — USING desugars to l.k=r.k; count(*)
+        // does not need the merged-column projection (still deferred).
+        ("F04_full_using_count",
+         "SELECT count(*) FROM l FULL OUTER JOIN r USING(k)", "6"),
+        // NULLs in both join keys on both sides — every join-key NULL is
+        // unmatched, so it surfaces on its own side with the other NULL.
+        ("F05_full_null_render",
+         "SELECT coalesce(string_agg(coalesce(l.k::text,'N')||coalesce(r.k::text,'N'), ',' ORDER BY coalesce(l.k,r.k) NULLS LAST, r.k NULLS LAST),'<empty>') FROM l FULL OUTER JOIN r ON l.k=r.k",
+         "1N,22,33,N4,NN,NN"),
     ]
 }
 
@@ -160,27 +203,26 @@ fn join_pg18_differential_corpus() {
 /// Known join features SPG does not yet implement. These are NOT
 /// correctness divergences on supported syntax — they are missing
 /// grammar/executor surface that would need a parser + join-executor
-/// refactor (RIGHT/FULL are absent from `JoinKind`; NATURAL is not
-/// parsed; USING does not merge the join column, leaving it ambiguous
-/// under `SELECT`). Pinning the CURRENT behaviour (an error) here means
-/// the day any of these lands, this test breaks and forces the author
-/// to promote the case into the green `corpus()` above with its live
-/// PG18 answer (recorded in the comment). This is a KNOWN-LIMITATION
-/// ledger, not an assertion that the SPG behaviour is correct.
+/// refactor (NATURAL is not parsed; USING does not merge the join
+/// column, leaving it ambiguous under `SELECT`). Pinning the CURRENT
+/// behaviour (an error) here means the day any of these lands, this test
+/// breaks and forces the author to promote the case into the green
+/// `corpus()` above with its live PG18 answer (recorded in the comment).
+/// This is a KNOWN-LIMITATION ledger, not an assertion that the SPG
+/// behaviour is correct.
+///
+/// v7.37.16 — RIGHT JOIN, FULL OUTER JOIN, and FULL OUTER JOIN USING
+/// (count form) were PROMOTED out of this ledger into `corpus()` above:
+/// `JoinKind` gained `Right` / `FullOuter`, the parser recognises
+/// `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`, and the hash /
+/// nested-loop stages emit unmatched-peer rows (mirror of the LEFT
+/// unmatched-drive emission). USING *column-merge* under a bare
+/// `SELECT k` stays deferred (see below).
 #[test]
 fn join_pg18_known_gaps() {
     let mut e = build();
     // (label, sql, PG18-would-return) — each currently errors in SPG.
     let gaps: &[(&str, &str, &str)] = &[
-        ("RIGHT JOIN",
-         "SELECT count(*) FROM l RIGHT JOIN r ON l.k=r.k",
-         "PG18=4"),
-        ("FULL OUTER JOIN",
-         "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k=r.k",
-         "PG18=6"),
-        ("FULL OUTER JOIN USING",
-         "SELECT count(*) FROM l FULL OUTER JOIN r USING(k)",
-         "PG18=6"),
         ("NATURAL JOIN",
          "SELECT count(*) FROM l NATURAL JOIN r",
          "PG18=2"),

@@ -11562,10 +11562,45 @@ impl Parser {
         (alias, cols)
     }
 
+    /// v7.37.16 — parse a `left(str, n)` / `right(str, n)` function call
+    /// whose keyword token was already consumed and whose `(` is the
+    /// current token. Factored out of `parse_atom` (and marked
+    /// `#[inline(never)]`) so its `Vec`/loop locals stay OFF the giant
+    /// recursive `parse_atom` frame — inlining them there enlarges the
+    /// per-nesting-level stack cost that `MAX_NEST_DEPTH` is tuned
+    /// against, risking an overflow before the budget triggers.
+    #[inline(never)]
+    fn parse_lr_string_function_call(&mut self, name: &str) -> Result<Expr, ParseError> {
+        self.advance(); // (
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                args.push(self.parse_expr(0)?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in {name}() args, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        self.advance(); // )
+        Ok(Expr::FunctionCall {
+            name: name.into(),
+            args,
+        })
+    }
+
     /// FROM-clause: a primary table reference plus zero-or-more joined
     /// peers expressed via either `, <table>` (cross-product, no ON) or
-    /// `[INNER|LEFT [OUTER]|CROSS] JOIN <table> [ON expr]`. v1.10 keeps
-    /// the join list flat (left-associative nested-loop semantics).
+    /// `[INNER|LEFT|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN <table> [ON expr]`.
+    /// v1.10 keeps the join list flat (left-associative nested-loop
+    /// semantics).
     fn parse_from_clause(&mut self) -> Result<FromClause, ParseError> {
         let primary = self.parse_table_ref()?;
         let mut joins = Vec::new();
@@ -11616,6 +11651,36 @@ impl Parser {
                         }
                         self.advance();
                         JoinKind::Cross
+                    }
+                    // v7.37.16 — RIGHT [OUTER] JOIN. OUTER is optional noise.
+                    Token::Right => {
+                        self.advance();
+                        if matches!(self.peek(), Token::Outer) {
+                            self.advance();
+                        }
+                        if !matches!(self.peek(), Token::Join) {
+                            return Err(self.err(format!(
+                                "expected JOIN after RIGHT [OUTER], got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        JoinKind::Right
+                    }
+                    // v7.37.16 — FULL [OUTER] JOIN. OUTER is optional noise.
+                    Token::Full => {
+                        self.advance();
+                        if matches!(self.peek(), Token::Outer) {
+                            self.advance();
+                        }
+                        if !matches!(self.peek(), Token::Join) {
+                            return Err(self.err(format!(
+                                "expected JOIN after FULL [OUTER], got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        JoinKind::FullOuter
                     }
                     Token::Join => {
                         self.advance();
@@ -12164,36 +12229,20 @@ impl Parser {
             Token::LBracket => self.parse_vector_literal_body(),
             Token::Extract => self.parse_extract_atom(),
             Token::Interval => self.parse_interval_atom(),
-            // `LEFT` is a reserved-keyword token because the
-            // grammar dedicates an arm for `LEFT [OUTER] JOIN`.
-            // When `left` is followed by `(` we're in expression
-            // position calling the PG `left(string, n)` function;
-            // rebuild the AST as a regular function call so the
-            // engine's apply_function dispatch picks it up.
+            // `LEFT` / `RIGHT` are reserved-keyword tokens because the
+            // grammar dedicates arms for `LEFT [OUTER] JOIN` /
+            // `RIGHT [OUTER] JOIN`. When followed by `(` we're in
+            // expression position calling the PG `left(string, n)` /
+            // `right(string, n)` function; rebuild the AST as a regular
+            // function call so the engine's apply_function dispatch picks
+            // it up. Delegated to a #[inline(never)] helper so its locals
+            // don't bloat this recursive `parse_atom` frame (the nesting
+            // budget in `enter_nested` is tuned to parse_atom's size).
             Token::Left if matches!(self.peek(), Token::LParen) => {
-                self.advance(); // (
-                let mut args = Vec::new();
-                if !matches!(self.peek(), Token::RParen) {
-                    loop {
-                        args.push(self.parse_expr(0)?);
-                        match self.peek() {
-                            Token::Comma => {
-                                self.advance();
-                            }
-                            Token::RParen => break,
-                            other => {
-                                return Err(self.err(alloc::format!(
-                                    "expected ',' or ')' in left() args, got {other:?}"
-                                )));
-                            }
-                        }
-                    }
-                }
-                self.advance(); // )
-                Ok(Expr::FunctionCall {
-                    name: "left".into(),
-                    args,
-                })
+                self.parse_lr_string_function_call("left")
+            }
+            Token::Right if matches!(self.peek(), Token::LParen) => {
+                self.parse_lr_string_function_call("right")
             }
             // v4.10: EXISTS / NOT EXISTS. EXISTS isn't a reserved
             // token; we match on the bare ident. NOT is a token
