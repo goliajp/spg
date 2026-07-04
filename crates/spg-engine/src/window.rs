@@ -698,23 +698,8 @@ fn effective_frame(
                     end
                 )));
             }
-            // GROUPS with an integer offset (`GROUPS N PRECEDING`, PG 11+)
-            // counts peer groups, which the aggregate loop can't yet walk.
-            // RANGE offset bounds ARE supported (see frame_bounds_for_row) for
-            // a single numeric ORDER BY column — the common moving-window shape.
-            if matches!(fr.kind, FrameKind::Groups)
-                && (matches!(
-                    fr.start,
-                    FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-                ) || matches!(
-                    end,
-                    FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-                ))
-            {
-                return Err(EngineError::Unsupported(
-                    "GROUPS with explicit offset bounds is not supported (only UNBOUNDED / CURRENT ROW)".into(),
-                ));
-            }
+            // RANGE and GROUPS offset bounds are both supported now (see
+            // frame_bounds_for_row → range_offset_bounds / groups_offset_bounds).
             Ok((fr.kind, fr.start.clone(), end))
         }
     }
@@ -741,16 +726,20 @@ fn frame_bounds_for_row(
     // FOLLOWING`): the frame is value-based — row j is in it iff its single
     // ORDER BY key sits within the offset window around row i's key. Handled
     // before the peer-aware Range arm below (which covers UNBOUNDED / CURRENT).
-    if matches!(kind, FrameKind::Range)
-        && (matches!(
-            start,
-            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-        ) || matches!(
-            end,
-            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-        ))
-    {
+    let has_offset = matches!(
+        start,
+        FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+    ) || matches!(
+        end,
+        FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+    );
+    if has_offset && matches!(kind, FrameKind::Range) {
         return range_offset_bounds(start, end, i, slice);
+    }
+    // GROUPS offset (`GROUPS N PRECEDING`, PG 11+) counts N peer groups in the
+    // row order (direction already baked into the sort, so no value flip).
+    if has_offset && matches!(kind, FrameKind::Groups) {
+        return groups_offset_bounds(start, end, i, slice);
     }
     let (mut lo, mut hi) = match kind {
         FrameKind::Rows => {
@@ -895,6 +884,91 @@ fn range_offset_bounds(
     }
     if !found {
         return Ok((1, 0)); // empty frame
+    }
+    Ok((lo, hi))
+}
+
+/// `GROUPS BETWEEN <n> PRECEDING AND <n> FOLLOWING` — peer-group-counted frame
+/// bounds. The slice is already sorted per the ORDER BY (direction baked in), so
+/// "preceding" is simply earlier peer groups by row index. A start bound landing
+/// past the partition end, or an end bound before its start, yields an empty
+/// frame.
+#[allow(clippy::type_complexity)]
+fn groups_offset_bounds(
+    start: &FrameBound,
+    end: &FrameBound,
+    i: usize,
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
+) -> Result<(usize, usize), EngineError> {
+    let last = slice.len().saturating_sub(1);
+    // Start row of the peer group `k` groups before i's (clamped to 0).
+    let back_start = |k: u64| -> usize {
+        let mut g = peer_group_start(slice, i);
+        for _ in 0..k {
+            if g == 0 {
+                break;
+            }
+            g = peer_group_start(slice, g - 1);
+        }
+        g
+    };
+    // End row of the peer group `k` groups after i's (clamped to last).
+    let fwd_end = |k: u64| -> usize {
+        let mut g = peer_group_end(slice, i);
+        for _ in 0..k {
+            if g >= last {
+                break;
+            }
+            g = peer_group_end(slice, g + 1);
+        }
+        g
+    };
+    // Start row of the peer group `k` groups after i's — `None` if beyond the end.
+    let fwd_start = |k: u64| -> Option<usize> {
+        let mut s = peer_group_start(slice, i);
+        for _ in 0..k {
+            let e = peer_group_end(slice, s);
+            if e >= last {
+                return None;
+            }
+            s = e + 1;
+        }
+        Some(s)
+    };
+    // End row of the peer group `k` groups before i's — `None` if before the start.
+    let back_end = |k: u64| -> Option<usize> {
+        let mut e = peer_group_end(slice, i);
+        for _ in 0..k {
+            let s = peer_group_start(slice, e);
+            if s == 0 {
+                return None;
+            }
+            e = s - 1;
+        }
+        Some(e)
+    };
+    let lo = match start {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::CurrentRow => peer_group_start(slice, i),
+        FrameBound::OffsetPreceding(k) => back_start(*k),
+        FrameBound::OffsetFollowing(k) => match fwd_start(*k) {
+            Some(s) => s,
+            None => return Ok((1, 0)),
+        },
+        FrameBound::UnboundedFollowing => last,
+    };
+    let hi = match end {
+        FrameBound::UnboundedFollowing => last,
+        FrameBound::CurrentRow => peer_group_end(slice, i),
+        FrameBound::OffsetFollowing(k) => fwd_end(*k),
+        FrameBound::OffsetPreceding(k) => match back_end(*k) {
+            Some(e) => e,
+            None => return Ok((1, 0)),
+        },
+        FrameBound::UnboundedPreceding => 0,
+    };
+    if lo > hi {
+        return Ok((1, 0));
     }
     Ok((lo, hi))
 }
