@@ -8570,6 +8570,22 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // PG `POSITION(bytea IN bytea)` lowers here as strpos(str, sub);
+            // it is a byte-level search, not a rendered-text search.
+            if let (Value::Bytes(haystack), Value::Bytes(needle)) = (&args[0], &args[1]) {
+                if needle.is_empty() {
+                    return Ok(Value::Int(1));
+                }
+                if needle.len() > haystack.len() {
+                    return Ok(Value::Int(0));
+                }
+                for i in 0..=haystack.len() - needle.len() {
+                    if &haystack[i..i + needle.len()] == needle.as_ref() {
+                        return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                    }
+                }
+                return Ok(Value::Int(0));
+            }
             let haystack = value_to_format_text(&args[0]);
             let needle = value_to_format_text(&args[1]);
             if needle.is_empty() {
