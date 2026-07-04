@@ -441,6 +441,16 @@ fn apply_binary_calendar(
                 micros: delta % DAY_US,
             }));
         }
+        (Value::Time(a), Value::Time(b)) if op == BinOp::Sub => {
+            // PG: time - time -> interval, the signed microsecond difference
+            // (always within a day, so no day component). 10:30 - 08:15 ->
+            // 02:15:00.
+            return Ok(Some(Value::Interval {
+                months: 0,
+                days: 0,
+                micros: a - b,
+            }));
+        }
         _ => {}
     }
     // INTERVAL arithmetic. PG: timestamp ± interval → timestamp,
