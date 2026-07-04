@@ -1864,3 +1864,23 @@ fn percentile_disc_array() {
     // scalar form unchanged
     assert_eq!(q(&mut e, "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1),(2),(3),(4)) t(v)"), "2");
 }
+
+/// v7.37 D — RANGE offset frame (`RANGE BETWEEN n PRECEDING AND n FOLLOWING`)
+/// over a numeric ORDER BY column: ASC + DESC + mixed bounds. Output ordered by
+/// the ORDER BY value so the comparison is deterministic. PG18.4-verified.
+#[test]
+fn range_offset_frame() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}"),
+            },
+            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "3,6,5,5");
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "6,5,8,5");
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "1,3,6,8");
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(4)) t(v)) s"), "3,2,2,1");
+}
