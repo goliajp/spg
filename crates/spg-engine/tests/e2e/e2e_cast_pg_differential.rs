@@ -223,3 +223,21 @@ fn int_arithmetic_overflow() {
     // an oversized literal is already bigint (lexer), so no overflow.
     ck(&mut e, r#"9999999999 + 1"#, r#"10000000000"#);
 }
+
+/// bigint-vs-int mixed arithmetic operand order. The mixed arm of `arith`
+/// used a `|`-merged pattern that always bound the Int operand on the left,
+/// so `bigint - int` computed `int - bigint` and `bigint / int` computed
+/// `int / bigint`. Commutative ops (+, *) were unaffected. PG18.4-verified.
+#[test]
+fn bigint_int_mixed_arithmetic() {
+    let mut e = Engine::new();
+    // bigint (LHS) op int (RHS) — order must be preserved.
+    ck(&mut e, r#"5000000000 - 1"#, r#"4999999999"#);
+    ck(&mut e, r#"5000000000 / 2"#, r#"2500000000"#);
+    ck(&mut e, r#"5000000000 * 2"#, r#"10000000000"#);
+    // int (LHS) op bigint (RHS) — already correct, kept as control.
+    ck(&mut e, r#"1 - 5000000000"#, r#"-4999999999"#);
+    ck(&mut e, r#"100 / 5000000000"#, r#"0"#);
+    // int op int control.
+    ck(&mut e, r#"10 - 3"#, r#"7"#);
+}

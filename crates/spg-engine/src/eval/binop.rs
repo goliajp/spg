@@ -1136,8 +1136,18 @@ fn arith(
             })?;
             Ok(Value::Int(small))
         }
-        (Value::Int(a), Value::BigInt(b)) | (Value::BigInt(b), Value::Int(a)) => {
+        // Order-preserving: the `|`-merged form used to bind the Int as the
+        // left operand regardless of position, so `bigint - int` computed
+        // `int - bigint` (and `bigint / int` computed `int / bigint`). Split
+        // so each side keeps its place for the non-commutative ops.
+        (Value::Int(a), Value::BigInt(b)) => {
             let result = int_op(i64::from(a), b).ok_or(EvalError::TypeMismatch {
+                detail: format!("bigint overflow on {op_name}"),
+            })?;
+            Ok(Value::BigInt(result))
+        }
+        (Value::BigInt(a), Value::Int(b)) => {
+            let result = int_op(a, i64::from(b)).ok_or(EvalError::TypeMismatch {
                 detail: format!("bigint overflow on {op_name}"),
             })?;
             Ok(Value::BigInt(result))
