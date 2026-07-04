@@ -23,10 +23,10 @@
 //! (`ARRAY[1,NULL] = ARRAY[1,NULL]` is `t`, NOT NULL — confirmed live).
 //!
 //! DEFERRED (still error in SPG, tracked at the bottom of this file):
-//!   * INET / CIDR / BIT ordering (`<` etc.) — PG's `network_cmp` /
-//!     `varbit_cmp` compare a common prefix before the length; a plain
-//!     field compare would silently return a non-PG answer, so only
-//!     equality is wired.
+//!   * INET / CIDR ordering (`<` etc.) — PG's `network_cmp` compares a
+//!     common address prefix before the netmask length; a plain field
+//!     compare would silently return a non-PG answer, so only equality is
+//!     wired. (BIT / VARBIT ordering IS implemented — see `bit_ordering`.)
 //!   * NUMERIC[] / FLOAT8[] / INTERVAL[] ordering (`<` etc.) — value-based
 //!     element comparators give a total order in PG, but only equality is
 //!     wired (ordering errors, not a wrong answer).
@@ -147,6 +147,22 @@ fn bit_equality() {
     ck(&mut e, "SELECT '1010'::bit(4) <> '1011'::bit(4)", "t");
     ck(&mut e, "SELECT '11111111'::varbit = '11111111'::varbit", "t");
     ck(&mut e, "SELECT '101'::varbit <> '1010'::varbit", "t");
+}
+
+#[test]
+fn bit_ordering() {
+    // v7.37 — BIT / VARBIT ordering (PG `varbit_cmp`): bit-lexicographic,
+    // a shorter string that is a prefix of a longer one is LESS. All values
+    // captured live from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    ck(&mut e, "SELECT '10'::varbit < '11'::varbit", "t");
+    ck(&mut e, "SELECT '1'::varbit < '10'::varbit", "t");
+    ck(&mut e, "SELECT '10'::varbit < '100'::varbit", "t");
+    ck(&mut e, "SELECT '10'::varbit < '1'::varbit", "f");
+    ck(&mut e, "SELECT '101'::varbit < '1010'::varbit", "t");
+    ck(&mut e, "SELECT '1010'::bit(4) < '1011'::bit(4)", "t");
+    ck(&mut e, "SELECT '1011'::bit(4) >= '1010'::bit(4)", "t");
+    ck(&mut e, "SELECT '10'::varbit <= '10'::varbit", "t");
 }
 
 // ---- array comparisons via typed columns --------------------------------
@@ -302,12 +318,11 @@ fn interval_array_value_equality() {
 #[test]
 fn deferred_orderings_error() {
     let mut e = Engine::new();
-    // INET / CIDR / BIT ordering is deferred; must ERROR (not silently
-    // return a non-PG answer) until a PG-`network_cmp`/`varbit_cmp`
-    // comparator is wired.
+    // INET / CIDR ordering is deferred; must ERROR (not silently return a
+    // non-PG answer) until a PG-`network_cmp` comparator is wired. (BIT /
+    // VARBIT ordering is now implemented — see `bit_ordering`.)
     assert_eq!(cell(&mut e, "SELECT '10.0.0.1'::inet < '10.0.0.2'::inet"), "<ERR>");
     assert_eq!(cell(&mut e, "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr"), "<ERR>");
-    assert_eq!(cell(&mut e, "SELECT '1010'::bit(4) < '1011'::bit(4)"), "<ERR>");
     // NUMERIC[] / FLOAT8[] / INTERVAL[] ordering is deferred (only = / <>);
     // exercised on real typed columns so it hits the `eq_only_result` arm.
     e.execute("CREATE TABLE ov (id int, na numeric[], fa float8[], ia interval[])")

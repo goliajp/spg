@@ -1590,23 +1590,30 @@ pub(super) fn compare(
                 }),
             };
         }
-        // v7.37.17 — BIT / BIT VARYING equality (=/<>). Equal iff same
-        // bit length and same packed bytes (the final byte is
-        // zero-padded at construction, so a byte compare is exact).
-        // Ordering DEFERRED: PG's `varbit_cmp` compares the data bytes
-        // then the bit length, and the padding-normalisation edge cases
-        // are unverified — only equality is wired.
+        // v7.37.17 — BIT / BIT VARYING comparison (=/<> and ordering).
+        // Bytes are MSB-packed with the trailing sub-byte zero-padded at
+        // construction, so a bytewise compare over the common byte prefix
+        // reproduces PG `varbit_cmp`'s bit-lexicographic order; when the
+        // common bytes tie, the string with MORE bits is greater (a shorter
+        // bit string is a strict prefix of the longer, hence less). Verified
+        // vs PG18: B'10'<B'11', B'1'<B'10', B'10'<B'100', B'101'<B'1010'.
         (
             Value::BitString { nbits: an, bytes: ab },
             Value::BitString { nbits: bn, bytes: bb },
         ) => {
-            let eq = an == bn && ab.as_ref() == bb.as_ref();
+            let av = ab.as_ref();
+            let bv = bb.as_ref();
+            let n = av.len().min(bv.len());
+            let ord = av[..n].cmp(&bv[..n]).then_with(|| an.cmp(bn));
             return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                BinOp::Eq => Ok(Value::Bool(ord.is_eq())),
+                BinOp::NotEq => Ok(Value::Bool(ord.is_ne())),
+                BinOp::Lt => Ok(Value::Bool(ord.is_lt())),
+                BinOp::LtEq => Ok(Value::Bool(ord.is_le())),
+                BinOp::Gt => Ok(Value::Bool(ord.is_gt())),
+                BinOp::GtEq => Ok(Value::Bool(ord.is_ge())),
                 _ => Err(EvalError::TypeMismatch {
-                    detail: "bit/varbit ordering (<, <=, >, >=) not yet supported; only = / <>"
-                        .into(),
+                    detail: "bit/varbit supports only comparison operators".into(),
                 }),
             };
         }
