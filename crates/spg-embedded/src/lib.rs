@@ -2490,6 +2490,23 @@ fn sql_is_read_only(sql: &str) -> bool {
     )
 }
 
+/// v7.37 Epic Du — is this a bare `CHECKPOINT` statement? The
+/// parser accepts `CHECKPOINT` as a top-level statement (a no-op
+/// at the engine layer — the no_std engine owns no WAL / snapshot),
+/// so the host recognises it here and forces a real, synchronous
+/// checkpoint (durability barrier) via [`Database::checkpoint`].
+/// Head-word match mirrors [`sql_is_read_only`]: only fires when
+/// the first token is `checkpoint`, so a table / column literally
+/// named `checkpoint` inside another statement is unaffected.
+fn sql_is_checkpoint(sql: &str) -> bool {
+    let head = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .next()
+        .unwrap_or("");
+    head.eq_ignore_ascii_case("checkpoint")
+}
+
 /// Embedded SPG database handle. Owns an `Engine` + provides
 /// ergonomic wrappers around `execute` and `query`. Drops the
 /// engine on `Drop` — no WAL flush / fsync, because v6.10.3
@@ -3579,6 +3596,22 @@ impl Database {
         sql: &str,
     ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute(sql)?;
+        // v7.37 Epic Du — a bare `CHECKPOINT` forces an immediate,
+        // synchronous checkpoint, matching PG where CHECKPOINT flushes
+        // a durability barrier now instead of waiting for the auto
+        // (byte / time) trigger. The engine parsed it as a no-op
+        // (CommandOk) because the no_std engine owns no WAL / snapshot;
+        // the host owns both, so we run the real checkpoint here.
+        // `checkpoint()` reuses the existing snapshot mechanism
+        // (snapshot_checkpoint_job → worker) and blocks until the
+        // snapshot + WAL fsync/rotate complete, so once this returns
+        // the committed state has been flushed to `db_path`. No WAL
+        // ticket — CHECKPOINT itself writes no WAL record (it is
+        // classified read-only, see `sql_is_read_only`).
+        if sql_is_checkpoint(sql) {
+            self.checkpoint()?;
+            return Ok((result, None));
+        }
         let modified = matches!(
             &result,
             QueryResult::CommandOk {
@@ -5928,6 +5961,67 @@ mod tests {
             "with time threshold disabled + bytes effectively-disabled, base.spg \
              mtime should NOT advance on writes"
         );
+    }
+
+    /// v7.37 Epic Du — a bare `CHECKPOINT` SQL statement forces an
+    /// immediate, synchronous checkpoint (durability barrier),
+    /// matching PG where CHECKPOINT flushes now instead of waiting
+    /// for the auto (byte / time) trigger. Both auto-triggers are
+    /// disabled here so the ONLY thing that can advance
+    /// `checkpoint_stats().total_count` is the explicit statement —
+    /// and the base snapshot's mtime must move too (real flush).
+    #[test]
+    fn bare_checkpoint_forces_real_checkpoint() {
+        let dir = tmpdir();
+        let db_path = dir.join("ckpt.spg");
+        let mut db = Database::open_path(&db_path).expect("open");
+
+        // Disable both auto-checkpoint triggers so nothing but the
+        // explicit CHECKPOINT can run a checkpoint.
+        db.set_checkpoint_time_threshold(None);
+        db.set_checkpoint_threshold_bytes(u64::MAX);
+
+        db.execute("CREATE TABLE t (id BIGINT)").expect("ddl");
+        db.execute("INSERT INTO t VALUES (1)").expect("insert");
+
+        let before_count = db.checkpoint_stats().total_count;
+        // The base snapshot only materialises once a checkpoint runs;
+        // on a fresh open_path it may not exist yet.
+        let before_mtime = std::fs::metadata(&db_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        // mtime resolution can be coarse; make sure any advance is
+        // observable.
+        std::thread::sleep(core::time::Duration::from_millis(10));
+
+        // The wired statement under test.
+        let res = db.execute("CHECKPOINT").expect("checkpoint stmt");
+        assert!(
+            matches!(res, QueryResult::CommandOk { .. }),
+            "CHECKPOINT should return CommandOk, got {res:?}"
+        );
+
+        // total_count advanced → a real checkpoint ran (synchronous,
+        // so it has already completed by the time execute returned).
+        let after_count = db.checkpoint_stats().total_count;
+        assert!(
+            after_count > before_count,
+            "bare CHECKPOINT did not run a real checkpoint: \
+             total_count {before_count} -> {after_count}"
+        );
+
+        // …and it was a real flush: the on-disk base snapshot exists
+        // and (if it already existed) its mtime moved forward.
+        let after_mtime = std::fs::metadata(&db_path)
+            .expect("base.spg must exist after CHECKPOINT flush")
+            .modified()
+            .expect("modified after");
+        if let Some(before_mtime) = before_mtime {
+            assert!(
+                after_mtime > before_mtime,
+                "bare CHECKPOINT did not flush base.spg (mtime {before_mtime:?} -> {after_mtime:?})"
+            );
+        }
     }
 
     /// v7.37.14 (A2.2 TDD [PG+]) — `Database::execute` increments

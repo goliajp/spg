@@ -53,8 +53,13 @@ fn lock_table_no_op() {
     ddl(&mut e, "LOCK TABLE t IN ACCESS SHARE MODE NOWAIT");
 }
 
+// CHECKPOINT at the *engine* layer is a no-op: the no_std engine
+// owns no WAL / snapshot, so there is nothing to flush here. The
+// real durability barrier is wired at the HOST layer (embedded
+// `Database::execute_buffered` → `Database::checkpoint`, Epic Du);
+// see spg-embedded's `bare_checkpoint_forces_real_checkpoint` test.
 #[test]
-fn checkpoint_no_op() {
+fn checkpoint_engine_layer_no_op() {
     let mut e = Engine::new();
     ddl(&mut e, "CHECKPOINT");
 }

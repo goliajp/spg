@@ -1584,9 +1584,13 @@ impl Parser {
             // v7.37.17 (17.6 sibling) — CHECKPOINT. Forces a WAL
             // durability marker + snapshot in PG. SPG has WAL
             // checkpointing on a byte / time schedule (v7.37.10
-            // 60s / 4 MiB defaults); explicit CHECKPOINT is a
-            // no-op today (an internal `SPG_FORCE_CHECKPOINT`
-            // path could tie into this on future customer demand).
+            // 60s / 4 MiB defaults). The bare statement parses to
+            // `Statement::Empty` here (the no_std engine owns no
+            // WAL / snapshot); v7.37 Epic Du wires the HOST
+            // (embedded `Database::execute_buffered`, via
+            // `sql_is_checkpoint`) to force an immediate synchronous
+            // checkpoint through `Database::checkpoint` — a real
+            // durability barrier, matching PG.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("checkpoint") => {
                 self.advance();
                 self.consume_until_statement_boundary();
