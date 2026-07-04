@@ -325,10 +325,21 @@ fn apply_binary_calendar(
             return Ok(Some(Value::BigInt(i64::from(*a) - i64::from(*b))));
         }
         (Value::Timestamp(a), Value::Timestamp(b)) if op == BinOp::Sub => {
+            // PG: timestamp - timestamp -> interval, justified to hours (every
+            // 24h of the microsecond delta becomes one day). 30h -> `1 day
+            // 06:00:00`, not a raw microsecond count.
             let delta = a.checked_sub(*b).ok_or(EvalError::TypeMismatch {
                 detail: "TIMESTAMP - TIMESTAMP overflows i64 microseconds".into(),
             })?;
-            return Ok(Some(Value::BigInt(delta)));
+            const DAY_US: i64 = 86_400_000_000;
+            let days = i32::try_from(delta / DAY_US).map_err(|_| EvalError::TypeMismatch {
+                detail: "TIMESTAMP - TIMESTAMP day count overflows".into(),
+            })?;
+            return Ok(Some(Value::Interval {
+                months: 0,
+                days,
+                micros: delta % DAY_US,
+            }));
         }
         _ => {}
     }

@@ -265,3 +265,23 @@ fn string_function_edge_cases() {
     ck(&mut e, r#"translate('hello', 'l', '')"#, r#"heo"#);
     ck(&mut e, r#"ascii('')"#, r#"0"#);
 }
+
+/// PG timestamp/interval arithmetic. `timestamp - timestamp` returns an
+/// interval justified to hours (30h -> `1 day 06:00:00`), fixed here from a
+/// raw-microsecond BigInt. Ground truth captured live from PostgreSQL 18.4.
+///
+/// Remaining date divergences noted for follow-up (NOT fixed here):
+///   * `date + interval` yields DATE in SPG, TIMESTAMP in PG.
+///   * `age(ts, ts)` yields flat days in SPG, a symbolic mon/day interval in PG.
+///   * `extract(epoch FROM ts)` renders integer in SPG, numeric `.000000` in PG.
+#[test]
+fn timestamp_interval_arithmetic() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"'2024-01-02 12:00:00'::timestamp - '2024-01-01 06:00:00'::timestamp"#, r#"1 day 06:00:00"#);
+    ck(&mut e, r#"'2024-01-01 00:00:00'::timestamp - '2024-01-01 00:00:00'::timestamp"#, r#"00:00:00"#);
+    // controls that already matched PG.
+    ck(&mut e, r#"'2024-01-31'::date + 1"#, r#"2024-02-01"#);
+    ck(&mut e, r#"'2024-03-01'::date - '2024-02-01'::date"#, r#"29"#);
+    ck(&mut e, r#"interval '2 days' - interval '1 day'"#, r#"1 day"#);
+    ck(&mut e, r#"'2024-01-01'::date - 5"#, r#"2023-12-27"#);
+}

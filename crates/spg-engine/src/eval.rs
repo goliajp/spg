@@ -1309,7 +1309,7 @@ mod tests {
     fn interval_format_basics() {
         // v7.37.5 β — three-arg signature. PG byte-equal:
         // `'1 day'` ≠ `'24 hours'` now, the format reflects it.
-        assert_eq!(format_interval(0, 0, 0), "0");
+        assert_eq!(format_interval(0, 0, 0), "00:00:00");
         assert_eq!(format_interval(0, 1, 0), "1 day");
         assert_eq!(format_interval(0, -1, 0), "-1 days");
         assert_eq!(format_interval(0, 0, 86_400_000_000), "24:00:00");
