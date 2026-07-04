@@ -346,6 +346,9 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                 break;
             }
         }
+        // PG conversion spec: `% [n$] [-] [width] type`. The pre-`$` digits are
+        // the arg position; otherwise they are the field width.
+        let mut width_digits = String::new();
         if !digit_buf.is_empty() && matches!(chars.peek(), Some(&'$')) {
             chars.next(); // consume `$`
             explicit_pos =
@@ -356,8 +359,27 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                             detail: format!("format(): invalid arg position {digit_buf:?}"),
                         })?,
                 );
-            digit_buf.clear();
+        } else {
+            width_digits = digit_buf.clone();
         }
+        // `-` flag (left-justify) then width — but only when the width wasn't
+        // already captured as the pre-`$` digits above.
+        let mut left_justify = false;
+        if width_digits.is_empty() {
+            if matches!(chars.peek(), Some(&'-')) {
+                chars.next();
+                left_justify = true;
+            }
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    width_digits.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        let width: usize = width_digits.parse().unwrap_or(0);
         // Specifier character.
         let spec = match chars.next() {
             Some(c) => c,
@@ -367,13 +389,6 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                 });
             }
         };
-        // Anything left in digit_buf (no `$`) was actually
-        // pre-spec digits we now have to emit verbatim. PG would
-        // treat them as width hint; v7.17 doesn't implement
-        // width, but we don't want to silently drop the digits.
-        // Strategy: ignore width for now and emit just the
-        // converted value.
-        let _ = digit_buf;
         if spec == '%' {
             out.push('%');
             continue;
@@ -387,10 +402,12 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
             }
         };
         let arg = arg_values.get(arg_index).cloned().unwrap_or(Value::Null);
-        match spec {
+        // Build the converted text for this conversion, then apply the field
+        // width (minimum width; PG never truncates, pads with spaces).
+        let converted: String = match spec {
             's' => match arg {
-                Value::Null => {} // PG: NULL renders as empty for %s.
-                v => out.push_str(&value_to_format_text(&v)),
+                Value::Null => String::new(), // PG: NULL renders as empty for %s.
+                v => value_to_format_text(&v),
             },
             'I' => match arg {
                 Value::Null => {
@@ -398,35 +415,45 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                         detail: "format(): NULL is not a valid identifier (%I)".into(),
                     });
                 }
-                v => {
-                    let s = value_to_format_text(&v);
-                    out.push_str(&pg_quote_ident(&s));
-                }
+                v => pg_quote_ident(&value_to_format_text(&v)),
             },
             'L' => match arg {
-                Value::Null => out.push_str("NULL"),
+                Value::Null => "NULL".into(),
                 v => {
                     let s = value_to_format_text(&v);
-                    out.push('\'');
+                    let mut q = String::with_capacity(s.len() + 2);
+                    q.push('\'');
                     for ch in s.chars() {
                         if ch == '\'' {
-                            out.push('\'');
-                            out.push('\'');
-                        } else {
-                            out.push(ch);
+                            q.push('\'');
                         }
+                        q.push(ch);
                     }
-                    out.push('\'');
+                    q.push('\'');
+                    q
                 }
             },
             other => {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "format(): unknown specifier '%{other}' \
-                         (v7.17 supports %s %I %L %%)"
+                         (supports %s %I %L %%)"
                     ),
                 });
             }
+        };
+        let vis_len = converted.chars().count();
+        if vis_len < width {
+            let pad = " ".repeat(width - vis_len);
+            if left_justify {
+                out.push_str(&converted);
+                out.push_str(&pad);
+            } else {
+                out.push_str(&pad);
+                out.push_str(&converted);
+            }
+        } else {
+            out.push_str(&converted);
         }
     }
     Ok(Value::text(out))

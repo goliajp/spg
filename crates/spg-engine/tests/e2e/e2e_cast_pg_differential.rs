@@ -1478,3 +1478,17 @@ fn to_char_roman_numerals() {
     ck(&mut e, "to_char(4000, 'FMRN')", "###############");
     ck(&mut e, "to_char(0, 'FMRN')", "###############");
 }
+
+/// v7.37 D — format() honors the `%[n$][-][width]s` field width (right-justify,
+/// `-` left-justify; never truncates). PG18.4-verified.
+#[test]
+fn format_width_spec() {
+    let mut e = Engine::new();
+    ck(&mut e, "format('[%3s]', 'x')", "[  x]");
+    ck(&mut e, "format('[%-3s]', 'x')", "[x  ]");
+    ck(&mut e, "format('[%1$3s]', 'y')", "[  y]");
+    ck(&mut e, "format('[%3s]', 'abcd')", "[abcd]");
+    // control: no-width forms unchanged.
+    ck(&mut e, "format('%1$s %1$s', 'x')", "x x");
+    ck(&mut e, "format('%I', 'my table')", "\"my table\"");
+}
