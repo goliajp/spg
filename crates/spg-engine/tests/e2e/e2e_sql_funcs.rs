@@ -22,7 +22,7 @@ fn encode_hex_round_trip() {
     let v = one_value(&mut eng, "SELECT encode('hello', 'hex')");
     assert_eq!(v, Value::text("68656c6c6f"));
     let v2 = one_value(&mut eng, "SELECT decode('68656c6c6f', 'hex')");
-    assert_eq!(v2, Value::text("hello"));
+    assert_eq!(v2, Value::Bytes(std::borrow::Cow::Owned(b"hello".to_vec())));
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn encode_base64_round_trip() {
     let v = one_value(&mut eng, "SELECT encode('Hello, World!', 'base64')");
     assert_eq!(v, Value::text("SGVsbG8sIFdvcmxkIQ=="));
     let v2 = one_value(&mut eng, "SELECT decode('SGVsbG8sIFdvcmxkIQ==', 'base64')");
-    assert_eq!(v2, Value::text("Hello, World!"));
+    assert_eq!(v2, Value::Bytes(std::borrow::Cow::Owned(b"Hello, World!".to_vec())));
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn encode_base32hex_round_trip() {
     let v = one_value(&mut eng, "SELECT encode('foo', 'base32hex')");
     assert_eq!(v, Value::text("CPNMU==="));
     let v2 = one_value(&mut eng, "SELECT decode('CPNMU===', 'base32hex')");
-    assert_eq!(v2, Value::text("foo"));
+    assert_eq!(v2, Value::Bytes(std::borrow::Cow::Owned(b"foo".to_vec())));
 }
 
 #[test]

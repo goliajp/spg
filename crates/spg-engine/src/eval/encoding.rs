@@ -49,6 +49,7 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         "base64url" => b64_encode(bytes, B64_URL),
         "base32hex" => b32hex_encode(bytes),
         "hex" => hex_encode(bytes),
+        "escape" => escape_encode(bytes),
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!("encode(): unknown format `{other}`"),
@@ -97,10 +98,24 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
             });
         }
     };
-    let s = String::from_utf8(bytes).map_err(|_| EvalError::TypeMismatch {
-        detail: "decode(): result bytes are not valid UTF-8 (SPG stores raw bytes as Text)".into(),
-    })?;
-    Ok(Value::text(s))
+    // PG's `decode` returns bytea; return raw bytes so `decode(...)::text`
+    // renders as `\xHEX` and non-UTF-8 output (e.g. `decode('deadbeef','hex')`)
+    // round-trips through `encode` instead of erroring.
+    Ok(Value::Bytes(alloc::borrow::Cow::Owned(bytes)))
+}
+
+/// PG's `escape` bytea format: printable ASCII stays literal, a backslash
+/// doubles, and any other byte becomes `\ooo` (3-digit octal).
+fn escape_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            0x5c => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out
 }
 
 /// v7.37.17 (17.6 siblings) — pgcrypto armor(bytea): OpenPGP
