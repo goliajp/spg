@@ -209,6 +209,18 @@ pub(super) fn apply_binary(
     // integers to a common NUMERIC scale and stay in i128 throughout.
     // A NUMERIC paired with an INTERVAL is interval scaling, not
     // numeric math — let the calendar path below take it.
+    // Range `*` intersection claims Mul before numeric/date arithmetic.
+    if op == BinOp::Mul {
+        if let (
+            Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
+            Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+        ) = (&l, &r)
+        {
+            return Ok(range_intersect(
+                *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+            ));
+        }
+    }
     if (matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }))
         && !matches!(l, Value::Interval { .. })
         && !matches!(r, Value::Interval { .. })
@@ -1815,6 +1827,50 @@ fn range_contains_elem(
         },
     };
     lower_ok && upper_ok
+}
+
+/// Range `*` intersection: the overlapping sub-range (empty if disjoint).
+#[allow(clippy::too_many_arguments)]
+fn range_intersect(
+    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+) -> Value<'static> {
+    let _ = bk;
+    let empty = Value::Range {
+        kind: ak,
+        lower: None,
+        upper: None,
+        lower_inc: false,
+        upper_inc: false,
+        empty: true,
+    };
+    if ae || be {
+        return empty;
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    // intersection lower = the later start, upper = the earlier end.
+    let (lo, lo_inc) = if lower_cmp(&al2, ali2, &bl2, bli2) == core::cmp::Ordering::Greater {
+        (al2, ali2)
+    } else {
+        (bl2, bli2)
+    };
+    let (up, up_inc) = if upper_cmp(&au2, aui2, &bu2, bui2) == core::cmp::Ordering::Less {
+        (au2, aui2)
+    } else {
+        (bu2, bui2)
+    };
+    if !range_point_le(&lo, lo_inc, &up, up_inc) {
+        return empty;
+    }
+    Value::Range {
+        kind: ak,
+        lower: lo.map(alloc::boxed::Box::new),
+        upper: up.map(alloc::boxed::Box::new),
+        lower_inc: lo_inc,
+        upper_inc: up_inc,
+        empty: false,
+    }
 }
 
 pub(super) fn compare(

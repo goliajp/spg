@@ -375,3 +375,15 @@ fn range_lower_upper_functions() {
     ck(&mut e, r#"lower('ABC')"#, r#"abc"#);
     ck(&mut e, r#"upper('abc')"#, r#"ABC"#);
 }
+
+/// Range `*` intersection returns the overlapping sub-range (empty if
+/// disjoint) — previously errored. PG18.4-verified.
+#[test]
+fn range_intersection_operator() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"int4range(1,10) * int4range(5,15)"#, r#"[5,10)"#);
+    ck(&mut e, r#"int4range(1,10) * int4range(3,7)"#, r#"[3,7)"#);
+    ck(&mut e, r#"int4range(1,5) * int4range(10,20)"#, r#"empty"#);
+    ck(&mut e, r#"int4range(1,5) * int4range(5,10)"#, r#"empty"#);
+    ck(&mut e, r#"int4range(1,10) * 'empty'::int4range"#, r#"empty"#);
+}
