@@ -274,7 +274,7 @@ pub(crate) fn compute_window_partition(
             let exclude = frame_exclusion(frame)?;
             #[allow(clippy::needless_range_loop)]
             for i in 0..slice.len() {
-                let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
+                let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
                 let mut sum: f64 = 0.0;
                 // v7.37.16 — exact NUMERIC accumulator for sum/avg over a
                 // Numeric frame (was deferred → NULL). Only written when a
@@ -507,7 +507,7 @@ pub(crate) fn compute_window_partition(
             };
             let eff = effective_frame(frame, ordered)?;
             for i in 0..slice.len() {
-                let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
+                let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
                 let (_, _, idx) = &slice[i];
                 let v = if lo > hi {
                     Value::Null
@@ -698,11 +698,11 @@ fn effective_frame(
                     end
                 )));
             }
-            // RANGE OFFSET PRECEDING / FOLLOWING needs value-typed
-            // arithmetic on the ORDER BY key (e.g. `RANGE BETWEEN
-            // INTERVAL '1 day' PRECEDING AND CURRENT ROW`). Not
-            // implemented in v4.20.
-            if matches!(fr.kind, FrameKind::Range | FrameKind::Groups)
+            // GROUPS with an integer offset (`GROUPS N PRECEDING`, PG 11+)
+            // counts peer groups, which the aggregate loop can't yet walk.
+            // RANGE offset bounds ARE supported (see frame_bounds_for_row) for
+            // a single numeric ORDER BY column — the common moving-window shape.
+            if matches!(fr.kind, FrameKind::Groups)
                 && (matches!(
                     fr.start,
                     FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
@@ -712,7 +712,7 @@ fn effective_frame(
                 ))
             {
                 return Err(EngineError::Unsupported(
-                    "RANGE / GROUPS with explicit offset bounds is not supported (v7.37.19: only UNBOUNDED / CURRENT ROW for peer-aware frames)".into(),
+                    "GROUPS with explicit offset bounds is not supported (only UNBOUNDED / CURRENT ROW)".into(),
                 ));
             }
             Ok((fr.kind, fr.start.clone(), end))
@@ -733,10 +733,25 @@ fn frame_bounds_for_row(
     eff: &(FrameKind, FrameBound, FrameBound),
     i: usize,
     slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
-) -> (usize, usize) {
+) -> Result<(usize, usize), EngineError> {
     let (kind, start, end) = eff;
     let n = slice.len();
     let last = n.saturating_sub(1);
+    // RANGE with an explicit numeric offset (`RANGE BETWEEN 1 PRECEDING AND 1
+    // FOLLOWING`): the frame is value-based — row j is in it iff its single
+    // ORDER BY key sits within the offset window around row i's key. Handled
+    // before the peer-aware Range arm below (which covers UNBOUNDED / CURRENT).
+    if matches!(kind, FrameKind::Range)
+        && (matches!(
+            start,
+            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+        ) || matches!(
+            end,
+            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+        ))
+    {
+        return range_offset_bounds(start, end, i, slice);
+    }
     let (mut lo, mut hi) = match kind {
         FrameKind::Rows => {
             // Compute the raw (signed) row indices first so a frame
@@ -764,7 +779,7 @@ fn frame_bounds_for_row(
             // Empty frame: end before partition start, start past the
             // partition end, or (degenerate) start after end.
             if hi_s < 0 || lo_s > last_s || lo_s > hi_s {
-                return (1, 0); // lo > hi ⇒ caller treats as empty
+                return Ok((1, 0)); // lo > hi ⇒ caller treats as empty
             }
             let lo = lo_s.max(0) as usize;
             let hi = hi_s.min(last_s) as usize;
@@ -802,7 +817,86 @@ fn frame_bounds_for_row(
     if lo >= n {
         lo = last;
     }
-    (lo, hi)
+    Ok((lo, hi))
+}
+
+/// A single ORDER BY key rendered to f64 for RANGE-offset value arithmetic.
+/// `None` unless there is exactly one order column and it is a real number.
+#[allow(clippy::cast_precision_loss)]
+fn range_order_key_f64(key: &[(Value, bool, Option<bool>)]) -> Option<(f64, bool)> {
+    if key.len() != 1 {
+        return None;
+    }
+    // The middle field is the per-key DESC flag (see order_key_cmp); asc = !desc.
+    let (v, desc, _) = &key[0];
+    let f = match v {
+        Value::SmallInt(n) => f64::from(*n),
+        Value::Int(n) => f64::from(*n),
+        Value::BigInt(n) => *n as f64,
+        Value::Float(x) => *x,
+        Value::Numeric { scaled, scale } => {
+            (*scaled as f64) / (10i128.pow(u32::from(*scale)) as f64)
+        }
+        _ => return None,
+    };
+    Some((f, !*desc))
+}
+
+/// `RANGE BETWEEN <offset> PRECEDING/FOLLOWING` — value-based frame bounds. Row
+/// `j` is in the frame iff its ORDER BY value lies within the offset window
+/// around row `i`'s value. Requires a single numeric ORDER BY column (PG's own
+/// restriction for numeric RANGE offsets); errors honestly otherwise.
+#[allow(clippy::type_complexity)]
+fn range_offset_bounds(
+    start: &FrameBound,
+    end: &FrameBound,
+    i: usize,
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
+) -> Result<(usize, usize), EngineError> {
+    let unsupported = || {
+        EngineError::Unsupported(
+            "RANGE offset frame requires a single numeric ORDER BY column".into(),
+        )
+    };
+    let (v, asc) = range_order_key_f64(&slice[i].1).ok_or_else(unsupported)?;
+    // The value a bound resolves to, given the ordering direction. PRECEDING is
+    // "earlier in the order": smaller values under ASC, larger under DESC.
+    // FOLLOWING is the mirror. UNBOUNDED means no limit on that side.
+    let bound_value = |b: &FrameBound| -> Option<f64> {
+        match b {
+            FrameBound::OffsetPreceding(k) => Some(if asc { v - *k as f64 } else { v + *k as f64 }),
+            FrameBound::OffsetFollowing(k) => Some(if asc { v + *k as f64 } else { v - *k as f64 }),
+            FrameBound::CurrentRow => Some(v),
+            FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => None,
+        }
+    };
+    // Window in value space [lo_val, hi_val] (inclusive). Under ASC the start
+    // bound sets the low value and the end bound the high value; under DESC the
+    // roles flip because larger values come first in the ordering.
+    let (lo_val, hi_val) = if asc {
+        (bound_value(start), bound_value(end))
+    } else {
+        (bound_value(end), bound_value(start))
+    };
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    let mut found = false;
+    for (j, row) in slice.iter().enumerate() {
+        let (x, _) = range_order_key_f64(&row.1).ok_or_else(unsupported)?;
+        let ge_lo = lo_val.is_none_or(|lv| x >= lv - 1e-9);
+        let le_hi = hi_val.is_none_or(|hv| x <= hv + 1e-9);
+        if ge_lo && le_hi {
+            if !found {
+                lo = j;
+                found = true;
+            }
+            hi = j;
+        }
+    }
+    if !found {
+        return Ok((1, 0)); // empty frame
+    }
+    Ok((lo, hi))
 }
 
 /// Find the inclusive index of the first row with the same ORDER
