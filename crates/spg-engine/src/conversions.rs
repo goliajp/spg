@@ -1681,7 +1681,9 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "smallint_array" | "int2_array" => DataType::SmallIntArray,
         "int_array" | "integer_array" | "int4_array" => DataType::IntArray,
         "bigint_array" | "int8_array" => DataType::BigIntArray,
-        "float_array" | "double_array" | "real_array" => DataType::FloatArray,
+        "float_array" | "double_array" | "real_array" | "float8_array" | "float4_array" => {
+            DataType::FloatArray
+        }
         // Width-suffixed float spellings and OID — SPG has one
         // float representation and OIDs are plain integers.
         "float4" | "real" | "float8" | "double precision" | "float" => DataType::Float,
@@ -2588,6 +2590,36 @@ pub(crate) fn coerce_value(
         (Value::TextArray(items), DataType::FloatArray) if items.is_empty() => {
             Some(Value::FloatArray(alloc::vec::Vec::new()))
         }
+        // `expr::float8[]` — an array literal reaches here as TEXT[] (elements
+        // rendered to text); parse each element to f64. NULLs pass through.
+        (Value::TextArray(items), DataType::FloatArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for item in items {
+                match item {
+                    None => out.push(None),
+                    Some(s) => match s.trim().parse::<f64>() {
+                        Ok(x) => out.push(Some(x)),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if ok { Some(Value::FloatArray(out)) } else { None }
+        }
+        // Identity for an already-float array, and widen integer arrays
+        // element-wise (PG accepts `ARRAY[1,2]::float8[]`).
+        (Value::FloatArray(items), DataType::FloatArray) => Some(Value::FloatArray(items)),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::IntArray(items), DataType::FloatArray) => Some(Value::FloatArray(
+            items.into_iter().map(|o| o.map(|n| f64::from(n))).collect(),
+        )),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::BigIntArray(items), DataType::FloatArray) => Some(Value::FloatArray(
+            items.into_iter().map(|o| o.map(|n| n as f64)).collect(),
+        )),
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
         }

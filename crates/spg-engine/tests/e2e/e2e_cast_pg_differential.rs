@@ -578,3 +578,15 @@ fn modulo_operator_sign_of_dividend() {
     ck(&mut e, r#"mod(-5, 3)"#, r#"-2"#);
     ck(&mut e, r#"mod(-5, 3) = (-5 % 3)"#, r#"true"#);
 }
+
+/// `expr::float8[]` (and float4[]/real[]) cast target — was ERR: the parser
+/// resolved it to Named("float8_array") but the type resolver didn't know that
+/// alias and coerce_value had no non-empty TEXT[]→FLOAT[] arm. PG18.4-verified.
+#[test]
+fn cast_to_float_array() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(ARRAY[1.5,2.5]::float8[])::text"#, r#"{1.5,2.5}"#);
+    ck(&mut e, r#"(ARRAY[1,2]::float8[])::text"#, r#"{1,2}"#);
+    ck(&mut e, r#"(ARRAY[1.5,2.5]::float4[])::text"#, r#"{1.5,2.5}"#);
+    ck(&mut e, r#"(ARRAY[10,20]::int[])::text"#, r#"{10,20}"#);
+}
