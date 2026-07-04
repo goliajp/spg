@@ -338,6 +338,14 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
     match c {
         '(' => {
             *p += 1;
+            // Non-capturing group `(?:...)`: consume the `?:` marker so the
+            // group body parses normally. (Capturing `(...)` groups are matched
+            // transparently today; per-group capture extraction — needed for
+            // regexp_match arrays / substring(from pattern) / `\N` in
+            // regexp_replace — is a separate D.9 slice.)
+            if *p + 1 < chars.len() && chars[*p] == '?' && chars[*p + 1] == ':' {
+                *p += 2;
+            }
             let inner = re_parse_alt(chars, p, depth + 1)?;
             if *p >= chars.len() || chars[*p] != ')' {
                 return Err(EvalError::TypeMismatch {
