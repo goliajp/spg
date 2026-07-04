@@ -209,6 +209,25 @@ pub(super) fn apply_binary(
     // integers to a common NUMERIC scale and stay in i128 throughout.
     // A NUMERIC paired with an INTERVAL is interval scaling, not
     // numeric math — let the calendar path below take it.
+    // `inet - inet` -> bigint: the count of addresses between them. Same
+    // family required, matching PG.
+    if op == BinOp::Sub {
+        if let (
+            Value::Inet { family: fa, addr: aa, .. },
+            Value::Inet { family: fb, addr: ab, .. },
+        ) = (&l, &r)
+        {
+            if fa != fb {
+                return Err(EvalError::TypeMismatch {
+                    detail: "cannot subtract addresses of different families".into(),
+                });
+            }
+            let diff = inet_addr_u128(*fa, aa) as i128 - inet_addr_u128(*fb, ab) as i128;
+            return i64::try_from(diff).map(Value::BigInt).map_err(|_| EvalError::TypeMismatch {
+                detail: "result out of range".into(),
+            });
+        }
+    }
     // Range `*` intersection / `+` union claim Mul / Add before numeric/date
     // arithmetic.
     if op == BinOp::Mul || op == BinOp::Add {
@@ -1974,6 +1993,13 @@ fn range_union(
         upper_inc: up_inc,
         empty: false,
     })
+}
+
+/// The numeric value of an inet/cidr address (IPv4 in the low 4 bytes,
+/// IPv6 across all 16), MSB-first.
+fn inet_addr_u128(family: u8, addr: &[u8; 16]) -> u128 {
+    let slice: &[u8] = if family == 4 { &addr[0..4] } else { &addr[..] };
+    slice.iter().fold(0u128, |acc, &b| (acc << 8) | u128::from(b))
 }
 
 pub(super) fn compare(
