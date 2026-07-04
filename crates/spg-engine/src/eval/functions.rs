@@ -6333,6 +6333,50 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // xmlelement(name_text, content …) — the parser lowers
+        // `XMLELEMENT(NAME ident, …)` to this call with the element name as
+        // the first (text) argument. Content args concatenate as the element
+        // body: xml-typed content is inserted verbatim, everything else is
+        // text-escaped (& < >). No content → a self-closing `<name/>`.
+        "xmlelement" => {
+            if args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "xmlelement() needs an element name".into(),
+                });
+            }
+            let name = match &args[0] {
+                Value::Null => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "xmlelement() name must not be NULL".into(),
+                    });
+                }
+                Value::Text(s) => s.to_string(),
+                other => value_to_format_text(other),
+            };
+            let mut body = alloc::string::String::new();
+            for arg in &args[1..] {
+                match arg {
+                    Value::Null => {}
+                    Value::Xml(s) => body.push_str(s),
+                    other => {
+                        for c in value_to_format_text(other).chars() {
+                            match c {
+                                '&' => body.push_str("&amp;"),
+                                '<' => body.push_str("&lt;"),
+                                '>' => body.push_str("&gt;"),
+                                o => body.push(o),
+                            }
+                        }
+                    }
+                }
+            }
+            let xml = if body.is_empty() {
+                alloc::format!("<{name}/>")
+            } else {
+                alloc::format!("<{name}>{body}</{name}>")
+            };
+            Ok(Value::Xml(alloc::borrow::Cow::Owned(xml)))
+        }
         // xmlconcat(xml, ...) — variadic fragment concatenation.
         // NULL args are skipped; all-NULL → NULL (PG semantics).
         "xmlconcat" => {
