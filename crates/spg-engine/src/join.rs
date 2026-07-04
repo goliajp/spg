@@ -653,6 +653,39 @@ impl Engine {
                 .unwrap_or(j.table.name.as_str())
                 .to_string();
             if let Some(inner_box) = &j.table.lateral_subquery {
+                // v7.37 D.19 — a NON-correlated derived-table peer (a bare
+                // `(VALUES …)`, which lowers to a UNION-ALL SELECT, or an
+                // uncorrelated subquery) must be materialised ONCE as an eager
+                // peer and cross-joined against every left row. Forcing it
+                // through the per-left-row lateral path below dropped its
+                // UNION-ALL rows, so `JOIN (VALUES ('1'),('2')) b ON true`
+                // yielded only the first value per left row instead of the
+                // full product. Only genuinely correlated laterals (which
+                // reference an outer column) need per-left-row evaluation.
+                if is_constant_values_derived(inner_box) {
+                    let pidx = from
+                        .joins
+                        .iter()
+                        .position(|jj| core::ptr::eq(jj, j))
+                        .unwrap_or(0);
+                    let (mut rows, cols) =
+                        self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
+                    if let Some(needed) = needed {
+                        Self::null_out_unreferenced(&mut rows, &cols, &a, needed);
+                    }
+                    budget.charge(approx_rows_bytes(&rows))?;
+                    joined.push(JoinedPeer {
+                        eager_rows: Some(rows),
+                        cols,
+                        alias: a,
+                        kind: j.kind,
+                        on: j.on.as_ref(),
+                        lateral: None,
+                        join_table: None,
+                        where_preds: Vec::new(),
+                    });
+                    continue;
+                }
                 // Probe schema by running the inner SELECT against a
                 // NULL-padded outer context. The probe gives us the
                 // projection's column shape; rows materialise per
@@ -2802,6 +2835,39 @@ pub(crate) fn synth_lateral_col_name(expr: &Expr, idx: usize) -> String {
 /// entire SELECT body (items, WHERE, GROUP BY, HAVING, ORDER BY,
 /// UNION peers) so any depth of outer reference inside the
 /// LATERAL subquery resolves before execution.
+/// True when `e` is a compile-time constant — no column ref, function call,
+/// subquery, or other outer-touching construct. Used to recognise a bare
+/// `(VALUES …)` derived table (whose rows are pure literals) so it can be
+/// eager-materialised as a join peer rather than forced through the per-left-row
+/// lateral path (see D.19).
+fn expr_is_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Placeholder(_) => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => expr_is_constant(expr),
+        Expr::Binary { lhs, rhs, .. } => expr_is_constant(lhs) && expr_is_constant(rhs),
+        _ => false,
+    }
+}
+
+/// True when `s` is a constant `(VALUES …)`-shaped derived table: the head and
+/// every UNION-ALL peer has no FROM clause and projects only constant
+/// expressions. Such a table references nothing outer, so it is safe to
+/// materialise once and cross-join — unlike a correlated lateral (e.g.
+/// `generate_series(1, outer.col)`), which must stay per-left-row.
+fn is_constant_values_derived(s: &SelectStatement) -> bool {
+    use spg_sql::ast::SelectItem;
+    let peer_ok = |p: &SelectStatement| -> bool {
+        p.from.is_none()
+            && p.where_.is_none()
+            && p.having.is_none()
+            && p.items.iter().all(|it| match it {
+                SelectItem::Expr { expr, .. } => expr_is_constant(expr),
+                _ => false,
+            })
+    };
+    peer_ok(s) && s.unions.iter().all(|(_, peer)| peer_ok(peer))
+}
+
 pub(crate) fn substitute_outer_columns_multi(
     stmt: &mut SelectStatement,
     outer_row: &Row<'static>,
