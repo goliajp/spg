@@ -1376,12 +1376,13 @@ fn sqrt_newton(x: f64) -> f64 {
     g
 }
 
-/// v7.37.7 C.1.7 — PG integer modulo. Float operands fall back to
-/// `f64::rem_euclid` (PG `%` on floats is C `fmod` semantics; the
-/// `rem_euclid` choice keeps the sign of the divisor for the
-/// uncommon negative-divisor case — matches PG 14+ behaviour).
-/// Division by zero surfaces as `DivisionByZero` so callers see the
-/// same error variant for `/` and `%`.
+/// v7.37.7 C.1.7 — PG integer modulo. PG's `%` (like C and the SQL
+/// `mod()` function) is truncated-division remainder: the result takes
+/// the sign of the DIVIDEND, so `-5 % 3 = -2`, not the Euclidean `1`.
+/// That is exactly Rust's native `%`; `wrapping_rem` is used so the
+/// `i64::MIN % -1` corner returns 0 instead of panicking. Division by
+/// zero surfaces as `DivisionByZero` so callers see the same error
+/// variant for `/` and `%`.
 fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
     let any_float = matches!(l.data_type(), Some(DataType::Float))
         || matches!(r.data_type(), Some(DataType::Float));
@@ -1394,15 +1395,14 @@ fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         return Ok(Value::Float(a % b));
     }
     // `arith()` is integer-only when the float fast path above didn't
-    // match; both closures take `i64`. `rem_euclid` is well-defined
-    // for i64 division (panics only on divide-by-zero, which the gate
-    // above prevents). We DO NOT need an `rem_euclid` for f64 — that
-    // path returned earlier with `%` (C-style fmod), matching PG.
+    // match; both closures take `i64`. `wrapping_rem` is truncated
+    // remainder (sign of the dividend, matching PG / C / `mod()`) and
+    // is panic-free including the `i64::MIN % -1` overflow corner.
     arith(
         l,
         r,
         |a, b| {
-            if b == 0 { None } else { Some(a.rem_euclid(b)) }
+            if b == 0 { None } else { Some(a.wrapping_rem(b)) }
         },
         // f64 fallback (when widening to Float happens inside arith);
         // f64's `%` is C `fmod` semantics, matching PG `%` on floats.
