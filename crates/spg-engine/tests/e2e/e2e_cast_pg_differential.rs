@@ -1065,3 +1065,22 @@ fn range_typed_literals() {
     // composes with operators.
     ck(&mut e, "(int4range '[1,5)' @> 3)::text", "true");
 }
+
+/// to_char(interval, fmt) — interval fields don't wrap (HH24 of 25h = 25),
+/// months split into YYYY-MM, negatives keep their sign. PG18.4-verified.
+#[test]
+fn to_char_interval_fmt() {
+    let mut e = Engine::new();
+    ck(&mut e, "to_char(interval '1 day 2 hours', 'HH24:MI:SS')", "02:00:00");
+    ck(&mut e, "to_char(interval '25 hours', 'HH24')", "25");
+    ck(&mut e, "to_char(interval '1 day 2 hours', 'DD HH24')", "01 02");
+    ck(&mut e, "to_char(interval '14 months', 'YYYY-MM')", "0001-02");
+    ck(&mut e, "to_char(interval '1 day 2 hours 3 minutes 4 seconds', 'DD HH24:MI:SS')", "01 02:03:04");
+    ck(&mut e, "to_char(interval '90 minutes', 'HH24:MI')", "01:30");
+    ck(&mut e, "to_char(interval '2 hours', 'HH12 AM')", "02 AM");
+    // negative time fields keep their sign (HH24/MI/SS/MM zero-pad after it).
+    ck(&mut e, "to_char(interval '-2 hours', 'HH24')", "-02");
+    // control: numeric/timestamp to_char unaffected.
+    ck(&mut e, "to_char(timestamp '2024-03-15 14:30:45', 'HH24:MI:SS')", "14:30:45");
+    ck(&mut e, "to_char(1234.5, 'FM9999.00')", "1234.50");
+}

@@ -532,6 +532,97 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
 /// roman numerals, `EEEE` scientific, `V` scale, `TH` / `th`
 /// ordinals, currency `L` / `$`, and a trailing (rather than
 /// leading) `S`.
+/// `to_char(interval, fmt)`. Unlike the timestamp form, interval fields carry
+/// their own sign and don't wrap: `HH24` of `interval '25 hours'` is `25`, not
+/// `01`. `MM`/`YYYY` come straight from the months component (14 months →
+/// `0001-02`); the time part decomposes into `HH24:MI:SS`. Calendar-only codes
+/// (day/month names, DOW, week, Julian) are meaningless for an interval and
+/// pass through as literals rather than erroring. Known cosmetic divergence:
+/// PG renders a negative `DD` field unpadded (`-1`, not `-01`); we zero-pad
+/// every numeric field consistently after the sign.
+fn to_char_interval(months: i64, days: i64, micros: i128, fmt: &str) -> String {
+    use core::fmt::Write as _;
+    let yyyy = months / 12;
+    let mm = months % 12;
+    let hh24 = i64::try_from(micros / 3_600_000_000).unwrap_or(0);
+    let mi = i64::try_from((micros / 60_000_000) % 60).unwrap_or(0);
+    let ss = i64::try_from((micros / 1_000_000) % 60).unwrap_or(0);
+    let ms = i64::try_from((micros / 1_000) % 1_000).unwrap_or(0);
+    let us = i64::try_from(micros % 1_000_000).unwrap_or(0);
+    let hh12 = match hh24.rem_euclid(12) {
+        0 => 12,
+        x => x,
+    };
+    let ampm = if hh24.rem_euclid(24) < 12 { "AM" } else { "PM" };
+    // Sign-aware zero pad: PG renders `-2` hours as `-02`.
+    let pad = |v: i64, w: usize, fm: bool| -> String {
+        if fm {
+            alloc::format!("{v}")
+        } else if v < 0 {
+            alloc::format!("-{:0width$}", -v, width = w)
+        } else {
+            alloc::format!("{:0width$}", v, width = w)
+        }
+    };
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    let mut fm = false;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"FM") {
+            fm = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            out.push_str(&fmt[start..i]);
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        let (frag, consumed): (String, usize) = if rest.starts_with(b"YYYY") {
+            (pad(yyyy, 4, fm), 4)
+        } else if rest.starts_with(b"HH24") {
+            (pad(hh24, 2, fm), 4)
+        } else if rest.starts_with(b"HH12") {
+            (pad(hh12, 2, fm), 4)
+        } else if rest.starts_with(b"US") {
+            (pad(us, 6, fm), 2)
+        } else if rest.starts_with(b"MS") {
+            (pad(ms, 3, fm), 2)
+        } else if rest.starts_with(b"HH") {
+            (pad(hh12, 2, fm), 2)
+        } else if rest.starts_with(b"MI") {
+            (pad(mi, 2, fm), 2)
+        } else if rest.starts_with(b"SS") {
+            (pad(ss, 2, fm), 2)
+        } else if rest.starts_with(b"DD") {
+            (pad(days, 2, fm), 2)
+        } else if rest.starts_with(b"MM") {
+            (pad(mm, 2, fm), 2)
+        } else if rest.starts_with(b"AM") || rest.starts_with(b"PM") {
+            (ampm.to_string(), 2)
+        } else {
+            // Any other byte (punctuation, spaces, calendar-name letters)
+            // passes through literally.
+            let mut buf = String::new();
+            let _ = write!(buf, "{}", bytes[i] as char);
+            (buf, 1)
+        };
+        out.push_str(&frag);
+        fm = false;
+        i += consumed;
+    }
+    out
+}
+
 fn to_char_numeric(n: f64, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
@@ -728,6 +819,15 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             ),
         });
     };
+    // Interval form: to_char(interval, 'HH24:MI:SS' / 'DD' / 'YYYY-MM' / …).
+    if let Value::Interval { months, days, micros } = &args[0] {
+        return Ok(Value::text(to_char_interval(
+            i64::from(*months),
+            i64::from(*days),
+            i128::from(*micros),
+            fmt,
+        )));
+    }
     // Numeric form: to_char(number, 'FM9999.00' / '999,990.9' / …).
     if let Some(n) = numeric_value_for_to_char(&args[0]) {
         return Ok(Value::text(to_char_numeric(n, fmt)));
