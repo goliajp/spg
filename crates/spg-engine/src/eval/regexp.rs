@@ -179,6 +179,14 @@ enum ReNode {
     Concat(Vec<ReNode>),
     /// Alternation.
     Alt(Vec<ReNode>),
+    /// Zero-width lookahead assertion. `(?=inner)` (negative == false) succeeds
+    /// at a position iff `inner` matches starting there; `(?!inner)` (negative
+    /// == true) succeeds iff it does NOT. Either way it consumes no input. Runs
+    /// under the same ReDoS step/depth budget as every other node.
+    Lookahead {
+        negative: bool,
+        inner: Box<ReNode>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -356,13 +364,25 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
     match c {
         '(' => {
             *p += 1;
-            // Non-capturing group `(?:...)`: consume the `?:` marker so the
-            // group body parses normally. (Capturing `(...)` groups are matched
-            // transparently today; per-group capture extraction — needed for
-            // regexp_match arrays / substring(from pattern) / `\N` in
-            // regexp_replace — is a separate D.9 slice.)
-            if *p + 1 < chars.len() && chars[*p] == '?' && chars[*p + 1] == ':' {
-                *p += 2;
+            // `(?...)` prefixes: `(?:` non-capturing group, `(?=`/`(?!` lookahead
+            // assertions. (Capturing `(...)` groups are matched transparently
+            // today; per-group capture extraction — needed for regexp_match
+            // arrays / substring(from pattern) / `\N` in regexp_replace — is a
+            // separate D.9 slice.)
+            let mut lookahead: Option<bool> = None;
+            if *p + 1 < chars.len() && chars[*p] == '?' {
+                match chars[*p + 1] {
+                    ':' => *p += 2,
+                    '=' => {
+                        lookahead = Some(false);
+                        *p += 2;
+                    }
+                    '!' => {
+                        lookahead = Some(true);
+                        *p += 2;
+                    }
+                    _ => {}
+                }
             }
             let inner = re_parse_alt(chars, p, depth + 1)?;
             if *p >= chars.len() || chars[*p] != ')' {
@@ -371,7 +391,13 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                 });
             }
             *p += 1;
-            Ok(inner)
+            match lookahead {
+                Some(negative) => Ok(ReNode::Lookahead {
+                    negative,
+                    inner: Box::new(inner),
+                }),
+                None => Ok(inner),
+            }
         }
         '[' => re_parse_class(chars, p),
         '.' => {
@@ -876,6 +902,12 @@ fn re_match_at(
                 return Ok(None);
             }
             Ok(Some(p))
+        }
+        ReNode::Lookahead { negative, inner } => {
+            // Zero-width: try `inner` at the current position; succeed (consuming
+            // nothing) per the positive/negative sense, else fail.
+            let hit = re_match_at(inner, s, pos, d, steps)?.is_some();
+            Ok(if hit != *negative { Some(pos) } else { None })
         }
     }
 }
@@ -1542,7 +1574,7 @@ fn fold_case(node: &mut ReNode) {
             }
             members.extend(extra);
         }
-        ReNode::Quant { inner, .. } => fold_case(inner),
+        ReNode::Quant { inner, .. } | ReNode::Lookahead { inner, .. } => fold_case(inner),
         ReNode::Concat(items) | ReNode::Alt(items) => {
             for it in items.iter_mut() {
                 fold_case(it);

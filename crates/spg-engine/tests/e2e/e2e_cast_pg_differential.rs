@@ -1534,3 +1534,19 @@ fn regex_char_escapes() {
     // control: an unknown escape is still the literal char.
     ck(&mut e, "('q' ~ '^\\q$')::text", "true");
 }
+
+/// v7.37 D.9 (slice 2) — zero-width lookahead assertions `(?=...)` / `(?!...)`.
+/// PG18.4-verified.
+#[test]
+fn regex_lookahead() {
+    let mut e = Engine::new();
+    ck(&mut e, "('abc' ~ 'a(?=b)')::text", "true");
+    ck(&mut e, "('axc' ~ 'a(?=b)')::text", "false");
+    ck(&mut e, "('abc' ~ 'a(?!x)')::text", "true");
+    ck(&mut e, "('axc' ~ 'a(?!x)')::text", "false");
+    // zero-width: the lookahead consumes nothing, so 'b' still must match after.
+    ck(&mut e, "('abc' ~ '^a(?=b)bc$')::text", "true");
+    // control: (?:...) / (?i) still work alongside.
+    ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
+    ck(&mut e, "('ABC' ~ '(?i)a(?=b)')::text", "true");
+}
