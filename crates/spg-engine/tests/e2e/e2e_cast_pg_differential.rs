@@ -988,3 +988,13 @@ fn point_constructor_and_mul() {
     ck(&mut e, "(point(2,3) * point(1,0))::text", "(2,3)");
     ck(&mut e, "(point(1,1) * point(0,1))::text", "(-1,1)"); // i*(1+i) = -1+i
 }
+
+/// lseg text input accepts the bare `(x1,y1),(x2,y2)` spelling, not just the
+/// bracketed `[...]` form; output is always bracketed. PG18.4-verified.
+#[test]
+fn lseg_bare_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "'(1,1),(2,2)'::lseg::text", "[(1,1),(2,2)]");
+    ck(&mut e, "'[(1,1),(2,2)]'::lseg::text", "[(1,1),(2,2)]"); // bracketed still works
+    ck(&mut e, "'(0,0),(3,4)'::lseg::text", "[(0,0),(3,4)]");
+}
