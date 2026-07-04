@@ -222,11 +222,29 @@ fn is_word_char(c: char) -> bool {
 fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
     let chars: Vec<char> = pat.chars().collect();
     let mut p = 0;
-    let n = re_parse_alt(&chars, &mut p, 0)?;
+    // Leading inline option group `(?flags)` applies to the whole pattern. The
+    // only flag that changes matching in this engine is `i` (case-insensitive);
+    // the rest (m/s/n/x/…) are accepted and ignored. A `(?:…)` non-capturing
+    // group is NOT an option group (its `:` isn't a flag letter) — it is handled
+    // in re_parse_atom, so this leading-flag scan skips it.
+    let mut fold = false;
+    if chars.len() >= 3 && chars[0] == '(' && chars[1] == '?' {
+        if let Some(close) = chars[2..].iter().position(|&c| c == ')') {
+            let flags = &chars[2..2 + close];
+            if !flags.is_empty() && flags.iter().all(|c| "bceimnpqstwx".contains(*c)) {
+                fold = flags.contains(&'i');
+                p = 2 + close + 1;
+            }
+        }
+    }
+    let mut n = re_parse_alt(&chars, &mut p, 0)?;
     if p != chars.len() {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("regex compile: trailing chars at pos {p} in {pat:?}"),
         });
+    }
+    if fold {
+        fold_case(&mut n);
     }
     Ok(n)
 }
