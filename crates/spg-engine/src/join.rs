@@ -1047,6 +1047,14 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<bool, EngineError> {
         const INL_MAX_LEFT: usize = 1024;
+        // v7.37.16 — RIGHT / FULL OUTER need to enumerate ALL peer rows
+        // (to emit the unmatched ones with a NULL-filled left). The INL
+        // probe only index-seeks the matched peer rows, so it cannot
+        // produce the unmatched-right set. Bail to the hash stage, which
+        // iterates every peer row and can track which matched.
+        if matches!(peer.kind, JoinKind::Right | JoinKind::FullOuter) {
+            return Ok(false);
+        }
         let Some(tname) = &peer.join_table else {
             return Ok(false);
         };
@@ -1355,6 +1363,16 @@ impl Engine {
                 .push(ri);
         }
         let mut next: Vec<usize> = Vec::new();
+        // v7.37.16 — RIGHT / FULL OUTER: track which peer (build-side)
+        // rows joined with at least one drive tuple so the unmatched
+        // ones can be emitted (NULL-filled left) after the probe loop.
+        // Empty (unallocated) for INNER / LEFT — no per-row cost there.
+        let track_right = matches!(peer.kind, JoinKind::Right | JoinKind::FullOuter);
+        let mut peer_matched: Vec<bool> = if track_right {
+            alloc::vec![false; n_rights]
+        } else {
+            Vec::new()
+        };
         let mut probebuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
@@ -1424,12 +1442,43 @@ impl Engine {
                         next.extend_from_slice(tuple);
                         next.push(ri);
                         left_matched = true;
+                        if track_right {
+                            peer_matched[ri] = true;
+                        }
                     }
                 }
             }
-            if !left_matched && matches!(peer.kind, JoinKind::Left) {
+            // LEFT (and FULL OUTER) keep unmatched drive rows with a
+            // NULL-filled peer (`usize::MAX` sentinel → NULL columns).
+            if !left_matched && matches!(peer.kind, JoinKind::Left | JoinKind::FullOuter) {
                 next.extend_from_slice(tuple);
                 next.push(usize::MAX);
+            }
+        }
+        // v7.37.16 — RIGHT / FULL OUTER: append the peer rows that no
+        // drive tuple matched, NULL-filling every prior source column
+        // (a `usize::MAX` sentinel for each of the `stride` drive slots)
+        // and carrying the real peer row index. Same visibility gate as
+        // the build loop so an invisible / NULL-key peer row is emitted
+        // once and only when it truly exists.
+        if track_right {
+            for ri in 0..n_rights {
+                if peer_matched[ri] {
+                    continue;
+                }
+                if let Some((gt, hot_len)) = build_gate
+                    && ri < hot_len
+                    && !gt.is_row_visible(ri, &scan_snapshot)
+                {
+                    continue;
+                }
+                if rights_src.get(ri).is_none() {
+                    continue;
+                }
+                for _ in 0..pipe.stride {
+                    next.push(usize::MAX);
+                }
+                next.push(ri);
             }
         }
         pipe.advance(next, rights_src, peer_mask.clone(), right_arity);
@@ -1489,6 +1538,51 @@ impl Engine {
         let rights_eager: Option<&[Row<'static>]> =
             peer.eager_rows.as_deref().or(lazy_rows.as_deref());
         let mut next: Vec<usize> = Vec::new();
+        let right_or_full = matches!(peer.kind, JoinKind::Right | JoinKind::FullOuter);
+        // v7.37.16 — RIGHT / FULL OUTER over a *derived-table* right
+        // operand (VALUES / non-correlated subquery). `build_join_peers`
+        // routes every derived table through the "lateral" branch even
+        // when it is not correlated; materialise it ONCE here into a
+        // fixed row set so the unmatched-peer rows can be enumerated. A
+        // truly correlated peer would give per-left-row-varying rows, but
+        // PG rejects RIGHT/FULL LATERAL, so a single NULL-outer
+        // materialisation is the correct fixed set. Also handles the
+        // empty-drive case (no left tuples → every peer row unmatched).
+        let lateral_fixed: Option<Vec<Row<'static>>> = if right_or_full && peer.lateral.is_some()
+        {
+            let inner = peer.lateral.expect("lateral peer");
+            // Materialise the derived table directly (no outer-column
+            // substitution): a RIGHT/FULL peer must be non-correlated
+            // (PG rejects RIGHT/FULL LATERAL), so its rows are the same
+            // for every drive row and independent of the outer context.
+            // Use the union-aware entry: a multi-row `VALUES (…),(…)` is
+            // stored as a head SELECT + `stmt.unions` tails, so the bare
+            // (non-union) executor would return only the first row.
+            match self.exec_select_cancel(inner, cancel)? {
+                QueryResult::Rows { rows, .. } => Some(rows),
+                _ => {
+                    return Err(EngineError::Unsupported(
+                        "derived-table join operand must be a SELECT".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        // A fixed peer-row index space exists for the non-lateral eager
+        // path OR the just-materialised `lateral_fixed` set. Both let
+        // RIGHT / FULL OUTER track which peer rows matched and emit the
+        // unmatched ones (NULL-filled left) after the loop.
+        let track_right = right_or_full && (peer.lateral.is_none() || lateral_fixed.is_some());
+        let fixed_peer_len = match &lateral_fixed {
+            Some(f) => f.len(),
+            None => rights_eager.map(<[_]>::len).unwrap_or(0),
+        };
+        let mut peer_matched: Vec<bool> = if track_right {
+            alloc::vec![false; fixed_peer_len]
+        } else {
+            Vec::new()
+        };
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
             let mut left_matched = false;
@@ -1499,8 +1593,10 @@ impl Engine {
                 tuple,
                 pipe.consumed_cols,
             );
-            let per_left_rrows: Cow<'_, [Row]> = match peer.lateral {
-                Some(inner) => {
+            let per_left_rrows: Cow<'_, [Row]> = match (&lateral_fixed, peer.lateral) {
+                // RIGHT/FULL derived-table peer — the single fixed set.
+                (Some(fixed), _) => Cow::Borrowed(fixed.as_slice()),
+                (None, Some(inner)) => {
                     // Substitute outer columns and run the inner SELECT
                     // against the current left row's slice of the
                     // combined schema.
@@ -1510,7 +1606,7 @@ impl Engine {
                         self.materialise_lateral_for_outer(inner, outer_schema, &left_row)?;
                     Cow::Owned(rows)
                 }
-                None => Cow::Borrowed(rights_eager.expect("non-lateral peer eager")),
+                (None, None) => Cow::Borrowed(rights_eager.expect("non-lateral peer eager")),
             };
             for (ri, right) in per_left_rrows.as_ref().iter().enumerate() {
                 let mut combined_vals = left_vals.clone();
@@ -1527,20 +1623,40 @@ impl Engine {
                 };
                 if keep {
                     next.extend_from_slice(tuple);
-                    if peer.lateral.is_some() {
+                    if peer.lateral.is_some() && lateral_fixed.is_none() {
+                        // Correlated / INNER-LEFT lateral: per-outer-row
+                        // arena (rows vary per left tuple).
                         let mut cv = combined.values;
                         let rv = cv.split_off(left_vals.len());
                         arena.push(Row::new(rv));
                         next.push(arena.len() - 1);
                     } else {
+                        // Fixed peer index space (non-lateral eager, or
+                        // the RIGHT/FULL `lateral_fixed` set).
                         next.push(ri);
+                        if track_right {
+                            peer_matched[ri] = true;
+                        }
                     }
                     left_matched = true;
                 }
             }
-            if !left_matched && matches!(peer.kind, JoinKind::Left) {
+            if !left_matched && matches!(peer.kind, JoinKind::Left | JoinKind::FullOuter) {
                 next.extend_from_slice(tuple);
                 next.push(usize::MAX);
+            }
+        }
+        // v7.37.16 — RIGHT / FULL OUTER: append unmatched peer rows with
+        // a NULL-filled left (`usize::MAX` for each drive slot).
+        if track_right {
+            for (ri, matched) in peer_matched.iter().enumerate() {
+                if *matched {
+                    continue;
+                }
+                for _ in 0..pipe.stride {
+                    next.push(usize::MAX);
+                }
+                next.push(ri);
             }
         }
         if next.len() / (pipe.stride + 1) > MAX_JOIN_INTERMEDIATE_ROWS {
@@ -1549,7 +1665,10 @@ impl Engine {
                 next.len() / (pipe.stride + 1)
             )));
         }
-        let source = if peer.lateral.is_some() {
+        let source = if let Some(fixed) = lateral_fixed {
+            // RIGHT/FULL derived-table peer — the fixed set is the source.
+            JoinSrc::Owned(fixed)
+        } else if peer.lateral.is_some() {
             JoinSrc::Owned(arena)
         } else if let Some(lz) = lazy_rows {
             JoinSrc::Owned(lz)
@@ -2900,6 +3019,18 @@ fn analyze_join_pushdown<'w>(
         .unwrap_or(from.primary.name.as_str());
     let mut primary_preds: Vec<&Expr> = Vec::new();
     let mut peer_preds: Vec<Vec<&Expr>> = alloc::vec![Vec::new(); from.joins.len()];
+    // v7.37.16 — a RIGHT / FULL OUTER join anywhere in the chain makes
+    // the primary (left/drive) side nullable: unmatched peer rows emit
+    // NULL-filled primary columns. A WHERE predicate on the primary must
+    // then be applied AFTER the join, never pushed onto the primary scan
+    // (pushing `l.k IS NULL` below `l RIGHT JOIN r` would filter l first
+    // and wrongly keep all NULL-primary rows). Leaving such predicates in
+    // the residual WHERE keeps them correct. Peer pushdown is already
+    // gated to INNER peers below, so it needs no extra guard.
+    let primary_nullable = from
+        .joins
+        .iter()
+        .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::FullOuter));
     if let Some(w) = where_ {
         for sub in reorder::split_and_conjunctions(w) {
             if expr_has_subquery(sub) || aggregate::contains_aggregate(sub) {
@@ -2916,7 +3047,9 @@ fn analyze_join_pushdown<'w>(
                 continue;
             }
             if q0.eq_ignore_ascii_case(primary_alias) {
-                primary_preds.push(sub);
+                if !primary_nullable {
+                    primary_preds.push(sub);
+                }
                 continue;
             }
             for (i, j) in from.joins.iter().enumerate() {

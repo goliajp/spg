@@ -2434,6 +2434,16 @@ pub enum JoinKind {
     Inner,
     Left,
     Cross,
+    /// v7.37.16 — `RIGHT [OUTER] JOIN`: keep every right (peer) row,
+    /// NULL-filling the left (drive) columns on unmatched right rows.
+    /// The executor runs the LEFT algorithm's mirror: it tracks which
+    /// peer rows matched and emits the unmatched ones with a NULL-left
+    /// tuple after the probe loop. Output column order is unchanged
+    /// (left-table cols then right-table cols).
+    Right,
+    /// v7.37.16 — `FULL [OUTER] JOIN`: keep every row from both sides
+    /// (LEFT-unmatched → NULL right, RIGHT-unmatched → NULL left).
+    FullOuter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4729,6 +4739,8 @@ impl fmt::Display for FromClause {
                 JoinKind::Inner => write!(f, " INNER JOIN {}", j.table)?,
                 JoinKind::Left => write!(f, " LEFT JOIN {}", j.table)?,
                 JoinKind::Cross => write!(f, " CROSS JOIN {}", j.table)?,
+                JoinKind::Right => write!(f, " RIGHT JOIN {}", j.table)?,
+                JoinKind::FullOuter => write!(f, " FULL OUTER JOIN {}", j.table)?,
             }
             if let Some(on) = &j.on {
                 write!(f, " ON {on}")?;

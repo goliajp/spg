@@ -193,6 +193,8 @@ pub enum Token {
     Left,
     Cross,
     Outer,
+    Right,
+    Full,
     Default,
     Savepoint,
     Release,
@@ -894,6 +896,9 @@ fn kw_len4(b: &[u8]) -> Option<Token> {
     if eq_ci(b, b"null") {
         return Some(Token::Null);
     }
+    if eq_ci(b, b"full") {
+        return Some(Token::Full);
+    }
     if eq_ci(b, b"true") {
         return Some(Token::True);
     }
@@ -957,6 +962,9 @@ fn kw_len5(b: &[u8]) -> Option<Token> {
     }
     if eq_ci(b, b"outer") {
         return Some(Token::Outer);
+    }
+    if eq_ci(b, b"right") {
+        return Some(Token::Right);
     }
     None
 }
