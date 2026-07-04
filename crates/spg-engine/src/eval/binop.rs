@@ -1898,6 +1898,20 @@ pub(super) fn compare(
         (Value::Multirange { kind: ak, ranges: ar }, Value::Multirange { kind: bk, ranges: br }) => {
             return cmp_result(op, multirange_cmp(*ak, ar, *bk, br));
         }
+        // v7.37 — TSVECTOR equality (=/<>). SPG stores lexemes sorted by
+        // word + deduped with their (ascending) positions and weight, so a
+        // structural compare matches PG (`'bar foo' = 'foo bar'`, position-
+        // sensitive, deduped). Ordering (< etc.) is deferred.
+        (Value::TsVector(a), Value::TsVector(b)) => {
+            let eq = a == b;
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "tsvector ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
+                }),
+            };
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
