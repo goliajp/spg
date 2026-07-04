@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use spg_sql::ast::CastTarget;
 use spg_storage::Value;
 
-use super::math::f64_round_half_away;
+use super::math::{f64_powi, f64_round_half_away};
 use super::{
     EvalError, decode_tsquery_external, decode_tsvector_external, parse_date_literal,
     parse_timestamp_literal, value_to_text,
@@ -610,6 +610,13 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Ok(Value::Float(n as f64)),
         Value::Float(x) => Ok(Value::Float(x)),
+        // PG's numeric→double precision is an implicit cast; a
+        // `Value::Numeric` (from `::numeric`, a numeric column, or
+        // numeric arithmetic) must convert to f64, not error.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale } => {
+            Ok(Value::Float((scaled as f64) / f64_powi(10.0, i32::from(scale))))
+        }
         Value::Text(s) => {
             s.trim()
                 .parse::<f64>()

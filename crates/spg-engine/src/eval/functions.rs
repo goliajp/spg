@@ -4282,6 +4282,12 @@ fn apply_function_dispatch(
                 Value::Int(n) => Ok(Value::Int(n.wrapping_abs())),
                 Value::BigInt(n) => Ok(Value::BigInt(n.wrapping_abs())),
                 Value::Float(x) => Ok(Value::Float(x.abs())),
+                // PG `abs(numeric)` returns numeric — preserve the type
+                // and scale, negating only the sign of the mantissa.
+                Value::Numeric { scaled, scale } => Ok(Value::Numeric {
+                    scaled: scaled.abs(),
+                    scale: *scale,
+                }),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("abs() needs numeric, got {:?}", other.data_type()),
                 }),
@@ -5203,6 +5209,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: "make_time(): sec must be numeric".into(),
@@ -5257,6 +5266,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: "make_timestamp(): sec must be numeric".into(),
@@ -5302,6 +5314,9 @@ fn apply_function_dispatch(
                     Some(Value::SmallInt(n)) => Ok(f64::from(*n)),
                     Some(Value::BigInt(n)) => Ok(*n as f64),
                     Some(Value::Float(f)) => Ok(*f),
+                    Some(Value::Numeric { scaled, scale }) => {
+                        Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+                    }
                     Some(other) => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
                             "make_interval(): needs numeric, got {:?}",
@@ -7082,6 +7097,11 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                // PG accepts numeric via the implicit numeric→float8 cast
+                // (all these take double precision).
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -7122,6 +7142,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -7181,6 +7204,9 @@ fn apply_function_dispatch(
                     Value::Int(n) => Ok(f64::from(*n)),
                     Value::SmallInt(n) => Ok(f64::from(*n)),
                     Value::BigInt(n) => Ok(*n as f64),
+                    Value::Numeric { scaled, scale } => {
+                        Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+                    }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
                             "atan2(): needs numeric, got {:?}",
@@ -7213,6 +7239,9 @@ fn apply_function_dispatch(
                         Value::Int(n) => Ok(f64::from(*n)),
                         Value::SmallInt(n) => Ok(f64::from(*n)),
                         Value::BigInt(n) => Ok(*n as f64),
+                        Value::Numeric { scaled, scale } => {
+                            Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+                        }
                         other => Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
                                 "atan2d(): needs numeric, got {:?}",
@@ -7236,6 +7265,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -7353,6 +7385,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -7400,6 +7435,9 @@ fn apply_function_dispatch(
                     Value::Int(n) => f64::from(*n),
                     Value::SmallInt(n) => f64::from(*n),
                     Value::BigInt(n) => *n as f64,
+                    Value::Numeric { scaled, scale } => {
+                        (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
@@ -7419,6 +7457,9 @@ fn apply_function_dispatch(
                     Value::Int(n) => f64::from(*n),
                     Value::SmallInt(n) => f64::from(*n),
                     Value::BigInt(n) => *n as f64,
+                    Value::Numeric { scaled, scale } => {
+                        (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
@@ -7826,6 +7867,9 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
+                Value::Numeric { scaled, scale } => {
+                    (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
