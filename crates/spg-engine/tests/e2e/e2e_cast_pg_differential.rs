@@ -459,3 +459,18 @@ fn time_minus_time_interval() {
     ck(&mut e, r#"'23:59:59'::time - '00:00:00'::time"#, r#"23:59:59"#);
 }
 
+
+/// PG shows an explicit `+` on the time part of an interval when a preceding
+/// date field is negative but the time is positive: `-1 days +02:00:00`.
+/// PG18.4-verified.
+#[test]
+fn interval_mixed_sign_plus_render() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"interval '1 day 2 hours'"#, r#"1 day 02:00:00"#);
+    ck(&mut e, r#"interval '-1 day 2 hours'"#, r#"-1 days +02:00:00"#);
+    ck(&mut e, r#"interval '1 day -2 hours'"#, r#"1 day -02:00:00"#);
+    ck(&mut e, r#"interval '-1 day -2 hours'"#, r#"-1 days -02:00:00"#);
+    ck(&mut e, r#"interval '-1 month -1 day -2 hours'"#, r#"-1 mons -1 days -02:00:00"#);
+    ck(&mut e, r#"interval '1 month -2 hours'"#, r#"1 mon -02:00:00"#);
+    ck(&mut e, r#"interval '-2 hours'"#, r#"-02:00:00"#);
+}
