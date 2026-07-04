@@ -1701,3 +1701,17 @@ fn bit_substring() {
     ck(&mut e, "substring('abcdef' from 2 for 3)::text", "bcd");
     ck(&mut e, "substring('abcdef' for 3)::text", "abc");
 }
+
+/// v7.37 D — length(path) (sum of segment lengths, closed adds wrap-around) and
+/// path + path concatenation. Both previously errored. PG18.4-verified.
+#[test]
+fn path_length_and_concat() {
+    let mut e = Engine::new();
+    ck(&mut e, "(length('[(0,0),(3,4)]'::path))::text", "5");
+    ck(&mut e, "(length('[(0,0),(3,0),(3,4)]'::path))::text", "7");
+    // closed path adds the wrap-around segment (3,4)->(0,0) = 5 → 7 + 5 = 12.
+    ck(&mut e, "(length('((0,0),(3,0),(3,4))'::path))::text", "12");
+    ck(&mut e, "('[(0,0),(3,0)]'::path + '[(3,0),(3,4)]'::path)::text", "[(0,0),(3,0),(3,0),(3,4)]");
+    // control: npoints still works.
+    ck(&mut e, "(npoints('[(0,0),(3,4),(5,5)]'::path))::text", "3");
+}
