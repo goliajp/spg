@@ -1904,3 +1904,30 @@ fn groups_offset_frame() {
     assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"), "5,7,7,3");
     assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v DESC GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"), "3,4,4,3");
 }
+
+/// v7.37 D.19 — a bare (VALUES …) join operand must cross-join fully, not yield
+/// only the first row. PG18.4-verified.
+#[test]
+fn join_bare_values_operand() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // CROSS JOIN two bare VALUES
+    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) CROSS JOIN (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    // comma-join
+    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v), (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    // JOIN ... ON true
+    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) JOIN (VALUES ('1'),('2')) b(v) ON true"), "a1,a2,b1,b2");
+    // real table CROSS bare VALUES
+    e.execute("CREATE TABLE ct19(v TEXT)").ok();
+    e.execute("INSERT INTO ct19 VALUES ('a'),('b')").ok();
+    assert_eq!(q(&mut e, "SELECT string_agg(ct19.v||b.v, ',' ORDER BY ct19.v||b.v) FROM ct19 CROSS JOIN (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    // regression guard: a genuinely correlated LATERAL still evaluates
+    // per-left-row (must NOT take the new eager path).
+    assert_eq!(q(&mut e, "SELECT string_agg(s.y, ',' ORDER BY s.y) FROM ct19 CROSS JOIN LATERAL (SELECT ct19.v || '!' AS y) s"), "a!,b!");
+}
