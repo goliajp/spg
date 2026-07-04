@@ -198,3 +198,28 @@ fn cast_pg18_differential_corpus() {
     ck(&mut e, r#"'-inf'::float8::text"#, r#"-Infinity"#);
     ck(&mut e, r#"'10:30:00.5'::time"#, r#"10:30:00.5"#);
 }
+
+/// int4 arithmetic overflow — PG errors "integer out of range" (int4
+/// op int4 -> int4), it does NOT silently widen to bigint. Verified
+/// live on PostgreSQL 18.4. Previously SPG promoted the result to
+/// bigint, diverging from PG and from SPG's own `::int` cast (which
+/// already errors on overflow).
+#[test]
+fn int_arithmetic_overflow() {
+    let mut e = Engine::new();
+    // overflowing int4 arithmetic errors (was silently -> bigint).
+    ck(&mut e, r#"2147483647 + 1"#, r#"ERR"#);
+    ck(&mut e, r#"2000000000 + 2000000000"#, r#"ERR"#);
+    ck(&mut e, r#"2147483647 * 2"#, r#"ERR"#);
+    // NOTE: `(-2147483648) - 1` also errors on PG (the int4-MIN literal folds
+    // to int4, then MIN-1 overflows), but SPG lexes the magnitude 2147483648
+    // as bigint so it takes the int8 path — a separate negative-literal-
+    // folding gap tracked outside this int4-arithmetic fix.
+    // in-range int4 arithmetic stays int4.
+    ck(&mut e, r#"2147483647 + 0"#, r#"2147483647"#);
+    ck(&mut e, r#"1000000 + 1000000"#, r#"2000000"#);
+    // explicit bigint operands do widen and don't overflow int4.
+    ck(&mut e, r#"2147483647::bigint + 1"#, r#"2147483648"#);
+    // an oversized literal is already bigint (lexer), so no overflow.
+    ck(&mut e, r#"9999999999 + 1"#, r#"10000000000"#);
+}
