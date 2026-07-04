@@ -665,9 +665,18 @@ impl Table {
             .hot_bytes
             .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
         // v7.34 — capture the row-level redo before the row is moved in.
+        // v7.37.15 (Epic W slice 1) — carry the stable RowId this insert
+        // will receive. `alloc_rowid` below hands out `RowId(next_rowid)`
+        // and bumps the counter unconditionally, so the id read here is
+        // exactly the one the row ends up with. `writer_version` (xmin)
+        // is 0: the writing TxId is not threaded to this layer yet (the
+        // header pushed below is `RowHeader::frozen()`).
+        let redo_rowid = crate::row_header::RowId(self.next_rowid);
         self.record_redo(|table| RowChange::Insert {
             table,
             row: row.clone(),
+            rowid: redo_rowid,
+            writer_version: 0,
         });
         // v4.39.1: push_mut keeps streaming inserts at Vec::push speed when
         // the table is uniquely owned (the spg-embedded path); inside a TX
@@ -686,6 +695,12 @@ impl Table {
         // bookkeeping the lock table / HOT chains / WAL migrate to.
         let rid = self.alloc_rowid();
         self.rowids.push_mut(rid);
+        // v7.37.15 (Epic W slice 1) — the id captured for the redo log
+        // above must be the one actually assigned to the row.
+        debug_assert_eq!(
+            rid, redo_rowid,
+            "redo-captured RowId must match the allocated RowId"
+        );
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
@@ -1472,15 +1487,36 @@ impl Table {
     }
 
     pub fn delete_rows(&mut self, positions: &[usize]) -> usize {
+        // v7.37.15 (Epic W slice 1) — capture the RowIds of the targeted
+        // rows BEFORE the deletion shifts them out. One id per input
+        // position (parallel to `positions`), `RowId::UNASSIGNED` for an
+        // out-of-bounds position. Only pay for it when redo capture is
+        // on. `writer_version` (xmax) is 0: the deleting TxId is not
+        // threaded to this layer yet.
+        let redo_rowids: Vec<crate::row_header::RowId> = if self.redo_log.is_some() {
+            positions
+                .iter()
+                .map(|&p| {
+                    self.rowids()
+                        .get(p)
+                        .copied()
+                        .unwrap_or(crate::row_header::RowId::UNASSIGNED)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let removed = self.delete_rows_no_index(positions);
         if removed > 0 {
             self.rebuild_indices();
             // v7.34 — capture row-level redo. Record the input positions
             // (replay's `delete_rows` dedups + bounds-filters identically);
             // skip a no-op delete so the log stays minimal.
-            self.record_redo(|table| RowChange::Delete {
+            self.record_redo(move |table| RowChange::Delete {
                 table,
                 positions: positions.to_vec(),
+                rowids: redo_rowids,
+                writer_version: 0,
             });
         }
         removed
@@ -1843,10 +1879,21 @@ impl Table {
                 .get(position)
                 .map(|r| r.values.clone())
                 .unwrap_or_default();
+            // v7.37.15 (Epic W slice 1) — carry the stable RowId of the
+            // updated row (`position` is bounds-checked above, so the id
+            // is present). `writer_version` (xmax of the superseded
+            // tuple) is 0: the writing TxId is not threaded here yet.
+            let redo_rowid = self
+                .rowids()
+                .get(position)
+                .copied()
+                .unwrap_or(crate::row_header::RowId::UNASSIGNED);
             self.record_redo(|table| RowChange::Update {
                 table,
                 pos: position,
                 new_row,
+                rowid: redo_rowid,
+                writer_version: 0,
             });
         }
         for fix in fixes {

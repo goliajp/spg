@@ -51,16 +51,22 @@ fn redo_apply_matches_direct_position_ops() {
         log.push(RowChange::Insert {
             table: "t".to_string(),
             row: r.clone(),
+            rowid: row_header::RowId::UNASSIGNED,
+            writer_version: 0,
         });
     }
     log.push(RowChange::Update {
         table: "t".to_string(),
         pos: 1,
         new_row: upd,
+        rowid: row_header::RowId::UNASSIGNED,
+        writer_version: 0,
     });
     log.push(RowChange::Delete {
         table: "t".to_string(),
         positions: vec![0, 2],
+        rowids: vec![row_header::RowId::UNASSIGNED; 2],
+        writer_version: 0,
     });
 
     // C2 — apply the log to a fresh catalog.
@@ -79,6 +85,8 @@ fn redo_apply_matches_direct_position_ops() {
         c3.apply_redo(&[RowChange::Insert {
             table: "nope".to_string(),
             row: rows[0].clone(),
+            rowid: row_header::RowId::UNASSIGNED,
+            writer_version: 0,
         }])
         .is_err()
     );
@@ -179,6 +187,9 @@ fn catalog_drain_redo_replays_multi_table() {
 /// and a truncated/empty buffer is a hard error (not a partial decode).
 #[test]
 fn redo_log_codec_round_trips() {
+    use row_header::RowId;
+    // Epic W slice 1 — carry real RowId + writer_version metadata so
+    // the new-format round-trip exercises the metadata path.
     let changes = vec![
         RowChange::Insert {
             table: "t".to_string(),
@@ -188,19 +199,27 @@ fn redo_log_codec_round_trips() {
                 Value::Null,
                 Value::Bool(true),
             ]),
+            rowid: RowId(11),
+            writer_version: 101,
         },
         RowChange::Update {
             table: "users".to_string(),
             pos: 42,
             new_row: alloc::vec![Value::Int(7), Value::bytes(alloc::vec![1, 2, 3])],
+            rowid: RowId(22),
+            writer_version: 202,
         },
         RowChange::Delete {
             table: "t".to_string(),
             positions: alloc::vec![0, 5, 99],
+            rowids: alloc::vec![RowId(3), RowId(4), RowId(5)],
+            writer_version: 303,
         },
         RowChange::Delete {
             table: "empty".to_string(),
             positions: alloc::vec![],
+            rowids: alloc::vec![],
+            writer_version: 0,
         },
     ];
     let bytes = encode_redo_log(&changes);
@@ -213,6 +232,165 @@ fn redo_log_codec_round_trips() {
     // Truncated / empty buffer is corruption, not a partial decode.
     assert!(decode_redo_log(&bytes[..bytes.len() / 2]).is_err());
     assert!(decode_redo_log(&[]).is_err());
+}
+
+/// v7.37.15 (Epic W slice 1) — the non-negotiable backward-compat
+/// gate: a redo payload written by PRE-Epic-W released code (leading
+/// `FILE_VERSION` byte, NO per-change metadata) must still decode +
+/// replay identically. This test hand-crafts a pre-Epic-W byte buffer
+/// (the exact layout `encode_redo_log` produced before this slice) and
+/// asserts it decodes to the same logical `RowChange`s with
+/// `RowId::UNASSIGNED` / `writer_version = 0`, and that replaying it
+/// reproduces the same table state as a fresh direct-mutation build.
+#[test]
+fn redo_log_old_format_decodes_and_replays_identically() {
+    use crate::codec;
+    use row_header::RowId;
+
+    // Reconstruct the PRE-Epic-W wire layout verbatim:
+    //   [u8 FILE_VERSION][u32 count]
+    //   Insert  [0][str table][u32 n][value×n]
+    //   Update  [1][str table][u32 pos][u32 n][value×n]
+    //   Delete  [2][str table][u32 n][u32 pos×n]
+    // No RowId / writer_version bytes existed.
+    fn encode_old(changes: &[RowChange]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(crate::FILE_VERSION);
+        codec::write_u32(&mut out, changes.len() as u32);
+        let write_values = |out: &mut Vec<u8>, vals: &[Value<'static>]| {
+            codec::write_u32(out, vals.len() as u32);
+            for v in vals {
+                codec::write_value(out, v);
+            }
+        };
+        for change in changes {
+            match change {
+                RowChange::Insert { table, row, .. } => {
+                    out.push(0);
+                    codec::write_str(&mut out, table);
+                    write_values(&mut out, &row.values);
+                }
+                RowChange::Update {
+                    table, pos, new_row, ..
+                } => {
+                    out.push(1);
+                    codec::write_str(&mut out, table);
+                    codec::write_u32(&mut out, *pos as u32);
+                    write_values(&mut out, new_row);
+                }
+                RowChange::Delete {
+                    table, positions, ..
+                } => {
+                    out.push(2);
+                    codec::write_str(&mut out, table);
+                    codec::write_u32(&mut out, positions.len() as u32);
+                    for p in positions {
+                        codec::write_u32(&mut out, *p as u32);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        c.create_table(TableSchema::new(
+            "t",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("v", DataType::Text, true),
+            ],
+        ))
+        .unwrap();
+        c
+    }
+    let mk = |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::text(v)]);
+
+    // Logical operations. `encode_old` ignores the metadata fields, so
+    // this represents exactly what a pre-Epic-W writer would have put
+    // on disk for the same sequence of physical mutations.
+    let logical = vec![
+        RowChange::Insert {
+            table: "t".to_string(),
+            row: mk(1, "a"),
+            rowid: RowId(999), // ignored by encode_old
+            writer_version: 7, // ignored by encode_old
+        },
+        RowChange::Insert {
+            table: "t".to_string(),
+            row: mk(2, "b"),
+            rowid: RowId(999),
+            writer_version: 7,
+        },
+        RowChange::Update {
+            table: "t".to_string(),
+            pos: 0,
+            new_row: alloc::vec![Value::BigInt(1), Value::text("A")],
+            rowid: RowId(999),
+            writer_version: 7,
+        },
+        RowChange::Delete {
+            table: "t".to_string(),
+            positions: alloc::vec![1],
+            rowids: alloc::vec![RowId(999)],
+            writer_version: 7,
+        },
+    ];
+
+    let old_bytes = encode_old(&logical);
+    // The old buffer's first byte is FILE_VERSION, never the 0xFF meta
+    // marker — the gate that routes it to the legacy decode path.
+    assert_ne!(old_bytes[0], 0xFF, "old layout must not look like new");
+
+    let decoded = decode_redo_log(&old_bytes).unwrap();
+    // Same logical content, but metadata absent → UNASSIGNED / 0 / empty.
+    let expected = vec![
+        RowChange::Insert {
+            table: "t".to_string(),
+            row: mk(1, "a"),
+            rowid: RowId::UNASSIGNED,
+            writer_version: 0,
+        },
+        RowChange::Insert {
+            table: "t".to_string(),
+            row: mk(2, "b"),
+            rowid: RowId::UNASSIGNED,
+            writer_version: 0,
+        },
+        RowChange::Update {
+            table: "t".to_string(),
+            pos: 0,
+            new_row: alloc::vec![Value::BigInt(1), Value::text("A")],
+            rowid: RowId::UNASSIGNED,
+            writer_version: 0,
+        },
+        RowChange::Delete {
+            table: "t".to_string(),
+            positions: alloc::vec![1],
+            rowids: alloc::vec![], // no RowId metadata in old layout
+            writer_version: 0,
+        },
+    ];
+    assert_eq!(decoded, expected, "old-format decode diverged");
+
+    // And it must REPLAY to the same state as a direct-mutation build.
+    let mut direct = fresh();
+    {
+        let t = direct.get_mut("t").unwrap();
+        t.insert(mk(1, "a")).unwrap();
+        t.insert(mk(2, "b")).unwrap();
+        t.update_row(0, alloc::vec![Value::BigInt(1), Value::text("A")])
+            .unwrap();
+        t.delete_rows(&[1]);
+    }
+    let mut replayed = fresh();
+    replayed.apply_redo(&decoded).unwrap();
+    assert_eq!(
+        direct.serialize(),
+        replayed.serialize(),
+        "old-format redo replay diverged from direct ops"
+    );
 }
 
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the

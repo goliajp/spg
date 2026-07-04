@@ -2351,6 +2351,13 @@ pub(crate) fn write_u16(out: &mut Vec<u8>, n: u16) {
 pub(crate) fn write_u32(out: &mut Vec<u8>, n: u32) {
     out.extend_from_slice(&n.to_le_bytes());
 }
+/// v7.37.15 (Epic W slice 1) — u64 LE write, symmetric to
+/// [`Cursor::read_u64`]. Used by the row-redo codec to carry a
+/// row's stable [`RowId`](crate::row_header::RowId) and writer
+/// version (`xmin`/`xmax`).
+pub(crate) fn write_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
 /// v7.23 (mailrs round-14) — sentinel for the escape form of the
 /// short-string codec: a u16 length of `0xFFFF` means "the REAL
 /// length follows as a u32". Strings of length `>= 0xFFFF` take the
