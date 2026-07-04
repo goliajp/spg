@@ -749,3 +749,19 @@ fn money_arithmetic() {
     ck(&mut e, r#"('$1,234.56'::money)::text"#, r#"$1,234.56"#);
     ck(&mut e, r#"('$100.00'::money > '$50.00'::money)::text"#, r#"true"#);
 }
+
+/// bit-string length/bit_length + bit→integer cast. Postfix `::` on a bare
+/// `B'..'` literal previously errored at parse time. PG18.4-verified.
+#[test]
+fn bit_string_length_and_int_cast() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"length(B'10101')::text"#, r#"5"#);
+    ck(&mut e, r#"bit_length(B'1010')::text"#, r#"4"#);
+    ck(&mut e, r#"(B'1010'::int)::text"#, r#"10"#);
+    ck(&mut e, r#"(B'11111111'::int)::text"#, r#"255"#);
+    ck(&mut e, r#"(B'1010'::bigint)::text"#, r#"10"#);
+    ck(&mut e, r#"(X'1F'::int)::text"#, r#"31"#);
+    // controls: bitwise ops + equality unchanged.
+    ck(&mut e, r#"(B'1010' & B'1100')::text"#, r#"1000"#);
+    ck(&mut e, r#"(B'1010' = B'1010')::text"#, r#"true"#);
+}

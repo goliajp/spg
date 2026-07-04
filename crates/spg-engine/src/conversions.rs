@@ -1236,6 +1236,16 @@ pub fn format_bit_string(nbits: u32, bytes: &[u8]) -> alloc::string::String {
     out
 }
 
+/// MSB-first integer value of a bit string (PG `bit`/`varbit` → integer cast).
+pub fn bit_string_to_i64(nbits: u32, bytes: &[u8]) -> i64 {
+    let mut val: i64 = 0;
+    for i in 0..nbits as usize {
+        let byte = bytes.get(i / 8).copied().unwrap_or(0);
+        val = (val << 1) | i64::from((byte >> (7 - (i % 8))) & 1);
+    }
+    val
+}
+
 /// v7.37.5 ζ-A — render a MONEY[] in PG external form. Each element
 /// is the canonical `format_money` output; the array wrapper is
 /// `{...}` with NULL elements as the literal token `NULL`.
@@ -2432,6 +2442,18 @@ pub(crate) fn coerce_value(
         (Value::Macaddr8(m), DataType::Text) => Some(Value::text(format_macaddr8(&m))),
         (Value::BitString { nbits, bytes }, DataType::Text) => {
             Some(Value::text(format_bit_string(nbits, &bytes)))
+        }
+        // BIT → integer: MSB-first bit value (PG bit→int cast).
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::BitString { nbits, bytes }, DataType::SmallInt) => {
+            Some(Value::SmallInt(bit_string_to_i64(nbits, &bytes) as i16))
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::BitString { nbits, bytes }, DataType::Int) => {
+            Some(Value::Int(bit_string_to_i64(nbits, &bytes) as i32))
+        }
+        (Value::BitString { nbits, bytes }, DataType::BigInt) => {
+            Some(Value::BigInt(bit_string_to_i64(nbits, &bytes)))
         }
         (Value::Xml(s), DataType::Text) => Some(Value::text(s)),
         (Value::Char1(b), DataType::Text) => Some(Value::text((b as char).to_string())),
