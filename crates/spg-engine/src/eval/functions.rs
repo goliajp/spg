@@ -8164,14 +8164,33 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{name}() takes at least 1 arg"),
                 });
             }
-            let non_null: alloc::vec::Vec<&Value> =
+            let non_null_refs: alloc::vec::Vec<&Value> =
                 args.iter().filter(|v| !matches!(v, Value::Null)).collect();
-            if non_null.is_empty() {
+            if non_null_refs.is_empty() {
                 return Ok(Value::Null);
             }
+            // PG coerces every GREATEST/LEAST arg to a common type; an
+            // unknown-type string literal takes a sibling typed arg's type.
+            // Without this, `greatest(time, '14:00')` compared Time vs Text,
+            // fell to the value_cmp fallback, and kept the first arg.
+            let target = non_null_refs.iter().find_map(|v| match v.data_type() {
+                Some(spg_storage::DataType::Text) | None => None,
+                dt => dt,
+            });
+            let non_null: alloc::vec::Vec<Value<'static>> = non_null_refs
+                .iter()
+                .map(|v| {
+                    if let (Value::Text(s), Some(dt)) = (v, target) {
+                        crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0)
+                            .unwrap_or_else(|_| (*v).clone().into_owned())
+                    } else {
+                        (*v).clone().into_owned()
+                    }
+                })
+                .collect();
             let is_greatest = name.eq_ignore_ascii_case("greatest")
                 || name.ends_with("larger");
-            let mut best: Value<'static> = non_null[0].clone().into_owned();
+            let mut best: Value<'static> = non_null[0].clone();
             for v in &non_null[1..] {
                 let ord = value_cmp_for_min_max(&best, v);
                 let take = if is_greatest {
@@ -8180,7 +8199,7 @@ fn apply_function_dispatch(
                     ord == core::cmp::Ordering::Greater
                 };
                 if take {
-                    best = (*v).clone().into_owned();
+                    best = v.clone();
                 }
             }
             Ok(best)

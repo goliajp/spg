@@ -1200,3 +1200,17 @@ fn cmp_text_coercion() {
     // control: existing numeric-vs-text and text-vs-text unaffected.
     ck(&mut e, "('abc' < 'abd')::text", "true");
 }
+
+/// GREATEST/LEAST coerces a string literal to a sibling typed arg's type.
+/// PG18.4-verified.
+#[test]
+fn greatest_least_coerce() {
+    let mut e = Engine::new();
+    ck(&mut e, "GREATEST('10:00'::time, '14:00')::text", "14:00:00");
+    ck(&mut e, "LEAST('10:00'::time, '14:00')::text", "10:00:00");
+    ck(&mut e, "GREATEST('\\x01'::bytea, '\\xff')::text", "\\xff");
+    ck(&mut e, "GREATEST('2024-01-01'::date, '2024-06-01')::text", "2024-06-01");
+    // control: all-text greatest unaffected.
+    ck(&mut e, "GREATEST('abc', 'abd', 'aaa')::text", "abd");
+    ck(&mut e, "GREATEST(3, 7, 5)::text", "7");
+}
