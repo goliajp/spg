@@ -1753,3 +1753,26 @@ fn numeric_modulo() {
     // control: integer modulo unchanged.
     ck(&mut e, "(17 % 5)::text", "2");
 }
+
+/// v7.37 D.13 — window functions over a derived table (subquery / VALUES).
+/// Previously threw TableNotFound because the window path only looked the
+/// source up in the catalog by name. PG18.4-verified.
+#[test]
+fn window_over_derived_table() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => {
+                let c: Vec<String> = rows.iter().map(|r| match &r.values[0] {
+                    Value::Null => "N".into(), Value::Text(s) => s.to_string(), o => format!("{o:?}"),
+                }).collect();
+                format!("[{}]", c.join(","))
+            }
+            Ok(o) => format!("<NON:{o:?}>"), Err(e2) => format!("ERR:{e2:?}"),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT (row_number() OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"), "[1,2,3]");
+    assert_eq!(q(&mut e, "SELECT (nth_value(v,2) OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"), "[N,20,20]");
+    assert_eq!(q(&mut e, "SELECT (lag(v,1,0) OVER (ORDER BY v))::text FROM (SELECT v FROM (VALUES (5),(10),(15)) x(v)) s(v)"), "[0,5,10]");
+    assert_eq!(q(&mut e, "SELECT (rank() OVER (ORDER BY v))::text FROM (VALUES (1),(1),(3)) t(v)"), "[1,1,3]");
+}
