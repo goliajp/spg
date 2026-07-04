@@ -1227,3 +1227,35 @@ fn temporal_minus_text() {
     ck(&mut e, "('2024-01-15'::date - '2024-01-10'::date)::text", "5");
     ck(&mut e, "('2024-01-15'::date - 5)::text", "2024-01-10");
 }
+
+/// v7.37 C.5 (A.2a) — the engine already supports concurrent, isolated
+/// transactions addressed by distinct `TxId`s: the `tx_catalogs` COW-shadow
+/// model gives each open tx its own snapshot. This proves the A.1 hypothesis
+/// (the data model is ready; only the server's per-connection tx_id threading
+/// is missing) and anchors the A.2 server wiring against regression.
+#[test]
+fn concurrent_tx_isolation() {
+    use spg_engine::IMPLICIT_TX;
+    let mut e = Engine::new();
+    e.execute_in("CREATE TABLE t (x int)", IMPLICIT_TX).unwrap();
+    let tx1 = e.alloc_tx_id();
+    let tx2 = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx1).unwrap();
+    e.execute_in("BEGIN", tx2).unwrap();
+    e.execute_in("INSERT INTO t VALUES (1)", tx1).unwrap();
+    let cnt = |e: &mut Engine, tx| -> String {
+        match e.execute_in("SELECT count(*) FROM t", tx) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(cnt(&mut e, tx1), "BigInt(1)", "tx1 sees its own uncommitted insert");
+    assert_eq!(cnt(&mut e, tx2), "BigInt(0)", "tx2 is isolated from tx1's uncommitted insert");
+    assert!(e.is_tx_open(tx1) && e.is_tx_open(tx2), "both tx open");
+    e.execute_in("COMMIT", tx1).unwrap();
+    assert_eq!(cnt(&mut e, tx2), "BigInt(0)", "tx2 keeps its snapshot after tx1 commits (SI)");
+    assert_eq!(cnt(&mut e, IMPLICIT_TX), "BigInt(1)", "autocommit reads main catalog with tx1's committed row");
+    assert!(!e.is_tx_open(tx1), "tx1 closed after commit");
+    e.execute_in("ROLLBACK", tx2).unwrap();
+    assert!(!e.is_tx_open(tx2), "tx2 closed after rollback");
+}
