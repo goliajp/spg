@@ -1084,3 +1084,15 @@ fn to_char_interval_fmt() {
     ck(&mut e, "to_char(timestamp '2024-03-15 14:30:45', 'HH24:MI:SS')", "14:30:45");
     ck(&mut e, "to_char(1234.5, 'FM9999.00')", "1234.50");
 }
+
+/// Geometric `&&` overlap for box and circle. PG18.4-verified.
+#[test]
+fn geo_overlap() {
+    let mut e = Engine::new();
+    ck(&mut e, "('(0,0),(2,2)'::box && '(1,1),(3,3)'::box)::text", "true");
+    ck(&mut e, "('(0,0),(2,2)'::box && '(5,5),(6,6)'::box)::text", "false");
+    ck(&mut e, "('<(0,0),5>'::circle && '<(3,0),5>'::circle)::text", "true");
+    ck(&mut e, "('<(0,0),1>'::circle && '<(10,0),1>'::circle)::text", "false");
+    // control: array overlap unaffected.
+    ck(&mut e, "(ARRAY[1,2] && ARRAY[2,3])::text", "true");
+}
