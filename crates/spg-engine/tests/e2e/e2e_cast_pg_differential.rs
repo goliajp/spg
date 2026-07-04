@@ -549,3 +549,17 @@ fn regexp_replace_case_insensitive_flag() {
     // g flag unaffected.
     ck(&mut e, r#"regexp_replace('hello world', 'o', 'O', 'g')"#, r#"hellO wOrld"#);
 }
+
+/// The whole regexp family honours the `i` (case-insensitive) flag at its
+/// per-function flags-argument position (was ignored family-wide). PG18.4-verified.
+#[test]
+fn regexp_family_case_insensitive_flag() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"regexp_count('AbAb', 'a', 1, 'i')"#, r#"2"#);
+    ck(&mut e, r#"regexp_substr('HELLO', 'l+', 1, 1, 'i')"#, r#"LL"#);
+    ck(&mut e, r#"regexp_instr('xxAB', 'ab', 1, 1, 0, 'i')"#, r#"3"#);
+    ck(&mut e, r#"regexp_match('HELLO', 'ell', 'i')"#, r#"{ELL}"#);
+    // case-sensitive default still no match.
+    ck(&mut e, r#"regexp_count('AbAb', 'a')"#, r#"0"#);
+    ck(&mut e, r#"regexp_substr('HELLO', 'l+', 1, 1)"#, r#"<NULL>"#);
+}
