@@ -2997,16 +2997,10 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
-            let x = match v {
-                Value::Int(n) => f64::from(*n),
-                Value::SmallInt(n) => f64::from(*n),
-                Value::BigInt(n) => *n as f64,
-                Value::Float(x) => *x,
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!("{name} needs numeric, got {:?}", other.data_type()),
-                    });
-                }
+            let Some(x) = agg_value_to_f64(v) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name} needs numeric, got {:?}", v.data_type()),
+                });
             };
             st.count += 1;
             st.sum_float += x;
@@ -3366,8 +3360,17 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
         Value::SmallInt(n) => Some(f64::from(*n)),
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
+        Value::Numeric { scaled, scale } => Some(numeric_to_f64(*scaled, *scale)),
         _ => None,
     }
+}
+
+/// NUMERIC → f64 for the float-math aggregates (stddev / variance / corr /
+/// percentile_cont). `scaled × 10^-scale`; `10^scale` fits in i128 for the
+/// NUMERIC scale range, so no `f64::powi` (unavailable under no_std) is needed.
+#[allow(clippy::cast_precision_loss)]
+fn numeric_to_f64(scaled: i128, scale: u8) -> f64 {
+    (scaled as f64) / (10i128.pow(u32::from(scale)) as f64)
 }
 
 /// v7.32 (round-29) — finalize a WITHIN GROUP aggregate. `st.items` is
