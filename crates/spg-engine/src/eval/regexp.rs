@@ -1033,6 +1033,16 @@ fn matchall_length_bounds(node: &ReNode) -> Option<(usize, Option<usize>)> {
 /// across all captures; SPG simplifies to first-match-only TEXT[].
 /// The `g` flag form `regexp_matches(s, pat, 'g')` falls through
 /// to all-matches concatenation as a flat array.)
+/// PG's regexp functions take a flags string in a trailing argument whose
+/// position differs per function. Returns true when that argument is present
+/// and contains `i` (case-insensitive matching).
+fn flags_have_i(args: &[Value<'_>], idx: usize) -> Result<bool, EvalError> {
+    match args.get(idx) {
+        Some(v) => Ok(text_arg(v)?.map_or(false, |f| f.contains('i'))),
+        None => Ok(false),
+    }
+}
+
 pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let (text, pat, all_matches) = match args.len() {
         2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),
@@ -1056,7 +1066,10 @@ pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     let Some(pat) = pat else {
         return Ok(Value::Null);
     };
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 2)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Option<String>> = Vec::new();
     let mut from = 0usize;
@@ -1095,7 +1108,10 @@ pub(super) fn regexp_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     let Some(pat) = pat else {
         return Ok(Value::Null);
     };
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 2)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     match re_find(&node, &chars, 0)? {
         Some((s_pos, e_pos)) => Ok(Value::TextArray(alloc::vec![Some(
@@ -1277,7 +1293,10 @@ pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
             detail: "regexp_instr(): start and N must be >= 1".into(),
         });
     }
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 5)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut from = (start_1based - 1) as usize;
     let mut hits = 0i64;
@@ -1353,7 +1372,10 @@ pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
             detail: "regexp_substr(): start and N must be >= 1".into(),
         });
     }
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 4)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut from = (start_1based - 1) as usize;
     let mut hits = 0i64;
@@ -1513,7 +1535,10 @@ pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
             detail: "regexp_count(): start must be >= 1".into(),
         });
     }
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 3)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut count: i64 = 0;
     let mut from = (start_1based - 1) as usize;
