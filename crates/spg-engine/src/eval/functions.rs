@@ -11197,12 +11197,9 @@ fn apply_function_dispatch(
         // don't check the identifier-safe character class — always
         // quote to be safe.
         "quote_ident" => match args.first() {
-            Some(Value::Text(s)) => {
-                let escaped = s.replace('"', "\"\"");
-                Ok(Value::text(alloc::format!("\"{escaped}\"")))
-            }
+            Some(Value::Text(s)) => Ok(Value::text(pg_quote_ident(s))),
             Some(Value::Null) | None => Ok(Value::Null),
-            Some(other) => Ok(Value::text(alloc::format!("\"{other:?}\""))),
+            Some(other) => Ok(Value::text(pg_quote_ident(&value_to_format_text(other)))),
         },
         "quote_literal" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),

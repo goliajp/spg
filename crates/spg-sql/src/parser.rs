@@ -14444,6 +14444,41 @@ impl Parser {
                             args,
                         });
                     }
+                    // PG `overlay(str PLACING repl FROM n [FOR len])`
+                    // syntactic form. Desugars to the `overlay(str,
+                    // repl, n[, len])` comma-list shape the evaluator
+                    // already implements. `PLACING` is not a reserved
+                    // token in SPG, so it arrives as a bare Ident.
+                    if first.eq_ignore_ascii_case("overlay")
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::Ident(kw) if kw == "placing")
+                    {
+                        self.advance(); // consume PLACING
+                        args.push(self.parse_expr(0)?); // replacement
+                        if !matches!(self.peek(), Token::From) {
+                            return Err(self.err(format!(
+                                "expected FROM in overlay(... PLACING ... FROM ...), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        args.push(self.parse_expr(0)?); // start position
+                        if matches!(self.peek(), Token::For) {
+                            self.advance();
+                            args.push(self.parse_expr(0)?); // length
+                        }
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close overlay(... PLACING ... FROM ... [FOR ...]), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        return Ok(Expr::FunctionCall {
+                            name: String::from("overlay"),
+                            args,
+                        });
+                    }
                     // `TRIM(chars FROM str)` — the keyword-less
                     // spelling lands here after the chars parse
                     // (the keyword forms return earlier).
