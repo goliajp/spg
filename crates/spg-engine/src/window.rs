@@ -277,8 +277,14 @@ pub(crate) fn compute_window_partition(
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
                 let mut sum: f64 = 0.0;
                 let mut count: i64 = 0;
-                let mut min_v: Option<f64> = None;
-                let mut max_v: Option<f64> = None;
+                // min/max compare the *actual* Value via value_cmp so
+                // they work on TEXT / DATE / NUMERIC (not just f64) and
+                // preserve the column type. The old f64-only path
+                // returned NULL for `max(text_col)` / `min(numeric_col)`
+                // (value_to_f64 → None) — a silent divergence from PG,
+                // which orders text lexically and numerics exactly.
+                let mut min_val: Option<Value<'static>> = None;
+                let mut max_val: Option<Value<'static>> = None;
                 let mut row_count: i64 = 0;
                 if lo <= hi {
                     for j in lo..=hi {
@@ -296,11 +302,30 @@ pub(crate) fn compute_window_partition(
                                 }
                             }
                             _ => {
+                                // sum/avg/min/max all skip NULLs.
+                                if v.is_null() {
+                                    continue;
+                                }
+                                // sum/avg accumulate in f64 (NUMERIC
+                                // stays deferred — value_to_f64 → None,
+                                // so a NUMERIC frame contributes nothing
+                                // and finalizes to NULL, matching the
+                                // main-path deferral, not a bogus 0).
                                 if let Some(x) = value_to_f64(v) {
                                     sum += x;
                                     count += 1;
-                                    min_v = Some(min_v.map_or(x, |m| m.min(x)));
-                                    max_v = Some(max_v.map_or(x, |m| m.max(x)));
+                                }
+                                if min_val
+                                    .as_ref()
+                                    .is_none_or(|m| value_cmp(v, m) == core::cmp::Ordering::Less)
+                                {
+                                    min_val = Some(v.clone());
+                                }
+                                if max_val
+                                    .as_ref()
+                                    .is_none_or(|m| value_cmp(m, v) == core::cmp::Ordering::Less)
+                                {
+                                    max_val = Some(v.clone());
                                 }
                             }
                         }
@@ -309,7 +334,17 @@ pub(crate) fn compute_window_partition(
                 let value = match lower.as_str() {
                     "count_star" => Value::BigInt(row_count),
                     "count" => Value::BigInt(count),
-                    "sum" => Value::Float(sum),
+                    // sum over a frame with no non-NULL numeric value is
+                    // NULL in PG (empty / all-NULL frame), not 0. The old
+                    // `Value::Float(sum)` returned 0 for `sum(x)` over an
+                    // all-NULL partition (see PARTITION BY nullable col).
+                    "sum" => {
+                        if count == 0 {
+                            Value::Null
+                        } else {
+                            Value::Float(sum)
+                        }
+                    }
                     "avg" => {
                         if count == 0 {
                             Value::Null
@@ -317,8 +352,8 @@ pub(crate) fn compute_window_partition(
                             Value::Float(sum / count as f64)
                         }
                     }
-                    "min" => min_v.map_or(Value::Null, Value::Float),
-                    "max" => max_v.map_or(Value::Null, Value::Float),
+                    "min" => min_val.unwrap_or(Value::Null),
+                    "max" => max_val.unwrap_or(Value::Null),
                     _ => unreachable!(),
                 };
                 let (_, _, idx) = &slice[i];
@@ -667,7 +702,12 @@ fn effective_frame(
 /// Compute `(lo, hi)` row-index bounds inside the partition slice
 /// for the row at position `i`. Inclusive, clamped to
 /// `[0, slice.len()-1]`. Empty result if `lo > hi`.
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn frame_bounds_for_row(
     eff: &(FrameKind, FrameBound, FrameBound),
     i: usize,
@@ -678,32 +718,35 @@ fn frame_bounds_for_row(
     let last = n.saturating_sub(1);
     let (mut lo, mut hi) = match kind {
         FrameKind::Rows => {
-            let lo = match start {
-                FrameBound::UnboundedPreceding => 0,
-                FrameBound::OffsetPreceding(k) => {
-                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
-                    i.saturating_sub(k)
+            // Compute the raw (signed) row indices first so a frame
+            // that lies ENTIRELY before the partition start (e.g.
+            // `ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING` on row 0) or
+            // entirely past the end (`1 FOLLOWING AND 2 FOLLOWING` on
+            // the last row) is recognised as EMPTY. The old
+            // saturating_sub / .min(last) collapsed such bounds onto
+            // index 0 / `last`, wrongly pulling the boundary row into
+            // the frame — PG returns NULL for a fully out-of-range
+            // ROWS frame, not the boundary value.
+            let i_s = i as i64;
+            let last_s = last as i64;
+            let bound = |b: &FrameBound| -> i64 {
+                match b {
+                    FrameBound::UnboundedPreceding => 0,
+                    FrameBound::OffsetPreceding(k) => i_s - (*k as i64),
+                    FrameBound::CurrentRow => i_s,
+                    FrameBound::OffsetFollowing(k) => i_s + (*k as i64),
+                    FrameBound::UnboundedFollowing => last_s,
                 }
-                FrameBound::CurrentRow => i,
-                FrameBound::OffsetFollowing(k) => {
-                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
-                    i.saturating_add(k).min(last)
-                }
-                FrameBound::UnboundedFollowing => last,
             };
-            let hi = match end {
-                FrameBound::UnboundedPreceding => 0,
-                FrameBound::OffsetPreceding(k) => {
-                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
-                    i.saturating_sub(k)
-                }
-                FrameBound::CurrentRow => i,
-                FrameBound::OffsetFollowing(k) => {
-                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
-                    i.saturating_add(k).min(last)
-                }
-                FrameBound::UnboundedFollowing => last,
-            };
+            let lo_s = bound(start);
+            let hi_s = bound(end);
+            // Empty frame: end before partition start, start past the
+            // partition end, or (degenerate) start after end.
+            if hi_s < 0 || lo_s > last_s || lo_s > hi_s {
+                return (1, 0); // lo > hi ⇒ caller treats as empty
+            }
+            let lo = lo_s.max(0) as usize;
+            let hi = hi_s.min(last_s) as usize;
             (lo, hi)
         }
         FrameKind::Range | FrameKind::Groups => {
