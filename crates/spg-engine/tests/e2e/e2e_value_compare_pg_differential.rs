@@ -27,11 +27,12 @@
 //! (`array_cmp`) are implemented — see `inet_ordering` / `bit_ordering` /
 //! `array_ordering`.
 //!
-//! RANGE `=` (`range_eq` with discrete `[)` canonicalisation) is
-//! implemented — see `range_equality`.
+//! RANGE `=` (`range_eq`, discrete `[)` canonicalisation) and MULTIRANGE `=`
+//! (`multirange_eq`, canonicalise + sort + merge spans) are implemented —
+//! see `range_equality` / `multirange_equality`.
 //!
 //! DEFERRED (still error in SPG):
-//!   * multirange `=` — needs per-span discrete canonicalisation.
+//!   * range / multirange ordering (`<` etc.) — only `=` / `<>` wired.
 //!   * tsvector `=` — lexeme/position semantics unverified.
 
 use spg_engine::{Engine, QueryResult};
@@ -416,4 +417,34 @@ fn range_equality() {
     );
     // infinite upper bound.
     ck(&mut e, "SELECT '[1,)'::int4range = '[1,)'::int4range", "t");
+}
+
+#[test]
+fn multirange_equality() {
+    // PG multirange `=`: canonicalise each span, then compare the normalised
+    // (sorted, merged) span lists. All values captured live from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    // per-span discrete canonicalisation: {[1,4]} == {[1,5)}.
+    ck(&mut e, "SELECT '{[1,4]}'::int4multirange = '{[1,5)}'::int4multirange", "t");
+    // multi-span identity.
+    ck(
+        &mut e,
+        "SELECT '{[1,3),[5,7)}'::int4multirange = '{[1,3),[5,7)}'::int4multirange",
+        "t",
+    );
+    ck(&mut e, "SELECT '{[1,5)}'::int4multirange = '{[1,3)}'::int4multirange", "f");
+    // empties equal.
+    ck(&mut e, "SELECT '{}'::int4multirange = '{}'::int4multirange", "t");
+    // adjacent spans merge: {[1,3),[3,5)} normalises to {[1,5)}.
+    ck(
+        &mut e,
+        "SELECT '{[1,3),[3,5)}'::int4multirange = '{[1,5)}'::int4multirange",
+        "t",
+    );
+    // different span counts are not equal.
+    ck(
+        &mut e,
+        "SELECT '{[1,3),[5,7)}'::int4multirange = '{[1,3)}'::int4multirange",
+        "f",
+    );
 }
