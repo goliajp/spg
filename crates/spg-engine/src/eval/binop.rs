@@ -1304,6 +1304,28 @@ pub(super) fn compare(
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
         (Value::Date(a), Value::Timestamp(b)) => (i64::from(*a) * 86_400_000_000).cmp(b),
         (Value::Timestamp(a), Value::Date(b)) => a.cmp(&(i64::from(*b) * 86_400_000_000)),
+        // INTERVAL compares by PG's canonical microsecond span:
+        // months count as 30 days and days as 24 hours, so
+        // `INTERVAL '1 month' = INTERVAL '30 days'` and
+        // `INTERVAL '1 day' = INTERVAL '24 hours'` (i128 keeps the
+        // months*30*86_400e6 product from overflowing i64).
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) => {
+            let span = |m: i32, d: i32, u: i64| -> i128 {
+                (i128::from(m) * 30 + i128::from(d)) * 86_400_000_000 + i128::from(u)
+            };
+            span(*am, *ad, *au).cmp(&span(*bm, *bd, *bu))
+        }
         // PG-style implicit coercion: comparing a DATE / TIMESTAMP
         // column against a text literal lifts the literal into the
         // matching domain (e.g. `day >= '2024-01-01'`).

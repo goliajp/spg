@@ -154,6 +154,7 @@ mod e2e_wal_utility_probes;
 mod e2e_snapshot_export_probes;
 mod e2e_interval_justify;
 mod e2e_date_bin;
+mod e2e_datetime_pg_differential;
 mod e2e_to_timestamp;
 mod e2e_pg_size_bytes;
 mod e2e_pg_size_pretty_real;

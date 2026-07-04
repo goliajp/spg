@@ -45,7 +45,12 @@ pub(super) fn extract_field(
             // `extract(day from INTERVAL '24 hours')` = 0 (the micros
             // dimension never bleeds into the day count).
             F::Day => i64::from(days),
-            F::Hour => (secs_total / 3600) % 24,
+            // PG does NOT roll interval hours into days: the `days`
+            // dimension is independent, so `extract(hour from INTERVAL
+            // '25 hours')` = 25 (not 1). Only MINUTE / SECOND wrap,
+            // because the HH:MM:SS time component keeps MM / SS < 60
+            // while HH is unbounded.
+            F::Hour => secs_total / 3600,
             F::Minute => (secs_total / 60) % 60,
             F::Second => secs_total % 60,
             F::Microsecond => (secs_total % 60) * 1_000_000 + frac,
@@ -140,7 +145,7 @@ fn era_bucket(y: i32, unit: i32) -> i64 {
 /// ISO 8601 week number and week-numbering year for a day count
 /// (days since 1970-01-01) whose civil year is `y`. Week 1 is the
 /// week containing January 4th; weeks run Monday-Sunday.
-fn iso_week_and_year(days: i32, y: i32) -> (i64, i64) {
+pub(crate) fn iso_week_and_year(days: i32, y: i32) -> (i64, i64) {
     let isodow = (days + 3).rem_euclid(7) + 1; // 1 = Monday
     let doy = days - days_from_civil(y, 1, 1) + 1;
     let iso_weeks_in = |year: i32| -> i32 {
