@@ -1491,10 +1491,23 @@ fn range_canonical(
     (lo, li, up, ui)
 }
 
-/// PG range equality: two empties are equal (an empty is never equal to a
-/// non-empty); otherwise the canonical `[)` forms must match exactly.
+/// Sort key for range uppers: `None` (+∞) greatest, then by value, then an
+/// inclusive upper after an exclusive one at the same value.
+fn upper_cmp(au: &Option<Value<'static>>, aui: bool, bu: &Option<Value<'static>>, bui: bool) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (au, bu) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater, // +∞ greatest
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => bound_cmp(x, y).then(aui.cmp(&bui)), // inclusive(true) greater
+    }
+}
+
+/// PG `range_cmp` total order: an empty range sorts first (two empties are
+/// equal), otherwise compare canonical lower bounds, then upper bounds. The
+/// `Equal` result subsumes range equality (canonical `[)` forms must match).
 #[allow(clippy::too_many_arguments)]
-fn range_eq(
+fn range_cmp(
     ak: spg_storage::RangeKind,
     al: &Option<alloc::boxed::Box<Value<'static>>>,
     au: &Option<alloc::boxed::Box<Value<'static>>>,
@@ -1507,16 +1520,18 @@ fn range_eq(
     bli: bool,
     bui: bool,
     be: bool,
-) -> bool {
-    if ak != bk {
-        return false;
-    }
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
     if ae || be {
-        return ae == be;
+        return match (ae, be) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            _ => Ordering::Greater,
+        };
     }
-    let a = range_canonical(ak, al, au, ali, aui);
-    let b = range_canonical(bk, bl, bu, bli, bui);
-    a == b
+    let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
+    lower_cmp(&al2, ali2, &bl2, bli2).then_with(|| upper_cmp(&au2, aui2, &bu2, bui2))
 }
 
 /// A canonicalised range span: (lower, lower_inc, upper, upper_inc).
@@ -1605,13 +1620,30 @@ fn normalize_multirange(kind: spg_storage::RangeKind, spans: &[spg_storage::Rang
     out
 }
 
-fn multirange_eq(
+/// Compare two already-canonicalised spans by lower then upper bound.
+fn canon_span_cmp(a: &CanonSpan, b: &CanonSpan) -> core::cmp::Ordering {
+    lower_cmp(&a.0, a.1, &b.0, b.1).then_with(|| upper_cmp(&a.2, a.3, &b.2, b.3))
+}
+
+/// PG multirange total order: compare the normalised span lists element by
+/// element; a multirange that is a prefix of another sorts first (`{}` sorts
+/// first). `Equal` subsumes multirange equality.
+fn multirange_cmp(
     ak: spg_storage::RangeKind,
     aranges: &[spg_storage::RangeSpan],
     bk: spg_storage::RangeKind,
     branges: &[spg_storage::RangeSpan],
-) -> bool {
-    ak == bk && normalize_multirange(ak, aranges) == normalize_multirange(bk, branges)
+) -> core::cmp::Ordering {
+    let _ = (ak, bk);
+    let a = normalize_multirange(ak, aranges);
+    let b = normalize_multirange(bk, branges);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = canon_span_cmp(x, y);
+        if o != core::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 pub(super) fn compare(
@@ -1849,36 +1881,22 @@ pub(super) fn compare(
                 }),
             };
         }
-        // v7.37 — RANGE equality (=/<>). Discrete kinds (int4/int8/date)
-        // canonicalise to `[)` before comparing, so `int4range(1,5)` equals
-        // `'[1,4]'`; continuous kinds compare bounds verbatim. Ordering
-        // (< <= > >=) is deferred. Verified vs PG18.
+        // v7.37 — RANGE comparison (=/<> and ordering), PG `range_cmp`.
+        // Discrete kinds (int4/int8/date) canonicalise to `[)` first, so
+        // `int4range(1,5)` equals `'[1,4]'`; continuous kinds compare bounds
+        // verbatim. An empty range sorts first. Verified vs PG18.
         (
             Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
             Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
         ) => {
-            let eq = range_eq(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be);
-            return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: "range ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
-                }),
-            };
+            let ord = range_cmp(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be);
+            return cmp_result(op, ord);
         }
-        // v7.37 — MULTIRANGE equality (=/<>). Normalise both to PG's
-        // canonical form (canonicalise each span, drop empties, sort, merge
-        // overlapping/adjacent spans) and compare. Ordering is deferred.
+        // v7.37 — MULTIRANGE comparison (=/<> and ordering). Normalise both
+        // to PG's canonical form (canonicalise each span, drop empties, sort,
+        // merge overlapping/adjacent) and compare the span lists lexically.
         (Value::Multirange { kind: ak, ranges: ar }, Value::Multirange { kind: bk, ranges: br }) => {
-            let eq = multirange_eq(*ak, ar, *bk, br);
-            return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: "multirange ordering (<, <=, >, >=) not yet supported; only = / <>"
-                        .into(),
-                }),
-            };
+            return cmp_result(op, multirange_cmp(*ak, ar, *bk, br));
         }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
