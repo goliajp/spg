@@ -1214,3 +1214,16 @@ fn greatest_least_coerce() {
     ck(&mut e, "GREATEST('abc', 'abd', 'aaa')::text", "abd");
     ck(&mut e, "GREATEST(3, 7, 5)::text", "7");
 }
+
+/// `<date|timestamp> - <string literal>` coerces the literal to the operand
+/// type (date-date → int days, ts-ts → interval). PG18.4-verified.
+#[test]
+fn temporal_minus_text() {
+    let mut e = Engine::new();
+    ck(&mut e, "('2024-01-15'::date - '2024-01-10')::text", "5");
+    ck(&mut e, "('2024-06-01'::timestamp - '2024-05-01')::text", "31 days");
+    ck(&mut e, "('14:00'::time - '10:00')::text", "04:00:00");
+    // control: date-date, date-int still work.
+    ck(&mut e, "('2024-01-15'::date - '2024-01-10'::date)::text", "5");
+    ck(&mut e, "('2024-01-15'::date - 5)::text", "2024-01-10");
+}

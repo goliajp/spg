@@ -499,6 +499,30 @@ fn apply_binary_calendar(
             _ => None,
         }
     };
+    // PG resolves `<temporal> - <unknown-type string literal>` to the
+    // same-type difference (date-date→int days, ts-ts/time-time/interval-
+    // interval→interval; `date - '5 days'` is a date-date parse error in PG,
+    // not date-interval). Coerce the Text operand to the temporal operand's
+    // type before the arms below. Only `-` is unambiguous this way — `+`
+    // stays a "not unique" error, matching PG.
+    if op == BinOp::Sub {
+        let temporal_dt = |v: &Value| match v.data_type() {
+            Some(
+                dt @ (DataType::Date | DataType::Timestamp | DataType::Time | DataType::Interval),
+            ) => Some(dt),
+            _ => None,
+        };
+        if let (Value::Text(s), Some(dt)) = (l, temporal_dt(r)) {
+            if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
+                return apply_binary_calendar(op, &c, r);
+            }
+        }
+        if let (Some(dt), Value::Text(s)) = (temporal_dt(l), r) {
+            if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
+                return apply_binary_calendar(op, l, &c);
+            }
+        }
+    }
     // Most-specific cases first — DATE-DATE / TS-TS subtraction before
     // DATE-integer subtraction, otherwise the latter swallows the
     // former with an `int_value(Date) = None` no-op fall-through.
