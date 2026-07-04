@@ -1661,3 +1661,15 @@ fn bit_get_set_bit() {
     // control: get_bit/set_bit on bytea still work.
     ck(&mut e, "get_bit('\\x00'::bytea, 0)::text", "0");
 }
+
+/// v7.37 D — length(tsvector) / tsvector_length(tsvector) return the lexeme
+/// count (both previously errored on the TsVector value). PG18.4-verified.
+#[test]
+fn tsvector_length_ops() {
+    let mut e = Engine::new();
+    ck(&mut e, "length('a:1 b:2 c:3'::tsvector)::text", "3");
+    ck(&mut e, "tsvector_length('a:1 b:2 c:3'::tsvector)::text", "3");
+    ck(&mut e, "length('the quick brown fox'::tsvector)::text", "4");
+    // control: length(text) unchanged.
+    ck(&mut e, "length('abcd')::text", "4");
+}
