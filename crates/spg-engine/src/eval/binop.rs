@@ -245,6 +245,53 @@ pub(super) fn apply_binary(
             });
         }
     }
+    // `inet ± bigint` -> inet: shift the address by N, keeping family + bits.
+    // `bigint + inet` is commutative. PG18-verified: 192.168.1.5 + 10 =
+    // 192.168.1.15/32.
+    if matches!(op, BinOp::Add | BinOp::Sub) {
+        let as_int = |v: &Value| -> Option<i128> {
+            match v {
+                Value::SmallInt(n) => Some(i128::from(*n)),
+                Value::Int(n) => Some(i128::from(*n)),
+                Value::BigInt(n) => Some(i128::from(*n)),
+                _ => None,
+            }
+        };
+        let arith = match (&l, &r) {
+            (Value::Inet { family, bits, addr }, other) => {
+                as_int(other).map(|n| (*family, *bits, *addr, if op == BinOp::Sub { -n } else { n }))
+            }
+            (other, Value::Inet { family, bits, addr }) if op == BinOp::Add => {
+                as_int(other).map(|n| (*family, *bits, *addr, n))
+            }
+            _ => None,
+        };
+        if let Some((family, bits, addr, delta)) = arith {
+            let cur = inet_addr_u128(family, &addr);
+            let next = if delta >= 0 {
+                cur.checked_add(delta as u128)
+            } else {
+                cur.checked_sub(delta.unsigned_abs())
+            };
+            let max = if family == 4 { u128::from(u32::MAX) } else { u128::MAX };
+            let next = match next {
+                Some(v) if v <= max => v,
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "result is out of range for the inet type".into(),
+                    });
+                }
+            };
+            let mut new_addr = [0u8; 16];
+            if family == 4 {
+                #[allow(clippy::cast_possible_truncation)]
+                new_addr[0..4].copy_from_slice(&(next as u32).to_be_bytes());
+            } else {
+                new_addr.copy_from_slice(&next.to_be_bytes());
+            }
+            return Ok(Value::Inet { family, bits, addr: new_addr });
+        }
+    }
     // PG `point ± point` translates a point by another's coordinates;
     // `point * point` / `point / point` are complex-number multiply/divide
     // (PG treats a point as the complex number x + yi).
