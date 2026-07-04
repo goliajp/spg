@@ -1082,23 +1082,30 @@ pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Po
 /// any two-corner input into upper-right + lower-left; we do
 /// the same.
 pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Point2D)> {
-    // PG box input: `(x1,y1),(x2,y2)` or the bare `x1,y1,x2,y2` — four raw
-    // numbers with no point parens. Try the point-list form first, then fall
-    // back to four comma-separated floats.
-    let pts = match parse_point_list(s) {
-        Some(p) if p.len() == 2 => p,
-        _ => {
-            let nums: Option<alloc::vec::Vec<f64>> =
-                s.trim().split(',').map(|t| t.trim().parse::<f64>().ok()).collect();
-            let nums = nums?;
-            if nums.len() != 4 {
-                return None;
-            }
-            alloc::vec![
-                spg_storage::Point2D { x: nums[0], y: nums[1] },
-                spg_storage::Point2D { x: nums[2], y: nums[3] },
-            ]
+    // PG box input: `(x1,y1),(x2,y2)`, the fully-wrapped `((x1,y1),(x2,y2))`,
+    // or the bare `x1,y1,x2,y2` (four raw numbers). Try the point-list form,
+    // then the same list inside one stripped `(...)` layer, then four floats.
+    let s = s.trim();
+    let two_points = |v: Option<alloc::vec::Vec<spg_storage::Point2D>>| v.filter(|p| p.len() == 2);
+    let pts = if let Some(p) = two_points(parse_point_list(s)) {
+        p
+    } else if let Some(p) = s
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .and_then(|inner| two_points(parse_point_list(inner)))
+    {
+        p
+    } else {
+        let nums: Option<alloc::vec::Vec<f64>> =
+            s.split(',').map(|t| t.trim().parse::<f64>().ok()).collect();
+        let nums = nums?;
+        if nums.len() != 4 {
+            return None;
         }
+        alloc::vec![
+            spg_storage::Point2D { x: nums[0], y: nums[1] },
+            spg_storage::Point2D { x: nums[2], y: nums[3] },
+        ]
     };
     if pts.len() != 2 {
         return None;
