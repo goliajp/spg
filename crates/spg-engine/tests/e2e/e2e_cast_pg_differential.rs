@@ -1592,3 +1592,15 @@ fn macaddr_bitwise() {
     // control: macaddr comparison still works.
     ck(&mut e, "('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text", "true");
 }
+
+/// v7.37 D — macaddr8 (EUI-64) bitwise operators `&` / `|` and unary `~`,
+/// mirroring the 6-byte macaddr support. PG18.4-verified.
+#[test]
+fn macaddr8_bitwise() {
+    let mut e = Engine::new();
+    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 & 'ff:ff:ff:00:00:00:ff:ff'::macaddr8)::text", "08:00:2b:00:00:00:04:05");
+    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 | '00:00:00:ff:ff:ff:00:00'::macaddr8)::text", "08:00:2b:ff:ff:ff:04:05");
+    ck(&mut e, "(~ '08:00:2b:01:02:03:04:05'::macaddr8)::text", "f7:ff:d4:fe:fd:fc:fb:fa");
+    // control: macaddr8 comparison still works.
+    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 = '08:00:2b:01:02:03:04:05'::macaddr8)::text", "true");
+}
