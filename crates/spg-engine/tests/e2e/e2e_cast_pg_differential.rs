@@ -590,3 +590,20 @@ fn cast_to_float_array() {
     ck(&mut e, r#"(ARRAY[1.5,2.5]::float4[])::text"#, r#"{1.5,2.5}"#);
     ck(&mut e, r#"(ARRAY[10,20]::int[])::text"#, r#"{10,20}"#);
 }
+
+/// The rest of the array cast-target family (`::bool[]`, `::numeric[]`,
+/// `::date[]`, `::timestamp[]`, `::uuid[]`, `::varchar[]`) — was ERR: only the
+/// empty-array arm existed, so non-empty literals fell through. Each element is
+/// now parsed via the scalar coerce path. PG18.4-verified.
+#[test]
+fn cast_to_typed_array_family() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"(ARRAY[true,false]::bool[])::text"#, r#"{t,f}"#);
+    ck(&mut e, r#"(ARRAY[1.5,2.5]::numeric[])::text"#, r#"{1.5,2.5}"#);
+    ck(&mut e, r#"(ARRAY['2024-01-01','2024-02-01']::date[])::text"#, r#"{2024-01-01,2024-02-01}"#);
+    ck(&mut e, r#"(ARRAY['a','b']::varchar[])::text"#, r#"{a,b}"#);
+    ck(&mut e, r#"(ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[])::text"#, r#"{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}"#);
+    // controls that already worked.
+    ck(&mut e, r#"(ARRAY[1,2]::smallint[])::text"#, r#"{1,2}"#);
+    ck(&mut e, r#"(ARRAY[1,2]::int[])::text"#, r#"{1,2}"#);
+}

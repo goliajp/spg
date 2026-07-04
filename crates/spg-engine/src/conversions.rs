@@ -1693,6 +1693,9 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "time" | "time without time zone" => DataType::Time,
         "timetz" | "time with time zone" => DataType::TimeTz,
         "numeric_array" | "decimal_array" => DataType::NumericArray,
+        "varchar_array" | "character varying_array" | "char_array" | "bpchar_array" => {
+            DataType::TextArray
+        }
         "text_array" => DataType::TextArray,
         "date_array" => DataType::DateArray,
         "timestamp_array" => DataType::TimestampArray,
@@ -1952,6 +1955,94 @@ pub(crate) fn check_unsigned_range(
         )));
     }
     Ok(())
+}
+
+/// Coerce a non-empty `TEXT[]` (how an array literal reaches a typed-array
+/// cast) into a typed array by parsing each element through the existing
+/// scalar `coerce_value` path. NULL elements pass through. Returns `None` for
+/// array targets this helper does not cover (leaving the caller's other arms
+/// or the final type-mismatch to handle it).
+fn coerce_text_array_to(
+    items: alloc::vec::Vec<Option<alloc::string::String>>,
+    target: &DataType,
+    col: &str,
+) -> Result<Option<Value<'static>>, EngineError> {
+    let elem_dt = match target {
+        DataType::BoolArray => DataType::Bool,
+        DataType::NumericArray => DataType::Numeric { precision: 0, scale: 0 },
+        DataType::DateArray => DataType::Date,
+        DataType::TimestampArray => DataType::Timestamp,
+        DataType::TimestamptzArray => DataType::Timestamptz,
+        DataType::UuidArray => DataType::Uuid,
+        _ => return Ok(None),
+    };
+    let mut scal: alloc::vec::Vec<Option<Value<'static>>> =
+        alloc::vec::Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            None => scal.push(None),
+            Some(s) => scal.push(Some(coerce_value(Value::text(s), elem_dt.clone(), col, 0)?)),
+        }
+    }
+    let out = match target {
+        DataType::BoolArray => Value::BoolArray(
+            scal.into_iter()
+                .map(|o| o.map(|v| matches!(v, Value::Bool(true))))
+                .collect(),
+        ),
+        DataType::NumericArray => Value::NumericArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.map(|v| match v {
+                        Value::Numeric { scaled, scale } => (scaled, scale),
+                        _ => (0, 0),
+                    })
+                })
+                .collect(),
+        ),
+        DataType::DateArray => Value::DateArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.map(|v| match v {
+                        Value::Date(d) => d,
+                        _ => 0,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::TimestampArray => Value::TimestampArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.map(|v| match v {
+                        Value::Timestamp(t) => t,
+                        _ => 0,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::TimestamptzArray => Value::TimestamptzArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.map(|v| match v {
+                        Value::Timestamp(t) => t,
+                        _ => 0,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::UuidArray => Value::UuidArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.map(|v| match v {
+                        Value::Uuid(u) => u,
+                        _ => [0u8; 16],
+                    })
+                })
+                .collect(),
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
 }
 
 pub(crate) fn coerce_value(
@@ -2647,6 +2738,18 @@ pub(crate) fn coerce_value(
         (Value::TextArray(items), DataType::IntervalArray) if items.is_empty() => {
             Some(Value::IntervalArray(alloc::vec::Vec::new()))
         }
+        // Non-empty `TEXT[]` → typed array (`ARRAY[..]::bool[]`, `::numeric[]`,
+        // `::date[]`, `::timestamp[]`, `::uuid[]`): parse each element via the
+        // scalar path. Empty arrays are handled by the arms above.
+        (
+            Value::TextArray(items),
+            dt @ (DataType::BoolArray
+            | DataType::NumericArray
+            | DataType::DateArray
+            | DataType::TimestampArray
+            | DataType::TimestamptzArray
+            | DataType::UuidArray),
+        ) => coerce_text_array_to(items, &dt, col_name)?,
         (Value::TextArray(items), DataType::MoneyArray) if items.is_empty() => {
             Some(Value::MoneyArray(alloc::vec::Vec::new()))
         }
