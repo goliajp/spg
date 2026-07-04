@@ -1911,6 +1911,119 @@ fn mvcc_inplace_reinsert_of_tombstoned_key_succeeds() {
 }
 
 #[test]
+fn mvcc_inplace_fk_parent_tombstone_fails_child_insert() {
+    // Phase C.3: the single-column FK existence check rides the parent's
+    // BTree index (`idx.lookup_eq`), which does NOT consult row headers.
+    // With the in-place gate ON, DELETE tombstones the parent (xmax
+    // stamped, row + index entry kept), so — before this fix — a child
+    // INSERT referencing the tombstoned parent wrongly succeeded. The
+    // fix skips tombstoned index locators, so the parent reads as gone
+    // and the FK insert must FAIL "no parent row" (PG agrees: a deleted
+    // parent violates the FK).
+    let setup = |e: &mut Engine| {
+        e.execute("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+        e.execute("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))")
+            .unwrap();
+        e.execute("INSERT INTO parent VALUES (1)").unwrap();
+        e.execute("DELETE FROM parent WHERE id = 1").unwrap();
+    };
+
+    // --- Gate ON: tombstoned parent is gone → child insert fails ---
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    setup(&mut e);
+    assert!(
+        e.execute("INSERT INTO child VALUES (10, 1)").is_err(),
+        "child referencing a tombstoned parent must FAIL 'no parent row' (gate-on)"
+    );
+    // Sanity: a child referencing a still-live parent succeeds.
+    e.execute("INSERT INTO parent VALUES (2)").unwrap();
+    e.execute("INSERT INTO child VALUES (11, 2)")
+        .expect("child referencing a live parent must succeed (gate-on)");
+
+    // --- Gate-OFF control: physical delete removes the parent too ---
+    let mut c = Engine::new();
+    setup(&mut c);
+    assert!(
+        c.execute("INSERT INTO child VALUES (10, 1)").is_err(),
+        "child referencing a physically-deleted parent must FAIL 'no parent row' (gate-off)"
+    );
+}
+
+#[test]
+fn mvcc_inplace_on_conflict_tombstoned_row_inserts_not_updates() {
+    // Phase C.3: ON CONFLICT existence rides `on_conflict_keys_exist`
+    // (single-column BTree `lookup_eq`) + `lookup_row_position_by_keys`.
+    // With the in-place gate ON, DELETE tombstones id=2. Before this fix
+    // the existence check saw the tombstone as a live conflict, so
+    // `INSERT ... ON CONFLICT DO UPDATE` resurrected the dead row. The
+    // fix treats a tombstoned hit as no-conflict, so the statement takes
+    // the INSERT arm and produces exactly one live id=2 with the INSERT's
+    // value — never the tombstone's.
+    let visible_v = |e: &Engine| -> Vec<i32> {
+        let QueryResult::Rows { rows, .. } = e
+            .execute_readonly("SELECT v FROM t WHERE id = 2 ORDER BY v")
+            .unwrap()
+        else {
+            panic!("expected Rows");
+        };
+        rows.iter()
+            .map(|r| match r.values[0] {
+                Value::Int(n) => n,
+                ref other => panic!("expected Int, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // --- Gate ON: tombstoned row is not a conflict → INSERT arm ---
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (2, 100)").unwrap();
+    e.execute("DELETE FROM t WHERE id = 2").unwrap();
+    e.execute(
+        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
+    )
+    .expect("ON CONFLICT over a tombstoned key must take the INSERT arm (gate-on)");
+    assert_eq!(
+        visible_v(&e),
+        vec![200],
+        "tombstone + ON CONFLICT DO UPDATE inserts the new row (v=200), \
+         never resurrects the tombstone as v=999 (gate-on)"
+    );
+
+    // --- Gate-ON positive control: a LIVE conflict still DO UPDATEs ---
+    let mut u = Engine::new();
+    u.set_mvcc_inplace(true);
+    u.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    u.execute("INSERT INTO t VALUES (2, 100)").unwrap();
+    u.execute(
+        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
+    )
+    .expect("ON CONFLICT over a live key must take the UPDATE arm (gate-on)");
+    assert_eq!(
+        visible_v(&u),
+        vec![999],
+        "a live conflict still DO UPDATEs to v=999 (gate-on)"
+    );
+
+    // --- Gate-OFF control: physical delete → INSERT arm too ---
+    let mut c = Engine::new();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    c.execute("INSERT INTO t VALUES (2, 100)").unwrap();
+    c.execute("DELETE FROM t WHERE id = 2").unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
+    )
+    .expect("ON CONFLICT after a physical delete must take the INSERT arm (gate-off)");
+    assert_eq!(
+        visible_v(&c),
+        vec![200],
+        "physical delete + ON CONFLICT DO UPDATE inserts the new row (gate-off)"
+    );
+}
+
+#[test]
 fn engine_row_locks_acquire_and_release() {
     use crate::locks::{LockMode, LockOutcome, WaitPolicy};
     use spg_storage::row_header::{RelId, RowId};
