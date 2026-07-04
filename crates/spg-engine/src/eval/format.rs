@@ -367,7 +367,8 @@ pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
         }
     }
     if parts.is_empty() {
-        "0".into()
+        // PG renders a zero interval as `00:00:00`, not `0`.
+        "00:00:00".into()
     } else {
         parts.join(" ")
     }
