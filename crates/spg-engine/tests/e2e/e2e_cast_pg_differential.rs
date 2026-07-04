@@ -1550,3 +1550,18 @@ fn regex_lookahead() {
     ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
     ck(&mut e, "('ABC' ~ '(?i)a(?=b)')::text", "true");
 }
+
+/// v7.37 D — inet \u00b1 integer shifts the address (keeping family + prefix), and
+/// integer + inet is commutative. Verified via host()/masklen (display-agnostic
+/// so the /32-elision rendering nuance doesn't affect it). PG18.4-verified.
+#[test]
+fn inet_int_arithmetic() {
+    let mut e = Engine::new();
+    ck(&mut e, "host('192.168.1.5'::inet + 10)", "192.168.1.15");
+    ck(&mut e, "host('192.168.1.20'::inet - 5)", "192.168.1.15");
+    ck(&mut e, "host(10 + '192.168.1.5'::inet)", "192.168.1.15");
+    ck(&mut e, "host('192.168.1.5/24'::inet + 1)", "192.168.1.6");
+    ck(&mut e, "masklen('192.168.1.5/24'::inet + 1)::text", "24");
+    // control: inet - inet still yields the address count.
+    ck(&mut e, "('192.168.1.20'::inet - '192.168.1.5'::inet)::text", "15");
+}
