@@ -12057,18 +12057,13 @@ impl Parser {
                 name: String::from("power"),
                 args: alloc::vec![lhs.clone(), rhs],
             },
+            // `#` bitwise XOR — a real operator now (was desugared to
+            // `(a|b)-(a&b)`, algebraically identical for integers but
+            // undefined for bit strings; the direct op handles both).
             Sym::Xor => Expr::Binary {
-                lhs: Box::new(Expr::Binary {
-                    lhs: Box::new(lhs.clone()),
-                    op: BinOp::BitOr,
-                    rhs: Box::new(rhs.clone()),
-                }),
-                op: BinOp::Sub,
-                rhs: Box::new(Expr::Binary {
-                    lhs: Box::new(lhs.clone()),
-                    op: BinOp::BitAnd,
-                    rhs: Box::new(rhs),
-                }),
+                lhs: Box::new(lhs.clone()),
+                op: BinOp::BitXor,
+                rhs: Box::new(rhs),
             },
         };
         Ok(Some(out))
