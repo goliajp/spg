@@ -359,3 +359,19 @@ fn bit_string_bitwise_and_or() {
     ck(&mut e, r#"~ B'11001010'"#, r#"00110101"#);
     ck(&mut e, r#"~ B'111'"#, r#"000"#);
 }
+
+/// lower(anyrange) / upper(anyrange) return the range bounds (previously
+/// errored "lower() needs text"). Text lower/upper are unchanged.
+/// PG18.4-verified.
+#[test]
+fn range_lower_upper_functions() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"lower(int4range(1,10))"#, r#"1"#);
+    ck(&mut e, r#"upper(int4range(1,10))"#, r#"10"#);
+    ck(&mut e, r#"lower('empty'::int4range)"#, r#"<NULL>"#);
+    ck(&mut e, r#"upper('(,5)'::int4range)"#, r#"5"#);
+    ck(&mut e, r#"lower('(,5)'::int4range)"#, r#"<NULL>"#);
+    // text lower/upper still work.
+    ck(&mut e, r#"lower('ABC')"#, r#"abc"#);
+    ck(&mut e, r#"upper('abc')"#, r#"ABC"#);
+}

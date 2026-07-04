@@ -4257,6 +4257,13 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::text(s.to_uppercase())),
+                // PG `upper(anyrange)` returns the upper bound (NULL for an
+                // empty or upper-unbounded range).
+                Value::Range { upper, empty, .. } => Ok(if *empty {
+                    Value::Null
+                } else {
+                    upper.as_ref().map_or(Value::Null, |v| (**v).clone())
+                }),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("upper() needs text, got {:?}", other.data_type()),
                 }),
@@ -4271,6 +4278,13 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::text(s.to_lowercase())),
+                // PG `lower(anyrange)` returns the lower bound (NULL for an
+                // empty or lower-unbounded range).
+                Value::Range { lower, empty, .. } => Ok(if *empty {
+                    Value::Null
+                } else {
+                    lower.as_ref().map_or(Value::Null, |v| (**v).clone())
+                }),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("lower() needs text, got {:?}", other.data_type()),
                 }),
