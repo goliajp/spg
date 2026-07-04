@@ -1736,6 +1736,107 @@ fn epic_p_panic_in_query_is_caught_and_engine_survives() {
     );
 }
 
+// v7.38 Epic P (panic isolation) — Slice 2 centerpiece. Mirror of
+// `epic_p_panic_in_query_is_caught_and_engine_survives`, but drives the
+// panicking statement through the PREPARED / EXTENDED-query path
+// (`execute_prepared` → `execute_prepared_with_cancel` →
+// `execute_stmt_catching` → `execute_stmt_with_cancel`) — the path sqlx /
+// asyncpg / most drivers actually use via pgwire `Bind`+`Execute`. Asserts
+// the same isolation contract as the simple-query slice:
+//   (a) the panic is caught and returned as an ordinary EngineError,
+//   (b) the engine is still usable afterward,
+//   (c) the panicked transaction was rolled back — no partial effect,
+//   (d) the engine's RwLock is NOT poisoned by the caught panic.
+// This proves Slice 2 reuses Slice 1's rollback (`discard_tx_on_panic`)
+// via the shared `catch_stmt_panic` firewall — no second policy.
+#[cfg(feature = "injection-points")]
+#[test]
+fn epic_p_panic_in_prepared_query_is_caught_and_engine_survives() {
+    extern crate std;
+    use std::sync::RwLock;
+
+    let mut e = crate::Engine::new();
+    e.execute("CREATE TABLE inj_panic_prep (id INT)").unwrap();
+    // Committed baseline row (autocommit).
+    e.execute("INSERT INTO inj_panic_prep VALUES (1)").unwrap();
+    // Open an explicit tx and stage an UNCOMMITTED write into the
+    // per-tx shadow catalog. This is the write that must vanish when
+    // the panicked tx is rolled back.
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO inj_panic_prep VALUES (2)").unwrap();
+
+    // Pre-parse the panicking SELECT into a prepared `Statement` so the
+    // panic drives the EXTENDED-query path (execute_prepared →
+    // execute_stmt_with_cancel), NOT the simple-query path. `prepare`
+    // takes `&self`, so this is fine before the engine moves into the lock.
+    let prepared = e.prepare("SELECT * FROM inj_panic_prep").unwrap();
+
+    // Grab the shared store (Arc), then wrap the engine in an RwLock
+    // exactly like spg-server does, to prove the caught panic leaves it
+    // un-poisoned.
+    let store = e.injection_store();
+    let lock = RwLock::new(e);
+
+    // Arm a panic at the SELECT executor head. The attach SELECT itself
+    // completes because the point fires *before* the projection that
+    // installs the action.
+    lock.write()
+        .unwrap()
+        .execute("SELECT spg_injection_attach('planner_first_row_fetch', 'error:boom')")
+        .expect("attach succeeds");
+
+    // (a) the panic thrown mid-Execute on the PREPARED path is caught and
+    //     returned as a normal EngineError, NOT unwound past the write guard.
+    {
+        let mut g = lock.write().expect("engine lock not poisoned pre-panic");
+        // The prepared / extended-query entry does not itself establish an
+        // injection scope (only the simple-query `execute_in_with_cancel`
+        // does — a no-op in production where the feature is off). Enter one
+        // by hand so the armed `planner_first_row_fetch` point can fire
+        // during this Execute. The guard holds no borrow of `g`, so the
+        // `&mut` execute_prepared call below is fine.
+        let _scope = g.enter_injection_scope();
+        let r = g.execute_prepared(prepared.clone(), &[]);
+        match r {
+            Err(EngineError::Internal(msg)) => {
+                assert!(msg.contains("aborted"), "unexpected internal msg: {msg}");
+            }
+            other => panic!("expected Err(Internal) from prepared path, got {other:?}"),
+        }
+    } // (d) guard drops WITHOUT an escaping unwind → lock stays un-poisoned
+
+    // Detach via the shared store — a SELECT here would re-trigger the
+    // panic, so we reach around the SQL surface.
+    store.detach("planner_first_row_fetch");
+
+    // (d) the write lock is still acquirable — a caught panic never
+    //     poisoned it. `.expect` would panic on a PoisonError.
+    let mut g = lock
+        .write()
+        .expect("engine lock poisoned by caught panic (prepared path)");
+
+    // (b) engine still usable + (c) tx rolled back: only the committed
+    //     row 1 survives; the in-tx INSERT(2) in the discarded shadow is
+    //     gone.
+    match g.execute("SELECT id FROM inj_panic_prep").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "prepared-path panicked tx write should have been rolled back"
+            );
+            assert_eq!(rows[0].values[0], Value::Int(1));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+
+    // The transaction is gone (rolled back), not still open.
+    assert!(
+        matches!(g.execute("COMMIT"), Err(EngineError::NoActiveTransaction)),
+        "prepared-path panicked tx should have been rolled back, leaving no active tx"
+    );
+}
+
 // ---------------------------------------------------------------
 // v7.37.15 Phase C.2 — transaction status oracle
 // ---------------------------------------------------------------
