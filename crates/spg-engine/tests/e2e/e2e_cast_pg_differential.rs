@@ -998,3 +998,21 @@ fn lseg_bare_input() {
     ck(&mut e, "'[(1,1),(2,2)]'::lseg::text", "[(1,1),(2,2)]"); // bracketed still works
     ck(&mut e, "'(0,0),(3,4)'::lseg::text", "[(0,0),(3,4)]");
 }
+
+/// Geometric accessors: area/width/height/center (box), radius/diameter/area/
+/// center (circle), length/isvertical/ishorizontal (lseg). PG18.4-verified.
+#[test]
+fn geometric_accessors() {
+    let mut e = Engine::new();
+    ck(&mut e, "area('(0,0),(2,3)'::box)::text", "6");
+    ck(&mut e, "width('(0,0),(2,3)'::box)::text", "2");
+    ck(&mut e, "height('(0,0),(2,3)'::box)::text", "3");
+    ck(&mut e, "center('(0,0),(2,4)'::box)::text", "(1,2)");
+    ck(&mut e, "radius('<(0,0),5>'::circle)::text", "5");
+    ck(&mut e, "diameter('<(0,0),5>'::circle)::text", "10");
+    ck(&mut e, "area('<(0,0),1>'::circle)::text", "3.141592653589793");
+    ck(&mut e, "center('<(1,2),5>'::circle)::text", "(1,2)");
+    ck(&mut e, "length('[(0,0),(3,4)]'::lseg)::text", "5");
+    ck(&mut e, "isvertical('[(0,0),(0,4)]'::lseg)::text", "true");
+    ck(&mut e, "ishorizontal('[(0,0),(3,0)]'::lseg)::text", "true");
+}

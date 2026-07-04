@@ -177,6 +177,11 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // Geometric `length(lseg)` — the segment's Euclidean length.
+                Value::Lseg(a, b) => {
+                    let (dx, dy) = (b.x - a.x, b.y - a.y);
+                    Ok(Value::Float(f64_sqrt(dx * dx + dy * dy)))
+                }
                 Value::Text(s) => {
                     // v7.36 (perf — mailrs Ask 1) — ASCII fast path.
                     // `s.is_ascii()` is SIMD-vectorised; for the 1 KB
@@ -1874,6 +1879,37 @@ fn apply_function_dispatch(
                 detail: "point() needs numeric y".into(),
             })?;
             Ok(Value::Point(spg_storage::Point2D { x, y }))
+        }
+        // Geometric accessors over box / circle / lseg. (`length(lseg)` is
+        // handled in the `length` arm above, which the text form shares.)
+        "area" | "width" | "height" | "center" | "radius" | "diameter"
+        | "isvertical" | "ishorizontal"
+            if args.len() == 1
+                && matches!(
+                    &args[0],
+                    Value::PgBox(..) | Value::Circle { .. } | Value::Lseg(..)
+                ) =>
+        {
+            let pt = |x: f64, y: f64| Value::Point(spg_storage::Point2D { x, y });
+            match (name, &args[0]) {
+                ("area", Value::PgBox(a, b)) => {
+                    Ok(Value::Float((a.x - b.x).abs() * (a.y - b.y).abs()))
+                }
+                ("area", Value::Circle { radius, .. }) => {
+                    Ok(Value::Float(core::f64::consts::PI * radius * radius))
+                }
+                ("width", Value::PgBox(a, b)) => Ok(Value::Float((a.x - b.x).abs())),
+                ("height", Value::PgBox(a, b)) => Ok(Value::Float((a.y - b.y).abs())),
+                ("center", Value::PgBox(a, b)) => Ok(pt((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)),
+                ("center", Value::Circle { center, .. }) => Ok(pt(center.x, center.y)),
+                ("radius", Value::Circle { radius, .. }) => Ok(Value::Float(*radius)),
+                ("diameter", Value::Circle { radius, .. }) => Ok(Value::Float(2.0 * radius)),
+                ("isvertical", Value::Lseg(a, b)) => Ok(Value::Bool(a.x == b.x)),
+                ("ishorizontal", Value::Lseg(a, b)) => Ok(Value::Bool(a.y == b.y)),
+                (n, v) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("{n}() not defined for {:?}", v.data_type()),
+                }),
+            }
         }
         "gcd" => {
             if args.len() != 2 {
