@@ -13,7 +13,39 @@ use alloc::vec::Vec;
 
 use spg_storage::Value;
 
-use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days};
+use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days, days_from_civil};
+
+/// Full weekday names, indexed Monday = 0 .. Sunday = 6 (matching
+/// `(days + 3).rem_euclid(7)` since 1970-01-01 was a Thursday).
+const DAY_FULL: [&str; 7] = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+];
+/// Abbreviated weekday names, same Monday = 0 indexing.
+const DAY_ABBR: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+/// Roman numeral months (PG `RM` / `rm`), index month-1.
+const MONTH_ROMAN: [&str; 12] = [
+    "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+];
+
+/// Apply a PG `to_char` case template to a mixed-case canonical name:
+/// `"Tuesday"` → itself for `Xx`, uppercase for `XX`, lowercase for
+/// `xx`. `blank_to` (when `Some`) right-pads with spaces to the fixed
+/// PG field width (9 for full day/month names, 4 for roman months).
+fn cased_name(canonical: &str, upper: bool, lower: bool, blank_to: Option<usize>) -> String {
+    let mut s = if upper {
+        canonical.to_ascii_uppercase()
+    } else if lower {
+        canonical.to_ascii_lowercase()
+    } else {
+        canonical.to_string()
+    };
+    if let Some(width) = blank_to {
+        while s.len() < width {
+            s.push(' ');
+        }
+    }
+    s
+}
 
 // PG trim family: which side to strip.
 #[derive(Debug, Clone, Copy)]
@@ -567,59 +599,170 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let ms = u32::try_from(frac / 1_000).unwrap_or(0); // millisecond
     let us = u32::try_from(frac).unwrap_or(0); // microsecond (0..1_000_000)
 
+    // Calendar-derived fields (PG doc semantics). 1970-01-01 was a
+    // Thursday (index 3 in a Monday=0 week).
+    let dow_mon0 = usize::try_from((i64::from(days) + 3).rem_euclid(7)).unwrap_or(0);
+    let day_of_year = i64::from(days - days_from_civil(y, 1, 1)) + 1; // DDD
+    let (iso_week, iso_year) = super::datetime::iso_week_and_year(days, y); // IW / IYYY
+    let quarter = i64::from((mo - 1) / 3) + 1; // Q
+    let week_of_year = (day_of_year - 1) / 7 + 1; // WW
+    let week_of_month = i64::from((d - 1) / 7) + 1; // W
+    let dow_sun1 = (i64::from(days) + 4).rem_euclid(7) + 1; // D: Sunday = 1
+    let iso_dow = i64::from(dow_mon0 as i64) + 1; // ID: Monday = 1
+    let julian = i64::from(days) + 2_440_588; // J
+    let century: i64 = if y > 0 {
+        i64::from((y - 1) / 100) + 1
+    } else {
+        i64::from(y / 100) - 1
+    }; // CC
+
     let mut out = String::with_capacity(fmt.len() + 8);
     let bytes = fmt.as_bytes();
     let mut i = 0;
+    // `FM` prefix suppresses the leading zeros / blank padding of the
+    // one field it precedes.
+    let mut fm = false;
     // write! against a String never fails — discard the Result.
     while i < bytes.len() {
         // Try the longest prefixes first so "YYYY" wins over "YY".
         let rest = &bytes[i..];
+        // FM toggles fill-mode for the *next* field only; consume and
+        // loop without emitting so it applies to whatever follows.
+        if rest.starts_with(b"FM") {
+            fm = true;
+            i += 2;
+            continue;
+        }
+        // Blank-padded name fields (Day / Month / RM): FM strips the
+        // trailing blanks; the width is the longest member (9 for
+        // day/month names, 4 for roman months).
+        let pad = |width: usize| if fm { None } else { Some(width) };
+        // Numeric fields honour FM by dropping the zero pad.
+        macro_rules! num {
+            ($val:expr, $width:literal) => {{
+                if fm {
+                    let _ = write!(out, "{}", $val);
+                } else {
+                    let _ = write!(out, "{:0width$}", $val, width = $width);
+                }
+            }};
+        }
+        let mut consumed = 2usize;
         if rest.starts_with(b"YYYY") {
-            let _ = write!(out, "{y:04}");
-            i += 4;
-        } else if rest.starts_with(b"YY") {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let yy = (y.rem_euclid(100)) as u32;
-            let _ = write!(out, "{yy:02}");
-            i += 2;
-        } else if rest.starts_with(b"Month") {
-            out.push_str(MONTH_FULL[(mo - 1) as usize]);
-            i += 5;
-        } else if rest.starts_with(b"Mon") {
-            out.push_str(MONTH_ABBR[(mo - 1) as usize]);
-            i += 3;
-        } else if rest.starts_with(b"MM") {
-            let _ = write!(out, "{mo:02}");
-            i += 2;
-        } else if rest.starts_with(b"DD") {
-            let _ = write!(out, "{d:02}");
-            i += 2;
+            num!(y, 4);
+            consumed = 4;
+        } else if rest.starts_with(b"IYYY") {
+            num!(iso_year, 4);
+            consumed = 4;
         } else if rest.starts_with(b"HH24") {
-            let _ = write!(out, "{hh24:02}");
-            i += 4;
+            num!(hh24, 2);
+            consumed = 4;
         } else if rest.starts_with(b"HH12") {
-            let _ = write!(out, "{hh12:02}");
-            i += 4;
+            num!(hh12, 2);
+            consumed = 4;
+        } else if rest.starts_with(b"IYY") {
+            let _ = write!(out, "{:03}", iso_year.rem_euclid(1000));
+            consumed = 3;
+        } else if rest.starts_with(b"YYY") {
+            let _ = write!(out, "{:03}", i64::from(y).rem_euclid(1000));
+            consumed = 3;
+        } else if rest.starts_with(b"DDD") {
+            num!(day_of_year, 3);
+            consumed = 3;
+        } else if rest.starts_with(b"Month") {
+            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], false, false, pad(9)));
+            consumed = 5;
+        } else if rest.starts_with(b"MONTH") {
+            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], true, false, pad(9)));
+            consumed = 5;
+        } else if rest.starts_with(b"month") {
+            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], false, true, pad(9)));
+            consumed = 5;
+        } else if rest.starts_with(b"Mon") {
+            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], false, false, None));
+            consumed = 3;
+        } else if rest.starts_with(b"MON") {
+            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], true, false, None));
+            consumed = 3;
+        } else if rest.starts_with(b"mon") {
+            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], false, true, None));
+            consumed = 3;
+        } else if rest.starts_with(b"Day") {
+            out.push_str(&cased_name(DAY_FULL[dow_mon0], false, false, pad(9)));
+            consumed = 3;
+        } else if rest.starts_with(b"DAY") {
+            out.push_str(&cased_name(DAY_FULL[dow_mon0], true, false, pad(9)));
+            consumed = 3;
+        } else if rest.starts_with(b"day") {
+            out.push_str(&cased_name(DAY_FULL[dow_mon0], false, true, pad(9)));
+            consumed = 3;
+        } else if rest.starts_with(b"Dy") {
+            out.push_str(&cased_name(DAY_ABBR[dow_mon0], false, false, None));
+        } else if rest.starts_with(b"DY") {
+            out.push_str(&cased_name(DAY_ABBR[dow_mon0], true, false, None));
+        } else if rest.starts_with(b"dy") {
+            out.push_str(&cased_name(DAY_ABBR[dow_mon0], false, true, None));
+        } else if rest.starts_with(b"YY") {
+            let _ = write!(out, "{:02}", i64::from(y).rem_euclid(100));
+        } else if rest.starts_with(b"IW") {
+            num!(iso_week, 2);
+        } else if rest.starts_with(b"IY") {
+            let _ = write!(out, "{:02}", iso_year.rem_euclid(100));
+        } else if rest.starts_with(b"ID") {
+            let _ = write!(out, "{iso_dow}");
+        } else if rest.starts_with(b"MM") {
+            num!(mo, 2);
+        } else if rest.starts_with(b"DD") {
+            num!(d, 2);
         } else if rest.starts_with(b"MI") {
-            let _ = write!(out, "{mi:02}");
-            i += 2;
+            num!(mi, 2);
         } else if rest.starts_with(b"SS") {
-            let _ = write!(out, "{ss:02}");
-            i += 2;
+            num!(ss, 2);
         } else if rest.starts_with(b"MS") {
             let _ = write!(out, "{ms:03}");
-            i += 2;
         } else if rest.starts_with(b"US") {
             let _ = write!(out, "{us:06}");
-            i += 2;
+        } else if rest.starts_with(b"WW") {
+            num!(week_of_year, 2);
+        } else if rest.starts_with(b"CC") {
+            num!(century, 2);
+        } else if rest.starts_with(b"RM") {
+            out.push_str(&cased_name(MONTH_ROMAN[(mo - 1) as usize], true, false, pad(4)));
+        } else if rest.starts_with(b"rm") {
+            out.push_str(&cased_name(MONTH_ROMAN[(mo - 1) as usize], false, true, pad(4)));
+        } else if rest.starts_with(b"HH") {
+            num!(hh12, 2);
         } else if rest.starts_with(b"AM") || rest.starts_with(b"PM") {
             out.push_str(ampm);
-            i += 2;
+        } else if rest.starts_with(b"am") || rest.starts_with(b"pm") {
+            out.push_str(if hh24 < 12 { "am" } else { "pm" });
+        } else if rest.starts_with(b"Y") || rest.starts_with(b"I") {
+            // Single-digit year / ISO-year (last digit).
+            let base = if rest[0] == b'I' { iso_year } else { i64::from(y) };
+            let _ = write!(out, "{}", base.rem_euclid(10));
+            consumed = 1;
+        } else if rest.starts_with(b"Q") {
+            let _ = write!(out, "{quarter}");
+            consumed = 1;
+        } else if rest.starts_with(b"W") {
+            let _ = write!(out, "{week_of_month}");
+            consumed = 1;
+        } else if rest.starts_with(b"D") {
+            let _ = write!(out, "{dow_sun1}");
+            consumed = 1;
+        } else if rest.starts_with(b"J") {
+            let _ = write!(out, "{julian}");
+            consumed = 1;
         } else {
             // Pass any non-placeholder byte through verbatim.
             out.push(bytes[i] as char);
-            i += 1;
+            consumed = 1;
+            i += consumed;
+            // A literal byte doesn't consume the pending FM.
+            continue;
         }
+        fm = false;
+        i += consumed;
     }
     Ok(Value::text(out))
 }
