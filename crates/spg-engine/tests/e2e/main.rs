@@ -543,3 +543,4 @@ mod e2e_writable_cte_select;
 mod mailrs_round26;
 mod mailrs_round30;
 mod mailrs_round31;
+mod mvcc_pg_differential;
