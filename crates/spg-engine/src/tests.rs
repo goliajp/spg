@@ -1837,6 +1837,150 @@ fn epic_p_panic_in_prepared_query_is_caught_and_engine_survives() {
     );
 }
 
+// v7.38 Epic P (panic isolation) — Slice 3. Mirror of the prepared-path
+// test, but drives the panic through the READ-ONLY prepared-SELECT hot
+// path `execute_prepared_select_no_params` → `exec_select_cancel` — the
+// pgwire `Execute` path for a bound-param-free SELECT (the bulk of driver
+// read traffic). Asserts the isolation contract that applies to a
+// read-only path:
+//   (a) the panic is caught and returned as an ordinary EngineError,
+//   (b) the engine is still usable afterward,
+//   (d) the engine's RwLock is NOT poisoned by the caught panic.
+// (c) tx-rollback is intentionally NOT asserted here: a SELECT opens no
+// COW shadow / writer version, so the firewall's `discard_tx_on_panic` is
+// a no-op on this path — there is nothing to roll back. The point of the
+// firewall on the read-only paths is purely catch + survive + un-poison.
+#[cfg(feature = "injection-points")]
+#[test]
+fn epic_p_panic_in_no_params_select_is_caught_and_engine_survives() {
+    extern crate std;
+    use std::sync::RwLock;
+
+    let mut e = crate::Engine::new();
+    e.execute("CREATE TABLE inj_panic_np (id INT)").unwrap();
+    // Committed baseline row (autocommit) — must survive the caught panic.
+    e.execute("INSERT INTO inj_panic_np VALUES (1)").unwrap();
+
+    // Pre-parse the panicking SELECT into a `SelectStatement` so we can
+    // drive the read-only no-params entry directly, exactly as pgwire does
+    // for a param-free `Execute`. `prepare_select_streaming` takes `&self`,
+    // so this is fine before the engine moves into the lock.
+    let sel = e
+        .prepare_select_streaming("SELECT * FROM inj_panic_np")
+        .unwrap();
+
+    let store = e.injection_store();
+    let lock = RwLock::new(e);
+
+    // Arm a panic at the SELECT executor head.
+    lock.write()
+        .unwrap()
+        .execute("SELECT spg_injection_attach('planner_first_row_fetch', 'error:boom')")
+        .expect("attach succeeds");
+
+    // (a) the panic thrown inside the read-only no-params SELECT path is
+    //     caught and returned as a normal EngineError, NOT unwound past the
+    //     write guard.
+    {
+        let mut g = lock.write().expect("engine lock not poisoned pre-panic");
+        // The read-only entry does not itself establish an injection scope
+        // (only the simple-query `execute_in_with_cancel` does — a no-op in
+        // production where the feature is off). Enter one by hand so the
+        // armed point can fire during this call.
+        let _scope = g.enter_injection_scope();
+        let r = g.execute_prepared_select_no_params(&sel, CancelToken::none());
+        match r {
+            Err(EngineError::Internal(msg)) => {
+                assert!(msg.contains("aborted"), "unexpected internal msg: {msg}");
+            }
+            other => panic!("expected Err(Internal) from no-params path, got {other:?}"),
+        }
+    } // (d) guard drops WITHOUT an escaping unwind → lock stays un-poisoned
+
+    store.detach("planner_first_row_fetch");
+
+    // (d) the write lock is still acquirable — a caught panic never
+    //     poisoned it. `.expect` would panic on a PoisonError.
+    let mut g = lock
+        .write()
+        .expect("engine lock poisoned by caught panic (no-params path)");
+
+    // (b) engine still usable: the committed baseline row is intact and
+    //     the engine takes the next query.
+    match g.execute("SELECT id FROM inj_panic_np").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "committed baseline row must survive");
+            assert_eq!(rows[0].values[0], Value::Int(1));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+// v7.38 Epic P (panic isolation) — Slice 3. Same contract as the no-params
+// test, but drives the panic through the STREAMING read-only SELECT path
+// `execute_prepared_select_streaming` → `exec_select_streaming`. Proves
+// the streaming firewall covers the streaming phase, not just setup: the
+// engine drives the `emit` callback synchronously (push model) inside the
+// single statement-boundary `catch_unwind`, so an unwind anywhere in the
+// streaming phase is caught here. A single-table SELECT (no joins) takes
+// the materialising fall-back inside `exec_select_streaming`, where the
+// armed `planner_first_row_fetch` point fires before any row is emitted.
+#[cfg(feature = "injection-points")]
+#[test]
+fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
+    extern crate std;
+    use std::sync::RwLock;
+
+    let mut e = crate::Engine::new();
+    e.execute("CREATE TABLE inj_panic_stream (id INT)").unwrap();
+    e.execute("INSERT INTO inj_panic_stream VALUES (1)").unwrap();
+
+    let sel = e
+        .prepare_select_streaming("SELECT * FROM inj_panic_stream")
+        .unwrap();
+
+    let store = e.injection_store();
+    let lock = RwLock::new(e);
+
+    lock.write()
+        .unwrap()
+        .execute("SELECT spg_injection_attach('planner_first_row_fetch', 'error:boom')")
+        .expect("attach succeeds");
+
+    // (a) the panic thrown inside the streaming SELECT path is caught and
+    //     returned as a normal EngineError, NOT unwound past the write guard.
+    {
+        let mut g = lock.write().expect("engine lock not poisoned pre-panic");
+        let _scope = g.enter_injection_scope();
+        // Benign `emit` closure, exactly the shape the wire layer supplies.
+        // It never runs here because the panic fires before any Header/Row
+        // is emitted (the fall-back materialises via `exec_select_cancel`
+        // first, which is where `planner_first_row_fetch` fires).
+        let r = g.execute_prepared_select_streaming(&sel, CancelToken::none(), |_item| Ok(()));
+        match r {
+            Err(EngineError::Internal(msg)) => {
+                assert!(msg.contains("aborted"), "unexpected internal msg: {msg}");
+            }
+            other => panic!("expected Err(Internal) from streaming path, got {other:?}"),
+        }
+    } // (d) guard drops WITHOUT an escaping unwind → lock stays un-poisoned
+
+    store.detach("planner_first_row_fetch");
+
+    let mut g = lock
+        .write()
+        .expect("engine lock poisoned by caught panic (streaming path)");
+
+    // (b) engine still usable after the caught streaming panic.
+    match g.execute("SELECT id FROM inj_panic_stream").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "committed baseline row must survive");
+            assert_eq!(rows[0].values[0], Value::Int(1));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------
 // v7.37.15 Phase C.2 — transaction status oracle
 // ---------------------------------------------------------------
