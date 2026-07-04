@@ -394,6 +394,11 @@ pub(super) fn apply_binary(
         {
             Ok(Value::Bool(array_contains_all(&r, &l)))
         }
+        // Geometric `box && box` / `circle && circle` overlap, ahead of the
+        // array-overlap interpretation.
+        BinOp::InetOverlap if geo_overlaps(&l, &r).is_some() => {
+            Ok(Value::Bool(geo_overlaps(&l, &r).expect("guard checked")))
+        }
         BinOp::InetOverlap
             if array_scalar_elems(&l).is_some() && array_scalar_elems(&r).is_some() =>
         {
@@ -2222,6 +2227,23 @@ fn range_strictly_left(
             Ordering::Equal => !(aui2 && bli2),
             Ordering::Greater => false,
         },
+    }
+}
+
+/// Geometric overlap `a && b` for same-type box or circle: boxes overlap when
+/// their x- and y-projections both overlap; circles overlap when the distance
+/// between centres is ≤ the sum of the radii. `None` for other operand pairs.
+fn geo_overlaps(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
+    match (a, b) {
+        (Value::PgBox(aur, all), Value::PgBox(bur, bll)) => Some(
+            all.x <= bur.x && bll.x <= aur.x && all.y <= bur.y && bll.y <= aur.y,
+        ),
+        (Value::Circle { center: c1, radius: r1 }, Value::Circle { center: c2, radius: r2 }) => {
+            let (dx, dy) = (c1.x - c2.x, c1.y - c2.y);
+            let rsum = r1 + r2;
+            Some(dx * dx + dy * dy <= rsum * rsum)
+        }
+        _ => None,
     }
 }
 
