@@ -8679,6 +8679,37 @@ fn apply_function_dispatch(
                             });
                         }
                     };
+                    // Exact NUMERIC rounding for a non-negative target scale:
+                    // going through f64 corrupts values like
+                    // `round(1.255::numeric, 2)` (1.255 has no exact f64, so it
+                    // lands at 1.25 instead of PG's 1.26). Do half-away-from-zero
+                    // on the integer mantissa. Negative target scales fall
+                    // through to the f64 path below (existing behaviour).
+                    if let Value::Numeric { scaled, scale } = &args[0] {
+                        let cur = i32::from(*scale);
+                        if (0..=38).contains(&n) {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let out = if n >= cur {
+                                scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
+                                    Value::Numeric { scaled: m, scale: n as u8 }
+                                })
+                            } else {
+                                let factor = pow10_i128((cur - n) as u8);
+                                let neg = *scaled < 0;
+                                let abs = scaled.unsigned_abs() as i128;
+                                let q = abs / factor;
+                                let r = abs % factor;
+                                let mag = if 2 * r >= factor { q + 1 } else { q };
+                                Some(Value::Numeric {
+                                    scaled: if neg { -mag } else { mag },
+                                    scale: n as u8,
+                                })
+                            };
+                            if let Some(v) = out {
+                                return Ok(v);
+                            }
+                        }
+                    }
                     // Convert input to f64 for arithmetic
                     // simplicity (PG does NUMERIC math here but
                     // SPG's f64 path matches the dominant

@@ -1431,3 +1431,21 @@ fn time_allballs_and_24h() {
     ck(&mut e, "('12:30'::time)::text", "12:30:00");
     assert_eq!(cast(&mut e, "'24:00:01'::time"), "ERR");
 }
+
+
+
+
+
+/// v7.37 D — round(numeric, scale) does exact mantissa rounding instead of
+/// routing through f64, so `round(1.255::numeric, 2)` = 1.26 like PG (1.255 has
+/// no exact f64 and would otherwise land at 1.25). PG18.4-verified.
+#[test]
+fn round_numeric_exact_scale() {
+    let mut e = Engine::new();
+    ck(&mut e, "round(1.255::numeric, 2)::text", "1.26");
+    ck(&mut e, "round(2.675::numeric, 2)::text", "2.68");
+    ck(&mut e, "round((-1.255)::numeric, 2)::text", "-1.26");
+    ck(&mut e, "round(1.5::numeric, 3)::text", "1.500");
+    // control: 1-arg numeric round unchanged.
+    ck(&mut e, "round(2.5::numeric)::text", "3");
+}
