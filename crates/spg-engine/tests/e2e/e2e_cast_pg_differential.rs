@@ -1111,3 +1111,22 @@ fn point_geo_distance() {
     ck(&mut e, "('(3,0),(4,0)'::lseg <-> point(0,0))::text", "3");
     ck(&mut e, "(point(0,0) <-> point(3,4))::text", "5");
 }
+
+/// sum(money) — the aggregate accumulator had no Money arm. PG18.4-verified.
+/// (PG has no avg(money); SPG accepts it as a superset.)
+#[test]
+fn sum_money_agg() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE mt (m money)").unwrap();
+    e.execute("INSERT INTO mt VALUES ('$10.00'),('$20.50'),('$5.25')").unwrap();
+    let row = |e: &mut Engine, q: &str| -> String {
+        match e.execute(q) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(row(&mut e, "SELECT sum(m)::text FROM mt"), "Text(\"$35.75\")");
+    assert_eq!(row(&mut e, "SELECT max(m)::text FROM mt"), "Text(\"$20.50\")");
+    // superset avg(money): (1000+2050+525)/3 = 1191.67c → $11.92 (rounded).
+    assert_eq!(row(&mut e, "SELECT avg(m)::text FROM mt"), "Text(\"$11.92\")");
+}
