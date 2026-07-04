@@ -334,6 +334,19 @@ pub(super) fn apply_binary(
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // bit(n) << / >> k: shift within the fixed-width bit string. Claims
+        // the operator ahead of the integer-shift and inet interpretations.
+        BinOp::InetContainedBy | BinOp::InetContains
+            if matches!(l, Value::BitString { .. }) && int_operand(&r).is_some() =>
+        {
+            let Value::BitString { nbits, bytes } = &l else { unreachable!() };
+            let k = int_operand(&r).expect("guard checked");
+            let out = bitstring_shift(*nbits, bytes, k, matches!(op, BinOp::InetContainedBy));
+            Ok(Value::BitString {
+                nbits: *nbits,
+                bytes: alloc::borrow::Cow::Owned(out),
+            })
+        }
         // Integer operands claim << / >> as bit shifts before the
         // inet containment interpretation (PG int4/int8 shift ops).
         BinOp::InetContainedBy | BinOp::InetContains
@@ -1101,6 +1114,29 @@ fn unwrap_vec_pair(
 /// Bitwise integer op (`|` / `&`). PG defines these for integer
 /// types only — SmallInt widens to Int, Int x BigInt widens to
 /// BigInt, anything else is a type error (mailrs embed round-12).
+/// PG `bit(n) << k` / `>> k`: shift the MSB-packed bit sequence within its
+/// fixed `nbits` window, zero-filling the vacated end (bits shifted past
+/// either end are dropped). A negative count reverses direction.
+fn bitstring_shift(nbits: u32, bytes: &[u8], k: i64, mut left: bool) -> alloc::vec::Vec<u8> {
+    let n = nbits as usize;
+    let k = if k < 0 {
+        left = !left;
+        k.unsigned_abs() as usize
+    } else {
+        k as usize
+    };
+    let get = |i: usize| -> bool { i < n && (bytes[i / 8] >> (7 - (i % 8))) & 1 == 1 };
+    let mut out = alloc::vec![0u8; n.div_ceil(8)];
+    for i in 0..n {
+        // shift-left: out[i] = in[i+k]; shift-right: out[i] = in[i-k].
+        let src = if left { i.checked_add(k) } else { i.checked_sub(k) };
+        if src.is_some_and(get) {
+            out[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    out
+}
+
 fn bitop(
     l: Value<'static>,
     r: Value<'static>,

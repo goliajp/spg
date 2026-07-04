@@ -401,3 +401,16 @@ fn range_union_operator() {
     // a gap between the operands is a contiguity error.
     ck(&mut e, r#"int4range(1,5) + int4range(10,20)"#, r#"ERR"#);
 }
+
+/// bit(n) << / >> k shift within the fixed-width window (previously errored).
+/// PG18.4-verified: over-shift zeroes, negative count reverses direction.
+#[test]
+fn bit_string_shift_operators() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"B'1010' << 1"#, r#"0100"#);
+    ck(&mut e, r#"B'1010' >> 1"#, r#"0101"#);
+    ck(&mut e, r#"B'11010' << 2"#, r#"01000"#);
+    ck(&mut e, r#"B'1010' << 5"#, r#"0000"#);
+    ck(&mut e, r#"B'1010' >> 5"#, r#"0000"#);
+    ck(&mut e, r#"B'1010' << -1"#, r#"0101"#);
+}
