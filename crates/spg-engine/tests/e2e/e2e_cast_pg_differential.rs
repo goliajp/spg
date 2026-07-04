@@ -1339,3 +1339,14 @@ fn polygon_bare_input() {
     ck(&mut e, "npoints('(0,0),(4,0),(4,3),(0,3)'::polygon)::text", "4");
     ck(&mut e, "npoints('((0,0),(1,1))'::polygon)::text", "2");
 }
+
+/// v7.37 D.5 — path text accepts the bare (no-bracket) point list as a closed
+/// path, like PG; `[...]` stays open, `(...)` stays closed. PG18.4-verified.
+#[test]
+fn path_bare_input() {
+    let mut e = Engine::new();
+    ck(&mut e, "('[(0,0),(1,1),(2,0)]'::path)::text", "[(0,0),(1,1),(2,0)]");
+    ck(&mut e, "('((0,0),(1,1),(2,0))'::path)::text", "((0,0),(1,1),(2,0))");
+    ck(&mut e, "('(0,0),(1,1),(2,0)'::path)::text", "((0,0),(1,1),(2,0))");
+    ck(&mut e, "npoints('(0,0),(1,1),(2,0)'::path)::text", "3");
+}
