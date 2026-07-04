@@ -2411,6 +2411,31 @@ pub(super) fn compare(
     l: &Value<'_>,
     r: &Value<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // PG implicitly casts an unknown-type string literal to the other
+    // operand's type. When one side is Text and the other is a typed scalar
+    // that the arms below don't compare against Text (time/bytea/inet/interval/
+    // uuid/macaddr/date/timestamp/...), coerce the Text to that type first.
+    // Numeric variants already have Text-free arms, so leave them alone.
+    let needs_text_coerce = |other: &Value<'_>| -> Option<DataType> {
+        match other.data_type() {
+            Some(
+                DataType::Int | DataType::BigInt | DataType::SmallInt | DataType::Float
+                | DataType::Numeric { .. } | DataType::Text | DataType::Bool,
+            )
+            | None => None,
+            dt => dt,
+        }
+    };
+    if let (Value::Text(s), Some(dt)) = (l, needs_text_coerce(r)) {
+        if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
+            return compare(op, &c, r);
+        }
+    }
+    if let (Some(dt), Value::Text(s)) = (needs_text_coerce(l), r) {
+        if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
+            return compare(op, l, &c);
+        }
+    }
     let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => i64::from(*a).cmp(&i64::from(*b)),
         (Value::Int(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
