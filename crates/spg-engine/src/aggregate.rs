@@ -4116,6 +4116,37 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             Value::Numeric { scaled: xs, scale: xsc },
             Value::Numeric { scaled: ys, scale: ysc },
         ) => crate::orderby::cmp_numeric(*xs, *xsc, *ys, *ysc),
+        // Mixed exact-decimal ↔ integer — promote the integer to a
+        // NUMERIC at scale 0 and compare exactly (mirrors binop.rs
+        // `numeric_or_widen`), so min/max over a mixed NUMERIC/int column
+        // matches arithmetic + WHERE. The old `_ => Equal` fallback made
+        // min/max keep whichever row happened to arrive first.
+        (Value::Numeric { scaled: xs, scale: xsc }, Value::SmallInt(y)) => {
+            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
+        }
+        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
+        }
+        (Value::Numeric { scaled: xs, scale: xsc }, Value::Int(y)) => {
+            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
+        }
+        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
+        }
+        (Value::Numeric { scaled: xs, scale: xsc }, Value::BigInt(y)) => {
+            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
+        }
+        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
+        }
+        // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
+        // `numeric op double precision`, so compare as f64.
+        (Value::Numeric { scaled: xs, scale: xsc }, Value::Float(y)) => {
+            crate::orderby::numeric_to_f64(*xs, *xsc).partial_cmp(y).unwrap_or(Equal)
+        }
+        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+            x.partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc)).unwrap_or(Equal)
+        }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         // Temporal — stored as integral day / microsecond counts, so
@@ -4155,3 +4186,35 @@ pub static AGG_PER_ROW_EVAL_FALLBACK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static AGG_PER_ROW_COUNT_STAR_SENTINEL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod value_cmp_mixed_numeric_tests {
+    //! v7.37.16 Slice A — direct coverage of the mixed NUMERIC↔int/float
+    //! arms in the aggregate-local `value_cmp` (drives min / max / argmin
+    //! / argmax / mode / ordered-set aggregates). These pairs previously
+    //! hit `_ => Equal`, which made `min`/`max` over a mixed NUMERIC/int
+    //! key keep whichever row arrived first. Semantics now mirror
+    //! binop.rs: int→NUMERIC exact promotion, NUMERIC→f64 demotion vs a
+    //! float.
+    use super::value_cmp;
+    use core::cmp::Ordering;
+    use spg_storage::Value;
+
+    fn num(scaled: i128, scale: u8) -> Value<'static> {
+        Value::Numeric { scaled, scale }
+    }
+
+    #[test]
+    fn numeric_vs_integer_and_float() {
+        assert_eq!(value_cmp(&num(250, 2), &Value::Int(5)), Ordering::Less);
+        assert_eq!(value_cmp(&Value::Int(5), &num(250, 2)), Ordering::Greater);
+        // debug-string/Equal fallback bug: 1000 vs 9 must be Greater.
+        assert_eq!(value_cmp(&num(1000, 0), &Value::SmallInt(9)), Ordering::Greater);
+        assert_eq!(value_cmp(&num(20, 1), &Value::BigInt(2)), Ordering::Equal);
+        assert_eq!(value_cmp(&Value::BigInt(2), &num(20, 1)), Ordering::Equal);
+        // NUMERIC↔float demotion.
+        assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.5)), Ordering::Equal);
+        assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.0)), Ordering::Greater);
+        assert_eq!(value_cmp(&Value::Float(1.0), &num(25, 1)), Ordering::Less);
+    }
+}
