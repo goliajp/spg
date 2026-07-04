@@ -2679,12 +2679,24 @@ impl Engine {
             }
         }
         let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
+        // v7.37 D.21 — correlated subqueries in the WHERE / projection may
+        // reference this derived table's columns (`… WHERE u.gg = t.g` where t
+        // is `(VALUES …) t`). Resolve them per-row via eval_expr_with_correlated
+        // (the same path the aggregate branch uses); the old plain eval_expr let
+        // a ScalarSubquery reach row-eval unresolved ("engine resolver bug").
+        let corr_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
         // WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
             for row in rows {
                 cancel.check()?;
-                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                let v = self.eval_expr_with_correlated(
+                    w,
+                    &row,
+                    &scan_ctx,
+                    cancel,
+                    Some(&mut corr_memo.borrow_mut()),
+                )?;
                 if matches!(v, Value::Bool(true)) {
                     out.push(row);
                 }
@@ -2723,7 +2735,13 @@ impl Engine {
         for row in &filtered {
             let mut vals = alloc::vec::Vec::with_capacity(projection.len());
             for p in &projection {
-                let v = eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?;
+                let v = self.eval_expr_with_correlated(
+                    &p.expr,
+                    row,
+                    &scan_ctx,
+                    cancel,
+                    Some(&mut corr_memo.borrow_mut()),
+                )?;
                 vals.push(v);
             }
             projected_rows.push(Row::new(vals));

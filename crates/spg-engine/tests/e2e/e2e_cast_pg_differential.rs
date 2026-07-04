@@ -1931,3 +1931,24 @@ fn join_bare_values_operand() {
     // per-left-row (must NOT take the new eager path).
     assert_eq!(q(&mut e, "SELECT string_agg(s.y, ',' ORDER BY s.y) FROM ct19 CROSS JOIN LATERAL (SELECT ct19.v || '!' AS y) s"), "a!,b!");
 }
+
+/// v7.37 D.21 — a correlated subquery in the projection/WHERE of a query whose
+/// primary is a VALUES/subquery-derived table now resolves per-row (was
+/// "engine resolver bug"). PG18.4-verified.
+#[test]
+fn correlated_subq_over_derived() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // correlated scalar subquery in projection over VALUES-derived outer
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||mx, ',' ORDER BY g) FROM (SELECT g, (SELECT max(v) FROM (VALUES (1,10),(1,20),(2,5)) u(gg,v) WHERE u.gg=t.g)::text mx FROM (VALUES (1),(2)) t(g)) s"), "1:20,2:5");
+    // correlated in WHERE over derived outer
+    assert_eq!(q(&mut e, "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE g < (SELECT max(v) FROM (VALUES (1),(3)) u(v) WHERE u.v <> t.g)"), "1,2");
+    // EXISTS correlated over derived outer
+    assert_eq!(q(&mut e, "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE EXISTS (SELECT 1 FROM (VALUES (2),(3)) u(v) WHERE u.v=t.g)"), "2,3");
+}
