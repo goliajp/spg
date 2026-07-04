@@ -1603,6 +1603,17 @@ fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, E
         let (dx, dy) = (acx - bcx, acy - bcy);
         return Ok(Value::Float(sqrt_newton(dx * dx + dy * dy)));
     }
+    // PG `circle <-> circle` is the gap between the boundaries: the centre
+    // distance minus both radii, clamped to 0 when they overlap.
+    if let (
+        Value::Circle { center: ac, radius: ar },
+        Value::Circle { center: bc, radius: br },
+    ) = (&l, &r)
+    {
+        let (dx, dy) = (ac.x - bc.x, ac.y - bc.y);
+        let gap = sqrt_newton(dx * dx + dy * dy) - ar - br;
+        return Ok(Value::Float(if gap < 0.0 { 0.0 } else { gap }));
+    }
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
