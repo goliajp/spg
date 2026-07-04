@@ -241,3 +241,27 @@ fn bigint_int_mixed_arithmetic() {
     // int op int control.
     ck(&mut e, r#"10 - 3"#, r#"7"#);
 }
+
+/// PG string-function edge cases (negative/zero args, not-found, empty
+/// search). Ground truth captured live from PostgreSQL 18.4. Two SPG
+/// divergences fixed in the accompanying commit: substr(s, n, -1) now
+/// raises "negative substring length not allowed" (was empty), and
+/// ascii('') is 0 (was an error).
+#[test]
+fn string_function_edge_cases() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"substr('hello', -1, 3)"#, r#"h"#);
+    ck(&mut e, r#"substr('hello', 2, 0)"#, r#""#);
+    ck(&mut e, r#"substr('hello', 2, -1)"#, r#"ERR"#);
+    ck(&mut e, r#"split_part('a,b,c,d', ',', -1)"#, r#"d"#);
+    ck(&mut e, r#"split_part('a,b', ',', 5)"#, r#""#);
+    ck(&mut e, r#"left('hello', -2)"#, r#"hel"#);
+    ck(&mut e, r#"right('hello', -2)"#, r#"llo"#);
+    ck(&mut e, r#"lpad('hi', -1, 'x')"#, r#""#);
+    ck(&mut e, r#"repeat('ab', -1)"#, r#""#);
+    ck(&mut e, r#"strpos('hello', 'z')"#, r#"0"#);
+    ck(&mut e, r#"replace('hello', '', 'x')"#, r#"hello"#);
+    ck(&mut e, r#"btrim('xxhixx', 'x')"#, r#"hi"#);
+    ck(&mut e, r#"translate('hello', 'l', '')"#, r#"heo"#);
+    ck(&mut e, r#"ascii('')"#, r#"0"#);
+}

@@ -1678,10 +1678,8 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => {
-                    let ch = s.chars().next().ok_or_else(|| EvalError::TypeMismatch {
-                        detail: "ascii(): empty string has no first character".into(),
-                    })?;
-                    Ok(Value::Int(ch as i32))
+                    // PG: ascii('') is 0 (no first character), not an error.
+                    Ok(Value::Int(s.chars().next().map_or(0, |ch| ch as i32)))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
@@ -3908,8 +3906,15 @@ fn apply_function_dispatch(
             // end < start the result is empty. Clip start to 1.
             let (effective_start, effective_length): (i64, Option<i64>) = match length {
                 Some(len) => {
+                    // PG raises on a negative length; a non-negative length
+                    // whose window ends at or before position 1 is empty.
+                    if len < 0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "negative substring length not allowed".into(),
+                        });
+                    }
                     let end = start.saturating_add(len);
-                    if end <= 1 || len < 0 {
+                    if end <= 1 {
                         return Ok(match &args[0] {
                             Value::Text(_) => Value::text(String::new()),
                             Value::Bytes(_) => Value::bytes(Vec::new()),
