@@ -357,7 +357,24 @@ pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
         let hh = secs / 3600;
         let mm = (secs / 60) % 60;
         let ss = secs % 60;
-        let sign = if neg { "-" } else { "" };
+        // PG shows an explicit `+` on the time part when a preceding date
+        // field was negative but the time itself is positive, e.g.
+        // `-1 days +02:00:00`. `is_before` = the last-printed date field's
+        // sign.
+        let is_before = if days != 0 {
+            days < 0
+        } else if mons != 0 {
+            mons < 0
+        } else {
+            years < 0
+        };
+        let sign = if neg {
+            "-"
+        } else if is_before {
+            "+"
+        } else {
+            ""
+        };
         if frac == 0 {
             parts.push(format!("{sign}{hh:02}:{mm:02}:{ss:02}"));
         } else {
