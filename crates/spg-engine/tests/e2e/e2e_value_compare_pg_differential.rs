@@ -27,8 +27,11 @@
 //! (`array_cmp`) are implemented — see `inet_ordering` / `bit_ordering` /
 //! `array_ordering`.
 //!
+//! RANGE `=` (`range_eq` with discrete `[)` canonicalisation) is
+//! implemented — see `range_equality`.
+//!
 //! DEFERRED (still error in SPG):
-//!   * range / multirange `=` — needs discrete-range canonicalisation.
+//!   * multirange `=` — needs per-span discrete canonicalisation.
 //!   * tsvector `=` — lexeme/position semantics unverified.
 
 use spg_engine::{Engine, QueryResult};
@@ -385,4 +388,32 @@ fn array_ordering() {
     // compare [1,2] (id4) with itself for the equal case.
     assert_eq!(ord(&mut e, "na", 4, 4, "="), "t");
     assert_eq!(ord(&mut e, "na", 4, 4, "<="), "t");
+}
+
+#[test]
+fn range_equality() {
+    // PG range `=`: DISCRETE ranges (int4/int8/date) canonicalise to `[)`
+    // before comparing; continuous ranges (num/ts) compare bounds verbatim;
+    // two empties are equal. All values captured live from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    // discrete canonicalisation: [1,4] == [1,5).
+    ck(&mut e, "SELECT int4range(1,5) = '[1,4]'::int4range", "t");
+    ck(&mut e, "SELECT int4range(1,5) <> '[1,4]'::int4range", "f");
+    // exclusive lower canonicalises: (1,5) == [2,5).
+    ck(&mut e, "SELECT '(1,5)'::int4range = '[2,5)'::int4range", "t");
+    ck(&mut e, "SELECT int4range(1,5) = int4range(1,6)", "f");
+    // empties are equal; empty != non-empty.
+    ck(&mut e, "SELECT 'empty'::int4range = int4range(1,1)", "t");
+    ck(&mut e, "SELECT 'empty'::int4range = int4range(1,5)", "f");
+    // continuous ranges are NOT canonicalised: [1,5) != [1,5].
+    ck(&mut e, "SELECT '[1,5)'::numrange = '[1,5]'::numrange", "f");
+    ck(&mut e, "SELECT numrange(1,5) = '[1,5)'::numrange", "t");
+    // date canonicalisation by +1 day: [d1,d5] == [d1,d6).
+    ck(
+        &mut e,
+        "SELECT daterange('2024-01-01','2024-01-05','[]') = daterange('2024-01-01','2024-01-06','[)')",
+        "t",
+    );
+    // infinite upper bound.
+    ck(&mut e, "SELECT '[1,)'::int4range = '[1,)'::int4range", "t");
 }
