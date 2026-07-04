@@ -30,10 +30,12 @@ fn fill_mode_forms() {
 #[test]
 fn grouping_and_sign() {
     let mut e = Engine::new();
-    // Fixed-width form reserves a leading blank for the sign.
+    // Fixed-width form reserves a leading blank for the sign; PG
+    // right-aligns the grouped digits under the full field width
+    // (three leading spaces here, verified against PG 18).
     assert_eq!(
         text(&mut e, "SELECT to_char(1234.5, '999,999.99')"),
-        "  1,234.50"
+        "   1,234.50"
     );
     assert_eq!(
         text(&mut e, "SELECT to_char(1234567, 'FM9,999,999')"),

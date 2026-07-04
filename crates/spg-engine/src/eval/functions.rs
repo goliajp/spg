@@ -8271,10 +8271,11 @@ fn apply_function_dispatch(
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
                         // Truncate toward zero — sign-preserving division.
+                        // PG `trunc(numeric)` (1-arg) yields scale 0.
                         let q = scaled / factor;
                         Ok(Value::Numeric {
-                            scaled: q * factor,
-                            scale: *scale,
+                            scaled: q,
+                            scale: 0,
                         })
                     }
                     other => Err(EvalError::TypeMismatch {
@@ -8343,16 +8344,29 @@ fn apply_function_dispatch(
                     Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
                         Ok(args[0].clone().into_owned())
                     }
+                    // NOTE: PG rounds true `double precision` half-to-even
+                    // (round(2.5::float8)=2), but SPG collapses bare decimal
+                    // literals (which PG types as `numeric`, half-away) into
+                    // Float. Keeping half-away matches the dominant
+                    // `round(2.5)=3` case; the explicit-float8 divergence is
+                    // a known representation limitation, not fixable here
+                    // without literal-type tracking.
                     Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
-                        let q = scaled.div_euclid(factor);
-                        let r = scaled.rem_euclid(factor);
-                        // Half-away-from-zero: if 2*r >= factor → round up.
-                        let result = if 2 * r >= factor { q + 1 } else { q };
+                        // Half-away-from-zero on the magnitude, then
+                        // restore the sign — div_euclid alone rounds
+                        // toward -inf and mishandles negatives
+                        // (round(-2.5) must be -3, not -2).
+                        let neg = *scaled < 0;
+                        let abs = scaled.unsigned_abs() as i128;
+                        let q = abs / factor;
+                        let r = abs % factor;
+                        let mag = if 2 * r >= factor { q + 1 } else { q };
+                        // PG `round(numeric)` (1-arg) yields scale 0.
                         Ok(Value::Numeric {
-                            scaled: result * factor,
-                            scale: *scale,
+                            scaled: if neg { -mag } else { mag },
+                            scale: 0,
                         })
                     }
                     other => Err(EvalError::TypeMismatch {
@@ -8440,9 +8454,10 @@ fn apply_function_dispatch(
                     let q = scaled.div_euclid(factor);
                     let r = scaled.rem_euclid(factor);
                     let result = if r == 0 { q } else { q + 1 };
+                    // PG `ceil(numeric)` yields scale 0.
                     Ok(Value::Numeric {
-                        scaled: result * factor,
-                        scale: *scale,
+                        scaled: result,
+                        scale: 0,
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
@@ -8467,10 +8482,10 @@ fn apply_function_dispatch(
                     let q = scaled.div_euclid(factor);
                     // div_euclid rounds toward -infinity which is
                     // exactly the floor semantic — perfect for
-                    // negative values.
+                    // negative values. PG `floor(numeric)` yields scale 0.
                     Ok(Value::Numeric {
-                        scaled: q * factor,
-                        scale: *scale,
+                        scaled: q,
+                        scale: 0,
                     })
                 }
                 other => Err(EvalError::TypeMismatch {

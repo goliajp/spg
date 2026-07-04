@@ -457,67 +457,140 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
     }
 }
 
-/// A pragmatic subset of PG's numeric `to_char` format: digit slots
-/// `9` (space-padded) and `0` (zero-padded), the decimal point `.`,
-/// the group separator `,`, and the `FM` fill-mode prefix that
-/// suppresses the leading blank / padding. A leading `S` renders the
-/// sign; without it a negative number gets a leading `-` and a
-/// positive one a leading space (PG's default), which FM strips.
+/// A PG-faithful subset of the numeric `to_char` format. Supported
+/// tokens: digit slots `9` (leading-zero-blanked) and `0`
+/// (zero-forced); the decimal separators `.` / `D`; the group
+/// separators `,` / `G`; the explicit sign `S`; and the `FM`
+/// fill-mode prefix that drops padding and trims trailing fraction
+/// zeros. Matches PG on sign placement (spaces pad to the far left,
+/// the sign sits immediately left of the first digit), leading-zero
+/// suppression for values < 1, and `#` field-overflow.
+///
+/// Unsupported (rendered as literals / ignored, documented as
+/// known-limitations): `MI` / `PR` / `SG` alternate signs, `RN`
+/// roman numerals, `EEEE` scientific, `V` scale, `TH` / `th`
+/// ordinals, currency `L` / `$`, and a trailing (rather than
+/// leading) `S`.
 fn to_char_numeric(n: f64, fmt: &str) -> String {
-    let fill_mode = fmt.to_ascii_uppercase().starts_with("FM");
+    let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
-    let (int_pat, frac_pat) = match pat.find('.') {
-        Some(i) => (&pat[..i], &pat[i + 1..]),
-        None => (pat, ""),
-    };
-    let int_slots = int_pat.chars().filter(|c| matches!(c, '9' | '0')).count();
-    let frac_digits = frac_pat.chars().filter(|c| matches!(c, '9' | '0')).count();
-    let zero_slots = int_pat.chars().filter(|c| *c == '0').count();
-    let has_group = int_pat.contains(',');
+    let has_sign_tok = pat.chars().any(|c| c == 'S' || c == 's');
 
-    let neg = n < 0.0;
-    // Round to the requested scale and split into integer / fraction.
+    // Split around the decimal separator ('.', 'D', or 'd').
+    let dec_pos = pat
+        .char_indices()
+        .find(|(_, c)| *c == '.' || *c == 'D' || *c == 'd')
+        .map(|(i, c)| (i, c.len_utf8()));
+    let (int_pat, frac_pat, has_decimal) = match dec_pos {
+        Some((i, w)) => (&pat[..i], &pat[i + w..], true),
+        None => (pat, "", false),
+    };
+
+    let is_slot = |c: char| matches!(c, '9' | '0');
+    let is_group = |c: char| matches!(c, ',' | 'G' | 'g');
+    let int_slots = int_pat.chars().filter(|c| is_slot(*c)).count();
+    let frac_digits = frac_pat.chars().filter(|c| is_slot(*c)).count();
+    let has_group = int_pat.chars().any(is_group);
+    // The field width reserved for the integer side plus one sign
+    // column (PG always keeps a slot for the sign in fixed width).
+    let int_field_width = int_pat.chars().filter(|c| is_slot(*c) || is_group(*c)).count() + 1;
+    // Right-most integer slot char (units position) and left-most
+    // `0` slot position from the right (units = 0).
+    let int_slot_chars: alloc::vec::Vec<char> =
+        int_pat.chars().filter(|c| is_slot(*c)).collect();
+    let units_slot = int_slot_chars.last().copied().unwrap_or('9');
+    // Force leading zeros up to (and including) the left-most `0`
+    // slot: its distance from the units position sets the minimum
+    // integer width. `009` → width 3, `990` → width 1.
+    let zero_pad = int_slot_chars
+        .iter()
+        .position(|c| *c == '0')
+        .map_or(0, |i| int_slot_chars.len() - i);
+
+    // Round to the requested scale, split into integer / fraction.
     let pow = 10_i128.pow(frac_digits as u32);
     #[allow(clippy::cast_possible_truncation)]
     let scaled = libm::round(n.abs() * pow as f64) as i128;
     let int_part = scaled / pow;
     let frac_part = scaled % pow;
+    let value_is_zero = scaled == 0;
+    // A value that rounds to exactly zero carries no sign in PG.
+    let neg = n < 0.0 && !value_is_zero;
+    let sign_str: &str = if neg {
+        "-"
+    } else if has_sign_tok {
+        "+"
+    } else {
+        ""
+    };
 
-    // Integer text, zero-padded to the `0` slots at minimum.
-    let mut int_str = alloc::format!("{int_part}");
-    while int_str.chars().count() < zero_slots {
-        int_str.insert(0, '0');
-    }
-    if has_group {
-        int_str = group_thousands(&int_str);
-    }
-
-    let mut out = String::new();
-    if neg {
-        out.push('-');
-    } else if !fill_mode {
-        // PG reserves a leading blank for the sign in fixed-width mode.
-        out.push(' ');
-    }
-    // Space-pad (fixed width only) so the digits right-align in the
-    // `9` slots. FM drops this padding entirely.
-    if !fill_mode {
-        let width = int_slots.max(int_str.chars().count());
-        for _ in 0..width.saturating_sub(int_str.chars().count()) {
-            out.push(' ');
+    // --- Field overflow: integer digits exceed the digit slots. ---
+    let int_digit_len = if int_part == 0 {
+        0
+    } else {
+        alloc::format!("{int_part}").len()
+    };
+    if int_digit_len > int_slots {
+        let mut core = String::new();
+        core.push_str(sign_str);
+        for _ in 0..int_slots {
+            core.push('#');
         }
+        let mut out = if fill_mode {
+            core
+        } else {
+            left_pad_spaces(&core, int_field_width)
+        };
+        if has_decimal {
+            out.push('.');
+            for _ in 0..frac_digits {
+                out.push('#');
+            }
+        }
+        return out;
     }
-    out.push_str(&int_str);
-    if frac_digits > 0 {
+
+    // --- Integer body (significant digits, no leading blanks). ---
+    let mut body = if int_part == 0 {
+        // Show a "0" unless it is a leading zero being blanked: a
+        // '9' units slot with a decimal point (PG shows `.50`), and
+        // in fixed width a whole-zero value is likewise blanked.
+        let show_zero = if fill_mode {
+            value_is_zero || units_slot == '0'
+        } else {
+            units_slot == '0' || !has_decimal
+        };
+        if show_zero { "0".to_string() } else { String::new() }
+    } else {
+        alloc::format!("{int_part}")
+    };
+    // Force leading zeros up to the left-most '0' slot.
+    while !body.is_empty() && body.chars().count() < zero_pad {
+        body.insert(0, '0');
+    }
+    if has_group && body.chars().count() > 3 {
+        body = group_thousands(&body);
+    }
+
+    // --- Assemble sign + body, then pad / trim per mode. ---
+    let mut out = if fill_mode {
+        alloc::format!("{sign_str}{body}")
+    } else {
+        left_pad_spaces(&alloc::format!("{sign_str}{body}"), int_field_width)
+    };
+
+    if has_decimal {
         let mut fs = alloc::format!("{frac_part:0width$}", width = frac_digits);
         if fill_mode {
-            // FM trims trailing zeros down to the `0` slots.
+            // FM trims trailing zeros down to the `0` slots but keeps
+            // the decimal point (PG renders `5.` for to_char(5,'FM9.99')).
             let keep = frac_pat.chars().filter(|c| *c == '0').count();
             while fs.chars().count() > keep && fs.ends_with('0') {
                 fs.pop();
             }
-        }
-        if !fs.is_empty() {
+            out.push('.');
+            out.push_str(&fs);
+        } else if frac_digits > 0 {
             out.push('.');
             out.push_str(&fs);
         }
@@ -525,12 +598,25 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     out
 }
 
-/// Insert commas every three digits from the right of the integer
-/// text (leading blanks preserved so column alignment survives).
+/// Left-pad `s` with spaces so its char count reaches `width`
+/// (right-alignment); returns `s` unchanged when already wide enough.
+fn left_pad_spaces(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(width);
+    for _ in 0..width - len {
+        out.push(' ');
+    }
+    out.push_str(s);
+    out
+}
+
+/// Insert commas every three digits from the right of a pure-digit
+/// integer string.
 fn group_thousands(int_str: &str) -> String {
-    let trimmed = int_str.trim_start();
-    let lead = &int_str[..int_str.len() - trimmed.len()];
-    let bytes: alloc::vec::Vec<char> = trimmed.chars().collect();
+    let bytes: alloc::vec::Vec<char> = int_str.chars().collect();
     let mut out = String::new();
     let len = bytes.len();
     for (idx, c) in bytes.iter().enumerate() {
@@ -539,7 +625,7 @@ fn group_thousands(int_str: &str) -> String {
         }
         out.push(*c);
     }
-    alloc::format!("{lead}{out}")
+    out
 }
 
 pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
