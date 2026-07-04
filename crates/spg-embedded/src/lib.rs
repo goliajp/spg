@@ -6771,6 +6771,12 @@ mod tests {
                 } => {
                     cat_legacy.get_mut(table).unwrap().delete_rows(positions);
                 }
+                // This fixture uses only Insert/Update/Delete; the
+                // in-place tombstone path has its own dedicated replay
+                // test in spg-storage.
+                RowChange::Tombstone { .. } => {
+                    unreachable!("this legacy-parity fixture emits no Tombstone")
+                }
             }
         }
 

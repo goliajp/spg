@@ -14,6 +14,10 @@ fn writer_version(c: &RowChange) -> u64 {
         RowChange::Insert { writer_version, .. }
         | RowChange::Update { writer_version, .. }
         | RowChange::Delete { writer_version, .. } => *writer_version,
+        // A tombstone's `xmax` IS its writer version (the deleting
+        // statement's version). Only the gate-on (`SPG_MVCC_INPLACE`)
+        // path emits it; these e2e tests run gate-off, so it never fires.
+        RowChange::Tombstone { xmax, .. } => *xmax,
     }
 }
 

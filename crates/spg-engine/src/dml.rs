@@ -1159,15 +1159,22 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        for &pos in &positions {
-            // Errors here mean the position is out of bounds —
-            // already verified above; downgrade to a debug
-            // assertion. Production stays silent if invariant
-            // somehow breaks (the subsequent delete_rows would
-            // also no-op on bad positions).
-            let _ = table.mark_row_deleted(pos, xmax);
-        }
         let affected = if inplace {
+            // v7.37.15 (Epic W durable-tombstone slice) — stamp xmax
+            // ONLY on the in-place path. `mark_row_deleted` now records
+            // a `RowChange::Tombstone` for durability; the gate-off
+            // path below removes the rows via `delete_rows` (which
+            // records `RowChange::Delete`), so calling `mark_row_deleted`
+            // there too would double-log the deletion. The gate-off
+            // xmax stamp was already dead work (the row is physically
+            // removed immediately after), so scoping it here changes
+            // nothing observable for the default path.
+            for &pos in &positions {
+                // Errors here mean the position is out of bounds —
+                // already verified above; the subsequent no-op is
+                // silent (mark_row_deleted no-ops on bad positions).
+                let _ = table.mark_row_deleted(pos, xmax);
+            }
             // Tombstone-only: rows stay in `table.rows()` with xmax set;
             // count the distinct positions we tombstoned (the WHERE scan
             // that produced `positions` is itself gated, so every

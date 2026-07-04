@@ -221,6 +221,18 @@ fn redo_log_codec_round_trips() {
             rowids: alloc::vec![],
             writer_version: 0,
         },
+        // Epic W durable-tombstone slice — the new in-place tombstone op
+        // (byte 3) round-trips its RowId list + xmax.
+        RowChange::Tombstone {
+            table: "t".to_string(),
+            rowids: alloc::vec![RowId(7), RowId(8)],
+            xmax: 404,
+        },
+        RowChange::Tombstone {
+            table: "solo".to_string(),
+            rowids: alloc::vec![RowId(9)],
+            xmax: 505,
+        },
     ];
     let bytes = encode_redo_log(&changes);
     assert_eq!(decode_redo_log(&bytes).unwrap(), changes);
@@ -287,6 +299,12 @@ fn redo_log_old_format_decodes_and_replays_identically() {
                     for p in positions {
                         codec::write_u32(&mut out, *p as u32);
                     }
+                }
+                // The pre-Epic-W layout had no in-place tombstone op; this
+                // helper is never handed one (the `logical` fixture below
+                // uses only Insert/Update/Delete).
+                RowChange::Tombstone { .. } => {
+                    unreachable!("old redo layout has no Tombstone op")
                 }
             }
         }
@@ -391,6 +409,140 @@ fn redo_log_old_format_decodes_and_replays_identically() {
         replayed.serialize(),
         "old-format redo replay diverged from direct ops"
     );
+}
+
+/// v7.37.15 (Epic W durable-tombstone slice) — the durability proof for
+/// the gate-on (`SPG_MVCC_INPLACE`) in-place DELETE path. A gate-on
+/// DELETE calls `Table::mark_row_deleted` (stamps `xmax`, keeps the row)
+/// instead of `delete_rows`. This test drives that capture, round-trips
+/// the redo through the WAL codec, applies it into a FRESH catalog, and
+/// asserts the tombstoned row survives replay as a tombstone — hidden
+/// from a fresh snapshot but physically present — while the survivors
+/// stay visible. A gate-off control (physical `delete_rows`) is replayed
+/// the same way and must instead physically remove the row.
+#[test]
+fn redo_tombstone_survives_replay_hidden_from_snapshot() {
+    use crate::row_header::XMAX_ALIVE;
+    use crate::snapshot::Snapshot;
+
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        c.create_table(TableSchema::new(
+            "t",
+            vec![ColumnSchema::new("id", DataType::Int, false)],
+        ))
+        .unwrap();
+        c
+    }
+    let mk = |id: i32| Row::new(alloc::vec![Value::Int(id)]);
+    let snap = Snapshot::unbounded();
+
+    // --- Capture side: INSERT 3, then in-place tombstone row id=2. ---
+    // xmax = 42 stands in for the deleting statement's writer version
+    // (the engine passes `writer_version_for_current_stmt`).
+    const TOMB_XMAX: u64 = 42;
+    let mut cap = fresh();
+    cap.enable_redo_all();
+    {
+        let t = cap.get_mut("t").unwrap();
+        t.insert(mk(1)).unwrap();
+        t.insert(mk(2)).unwrap();
+        t.insert(mk(3)).unwrap();
+        // Tombstone the physical position of id=2 (slot 1).
+        t.mark_row_deleted(1, TOMB_XMAX).unwrap();
+    }
+    let log = cap.drain_redo();
+    // The drained log must contain exactly one Tombstone naming the
+    // RowId the insert of id=2 allocated (so replay can re-find it).
+    let tomb_ids: Vec<_> = log
+        .iter()
+        .filter_map(|c| match c {
+            RowChange::Tombstone { rowids, xmax, .. } => Some((rowids.clone(), *xmax)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tomb_ids.len(), 1, "one in-place delete → one Tombstone redo");
+    assert_eq!(tomb_ids[0].1, TOMB_XMAX, "tombstone carries the writer version");
+    assert_eq!(tomb_ids[0].0.len(), 1, "one row tombstoned");
+
+    // --- Round-trip through the WAL codec (the real durability path). ---
+    let bytes = encode_redo_log(&log);
+    let decoded = decode_redo_log(&bytes).unwrap();
+    assert_eq!(decoded, log, "tombstone redo must round-trip the codec");
+
+    // --- Replay into a FRESH catalog (crash-recovery simulation). ---
+    let unresolved_before = crate::unresolved_tombstone_count();
+    let mut rep = fresh();
+    rep.apply_redo(&decoded).unwrap();
+    assert_eq!(
+        crate::unresolved_tombstone_count(),
+        unresolved_before,
+        "the tombstone target must resolve by RowId within the replay run"
+    );
+
+    // Physically present: 3 rows survive (tombstone keeps the slot).
+    let t = rep.get("t").unwrap();
+    assert_eq!(t.rows().len(), 3, "tombstone must NOT physically remove the row");
+    // The visible set (per the MVCC snapshot gate) is {1, 3}; id=2 is a
+    // tombstone hidden from a fresh snapshot — exactly the live gate-on
+    // result, now reproduced from the WAL.
+    let visible: Vec<i32> = t
+        .scan_visible(&snap)
+        .filter_map(|(_, r)| match r.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visible, alloc::vec![1, 3], "tombstoned row must be hidden after replay");
+    // And the hidden row's header carries the exact xmax we stamped.
+    let hidden_idx = t
+        .rows()
+        .iter()
+        .position(|r| r.values.first() == Some(&Value::Int(2)))
+        .expect("id=2 physically present");
+    let h = t.headers().get(hidden_idx).expect("header lock-step");
+    assert_eq!(h.xmax, TOMB_XMAX, "recovered row must carry the tombstone xmax");
+    assert!(h.is_deleted(), "recovered row must read as deleted");
+    // Survivors stay alive (not accidentally tombstoned).
+    for (i, r) in t.rows().iter().enumerate() {
+        if r.values.first() != Some(&Value::Int(2)) {
+            assert_eq!(
+                t.headers().get(i).unwrap().xmax,
+                XMAX_ALIVE,
+                "survivor {i} must stay alive"
+            );
+        }
+    }
+
+    // --- Gate-off control: physical delete replays as a real removal. ---
+    let mut capc = fresh();
+    capc.enable_redo_all();
+    {
+        let t = capc.get_mut("t").unwrap();
+        t.insert(mk(1)).unwrap();
+        t.insert(mk(2)).unwrap();
+        t.insert(mk(3)).unwrap();
+        t.delete_rows(&[1]); // physical delete (gate-off path)
+    }
+    let logc = capc.drain_redo();
+    assert!(
+        logc.iter().all(|c| !matches!(c, RowChange::Tombstone { .. })),
+        "gate-off DELETE must NOT emit a Tombstone redo"
+    );
+    let mut repc = fresh();
+    repc.apply_redo(&decode_redo_log(&encode_redo_log(&logc)).unwrap())
+        .unwrap();
+    let tc = repc.get("t").unwrap();
+    assert_eq!(tc.rows().len(), 2, "gate-off replay physically removes the row");
+    let ids: Vec<i32> = tc
+        .rows()
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, alloc::vec![1, 3], "gate-off replay keeps only survivors");
 }
 
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the

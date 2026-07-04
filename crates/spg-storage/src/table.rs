@@ -235,6 +235,31 @@ impl Table {
         if let Some(new_headers) = self.headers.set(position, h) {
             self.headers = new_headers;
         }
+        // v7.37.15 (Epic W durable-tombstone slice) — capture the
+        // in-place tombstone as row-level redo so a gate-on
+        // (`SPG_MVCC_INPLACE`) DELETE / UPDATE-old-version /
+        // ON-CONFLICT survives crash recovery. Unlike `delete_rows`
+        // (which records `RowChange::Delete` with physical positions),
+        // the tombstone keeps the slot, so it is named by the row's
+        // stable `RowId` — read from `self.rowids()[position]` here,
+        // before any later compaction shifts the slot. `xmax` is the
+        // deleting statement's writer version (the engine passes
+        // `writer_version_for_current_stmt`), so no post-drain stamp is
+        // needed. Only paid for when redo capture is on; a no-op
+        // (already-tombstoned / out-of-bounds) returned above and
+        // records nothing.
+        if self.redo_log.is_some() {
+            let rowid = self
+                .rowids()
+                .get(position)
+                .copied()
+                .unwrap_or(crate::row_header::RowId::UNASSIGNED);
+            self.record_redo(move |table| RowChange::Tombstone {
+                table,
+                rowids: alloc::vec![rowid],
+                xmax,
+            });
+        }
         Ok(())
     }
 
