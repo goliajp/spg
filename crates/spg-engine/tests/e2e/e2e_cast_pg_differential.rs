@@ -436,3 +436,15 @@ fn array_fill_one_dim() {
     ck(&mut e, r#"array_fill(9::bigint, ARRAY[2])"#, r#"{9,9}"#);
     ck(&mut e, r#"array_fill('x', ARRAY[3])"#, r#"{x,x,x}"#);
 }
+
+/// age(ts, ts) is a calendar difference broken into months/days, not total
+/// days (was `65 days`, should be `2 mons 5 days`). PG18.4-verified.
+#[test]
+fn age_calendar_breakdown() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"age(timestamp '2024-03-15', timestamp '2024-01-10')"#, r#"2 mons 5 days"#);
+    ck(&mut e, r#"age(timestamp '2024-03-05', timestamp '2024-01-10')"#, r#"1 mon 26 days"#);
+    ck(&mut e, r#"age(timestamp '2024-03-01', timestamp '2024-01-01')"#, r#"2 mons"#);
+    ck(&mut e, r#"age(timestamp '2024-01-10', timestamp '2024-03-15')"#, r#"-2 mons -5 days"#);
+    ck(&mut e, r#"age(timestamp '2024-03-15 14:30:00', timestamp '2024-01-10 10:00:00')"#, r#"2 mons 5 days 04:30:00"#);
+}

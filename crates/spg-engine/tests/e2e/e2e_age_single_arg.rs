@@ -24,12 +24,12 @@ fn age_single_arg_from_anchor() {
     // 2020-01-01 (anchor) — age = 0.
     let v = first(&mut e, "SELECT age('2020-01-01'::timestamp)");
     assert_eq!(as_interval(&v), (0, 0, 0));
-    // 2019-12-01 → anchor - ts = 31 days positive.
+    // 2019-12-01 → anchor - ts = 1 month (calendar diff, PG18-verified).
     let v = first(&mut e, "SELECT age('2019-12-01'::timestamp)");
-    assert_eq!(as_interval(&v), (0, 31, 0));
-    // 2020-02-01 → anchor - ts = -31 days.
+    assert_eq!(as_interval(&v), (1, 0, 0));
+    // 2020-02-01 → anchor - ts = -1 month.
     let v = first(&mut e, "SELECT age('2020-02-01'::timestamp)");
-    assert_eq!(as_interval(&v), (0, -31, 0));
+    assert_eq!(as_interval(&v), (-1, 0, 0));
 }
 
 #[test]
@@ -40,7 +40,8 @@ fn age_two_arg_still_works() {
         &mut e,
         "SELECT age('2020-03-01'::timestamp, '2020-01-01'::timestamp)",
     );
-    assert_eq!(as_interval(&v), (0, 60, 0));
+    // PG18: age is a calendar diff — Jan1→Mar1 is `2 mons`, not 60 days.
+    assert_eq!(as_interval(&v), (2, 0, 0));
 }
 
 #[test]
