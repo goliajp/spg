@@ -67,14 +67,69 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
         (Value::SmallInt(x), Value::SmallInt(y)) => x.cmp(y),
+        // Cross integer widths — an ORDER BY key can mix variants
+        // (literal-seeded rows, integer casts). Widen and compare by
+        // value, not by the debug string (which would sort "1000"
+        // before "9").
+        (Value::SmallInt(x), Value::Int(y)) => i32::from(*x).cmp(y),
+        (Value::Int(x), Value::SmallInt(y)) => x.cmp(&i32::from(*y)),
+        (Value::SmallInt(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
+        (Value::BigInt(x), Value::SmallInt(y)) => x.cmp(&i64::from(*y)),
+        (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
+        (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // Mixed integer / float — widen the integer to f64.
+        (Value::SmallInt(n), Value::Float(x)) => {
+            f64::from(*n).partial_cmp(x).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::SmallInt(n)) => {
+            x.partial_cmp(&f64::from(*n)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Int(n), Value::Float(x)) => f64::from(*n).partial_cmp(x).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Int(n)) => {
+            x.partial_cmp(&f64::from(*n)).unwrap_or(Ordering::Equal)
+        }
+        #[allow(clippy::cast_precision_loss)]
+        (Value::BigInt(n), Value::Float(x)) => (*n as f64).partial_cmp(x).unwrap_or(Ordering::Equal),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Float(x), Value::BigInt(n)) => x.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal),
+        // Exact decimal — align scales, then compare the integral
+        // forms. The old `_ => debug-string` fallback sorted
+        // `12.50 < 5.25 < 99.99` (lexicographic on `Numeric { scaled:
+        // .. }`), corrupting `ORDER BY numeric_col` and every
+        // aggregate-internal `ORDER BY` over a NUMERIC key.
+        (
+            Value::Numeric { scaled: xs, scale: xsc },
+            Value::Numeric { scaled: ys, scale: ysc },
+        ) => cmp_numeric(*xs, *xsc, *ys, *ysc),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // Cross-type compare: fall back to the debug rendering —
         // same-partition is the goal, exact order is irrelevant.
         _ => alloc::format!("{a:?}").cmp(&alloc::format!("{b:?}")),
+    }
+}
+
+/// Order two exact-decimal values by aligning their scales to the
+/// larger of the two, then comparing the integral representations.
+/// `i128` headroom covers every in-range `NUMERIC`; on the rare
+/// overflow of the alignment multiply we fall back to an `f64`
+/// comparison (imprecise but never panics).
+pub(crate) fn cmp_numeric(xs: i128, xsc: u8, ys: i128, ysc: u8) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let max_scale = xsc.max(ysc);
+    let widen = |v: i128, sc: u8| -> Option<i128> {
+        10i128.checked_pow(u32::from(max_scale - sc)).and_then(|f| v.checked_mul(f))
+    };
+    match (widen(xs, xsc), widen(ys, ysc)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => {
+            let af = xs as f64 / 10f64.powi(i32::from(xsc));
+            let bf = ys as f64 / 10f64.powi(i32::from(ysc));
+            af.partial_cmp(&bf).unwrap_or(Ordering::Equal)
+        }
     }
 }
 

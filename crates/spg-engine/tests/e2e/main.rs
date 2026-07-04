@@ -8,6 +8,7 @@
 
 mod e2e;
 mod e2e_agg_subquery_pullup;
+mod e2e_aggregate_pg_differential;
 mod e2e_alter_add_column;
 mod e2e_alter_column_default_notnull;
 mod e2e_alter_column_pg_dump_compat;

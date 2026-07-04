@@ -1,0 +1,326 @@
+//! Aggregate-function PG18 differential corpus (6th differential sweep).
+//!
+//! Ground truth captured from live PostgreSQL 18.4 on 2026-07-04 over a
+//! small seeded table (NULLs + duplicates + multiple groups). Each
+//! `check` asserts SPG's rendered output against the value PG produced.
+//!
+//! BUGS FIXED in the accompanying commit and locked here:
+//!   * min/max/mode over DATE / TIMESTAMP / SMALLINT / NUMERIC — the
+//!     aggregate `value_cmp` fell through to `_ => Equal` for those
+//!     types, so `min(date_col)` / `max(numeric_col)` returned the
+//!     FIRST row instead of the extreme (see `min_max_typed_columns`).
+//!   * ORDER BY over NUMERIC (top-level and aggregate-internal) — the
+//!     ORDER BY comparator lacked a NUMERIC / cross-int-width /
+//!     int-float arm and fell to a debug-string compare, sorting
+//!     `12.50 < 5.25 < 99.99`. This corrupted `array_agg(x ORDER BY
+//!     numeric)`, `string_agg(... ORDER BY numeric)`, and ordered-set
+//!     aggregates (mode / percentile) over NUMERIC keys (see
+//!     `ordered_set_and_orderby_numeric`).
+//!
+//! DOCUMENTED REPRESENTATION / SEMANTIC divergences (SPG asserts its
+//! own form; PG value noted in a comment — NOT bugs):
+//!   * avg/stddev/variance/corr return FLOAT; PG returns NUMERIC, so
+//!     PG prints trailing zeros (`26.0000000000000000`) where SPG
+//!     prints `26`. Values are equal.
+//!   * array_agg(DISTINCT x) / string_agg(DISTINCT x): PG sorts the
+//!     distinct set (dedup is sort-based); SPG keeps first-seen order.
+//!     SQL leaves DISTINCT-without-ORDER-BY order UNSPECIFIED, so
+//!     SPG's order is a valid implementation.
+//!   * json_object_agg: PG inserts spaces (`{ "a" : 10 }`); SPG is
+//!     compact (`{"a": 10}`). Same value.
+//!
+//! DEFERRED GAP (reported, not fixed — needs a dedicated change):
+//!   * sum(NUMERIC) / avg(NUMERIC) raise a TypeMismatch error; PG
+//!     returns an exact NUMERIC. A correct fix needs an arbitrary-
+//!     precision numeric accumulator + NUMERIC finalize (avg has
+//!     PG-specific result-scale rules) and touches the perf-critical
+//!     sum fast path — out of scope for a localized differential fix.
+
+use spg_engine::{Engine, QueryResult};
+use spg_storage::Value;
+
+fn render(v: &Value) -> String {
+    match v {
+        Value::Null => "<NULL>".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(x) => x.to_string(),
+        Value::Text(s) => s.to_string(),
+        Value::Json(s) => s.to_string(),
+        Value::IntArray(a) => arr(a.iter().map(|o| o.map(|n| n.to_string()))),
+        Value::BigIntArray(a) => arr(a.iter().map(|o| o.map(|n| n.to_string()))),
+        Value::TextArray(a) => arr(a.iter().cloned()),
+        other => format!("{other:?}"),
+    }
+}
+
+fn arr<I: Iterator<Item = Option<String>>>(it: I) -> String {
+    let mut s = String::from("{");
+    for (i, e) in it.enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match e {
+            Some(x) => s.push_str(&x),
+            None => s.push_str("NULL"),
+        }
+    }
+    s.push('}');
+    s
+}
+
+fn cell(eng: &mut Engine, sql: &str) -> String {
+    match eng.execute(sql) {
+        Ok(QueryResult::Rows { rows, .. }) => {
+            if rows.is_empty() {
+                return "<NOROWS>".into();
+            }
+            let mut out = Vec::new();
+            for r in &rows {
+                let v = &r.values;
+                out.push(render(&v[v.len() - 1]));
+            }
+            out.join("|")
+        }
+        Ok(other) => format!("<NONROWS:{other:?}>"),
+        Err(e) => format!("<ERR:{e:?}>"),
+    }
+}
+
+fn check(eng: &mut Engine, sql: &str, expect: &str) {
+    let got = cell(eng, sql);
+    assert_eq!(got, expect, "\n  SQL: {sql}\n  want: {expect}\n  got:  {got}");
+}
+
+fn seed() -> Engine {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, g text, x int, bx bigint, y float8, b bool, d date, s text)")
+        .unwrap();
+    for row in [
+        "(1,'a',10, 100, 1.5,  true,  '2020-01-01','foo')",
+        "(2,'a',20, 200, 2.5,  false, '2020-03-01','bar')",
+        "(3,'a',NULL,NULL,NULL, NULL,  NULL,        NULL)",
+        "(4,'b',30, 300, 3.5,  true,  '2019-12-31','baz')",
+        "(5,'b',30, 300, 3.5,  true,  '2021-06-15','foo')",
+        "(6,'c',40, 400, NULL, false, '2020-01-01',NULL)",
+    ] {
+        e.execute(&format!("INSERT INTO t VALUES {row}")).unwrap();
+    }
+    e
+}
+
+// ---- empty set: sum/avg/min/max/string_agg/bool/array → NULL; count → 0 ----
+#[test]
+fn empty_set_semantics() {
+    let mut e = seed();
+    check(&mut e, "SELECT sum(x) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT count(*) FROM t WHERE false", "0");
+    check(&mut e, "SELECT count(x) FROM t WHERE false", "0");
+    check(&mut e, "SELECT avg(x) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT min(x) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT max(x) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT string_agg(s,',') FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT bool_and(b) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT bool_or(b) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT array_agg(x) FROM t WHERE false", "<NULL>");
+    check(&mut e, "SELECT max(s) FROM t WHERE false", "<NULL>");
+}
+
+// ---- NULL handling: sum/avg/count(x) skip NULLs, count(*) counts rows,
+//      array_agg KEEPS NULLs, all-NULL group → NULL ----
+#[test]
+fn null_handling() {
+    let mut e = seed();
+    check(&mut e, "SELECT sum(x) FROM t", "130");
+    check(&mut e, "SELECT count(x) FROM t", "5");
+    check(&mut e, "SELECT count(*) FROM t", "6");
+    check(&mut e, "SELECT array_agg(x ORDER BY id) FROM t", "{10,20,NULL,30,30,40}");
+    // all-NULL group
+    check(&mut e, "SELECT sum(x) FROM t WHERE id=3", "<NULL>");
+    check(&mut e, "SELECT count(x) FROM t WHERE id=3", "0");
+    check(&mut e, "SELECT avg(x) FROM t WHERE id=3", "<NULL>");
+    check(&mut e, "SELECT bool_and(b) FROM t WHERE id=3", "<NULL>");
+    // avg is FLOAT in SPG; PG NUMERIC prints 26.0000000000000000 (equal value)
+    check(&mut e, "SELECT avg(x) FROM t", "26");
+}
+
+// ---- DISTINCT: dedup works. Ordering of DISTINCT-without-ORDER-BY is
+//      SQL-unspecified; PG sorts, SPG keeps first-seen (documented). ----
+#[test]
+fn distinct() {
+    let mut e = seed();
+    check(&mut e, "SELECT count(DISTINCT x) FROM t", "4");
+    check(&mut e, "SELECT sum(DISTINCT x) FROM t", "100");
+    check(&mut e, "SELECT count(DISTINCT s) FROM t", "3");
+    // avg(DISTINCT) FLOAT; PG 25.0000000000000000
+    check(&mut e, "SELECT avg(DISTINCT x) FROM t", "25");
+    // SEMANTIC: PG sorts distinct set -> {10,20,30,40,NULL} / bar,baz,foo.
+    // SPG keeps first-seen order (valid: DISTINCT order is unspecified).
+    check(&mut e, "SELECT array_agg(DISTINCT x) FROM t", "{10,20,NULL,30,40}");
+    check(&mut e, "SELECT string_agg(DISTINCT s, ',') FROM t", "foo,bar,baz");
+}
+
+// ---- FILTER ----
+#[test]
+fn filter_clause() {
+    let mut e = seed();
+    check(&mut e, "SELECT count(*) FILTER (WHERE x>15) FROM t", "4");
+    check(&mut e, "SELECT sum(x) FILTER (WHERE x>15) FROM t", "120");
+    check(&mut e, "SELECT sum(x) FILTER (WHERE x>100) FROM t", "<NULL>");
+    // FILTER + GROUP BY
+    check(
+        &mut e,
+        "SELECT g||':'||(count(*) FILTER (WHERE b)) FROM t GROUP BY g ORDER BY g",
+        "a:1|b:2|c:0",
+    );
+}
+
+// ---- ORDER BY inside the aggregate ----
+#[test]
+fn order_by_inside_agg() {
+    let mut e = seed();
+    check(&mut e, "SELECT string_agg(s,',' ORDER BY s) FROM t", "bar,baz,foo,foo");
+    check(&mut e, "SELECT array_agg(x ORDER BY x DESC) FROM t", "{NULL,40,30,30,20,10}");
+    check(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM t", "10,20,30,30,40");
+}
+
+// ---- stddev / variance: sample (n-1) vs population (n) divisors,
+//      single-row (samp → NULL, pop → 0). SPG returns FLOAT; PG NUMERIC. ----
+#[test]
+fn stddev_variance_family() {
+    let mut e = seed();
+    // var_pop = 104, var_samp = variance = 130 (exact integers here)
+    check(&mut e, "SELECT var_pop(x) FROM t", "104");
+    check(&mut e, "SELECT var_samp(x) FROM t", "130");
+    check(&mut e, "SELECT variance(x) FROM t", "130");
+    // stddev_pop = sqrt(104), stddev_samp = stddev = sqrt(130)
+    check(&mut e, "SELECT stddev_pop(x) FROM t", "10.198039027185569");
+    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.401754250991381");
+    check(&mut e, "SELECT stddev(x) FROM t", "11.401754250991381");
+    // single-row group: samp undefined -> NULL, pop -> 0
+    check(&mut e, "SELECT stddev_samp(x) FROM t WHERE id=1", "<NULL>");
+    check(&mut e, "SELECT var_samp(x) FROM t WHERE id=1", "<NULL>");
+    check(&mut e, "SELECT stddev_pop(x) FROM t WHERE id=1", "0");
+}
+
+// ---- bool / bit aggregates ----
+#[test]
+fn bool_and_bit() {
+    let mut e = seed();
+    check(&mut e, "SELECT bool_and(b) FROM t", "false");
+    check(&mut e, "SELECT bool_or(b) FROM t", "true");
+    check(&mut e, "SELECT bool_and(b) FROM t WHERE g='b'", "true");
+    check(&mut e, "SELECT every(b) FROM t WHERE g='b'", "true");
+    check(&mut e, "SELECT bit_and(x) FROM t", "0");
+    check(&mut e, "SELECT bit_or(x) FROM t", "62");
+    check(&mut e, "SELECT bit_xor(x) FROM t", "54");
+}
+
+// ---- min/max over TEXT / DATE and (BUG FIX) DATE comparison ----
+#[test]
+fn min_max_text_date() {
+    let mut e = seed();
+    check(&mut e, "SELECT min(s) FROM t", "bar");
+    check(&mut e, "SELECT max(s) FROM t", "foo");
+    // BUG FIX: min/max over DATE previously returned the first row
+    // (value_cmp had no Date arm). PG: 2019-12-31 / 2021-06-15.
+    check(&mut e, "SELECT min(d)::text FROM t", "2019-12-31");
+    check(&mut e, "SELECT max(d)::text FROM t", "2021-06-15");
+}
+
+// ---- BUG FIX: min/max over SMALLINT / NUMERIC / TIMESTAMP columns ----
+#[test]
+fn min_max_typed_columns() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t2 (id int, sm smallint, nm numeric(10,2), ts timestamp)")
+        .unwrap();
+    for row in [
+        "(1, 30, 12.50, '2020-01-01 10:00:00')",
+        "(2, 10, 99.99, '2019-06-15 08:30:00')",
+        "(3, 20, 5.25,  '2021-12-31 23:59:59')",
+        "(4, NULL, NULL, NULL)",
+    ] {
+        e.execute(&format!("INSERT INTO t2 VALUES {row}")).unwrap();
+    }
+    check(&mut e, "SELECT min(sm) FROM t2", "10");
+    check(&mut e, "SELECT max(sm) FROM t2", "30");
+    check(&mut e, "SELECT min(nm)::text FROM t2", "5.25");
+    check(&mut e, "SELECT max(nm)::text FROM t2", "99.99");
+    check(&mut e, "SELECT min(ts)::text FROM t2", "2019-06-15 08:30:00");
+    check(&mut e, "SELECT max(ts)::text FROM t2", "2021-12-31 23:59:59");
+}
+
+// ---- BUG FIX: ordered-set aggregates + ORDER BY over a NUMERIC key ----
+#[test]
+fn ordered_set_and_orderby_numeric() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t3 (nm numeric(10,2))").unwrap();
+    for v in ["12.50", "99.99", "5.25"] {
+        e.execute(&format!("INSERT INTO t3 VALUES ({v})")).unwrap();
+    }
+    // Previously the ORDER BY comparator sorted NUMERIC by debug string
+    // (12.50 < 5.25 < 99.99). PG value order: 5.25,12.50,99.99.
+    check(
+        &mut e,
+        "SELECT string_agg(nm::text, ',' ORDER BY nm) FROM t3",
+        "5.25,12.50,99.99",
+    );
+    // mode() ties resolve to the smallest under the sort; PG -> 5.25.
+    check(&mut e, "SELECT (mode() WITHIN GROUP (ORDER BY nm))::text FROM t3", "5.25");
+    // percentile_disc(0.5) over 3 sorted values -> 2nd -> 12.50.
+    check(
+        &mut e,
+        "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY nm))::text FROM t3",
+        "12.50",
+    );
+}
+
+// ---- ordered-set + json over INT (already correct; regression lock) ----
+#[test]
+fn ordered_set_and_json_int() {
+    let mut e = seed();
+    check(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t", "30");
+    check(&mut e, "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY x))::text FROM t", "30");
+    check(&mut e, "SELECT (mode() WITHIN GROUP (ORDER BY x))::text FROM t", "30");
+    // json_agg / jsonb_agg keep NULLs, insertion order via ORDER BY id
+    check(&mut e, "SELECT json_agg(x ORDER BY id)::text FROM t", "[10, 20, null, 30, 30, 40]");
+    check(&mut e, "SELECT jsonb_agg(x ORDER BY id)::text FROM t", "[10, 20, null, 30, 30, 40]");
+}
+
+// ---- GROUP BY: count / sum / avg per group ----
+#[test]
+fn group_by_combos() {
+    let mut e = seed();
+    check(
+        &mut e,
+        "SELECT g||':'||count(*)||':'||coalesce(sum(x)::text,'<NULL>') FROM t GROUP BY g ORDER BY g",
+        "a:3:30|b:2:60|c:1:40",
+    );
+    // avg per group FLOAT; PG NUMERIC prints trailing zeros (equal value)
+    check(
+        &mut e,
+        "SELECT g||':'||coalesce(avg(x)::text,'<NULL>') FROM t GROUP BY g ORDER BY g",
+        "a:15|b:30|c:40",
+    );
+}
+
+// ---- numeric widening: sum(int) -> bigint, sum(bigint) value ----
+#[test]
+fn numeric_widening() {
+    let mut e = seed();
+    check(&mut e, "SELECT sum(bx) FROM t", "1300"); // PG: numeric 1300
+    check(&mut e, "SELECT sum(x) FROM t", "130"); // PG: bigint 130
+}
+
+// ---- regression family: corr / covar / regr_count over paired columns ----
+#[test]
+fn regression_family() {
+    let mut e = seed();
+    // corr(y,x) = 1 (perfectly linear on the non-NULL pairs)
+    check(&mut e, "SELECT corr(y,x) FROM t", "1");
+    check(&mut e, "SELECT covar_pop(y,x) FROM t", "6.875");
+    check(&mut e, "SELECT covar_samp(y,x) FROM t", "9.166666666666666");
+    check(&mut e, "SELECT regr_count(y,x) FROM t", "4");
+}

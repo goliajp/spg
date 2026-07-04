@@ -4016,17 +4016,37 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Null, Value::Null) => Equal,
         (Value::Null, _) => core::cmp::Ordering::Greater, // NULLs last
         (_, Value::Null) => core::cmp::Ordering::Less,
+        (Value::SmallInt(x), Value::SmallInt(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        // Cross integer widths — min/max over a column whose cells
+        // land in mixed integer variants (literal-seeded rows, casts).
+        (Value::SmallInt(x), Value::Int(y)) => i32::from(*x).cmp(y),
+        (Value::Int(x), Value::SmallInt(y)) => x.cmp(&i32::from(*y)),
+        (Value::SmallInt(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
+        (Value::BigInt(x), Value::SmallInt(y)) => x.cmp(&i64::from(*y)),
         (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
         (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Value::SmallInt(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),
+        (Value::Float(x), Value::SmallInt(y)) => x.partial_cmp(&f64::from(*y)).unwrap_or(Equal),
         (Value::Int(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),
         (Value::Float(x), Value::Int(y)) => x.partial_cmp(&f64::from(*y)).unwrap_or(Equal),
         (Value::BigInt(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
         (Value::Float(x), Value::BigInt(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        // Exact decimal — align scales before comparing the integral
+        // representations so 12.50 vs 5.25 orders correctly (the old
+        // `_ => Equal` fallback made min/max(numeric) keep the first row).
+        (
+            Value::Numeric { scaled: xs, scale: xsc },
+            Value::Numeric { scaled: ys, scale: ysc },
+        ) => crate::orderby::cmp_numeric(*xs, *xsc, *ys, *ysc),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Temporal — stored as integral day / microsecond counts, so
+        // the natural integer order is the calendar order.
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         _ => Equal,
     }
 }
