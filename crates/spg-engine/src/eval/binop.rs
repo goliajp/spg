@@ -2199,6 +2199,48 @@ fn range_strictly_left(
     }
 }
 
+/// `range_merge(a, b)` — the smallest range that contains both `a` and `b`.
+/// Unlike `+` union it never errors on a gap: the result spans it (earliest
+/// start to latest end). An empty operand contributes nothing. Returns `None`
+/// if either value is not a range (caller falls back).
+pub(crate) fn range_merge_pair(a: &Value<'_>, b: &Value<'_>) -> Option<Value<'static>> {
+    let (ak, al, au, ali, aui, ae) = match a {
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
+        }
+        _ => return None,
+    };
+    let (bk, bl, bu, bli, bui, be) = match b {
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
+        }
+        _ => return None,
+    };
+    let mk = |k, lo: Option<alloc::boxed::Box<Value<'static>>>, up: Option<alloc::boxed::Box<Value<'static>>>, li, ui, e| {
+        Value::Range { kind: k, lower: lo, upper: up, lower_inc: li, upper_inc: ui, empty: e }
+    };
+    if ae {
+        return Some(mk(bk, bl, bu, bli, bui, be));
+    }
+    if be {
+        return Some(mk(ak, al, au, ali, aui, ae));
+    }
+    let (al2, ali2, au2, aui2) = range_canonical(ak, &al, &au, ali, aui);
+    let (bl2, bli2, bu2, bui2) = range_canonical(bk, &bl, &bu, bli, bui);
+    // merge lower = the earlier start, upper = the later end.
+    let (lo, lo_inc) = if lower_cmp(&al2, ali2, &bl2, bli2) == core::cmp::Ordering::Less {
+        (al2, ali2)
+    } else {
+        (bl2, bli2)
+    };
+    let (up, up_inc) = if upper_cmp(&au2, aui2, &bu2, bui2) == core::cmp::Ordering::Greater {
+        (au2, aui2)
+    } else {
+        (bu2, bui2)
+    };
+    Some(mk(ak, lo.map(alloc::boxed::Box::new), up.map(alloc::boxed::Box::new), lo_inc, up_inc, false))
+}
+
 /// The numeric value of an inet/cidr address (IPv4 in the low 4 bytes,
 /// IPv6 across all 16), MSB-first.
 fn inet_addr_u128(family: u8, addr: &[u8; 16]) -> u128 {
