@@ -12792,6 +12792,16 @@ fn apply_function_dispatch(
                     ),
                 });
             }
+            // Typed range values (the common `range_merge(int4range(...), ...)`
+            // shape) merge via the range machinery in `binop`.
+            if matches!(args[0], Value::Range { .. }) || matches!(args[1], Value::Range { .. }) {
+                if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                    return Ok(Value::Null);
+                }
+                if let Some(v) = super::binop::range_merge_pair(&args[0], &args[1]) {
+                    return Ok(v);
+                }
+            }
             let (a, b) = match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
                 (Value::Text(a), Value::Text(b)) => (a.trim(), b.trim()),

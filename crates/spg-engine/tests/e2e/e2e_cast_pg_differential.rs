@@ -925,3 +925,17 @@ fn range_strictly_left_right() {
     // control: overlap/union unaffected.
     ck(&mut e, "(int4range(1,5) && int4range(4,10))::text", "true");
 }
+
+/// range_merge on typed range values (was TEXT-only). The smallest range
+/// containing both, spanning any gap. PG18.4-verified.
+#[test]
+fn range_merge_typed() {
+    let mut e = Engine::new();
+    ck(&mut e, "range_merge(int4range(1,5), int4range(8,10))::text", "[1,10)");
+    ck(&mut e, "range_merge(int4range(1,5), int4range(3,8))::text", "[1,8)");
+    ck(&mut e, "range_merge(numrange(1.5,3.5), numrange(5.5,7.5))::text", "[1.5,7.5)");
+    ck(&mut e, "range_merge(int4range(1,5), 'empty'::int4range)::text", "[1,5)");
+    ck(&mut e, "range_merge('[1,10]'::int4range, '[3,20]'::int4range)::text", "[1,21)"); // int4range canonicalizes []→[)
+    // control: union of contiguous ranges still works.
+    ck(&mut e, "(int4range(1,5) + int4range(4,10))::text", "[1,10)");
+}
