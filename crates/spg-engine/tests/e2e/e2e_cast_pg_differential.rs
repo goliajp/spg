@@ -1449,3 +1449,16 @@ fn round_numeric_exact_scale() {
     // control: 1-arg numeric round unchanged.
     ck(&mut e, "round(2.5::numeric)::text", "3");
 }
+
+
+/// v7.37 D — unary minus works on NUMERIC / SMALLINT / MONEY (only Int / BigInt
+/// / Float / Interval were handled, so `-1.255::numeric` errored). PG18.4-verified.
+#[test]
+fn unary_minus_numeric_smallint() {
+    let mut e = Engine::new();
+    ck(&mut e, "(-1.255::numeric)::text", "-1.255");
+    ck(&mut e, "(-(3::int2))::text", "-3");
+    ck(&mut e, "round(-1.255::numeric, 2)::text", "-1.26");
+    // control: existing int / float unary minus unchanged.
+    ck(&mut e, "(-5)::text", "-5");
+}
