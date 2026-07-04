@@ -27,12 +27,12 @@
 //! (`array_cmp`) are implemented — see `inet_ordering` / `bit_ordering` /
 //! `array_ordering`.
 //!
-//! RANGE `=` (`range_eq`, discrete `[)` canonicalisation) and MULTIRANGE `=`
-//! (`multirange_eq`, canonicalise + sort + merge spans) are implemented —
-//! see `range_equality` / `multirange_equality`.
+//! RANGE and MULTIRANGE comparison (`=`/`<>` and ordering, via `range_cmp` /
+//! `multirange_cmp` with discrete `[)` canonicalisation + span normalisation)
+//! are implemented — see `range_equality` / `range_ordering` /
+//! `multirange_equality` / `multirange_ordering`.
 //!
 //! DEFERRED (still error in SPG):
-//!   * range / multirange ordering (`<` etc.) — only `=` / `<>` wired.
 //!   * tsvector `=` — lexeme/position semantics unverified.
 
 use spg_engine::{Engine, QueryResult};
@@ -447,4 +447,44 @@ fn multirange_equality() {
         "SELECT '{[1,3),[5,7)}'::int4multirange = '{[1,3)}'::int4multirange",
         "f",
     );
+}
+
+#[test]
+fn range_ordering() {
+    // PG `range_cmp`: empty first, then by lower bound, then upper bound.
+    // All values captured live from PostgreSQL 18.4.
+    let mut e = Engine::new();
+    ck(&mut e, "SELECT int4range(1,5) < int4range(2,6)", "t"); // lower 1<2
+    ck(&mut e, "SELECT int4range(1,5) < int4range(1,6)", "t"); // same lower, upper 5<6
+    ck(&mut e, "SELECT 'empty'::int4range < int4range(1,5)", "t"); // empty first
+    ck(&mut e, "SELECT '[1,5)'::int4range < '(1,5)'::int4range", "t"); // incl lower < excl lower
+    ck(&mut e, "SELECT int4range(1,5) < int4range(1,5)", "f"); // equal
+    ck(&mut e, "SELECT int4range(1,5) <= int4range(1,5)", "t");
+    ck(&mut e, "SELECT int4range(2,6) > int4range(1,5)", "t");
+    ck(&mut e, "SELECT '(,5)'::int4range < int4range(1,5)", "t"); // -inf lower first
+    ck(&mut e, "SELECT '[1.5,3)'::numrange < '[2.0,3)'::numrange", "t");
+    ck(&mut e, "SELECT '[1,5]'::numrange > '[1,5)'::numrange", "t"); // incl upper > excl upper
+}
+
+#[test]
+fn multirange_ordering() {
+    // PG multirange order: lexical over the normalised span lists.
+    let mut e = Engine::new();
+    ck(&mut e, "SELECT '{[1,3)}'::int4multirange < '{[2,4)}'::int4multirange", "t");
+    ck(
+        &mut e,
+        "SELECT '{[1,3)}'::int4multirange < '{[1,3),[5,7)}'::int4multirange",
+        "t",
+    ); // prefix is less
+    ck(&mut e, "SELECT '{}'::int4multirange < '{[1,3)}'::int4multirange", "t"); // empty first
+    ck(
+        &mut e,
+        "SELECT '{[1,3),[5,7)}'::int4multirange <= '{[1,3),[5,7)}'::int4multirange",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT '{[1,3),[5,7)}'::int4multirange < '{[1,3),[5,8)}'::int4multirange",
+        "t",
+    ); // 2nd span upper decides
 }
