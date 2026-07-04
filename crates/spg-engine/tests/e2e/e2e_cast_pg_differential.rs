@@ -474,3 +474,18 @@ fn interval_mixed_sign_plus_render() {
     ck(&mut e, r#"interval '1 month -2 hours'"#, r#"1 mon -02:00:00"#);
     ck(&mut e, r#"interval '-2 hours'"#, r#"-02:00:00"#);
 }
+
+/// Fractional interval units cascade to the next-finer field, PG-style
+/// (was ERR). PG18.4-verified.
+#[test]
+fn interval_fractional_units() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"interval '1.5 hours'"#, r#"01:30:00"#);
+    ck(&mut e, r#"interval '2.5 seconds'"#, r#"00:00:02.5"#);
+    ck(&mut e, r#"interval '0.25 hours'"#, r#"00:15:00"#);
+    ck(&mut e, r#"interval '1.5 days'"#, r#"1 day 12:00:00"#);
+    ck(&mut e, r#"interval '1.5 weeks'"#, r#"10 days 12:00:00"#);
+    ck(&mut e, r#"interval '1.5 months'"#, r#"1 mon 15 days"#);
+    ck(&mut e, r#"interval '1.5 years'"#, r#"1 year 6 mons"#);
+    ck(&mut e, r#"interval '1.5 months 2.5 hours'"#, r#"1 mon 15 days 02:30:00"#);
+}

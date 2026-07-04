@@ -14913,35 +14913,79 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     let mut micros: i64 = 0;
     let mut i = 0;
     while i < parts.len() {
-        let n: i64 = parts[i].parse().ok()?;
         let unit = parts[i + 1].to_ascii_lowercase();
         let unit_stripped = unit.strip_suffix('s').unwrap_or(&unit);
-        match unit_stripped {
-            "microsecond" => micros = micros.checked_add(n)?,
-            "millisecond" => micros = micros.checked_add(n.checked_mul(1_000)?)?,
-            "second" => micros = micros.checked_add(n.checked_mul(1_000_000)?)?,
-            "minute" => micros = micros.checked_add(n.checked_mul(60_000_000)?)?,
-            "hour" => micros = micros.checked_add(n.checked_mul(3_600_000_000)?)?,
-            "day" => {
-                let n32 = i32::try_from(n).ok()?;
-                days = days.checked_add(n32)?;
+        if let Ok(n) = parts[i].parse::<i64>() {
+            match unit_stripped {
+                "microsecond" => micros = micros.checked_add(n)?,
+                "millisecond" => micros = micros.checked_add(n.checked_mul(1_000)?)?,
+                "second" => micros = micros.checked_add(n.checked_mul(1_000_000)?)?,
+                "minute" => micros = micros.checked_add(n.checked_mul(60_000_000)?)?,
+                "hour" => micros = micros.checked_add(n.checked_mul(3_600_000_000)?)?,
+                "day" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    days = days.checked_add(n32)?;
+                }
+                "week" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    days = days.checked_add(n32.checked_mul(7)?)?;
+                }
+                // v7.37.5 ship triage — accept PG's `format_interval`
+                // canonical output (`0 mons 0 days 0 microseconds`) so
+                // a round-trip Display → re-parse stays lossless.
+                "month" | "mon" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32)?;
+                }
+                "year" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(12)?)?;
+                }
+                _ => return None,
             }
-            "week" => {
-                let n32 = i32::try_from(n).ok()?;
-                days = days.checked_add(n32.checked_mul(7)?)?;
+        } else if let Ok(f) = parts[i].parse::<f64>() {
+            // Fractional units cascade down to the next-finer field the way
+            // PG does: `1.5 days` -> `1 day 12:00:00`, `1.5 months` ->
+            // `1 mon 15 days` (30-day month), `1.5 years` -> `1 year 6 mons`.
+            // no_std: f64 has no trunc/fract/round methods, so do them with
+            // casts (toward-zero) + explicit round-half-away-from-zero.
+            #[allow(clippy::cast_possible_truncation)]
+            fn round_i64(x: f64) -> i64 {
+                if x >= 0.0 { (x + 0.5) as i64 } else { (x - 0.5) as i64 }
             }
-            // v7.37.5 ship triage — accept PG's `format_interval`
-            // canonical output (`0 mons 0 days 0 microseconds`) so
-            // a round-trip Display → re-parse stays lossless.
-            "month" | "mon" => {
-                let n32 = i32::try_from(n).ok()?;
-                months = months.checked_add(n32)?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            fn add_days_frac(days: &mut i32, micros: &mut i64, d: f64) -> Option<()> {
+                const DAY_US: f64 = 86_400_000_000.0;
+                let whole = d as i64; // truncates toward zero
+                let frac = d - whole as f64;
+                *days = days.checked_add(i32::try_from(whole).ok()?)?;
+                *micros = micros.checked_add(round_i64(frac * DAY_US))?;
+                Some(())
             }
-            "year" => {
-                let n32 = i32::try_from(n).ok()?;
-                months = months.checked_add(n32.checked_mul(12)?)?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            match unit_stripped {
+                "microsecond" => micros = micros.checked_add(round_i64(f))?,
+                "millisecond" => micros = micros.checked_add(round_i64(f * 1_000.0))?,
+                "second" => micros = micros.checked_add(round_i64(f * 1_000_000.0))?,
+                "minute" => micros = micros.checked_add(round_i64(f * 60_000_000.0))?,
+                "hour" => micros = micros.checked_add(round_i64(f * 3_600_000_000.0))?,
+                "day" => add_days_frac(&mut days, &mut micros, f)?,
+                "week" => add_days_frac(&mut days, &mut micros, f * 7.0)?,
+                "month" | "mon" => {
+                    let whole = f as i64;
+                    months = months.checked_add(i32::try_from(whole).ok()?)?;
+                    add_days_frac(&mut days, &mut micros, (f - whole as f64) * 30.0)?;
+                }
+                "year" => {
+                    let m = f * 12.0;
+                    let whole = m as i64;
+                    months = months.checked_add(i32::try_from(whole).ok()?)?;
+                    add_days_frac(&mut days, &mut micros, (m - whole as f64) * 30.0)?;
+                }
+                _ => return None,
             }
-            _ => return None,
+        } else {
+            return None;
         }
         i += 2;
     }
