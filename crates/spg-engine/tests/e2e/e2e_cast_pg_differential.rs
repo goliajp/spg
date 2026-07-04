@@ -1814,3 +1814,18 @@ fn tsquery_containment() {
     ck(&mut e, "('cat'::tsquery <@ 'cat & dog'::tsquery)::text", "true");
     ck(&mut e, "('cat | dog'::tsquery @> 'dog'::tsquery)::text", "true");
 }
+
+/// v7.37 D — range @> numeric element (numeric operand no longer stolen by the
+/// numeric fast-path before the range containment arm). PG18.4-verified.
+#[test]
+fn numrange_contains_numeric() {
+    let mut e = Engine::new();
+    ck(&mut e, "(numrange(1.5, 3.5) @> 2.0::numeric)::text", "true");
+    ck(&mut e, "(numrange(1.5, 3.5) @> 4.0::numeric)::text", "false");
+    ck(&mut e, "('[1.5,3.5)'::numrange @> 2.0::numeric)::text", "true");
+    ck(&mut e, "(2.0::numeric <@ numrange(1.5, 3.5))::text", "true");
+    // int4range with a plain-int probe is unaffected by the guard.
+    // (PG rejects `int4range @> numeric` outright; SPG is leniently
+    // permissive there, so we assert only the PG-valid plain-int form.)
+    ck(&mut e, "('[1,10)'::int4range @> 5)::text", "true");
+}
