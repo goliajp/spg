@@ -636,3 +636,20 @@ fn to_char_ts_quoted_literal() {
     // control: no quotes unaffected.
     ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY-MM-DD')"#, r#"2024-03-05"#);
 }
+
+/// encode 'escape' format + decode returns bytea (was Text, which broke
+/// `decode(...)::text` rendering and non-UTF-8 decode round-trips). PG18.4-verified.
+#[test]
+fn encode_escape_and_decode_bytea() {
+    let mut e = Engine::new();
+    ck(&mut e, r#"encode('abc'::bytea, 'escape')"#, r#"abc"#);
+    // decode returns bytea → renders as \xHEX (was `abc`).
+    ck(&mut e, r#"(decode('YWJj', 'base64'))::text"#, r#"\x616263"#);
+    ck(&mut e, r#"(decode('616263', 'hex'))::text"#, r#"\x616263"#);
+    // non-UTF-8 decode round-trips through encode (was ERR).
+    ck(&mut e, r#"encode(decode('deadbeef','hex'),'base64')"#, r#"3q2+7w=="#);
+    ck(&mut e, r#"encode(decode('deadbeef','hex'),'hex')"#, r#"deadbeef"#);
+    // controls unaffected.
+    ck(&mut e, r#"encode('abc'::bytea, 'hex')"#, r#"616263"#);
+    ck(&mut e, r#"encode('abc'::bytea, 'base64')"#, r#"YWJj"#);
+}
