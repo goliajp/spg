@@ -1418,3 +1418,16 @@ fn date_compact_and_epoch() {
     // control: hyphenated date unchanged; invalid compact rejected downstream.
     ck(&mut e, "('2024-01-15'::date)::text", "2024-01-15");
 }
+
+
+/// v7.37 D — TIME accepts the `allballs` special value (midnight) and the
+/// `24:00:00` end-of-day sentinel; `24:00:01` stays rejected. PG18.4-verified.
+#[test]
+fn time_allballs_and_24h() {
+    let mut e = Engine::new();
+    ck(&mut e, "('allballs'::time)::text", "00:00:00");
+    ck(&mut e, "('24:00:00'::time)::text", "24:00:00");
+    // control: normal time + rejection of out-of-range.
+    ck(&mut e, "('12:30'::time)::text", "12:30:00");
+    assert_eq!(cast(&mut e, "'24:00:01'::time"), "ERR");
+}

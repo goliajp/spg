@@ -1600,6 +1600,10 @@ pub(crate) fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value<'static
 /// truncation, matches PG's `time_in` behaviour).
 pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     let s = s.trim();
+    // PG special TIME value: `allballs` is midnight (all zeros).
+    if s.eq_ignore_ascii_case("allballs") {
+        return Some(0);
+    }
     let (hms, frac) = match s.split_once('.') {
         Some((h, f)) => (h, Some(f)),
         None => (s, None),
@@ -1616,7 +1620,8 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     if parts.next().is_some() {
         return None;
     }
-    if hh > 23 || mm > 59 || ss > 59 {
+    // PG accepts the end-of-day sentinel `24:00:00` (but nothing past it).
+    if hh > 24 || mm > 59 || ss > 59 || (hh == 24 && (mm != 0 || ss != 0)) {
         return None;
     }
     let frac_us: i64 = match frac {
@@ -1634,6 +1639,9 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
             padded.parse().ok()?
         }
     };
+    if hh == 24 && frac_us != 0 {
+        return None;
+    }
     Some(
         i64::from(hh) * 3_600_000_000
             + i64::from(mm) * 60_000_000
