@@ -373,6 +373,14 @@ pub(super) fn apply_binary(
                 *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
             )))
         }
+        // Geometric `container @> point` / `point <@ container` for
+        // polygon / box / circle, ahead of the array & JSON interpretations.
+        BinOp::JsonContains if geo_contains_point(&l, &r).is_some() => {
+            Ok(Value::Bool(geo_contains_point(&l, &r).expect("guard checked")))
+        }
+        BinOp::JsonContainedBy if geo_contains_point(&r, &l).is_some() => {
+            Ok(Value::Bool(geo_contains_point(&r, &l).expect("guard checked")))
+        }
         // Array operands claim && / @> / <@ before the inet / JSON
         // interpretations: ARRAY[1,2] && ARRAY[2,3] is the overlap
         // test, ARRAY[1,2,3] @> ARRAY[2] the containment test.
@@ -2214,6 +2222,41 @@ fn range_strictly_left(
             Ordering::Equal => !(aui2 && bli2),
             Ordering::Greater => false,
         },
+    }
+}
+
+/// Geometric containment `container @> point`: whether the point lies inside
+/// (or on the boundary of) a polygon (even-odd ray cast), box (bounding-box
+/// test), or circle (distance ≤ radius). `None` if the operands are not a
+/// geometry/point pair.
+fn geo_contains_point(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
+    let Value::Point(pt) = p else { return None };
+    match container {
+        Value::PgBox(ur, ll) => Some(pt.x >= ll.x && pt.x <= ur.x && pt.y >= ll.y && pt.y <= ur.y),
+        Value::Circle { center, radius } => {
+            let (dx, dy) = (pt.x - center.x, pt.y - center.y);
+            Some(dx * dx + dy * dy <= radius * radius)
+        }
+        Value::Polygon(pts) => {
+            if pts.len() < 3 {
+                return Some(false);
+            }
+            // Even-odd ray-casting: count crossings of a ray going +x.
+            let mut inside = false;
+            let mut j = pts.len() - 1;
+            for i in 0..pts.len() {
+                let (xi, yi) = (pts[i].x, pts[i].y);
+                let (xj, yj) = (pts[j].x, pts[j].y);
+                if ((yi > pt.y) != (yj > pt.y))
+                    && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi)
+                {
+                    inside = !inside;
+                }
+                j = i;
+            }
+            Some(inside)
+        }
+        _ => None,
     }
 }
 

@@ -1025,3 +1025,17 @@ fn npoints_path_polygon() {
     ck(&mut e, "npoints('((0,0),(1,1),(2,0),(3,1))'::polygon)::text", "4");
     ck(&mut e, "npoints('((0,0),(1,1),(2,0))'::polygon)::text", "3");
 }
+
+/// Geometric containment `@>` / `<@`: point in polygon (ray cast) / circle
+/// (radius). PG18.4-verified.
+#[test]
+fn geo_containment() {
+    let mut e = Engine::new();
+    ck(&mut e, "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(2,2))::text", "true");
+    ck(&mut e, "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(5,5))::text", "false");
+    ck(&mut e, "(point(2,2) <@ '((0,0),(4,0),(4,4),(0,4))'::polygon)::text", "true");
+    ck(&mut e, "('<(0,0),5>'::circle @> point(3,3))::text", "true");
+    ck(&mut e, "('<(0,0),5>'::circle @> point(9,9))::text", "false");
+    // control: array containment unaffected.
+    ck(&mut e, "(ARRAY[1,2,3] @> ARRAY[2])::text", "true");
+}
