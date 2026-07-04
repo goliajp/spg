@@ -6,6 +6,25 @@ use crate::nsw::*;
 use alloc::string::ToString;
 use alloc::vec;
 
+/// v7.37.16 (Epic W) — the v53 catalog snapshot now persists each row's
+/// stable `RowId` (+ MVCC header). `RowId` allocation is path-dependent by
+/// design: redo replay's `set_rows_and_rebuild_indices` assigns FRESH ids
+/// rather than reproducing the exact ids a direct mutation sequence would
+/// hand out (see its doc: "fresh monotonic ids … so a post-replay id never
+/// collides with a pre-replay one"). So a direct-ops catalog and a
+/// redo-replayed one — logically identical rows, all frozen headers on the
+/// gate-off paths the redo tests exercise — legitimately differ ONLY in the
+/// MVCC appendix's rowid bookkeeping. Normalising both to dense ids before
+/// a byte-level `serialize()` comparison keeps the differential covering
+/// schema + rows + indices + headers without over-asserting on the
+/// intentionally path-dependent id allocation.
+#[cfg(test)]
+fn normalize_rowids_dense(c: &mut Catalog, tables: &[&str]) {
+    for name in tables {
+        c.get_mut(name).unwrap().assign_dense_rowids();
+    }
+}
+
 /// v7.34 (crash-recovery P0 #2) — row-level physical redo apply (S4
 /// core) must reproduce a catalog built by direct mutations,
 /// byte-for-byte. Build C1 by direct `Table` ops, an equivalent
@@ -73,6 +92,10 @@ fn redo_apply_matches_direct_position_ops() {
     let mut c2 = fresh();
     c2.apply_redo(&log).unwrap();
 
+    // Normalise the path-dependent RowId allocation before the byte
+    // comparison (see `normalize_rowids_dense`).
+    normalize_rowids_dense(&mut c1, &["t"]);
+    normalize_rowids_dense(&mut c2, &["t"]);
     assert_eq!(
         c1.serialize(),
         c2.serialize(),
@@ -130,6 +153,8 @@ fn redo_capture_replays_to_identical_state() {
 
     let mut c2 = fresh();
     c2.apply_redo(&log).unwrap();
+    normalize_rowids_dense(&mut c1, &["t"]);
+    normalize_rowids_dense(&mut c2, &["t"]);
     assert_eq!(
         c1.serialize(),
         c2.serialize(),
@@ -176,6 +201,8 @@ fn catalog_drain_redo_replays_multi_table() {
 
     let mut c2 = fresh();
     c2.apply_redo(&log).unwrap();
+    normalize_rowids_dense(&mut c1, &["a", "b"]);
+    normalize_rowids_dense(&mut c2, &["a", "b"]);
     assert_eq!(c1.serialize(), c2.serialize(), "multi-table redo diverged");
 
     // drain stopped capture: a second drain is empty.
@@ -404,6 +431,8 @@ fn redo_log_old_format_decodes_and_replays_identically() {
     }
     let mut replayed = fresh();
     replayed.apply_redo(&decoded).unwrap();
+    normalize_rowids_dense(&mut direct, &["t"]);
+    normalize_rowids_dense(&mut replayed, &["t"]);
     assert_eq!(
         direct.serialize(),
         replayed.serialize(),
@@ -743,6 +772,284 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
         alloc::vec![1, 3, NEW_VAL],
         "gate-off replay updates the row in place to the new value"
     );
+}
+
+// ---------------------------------------------------------------------
+// v7.37.16 (Epic W) — FILE_VERSION 53 catalog-snapshot MVCC appendix:
+// persist per-row RowHeader (xmin/xmax/flags) + stable RowId so a
+// cross-checkpoint tombstone survives a serialize→deserialize restore.
+// ---------------------------------------------------------------------
+
+/// Build the exact bytes the v53 per-table MVCC appendix would emit for a
+/// table: `[u32 count][per row: u64 xmin,u64 xmax,u8 flags,u64 rowid]
+/// [u64 next_rowid]`. Used by the byte-compat test to splice the appendix
+/// back out of a v53 image and reconstruct a genuine v52 image.
+#[cfg(test)]
+fn mvcc_appendix_bytes(t: &Table) -> Vec<u8> {
+    let mut a = Vec::new();
+    a.extend_from_slice(&(t.rows().len() as u32).to_le_bytes());
+    for (h, rid) in t.headers().iter().zip(t.rowids().iter()) {
+        a.extend_from_slice(&h.xmin.to_le_bytes());
+        a.extend_from_slice(&h.xmax.to_le_bytes());
+        a.push(h.flags);
+        a.extend_from_slice(&rid.0.to_le_bytes());
+    }
+    a.extend_from_slice(&t.next_rowid_for_test().to_le_bytes());
+    a
+}
+
+/// (a) BACKWARD-COMPAT GATE. A snapshot written by the CURRENT released
+/// code (FILE_VERSION 52, no MVCC appendix) MUST still deserialize to the
+/// exact same result as before this slice: every row `RowHeader::frozen()`
+/// and dense `1..=N` rowids with `next_rowid = N + 1`.
+///
+/// The v53 image differs from the v52 image by exactly two things: the
+/// version byte, and the per-table MVCC appendix appended in the table
+/// loop. So we serialize (v53), splice the (uniquely-locatable) appendix
+/// back out, flip the version byte to 52, and assert the result loads
+/// with the pre-v53 frozen/dense contract — a real old-image load.
+#[test]
+fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
+    use crate::row_header::{RowHeader, RowId, XMAX_ALIVE, XMIN_FROZEN};
+
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    {
+        let t = c.get_mut("t").unwrap();
+        // Distinctive values so the appendix subslice is unique.
+        t.insert(Row::new(alloc::vec![Value::Int(0x1111)])).unwrap();
+        t.insert(Row::new(alloc::vec![Value::Int(0x2222)])).unwrap();
+        t.insert(Row::new(alloc::vec![Value::Int(0x3333)])).unwrap();
+    }
+    let v53 = c.serialize();
+    assert_eq!(v53[FILE_MAGIC.len()], FILE_VERSION, "writer emits v53");
+
+    // Locate + splice out the appendix (must be present exactly once).
+    let appendix = mvcc_appendix_bytes(c.get("t").unwrap());
+    let hits: Vec<usize> = v53
+        .windows(appendix.len())
+        .enumerate()
+        .filter_map(|(i, w)| if w == appendix.as_slice() { Some(i) } else { None })
+        .collect();
+    assert_eq!(hits.len(), 1, "MVCC appendix must appear exactly once in the v53 image");
+    let start = hits[0];
+    let mut v52 = Vec::with_capacity(v53.len() - appendix.len());
+    v52.extend_from_slice(&v53[..start]);
+    v52.extend_from_slice(&v53[start + appendix.len()..]);
+    // Flip the version byte 53 -> 52: this is now byte-for-byte what the
+    // pre-slice released code would have written for this catalog.
+    v52[FILE_MAGIC.len()] = FILE_VERSION - 1;
+
+    let restored = Catalog::deserialize(&v52).expect("v52 image must still load");
+    let t = restored.get("t").unwrap();
+    assert_eq!(t.rows().len(), 3, "rows survive the v52 load");
+    // Every header frozen (pre-v53 contract).
+    for i in 0..t.rows().len() {
+        let h = *t.headers().get(i).unwrap();
+        assert_eq!(h, RowHeader::frozen(), "v52 row {i} must load frozen");
+        assert_eq!(h.xmin, XMIN_FROZEN);
+        assert_eq!(h.xmax, XMAX_ALIVE);
+    }
+    // Dense 1..=N rowids + next_rowid = N + 1.
+    let ids: Vec<RowId> = t.rowids().iter().copied().collect();
+    assert_eq!(ids, alloc::vec![RowId(1), RowId(2), RowId(3)], "v52 dense rowids");
+    assert_eq!(t.next_rowid_for_test(), 4, "v52 next_rowid = N + 1");
+}
+
+/// A short / truncated MVCC appendix must error cleanly (no panic/unwrap)
+/// on load. We take a valid v53 image and chop off the trailing bytes so
+/// the appendix reader hits EOF mid-field.
+#[test]
+fn truncated_mvcc_appendix_errors_cleanly() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    {
+        let t = c.get_mut("t").unwrap();
+        t.insert(Row::new(alloc::vec![Value::Int(7)])).unwrap();
+        t.insert(Row::new(alloc::vec![Value::Int(8)])).unwrap();
+    }
+    let full = c.serialize();
+    // Chop the last 5 bytes: guaranteed to land inside the appendix's
+    // trailing next_rowid (8 bytes), so the reader hits EOF.
+    let truncated = &full[..full.len() - 5];
+    let err = Catalog::deserialize(truncated);
+    assert!(err.is_err(), "a truncated snapshot must error, not panic");
+}
+
+/// (b) NEW ROUND-TRIP. A table with mixed headers (some tombstoned with a
+/// real xmax, some alive) and specific non-dense rowids must serialize +
+/// deserialize with headers AND rowids identical, and next_rowid correct
+/// (strictly above every loaded id).
+#[test]
+fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
+    use crate::row_header::{RowHeader, RowId, HEAP_XMIN_FROZEN, XMAX_ALIVE};
+
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    {
+        let t = c.get_mut("t").unwrap();
+        // Insert 6 rows (rowids 1..=6, next_rowid = 7), then physically
+        // delete slots 1,3,5 (rowids 2,4,6). Survivors keep their real
+        // ids [1,3,5]; next_rowid stays 7 — a non-dense id set.
+        for v in 0..6 {
+            t.insert(Row::new(alloc::vec![Value::Int(100 + v)])).unwrap();
+        }
+        t.delete_rows(&[1, 3, 5]);
+        assert_eq!(t.rows().len(), 3);
+        assert_eq!(
+            t.rowids().iter().copied().collect::<Vec<_>>(),
+            alloc::vec![RowId(1), RowId(3), RowId(5)],
+            "survivors keep their real (non-dense) rowids"
+        );
+        assert_eq!(t.next_rowid_for_test(), 7, "next_rowid unaffected by delete");
+        // Stamp mixed headers: slot 0 alive-frozen, slot 1 tombstoned
+        // (xmax = 99), slot 2 alive with a non-frozen xmin.
+        let headers = t.headers_mut_for_test();
+        *headers.get_mut(0).unwrap() = RowHeader::frozen();
+        *headers.get_mut(1).unwrap() = RowHeader {
+            xmin: 5,
+            xmax: 99,
+            flags: 0,
+        };
+        *headers.get_mut(2).unwrap() = RowHeader {
+            xmin: 42,
+            xmax: XMAX_ALIVE,
+            flags: HEAP_XMIN_FROZEN,
+        };
+    }
+    let want_headers: Vec<RowHeader> =
+        c.get("t").unwrap().headers().iter().copied().collect();
+
+    let bytes = c.serialize();
+    let restored = Catalog::deserialize(&bytes).expect("v53 image loads");
+    let t = restored.get("t").unwrap();
+
+    // Rowids identical (verbatim, NOT dense-reassigned).
+    assert_eq!(
+        t.rowids().iter().copied().collect::<Vec<_>>(),
+        alloc::vec![RowId(1), RowId(3), RowId(5)],
+        "rowids must round-trip verbatim"
+    );
+    // Headers identical field-for-field.
+    let got_headers: Vec<RowHeader> = t.headers().iter().copied().collect();
+    assert_eq!(got_headers, want_headers, "headers must round-trip verbatim");
+    assert!(got_headers[1].is_deleted(), "the tombstoned row stays tombstoned");
+    assert_eq!(got_headers[1].xmax, 99, "tombstone xmax preserved");
+    // next_rowid restored above the max loaded id (5) — a fresh alloc
+    // (7) cannot collide with any restored row.
+    assert_eq!(t.next_rowid_for_test(), 7, "next_rowid restored verbatim");
+    assert!(
+        t.next_rowid_for_test() > 5,
+        "next_rowid must exceed every loaded id"
+    );
+}
+
+/// (c) CROSS-CHECKPOINT DURABILITY. A tombstone naming a row inserted
+/// BEFORE the last checkpoint must survive the base-snapshot boundary:
+/// after serialize→deserialize the tombstone-redo resolves by RowId and
+/// hides the row, with `unresolved_tombstone_count()` unchanged.
+///
+/// The scenario is engineered so the surviving row's real RowId (4) is NOT
+/// what dense-assignment would produce (1). With the PRE-v53 format the
+/// restore would dense-reassign the survivor to RowId(1); a tombstone
+/// naming RowId(4) would then be unresolved (counter++). With the v53
+/// format the id persists as 4, so the tombstone resolves.
+#[test]
+fn cross_checkpoint_tombstone_resolves_after_snapshot_restore() {
+    use crate::row_header::RowId;
+    use crate::snapshot::Snapshot;
+
+    const TOMB_XMAX: u64 = 77;
+    let snap = Snapshot::unbounded();
+
+    // --- Pre-checkpoint: 4 rows, then physically delete 3, leaving the
+    // row with real RowId(4). next_rowid = 5. ---
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    {
+        let t = c.get_mut("t").unwrap();
+        for v in [10, 20, 30, 40] {
+            t.insert(Row::new(alloc::vec![Value::Int(v)])).unwrap();
+        }
+        t.delete_rows(&[0, 1, 2]); // leave value 40 == RowId(4)
+        assert_eq!(t.rows().len(), 1);
+        assert_eq!(
+            t.rowids().iter().copied().collect::<Vec<_>>(),
+            alloc::vec![RowId(4)],
+            "surviving row carries the pre-checkpoint RowId(4)"
+        );
+    }
+
+    // --- CHECKPOINT: write the base snapshot (no tombstone in it yet). ---
+    let base = c.serialize();
+
+    // --- Post-checkpoint mutation captured in the WAL: tombstone the
+    // survivor (RowId 4). This is the redo that must survive the restore. ---
+    c.enable_redo_all();
+    {
+        let t = c.get_mut("t").unwrap();
+        t.mark_row_deleted(0, TOMB_XMAX).unwrap();
+    }
+    let log = c.drain_redo();
+    let tomb_targets: Vec<_> = log
+        .iter()
+        .filter_map(|ch| match ch {
+            RowChange::Tombstone { rowids, xmax, .. } => Some((rowids.clone(), *xmax)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tomb_targets.len(), 1, "one in-place tombstone captured");
+    assert_eq!(tomb_targets[0].0, alloc::vec![RowId(4)], "tombstone names the pre-checkpoint id");
+    // Round-trip through the real WAL codec.
+    let decoded = decode_redo_log(&encode_redo_log(&log)).unwrap();
+
+    // --- CRASH + RESTORE: load the base, replay the WAL tombstone. ---
+    let mut restored = Catalog::deserialize(&base).expect("base snapshot loads");
+    // The crux: the id persisted as 4 (NOT dense-reassigned to 1).
+    assert_eq!(
+        restored.get("t").unwrap().rowids().iter().copied().collect::<Vec<_>>(),
+        alloc::vec![RowId(4)],
+        "v53 restore preserves RowId(4); pre-v53 would have dense-assigned RowId(1)"
+    );
+
+    let unresolved_before = crate::unresolved_tombstone_count();
+    restored.apply_redo(&decoded).unwrap();
+    assert_eq!(
+        crate::unresolved_tombstone_count(),
+        unresolved_before,
+        "the cross-checkpoint tombstone must resolve by RowId (0 unresolved)"
+    );
+
+    // The row is physically present but hidden, carrying the tombstone xmax.
+    let t = restored.get("t").unwrap();
+    assert_eq!(t.rows().len(), 1, "tombstone keeps the physical row");
+    let h = *t.headers().get(0).unwrap();
+    assert_eq!(h.xmax, TOMB_XMAX, "recovered row carries the tombstone xmax");
+    assert!(h.is_deleted(), "recovered row reads as deleted");
+    let visible: Vec<i32> = t
+        .scan_visible(&snap)
+        .filter_map(|(_, r)| match r.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert!(visible.is_empty(), "the tombstoned survivor must be hidden after restore");
 }
 
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the

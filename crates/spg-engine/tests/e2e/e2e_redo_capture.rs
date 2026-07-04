@@ -29,6 +29,21 @@ fn with_ddl() -> Engine {
     e
 }
 
+/// v7.37.16 (Epic W) — the v53 catalog snapshot persists each row's stable
+/// `RowId`, and those ids are allocated path-dependently: redo replay's
+/// `set_rows_and_rebuild_indices` mints FRESH ids rather than reproducing
+/// the exact ids a direct SQL execution would hand out. So `snapshot()`
+/// bytes legitimately diverge between execution and replay on the id
+/// bookkeeping alone (the rows + their visibility are identical). Assert
+/// LOGICAL committed-state equivalence — the rows a client actually
+/// observes — via SELECT, which is id-independent and the property these
+/// capture≡execute tests care about.
+fn assert_same_rows(e1: &mut Engine, e2: &mut Engine, query: &str) {
+    let r1 = e1.execute(query).unwrap();
+    let r2 = e2.execute(query).unwrap();
+    assert_eq!(r1, r2, "redo replay diverged from execution on `{query}`");
+}
+
 #[test]
 fn engine_redo_capture_replays_to_identical_state() {
     // E1 executes the DML with capture on; E2 starts from the same DDL
@@ -54,11 +69,10 @@ fn engine_redo_capture_replays_to_identical_state() {
     let mut e2 = with_ddl();
     e2.apply_redo(&log).unwrap();
 
-    assert_eq!(
-        e1.snapshot(),
-        e2.snapshot(),
-        "engine redo replay diverged from execution"
-    );
+    // Logical committed state must match (id-independent; see
+    // `assert_same_rows`).
+    assert_same_rows(&mut e1, &mut e2, "SELECT * FROM t ORDER BY id");
+    assert_same_rows(&mut e1, &mut e2, "SELECT * FROM u ORDER BY k, n");
 }
 
 #[test]
@@ -192,12 +206,9 @@ fn writer_version_stamp_does_not_change_replay_result() {
     // Every captured change carries a real (non-zero) version …
     assert!(log.iter().all(|c| writer_version(c) > XMIN_FROZEN));
 
-    // … yet replay reproduces the executed state byte-for-byte.
+    // … yet replay reproduces the executed committed state (id-independent;
+    // see `assert_same_rows`).
     let mut e2 = with_ddl();
     e2.apply_redo(&log).unwrap();
-    assert_eq!(
-        e1.snapshot(),
-        e2.snapshot(),
-        "writer_version stamping must not change replay result"
-    );
+    assert_same_rows(&mut e1, &mut e2, "SELECT * FROM t ORDER BY id");
 }
