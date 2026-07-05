@@ -30,6 +30,36 @@ pub(super) fn apply_function_lower(
     apply_function_dispatch(name_lower, args, ctx)
 }
 
+/// v7.37 D.24 — does a POSIX regex pattern contain a *capturing* parenthesized
+/// subexpression? `(...)` is capturing unless it opens `(?...)` (non-capturing /
+/// lookaround / inline flags). An escaped `\(` is a literal paren, and `(`
+/// inside a `[...]` character class is literal. Used to decide whether
+/// `substring(string FROM pattern)` can be answered with the whole match
+/// (no capture group) or needs first-group extraction (a regex-engine gap).
+fn pattern_has_capturing_group(pat: &str) -> bool {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                if chars.get(i + 1) != Some(&'?') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -4081,6 +4111,27 @@ fn apply_function_dispatch(
             }
             if args.iter().any(|a| matches!(a, Value::Null)) {
                 return Ok(Value::Null);
+            }
+            // v7.37 D.24 — PG `substring(string FROM pattern)` /
+            // `substring(string, pattern)`: when the 2nd arg is a TEXT pattern
+            // (not an integer position), do POSIX regex extraction. A pattern
+            // without a parenthesized subexpression → the whole match (== the
+            // first regexp_substr match). A pattern WITH a capturing group → PG
+            // returns the first group, which needs regex capture-group extraction
+            // (a regex-engine gap, per Epic Rx P3) — honest-error rather than
+            // silently returning the whole match.
+            if name != "mid" && args.len() == 2 && matches!(&args[1], Value::Text(_)) {
+                if let Value::Text(pat) = &args[1]
+                    && pattern_has_capturing_group(pat)
+                {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "substring(string FROM pattern) with a capturing \
+                                 group needs regex capture-group extraction (not \
+                                 yet supported); use a pattern with no parentheses"
+                            .into(),
+                    });
+                }
+                return super::regexp::regexp_substr(&args[..2]);
             }
             let start: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
