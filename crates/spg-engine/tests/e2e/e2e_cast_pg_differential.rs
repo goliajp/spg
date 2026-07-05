@@ -2414,3 +2414,32 @@ fn merge_subquery_source() {
     e.execute("MERGE INTO tg3 USING sr3 ON tg3.id=sr3.id WHEN MATCHED THEN UPDATE SET v=sr3.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (sr3.id,sr3.v)").unwrap();
     assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tg3"), "1:99,2:88");
 }
+
+/// v7.37 D.45 — RANGE partitioning on INTEGER / DATE / BIGINT keys (not just
+/// TIMESTAMPTZ). Routes INSERT/UPDATE by the key's own type. PG18.4-verified.
+#[test]
+fn range_partition_nontimestamp_key() {
+    let mut e = Engine::new();
+    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
+    // INTEGER range key
+    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)").unwrap();
+    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)").unwrap();
+    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)").unwrap();
+    e.execute("CREATE TABLE mi_def PARTITION OF mi DEFAULT").unwrap();
+    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12),(5,25)").unwrap();
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"), "1:5,3:8");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_hi"), "2:15,4:12");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_def"), "5:25");
+    // DATE range key
+    e.execute("CREATE TABLE md(id int, d date) PARTITION BY RANGE (d)").unwrap();
+    e.execute("CREATE TABLE md_2025 PARTITION OF md FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')").unwrap();
+    e.execute("CREATE TABLE md_2026 PARTITION OF md FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')").unwrap();
+    e.execute("INSERT INTO md VALUES (1,'2025-06-15'),(2,'2026-03-20')").unwrap();
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2025"), "1:2025-06-15");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2026"), "2:2026-03-20");
+    // BIGINT range key
+    e.execute("CREATE TABLE mb(id int, k bigint) PARTITION BY RANGE (k)").unwrap();
+    e.execute("CREATE TABLE mb_a PARTITION OF mb FOR VALUES FROM (0) TO (1000000000000)").unwrap();
+    e.execute("INSERT INTO mb VALUES (1, 500000000000)").unwrap();
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||k,',' ORDER BY id) FROM mb_a"), "1:500000000000");
+}

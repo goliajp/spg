@@ -1877,27 +1877,17 @@ impl Engine {
             }
             let target = match parent_kind {
                 spg_storage::PartitionKind::Range => {
-                    let key_micros: i64 = match &key_value {
-                        Value::Timestamp(m) => *m,
-                        Value::Date(days) => i64::from(*days) * 86_400i64 * 1_000_000i64,
-                        Value::Text(s) => {
-                            crate::eval::parse_timestamp_literal(s).ok_or_else(|| {
-                                EngineError::Unsupported(alloc::format!(
-                                    "INSERT INTO {parent_name:?}: partition key text \
-                                     literal {s:?} is not a TIMESTAMPTZ"
-                                ))
-                            })?
-                        }
-                        other => {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "INSERT INTO {parent_name:?}: partition key value \
-                                 {other:?} is not a TIMESTAMPTZ"
-                            )));
-                        }
-                    };
+                    // v7.37 D.45 — route by the key's actual type (int-family /
+                    // DATE / TIMESTAMPTZ / TEXT), not a forced TIMESTAMPTZ coercion.
+                    let key_bound = crate::partition::value_to_bound(&key_value).ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "INSERT INTO {parent_name:?}: partition key value \
+                             {key_value:?} is not a supported RANGE key type"
+                        ))
+                    })?;
                     range_children
                         .iter()
-                        .find(|(_, lo, hi)| crate::partition::value_in_range(key_micros, lo, hi))
+                        .find(|(_, lo, hi)| crate::partition::value_in_range(&key_bound, lo, hi))
                         .map(|(name, _, _)| name.clone())
                         .or_else(|| default_child.clone())
                         .ok_or_else(|| {
