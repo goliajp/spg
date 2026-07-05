@@ -1032,7 +1032,11 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             }};
         }
         let mut consumed = 2usize;
-        if rest.starts_with(b"YYYY") {
+        if rest.starts_with(b"Y,YYY") {
+            // v7.37 — special comma-grouped year token (2026 → "2,026").
+            out.push_str(&group_thousands(&alloc::format!("{y}")));
+            consumed = 5;
+        } else if rest.starts_with(b"YYYY") {
             num!(y, 4);
             consumed = 4;
         } else if rest.starts_with(b"IYYY") {
@@ -1092,6 +1096,11 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             num!(iso_week, 2);
         } else if rest.starts_with(b"IY") {
             let _ = write!(out, "{:02}", iso_year.rem_euclid(100));
+        } else if rest.starts_with(b"IDDD") {
+            // v7.37 — ISO day of year (day within the ISO 8601 week-year),
+            // = (iso_week - 1) * 7 + iso_dow. Must precede the `ID` arm.
+            let _ = write!(out, "{:03}", (iso_week - 1) * 7 + iso_dow);
+            consumed = 4;
         } else if rest.starts_with(b"ID") {
             let _ = write!(out, "{iso_dow}");
         } else if rest.starts_with(b"MM") {
