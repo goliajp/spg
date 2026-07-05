@@ -2854,3 +2854,14 @@ fn to_char_l_currency() {
     assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
     assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
 }
+
+#[test]
+fn numeric_concat_renders_exact_decimal() {
+    // PG: concat / || / format coerce a numeric to its exact decimal text,
+    // not a debug dump. Reachable today via explicit ::numeric.
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
+    assert_eq!(q(&mut e, "SELECT concat('x', 2.5::numeric)"), "x2.5");
+    assert_eq!(q(&mut e, "SELECT concat_ws('-', 1.5::numeric, 2.5::numeric)"), "1.5-2.5");
+    assert_eq!(q(&mut e, "SELECT format('%s', 3.14::numeric)"), "3.14");
+}
