@@ -60,7 +60,7 @@ fn json_each_nested_and_numbers() {
         "SELECT key, value FROM json_each('{\"n\": 5, \"o\": {\"x\": 1}}') ORDER BY key",
     );
     assert_eq!(render(&got[0][1]), Some("5".to_string()));
-    assert_eq!(render(&got[1][1]), Some("{\"x\":1}".to_string()));
+    assert_eq!(render(&got[1][1]), Some("{\"x\": 1}".to_string()));
 }
 
 #[test]
