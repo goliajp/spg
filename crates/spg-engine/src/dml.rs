@@ -1707,15 +1707,9 @@ impl Engine {
                 }
             })?;
             let schema = table.schema();
-            let mut uniq_idx = 0usize;
             let mut found: Option<Vec<String>> = None;
             for uc in &schema.uniqueness_constraints {
-                let synth = if uc.is_primary_key {
-                    alloc::format!("{table_name}_pkey")
-                } else {
-                    uniq_idx += 1;
-                    alloc::format!("{table_name}_uniq{}", uniq_idx - 1)
-                };
+                let synth = crate::system_catalog::pg_unique_conname(table, uc, table_name);
                 if synth.eq_ignore_ascii_case(cname) {
                     found = Some(
                         uc.columns

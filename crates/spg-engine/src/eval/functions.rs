@@ -11293,19 +11293,19 @@ fn apply_function_dispatch(
                         |c| c.name.clone(),
                     )
                 };
-                for (ci, uc) in
-                    t.schema().uniqueness_constraints.iter().enumerate()
-                {
+                for uc in t.schema().uniqueness_constraints.iter() {
+                    let names: alloc::vec::Vec<String> =
+                        uc.columns.iter().map(|&p| col_name_at(p)).collect();
+                    // Match synth_pg_constraint's PG-style auto-names:
+                    // `{t}_pkey` / `{t}_{col…}_key`.
                     let conname = if uc.is_primary_key {
                         alloc::format!("{tname}_pkey")
                     } else {
-                        alloc::format!("{tname}_uniq{ci}")
+                        alloc::format!("{tname}_{}_key", names.join("_"))
                     };
                     if conname != bare {
                         continue;
                     }
-                    let names: alloc::vec::Vec<String> =
-                        uc.columns.iter().map(|&p| col_name_at(p)).collect();
                     let kw = if uc.is_primary_key {
                         "PRIMARY KEY"
                     } else {
