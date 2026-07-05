@@ -113,3 +113,30 @@ fn pg_get_def_by_oid() {
     let QueryResult::Rows { rows, .. } = pk else { panic!() };
     assert!(matches!(&rows[0].values[0], spg_storage::Value::Text(s) if s.as_ref() == "PRIMARY KEY (id)"));
 }
+
+// read01 — a plain (non-UNIQUE) multi-column index now persists every
+// key column, so pg_get_indexdef reports the full list (previously only
+// the leading column survived). Query results are unaffected — the BTree
+// still keys on the leading column. vs live PG 18.4.
+#[test]
+fn multi_column_nonunique_index_lists_all_columns() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE mi (id INT PRIMARY KEY, a INT, b TEXT, c INT)")
+        .unwrap();
+    e.execute("CREATE INDEX idx_mi ON mi (a, b, c)").unwrap();
+    e.execute("INSERT INTO mi VALUES (1, 10, 'x', 5), (2, 10, 'y', 6)")
+        .unwrap();
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_get_indexdef('idx_mi')")),
+        "CREATE INDEX idx_mi ON public.mi USING btree (a, b, c)"
+    );
+    // A trailing-column filter still returns the right rows.
+    let QueryResult::Rows { rows, .. } = e
+        .execute("SELECT id FROM mi WHERE a = 10 AND b = 'y'")
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].values[0], spg_storage::Value::Int(2)));
+}
