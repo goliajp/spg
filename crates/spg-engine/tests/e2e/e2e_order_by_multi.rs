@@ -137,3 +137,69 @@ fn mixed_alias_and_position_in_one_order_by() {
         ]
     );
 }
+
+/// U31 (read01 A-group): ORDER BY of a BIGINT (or TIMESTAMP micros)
+/// used to project the key to f64, silently collapsing values past
+/// 2^53 (`9007199254740993`::float8 == `9007199254740992`::float8),
+/// which scrambled their order. OrderKey::Int carries the exact i128.
+/// Expected order captured live from PG 18.4.
+#[test]
+fn order_by_bigint_past_2pow53_is_exact() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE big (x BIGINT)").unwrap();
+    // Insert scrambled; these four differ only in the low bits and are
+    // indistinguishable as f64.
+    for x in [
+        9_007_199_254_740_994_i64,
+        9_007_199_254_740_992,
+        9_007_199_254_740_993,
+        9_007_199_254_740_991,
+    ] {
+        eng.execute(&format!("INSERT INTO big VALUES ({x})")).unwrap();
+    }
+    let res = eng.execute("SELECT x FROM big ORDER BY x").unwrap();
+    assert_eq!(
+        rows_of(res),
+        vec![
+            vec![Value::BigInt(9_007_199_254_740_991)],
+            vec![Value::BigInt(9_007_199_254_740_992)],
+            vec![Value::BigInt(9_007_199_254_740_993)],
+            vec![Value::BigInt(9_007_199_254_740_994)],
+        ]
+    );
+    // DESC path uses the same key.
+    let res = eng.execute("SELECT x FROM big ORDER BY x DESC LIMIT 2").unwrap();
+    assert_eq!(
+        rows_of(res),
+        vec![
+            vec![Value::BigInt(9_007_199_254_740_994)],
+            vec![Value::BigInt(9_007_199_254_740_993)],
+        ]
+    );
+}
+
+/// U31 sibling: TIMESTAMP is ordered by its exact microsecond count,
+/// so timestamps one microsecond apart (well past the f64 integer
+/// range for large epochs) still order correctly.
+#[test]
+fn order_by_timestamp_microsecond_is_exact() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE evt (ts TIMESTAMP)").unwrap();
+    for us in ["000002", "000000", "000001"] {
+        eng.execute(&format!(
+            "INSERT INTO evt VALUES (TIMESTAMP '2024-01-01 00:00:00.{us}')"
+        ))
+        .unwrap();
+    }
+    let res = eng
+        .execute("SELECT (ts)::text FROM evt ORDER BY ts")
+        .unwrap();
+    assert_eq!(
+        rows_of(res),
+        vec![
+            vec![Value::text("2024-01-01 00:00:00")],
+            vec![Value::text("2024-01-01 00:00:00.000001")],
+            vec![Value::text("2024-01-01 00:00:00.000002")],
+        ]
+    );
+}
