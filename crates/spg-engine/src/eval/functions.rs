@@ -1707,6 +1707,41 @@ fn apply_function_dispatch(
         // over [low, high]. Values < low return 0; values >= high
         // return count+1 (matches PG semantics).
         "width_bucket" => {
+            // v7.38 (read01) — the array form
+            // `width_bucket(operand, thresholds[])` returns the number of
+            // (ascending-sorted) thresholds ≤ operand, i.e. the bucket the
+            // operand falls into. NULL element thresholds are skipped.
+            if args.len() == 2 {
+                if args.iter().any(|v| matches!(v, Value::Null)) {
+                    return Ok(Value::Null);
+                }
+                let op = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "width_bucket(): operand must be numeric".into(),
+                })?;
+                let Some(n) = array_len(&args[1]) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "width_bucket(): second argument must be a numeric array".into(),
+                    });
+                };
+                // An inline `ARRAY[1.0, 3.0, …]` of bare decimals is
+                // inferred as a TEXT[], so parse text thresholds too.
+                let as_f64 = |v: &Value| -> Option<f64> {
+                    value_to_f64(v).or_else(|| match v {
+                        Value::Text(s) => s.trim().parse::<f64>().ok(),
+                        _ => None,
+                    })
+                };
+                let mut bucket = 0i32;
+                for i in 0..n {
+                    let elem = array_element_at(&args[1], i).unwrap_or(Value::Null);
+                    if let Some(t) = as_f64(&elem)
+                        && op >= t
+                    {
+                        bucket += 1;
+                    }
+                }
+                return Ok(Value::Int(bucket));
+            }
             if args.len() != 4 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
