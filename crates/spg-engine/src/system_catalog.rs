@@ -12,6 +12,32 @@ use spg_storage::{Catalog, ColumnSchema, DataType, Row, TableSchema, Value};
 
 use crate::{Engine, EngineError};
 
+/// PG's auto-generated name for a uniqueness constraint: `{table}_pkey`
+/// for a PRIMARY KEY, else `{table}_{col…}_key` with each constrained
+/// column name joined by `_`. Shared by every pg_catalog /
+/// information_schema view and pg_get_constraintdef so they agree.
+pub(crate) fn pg_unique_conname(
+    t: &spg_storage::Table,
+    uc: &spg_storage::UniquenessConstraint,
+    tname: &str,
+) -> String {
+    if uc.is_primary_key {
+        return alloc::format!("{tname}_pkey");
+    }
+    let cols = uc
+        .columns
+        .iter()
+        .map(|&p| {
+            t.schema()
+                .columns
+                .get(p)
+                .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+        })
+        .collect::<Vec<_>>()
+        .join("_");
+    alloc::format!("{tname}_{cols}_key")
+}
+
 /// v7.16.2 — map an SPG [`DataType`] to the PG-canonical
 /// `information_schema.columns.data_type` text. Covers the
 /// values mailrs's migrations probe (`'ARRAY'`, `'integer'`,
@@ -1378,12 +1404,8 @@ pub(crate) fn synth_information_schema_table_constraints(
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         // Uniqueness constraints — both PK and UNIQUE forms.
-        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
-            let conname = if uc.is_primary_key {
-                alloc::format!("{tname}_pkey")
-            } else {
-                alloc::format!("{tname}_uniq{ci}")
-            };
+        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = pg_unique_conname(t, uc, &tname);
             let kind = if uc.is_primary_key {
                 "PRIMARY KEY"
             } else {
@@ -2242,12 +2264,8 @@ pub(crate) fn synth_info_constraint_column_usage(
             cols.get(pos)
                 .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
         };
-        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
-            let conname = if uc.is_primary_key {
-                alloc::format!("{tname}_pkey")
-            } else {
-                alloc::format!("{tname}_uniq{ci}")
-            };
+        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = pg_unique_conname(t, uc, &tname);
             for &p in &uc.columns {
                 push(&tname, col_name_at(p), conname.clone());
             }
@@ -2420,12 +2438,8 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
             }
         }
         // PK / composite UC entries.
-        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
-            let conname = if uc.is_primary_key {
-                alloc::format!("{}_pkey", tname)
-            } else {
-                alloc::format!("{}_uniq{ci}", tname)
-            };
+        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = pg_unique_conname(t, uc, &tname);
             for (i, &local) in uc.columns.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
                 let ordinal = (i + 1) as i32;
@@ -2647,13 +2661,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             s
         };
         // Uniqueness constraints.
-        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+        for uc in t.schema().uniqueness_constraints.iter() {
             let kind = if uc.is_primary_key { "p" } else { "u" };
-            let conname = if uc.is_primary_key {
-                alloc::format!("{}_pkey", tname)
-            } else {
-                alloc::format!("{}_uniq{ci}", tname)
-            };
+            let conname = pg_unique_conname(t, uc, &tname);
             let conkey = conkey_vec(&uc.columns);
             let conkey_names: Vec<String> =
                 uc.columns.iter().map(|&p| col_name_at(p)).collect();

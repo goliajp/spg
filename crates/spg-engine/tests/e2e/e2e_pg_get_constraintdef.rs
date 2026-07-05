@@ -88,3 +88,44 @@ fn constraintdef_check_and_not_null() {
     );
     assert_eq!(text(&via_oid), "CHECK ((a > 0))");
 }
+
+// read01 — UNIQUE constraints use PG's auto-name convention
+// `{table}_{col…}_key`, consistent across pg_constraint,
+// pg_get_constraintdef, and `ON CONFLICT ON CONSTRAINT`. vs live PG 18.4.
+#[test]
+fn unique_constraint_pg_naming() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE nm (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b, c))")
+        .unwrap();
+    let names = {
+        let r = e
+            .execute(
+                "SELECT conname FROM pg_constraint \
+                 WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'nm') \
+                   AND contype = 'u' ORDER BY conname",
+            )
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        rows.iter()
+            .filter_map(|row| match &row.values[0] {
+                spg_storage::Value::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names, ["nm_a_key", "nm_b_c_key"]);
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_get_constraintdef('nm_b_c_key')")),
+        "UNIQUE (b, c)"
+    );
+    // The name resolves for ON CONFLICT ON CONSTRAINT.
+    e.execute("INSERT INTO nm VALUES (1, 2, 3)").unwrap();
+    e.execute("INSERT INTO nm VALUES (1, 9, 9) ON CONFLICT ON CONSTRAINT nm_a_key DO NOTHING")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } =
+        e.execute("SELECT count(*) FROM nm").unwrap()
+    else {
+        panic!()
+    };
+    assert!(matches!(rows[0].values[0], spg_storage::Value::BigInt(1)));
+}
