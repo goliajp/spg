@@ -149,6 +149,114 @@ pub fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
         .collect()
 }
 
+/// Decode one CSV data record (`COPY … FROM stdin WITH (FORMAT csv)`)
+/// into its fields. A field that starts with the quote character is a
+/// quoted field: its content runs to the matching close quote, a
+/// doubled quote (`""`) is one literal quote, and it is never NULL — a
+/// quoted empty string stays `Some("")`. An unquoted field runs to the
+/// next delimiter; if its text equals `null_str` it decodes to NULL, so
+/// with the default empty null string an empty *unquoted* field is NULL
+/// while `""` is the empty string (PG's exact CSV distinction). Embedded
+/// delimiters and newlines are only meaningful inside quotes.
+#[must_use]
+pub fn decode_copy_csv_record(
+    record: &str,
+    delimiter: char,
+    quote: char,
+    null_str: &str,
+) -> Vec<Option<String>> {
+    let chars: Vec<char> = record.chars().collect();
+    let n = chars.len();
+    let mut fields: Vec<Option<String>> = Vec::new();
+    let mut i = 0;
+    loop {
+        if i < n && chars[i] == quote {
+            // Quoted field: read to the matching close quote.
+            i += 1;
+            let mut content = String::new();
+            while i < n {
+                let c = chars[i];
+                if c == quote {
+                    if i + 1 < n && chars[i + 1] == quote {
+                        content.push(quote);
+                        i += 2;
+                    } else {
+                        i += 1; // closing quote
+                        break;
+                    }
+                } else {
+                    content.push(c);
+                    i += 1;
+                }
+            }
+            fields.push(Some(content));
+            // Skip any characters between the close quote and the next
+            // delimiter (PG rejects them; we are lenient).
+            while i < n && chars[i] != delimiter {
+                i += 1;
+            }
+        } else {
+            // Unquoted field: read to the next delimiter.
+            let start = i;
+            while i < n && chars[i] != delimiter {
+                i += 1;
+            }
+            let content: String = chars[start..i].iter().collect();
+            fields.push(if content == null_str {
+                None
+            } else {
+                Some(content)
+            });
+        }
+        if i < n && chars[i] == delimiter {
+            i += 1; // step over the delimiter, parse the next field
+        } else {
+            break;
+        }
+    }
+    fields
+}
+
+/// Byte length of the first complete CSV record in `buf` — including its
+/// terminating `\n` — or `None` if the buffer does not yet hold a full
+/// record (an unterminated quoted field, or no record-ending newline
+/// yet). Quote-aware: a newline inside a quoted field is part of the
+/// record. The quote character only opens a quoted field at the start of
+/// a field (buffer start or right after a delimiter), so `delimiter` is
+/// needed to track field boundaries. Scanning raw bytes is UTF-8-safe
+/// because the ASCII delimiter / quote / newline never collide with a
+/// multi-byte continuation byte (which is always ≥ 0x80).
+#[must_use]
+pub fn csv_record_end(buf: &[u8], delimiter: u8, quote: u8) -> Option<usize> {
+    let mut in_quote = false;
+    let mut at_field_start = true;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if in_quote {
+            if b == quote {
+                if buf.get(i + 1) == Some(&quote) {
+                    i += 2; // escaped quote, still inside the field
+                    continue;
+                }
+                in_quote = false; // closing quote
+            }
+            // Any other byte (including '\n') stays inside the field.
+        } else if b == quote && at_field_start {
+            in_quote = true;
+            at_field_start = false;
+        } else if b == b'\n' {
+            return Some(i + 1);
+        } else if b == delimiter {
+            at_field_start = true;
+        } else {
+            at_field_start = false;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Build `INSERT INTO <table> [(cols)] VALUES (…)` from a decoded
 /// row. Numeric-looking and boolean cells go in bare so the engine
 /// sees typed literals; everything else is single-quoted with SQL
@@ -286,6 +394,61 @@ mod tests {
             build_copy_insert("t", None, &[None, Some("0042".to_string())]),
             "INSERT INTO t VALUES (NULL, '0042')"
         );
+    }
+
+    fn csv(record: &str) -> Vec<Option<String>> {
+        decode_copy_csv_record(record, ',', '"', "")
+    }
+
+    #[test]
+    fn decodes_csv_quoting_and_null() {
+        // Quoted field with embedded delimiter + doubled quote; PG18.4.
+        assert_eq!(
+            csv("p,\"x,y\",\"a\"\"b\""),
+            vec![
+                Some("p".to_string()),
+                Some("x,y".to_string()),
+                Some("a\"b".to_string()),
+            ]
+        );
+        // Spaces preserved; trailing empty *unquoted* field → NULL.
+        assert_eq!(
+            csv("q, spaced ,"),
+            vec![Some("q".to_string()), Some(" spaced ".to_string()), None]
+        );
+        // Empty unquoted → NULL; empty quoted → "" (the CSV distinction).
+        assert_eq!(csv(",\"\""), vec![None, Some(String::new())]);
+        // A quoted field may hold a newline (the record spans lines).
+        assert_eq!(
+            csv("\"line\nbreak\",r"),
+            vec![Some("line\nbreak".to_string()), Some("r".to_string())]
+        );
+    }
+
+    #[test]
+    fn decodes_csv_custom_delimiter_quote_and_null() {
+        assert_eq!(
+            decode_copy_csv_record("1;#a;b#;NULO", ';', '#', "NULO"),
+            vec![Some("1".to_string()), Some("a;b".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn csv_record_end_is_quote_aware() {
+        // A newline outside quotes ends the record (length includes it).
+        assert_eq!(csv_record_end(b"a,b\nrest", b',', b'"'), Some(4));
+        // A newline *inside* a quoted field does not end the record; the
+        // record ends at the newline after the closing quote.
+        assert_eq!(csv_record_end(b"a,\"x\ny\"\nnext", b',', b'"'), Some(8));
+        // A quoted field is only opened at a field start (after a
+        // delimiter): the second field's quote must be honoured.
+        assert_eq!(csv_record_end(b"1,\"p\nq\"\n", b',', b'"'), Some(8));
+        // Doubled quote inside a quoted field stays inside.
+        assert_eq!(csv_record_end(b"\"a\"\"b\"\nx", b',', b'"'), Some(7));
+        // Incomplete: unterminated quote → need more bytes.
+        assert_eq!(csv_record_end(b"\"unterminated\n", b',', b'"'), None);
+        // Incomplete: no newline yet.
+        assert_eq!(csv_record_end(b"a,b", b',', b'"'), None);
     }
 }
 
