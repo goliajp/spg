@@ -534,7 +534,7 @@ impl Parser {
             Token::LParen
                 if matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::Select | Token::LParen)
+                    Some(Token::Select | Token::LParen | Token::Values)
                 ) =>
             {
                 self.parse_select_stmt()
@@ -7019,12 +7019,21 @@ impl Parser {
         if matches!(self.peek(), Token::LParen)
             && matches!(
                 self.tokens.get(self.pos + 1),
-                Some(Token::Select | Token::LParen)
+                Some(Token::Select | Token::LParen | Token::Values)
             )
         {
             self.advance(); // (
             self.enter_nested()?;
-            let mut head = self.parse_bare_select().and_then(|mut h| {
+            // v7.37 D.20 — a group whose head is a VALUES list:
+            // `(VALUES (1),(2)) UNION (VALUES (3))`. Parse the VALUES body,
+            // otherwise recurse into a nested SELECT/group head.
+            let mut head = (if matches!(self.peek(), Token::Values) {
+                self.advance(); // VALUES
+                self.parse_values_rows_body()
+            } else {
+                self.parse_bare_select()
+            })
+            .and_then(|mut h| {
                 self.parse_setop_chain_into(&mut h)?;
                 Ok(h)
             });
