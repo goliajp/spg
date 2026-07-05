@@ -1090,27 +1090,16 @@ fn apply_binary_numeric(
             if b == 0 {
                 return Err(EvalError::DivisionByZero);
             }
-            // Result scale: keep the wider operand's scale. Pre-scale
-            // the numerator so the integer division retains that many
-            // fractional digits. Round half-away-from-zero.
-            let target_scale = sa.max(sb);
-            // Numerator effective scale becomes sa + target_scale; we
-            // bring it up to (target_scale + sb) so the divisor's scale
-            // cancels cleanly.
-            let bump = pow10_i128(target_scale.saturating_add(sb).saturating_sub(sa));
-            let num = a.checked_mul(bump).ok_or(EvalError::TypeMismatch {
-                detail: "NUMERIC overflow on / scaling".into(),
-            })?;
-            let half = if b >= 0 { b / 2 } else { -(b / 2) };
-            let adj = if (num >= 0) == (b >= 0) {
-                num + half
-            } else {
-                num - half
-            };
-            Ok(Value::Numeric {
-                scaled: adj / b,
-                scale: target_scale,
-            })
+            // PG `numeric / numeric` picks the result scale via
+            // `select_div_scale` — it forces at least NUMERIC_MIN_SIG_DIGITS
+            // (16) significant digits, so `10::numeric / 3` keeps 16
+            // fractional digits (3.3333333333333333) rather than truncating
+            // to the operands' scale-0 (which silently produced `3`).
+            let (scaled, scale) =
+                crate::numeric::numeric_div(a, sa, b, sb).ok_or(EvalError::TypeMismatch {
+                    detail: "NUMERIC overflow on / scaling".into(),
+                })?;
+            Ok(Value::Numeric { scaled, scale })
         }
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             let target_scale = sa.max(sb);
