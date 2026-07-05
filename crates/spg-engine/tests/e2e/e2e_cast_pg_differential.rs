@@ -2508,3 +2508,22 @@ fn jsonb_array_length_text_arg() {
     assert_eq!(q(&mut e, "SELECT jsonb_array_length(NULL)"), "Null");
     assert!(q(&mut e, "SELECT jsonb_array_length('{\"a\":1}')").starts_with("ERR"));
 }
+
+/// v7.37 D.49 (family) — jsonb_typeof / json_typeof / jsonb_strip_nulls also
+/// accept a TEXT arg. PG18.4-verified.
+#[test]
+fn jsonb_typeof_strip_text_arg() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Null=>"".into(), o=>format!("{o:?}") }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.25}", format!("{er:?}")) }
+    };
+    assert_eq!(q(&mut e, "SELECT jsonb_typeof('[1,2]')"), "array");
+    assert_eq!(q(&mut e, "SELECT jsonb_typeof('{\"a\":1}')"), "object");
+    assert_eq!(q(&mut e, "SELECT jsonb_typeof('42')"), "number");
+    assert_eq!(q(&mut e, "SELECT json_typeof('\"hi\"')"), "string");
+    // strip_nulls returns jsonb; its spacing is D.8-architectural so just check keys
+    assert_eq!(q(&mut e, "SELECT (jsonb_strip_nulls('{\"a\":null,\"b\":1}')->>'b')"), "1");
+    // NULL passthrough + ::jsonb still work
+    assert_eq!(q(&mut e, "SELECT jsonb_typeof(NULL)"), "");
+    assert_eq!(q(&mut e, "SELECT jsonb_typeof('[1]'::jsonb)"), "array");
+}
