@@ -67,3 +67,24 @@ fn width_bucket_ascending() {
         }
     }
 }
+
+// read01 — the array form width_bucket(operand, thresholds[]) returns
+// the count of ascending thresholds ≤ operand. Inline decimal arrays are
+// inferred as TEXT[], so the thresholds are parsed numerically. vs PG18.4.
+#[test]
+fn width_bucket_array_form() {
+    let mut e = Engine::new();
+    let bucket = |e: &mut Engine, sql: &str| -> i64 {
+        match first(e, sql) {
+            spg_storage::Value::Int(n) => i64::from(n),
+            other => panic!("{sql}: {other:?}"),
+        }
+    };
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(5, ARRAY[1,3,7,10])"), 2);
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(0, ARRAY[1,3,7,10])"), 0);
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(20, ARRAY[1,3,7,10])"), 4);
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(3, ARRAY[1,3,7,10])"), 2);
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(2.5, ARRAY[1.0,3.0,7.0])"), 1);
+    // The 4-arg range form still works.
+    assert_eq!(bucket(&mut e, "SELECT width_bucket(5.0, 0.0, 10.0, 5)"), 3);
+}
