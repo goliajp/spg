@@ -601,7 +601,7 @@ impl Engine {
                 // Recurse into the inner SELECT first so nested
                 // subqueries materialise bottom-up.
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                let r = match self.exec_select_cancel(&s, cancel) {
                     Ok(r) => r,
                     Err(e) if is_correlation_error(&e) => return Ok(None),
                     Err(e) => return Err(e),
@@ -629,7 +629,7 @@ impl Engine {
                 }
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                let r = match self.exec_select_cancel(&s, cancel) {
                     Ok(r) => r,
                     Err(e) if is_correlation_error(&e) => return Ok(None),
                     Err(e) => return Err(e),
@@ -651,7 +651,7 @@ impl Engine {
                 }
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                let r = match self.exec_select_cancel(&s, cancel) {
                     Ok(r) => r,
                     Err(e) if is_correlation_error(&e) => return Ok(None),
                     Err(e) => return Err(e),

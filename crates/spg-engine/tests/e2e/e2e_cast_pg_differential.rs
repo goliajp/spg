@@ -2177,3 +2177,23 @@ fn view_over_values_derived() {
     e.execute("INSERT INTO lt VALUES (1),(2)").unwrap();
     assert_eq!(q(&mut e, "SELECT string_agg(a||':'||b, ',' ORDER BY a) FROM lt CROSS JOIN LATERAL (SELECT lt.a*10 b) s"), "1:10,2:20");
 }
+
+/// v7.37 D.29 — a view referenced inside an uncorrelated scalar / EXISTS / IN
+/// subquery is now expanded (the subquery exec path used exec_bare_select_cancel,
+/// which skips view/CTE/union expansion). PG18.4-verified.
+#[test]
+fn view_in_scalar_subquery() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    e.execute("CREATE VIEW vw AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)").unwrap();
+    assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM vw)::text"), "3");
+    assert_eq!(q(&mut e, "SELECT (SELECT sum(d) FROM vw)::text"), "60");
+    assert_eq!(q(&mut e, "SELECT (EXISTS (SELECT 1 FROM vw WHERE d > 25))::text"), "true");
+    assert_eq!(q(&mut e, "SELECT string_agg(g::text,',' ORDER BY g) FROM vw WHERE d IN (SELECT d FROM vw WHERE g > 1)"), "2,3");
+}
