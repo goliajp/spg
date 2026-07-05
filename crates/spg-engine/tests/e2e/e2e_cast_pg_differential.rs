@@ -2676,3 +2676,19 @@ fn to_char_ts_ssss_and_ff() {
     // midnight SSSS=0
     assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 00:00:00', 'SSSS')"), "0");
 }
+
+/// v7.37 D.59 — to_char Y,YYY comma-year + IDDD ISO day-of-year. PG18.4-verified.
+#[test]
+fn to_char_ts_yyyy_comma_and_iddd() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    macro_rules! p { ($f:expr) => { q(&mut e, &format!("SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', '{}')", $f)) } }
+    assert_eq!(p!("Y,YYY"), "2,026");
+    assert_eq!(p!("IDDD"), "067");
+    // no regression: ID (iso dow) + DD (day) still independent
+    assert_eq!(p!("ID"), "4");
+    assert_eq!(p!("DD"), "05");
+    assert_eq!(p!("YYYY"), "2026");
+    // IDDD on ISO-year day 1 (2026 ISO year starts Mon 2025-12-29)
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2025-12-29 00:00:00', 'IDDD')"), "001");
+}
