@@ -13702,6 +13702,24 @@ fn expect_text_arg<'a>(
 /// case-insensitively; AM/PM adjust HH12; every other template
 /// char consumes one input char (separator). Returns
 /// (year, month, day, hour, minute, second, microsecond).
+/// PG `adjust_partial_year_to_2020` (formatting.c): map a partial
+/// (< 4-digit) year field toward the 1970-2069 window. Two-digit years
+/// pivot at 70 ('70' → 1970, '69' → 2069); three-digit years fold via
+/// the same downstream ranges ('970' → 1970).
+fn adjust_partial_year_to_2020(year: i32) -> i32 {
+    if year < 70 {
+        year + 2000
+    } else if year < 100 {
+        year + 1900
+    } else if year < 520 {
+        year + 2000
+    } else if year < 1000 {
+        year + 1000
+    } else {
+        year
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn parse_by_format(
     input: &str,
@@ -13712,6 +13730,12 @@ fn parse_by_format(
         "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
     ];
     let mut year: i32 = 1;
+    // Deferred year resolution: (raw value, format-token digit width). A
+    // partial (< 4-digit) field gets PG's adjust_partial_year_to_2020
+    // pivot; a `CC` century token, when present, overrides the high
+    // digits. Resolved after the parse loop so DDD sees the final year.
+    let mut year_token: Option<(i32, u8)> = None;
+    let mut century: Option<i32> = None;
     let mut month: u32 = 1;
     let mut day: u32 = 1;
     let mut hour: u32 = 0;
@@ -13755,12 +13779,25 @@ fn parse_by_format(
         if starts_with_ci(&fmt_bytes, fi, "YYYY") {
             let v = take_digits(&in_bytes, &mut ii, 4)
                 .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
-            year = v as i32;
+            year_token = Some((v as i32, 4));
             fi += 4;
+        } else if starts_with_ci(&fmt_bytes, fi, "YYY") {
+            let v = take_digits(&in_bytes, &mut ii, 3)
+                .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
+            year_token = Some((v as i32, 3));
+            fi += 3;
         } else if starts_with_ci(&fmt_bytes, fi, "YY") {
             let v = take_digits(&in_bytes, &mut ii, 2)
                 .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
-            year = 2000 + v as i32;
+            year_token = Some((v as i32, 2));
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "CC") {
+            // Century token. Resolved after the loop: `CC` alone gives the
+            // first year of that century ((cc-1)*100+1); combined with a
+            // 1-2 digit year it supplies the high digits.
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected century digits at position {ii}"))?;
+            century = Some(v as i32);
             fi += 2;
         } else if starts_with_ci(&fmt_bytes, fi, "MONTH") {
             let rest: alloc::string::String =
@@ -13865,6 +13902,22 @@ fn parse_by_format(
         } else if !pm_shift && hour == 12 {
             hour = 0;
         }
+    }
+    // Resolve the year: a `CC` century token (alone, or supplying the high
+    // digits for a 1-2 digit year) takes priority; otherwise a partial
+    // (< 4-digit) year field is pivoted via PG's adjust_partial_year_to_2020
+    // ('70' → 1970, '69' → 2069), and a 4-digit field is taken literally.
+    match (century, year_token) {
+        (Some(cc), Some((yy, digits))) if digits <= 2 => {
+            year = (cc - 1) * 100 + yy;
+        }
+        (Some(cc), _) => {
+            year = (cc - 1) * 100 + 1;
+        }
+        (None, Some((v, digits))) => {
+            year = if digits >= 4 { v } else { adjust_partial_year_to_2020(v) };
+        }
+        (None, None) => {}
     }
     // v7.37 — resolve DDD (day of year) to month/day now that the year is
     // known (Jan 1 + doy - 1).
