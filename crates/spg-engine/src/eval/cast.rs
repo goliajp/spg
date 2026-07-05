@@ -228,16 +228,29 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     detail: alloc::format!("unsupported cast target `::{name}`"),
                 }
             })?;
-            // PG semantics: an EXPLICIT varchar(n) / char(n) cast
-            // truncates to n characters — only column assignment
-            // errors on overflow. Truncate up front so the coerce
-            // path's length contract never fires here.
+            // PG semantics: any value casts to varchar(n) / char(n) through
+            // its text representation (`99::char(2)` → '99'), and an EXPLICIT
+            // cast truncates to n characters — only column assignment errors on
+            // overflow. Stringify a non-text source first, then truncate up
+            // front so the coerce path's length contract never fires here.
             let v = match (&dt, v) {
                 (
                     spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n),
-                    Value::Text(s),
-                ) if *n > 0 && s.chars().count() > *n as usize => {
-                    Value::text(s.chars().take(*n as usize).collect::<alloc::string::String>())
+                    v,
+                ) => {
+                    // v7.37 D.36 — previously only `Value::Text` was handled, so
+                    // `99::char(2)` reached coerce_value as an INT and hit a
+                    // CHAR/INT storage type-mismatch.
+                    let s = match v {
+                        Value::Text(s) => s.into_owned(),
+                        other => value_to_text(&other),
+                    };
+                    let s = if *n > 0 && s.chars().count() > *n as usize {
+                        s.chars().take(*n as usize).collect::<alloc::string::String>()
+                    } else {
+                        s
+                    };
+                    Value::text(s)
                 }
                 (_, v) => v,
             };
