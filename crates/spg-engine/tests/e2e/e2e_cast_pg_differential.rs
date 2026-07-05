@@ -2082,3 +2082,28 @@ fn derived_values_group() {
     assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION ALL (VALUES (2),(3))) s(x)"), "1,2,2,3");
     assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY x) FROM ((VALUES ('a')) UNION (SELECT 'b')) s(x)"), "a,b");
 }
+
+/// v7.37 D.22 follow-up — a set-returning function alongside scalar columns in a
+/// no-FROM projection (`SELECT 'x', unnest(ARRAY[1,2])`) expands to rows with the
+/// scalars repeated. PG18.4-verified.
+#[test]
+fn mixed_srf_in_projection() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // scalar + SRF, no FROM
+    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||u, ',' ORDER BY a, u) FROM (SELECT 'x' a, unnest(ARRAY[1,2]) u) s"), "x:1,x:2");
+    // scalar + generate_series, no FROM
+    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||g, ',' ORDER BY g) FROM (SELECT 'y' a, generate_series(1,3) g) s"), "y:1,y:2,y:3");
+    // bare single SRF still works (D.22 base case)
+    assert_eq!(q(&mut e, "SELECT string_agg(u::text,',' ORDER BY u) FROM (SELECT unnest(ARRAY[5,3]) u) s"), "3,5");
+    // mixed SRF over a real FROM still works (targetlist-SRF path, unchanged)
+    e.execute("CREATE TABLE mt(id int, tags int[])").unwrap();
+    e.execute("INSERT INTO mt VALUES (1, ARRAY[10,20]),(2,ARRAY[30])").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||u, ',' ORDER BY id, u) FROM (SELECT id, unnest(tags) u FROM mt) s"), "1:10,1:20,2:30");
+}
