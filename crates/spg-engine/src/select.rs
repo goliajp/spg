@@ -191,6 +191,7 @@ impl Engine {
                 order_by,
                 frame,
                 null_treatment,
+                filter,
             } = wnode
             else {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
@@ -236,6 +237,7 @@ impl Engine {
                     !order_by.is_empty(),
                     frame.as_ref(),
                     *null_treatment,
+                    filter.as_deref(),
                     &indexed[p_start..p_end],
                     &filtered_refs,
                     &ctx,
