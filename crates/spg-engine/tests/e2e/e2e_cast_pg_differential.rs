@@ -2692,3 +2692,23 @@ fn to_char_ts_yyyy_comma_and_iddd() {
     // IDDD on ISO-year day 1 (2026 ISO year starts Mon 2025-12-29)
     assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2025-12-29 00:00:00', 'IDDD')"), "001");
 }
+
+/// v7.37 D.60 — to_char timestamp era (AD/BC/dotted) + dotted meridiem + real
+/// TH/th ordinal on the preceding field. Full sweep vs PG18.4.
+#[test]
+fn to_char_ts_era_meridiem_ordinal() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.10}", format!("{er:?}")) } };
+    let ts = "TIMESTAMP '2026-03-05 14:30:45.123456'";
+    let codes = ["AM","PM","A.M.","am","pm","a.m.","BC","AD","B.C.","bc","MMth","HH12th","DDth","DDTH"];
+    let pg =    ["PM","PM","P.M.","pm","pm","p.m.","AD","AD","A.D.","ad","03rd","02nd","05th","05TH"];
+    let mut diffs: Vec<String> = Vec::new();
+    for (i,c) in codes.iter().enumerate() {
+        let got = q(&mut e, &format!("SELECT to_char({ts}, '{c}')"));
+        if got != pg[i] { diffs.push(format!("{c}[{got}!={}]", pg[i])); }
+    }
+    // ordinal edges + BC date, PG18.4-verified
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-21 14:00:00','DDth')"), "21st");
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-01 00:00:00','DDth')"), "01st");
+    assert!(diffs.is_empty(), "DIVERGENCES: {}", diffs.join(" "));
+}
