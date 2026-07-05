@@ -4849,6 +4849,19 @@ pub(crate) fn generate_series_rows(
     if arg_values.iter().any(|v| matches!(v, Value::Null)) {
         return Ok((DataType::BigInt, alloc::vec::Vec::new()));
     }
+    // PG resolves `generate_series(date, date, interval)` to the
+    // timestamp/timestamptz overload by implicitly casting each date
+    // bound up to a timestamp at midnight (verified vs live PG18.4:
+    // date args yield rows anchored at 00:00:00). SPG's TZ-naive
+    // timestamp model renders the same instants, so fold any Date
+    // bound to its midnight Timestamp (canonical `days *
+    // 86_400_000_000`, matching cast.rs `cast_to_timestamp`) before
+    // the shape match so the existing timestamp arm drives the walk.
+    for v in &mut arg_values {
+        if let Value::Date(d) = *v {
+            *v = Value::Timestamp(i64::from(d) * 86_400_000_000);
+        }
+    }
     match arg_values.as_slice() {
         [Value::Timestamp(start), Value::Timestamp(stop), step] => {
             let interval_step = match step {
