@@ -11186,8 +11186,8 @@ fn apply_function_dispatch(
                 false
             };
             let val = match name.to_ascii_lowercase().as_str() {
-                "server_version" => "16.0 (SPG-compat)",
-                "server_version_num" => "160000",
+                "server_version" => "18.4 (SPG-compat)",
+                "server_version_num" => "180004",
                 "server_encoding" => "UTF8",
                 "client_encoding" => "UTF8",
                 "lc_collate" => "C.UTF-8",
@@ -13053,7 +13053,7 @@ fn apply_function_dispatch(
             };
             Ok(Value::BigInt(a - b))
         }
-        "version" => Ok(Value::text("PostgreSQL 16 (SPG-compat)")),
+        "version" => Ok(Value::text("PostgreSQL 18.4 (SPG-compat)")),
         // v7.37.17 (17.6 siblings) — PG's `similar_to_escape(pattern
         // [, escape])` converts a SQL-standard SIMILAR TO pattern
         // to a POSIX regex string. The conversion table:

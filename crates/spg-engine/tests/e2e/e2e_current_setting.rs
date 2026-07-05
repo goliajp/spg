@@ -22,11 +22,11 @@ fn current_setting_server_version() {
     let mut e = Engine::new();
     assert_eq!(
         text(&first(&mut e, "SELECT current_setting('server_version')")),
-        "16.0 (SPG-compat)"
+        "18.4 (SPG-compat)"
     );
     assert_eq!(
         text(&first(&mut e, "SELECT current_setting('server_version_num')")),
-        "160000"
+        "180004"
     );
 }
 

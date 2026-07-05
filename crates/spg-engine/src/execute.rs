@@ -823,7 +823,7 @@ impl Engine {
                 // per-session parameter.
                 if name.eq_ignore_ascii_case("all") {
                     let params: &[(&str, &str, &str)] = &[
-                        ("server_version", "16.0 (spg)", "Reports the server version."),
+                        ("server_version", "18.4 (spg)", "Reports the server version."),
                         ("server_encoding", "UTF8", "Sets the server's encoding."),
                         ("client_encoding", "UTF8", "Sets the client's encoding."),
                         ("is_superuser", "on", "Reports superuser status."),
@@ -857,7 +857,7 @@ impl Engine {
                 let owned;
                 let value: &str = match name.as_str() {
                     "transaction_isolation" => self.current_isolation_level.as_pg_str(),
-                    "server_version" => "16.0 (spg)",
+                    "server_version" => "18.4 (spg)",
                     "server_encoding" => "UTF8",
                     "is_superuser" => "on",
                     "TimeZone" | "timezone" => self

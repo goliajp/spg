@@ -1131,7 +1131,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     send_msg(&mut stream, b'R', &0u32.to_be_bytes())?;
     // ParameterStatus pairs — keep the set minimal but include the
     // ones psql / driver libraries check first.
-    send_parameter_status(&mut stream, "server_version", "16.0 (spg-4.3)")?;
+    send_parameter_status(&mut stream, "server_version", "18.4 (spg-4.3)")?;
     send_parameter_status(&mut stream, "client_encoding", "UTF8")?;
     send_parameter_status(&mut stream, "DateStyle", "ISO, MDY")?;
     send_parameter_status(&mut stream, "integer_datetimes", "on")?;
@@ -2911,7 +2911,7 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("intervalstyle", "postgres"),
         ("search_path", "\"$user\", public"),
         ("server_encoding", "UTF8"),
-        ("server_version", "16.0 (spg-4.19)"),
+        ("server_version", "18.4 (spg-4.19)"),
         ("standard_conforming_strings", "on"),
         ("statement_timeout", "0"),
         ("timezone", "UTC"),
