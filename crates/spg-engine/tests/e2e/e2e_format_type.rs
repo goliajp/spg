@@ -69,3 +69,26 @@ fn unknown_oid_and_null() {
         spg_storage::Value::Null
     ));
 }
+
+// read01 — SPG's `::regtype` yields the type name (no OID space), so
+// format_type is commonly called as `format_type('int4'::regtype, …)`
+// with a TEXT first argument. It must resolve the name and render the
+// typmod, same as the OID path. Values vs live PG 18.4.
+#[test]
+fn format_type_accepts_regtype_name() {
+    let mut e = Engine::new();
+    assert_eq!(text(&first(&mut e, "SELECT format_type('int4'::regtype, NULL)")), "integer");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('varchar'::regtype, 14)")),
+        "character varying(10)"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('numeric'::regtype, 655366)")),
+        "numeric(10,2)"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('timestamp'::regtype, 3)")),
+        "timestamp(3) without time zone"
+    );
+    assert_eq!(text(&first(&mut e, "SELECT format_type('bool'::regtype, NULL)")), "boolean");
+}
