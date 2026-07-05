@@ -550,6 +550,31 @@ pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) 
     tagged.sort_by(|a, b| cmp_multi_key(&a.0, &b.0, descs));
 }
 
+/// Streaming top-N trim for `ORDER BY … LIMIT k`. Called inside the row-
+/// production loop after each push: once the accumulator reaches `2·keep`
+/// rows, `select_nth_unstable_by` partitions the `keep` smallest into the
+/// prefix in O(len) and the tail is truncated away. Over the whole scan
+/// this bounds live memory to O(keep) instead of materialising all N
+/// projected rows (the OOM shape from large `… ORDER BY col LIMIT 10`
+/// scans) while staying O(N) total time — the same top-N-heap complexity
+/// PG's tuplesort uses, without a per-row heap sift.
+///
+/// The retained set after every trim is exactly the running top-`keep`,
+/// so a final [`partial_sort_tagged`] over the ≤ `2·keep` survivors
+/// yields the identical rows a full sort would. Rows sharing an ORDER BY
+/// key may be retained in a different order than a full sort would pick —
+/// but `select_nth_unstable_by` is already unstable, so no tie order was
+/// ever guaranteed. A no-op when `keep == 0` (LIMIT 0 is handled by the
+/// caller's truncation).
+pub(crate) fn topk_trim(tagged: &mut Vec<(Vec<OrderKey>, Row)>, keep: usize, descs: &[bool]) {
+    if keep > 0 && tagged.len() >= keep.saturating_mul(2) {
+        let cmp =
+            |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
+        tagged.select_nth_unstable_by(keep - 1, cmp);
+        tagged.truncate(keep);
+    }
+}
+
 /// v6.4.0 — multi-key ORDER BY comparator. Each key's per-key DESC
 /// flag is honored independently. NULL is encoded as `f64::INFINITY`
 /// so it sorts last in ASC and first in DESC (matches PG default).
