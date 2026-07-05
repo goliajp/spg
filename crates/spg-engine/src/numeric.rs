@@ -230,7 +230,7 @@ pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, 
 /// PG18's exact avg output text including trailing digits. `count` must
 /// be > 0 (callers gate on `count == 0 → NULL`).
 pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128, u8) {
-    let rscale = select_div_scale(sum_scaled, sum_scale, count);
+    let rscale = select_div_scale(sum_scaled, sum_scale, count, 0);
     let (num, den) = if i32::from(rscale) >= i32::from(sum_scale) {
         let k = rscale - sum_scale;
         (sum_scaled.saturating_mul(pow10_sat(k)), count)
@@ -241,14 +241,45 @@ pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128
     (div_round_half_away(num, den), rscale)
 }
 
+/// PG-compatible `numeric / numeric` (`numeric.c:div_var`): picks the
+/// display scale via `select_div_scale` (which forces at least
+/// `NUMERIC_MIN_SIG_DIGITS = 16` significant digits — so `10 / 3` keeps 16
+/// fractional digits, not 0), then rounds half-away-from-zero. `a`/`b` are
+/// `(scaled, scale)` pairs; `b != 0` is the caller's contract. Returns `None`
+/// only on i128 overflow of the pre-scale multiply (SPG's fixed-width limit,
+/// surfaced as an honest error rather than a silently-truncated result).
+pub(crate) fn numeric_div(a: i128, sa: u8, b: i128, sb: u8) -> Option<(i128, u8)> {
+    let rscale = select_div_scale(a, sa, b, sb);
+    // True value = (a / 10^sa) / (b / 10^sb) = (a * 10^sb) / (b * 10^sa).
+    // Express it at `rscale`: result_scaled = round( a * 10^(sb+rscale) /
+    // (b * 10^sa) ). Fold the exponents into one power of ten with a sign.
+    let e = i32::from(sb) + i32::from(rscale) - i32::from(sa);
+    let (num, den) = if e >= 0 {
+        (a.checked_mul(pow10_checked(e as u32)?)?, b)
+    } else {
+        (a, b.checked_mul(pow10_checked((-e) as u32)?)?)
+    };
+    Some((div_round_half_away(num, den), rscale))
+}
+
+/// `10^p` as i128, or `None` on overflow (unlike `pow10_sat`, which
+/// saturates — a saturated power would corrupt the division scaling).
+fn pow10_checked(p: u32) -> Option<i128> {
+    let mut acc: i128 = 1;
+    for _ in 0..p {
+        acc = acc.checked_mul(10)?;
+    }
+    Some(acc)
+}
+
 /// Port of PG `numeric.c:select_div_scale`. Returns the display scale
 /// PG would give `sum / count`, clamped to SPG's `u8` scale field
 /// (PG allows up to `NUMERIC_MAX_DISPLAY_SCALE = 1000`, but every
 /// `Value::Numeric` scale in SPG is `u8`; scales beyond 255 are a
 /// pre-existing SPG representation limit, not introduced here).
-fn select_div_scale(sum_scaled: i128, sum_scale: u8, count: i128) -> u8 {
+fn select_div_scale(sum_scaled: i128, sum_scale: u8, count: i128, count_scale: u8) -> u8 {
     let (w1, fd1) = base10000_weight_firstdigit(sum_scaled, sum_scale);
-    let (w2, fd2) = base10000_weight_firstdigit(count, 0);
+    let (w2, fd2) = base10000_weight_firstdigit(count, count_scale);
     // Estimate the weight of the quotient; if the two leading base-10000
     // digits are equal we can't be sure, so PG assumes var1 < var2.
     let mut qweight = w1 - w2;

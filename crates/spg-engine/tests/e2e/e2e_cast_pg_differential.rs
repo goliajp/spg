@@ -2223,3 +2223,27 @@ fn update_from_target_col_in_set() {
     e.execute("UPDATE t SET v = u.bonus FROM u WHERE u.id = t.id").unwrap();
     assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:5,2:7");
 }
+
+/// v7.37 D.31 — numeric / numeric keeps PG's select_div_scale (≥16 sig digits)
+/// instead of truncating to the operands' scale. PG18.4-verified.
+#[test]
+fn numeric_division_scale() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    let out = [
+        q(&mut e, "SELECT (10::numeric / 3)::text"),
+        q(&mut e, "SELECT (10::numeric / 3::numeric)::text"),
+        q(&mut e, "SELECT (1::numeric / 7)::text"),
+        q(&mut e, "SELECT (100::numeric / 4)::text"),
+        q(&mut e, "SELECT (22.5::numeric / 1.5::numeric)::text"),
+        q(&mut e, "SELECT (-10::numeric / 3)::text"),
+        q(&mut e, "SELECT (0::numeric / 5)::text"),
+        q(&mut e, "SELECT (123.456::numeric / 1)::text"),
+        q(&mut e, "SELECT (avg(x))::text FROM (VALUES (10::numeric),(20),(31)) t(x)"),
+        q(&mut e, "SELECT (1000000::numeric / 3)::text"),
+    ];
+    let exp = "3.3333333333333333|3.3333333333333333|0.14285714285714285714|25.0000000000000000|15.0000000000000000|-3.3333333333333333|0.00000000000000000000|123.4560000000000000|20.3333333333333333|333333.333333333333";
+    assert_eq!(out.join("|"), exp);
+}
