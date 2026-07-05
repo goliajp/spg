@@ -121,3 +121,34 @@ fn create_index_display_round_trips_expression() {
     let stmt2 = parse_statement(&stmt.to_string()).unwrap();
     assert_eq!(stmt2, stmt);
 }
+
+/// U1 (read01 A-group): a UNIQUE expression index
+/// (`CREATE UNIQUE INDEX ON t (lower(email))`) must enforce
+/// uniqueness on the EXPRESSION value, not silently allow duplicates.
+/// The enforcer keyed on column positions, so case-different emails
+/// with the same lower() slipped in. Behavior matches live PG 18.4:
+/// 'A@x.com' then 'a@x.com' → duplicate key error; distinct lower() OK.
+#[test]
+fn unique_expression_index_enforces_on_expression() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE u (email TEXT NOT NULL)").unwrap();
+    e.execute("CREATE UNIQUE INDEX u_lower ON u (lower(email))")
+        .unwrap();
+    e.execute("INSERT INTO u VALUES ('A@x.com')").unwrap();
+    // Same lower() → rejected (was silently accepted before the fix).
+    assert!(
+        e.execute("INSERT INTO u VALUES ('a@x.com')").is_err(),
+        "duplicate lower(email) must violate the unique expression index"
+    );
+    // Distinct lower() → accepted.
+    e.execute("INSERT INTO u VALUES ('b@x.com')").unwrap();
+    // Multi-row batch with an internal expression dup is rejected too.
+    e.execute("CREATE TABLE u2 (email TEXT NOT NULL)").unwrap();
+    e.execute("CREATE UNIQUE INDEX u2_lower ON u2 (lower(email))")
+        .unwrap();
+    assert!(
+        e.execute("INSERT INTO u2 VALUES ('C@x.com'), ('c@x.com')")
+            .is_err(),
+        "batch with duplicate lower(email) must be rejected"
+    );
+}
