@@ -2288,3 +2288,17 @@ fn text_numeric_concat() {
     // int || numeric still fine (int coerces to text)
     assert_eq!(q(&mut e, "SELECT (5 || ':' || 2.5::numeric)"), "5:2.5");
 }
+
+/// v7.37 D.35 — date + time → timestamp (both operand orders). PG18.4-verified.
+#[test]
+fn date_plus_time_is_timestamp() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + time '10:30:00')::text"), "2024-06-15 10:30:00");
+    assert_eq!(q(&mut e, "SELECT (time '23:59:59' + date '2024-06-15')::text"), "2024-06-15 23:59:59");
+    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + time '00:00:00')::text"), "2024-06-15 00:00:00");
+    // date + interval still works (regression)
+    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + interval '1 day')::text"), "2024-06-16 00:00:00");
+}
