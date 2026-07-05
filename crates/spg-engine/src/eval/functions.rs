@@ -2006,17 +2006,12 @@ fn apply_function_dispatch(
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!("cbrt() needs numeric, got {:?}", v.data_type()),
                     })?;
-                    // cbrt(x) = sign(x) * (|x|)^(1/3). Preserve sign
-                    // for negative inputs (matches PG).
-                    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-                    let mag = if x < 0.0 { -x } else { x };
-                    // (|x|)^(1/3) via exp(ln(|x|)/3). Zero short-circuit.
-                    let mag_cbrt = if mag == 0.0 {
-                        0.0
-                    } else {
-                        f64_exp(f64_ln(mag) / 3.0)
-                    };
-                    Ok(Value::Float(sign * mag_cbrt))
+                    // libm::cbrt is the accurate C-libm cube root PG
+                    // itself calls — it round-trips perfect cubes
+                    // exactly (cbrt(27) = 3, not 3.0000000000000004 as
+                    // the exp(ln(|x|)/3) approximation gave) and handles
+                    // the sign of negative inputs natively.
+                    Ok(Value::Float(libm::cbrt(x)))
                 }
             }
         }
