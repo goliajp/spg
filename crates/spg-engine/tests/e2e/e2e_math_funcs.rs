@@ -55,11 +55,19 @@ fn log_base_2_of_8_is_3() {
 #[test]
 fn cbrt_of_27_is_3() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT cbrt(27.0)");
-    assert!(approx(as_f64(&v), 3.0, 1e-6), "got {}", as_f64(&v));
-    // Negative sign preserved.
-    let v = first(&mut e, "SELECT cbrt(-27.0)");
-    assert!(approx(as_f64(&v), -3.0, 1e-6), "got {}", as_f64(&v));
+    // libm::cbrt round-trips perfect cubes EXACTLY (live PG18.4:
+    // cbrt(27) = 3, not the 3.0000000000000004 the old
+    // exp(ln|x|/3) approximation produced).
+    assert_eq!(as_f64(&first(&mut e, "SELECT cbrt(27.0)")), 3.0);
+    // Negative sign preserved, exact.
+    assert_eq!(as_f64(&first(&mut e, "SELECT cbrt(-27.0)")), -3.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT cbrt(1000000.0)")), 100.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT cbrt(-64.0)")), -4.0);
+    // Non-perfect cube matches PG18.4's exact double bit-for-bit.
+    assert_eq!(
+        as_f64(&first(&mut e, "SELECT cbrt(2.0)")),
+        1.259_921_049_894_873_2
+    );
 }
 
 #[test]
