@@ -1801,6 +1801,13 @@ impl Engine {
                 }
             }
         }
+        // PG resolves a UNION / VALUES result column to one common type
+        // and casts every branch to it (`SELECT '2020-01-01'::date UNION
+        // ALL SELECT '2020-01-02'` → both DATE, not DATE + TEXT). SPG
+        // built each branch independently, leaving mixed-type columns
+        // that broke ORDER BY, comparisons, and value-based window
+        // frames. Unify + coerce before the combined ORDER BY sees them.
+        unify_union_columns(&mut columns, &mut rows);
         // ORDER BY at the top of a UNION applies to the combined result.
         // Eval against the projected schema (NOT the source table).
         if !stmt.order_by.is_empty() {
@@ -4744,6 +4751,104 @@ pub(crate) fn infer_column_types(
         }
     }
     out
+}
+
+/// Numeric widening rank for UNION type resolution (higher = wider).
+fn numeric_rank(t: &DataType) -> Option<u8> {
+    match t {
+        DataType::SmallInt => Some(1),
+        DataType::Int => Some(2),
+        DataType::BigInt => Some(3),
+        DataType::Numeric { .. } => Some(4),
+        DataType::Float => Some(5),
+        _ => None,
+    }
+}
+
+/// Resolve the common result type for a UNION / VALUES column from the
+/// set of concrete (non-NULL) branch types, following the safe subset
+/// of PG's type resolution:
+///   * all-numeric  → the widest numeric (int ∪ bigint → bigint, … ∪
+///     numeric → numeric, … ∪ float → float);
+///   * DATE ∪ TIMESTAMP → TIMESTAMP;
+///   * exactly one concrete non-TEXT type mixed with TEXT literals →
+///     that concrete type (the TEXT cells get parsed into it).
+/// Returns `None` for anything ambiguous, so the caller leaves the
+/// column untouched rather than risk a wrong or failing coercion.
+fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
+    if types.len() < 2 {
+        return None;
+    }
+    if types.iter().all(|t| numeric_rank(t).is_some()) {
+        return types
+            .iter()
+            .max_by_key(|t| numeric_rank(t).unwrap_or(0))
+            .cloned();
+    }
+    let non_text: Vec<&DataType> = types
+        .iter()
+        .filter(|t| !matches!(t, DataType::Text))
+        .collect();
+    if non_text.iter().all(|t| matches!(t, DataType::Date | DataType::Timestamp))
+        && non_text.iter().any(|t| matches!(t, DataType::Timestamp))
+    {
+        return Some(DataType::Timestamp);
+    }
+    // A single concrete non-TEXT type mixed with TEXT literals.
+    if non_text.len() == 1 {
+        return Some(non_text[0].clone());
+    }
+    None
+}
+
+/// Coerce every cell of a UNION / VALUES result column to one common
+/// type (see [`resolve_union_common_type`]). Conservative: a column
+/// whose branches already agree, or whose types don't resolve, or where
+/// any cell fails to coerce, is left exactly as it was — this never
+/// turns a previously-working query into an error.
+fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) {
+    for col_idx in 0..columns.len() {
+        let mut seen: Vec<DataType> = Vec::new();
+        for row in rows.iter() {
+            if let Some(dt) = row.values.get(col_idx).and_then(Value::data_type) {
+                if !seen.contains(&dt) {
+                    seen.push(dt);
+                }
+            }
+        }
+        let Some(target) = resolve_union_common_type(&seen) else {
+            continue;
+        };
+        // Dry-run the coercion; abandon the whole column if any fails.
+        let mut coerced: Vec<Option<Value<'static>>> = Vec::with_capacity(rows.len());
+        let mut ok = true;
+        for row in rows.iter() {
+            match row.values.get(col_idx) {
+                Some(v) => match crate::conversions::coerce_value(
+                    v.clone(),
+                    target.clone(),
+                    &columns[col_idx].name,
+                    col_idx,
+                ) {
+                    Ok(cv) => coerced.push(Some(cv)),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                },
+                None => coerced.push(None),
+            }
+        }
+        if !ok {
+            continue;
+        }
+        for (row, cv) in rows.iter_mut().zip(coerced) {
+            if let (Some(slot), Some(nv)) = (row.values.get_mut(col_idx), cv) {
+                *slot = nv;
+            }
+        }
+        columns[col_idx].ty = target;
+    }
 }
 
 /// v4.22: encode a Row to a comparable byte key for UNION-DISTINCT

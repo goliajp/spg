@@ -96,3 +96,53 @@ fn aggregate_over_derived_table() {
     assert_eq!(as_i64(&got[0][0]), 3);
     assert_eq!(as_i64(&got[0][1]), 9);
 }
+
+#[test]
+fn values_union_column_type_unification() {
+    use spg_storage::Value;
+    // PG resolves a VALUES / UNION column to one common type and casts
+    // every branch to it (live PG18.4). SPG previously left each branch
+    // its own type, so a date column seeded by only the first row's cast
+    // came back DATE + TEXT. Verify the whole column is now uniform.
+    let mut e = Engine::new();
+
+    // DATE: first row cast, rest bare literals → all DATE.
+    let got = rows(
+        &mut e,
+        "SELECT d FROM (VALUES('2020-01-01'::date),('2020-01-02'),('2020-01-05')) t(d) ORDER BY d",
+    );
+    assert!(
+        got.iter().all(|r| matches!(&r[0], Value::Date(_))),
+        "want all DATE, got {got:?}"
+    );
+
+    // Numeric widening: bigint ∪ int → all bigint.
+    let got = rows(
+        &mut e,
+        "SELECT n FROM (VALUES(1::bigint),(2),(3)) t(n) ORDER BY n",
+    );
+    assert!(
+        got.iter().all(|r| matches!(&r[0], Value::BigInt(_))),
+        "want all BIGINT, got {got:?}"
+    );
+
+    // DATE ∪ TIMESTAMP → TIMESTAMP.
+    let got = rows(
+        &mut e,
+        "SELECT x FROM (SELECT '2020-01-01'::date UNION ALL SELECT '2020-01-02 10:00'::timestamp) t(x)",
+    );
+    assert!(
+        got.iter().all(|r| matches!(&r[0], Value::Timestamp(_))),
+        "want all TIMESTAMP, got {got:?}"
+    );
+
+    // A value-based window frame over the unified DATE column now works
+    // (this was the motivating regression).
+    let got = rows(
+        &mut e,
+        "SELECT string_agg(c::text, ',') FROM (SELECT count(*) OVER \
+         (ORDER BY d RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) c \
+         FROM (VALUES('2020-01-01'::date),('2020-01-02'),('2020-01-02'),('2020-01-05')) t(d)) s",
+    );
+    assert!(matches!(&got[0][0], Value::Text(s) if s == "1,3,3,1"), "got {got:?}");
+}
