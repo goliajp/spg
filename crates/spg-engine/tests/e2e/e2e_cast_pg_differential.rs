@@ -2865,3 +2865,20 @@ fn numeric_concat_renders_exact_decimal() {
     assert_eq!(q(&mut e, "SELECT concat_ws('-', 1.5::numeric, 2.5::numeric)"), "1.5-2.5");
     assert_eq!(q(&mut e, "SELECT format('%s', 3.14::numeric)"), "3.14");
 }
+
+#[test]
+fn concat_format_render_all_types_pg_faithful() {
+    // PG concat / format / || / row coerce every type to its canonical text,
+    // never a debug dump. Reachable today via typed literals / casts.
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
+    assert_eq!(q(&mut e, "SELECT concat('x', DATE '2020-01-15')"), "x2020-01-15");
+    assert_eq!(q(&mut e, "SELECT concat('x', TIMESTAMP '2020-01-15 10:30:00')"), "x2020-01-15 10:30:00");
+    assert_eq!(q(&mut e, "SELECT concat('x', INTERVAL '1 day')"), "x1 day");
+    assert_eq!(q(&mut e, "SELECT concat('x', '{1,2,3}'::int[])"), "x{1,2,3}");
+    assert_eq!(q(&mut e, "SELECT concat('x', '{a,b}'::text[])"), "x{a,b}");
+    assert_eq!(q(&mut e, "SELECT concat('x', '\\x41'::bytea)"), "x\\x41");
+    assert_eq!(q(&mut e, "SELECT concat('x', 'a1b2c3d4-e5f6-7788-9900-aabbccddeeff'::uuid)"), "xa1b2c3d4-e5f6-7788-9900-aabbccddeeff");
+    assert_eq!(q(&mut e, "SELECT format('%s', DATE '2020-01-15')"), "2020-01-15");
+    assert_eq!(q(&mut e, "SELECT format('%s', '{1,2}'::int[])"), "{1,2}");
+}

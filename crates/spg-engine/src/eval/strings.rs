@@ -522,7 +522,11 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
             }
         }
         Value::Null => String::new(),
-        other => format!("{other:?}"),
+        // Every other type (Date / Timestamp / Interval / arrays / Bytea /
+        // UUID / Time / Money / Range / Hstore / 2D arrays / …) renders via
+        // the canonical value→text renderer — the same PG-faithful form SELECT
+        // and the wire layer emit — rather than leaking a Rust debug dump.
+        other => super::values::value_to_text(other),
     }
 }
 
