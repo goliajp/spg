@@ -2295,6 +2295,16 @@ impl Engine {
         // executor — partition + sort + per-row window value before
         // the regular projection.
         if select_has_window(stmt) {
+            // v7.37 D.23 — window functions run AFTER GROUP BY aggregation.
+            // `SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g`
+            // needs the aggregation done first, then windows over the grouped
+            // rows. Rewrite to an aggregate derived subquery + outer window query
+            // (which the window-over-derived path, D.13, executes). Only fires on
+            // the currently-erroring agg+window+GROUP BY shape, so it can't
+            // regress working window-only or aggregate-only queries.
+            if let Some(rewritten) = rewrite_agg_before_window(stmt) {
+                return self.exec_select_cancel(&rewritten, cancel);
+            }
             return self.exec_select_with_window(stmt, cancel);
         }
         // Constant SELECT (no FROM) — evaluate each item once against an
@@ -4121,6 +4131,224 @@ pub(crate) struct ProjectedItem {
 /// `NULL = NULL → TRUE` and `NaN = NaN → FALSE`. The first agrees with
 /// the spec's "two NULLs are not distinct"; the second is a tolerated
 /// quirk for v1 (no NaN literals are reachable from the SQL surface).
+/// v7.37 D.23 — is this expression a bare (non-window) aggregate call?
+fn expr_is_aggregate_call(e: &Expr) -> bool {
+    match e {
+        Expr::FunctionCall { name, .. } => crate::aggregate::is_aggregate_name(name),
+        Expr::AggregateOrdered { .. } => true,
+        _ => false,
+    }
+}
+
+/// Collect distinct top-level aggregate call expressions (dedup by value). Does
+/// not recurse into an aggregate's own args (it's hoisted whole). Reuses the same
+/// pragmatic variant set as `rewrite_window_to_columns`; aggregates nested in
+/// uncovered variants simply aren't hoisted (the query keeps erroring, no worse
+/// than today — never a regression on a working query).
+fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
+    if expr_is_aggregate_call(e) {
+        if !out.iter().any(|x| x == e) {
+            out.push(e.clone());
+        }
+        return;
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_agg_exprs(lhs, out);
+            collect_agg_exprs(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_agg_exprs(expr, out)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_agg_exprs(a, out);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_agg_exprs(expr, out);
+            collect_agg_exprs(pattern, out);
+        }
+        Expr::Extract { source, .. } => collect_agg_exprs(source, out),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                collect_agg_exprs(a, out);
+            }
+            for p in partition_by {
+                collect_agg_exprs(p, out);
+            }
+            for (o, _, _) in order_by {
+                collect_agg_exprs(o, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace each aggregate call in `aggs` with a `Column(__aggN)` reference.
+fn replace_agg_exprs(e: &mut Expr, aggs: &[Expr]) {
+    if expr_is_aggregate_call(e) {
+        if let Some(idx) = aggs.iter().position(|x| x == e) {
+            *e = Expr::Column(ColumnName {
+                qualifier: None,
+                name: alloc::format!("__agg{idx}"),
+            });
+        }
+        return;
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            replace_agg_exprs(lhs, aggs);
+            replace_agg_exprs(rhs, aggs);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            replace_agg_exprs(expr, aggs)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                replace_agg_exprs(a, aggs);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            replace_agg_exprs(expr, aggs);
+            replace_agg_exprs(pattern, aggs);
+        }
+        Expr::Extract { source, .. } => replace_agg_exprs(source, aggs),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                replace_agg_exprs(a, aggs);
+            }
+            for p in partition_by {
+                replace_agg_exprs(p, aggs);
+            }
+            for (o, _, _) in order_by {
+                replace_agg_exprs(o, aggs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v7.37 D.23 — window functions run AFTER GROUP BY aggregation. Rewrite
+/// `SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g` into an
+/// aggregate derived subquery (`SELECT g, sum(v) AS __agg0 FROM t GROUP BY g`) +
+/// an outer window query over it (`SELECT g, __agg0, rank() OVER (ORDER BY
+/// __agg0) FROM (...) __aggwin`), which the window-over-derived path (D.13) runs.
+/// Returns None outside the bounded subset (leaves current behaviour). Only fires
+/// on the currently-erroring agg+window+GROUP BY shape → cannot regress working
+/// window-only / aggregate-only queries.
+fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> {
+    if !(crate::aggregate::uses_aggregate(stmt) || stmt.group_by.is_some()) {
+        return None;
+    }
+    // Bounded subset: no set-ops; GROUP BY keys must be simple columns.
+    if !stmt.unions.is_empty() {
+        return None;
+    }
+    let group_cols: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
+    if group_cols.iter().any(|g| !matches!(g, Expr::Column(_))) {
+        return None;
+    }
+    stmt.from.as_ref()?;
+    // Collect the aggregate calls to hoist from projection + outer ORDER BY.
+    let mut aggs: Vec<Expr> = Vec::new();
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_agg_exprs(expr, &mut aggs);
+        }
+    }
+    for ob in &stmt.order_by {
+        collect_agg_exprs(&ob.expr, &mut aggs);
+    }
+    // Inner aggregate subquery: group cols (by name) + each aggregate as __aggN.
+    let mut inner_items: Vec<SelectItem> = Vec::new();
+    for g in &group_cols {
+        inner_items.push(SelectItem::Expr {
+            expr: g.clone(),
+            alias: None,
+        });
+    }
+    for (i, a) in aggs.iter().enumerate() {
+        inner_items.push(SelectItem::Expr {
+            expr: a.clone(),
+            alias: Some(alloc::format!("__agg{i}")),
+        });
+    }
+    let inner = SelectStatement {
+        items: inner_items,
+        distinct: false,
+        distinct_on: Vec::new(),
+        unions: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        limit_with_ties: false,
+        ..stmt.clone()
+    };
+    let derived = TableRef {
+        name: "__aggwin".into(),
+        alias: Some("__aggwin".into()),
+        as_of_segment: None,
+        unnest_expr: None,
+        unnest_column_aliases: Vec::new(),
+        with_ordinality: false,
+        generate_series_args: None,
+        lateral_subquery: Some(alloc::boxed::Box::new(inner)),
+        jsonb_each_text_arg: None,
+    };
+    // Outer window query over the derived rows: aggregates → __aggN column refs.
+    let mut outer_items = stmt.items.clone();
+    for item in &mut outer_items {
+        if let SelectItem::Expr { expr, alias } = item {
+            // Preserve PG's column label for a bare aggregate projection.
+            if alias.is_none()
+                && let Expr::FunctionCall { name, .. } = expr
+                && crate::aggregate::is_aggregate_name(name)
+            {
+                *alias = Some(name.to_ascii_lowercase());
+            }
+            replace_agg_exprs(expr, &aggs);
+        }
+    }
+    let mut outer_order = stmt.order_by.clone();
+    for ob in &mut outer_order {
+        replace_agg_exprs(&mut ob.expr, &aggs);
+    }
+    let mut outer_distinct_on = stmt.distinct_on.clone();
+    for e in &mut outer_distinct_on {
+        replace_agg_exprs(e, &aggs);
+    }
+    Some(SelectStatement {
+        ctes: Vec::new(),
+        distinct: stmt.distinct,
+        distinct_on: outer_distinct_on,
+        items: outer_items,
+        from: Some(FromClause {
+            primary: derived,
+            joins: Vec::new(),
+        }),
+        where_: None,
+        group_by: None,
+        group_by_all: false,
+        having: None,
+        unions: Vec::new(),
+        order_by: outer_order,
+        limit: stmt.limit.clone(),
+        offset: stmt.offset.clone(),
+        limit_with_ties: stmt.limit_with_ties,
+    })
+}
+
 fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
     let mut out: Vec<Row<'static>> = Vec::with_capacity(rows.len());
     for r in rows {
