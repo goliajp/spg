@@ -2527,3 +2527,19 @@ fn jsonb_typeof_strip_text_arg() {
     assert_eq!(q(&mut e, "SELECT jsonb_typeof(NULL)"), "");
     assert_eq!(q(&mut e, "SELECT jsonb_typeof('[1]'::jsonb)"), "array");
 }
+
+/// v7.37 D.51 — to_tsquery accepts the `<->` adjacency operator (PG shorthand for
+/// `<1>`). PG18.4-verified.
+#[test]
+fn tsquery_adjacency_operator() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Bool(b)=>format!("{b}"), o=>format!("{o:?}") }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+    };
+    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'quick <-> brown'))::text"), "'quick' <-> 'brown'");
+    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'quick <2> fox'))::text"), "'quick' <2> 'fox'");
+    assert_eq!(q(&mut e, "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> brown'))::text"), "true");
+    assert_eq!(q(&mut e, "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> fox'))::text"), "false");
+    // <-> binds tighter than & (no stop words here to keep it about the operator)
+    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'foo <-> bar & baz'))::text"), "'foo' <-> 'bar' & 'baz'");
+}

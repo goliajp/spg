@@ -352,7 +352,13 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
                 distance,
             } => {
                 go(left, own_prec, out);
-                out.push_str(&alloc::format!(" <{distance}> "));
+                // v7.37 D.51 — PG renders distance-1 phrases with the `<->`
+                // adjacency shorthand, and `<N>` for N > 1.
+                if *distance == 1 {
+                    out.push_str(" <-> ");
+                } else {
+                    out.push_str(&alloc::format!(" <{distance}> "));
+                }
                 go(right, own_prec, out);
             }
         }
@@ -567,24 +573,36 @@ impl<'a> TsQueryParser<'a> {
                     lhs = TsQueryAst::And(Box::new(lhs), Box::new(rhs));
                 }
                 Some(b'<') => {
-                    // Phrase distance `<N>`.
+                    // Phrase operator `<N>` (distance N) or `<->` (v7.37 D.51 —
+                    // PG's adjacency shorthand, equivalent to `<1>`).
                     self.pos += 1;
-                    let start = self.pos;
-                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                        self.pos += 1;
-                    }
-                    if start == self.pos || self.peek() != Some(b'>') {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "tsquery literal: malformed <N> phrase operator".into(),
-                        });
-                    }
-                    let n: u16 = core::str::from_utf8(&self.bytes[start..self.pos])
-                        .expect("ascii digits")
-                        .parse()
-                        .map_err(|_| EvalError::TypeMismatch {
-                            detail: "tsquery literal: phrase distance overflows u16".into(),
-                        })?;
-                    self.pos += 1; // consume '>'
+                    let n: u16 = if self.peek() == Some(b'-')
+                        && self.bytes.get(self.pos + 1) == Some(&b'>')
+                    {
+                        self.pos += 2; // consume '->'
+                        1
+                    } else {
+                        let start = self.pos;
+                        while self.pos < self.bytes.len()
+                            && self.bytes[self.pos].is_ascii_digit()
+                        {
+                            self.pos += 1;
+                        }
+                        if start == self.pos || self.peek() != Some(b'>') {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "tsquery literal: malformed <N> / <-> phrase operator"
+                                    .into(),
+                            });
+                        }
+                        let val = core::str::from_utf8(&self.bytes[start..self.pos])
+                            .expect("ascii digits")
+                            .parse()
+                            .map_err(|_| EvalError::TypeMismatch {
+                                detail: "tsquery literal: phrase distance overflows u16".into(),
+                            })?;
+                        self.pos += 1; // consume '>'
+                        val
+                    };
                     let rhs = self.parse_unary()?;
                     lhs = TsQueryAst::Phrase {
                         left: Box::new(lhs),
