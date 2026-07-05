@@ -2712,3 +2712,29 @@ fn to_char_ts_era_meridiem_ordinal() {
     assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-01 00:00:00','DDth')"), "01st");
     assert!(diffs.is_empty(), "DIVERGENCES: {}", diffs.join(" "));
 }
+
+/// v7.37 D.61 — to_char numeric trailing sign modes MI/PL/SG/S + trailing $. PG18.4-verified.
+#[test]
+fn to_char_num_trailing_sign() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let cases = [
+        ("-1234.5","9999.99MI","1234.50-"),
+        ("1234.5","9999.99PL"," 1234.50+"),
+        ("1234.5","9999.99S","1234.50+"),
+        ("-1234.5","9999.99SG","1234.50-"),
+        ("-1234.5","S9999.99","-1234.50"),
+        ("1234.5","9999.99$"," 1234.50$"),
+        ("-5","FM9MI","5-"),
+        ("5","FM9PL","5+"),
+        ("-1234.5","9999.99PR","<1234.50>"),
+        ("1234.5","9999.99"," 1234.50"),
+        ("5","FM9th","5th"),
+    ];
+    let mut bad = Vec::new();
+    for (n,f,pg) in &cases {
+        let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
+        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+    }
+    assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
+}
