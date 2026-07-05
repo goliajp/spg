@@ -166,6 +166,24 @@ pub fn canonicalize_value(v: Value<'static>) -> Value<'static> {
     }
 }
 
+/// Render a sub-value extracted by the `->` / `#>` (jsonb) and `->>` /
+/// `#>>` (text) accessors. Containers are serialised canonically (PG
+/// re-emits the extracted jsonb in canonical form); a scalar under
+/// `as_text` returns its raw value — already canonical, since the source
+/// jsonb was canonicalised on input.
+fn accessor_result(v: &JsonValue, as_text: bool) -> Value<'static> {
+    if as_text && !matches!(v, JsonValue::Array(_) | JsonValue::Object(_)) {
+        return Value::text(v.as_text());
+    }
+    let mut s = String::new();
+    write_json_canonical(v, &mut s);
+    if as_text {
+        Value::text(s)
+    } else {
+        Value::json(s)
+    }
+}
+
 fn write_json_canonical(v: &JsonValue, out: &mut String) {
     match v {
         JsonValue::Null => out.push_str("null"),
@@ -455,11 +473,7 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
     if matches!(cur, JsonValue::Null) {
         return Ok(Value::Null);
     }
-    if as_text {
-        Ok(Value::text(cur.as_text()))
-    } else {
-        Ok(Value::json(cur.to_json_text()))
-    }
+    Ok(accessor_result(&cur, as_text))
 }
 
 /// v6.4.5 — PG `json @> sub_json` containment. Returns BOOL.
@@ -824,13 +838,7 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
     };
     match inner {
         None | Some(JsonValue::Null) => Ok(Value::Null),
-        Some(v) => {
-            if as_text {
-                Ok(Value::text(v.as_text()))
-            } else {
-                Ok(Value::json(v.to_json_text()))
-            }
-        }
+        Some(v) => Ok(accessor_result(&v, as_text)),
     }
 }
 
@@ -2061,7 +2069,8 @@ mod tests {
     fn path_get_nested_subtree_renders_back() {
         let doc = Value::json::<String>(r#"{"k":{"x":[1,2]}}"#.into());
         let v = path_get(&doc, &Value::text("k"), false).unwrap();
-        assert_eq!(v, Value::json::<String>("{\"x\":[1,2]}".into()));
+        // The extracted jsonb subtree is re-emitted canonically (PG form).
+        assert_eq!(v, Value::json::<String>("{\"x\": [1, 2]}".into()));
     }
 }
 
