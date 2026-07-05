@@ -2897,3 +2897,16 @@ fn to_json_renders_temporal_types_pg_faithful() {
     assert_eq!(q(&mut e, "SELECT to_json(2.5::numeric)::text"), "2.5");
     assert_eq!(q(&mut e, "SELECT to_json('hi\"there'::text)::text"), "\"hi\\\"there\"");
 }
+
+#[test]
+fn array_agg_temporal_elements_pg_faithful() {
+    // array_agg of Date/Numeric/Interval renders each element via canonical
+    // text (TextArray quoting matches PG), never a Rust debug dump.
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
+    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (DATE '2020-01-15'),(DATE '2020-02-01')) t(x)"), "{2020-01-15,2020-02-01}");
+    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (2.5::numeric),(3.5::numeric)) t(x)"), "{2.5,3.5}");
+    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (INTERVAL '1 day'),(INTERVAL '2 hours')) t(x)"), "{\"1 day\",02:00:00}");
+    // int/bigint arrays keep their fast-path typing (regression guard)
+    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (1),(2),(3)) t(x)"), "{1,2,3}");
+}
