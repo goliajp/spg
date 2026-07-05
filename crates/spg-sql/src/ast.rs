@@ -4780,6 +4780,21 @@ impl fmt::Display for TableRef {
             write!(f, "LATERAL ({inner})")?;
             if let Some(a) = &self.alias {
                 write!(f, " AS {}", quote_ident(a))?;
+                // v7.37 D.28 — a derived table on the lateral_subquery channel
+                // may carry `AS t(cols)` column aliases (e.g. `(VALUES …) t(g)`
+                // lowers here). Rendering the alias without the column list lost
+                // the column names on re-parse (a view body round-trips through
+                // Display), so `SELECT g FROM the_view` failed ColumnNotFound.
+                if !self.unnest_column_aliases.is_empty() {
+                    f.write_str(" (")?;
+                    for (i, c) in self.unnest_column_aliases.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        f.write_str(&quote_ident(c))?;
+                    }
+                    f.write_str(")")?;
+                }
             }
             return Ok(());
         }

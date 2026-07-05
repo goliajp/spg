@@ -10969,14 +10969,17 @@ impl Parser {
                 )));
             }
             self.advance();
-            let alias_ident = self.parse_optional_alias();
+            // v7.37 D.28 — `LATERAL (…) AS t(cols)` column-alias list (also how a
+            // `(VALUES …) t(g)` derived table round-trips through view-body
+            // Display, which renders on the lateral_subquery channel).
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: None,
-                unnest_column_aliases: Vec::new(),
+                unnest_column_aliases: column_aliases,
                 with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
