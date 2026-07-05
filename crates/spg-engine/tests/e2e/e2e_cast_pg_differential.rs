@@ -2302,3 +2302,19 @@ fn date_plus_time_is_timestamp() {
     // date + interval still works (regression)
     assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + interval '1 day')::text"), "2024-06-16 00:00:00");
 }
+
+/// v7.37 D.36 — casting a non-text value to char(n)/varchar(n) stringifies first
+/// (99::char(2) → '99'), instead of a CHAR/INT storage type-mismatch. PG18.4.
+#[test]
+fn value_to_charn_cast() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT (99::char(2))"), "99");
+    assert_eq!(q(&mut e, "SELECT (99::varchar(2))"), "99");
+    assert_eq!(q(&mut e, "SELECT (12345::varchar(3))"), "123");
+    assert_eq!(q(&mut e, "SELECT (3.14::varchar(10))"), "3.14");
+    assert_eq!(q(&mut e, "SELECT (true::char(1))"), "t");
+    assert_eq!(q(&mut e, "SELECT ('abcdef'::varchar(3))"), "abc");
+}
