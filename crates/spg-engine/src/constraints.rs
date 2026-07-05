@@ -810,15 +810,41 @@ pub(crate) fn enforce_unique_index_inserts(
             })?),
             None => None,
         };
+        // v7.38 (read01 U1) — an expression index (`CREATE UNIQUE INDEX ON
+        // t (lower(email))`) carries its key as a parseable expression, not
+        // a column position. Re-parse once per batch and evaluate per row so
+        // the key reflects the expression; without this the uniqueness was
+        // silently not enforced (duplicate `lower(email)` values slipped in).
+        let expr_key = match idx.expression.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
         let key_positions = unique_key_positions(idx);
-        let key_of = |values: &[spg_storage::Value<'static>]| -> alloc::vec::Vec<spg_storage::Value<'static>> {
-            key_positions
+        let key_of = |values: &[spg_storage::Value<'static>]| -> Result<alloc::vec::Vec<spg_storage::Value<'static>>, EngineError> {
+            if let Some(expr) = &expr_key {
+                let tmp_row = spg_storage::Row {
+                    values: values.to_vec(),
+                };
+                let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} expression eval: {e:?}",
+                        idx.name
+                    ))
+                })?;
+                return Ok(alloc::vec![v]);
+            }
+            Ok(key_positions
                 .iter()
                 .map(|&p| {
                     let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
                     collated_key_cell(&v, p, schema)
                 })
-                .collect()
+                .collect())
         };
         let participates = |values: &[spg_storage::Value<'static>]| -> Result<bool, EngineError> {
             let Some(expr) = &predicate_expr else {
@@ -857,7 +883,7 @@ pub(crate) fn enforce_unique_index_inserts(
             if !participates(&prow.values)? {
                 continue;
             }
-            let key = key_of(&prow.values);
+            let key = key_of(&prow.values)?;
             if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
                 continue;
             }
@@ -867,7 +893,7 @@ pub(crate) fn enforce_unique_index_inserts(
             if !participates(row_values)? {
                 continue;
             }
-            let key = key_of(row_values);
+            let key = key_of(row_values)?;
             if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
                 continue;
             }
