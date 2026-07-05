@@ -26,7 +26,7 @@ use crate::{
     compute_window_partition, eval, expr_tree_has_subquery, materialise_in_order,
     materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp, partial_sort_tagged,
     partition_key_cmp, rewrite_window_to_columns, select_has_window, select_references_meta_view,
-    select_refers_to, sort_by_keys, synth_info_key_column_usage,
+    select_refers_to, sort_by_keys, synth_info_key_column_usage, topk_trim,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
@@ -3423,6 +3423,28 @@ impl Engine {
         } else {
             None
         };
+        // v7.38 (read01 B8) — streaming top-N budget. For `ORDER BY …
+        // LIMIT k` (no DISTINCT / WITH TIES / SRF, and not forced to
+        // full-sort by the test gate) keep only the running top-`keep`
+        // rows in memory instead of materialising every projected row,
+        // so a `… ORDER BY col LIMIT 10` over a huge table is O(keep)
+        // space, not O(rows). `None` = accumulate everything (the prior
+        // behaviour). The final `partial_sort_tagged(keep)` below still
+        // runs and produces the identical rows.
+        let topk_stream: Option<(usize, Vec<bool>)> = if !stmt.order_by.is_empty()
+            && !stmt.distinct
+            && !stmt.limit_with_ties
+            && srf_position.is_none()
+            && !self.env_cfg().disable_topk
+        {
+            stmt.limit_literal().and_then(|l| {
+                let keep =
+                    (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
+                (keep >= 1).then(|| (keep, stmt.order_by.iter().map(|o| o.desc).collect()))
+            })
+        } else {
+            None
+        };
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
@@ -3499,6 +3521,10 @@ impl Engine {
                 let out = Row::new(values);
                 budget.charge(approx_row_bytes(&out))?;
                 tagged.push((order_keys, out));
+            }
+            // Streaming top-N: bound the accumulator to O(keep) rows.
+            if let Some((k, descs)) = &topk_stream {
+                topk_trim(&mut tagged, *k, descs);
             }
             Ok(())
         };
@@ -3960,6 +3986,22 @@ impl Engine {
         let stride = deferred.stride;
         let survivors_ref = &deferred.survivors;
         let n_surv = survivors_ref.len() / stride.max(1);
+        // v7.38 (read01 B8) — streaming top-N budget (see the sibling
+        // single-table path). Bounds this JOIN projection's accumulator
+        // to O(keep) for `ORDER BY … LIMIT k`.
+        let topk_stream: Option<(usize, Vec<bool>)> = if !stmt.order_by.is_empty()
+            && !stmt.distinct
+            && !stmt.limit_with_ties
+            && !self.env_cfg().disable_topk
+        {
+            stmt.limit_literal().and_then(|l| {
+                let keep =
+                    (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
+                (keep >= 1).then(|| (keep, stmt.order_by.iter().map(|o| o.desc).collect()))
+            })
+        } else {
+            None
+        };
         for surv_i in 0..n_surv {
             let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
             let row = &refs[surv_i];
@@ -4019,6 +4061,9 @@ impl Engine {
             let out_row = Row::new(values);
             budget.charge(approx_row_bytes(&out_row))?;
             tagged.push((order_keys, out_row));
+            if let Some((k, descs)) = &topk_stream {
+                topk_trim(&mut tagged, *k, descs);
+            }
         }
         if !stmt.order_by.is_empty() {
             let keep = if stmt.distinct
