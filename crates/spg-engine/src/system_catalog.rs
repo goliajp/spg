@@ -3090,17 +3090,22 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
-            let col_name = t
-                .schema()
-                .columns
-                .get(idx.column_position)
-                .map_or("?".into(), |c| c.name.clone());
+            let col_at = |pos: usize| -> String {
+                t.schema()
+                    .columns
+                    .get(pos)
+                    .map_or("?".into(), |c| c.name.clone())
+            };
+            let mut positions = alloc::vec![idx.column_position];
+            positions.extend(idx.extra_column_positions.iter().copied());
+            let cols = positions.iter().map(|&p| col_at(p)).collect::<Vec<_>>().join(", ");
             let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+            // Matches PG's pg_get_indexdef spelling (with `USING btree`).
             let indexdef = alloc::format!(
-                "CREATE {unique_kw}INDEX {} ON public.{} ({})",
+                "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({})",
                 idx.name,
                 tname,
-                col_name
+                cols
             );
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
