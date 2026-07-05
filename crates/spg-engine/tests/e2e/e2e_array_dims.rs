@@ -63,3 +63,41 @@ fn array_dims_returns_bracket_range() {
         other => panic!("got {other:?}"),
     }
 }
+
+/// U18 (read01 A-group): the dimension/length array functions
+/// (array_length / array_upper / array_lower / array_ndims /
+/// array_dims / cardinality) are element-type-agnostic in PG, but
+/// SPG only matched Text/Int/BigInt arms and errored on every other
+/// element type (bool[], date[], numeric[], float8[], ...). Values
+/// asserted against live PG 18.4.
+#[test]
+fn dimension_funcs_cover_all_element_types() {
+    let mut e = Engine::new();
+    let i = |e: &mut Engine, sql: &str| match first(e, sql) {
+        spg_storage::Value::Int(n) => n,
+        other => panic!("{sql}: got {other:?}"),
+    };
+    // bool[]
+    assert_eq!(i(&mut e, "SELECT array_length(ARRAY[true,false], 1)"), 2);
+    assert_eq!(i(&mut e, "SELECT cardinality(ARRAY[true,false,true])"), 3);
+    assert_eq!(i(&mut e, "SELECT array_ndims(ARRAY[true,false])"), 1);
+    // date[]
+    assert_eq!(
+        i(&mut e, "SELECT array_upper(ARRAY['2024-01-01'::date,'2024-01-02'], 1)"),
+        2
+    );
+    // numeric[] / float8[]
+    assert_eq!(i(&mut e, "SELECT array_lower(ARRAY[1.5,2.5]::numeric[], 1)"), 1);
+    assert_eq!(i(&mut e, "SELECT array_upper(ARRAY[1.5,2.5,3.5]::float8[], 1)"), 3);
+    assert_eq!(i(&mut e, "SELECT array_ndims(ARRAY[1.5,2.5]::numeric[])"), 1);
+    // array_dims on bool[]
+    match first(&mut e, "SELECT array_dims(ARRAY[true,false,true])") {
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "[1:3]"),
+        other => panic!("got {other:?}"),
+    }
+    // Empty typed array → NULL length/ndims (PG: no dimensions).
+    assert!(matches!(
+        first(&mut e, "SELECT array_length(ARRAY[]::bool[], 1)"),
+        spg_storage::Value::Null
+    ));
+}
