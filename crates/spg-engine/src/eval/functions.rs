@@ -11374,6 +11374,43 @@ fn apply_function_dispatch(
                     }
                     return Ok(Value::text(def));
                 }
+                // CHECK constraints — mirror synth_pg_constraint's naming
+                // (`{t}_check` / `{t}_check{i}`). PG wraps the predicate in
+                // an outer `CHECK (…)`.
+                for (ci, pred) in t.schema().checks.iter().enumerate() {
+                    let conname = if ci == 0 {
+                        alloc::format!("{tname}_check")
+                    } else {
+                        alloc::format!("{tname}_check{ci}")
+                    };
+                    if conname != bare {
+                        continue;
+                    }
+                    let inner = pred.trim();
+                    let body = if inner.starts_with('(') && inner.ends_with(')') {
+                        inner.to_string()
+                    } else {
+                        alloc::format!("({inner})")
+                    };
+                    return Ok(Value::text(alloc::format!("CHECK ({body})")));
+                }
+                // NOT NULL constraints (PG 18) — `{t}_{col}_not_null` for
+                // every NOT NULL column (incl. implicit-from-PK).
+                let pk_cols: alloc::collections::BTreeSet<usize> = t
+                    .schema()
+                    .uniqueness_constraints
+                    .iter()
+                    .filter(|uc| uc.is_primary_key)
+                    .flat_map(|uc| uc.columns.iter().copied())
+                    .collect();
+                for (i, col) in cols.iter().enumerate() {
+                    if col.nullable && !pk_cols.contains(&i) {
+                        continue;
+                    }
+                    if alloc::format!("{tname}_{}_not_null", col.name) == bare {
+                        return Ok(Value::text(alloc::format!("NOT NULL {}", col.name)));
+                    }
+                }
             }
             Ok(Value::Null)
         }
