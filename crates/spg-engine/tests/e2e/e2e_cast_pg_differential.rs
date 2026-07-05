@@ -2648,3 +2648,15 @@ fn jsonb_path_exists_operator() {
     assert_eq!(q(&mut e, "SELECT ('{\"x\":{\"y\":5}}'::jsonb @? '$.x.y')::text"), "true");
     assert_eq!(q(&mut e, "SELECT ('{\"a\":[1,2,3]}'::jsonb @? '$.a[*]')::text"), "true");
 }
+
+/// v7.37 D.57 — to_char `TH`/`th` ordinal suffix + trailing `%` literal. PG18.4-verified.
+#[test]
+fn to_char_ordinal_and_percent() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    assert_eq!(q(&mut e, "SELECT to_char(1,'FM9th')||'|'||to_char(2,'FM9th')||'|'||to_char(3,'FM9th')||'|'||to_char(4,'FM9th')||'|'||to_char(11,'FM99th')||'|'||to_char(21,'FM99th')||'|'||to_char(5,'FM9TH')||'|'||to_char(0.5,'FM90%')"),
+        "1st|2nd|3rd|4th|11th|21st|5TH|1%");
+    // no regression on the common patterns
+    assert_eq!(q(&mut e, "SELECT to_char(1234567.891, 'FM999,999,999.00')"), "1,234,567.89");
+    assert_eq!(q(&mut e, "SELECT to_char(-1234.5, 'FM999,990.00PR')"), "<1,234.50>");
+}
