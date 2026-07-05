@@ -1079,6 +1079,7 @@ pub(crate) fn resolve_col_literal_pair(
             }
         }
         Literal::Float(x) => Value::Float(*x),
+        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale },
         Literal::String(s) => Value::text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
