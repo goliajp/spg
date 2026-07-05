@@ -103,8 +103,44 @@ pub(crate) fn evaluate_partition_bound(expr: Expr) -> Result<PartitionBound, Eng
 /// Range bound order, used by overlap detection and INSERT routing.
 /// `MinValue` is below every TIMESTAMPTZ; `MaxValue` is above every
 /// TIMESTAMPTZ. Two `TimestampTz` micros compare as `i64`.
+/// The i64-comparable payload of an ordered bound, or `None` for the
+/// sentinels / TEXT (handled separately). All integer-family, DATE and
+/// TIMESTAMPTZ bounds share one i64 ordering space; a partition's key
+/// column has a single type, so its bounds are homogeneous and the shared
+/// space never mixes e.g. DATE-vs-TIMESTAMPTZ. Int-literal-into-BIGINT-key
+/// (Int vs BigInt) is the one legitimate cross-variant compare, and both
+/// widen to the same i64.
+fn bound_i64(b: &PartitionBound) -> Option<i64> {
+    match b {
+        PartitionBound::TimestampTz(m) => Some(*m),
+        PartitionBound::BigInt(n) => Some(*n),
+        PartitionBound::Int(n) => Some(i64::from(*n)),
+        PartitionBound::SmallInt(n) => Some(i64::from(*n)),
+        PartitionBound::Date(d) => Some(i64::from(*d)),
+        PartitionBound::MinValue | PartitionBound::MaxValue | PartitionBound::Text(_) => None,
+    }
+}
+
+/// v7.37 D.45 — build a range bound from a routed row's partition-key
+/// value. Mirrors `evaluate_partition_bound`'s literal→bound mapping.
+pub(crate) fn value_to_bound(v: &spg_storage::Value) -> Option<PartitionBound> {
+    use spg_storage::Value;
+    match v {
+        Value::Timestamp(m) => Some(PartitionBound::TimestampTz(*m)),
+        Value::BigInt(n) => Some(PartitionBound::BigInt(*n)),
+        Value::Int(n) => Some(PartitionBound::Int(*n)),
+        Value::SmallInt(n) => Some(PartitionBound::SmallInt(*n)),
+        Value::Date(d) => Some(PartitionBound::Date(*d)),
+        Value::Text(s) => match crate::eval::parse_timestamp_literal(s) {
+            Some(m) => Some(PartitionBound::TimestampTz(m)),
+            None => Some(PartitionBound::Text(s.clone().into_owned())),
+        },
+        _ => None,
+    }
+}
+
 fn bound_cmp(a: &PartitionBound, b: &PartitionBound) -> core::cmp::Ordering {
-    use PartitionBound::{MaxValue, MinValue, TimestampTz};
+    use PartitionBound::{MaxValue, MinValue, Text};
     use core::cmp::Ordering;
     match (a, b) {
         (MinValue, MinValue) | (MaxValue, MaxValue) => Ordering::Equal,
@@ -112,13 +148,16 @@ fn bound_cmp(a: &PartitionBound, b: &PartitionBound) -> core::cmp::Ordering {
         (_, MinValue) => Ordering::Greater,
         (MaxValue, _) => Ordering::Greater,
         (_, MaxValue) => Ordering::Less,
-        (TimestampTz(x), TimestampTz(y)) => x.cmp(y),
-        // v7.37.16 (16.6) — extended PartitionBound variants are
-        // Range/LIST-key reservations; not yet ordered against
-        // TIMESTAMPTZ. Treat as Equal so child-overlap detection
-        // is conservative (caller still uses MinValue/MaxValue for
-        // sentinels until each variant grows its own ordering pass).
-        _ => Ordering::Equal,
+        // v7.37 D.45 — TEXT bounds order lexicographically; every other
+        // ordered variant (int-family / DATE / TIMESTAMPTZ) shares the i64
+        // space via `bound_i64`.
+        (Text(x), Text(y)) => x.cmp(y),
+        _ => match (bound_i64(a), bound_i64(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            // Genuinely incomparable (e.g. TEXT vs numeric) — conservative
+            // Equal keeps overlap detection from spuriously separating them.
+            _ => Ordering::Equal,
+        },
     }
 }
 
@@ -140,37 +179,19 @@ pub(crate) fn ranges_overlap(
 /// (extracted at INSERT time via `Value::Timestamptz`); the result
 /// follows PG's "inclusive-lower / exclusive-upper" rule.
 #[allow(dead_code)] // wired by commit #4 (INSERT routing)
+/// v7.37 D.45 — a routed key (as a [`PartitionBound`] built by
+/// [`value_to_bound`]) falls in `[lower, upper)`: PG's inclusive-lower /
+/// exclusive-upper rule. Works for every ordered bound type (int-family /
+/// DATE / TIMESTAMPTZ / TEXT), not just TIMESTAMPTZ; MINVALUE/MAXVALUE
+/// sentinels are handled by `bound_cmp`.
 pub(crate) fn value_in_range(
-    value_micros: i64,
+    key: &PartitionBound,
     lower: &PartitionBound,
     upper: &PartitionBound,
 ) -> bool {
-    // v7.37.16 (16.6) — Range partitioning lower/upper currently only
-    // supports TIMESTAMPTZ bounds (v7.37.6-B intro). The other
-    // PartitionBound variants are reserved for LIST membership +
-    // future Range-on-numeric / Range-on-Date strategies; treat them
-    // here as "this bound doesn't constrain a TIMESTAMPTZ scan."
-    let lower_ok = match lower {
-        PartitionBound::MinValue => true,
-        PartitionBound::MaxValue => false,
-        PartitionBound::TimestampTz(m) => value_micros >= *m,
-        PartitionBound::BigInt(_)
-        | PartitionBound::Int(_)
-        | PartitionBound::SmallInt(_)
-        | PartitionBound::Date(_)
-        | PartitionBound::Text(_) => false,
-    };
-    let upper_ok = match upper {
-        PartitionBound::MinValue => false,
-        PartitionBound::MaxValue => true,
-        PartitionBound::TimestampTz(m) => value_micros < *m,
-        PartitionBound::BigInt(_)
-        | PartitionBound::Int(_)
-        | PartitionBound::SmallInt(_)
-        | PartitionBound::Date(_)
-        | PartitionBound::Text(_) => false,
-    };
-    lower_ok && upper_ok
+    use core::cmp::Ordering;
+    // key >= lower (inclusive) AND key < upper (exclusive).
+    bound_cmp(key, lower) != Ordering::Less && bound_cmp(key, upper) == Ordering::Less
 }
 
 /// v7.37.16 (16.2) — PG-compatible-ish hash for a typed
@@ -321,16 +342,24 @@ mod tests {
     /// exclusive-upper rule. Sentinel bounds skip the comparison.
     #[test]
     fn value_in_range_inclusive_lower_exclusive_upper() {
-        assert!(value_in_range(50, &TimestampTz(0), &TimestampTz(100)));
-        assert!(value_in_range(0, &TimestampTz(0), &TimestampTz(100)));
-        assert!(!value_in_range(100, &TimestampTz(0), &TimestampTz(100)));
-        assert!(!value_in_range(-1, &TimestampTz(0), &TimestampTz(100)));
+        use PartitionBound::{Date, Int};
+        assert!(value_in_range(&TimestampTz(50), &TimestampTz(0), &TimestampTz(100)));
+        assert!(value_in_range(&TimestampTz(0), &TimestampTz(0), &TimestampTz(100)));
+        assert!(!value_in_range(&TimestampTz(100), &TimestampTz(0), &TimestampTz(100)));
+        assert!(!value_in_range(&TimestampTz(-1), &TimestampTz(0), &TimestampTz(100)));
         // MINVALUE always satisfies lower; MAXVALUE always satisfies
         // upper (the catch-all "everything" range).
-        assert!(value_in_range(i64::MIN, &MinValue, &MaxValue));
-        assert!(value_in_range(i64::MAX - 1, &MinValue, &MaxValue));
+        assert!(value_in_range(&TimestampTz(i64::MIN), &MinValue, &MaxValue));
+        assert!(value_in_range(&TimestampTz(i64::MAX - 1), &MinValue, &MaxValue));
         // MAXVALUE as lower or MINVALUE as upper rejects everything.
-        assert!(!value_in_range(0, &MaxValue, &MaxValue));
-        assert!(!value_in_range(0, &MinValue, &MinValue));
+        assert!(!value_in_range(&TimestampTz(0), &MaxValue, &MaxValue));
+        assert!(!value_in_range(&TimestampTz(0), &MinValue, &MinValue));
+        // v7.37 D.45 — INTEGER and DATE range keys route by their own type.
+        assert!(value_in_range(&Int(5), &Int(0), &Int(10)));
+        assert!(!value_in_range(&Int(10), &Int(0), &Int(10))); // upper exclusive
+        assert!(value_in_range(&Int(0), &Int(0), &Int(10))); // lower inclusive
+        assert!(value_in_range(&Int(12), &Int(10), &MaxValue));
+        assert!(value_in_range(&Date(100), &Date(0), &Date(365)));
+        assert!(!value_in_range(&Date(400), &Date(0), &Date(365)));
     }
 }
