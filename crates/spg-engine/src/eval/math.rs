@@ -72,35 +72,22 @@ pub(super) fn prng_next_f64() -> f64 {
     mantissa as f64 / denom
 }
 
-/// no_std `f64::sqrt(x)` — square root via Newton's method
-/// (Babylonian). Gives EXACT results for perfect squares
-/// because the iteration converges to bit-exact precision in
-/// floating-point. x must be non-negative (caller's contract).
+/// no_std `f64::sqrt(x)` — delegates to `libm::sqrt`, the
+/// correctly-rounded IEEE-754 square root PG itself calls via C
+/// libm. Perfect squares round-trip exactly and non-squares match
+/// PG to the last ULP (the previous Newton iteration lost a ULP,
+/// e.g. sqrt(2) = 1.414213562373095 vs PG 1.4142135623730951).
+/// x must be non-negative (caller's contract; negatives → NaN).
 pub(crate) fn f64_sqrt(x: f64) -> f64 {
-    if x == 0.0 || x.is_nan() {
-        return x;
-    }
-    if x.is_infinite() {
-        return x;
-    }
-    // Initial guess via bit manipulation of the exponent: divide
-    // the exponent by 2. Avoids needing a logarithm for the
-    // seed and converges in ~5 iterations.
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
-    let new_exp = (exp / 2) + 1023;
-    let mut guess = f64::from_bits(((new_exp as u64) & 0x7ff) << 52);
-    // 5 Newton iterations are MORE than enough for f64 precision.
-    for _ in 0..8 {
-        guess = 0.5 * (guess + x / guess);
-    }
-    guess
+    libm::sqrt(x)
 }
 
 /// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
 /// series. Adequate for power(), exp(), and pseudo-random-ish
 /// scales the engine uses; ~1e-12 relative error in the
-/// common range.
+/// common range. (libm::exp was evaluated but is itself ~1 ULP
+/// off PG's glibc exp on e.g. exp(1), so it is not a clean
+/// drop-in win — kept the existing series.)
 pub(super) fn f64_exp(x: f64) -> f64 {
     if x.is_nan() {
         return x;

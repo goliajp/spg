@@ -1952,8 +1952,12 @@ fn apply_function_dispatch(
                                 detail: alloc::format!("{name}(): input must be > 0"),
                             });
                         }
-                        // log10(x) = ln(x) / ln(10).
-                        Ok(Value::Float(f64_ln(x) / f64_ln(10.0)))
+                        // PG's log(x) / log10(x) is the dedicated
+                        // base-10 log — use libm::log10 (matching PG's
+                        // C libm) so exact powers of ten land on whole
+                        // numbers (log10(1000) = 3, not the
+                        // 2.9999999999999996 that ln(x)/ln(10) yields).
+                        Ok(Value::Float(libm::log10(x)))
                     }
                 }
             } else if arg_count == 2 {
