@@ -1099,19 +1099,21 @@ impl Engine {
         }
         // Anchor: the body's leading SELECT, with unions stripped.
         let mut anchor = body_select.clone();
-        let union_terms = core::mem::take(&mut anchor.unions);
+        let all_union_terms = core::mem::take(&mut anchor.unions);
         anchor.ctes = Vec::new();
-        // Anchor must not reference the CTE name.
-        if select_refers_to(&anchor, &cte.name) {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "WITH RECURSIVE {:?}: the anchor must not reference the CTE itself",
-                cte.name
-            )));
-        }
+        // v7.37 D.42 — split the UNION members: those that do NOT reference the
+        // CTE are additional ANCHOR terms, only the ones that do recurse. A
+        // multi-row VALUES seed lowers to `SELECT r1 UNION ALL SELECT r2 UNION
+        // ALL <recursive>`, so the leading SELECT alone is not the whole anchor —
+        // treating the non-recursive `SELECT r2` as a recursive term made it
+        // re-emit its constant row every iteration → runaway loop.
+        let (anchor_terms, union_terms): (Vec<_>, Vec<_>) = all_union_terms
+            .into_iter()
+            .partition(|(_, t)| !select_refers_to(t, &cte.name));
         let anchor_result = self.exec_select_cancel(&anchor, cancel)?;
         let QueryResult::Rows {
             columns: anchor_cols,
-            rows: anchor_rows,
+            rows: mut anchor_rows,
         } = anchor_result
         else {
             return Err(EngineError::Unsupported(alloc::format!(
@@ -1119,6 +1121,14 @@ impl Engine {
                 cte.name
             )));
         };
+        // Append every non-recursive UNION member's rows to the anchor set.
+        for (_, term) in &anchor_terms {
+            let mut term = term.clone();
+            term.ctes = Vec::new();
+            if let QueryResult::Rows { rows, .. } = self.exec_select_cancel(&term, cancel)? {
+                anchor_rows.extend(rows);
+            }
+        }
         // The projection builder labels non-column expressions Text;
         // refine column types from the anchor's actual values so the
         // intermediate iter-catalog tables accept them.

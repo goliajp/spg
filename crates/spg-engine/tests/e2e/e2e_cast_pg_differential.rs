@@ -2356,3 +2356,21 @@ fn distinct_over_window() {
     // plain DISTINCT (no window) unchanged
     assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM (SELECT DISTINCT g FROM t) s)::text"), "3");
 }
+
+/// v7.37 D.42 — a multi-row VALUES seed recursive CTE terminates (non-recursive
+/// UNION members are anchor terms, not recursive terms). PG18.4-verified.
+#[test]
+fn recursive_cte_multirow_seed() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    // multi-row VALUES seed (previously ran away to 100k iterations)
+    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1),(2) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"), "1,2,11,12,21,22");
+    // single-row VALUES seed unchanged (task #387)
+    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"), "1,11,21");
+    // SELECT-based two-anchor seed
+    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT 2 UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT DISTINCT n FROM c) s"), "1,2,11,12,21,22");
+    // plain single-anchor recursion unchanged (regression)
+    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c) s"), "1,2,3,4,5");
+}
