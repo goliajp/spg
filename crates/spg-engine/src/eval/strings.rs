@@ -689,7 +689,22 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a
     // non-negative one gets a trailing space where the `>` would sit.
     let has_pr = pat.len() >= 2 && pat[pat.len() - 2..].eq_ignore_ascii_case("PR");
-    let pat = if has_pr { &pat[..pat.len() - 2] } else { pat };
+    let mut pat = if has_pr { &pat[..pat.len() - 2] } else { pat };
+    // v7.37 — `TH` / `th` ordinal suffix and a trailing `%` literal. Both are
+    // stripped here and re-applied post-pass (like PR), so the slot machinery
+    // never sees them. `TH` (upper) → uppercase suffix; `th` → lowercase.
+    let th_suffix: Option<bool> = if pat.len() >= 2 && pat[pat.len() - 2..].eq_ignore_ascii_case("TH")
+    {
+        let upper = pat.ends_with("TH");
+        pat = &pat[..pat.len() - 2];
+        Some(upper)
+    } else {
+        None
+    };
+    let has_pct = pat.ends_with('%');
+    if has_pct {
+        pat = &pat[..pat.len() - 1];
+    }
     let has_sign_tok = pat.chars().any(|c| c == 'S' || c == 's');
 
     // Split around the decimal separator ('.', 'D', or 'd').
@@ -827,7 +842,35 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
             out.push(' ');
         }
     }
+    // v7.37 — ordinal suffix (`TH`/`th`) based on the integer value, then a
+    // trailing `%` literal.
+    if let Some(upper) = th_suffix {
+        let suf = ordinal_suffix(int_part);
+        if upper {
+            out.push_str(&suf.to_ascii_uppercase());
+        } else {
+            out.push_str(suf);
+        }
+    }
+    if has_pct {
+        out.push('%');
+    }
     out
+}
+
+/// The English ordinal suffix (`st`/`nd`/`rd`/`th`) for `n`, matching PG's
+/// `TH` / `th` numeric-format modifier. 11/12/13 are always `th`.
+fn ordinal_suffix(n: i128) -> &'static str {
+    let n = n.unsigned_abs();
+    if (11..=13).contains(&(n % 100)) {
+        return "th";
+    }
+    match n % 10 {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        _ => "th",
+    }
 }
 
 /// Left-pad `s` with spaces so its char count reaches `width`
