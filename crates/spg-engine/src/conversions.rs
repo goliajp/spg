@@ -2332,7 +2332,12 @@ pub(crate) fn coerce_value(
         // v4.9: Text ↔ JSON coercion. No structural validation —
         // any text literal is accepted; the responsibility for
         // valid JSON lies with the producer.
-        (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::json(s)),
+        (Value::Text(s), DataType::Json) => Some(Value::json(s)),
+        // v7.38 (read01) — a jsonb column canonicalises its value on
+        // assignment, the same as PG's `::jsonb` cast.
+        (Value::Text(s), DataType::Jsonb) => Some(Value::json(
+            crate::json::canonicalize_jsonb(s.as_ref()).unwrap_or_else(|_| s.into_owned()),
+        )),
         (Value::Json(s), DataType::Text) => Some(Value::text(s)),
         // v7.13.3 — mailrs round-7 S10. SPG's storage represents
         // both JSON and JSONB on-disk as `Value::json(String)` —
@@ -2341,7 +2346,10 @@ pub(crate) fn coerce_value(
         // satisfy a DataType::Jsonb column. Identity coerce in
         // both directions so JSON ↔ JSONB assignments work at all
         // INSERT / ALTER COLUMN TYPE / DEFAULT contexts.
-        (Value::Json(s), DataType::Jsonb | DataType::Json) => Some(Value::json(s)),
+        (Value::Json(s), DataType::Json) => Some(Value::json(s)),
+        (Value::Json(s), DataType::Jsonb) => Some(Value::json(
+            crate::json::canonicalize_jsonb(s.as_ref()).unwrap_or_else(|_| s.into_owned()),
+        )),
         // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
         //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
         //   - Escape: `Hello\\000world`  (backslash + octal triples)

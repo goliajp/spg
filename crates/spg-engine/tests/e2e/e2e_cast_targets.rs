@@ -58,7 +58,7 @@ fn jsonb_cast_from_text() {
     let Value::Json(s) = &rows[0].values[0] else {
         panic!("{:?}", rows[0].values[0])
     };
-    assert_eq!(s, r#"{"k":"v"}"#);
+    assert_eq!(s, r#"{"k": "v"}"#);
 }
 
 #[test]

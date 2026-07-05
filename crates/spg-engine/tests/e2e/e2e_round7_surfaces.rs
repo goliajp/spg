@@ -221,5 +221,5 @@ fn jsonb_cast_in_insert_value() {
         .unwrap();
     let table = e.catalog().get("jb").unwrap();
     let row = table.rows().get(0).unwrap();
-    assert!(matches!(&row.values[1], spg_storage::Value::Json(s) if s == "[1,2,3]"));
+    assert!(matches!(&row.values[1], spg_storage::Value::Json(s) if s == "[1, 2, 3]"));
 }
