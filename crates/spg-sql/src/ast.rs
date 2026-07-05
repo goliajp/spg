@@ -338,6 +338,16 @@ pub enum Statement {
     /// (composite / range / domain) extend the inner `kind`
     /// enum.
     CreateType(CreateTypeStatement),
+    /// v7.37 D.55 — `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'
+    /// [{BEFORE | AFTER} 'existing']`. Extends an enum's label list so
+    /// enum evolution stops being a silent no-op. `position` is
+    /// `Some((is_before, anchor))`.
+    AlterTypeAddValue {
+        type_name: String,
+        label: String,
+        if_not_exists: bool,
+        position: Option<(bool, String)>,
+    },
     /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] name [, name…]
     /// [CASCADE | RESTRICT]`. Removes the matching enum/domain
     /// from the catalog.
@@ -3130,6 +3140,7 @@ impl Statement {
             | Statement::RefreshMaterializedView { .. }
             | Statement::DropMaterializedView { .. }
             | Statement::CreateType(_)
+            | Statement::AlterTypeAddValue { .. }
             | Statement::DropType { .. }
             | Statement::CreateDomain(_)
             | Statement::DropDomain { .. }
@@ -3487,6 +3498,22 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::CreateType(t) => t.fmt(f),
+            Self::AlterTypeAddValue {
+                type_name,
+                label,
+                if_not_exists,
+                position,
+            } => {
+                write!(f, "ALTER TYPE {type_name} ADD VALUE ")?;
+                if *if_not_exists {
+                    write!(f, "IF NOT EXISTS ")?;
+                }
+                write!(f, "'{label}'")?;
+                if let Some((is_before, anchor)) = position {
+                    write!(f, " {} '{anchor}'", if *is_before { "BEFORE" } else { "AFTER" })?;
+                }
+                Ok(())
+            }
             Self::DropType { names, if_exists } => {
                 f.write_str("DROP TYPE ")?;
                 if *if_exists {

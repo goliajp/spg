@@ -987,6 +987,21 @@ impl Engine {
                 self.exec_drop_materialized_view(&names, if_exists)
             }
             Statement::CreateType(s) => self.exec_create_type(s),
+            Statement::AlterTypeAddValue {
+                type_name,
+                label,
+                if_not_exists,
+                position,
+            } => {
+                let added = self
+                    .active_catalog_mut()
+                    .add_enum_value(&type_name, &label, if_not_exists, position)
+                    .map_err(EngineError::Storage)?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: added,
+                })
+            }
             Statement::DropType { names, if_exists } => self.exec_drop_type(&names, if_exists),
             Statement::CreateDomain(s) => self.exec_create_domain(s),
             Statement::DropDomain { names, if_exists } => self.exec_drop_domain(&names, if_exists),

@@ -3581,6 +3581,44 @@ impl Catalog {
 
     /// v7.17.0 Phase 1.4 — drop an ENUM type by name. Returns
     /// true if a type was removed.
+    /// v7.37 D.55 — `ALTER TYPE … ADD VALUE`. Appends `label` to an existing
+    /// enum's ordered label list, or inserts it before/after an existing label.
+    /// `if_not_exists` makes a duplicate a no-op; otherwise a duplicate errors.
+    /// Returns `Ok(true)` if a label was added, `Ok(false)` if it already existed
+    /// (only possible under `if_not_exists`).
+    pub fn add_enum_value(
+        &mut self,
+        type_name: &str,
+        label: &str,
+        if_not_exists: bool,
+        position: Option<(bool, String)>,
+    ) -> Result<bool, StorageError> {
+        let def = self.enum_types.get_mut(type_name).ok_or_else(|| {
+            StorageError::Corrupt(format!("type {type_name:?} does not exist"))
+        })?;
+        if def.labels.iter().any(|l| l == label) {
+            if if_not_exists {
+                return Ok(false);
+            }
+            return Err(StorageError::Corrupt(format!(
+                "enum label {label:?} already exists in type {type_name:?}"
+            )));
+        }
+        match position {
+            None => def.labels.push(label.to_string()),
+            Some((is_before, anchor)) => {
+                let at = def.labels.iter().position(|l| l == &anchor).ok_or_else(|| {
+                    StorageError::Corrupt(format!(
+                        "enum label {anchor:?} does not exist in type {type_name:?}"
+                    ))
+                })?;
+                let idx = if is_before { at } else { at + 1 };
+                def.labels.insert(idx, label.to_string());
+            }
+        }
+        Ok(true)
+    }
+
     pub fn drop_enum_type(&mut self, name: &str) -> bool {
         self.enum_types.remove(name).is_some()
     }

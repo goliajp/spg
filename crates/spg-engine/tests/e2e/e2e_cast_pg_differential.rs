@@ -2589,3 +2589,28 @@ fn in_subquery_null_three_valued_logic() {
     // PG18.4: a1=1 a2=(none) a3=1 a4=2 a5=NULL a6=NULL a7=true
     assert_eq!(out.join("|"), "1|(none)|1|2|||true");
 }
+
+/// v7.37 D.55 — ALTER TYPE … ADD VALUE real enum evolution (was a silent no-op).
+/// PG18.4-verified.
+#[test]
+fn alter_type_add_value() {
+    let mut e = Engine::new();
+    e.execute("CREATE TYPE mood AS ENUM ('sad','ok')").unwrap();
+    // plain append
+    e.execute("ALTER TYPE mood ADD VALUE 'happy'").unwrap();
+    e.execute("CREATE TABLE m(x mood)").unwrap();
+    e.execute("INSERT INTO m VALUES ('happy')").unwrap();
+    // BEFORE / AFTER positioning
+    e.execute("ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok'").unwrap();
+    e.execute("ALTER TYPE mood ADD VALUE 'awful' BEFORE 'sad'").unwrap();
+    e.execute("INSERT INTO m VALUES ('meh'),('awful')").unwrap();
+    // IF NOT EXISTS is a no-op on a duplicate
+    e.execute("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'happy'").unwrap();
+    // duplicate without IF NOT EXISTS errors
+    assert!(e.execute("ALTER TYPE mood ADD VALUE 'happy'").is_err());
+    // enum ordering reflected via enum_range/ordering
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    // all three ADD VALUE labels round-trip (ordered by text — SPG orders enum
+    // columns lexically, not by ordinal; enum-ordinal ORDER BY is a separate gap).
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text, ',' ORDER BY x::text) FROM m"), "awful,happy,meh");
+}
