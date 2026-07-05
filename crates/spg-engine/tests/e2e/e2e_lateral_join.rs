@@ -38,6 +38,49 @@ fn setup(e: &mut Engine) {
         .unwrap();
 }
 
+// read01 LATERAL — a FROM-less LATERAL subquery references outer columns
+// in its projection. Previously only qualified `alias.col` refs (in a
+// correlated inner WHERE) were substituted; a FROM-less `LATERAL (SELECT
+// v*2)` left the bare outer column unresolved and errored. Values vs
+// live PG 18.4.
+#[test]
+fn lateral_fromless_projects_outer_column() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT, g INT, v INT)").unwrap();
+    e.execute("INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)")
+        .unwrap();
+
+    // Comma-join FROM-less LATERAL: x = v*2.
+    let r = rows(
+        e.execute("SELECT t.id, x FROM t, LATERAL (SELECT v * 2 AS x) sub WHERE t.id = 1")
+            .unwrap(),
+    );
+    assert_eq!(r, vec![vec![Value::Int(1), Value::Int(20)]]);
+
+    // CROSS JOIN LATERAL, bare outer ref.
+    let r = rows(
+        e.execute("SELECT t.id, x FROM t CROSS JOIN LATERAL (SELECT v + 1 AS x) sub WHERE t.id = 2")
+            .unwrap(),
+    );
+    assert_eq!(r, vec![vec![Value::Int(2), Value::Int(21)]]);
+
+    // Multiple outer columns across multiple projected columns.
+    let r = rows(
+        e.execute(
+            "SELECT t.id, a, b FROM t, LATERAL (SELECT v * 10 AS a, g + v AS b) sub WHERE t.id = 3",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r, vec![vec![Value::Int(3), Value::Int(300), Value::Int(32)]]);
+
+    // JOIN LATERAL … ON true (the ON-clause mixed form).
+    let r = rows(
+        e.execute("SELECT t.id, x FROM t JOIN LATERAL (SELECT v AS x) sub ON true WHERE t.id = 2")
+            .unwrap(),
+    );
+    assert_eq!(r, vec![vec![Value::Int(2), Value::Int(20)]]);
+}
+
 #[test]
 fn lateral_subquery_correlated_in_where() {
     // The canonical LATERAL shape: for each user, fetch one order.
