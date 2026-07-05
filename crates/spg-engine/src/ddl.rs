@@ -1330,10 +1330,9 @@ impl Engine {
         }
         // v7.9.14 — multi-column index parses through; engine
         // builds a single-column BTree on the leading column only.
-        // The extras live on the AST so spg-server's dispatcher
-        // can emit a PG-wire NoticeResponse / log line. Composite
-        // BTree keys land in v7.10.
-        let _ = &stmt.extra_columns; // intentional drop on engine side
+        // The trailing index columns are resolved + persisted below
+        // (for every index, not just UNIQUE) so the catalog reports the
+        // full column list; the BTree still keys on the leading column.
         let table_name = stmt.table.clone();
         // v6.8.0 — resolve INCLUDE column names to positions. Done
         // before `add_index` so a typo error surfaces before any
@@ -1502,10 +1501,12 @@ impl Engine {
         // checks that no other row whose predicate evaluates true
         // shares the same indexed key. Parser already rejected
         // `UNIQUE` on HNSW / BRIN, so plain BTree here.
-        // For multi-column UNIQUE INDEX the extras matter (the
-        // full tuple is the uniqueness key), so resolve them to
-        // column positions and persist on the index too.
-        if stmt.is_unique {
+        // Resolve the trailing index columns to positions and persist
+        // them on EVERY index, unique or not — the BTree keys on the
+        // leading column, but the extras drive uniqueness enforcement
+        // (unique) and the catalog / pg_get_indexdef column list
+        // (both), so a plain `CREATE INDEX t (a, b)` reports (a, b).
+        {
             let mut extra_positions: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
             for col_name in &stmt.extra_columns {
                 let pos = table
@@ -1515,7 +1516,7 @@ impl Engine {
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| {
                         EngineError::Unsupported(alloc::format!(
-                            "UNIQUE INDEX {:?}: extra column {col_name:?} not in table {:?}",
+                            "INDEX {:?}: extra column {col_name:?} not in table {:?}",
                             stmt.name,
                             stmt.table
                         ))
@@ -1523,8 +1524,12 @@ impl Engine {
                 extra_positions.push(pos);
             }
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
-                idx.is_unique = true;
                 idx.extra_column_positions = extra_positions;
+            }
+        }
+        if stmt.is_unique {
+            if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
+                idx.is_unique = true;
             }
             // At index-creation time, check the existing rows for
             // pre-existing duplicates that would have violated the
