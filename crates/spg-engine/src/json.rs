@@ -1244,11 +1244,18 @@ fn encode_value_into(v: &Value, out: &mut String) {
             }
             out.push(']');
         }
-        // Fall-through: render via Debug-stripped textual form,
-        // wrapped as a JSON string. Date/Timestamp/Uuid/Bytes/etc.
-        // PG itself stringifies these to their text-out form.
+        // PG's to_json spells a timestamp in ISO 8601 with a `T`
+        // separator (`2020-01-15T10:30:00`), unlike the space-separated
+        // text-out form, so it needs its own arm ahead of the catch-all.
+        Value::Timestamp(_) => {
+            let txt = crate::eval::values::value_to_text(v).replacen(' ', "T", 1);
+            write_json(&JsonValue::String(txt), out);
+        }
+        // Fall-through: every other type (Date / Interval / Uuid / Bytea /
+        // Time / Money / …) renders via the canonical PG-faithful text
+        // renderer, wrapped as a JSON string — never a Rust debug dump.
         other => {
-            let txt = alloc::format!("{other:?}");
+            let txt = crate::eval::values::value_to_text(other);
             write_json(&JsonValue::String(txt), out);
         }
     }
