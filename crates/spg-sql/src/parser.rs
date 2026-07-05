@@ -12037,6 +12037,7 @@ impl Parser {
     ) -> Result<Option<Expr>, ParseError> {
         enum Sym {
             Regex { ci: bool, negated: bool },
+            Like { ci: bool, negated: bool },
             StartsWith,
             Power,
             Xor,
@@ -12071,6 +12072,35 @@ impl Parser {
                 },
                 4,
             ),
+            // v7.37 D.25 — PG operator spellings of LIKE/ILIKE.
+            Token::DoubleTilde => (
+                Sym::Like {
+                    ci: false,
+                    negated: false,
+                },
+                4,
+            ),
+            Token::DoubleTildeStar => (
+                Sym::Like {
+                    ci: true,
+                    negated: false,
+                },
+                4,
+            ),
+            Token::NotDoubleTilde => (
+                Sym::Like {
+                    ci: false,
+                    negated: true,
+                },
+                4,
+            ),
+            Token::NotDoubleTildeStar => (
+                Sym::Like {
+                    ci: true,
+                    negated: true,
+                },
+                4,
+            ),
             Token::CaretAt => (Sym::StartsWith, 4),
             Token::Caret => (Sym::Power, 8),
             Token::Hash => (Sym::Xor, 6),
@@ -12096,6 +12126,12 @@ impl Parser {
                     negated,
                 )
             }
+            Sym::Like { ci, negated } => Expr::Like {
+                expr: alloc::boxed::Box::new(lhs.clone()),
+                pattern: alloc::boxed::Box::new(rhs),
+                negated,
+                case_insensitive: ci,
+            },
             Sym::StartsWith => Expr::FunctionCall {
                 name: String::from("starts_with"),
                 args: alloc::vec![lhs.clone(), rhs],

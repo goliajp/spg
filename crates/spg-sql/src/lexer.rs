@@ -173,6 +173,14 @@ pub enum Token {
     NotTilde,
     /// Negated case-insensitive regex match `!~*`.
     NotTildeStar,
+    /// LIKE operator `~~` (PG's operator form of `LIKE`).
+    DoubleTilde,
+    /// ILIKE operator `~~*` (case-insensitive LIKE).
+    DoubleTildeStar,
+    /// NOT LIKE operator `!~~`.
+    NotDoubleTilde,
+    /// NOT ILIKE operator `!~~*`.
+    NotDoubleTildeStar,
     /// Power operator `^`.
     Caret,
     /// Starts-with operator `^@` (PG 11+).
@@ -610,6 +618,16 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b'|' => {
                 single(&mut out, Token::Pipe, &mut i);
             }
+            // `~~*` (ILIKE) / `~~` (LIKE) — check the double-tilde forms before
+            // `~*` and single `~` so PG's operator spellings of LIKE/ILIKE parse.
+            b'~' if peek_eq(bytes, i + 1, b'~') && peek_eq(bytes, i + 2, b'*') => {
+                out.push(Token::DoubleTildeStar);
+                i += 3;
+            }
+            b'~' if peek_eq(bytes, i + 1, b'~') => {
+                out.push(Token::DoubleTilde);
+                i += 2;
+            }
             b'~' if peek_eq(bytes, i + 1, b'*') => {
                 out.push(Token::TildeStar);
                 i += 2;
@@ -657,6 +675,18 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
                 i += 2;
+            }
+            // `!~~*` (NOT ILIKE) / `!~~` (NOT LIKE) — before `!~*` / `!~`.
+            b'!' if peek_eq(bytes, i + 1, b'~')
+                && peek_eq(bytes, i + 2, b'~')
+                && peek_eq(bytes, i + 3, b'*') =>
+            {
+                out.push(Token::NotDoubleTildeStar);
+                i += 4;
+            }
+            b'!' if peek_eq(bytes, i + 1, b'~') && peek_eq(bytes, i + 2, b'~') => {
+                out.push(Token::NotDoubleTilde);
+                i += 3;
             }
             b'!' if peek_eq(bytes, i + 1, b'~') && peek_eq(bytes, i + 2, b'*') => {
                 out.push(Token::NotTildeStar);
