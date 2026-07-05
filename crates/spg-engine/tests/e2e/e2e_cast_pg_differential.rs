@@ -2882,3 +2882,18 @@ fn concat_format_render_all_types_pg_faithful() {
     assert_eq!(q(&mut e, "SELECT format('%s', DATE '2020-01-15')"), "2020-01-15");
     assert_eq!(q(&mut e, "SELECT format('%s', '{1,2}'::int[])"), "{1,2}");
 }
+
+#[test]
+fn to_json_renders_temporal_types_pg_faithful() {
+    // PG to_json/to_jsonb stringify Date/Timestamp/Interval to their text-out
+    // form (timestamp uses the ISO `T` separator), never a Rust debug dump.
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
+    assert_eq!(q(&mut e, "SELECT to_json(DATE '2020-01-15')::text"), "\"2020-01-15\"");
+    assert_eq!(q(&mut e, "SELECT to_json(TIMESTAMP '2020-01-15 10:30:00')::text"), "\"2020-01-15T10:30:00\"");
+    assert_eq!(q(&mut e, "SELECT to_json(INTERVAL '1 day')::text"), "\"1 day\"");
+    assert_eq!(q(&mut e, "SELECT to_jsonb(DATE '2020-01-15')::text"), "\"2020-01-15\"");
+    // regression guard on the already-correct scalars
+    assert_eq!(q(&mut e, "SELECT to_json(2.5::numeric)::text"), "2.5");
+    assert_eq!(q(&mut e, "SELECT to_json('hi\"there'::text)::text"), "\"hi\\\"there\"");
+}
