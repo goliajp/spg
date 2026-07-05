@@ -64,6 +64,11 @@ fn jsonb_accessor_operators() {
     check(&mut e, "SELECT ('{\"a\":{\"b\":{\"c\":5}}}'::jsonb #> '{a,b,c}')::text", "5");
     check(&mut e, "SELECT ('{\"a\":{\"b\":{\"c\":5}}}'::jsonb #>> '{a,b,c}')", "5");
     check(&mut e, "SELECT ('{\"a\":1}'::jsonb #> '{a,b}')::text", "<NULL>");
+    // Extracting a container re-emits it in canonical jsonb form (PG18.4).
+    check(&mut e, "SELECT ('{\"a\":{\"c\":2,\"b\":1}}'::jsonb -> 'a')::text", "{\"b\": 1, \"c\": 2}");
+    check(&mut e, "SELECT ('{\"a\":{\"c\":2,\"b\":1}}'::jsonb ->> 'a')", "{\"b\": 1, \"c\": 2}");
+    check(&mut e, "SELECT ('{\"a\":{\"x\":{\"z\":1,\"y\":2}}}'::jsonb #> '{a,x}')::text", "{\"y\": 2, \"z\": 1}");
+    check(&mut e, "SELECT ('[{\"b\":1,\"a\":2}]'::jsonb -> 0)::text", "{\"a\": 2, \"b\": 1}");
 }
 
 // ---- containment / key-exists ----
