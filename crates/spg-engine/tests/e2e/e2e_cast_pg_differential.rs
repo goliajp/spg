@@ -2374,3 +2374,18 @@ fn recursive_cte_multirow_seed() {
     // plain single-anchor recursion unchanged (regression)
     assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c) s"), "1,2,3,4,5");
 }
+
+/// v7.37 D.43 — a WITH/RECURSIVE CTE in scalar-subquery position parses + runs.
+/// PG18.4-verified.
+#[test]
+fn cte_in_scalar_subquery() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 100) SELECT count(*) FROM c)::text"), "100");
+    assert_eq!(q(&mut e, "SELECT (WITH x AS (SELECT 5 v) SELECT v FROM x)::text"), "5");
+    assert_eq!(q(&mut e, "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT sum(n) FROM c)::text"), "15");
+    // non-subquery parenthesised expression still works (regression)
+    assert_eq!(q(&mut e, "SELECT ((1 + 2) * 3)::text"), "9");
+}

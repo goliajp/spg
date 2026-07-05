@@ -12442,6 +12442,36 @@ impl Parser {
         }
     }
 
+    /// Parse a parenthesised scalar subquery body after the caller has consumed
+    /// `(` and confirmed the next token is SELECT (or WITH, when `is_with`).
+    /// v7.37 D.43 — `#[inline(never)]` keeps the large `Statement` local and the
+    /// SELECT/WITH parse machinery off `parse_atom`'s stack frame; parse_atom sits
+    /// on the recursive `((…))` cycle whose depth budget is tuned to that frame.
+    #[inline(never)]
+    fn parse_paren_scalar_subquery(&mut self, is_with: bool) -> Result<Expr, ParseError> {
+        let inner = if is_with {
+            self.advance(); // WITH
+            self.parse_with_cte_then_select()?
+        } else {
+            self.parse_select_stmt()?
+        };
+        match self.advance() {
+            Token::RParen => {
+                let Statement::Select(s) = inner else {
+                    return Err(ParseError {
+                        message: "scalar subquery body must be a SELECT".into(),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                };
+                Ok(Expr::ScalarSubquery(Box::new(s)))
+            }
+            other => Err(ParseError {
+                message: format!("expected ')' after scalar subquery, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
+    }
+
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
         // `B'1010'` / `X'1F'` — SQL bit-string literals. The lexer
         // splits them into an ident + string; recombine here and
@@ -12499,20 +12529,16 @@ impl Parser {
                 // v4.10: `(SELECT ...)` in expression position is a
                 // scalar subquery; otherwise it's a parenthesised
                 // expression. Peek for SELECT keyword to dispatch.
-                if matches!(self.peek(), Token::Select) {
-                    let inner = self.parse_select_stmt()?;
-                    match self.advance() {
-                        Token::RParen => {
-                            let Statement::Select(s) = inner else {
-                                unreachable!("parse_select_stmt returns Select")
-                            };
-                            Ok(Expr::ScalarSubquery(Box::new(s)))
-                        }
-                        other => Err(ParseError {
-                            message: format!("expected ')' after scalar subquery, got {other:?}"),
-                            token_pos: self.pos.saturating_sub(1),
-                        }),
-                    }
+                // v7.37 D.43 — also accept `(WITH [RECURSIVE] … SELECT …)`; WITH
+                // lexes as Ident("with") (not a reserved token). The subquery body
+                // is parsed in `parse_paren_scalar_subquery` (marked #[inline(never)]
+                // so its large `Statement` local stays out of parse_atom's stack
+                // frame — parse_atom is on the recursive `((…))` cycle and the
+                // nesting budget is tuned to its frame size).
+                let is_with = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("with"));
+                if matches!(self.peek(), Token::Select) || is_with {
+                    self.parse_paren_scalar_subquery(is_with)
                 } else {
                     let e = self.parse_expr(0)?;
                     // `(a, b, …)` — a row constructor. Valid only
