@@ -5541,7 +5541,57 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
                 return self.parse_alter_sequence_after_keyword();
             }
-            // v7.14.0 — ALTER VIEW / ALTER FUNCTION / ALTER TYPE /
+            // v7.37 D.55 — ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'
+            // [{BEFORE | AFTER} 'existing']. Real enum evolution; other ALTER
+            // TYPE forms (RENAME / OWNER / SET SCHEMA) still no-op below.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("type") => {
+                // NB: the match arm consumed `TYPE` via self.advance(); the
+                // cursor is now at the type name — do NOT advance again.
+                let type_name = self.expect_ident_like()?;
+                let is_add_value = matches!(self.peek(), Token::Ident(a) if a.eq_ignore_ascii_case("add"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(v)) if v.eq_ignore_ascii_case("value"));
+                if is_add_value {
+                    self.advance(); // ADD
+                    self.advance(); // VALUE
+                    // `IF NOT EXISTS` — NOT lexes as the keyword `Token::Not`,
+                    // IF/EXISTS as identifiers.
+                    let if_not_exists = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                        let n1 = self.tokens.get(self.pos + 1);
+                        let n2 = self.tokens.get(self.pos + 2);
+                        if matches!(n1, Some(Token::Not))
+                            && matches!(n2, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exists"))
+                        {
+                            self.advance();
+                            self.advance();
+                            self.advance();
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let label = self.expect_string_literal()?;
+                    let position = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("before") || s.eq_ignore_ascii_case("after")) {
+                        let is_before = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("before"));
+                        self.advance();
+                        let anchor = self.expect_string_literal()?;
+                        Some((is_before, anchor))
+                    } else {
+                        None
+                    };
+                    return Ok(Statement::AlterTypeAddValue {
+                        type_name,
+                        label,
+                        if_not_exists,
+                        position,
+                    });
+                }
+                // Other ALTER TYPE forms — accept as no-op (pg_dump tail).
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
+            }
+            // v7.14.0 — ALTER VIEW / ALTER FUNCTION /
             // ALTER DOMAIN / ALTER DATABASE / ALTER USER / ALTER
             // ROLE / ALTER SCHEMA / ALTER OWNER / ALTER DEFAULT
             // PRIVILEGES — accept as no-op so pg_dump's tail loads.
@@ -5551,7 +5601,6 @@ impl Parser {
                     s.to_ascii_lowercase().as_str(),
                     "view"
                         | "function"
-                        | "type"
                         | "domain"
                         | "database"
                         | "role"
