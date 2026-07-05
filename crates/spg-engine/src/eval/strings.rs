@@ -661,6 +661,63 @@ fn to_char_interval(months: i64, days: i64, micros: i128, fmt: &str) -> String {
 /// PG `to_char(n, 'RN')` — Roman numerals. Valid for 1..=3999; anything else
 /// (including 0 and negatives) renders as 15 `#`. Without `FM` the result is
 /// right-justified in a 15-character field; `FM` trims it.
+/// Format `x` with exactly `d` fractional digits (round-half-away-from-zero),
+/// no sign. `d == 0` yields no decimal point.
+fn format_fixed_abs(x: f64, d: usize) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let pow = libm::pow(10.0, d as f64);
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = libm::round(x.abs() * pow) as i128;
+    if d == 0 {
+        return alloc::format!("{scaled}");
+    }
+    let unit = 10_i128.pow(d as u32);
+    let ip = scaled / unit;
+    let fp = (scaled % unit).abs();
+    alloc::format!("{ip}.{fp:0width$}", width = d)
+}
+
+/// PG `EEEE` scientific notation. `mant_fmt` is the format preceding `EEEE`
+/// (e.g. `9.9`); its post-decimal digit count sets the mantissa precision.
+/// Mantissa is normalised to one leading digit; rounding is not
+/// re-normalised (PG: `9.99` with `9.9EEEE` → `10.0e+00`). Exponent is a
+/// signed two-digit field. Non-FM keeps a leading blank for the sign.
+fn to_char_scientific(n: f64, mant_fmt: &str, fill_mode: bool) -> String {
+    let neg = n < 0.0 && n != 0.0;
+    let a = n.abs();
+    let exp: i32 = if a == 0.0 {
+        0
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            libm::floor(libm::log10(a)) as i32
+        }
+    };
+    let frac_digits = mant_fmt
+        .find(['.', 'D', 'd'])
+        .map_or(0, |dot| {
+            mant_fmt[dot + 1..]
+                .chars()
+                .filter(|c| matches!(c, '9' | '0'))
+                .count()
+        });
+    let mantissa = if a == 0.0 {
+        0.0
+    } else {
+        a / libm::pow(10.0, f64::from(exp))
+    };
+    let mant_str = format_fixed_abs(mantissa, frac_digits);
+    let sign = if neg {
+        "-"
+    } else if fill_mode {
+        ""
+    } else {
+        " "
+    };
+    let esign = if exp < 0 { '-' } else { '+' };
+    alloc::format!("{sign}{mant_str}e{esign}{:02}", exp.abs())
+}
+
 fn to_char_roman(n: f64, fill_mode: bool) -> String {
     #[allow(clippy::cast_possible_truncation)]
     let v = libm::round(n) as i64;
@@ -692,6 +749,11 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
     if pat.eq_ignore_ascii_case("RN") {
         return to_char_roman(n, fill_mode);
+    }
+    // `EEEE`: scientific notation. The mantissa format is whatever precedes
+    // `EEEE`; the digit count after its decimal sets the mantissa precision.
+    if let Some(epos) = pat.to_ascii_uppercase().find("EEEE") {
+        return to_char_scientific(n, &pat[..epos], fill_mode);
     }
     // `PR` suffix: PG's accounting-negative notation — a negative value is
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a
