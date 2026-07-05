@@ -30,6 +30,7 @@ use crate::{
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
+    synth_pg_sequence,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
     try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n,
@@ -591,6 +592,12 @@ impl Engine {
                 // for FK / UNIQUE / PK / CHECK introspection.
                 "__spg_pg_constraint" => {
                     let (schema, rows) = synth_pg_constraint(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.37 U11 — pg_catalog.pg_sequence, one row per CREATE
+                // SEQUENCE (psql \d <seq> + ORM sequence introspection).
+                "__spg_pg_sequence" => {
+                    let (schema, rows) = synth_pg_sequence(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-55 — pg_catalog.pg_database /

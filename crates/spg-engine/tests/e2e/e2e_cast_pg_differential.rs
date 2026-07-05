@@ -2627,3 +2627,13 @@ fn pg_constraint_check_and_notnull_rows() {
     assert_eq!(q(&mut e, "SELECT contype||':'||count(*)::text FROM pg_constraint GROUP BY contype ORDER BY contype"), "c:1,n:2,p:1,u:1");
     assert_eq!(q(&mut e, "SELECT conname FROM pg_constraint WHERE contype='n' ORDER BY conname"), "t_email_not_null,t_id_not_null");
 }
+
+/// v7.37 U11 — pg_catalog.pg_sequence view, one row per sequence. PG18.4-verified.
+#[test]
+fn pg_sequence_catalog_view() {
+    let mut e = Engine::new();
+    e.execute("CREATE SEQUENCE q START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CACHE 1 CYCLE").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    // PG18.4: seqstart|seqincrement|seqmax|seqmin|seqcache|seqcycle = 5|2|100|1|1|true
+    assert_eq!(q(&mut e, "SELECT seqstart::text||'|'||seqincrement::text||'|'||seqmax::text||'|'||seqmin::text||'|'||seqcache::text||'|'||seqcycle::text FROM pg_sequence"), "5|2|100|1|1|true");
+}

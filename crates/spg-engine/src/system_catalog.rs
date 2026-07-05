@@ -2544,6 +2544,41 @@ pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///     empty string otherwise)
 ///   * conkey (Text) — comma-separated column names
 ///   * confkey (Text) — comma-separated parent column names (FK only)
+/// v7.37 U11 — synthesise `pg_catalog.pg_sequence`. One row per CREATE
+/// SEQUENCE, exposing PG's seqstart/seqincrement/seqmax/seqmin/seqcache/
+/// seqcycle columns from the catalog SequenceDef. Previously absent, so
+/// psql `\d <seq>` and ORMs that read pg_sequence saw nothing.
+pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("seqrelid", DataType::BigInt, false),
+        ColumnSchema::new("seqtypid", DataType::BigInt, false),
+        ColumnSchema::new("seqstart", DataType::BigInt, false),
+        ColumnSchema::new("seqincrement", DataType::BigInt, false),
+        ColumnSchema::new("seqmax", DataType::BigInt, false),
+        ColumnSchema::new("seqmin", DataType::BigInt, false),
+        ColumnSchema::new("seqcache", DataType::BigInt, false),
+        ColumnSchema::new("seqcycle", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    // Sequence OIDs live in their own synthetic band, monotonically
+    // assigned in name order (stable within a catalog snapshot).
+    let mut seq_oid: i64 = 32768;
+    for (_name, def) in cat.sequences() {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(seq_oid),
+            Value::BigInt(20), // seqtypid — bigint (OID 20)
+            Value::BigInt(def.start),
+            Value::BigInt(def.increment),
+            Value::BigInt(def.max_value),
+            Value::BigInt(def.min_value),
+            Value::BigInt(def.cache),
+            Value::Bool(def.cycle),
+        ]));
+        seq_oid = seq_oid.saturating_add(1);
+    }
+    (schema, rows)
+}
+
 pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.37.24 (24.8b-3) — widened from 6 to 17 PG-canonical
     // columns. Key change: conrelid + confrelid are now BigInt
