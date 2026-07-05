@@ -319,6 +319,14 @@ impl Engine {
             sort_by_keys(&mut tagged, &descs);
         }
         let mut out_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
+        // v7.37 D.41 — `SELECT DISTINCT` over a window projection: the window
+        // pipeline builds one output row per input row, so DISTINCT must dedup the
+        // projected rows (PG evaluates window functions before DISTINCT). Applied
+        // after ORDER BY (duplicate rows share sort keys, so order is preserved)
+        // and before LIMIT.
+        if stmt.distinct {
+            out_rows = dedup_rows(out_rows);
+        }
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
             .into_iter()
