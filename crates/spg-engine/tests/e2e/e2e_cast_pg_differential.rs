@@ -2563,3 +2563,29 @@ fn update_set_array_element() {
     e.execute("UPDATE t SET arr[1] = 100, arr[3] = 300 WHERE id=1").unwrap();
     assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=1"), "{100,99,300}");
 }
+
+/// v7.37 D.54 — IN/NOT IN subquery three-valued NULL logic. When the IN-list holds
+/// a NULL and the LHS doesn't match, the predicate is UNKNOWN (NULL), not an error.
+/// PG18.4-verified (the classic `x NOT IN (… NULL …)` gotcha).
+#[test]
+fn in_subquery_null_three_valued_logic() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int, v int)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,NULL)").unwrap();
+    e.execute("CREATE TABLE s(x int)").unwrap();
+    e.execute("INSERT INTO s VALUES (10),(NULL)").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Bool(b))=>format!("{b}"), Some(Value::Null)=>"".into(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+    };
+    let out = [
+        q(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s)"),
+        q(&mut e, "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s)"),
+        q(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s WHERE x IS NOT NULL)"),
+        q(&mut e, "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s WHERE x IS NOT NULL)"),
+        q(&mut e, "SELECT (5 IN (SELECT x FROM s))::text"),
+        q(&mut e, "SELECT (5 NOT IN (SELECT x FROM s))::text"),
+        q(&mut e, "SELECT (10 IN (SELECT x FROM s))::text"),
+    ];
+    // PG18.4: a1=1 a2=(none) a3=1 a4=2 a5=NULL a6=NULL a7=true
+    assert_eq!(out.join("|"), "1|(none)|1|2|||true");
+}
