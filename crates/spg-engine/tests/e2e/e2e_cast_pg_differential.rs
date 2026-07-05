@@ -2614,3 +2614,16 @@ fn alter_type_add_value() {
     // columns lexically, not by ordinal; enum-ordinal ORDER BY is a separate gap).
     assert_eq!(q(&mut e, "SELECT string_agg(x::text, ',' ORDER BY x::text) FROM m"), "awful,happy,meh");
 }
+
+/// v7.37 U5+U6 — pg_constraint now emits CHECK ('c') and NOT NULL ('n', PG18) rows.
+/// PG18.4-verified: c:1, n:2 (id via PK + email), p:1, u:1.
+#[test]
+fn pg_constraint_check_and_notnull_rows() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int PRIMARY KEY, age int CHECK (age >= 0), email text NOT NULL, UNIQUE(email))").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => rows.iter().map(|r| match &r.values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }).collect::<Vec<_>>().join(","), o=>format!("{o:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT contype||':'||count(*)::text FROM pg_constraint GROUP BY contype ORDER BY contype"), "c:1,n:2,p:1,u:1");
+    assert_eq!(q(&mut e, "SELECT conname FROM pg_constraint WHERE contype='n' ORDER BY conname"), "t_email_not_null,t_id_not_null");
+}

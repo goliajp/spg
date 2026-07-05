@@ -2752,6 +2752,77 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(alloc::format!("{confkey} [{}]", confkey_names.join(","))),
             ]));
         }
+        // v7.37 U5 — CHECK constraints (contype 'c'). Previously
+        // omitted, so pg_constraint enumeration missed every CHECK.
+        for (ci, _pred) in t.schema().checks.iter().enumerate() {
+            let conname = if ci == 0 {
+                alloc::format!("{tname}_check")
+            } else {
+                alloc::format!("{tname}_check{ci}")
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(next_con_oid()),
+                Value::text(conname),
+                Value::BigInt(2200),
+                Value::text("c"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::BigInt(conrelid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(" "),
+                Value::text(" "),
+                Value::text(" "),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(true),
+                Value::text(String::new()),
+                Value::text(String::new()),
+            ]));
+        }
+        // v7.37 U6 — NOT NULL constraints (contype 'n', PG 18). PG
+        // materialises one row per NOT NULL column, named
+        // `<table>_<col>_not_null`, including columns made NOT NULL
+        // implicitly by a PRIMARY KEY.
+        let pk_cols: alloc::collections::BTreeSet<usize> = t
+            .schema()
+            .uniqueness_constraints
+            .iter()
+            .filter(|uc| uc.is_primary_key)
+            .flat_map(|uc| uc.columns.iter().copied())
+            .collect();
+        for (i, col) in cols.iter().enumerate() {
+            if col.nullable && !pk_cols.contains(&i) {
+                continue;
+            }
+            let conname = alloc::format!("{tname}_{}_not_null", col.name);
+            let conkey_display = alloc::format!("{} [{}]", i + 1, col.name);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(next_con_oid()),
+                Value::text(conname),
+                Value::BigInt(2200),
+                Value::text("n"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::BigInt(conrelid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(" "),
+                Value::text(" "),
+                Value::text(" "),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(true),
+                Value::text(conkey_display),
+                Value::text(String::new()),
+            ]));
+        }
     }
     (schema, rows)
 }
