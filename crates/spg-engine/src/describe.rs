@@ -154,6 +154,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                     }
                 }
                 L::Float(_) => (DataType::Float, false),
+                L::Numeric { .. } => (DataType::Numeric { precision: 0, scale: 0 }, false),
                 L::String(_) => (DataType::Text, false),
                 L::Bool(_) => (DataType::Bool, false),
                 L::Vector(_) | L::Interval { .. } => return None,

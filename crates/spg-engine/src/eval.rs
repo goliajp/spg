@@ -1037,6 +1037,7 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
             }
         }
         Literal::Float(x) => Value::Float(*x),
+        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale },
         Literal::String(s) => Value::text(s.clone()),
         Literal::Vector(v) => Value::vector(v.clone()),
         Literal::TextArray(items) => Value::TextArray(items.clone()),

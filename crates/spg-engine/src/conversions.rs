@@ -1965,6 +1965,7 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
     match l {
         Literal::Integer(n) => int_value_for(n),
         Literal::Float(x) => Value::Float(x),
+        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: unscaled, scale },
         Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,

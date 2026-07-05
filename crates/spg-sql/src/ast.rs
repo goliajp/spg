@@ -2909,6 +2909,15 @@ impl fmt::Display for CastTarget {
 pub enum Literal {
     Integer(i64),
     Float(f64),
+    /// Exact decimal literal — a bare `12.34`-style token, kept as
+    /// `unscaled / 10^scale` so no precision or trailing-zero scale is lost
+    /// before it becomes a `Value::Numeric`. PG parses such literals as
+    /// `numeric`, not `double precision`. (Scientific/huge literals stay
+    /// `Float`.)
+    Numeric {
+        unscaled: i128,
+        scale: u8,
+    },
     String(String),
     Bool(bool),
     Null,
@@ -5160,6 +5169,24 @@ impl fmt::Display for Expr {
     }
 }
 
+/// Render an exact decimal `unscaled / 10^scale`, keeping the scale
+/// (trailing zeros): `(200, 2)` → `2.00`, `(1, 1)` → `0.1`, `(-15, 1)` → `-1.5`.
+pub fn render_exact_decimal(unscaled: i128, scale: u8) -> alloc::string::String {
+    use alloc::string::ToString;
+    if scale == 0 {
+        return alloc::format!("{unscaled}");
+    }
+    let neg = unscaled < 0;
+    let digits = alloc::format!("{}", unscaled.unsigned_abs());
+    let scale = scale as usize;
+    let (int_part, frac_part) = if digits.len() > scale {
+        (digits[..digits.len() - scale].to_string(), digits[digits.len() - scale..].to_string())
+    } else {
+        ("0".to_string(), alloc::format!("{digits:0>scale$}"))
+    };
+    alloc::format!("{}{int_part}.{frac_part}", if neg { "-" } else { "" })
+}
+
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -5173,6 +5200,11 @@ impl fmt::Display for Literal {
                 } else {
                     write!(f, "{s}.0")
                 }
+            }
+            Self::Numeric { unscaled, scale } => {
+                // Render the exact decimal `unscaled / 10^scale`, preserving
+                // scale (trailing zeros) — round-trips to the same literal.
+                f.write_str(&render_exact_decimal(*unscaled, *scale))
             }
             Self::String(s) => {
                 f.write_str("'")?;
