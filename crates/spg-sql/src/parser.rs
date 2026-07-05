@@ -10878,8 +10878,17 @@ impl Parser {
         // an uncorrelated inner SELECT executes identically. The
         // inner parse carries UNION tails (they live on
         // SelectStatement.unions).
+        // v7.37 D.20 — the derived-table inner may itself be a
+        // parenthesized set-operation group (`FROM ((SELECT…) UNION
+        // (SELECT…)) s`) or a CTE (`FROM (WITH … SELECT …) z`), not just a
+        // bare `(SELECT …)`. parse_one_statement already routes a leading
+        // `(` set-op group (its LParen arm) and a leading WITH
+        // (parse_with_cte_then_select), so widen the second-token gate to
+        // Select | LParen | WITH.
         if matches!(self.peek(), Token::LParen)
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::Select))
+            && (matches!(self.tokens.get(self.pos + 1), Some(Token::Select | Token::LParen))
+                || matches!(self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("with")))
         {
             self.advance(); // (
             let inner = match self.parse_one_statement()? {

@@ -2043,3 +2043,25 @@ fn like_operators() {
     assert_eq!(b(&mut e, "SELECT ('abc' ~ 'b')::text"), "true"); // regex ~ still distinct
     assert_eq!(b(&mut e, "SELECT string_agg(v, ',' ORDER BY v) FROM (VALUES ('apple'),('banana'),('avocado')) t(v) WHERE v ~~ 'a%'"), "apple,avocado");
 }
+
+/// v7.37 D.20 — a parenthesized set-op group or a CTE as a derived table.
+/// PG18.4-verified. (Bare `(VALUES…) UNION` group left as follow-up.)
+#[test]
+fn derived_setop_group_and_cte() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // parenthesized set-op group as derived table
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2)) s(x)"), "1,2");
+    // 3-way group
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2) UNION (SELECT 3)) s(x)"), "1,2,3");
+    // CTE as derived table
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY x) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n::text x FROM r) z"), "1,2,3,4");
+    // regression: plain (SELECT ... UNION ...) without inner parens still works
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM (SELECT 1 UNION SELECT 2) s(x)"), "1,2");
+}
