@@ -895,13 +895,12 @@ impl Parser {
                     )));
                 }
                 self.advance();
-                if !matches!(self.peek(), Token::Eof | Token::Semicolon) {
-                    return Err(self.err(format!(
-                        "COPY TO STDOUT options are not supported yet, got {:?}",
-                        self.peek()
-                    )));
-                }
-                Ok(Statement::CopyTo { table, columns })
+                let options = self.parse_copy_to_options()?;
+                Ok(Statement::CopyTo {
+                    table,
+                    columns,
+                    options,
+                })
             }
             // MySQL `REPLACE INTO t …` — delete-then-insert upsert.
             // Shares the INSERT body; the replace flag lowers it
@@ -6477,6 +6476,146 @@ impl Parser {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Parse the optional trailer of `COPY … TO STDOUT`: nothing (text
+    /// format, no header), the modern `[WITH] ( opt [, opt]* )` list, or
+    /// the legacy space-separated `[WITH] CSV|TEXT [HEADER] [DELIMITER
+    /// 'c'] [NULL 'str'] [QUOTE 'c']` spelling.
+    fn parse_copy_to_options(&mut self) -> Result<crate::ast::CopyOptions, ParseError> {
+        let mut opts = crate::ast::CopyOptions::default();
+        if matches!(self.peek(), Token::Eof | Token::Semicolon) {
+            return Ok(opts);
+        }
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+            self.advance();
+        }
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                self.parse_one_copy_option(&mut opts)?;
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in COPY options, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        } else {
+            while !matches!(self.peek(), Token::Eof | Token::Semicolon) {
+                self.parse_one_copy_option(&mut opts)?;
+            }
+        }
+        if !matches!(self.peek(), Token::Eof | Token::Semicolon) {
+            return Err(self.err(alloc::format!(
+                "unexpected token after COPY options: {:?}",
+                self.peek()
+            )));
+        }
+        Ok(opts)
+    }
+
+    fn parse_one_copy_option(
+        &mut self,
+        opts: &mut crate::ast::CopyOptions,
+    ) -> Result<(), ParseError> {
+        use crate::ast::CopyFormat;
+        // The option keyword. NULL lexes as its own token; the rest are
+        // bare identifiers.
+        let kw = match self.advance() {
+            Token::Null => alloc::string::String::from("NULL"),
+            Token::Ident(s) => s.to_uppercase(),
+            other => {
+                return Err(
+                    self.err(alloc::format!("expected a COPY option keyword, got {other:?}"))
+                );
+            }
+        };
+        match kw.as_str() {
+            "FORMAT" => {
+                let fmt = self.expect_ident_like()?;
+                match fmt.to_ascii_uppercase().as_str() {
+                    "CSV" => opts.format = CopyFormat::Csv,
+                    "TEXT" => opts.format = CopyFormat::Text,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "COPY FORMAT {other} is not supported (use text or csv)"
+                        )));
+                    }
+                }
+            }
+            // Legacy bare format keywords.
+            "CSV" => opts.format = CopyFormat::Csv,
+            "TEXT" => opts.format = CopyFormat::Text,
+            "HEADER" => {
+                opts.header = match self.peek() {
+                    Token::True => {
+                        self.advance();
+                        true
+                    }
+                    Token::False => {
+                        self.advance();
+                        false
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("on") => {
+                        self.advance();
+                        true
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("off") => {
+                        self.advance();
+                        false
+                    }
+                    // Bare HEADER (no boolean) means HEADER true.
+                    _ => true,
+                };
+            }
+            "DELIMITER" | "QUOTE" => {
+                let s = match self.advance() {
+                    Token::String(s) => s,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "COPY {kw} expects a single-character string, got {other:?}"
+                        )));
+                    }
+                };
+                let mut chars = s.chars();
+                let c = chars.next().ok_or_else(|| {
+                    self.err(alloc::format!("COPY {kw} must be a single character"))
+                })?;
+                if chars.next().is_some() {
+                    return Err(self.err(alloc::format!(
+                        "COPY {kw} must be a single character, got {s:?}"
+                    )));
+                }
+                if kw == "DELIMITER" {
+                    opts.delimiter = Some(c);
+                } else {
+                    opts.quote = Some(c);
+                }
+            }
+            "NULL" => {
+                opts.null_str = Some(match self.advance() {
+                    Token::String(s) => s,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "COPY NULL expects a quoted string, got {other:?}"
+                        )));
+                    }
+                });
+            }
+            other => {
+                return Err(self.err(alloc::format!("unsupported COPY option {other:?}")));
+            }
+        }
+        Ok(())
     }
 
     fn parse_partition_bounds_tail(&mut self) -> Result<crate::ast::PartitionOfBoundsAst, ParseError> {

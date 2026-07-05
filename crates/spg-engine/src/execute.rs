@@ -720,9 +720,11 @@ impl Engine {
                     self.exec_select_cancel(&s, cancel)
                 }
             }
-            Statement::CopyTo { table, columns } => {
-                self.exec_copy_to(&table, columns.as_deref(), cancel)
-            }
+            Statement::CopyTo {
+                table,
+                columns,
+                options,
+            } => self.exec_copy_to(&table, columns.as_deref(), &options, cancel),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1037,8 +1039,10 @@ impl Engine {
         &mut self,
         table_name: &str,
         columns: Option<&[String]>,
+        options: &spg_sql::ast::CopyOptions,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::CopyFormat;
         let table = self.active_catalog().get(table_name).ok_or_else(|| {
             EngineError::Storage(spg_storage::StorageError::TableNotFound {
                 name: alloc::string::String::from(table_name),
@@ -1061,17 +1065,50 @@ impl Engine {
                 .collect::<Result<_, _>>()?,
             None => (0..schema_cols.len()).collect(),
         };
+        // Per-format defaults: text = tab / `\N`; csv = comma / `` / `"`.
+        let is_csv = options.format == CopyFormat::Csv;
+        let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
+        let quote = options.quote.unwrap_or('"');
+        let null_str = options
+            .null_str
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
+        let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
+            if is_csv {
+                crate::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
+            } else {
+                crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
+            }
+        };
         let snap = self.current_snapshot();
         let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
+        // HEADER: the selected column names as the first line, encoded
+        // per the same format rules (a name is never NULL).
+        if options.header {
+            let names: alloc::vec::Vec<Option<alloc::string::String>> = positions
+                .iter()
+                .map(|&p| Some(schema_cols[p].name.clone()))
+                .collect();
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(
+                encode_cells(&names)
+            )]));
+        }
+        // COPY renders each value with its type's output function, the
+        // same as the wire — notably bool as `t` / `f`, not the engine's
+        // debug-ish `true` / `false`.
+        let cell_text = |v: &Value| -> Option<alloc::string::String> {
+            match v {
+                Value::Null => None,
+                Value::Bool(b) => Some(alloc::string::String::from(if *b { "t" } else { "f" })),
+                other => Some(crate::eval::values::value_to_text(other)),
+            }
+        };
         let encode = |row: &spg_storage::Row<'static>| {
             let cells: alloc::vec::Vec<Option<alloc::string::String>> = positions
                 .iter()
-                .map(|&p| match row.values.get(p) {
-                    None | Some(Value::Null) => None,
-                    Some(v) => Some(crate::eval::values::value_to_text(v)),
-                })
+                .map(|&p| row.values.get(p).and_then(cell_text))
                 .collect();
-            crate::copy::encode_copy_text_cells(&cells)
+            encode_cells(&cells)
         };
         for (_, row) in table.scan_visible(&snap) {
             cancel.check()?;

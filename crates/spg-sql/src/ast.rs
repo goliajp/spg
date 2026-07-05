@@ -11,6 +11,30 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+/// `COPY … TO STDOUT` output format. `text` is PG's default
+/// (tab-separated, `\N` nulls, backslash escapes); `csv` follows
+/// RFC-4180-style quoting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyFormat {
+    #[default]
+    Text,
+    Csv,
+}
+
+/// Options for `COPY … TO STDOUT [WITH] (…)`. Defaults reproduce the
+/// bare `COPY … TO STDOUT` text-format behaviour, so an empty option
+/// list is a no-op. `delimiter` / `null_str` / `quote` fall back to the
+/// per-format defaults (text: `\t` / `\N`; csv: `,` / `` / `"`) when
+/// unset.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopyOptions {
+    pub format: CopyFormat,
+    pub header: bool,
+    pub delimiter: Option<char>,
+    pub null_str: Option<String>,
+    pub quote: Option<char>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
@@ -44,6 +68,10 @@ pub enum Statement {
     CopyTo {
         table: String,
         columns: Option<Vec<String>>,
+        /// v7.37.x — `WITH (FORMAT csv, HEADER, DELIMITER, NULL, QUOTE)`
+        /// and the legacy `WITH CSV HEADER …` spelling. Default =
+        /// text format, no header (bare `COPY … TO STDOUT`).
+        options: CopyOptions,
     },
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
@@ -3165,12 +3193,32 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
-            Self::CopyTo { table, columns } => {
+            Self::CopyTo { table, columns, options } => {
                 write!(f, "COPY {table}")?;
                 if let Some(cols) = columns {
                     write!(f, " ({})", cols.join(", "))?;
                 }
-                write!(f, " TO STDOUT")
+                write!(f, " TO STDOUT")?;
+                let mut parts: Vec<String> = Vec::new();
+                if options.format == CopyFormat::Csv {
+                    parts.push("FORMAT csv".to_string());
+                }
+                if options.header {
+                    parts.push("HEADER true".to_string());
+                }
+                if let Some(d) = options.delimiter {
+                    parts.push(alloc::format!("DELIMITER '{d}'"));
+                }
+                if let Some(n) = &options.null_str {
+                    parts.push(alloc::format!("NULL '{n}'"));
+                }
+                if let Some(q) = options.quote {
+                    parts.push(alloc::format!("QUOTE '{q}'"));
+                }
+                if !parts.is_empty() {
+                    write!(f, " WITH ({})", parts.join(", "))?;
+                }
+                Ok(())
             }
             Self::Truncate {
                 tables,
