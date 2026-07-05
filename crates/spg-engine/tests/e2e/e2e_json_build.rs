@@ -115,8 +115,8 @@ fn to_json_null_renders_json_null_literal() {
 #[test]
 fn to_json_json_passes_through() {
     let mut e = Engine::new();
-    let s = json_text(one_cell(&mut e, r#"SELECT to_jsonb('{"a":1}'::json)"#));
-    assert_eq!(s, r#"{"a":1}"#);
+    let s = json_text(one_cell(&mut e, r#"SELECT to_jsonb('{"a": 1}'::json)"#));
+    assert_eq!(s, r#"{"a": 1}"#);
 }
 
 // ── json_build_object / jsonb_build_object ───────────────────────
@@ -192,9 +192,9 @@ fn jsonb_set_replaces_existing_object_key() {
     let mut e = Engine::new();
     let s = json_text(one_cell(
         &mut e,
-        r#"SELECT jsonb_set('{"a":1,"b":2}', '{a}', '99')"#,
+        r#"SELECT jsonb_set('{"a": 1, "b": 2}', '{a}', '99')"#,
     ));
-    assert_eq!(s, r#"{"a":99,"b":2}"#);
+    assert_eq!(s, r#"{"a": 99, "b": 2}"#);
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn jsonb_set_replaces_nested_object_key() {
         &mut e,
         r#"SELECT jsonb_set('{"a":{"b":{"c":1}}}', '{a,b,c}', '"x"')"#,
     ));
-    assert_eq!(s, r#"{"a":{"b":{"c":"x"}}}"#);
+    assert_eq!(s, r#"{"a": {"b": {"c": "x"}}}"#);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn jsonb_set_replaces_array_index() {
         &mut e,
         r#"SELECT jsonb_set('[10,20,30]', '{1}', '99')"#,
     ));
-    assert_eq!(s, "[10,99,30]");
+    assert_eq!(s, "[10, 99, 30]");
 }
 
 #[test]
@@ -222,9 +222,9 @@ fn jsonb_set_creates_missing_object_key_when_default_true() {
     let mut e = Engine::new();
     let s = json_text(one_cell(
         &mut e,
-        r#"SELECT jsonb_set('{"a":1}', '{b}', '2')"#,
+        r#"SELECT jsonb_set('{"a": 1}', '{b}', '2')"#,
     ));
-    assert_eq!(s, r#"{"a":1,"b":2}"#);
+    assert_eq!(s, r#"{"a": 1, "b": 2}"#);
 }
 
 #[test]
@@ -232,9 +232,9 @@ fn jsonb_set_missing_with_create_missing_false_returns_unchanged() {
     let mut e = Engine::new();
     let s = json_text(one_cell(
         &mut e,
-        r#"SELECT jsonb_set('{"a":1}', '{b}', '2', false)"#,
+        r#"SELECT jsonb_set('{"a": 1}', '{b}', '2', false)"#,
     ));
-    assert_eq!(s, r#"{"a":1}"#);
+    assert_eq!(s, r#"{"a": 1}"#);
 }
 
 // ── jsonb_insert ─────────────────────────────────────────────────
@@ -246,7 +246,7 @@ fn jsonb_insert_into_array_before_index_by_default() {
         &mut e,
         r#"SELECT jsonb_insert('[10,20,30]', '{1}', '99')"#,
     ));
-    assert_eq!(s, "[10,99,20,30]");
+    assert_eq!(s, "[10, 99, 20, 30]");
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn jsonb_insert_into_array_after_index_when_true() {
         &mut e,
         r#"SELECT jsonb_insert('[10,20,30]', '{1}', '99', true)"#,
     ));
-    assert_eq!(s, "[10,20,99,30]");
+    assert_eq!(s, "[10, 20, 99, 30]");
 }
 
 #[test]
@@ -264,14 +264,14 @@ fn jsonb_insert_creates_new_object_key() {
     let mut e = Engine::new();
     let s = json_text(one_cell(
         &mut e,
-        r#"SELECT jsonb_insert('{"a":1}', '{b}', '"new"')"#,
+        r#"SELECT jsonb_insert('{"a": 1}', '{b}', '"new"')"#,
     ));
-    assert_eq!(s, r#"{"a":1,"b":"new"}"#);
+    assert_eq!(s, r#"{"a": 1, "b": "new"}"#);
 }
 
 #[test]
 fn jsonb_insert_errors_on_existing_object_key() {
     let mut e = Engine::new();
-    let r = e.execute(r#"SELECT jsonb_insert('{"a":1}', '{a}', '2')"#);
+    let r = e.execute(r#"SELECT jsonb_insert('{"a": 1}', '{a}', '2')"#);
     assert!(r.is_err(), "jsonb_insert on existing key must error");
 }

@@ -24,7 +24,7 @@ fn strips_null_keys_from_object() {
         &mut e,
         "SELECT jsonb_strip_nulls('{\"a\":1,\"b\":null,\"c\":2}'::jsonb)",
     );
-    assert_eq!(as_json(&v), r#"{"a":1,"c":2}"#);
+    assert_eq!(as_json(&v), r#"{"a": 1, "c": 2}"#);
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn keeps_null_array_items() {
         &mut e,
         "SELECT jsonb_strip_nulls('[1, null, 2]'::jsonb)",
     );
-    assert_eq!(as_json(&v), r#"[1,null,2]"#);
+    assert_eq!(as_json(&v), r#"[1, null, 2]"#);
 }
 
 #[test]
@@ -44,14 +44,14 @@ fn recurses_into_nested_objects() {
         &mut e,
         "SELECT jsonb_strip_nulls('{\"a\":{\"x\":null,\"y\":1},\"b\":null}'::jsonb)",
     );
-    assert_eq!(as_json(&v), r#"{"a":{"y":1}}"#);
+    assert_eq!(as_json(&v), r#"{"a": {"y": 1}}"#);
 }
 
 #[test]
 fn no_nulls_unchanged() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT jsonb_strip_nulls('{\"a\":1,\"b\":2}'::jsonb)");
-    assert_eq!(as_json(&v), r#"{"a":1,"b":2}"#);
+    let v = first(&mut e, "SELECT jsonb_strip_nulls('{\"a\": 1, \"b\": 2}'::jsonb)");
+    assert_eq!(as_json(&v), r#"{"a": 1, "b": 2}"#);
 }
 
 #[test]

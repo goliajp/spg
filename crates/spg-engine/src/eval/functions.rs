@@ -1302,7 +1302,13 @@ fn apply_function_dispatch(
                     }
                     let mut out = alloc::string::String::new();
                     write_json(&parsed, &mut out);
-                    Ok(Value::json(out))
+                    let result = Value::json(out);
+                    // jsonb_strip_nulls yields canonical jsonb.
+                    if name == "jsonb_strip_nulls" {
+                        Ok(crate::json::canonicalize_value(result))
+                    } else {
+                        Ok(result)
+                    }
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -9357,12 +9363,22 @@ fn apply_function_dispatch(
                 });
             }
             // Json input passes through verbatim — PG identity.
-            if let Value::Json(s) = &args[0] {
-                return Ok(Value::json(s.clone()));
+            let out = if let Value::Json(s) = &args[0] {
+                Value::json(s.clone())
+            } else {
+                Value::json(crate::json::value_to_json_text(&args[0]))
+            };
+            // to_jsonb yields canonical jsonb; to_json stays verbatim.
+            if name == "to_jsonb" {
+                Ok(crate::json::canonicalize_value(out))
+            } else {
+                Ok(out)
             }
-            Ok(Value::json(crate::json::value_to_json_text(&args[0])))
         }
-        "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        "jsonb_build_object" => {
+            crate::json::build_object(args).map(crate::json::canonicalize_value)
+        }
+        "json_build_object" => crate::json::build_object(args),
         // Catalog function forms of the ? / ?| / ?& / @> / <@
         // operators — same helpers the operators use.
         "jsonb_exists" => {
@@ -9634,9 +9650,10 @@ fn apply_function_dispatch(
             Ok(Value::json(out))
         }
         // "json_array" is MySQL's spelling of json_build_array.
-        "json_build_array" | "jsonb_build_array" | "json_array" => {
-            crate::json::build_array(args)
+        "jsonb_build_array" => {
+            crate::json::build_array(args).map(crate::json::canonicalize_value)
         }
+        "json_build_array" | "json_array" => crate::json::build_array(args),
         // v7.37.17 (17.6 siblings) — MySQL path-based JSON functions
         // (json.rs mysql_path_steps parser: $, .key, ."quoted", [N];
         // wildcards error honestly).
@@ -9968,7 +9985,8 @@ fn apply_function_dispatch(
         {
             crate::json::mysql_json_set(args)
         }
-        "jsonb_set" | "json_set" => crate::json::set(args),
+        "jsonb_set" => crate::json::set(args).map(crate::json::canonicalize_value),
+        "json_set" => crate::json::set(args),
         // v7.37.17 (17.6 siblings) — MySQL JSON mutation family on
         // the '$.x' path machinery.
         "json_replace" => crate::json::mysql_json_replace(args),
@@ -10209,7 +10227,10 @@ fn apply_function_dispatch(
         }
         // v7.37.17 (17.6 siblings) — jsonb_delete_path: function
         // form of the #- operator.
-        "jsonb_delete_path" | "json_delete_path" => crate::json::delete_path(args),
+        "jsonb_delete_path" => {
+            crate::json::delete_path(args).map(crate::json::canonicalize_value)
+        }
+        "json_delete_path" => crate::json::delete_path(args),
         // Same two-dialect routing as json_set above.
         "jsonb_insert" | "json_insert"
             if args.len() >= 3
@@ -10217,7 +10238,8 @@ fn apply_function_dispatch(
         {
             crate::json::mysql_json_insert(args)
         }
-        "jsonb_insert" | "json_insert" => crate::json::insert(args),
+        "jsonb_insert" => crate::json::insert(args).map(crate::json::canonicalize_value),
+        "json_insert" => crate::json::insert(args),
         // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
         // v7.37.17 (17.6 siblings) — jsonb_concat / jsonb_delete —
         // function forms of || and - operators.

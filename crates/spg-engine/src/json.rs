@@ -151,6 +151,21 @@ pub fn canonicalize_jsonb(src: &str) -> Result<String, ParseError> {
     Ok(out)
 }
 
+/// Canonicalise a `Value::Json` payload (a jsonb-typed result); any
+/// other value passes through untouched. Used to bring jsonb builder /
+/// mutator functions (`jsonb_build_object`, `to_jsonb`, `jsonb_set`, the
+/// `||` / `-` / `#-` operators, …) in line with PG, which always emits
+/// canonical jsonb from them. The `json_*` siblings stay verbatim.
+#[must_use]
+pub fn canonicalize_value(v: Value<'static>) -> Value<'static> {
+    match v {
+        Value::Json(s) => {
+            Value::json(canonicalize_jsonb(s.as_ref()).unwrap_or_else(|_| s.into_owned()))
+        }
+        other => other,
+    }
+}
+
 fn write_json_canonical(v: &JsonValue, out: &mut String) {
     match v {
         JsonValue::Null => out.push_str("null"),
@@ -1426,6 +1441,10 @@ fn render_numeric(scaled: i128, scale: u8) -> String {
 /// duplicates); array + array appends; array + scalar appends the
 /// scalar; scalar + scalar makes a 2-element array (PG semantics).
 pub fn concat(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
+    concat_inner(lhs, rhs).map(canonicalize_value)
+}
+
+fn concat_inner(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let (a_src, b_src) = match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
         (Value::Json(a) | Value::Text(a), Value::Json(b) | Value::Text(b)) => {
@@ -1477,6 +1496,10 @@ pub fn concat(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
 /// form of the `-` operator. Removes an object key or an array
 /// element (by text match for objects, by index for arrays).
 pub fn delete_key(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
+    delete_key_inner(lhs, rhs).map(canonicalize_value)
+}
+
+fn delete_key_inner(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
     let src = match lhs {
         Value::Null => return Ok(Value::Null),
         Value::Json(s) | Value::Text(s) => s.as_ref(),
@@ -1627,6 +1650,10 @@ pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 /// function form of the `#-` operator. Removes the value at the
 /// nested path; missing path leaves the doc unchanged.
 pub fn delete_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    delete_path_inner(args).map(canonicalize_value)
+}
+
+fn delete_path_inner(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(

@@ -65,7 +65,7 @@ fn arrow_object_member_returns_jsonb() {
 #[test]
 fn arrow_object_member_missing_returns_jsonb_null() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb -> 'missing'"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb -> 'missing'"#);
     // PG returns SQL NULL for missing key (not jsonb null).
     assert_eq!(v, Value::Null);
 }
@@ -130,7 +130,7 @@ fn arrow_text_array_index_returns_text() {
 #[test]
 fn arrow_text_missing_returns_null() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb ->> 'missing'"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb ->> 'missing'"#);
     assert_eq!(v, Value::Null);
 }
 
@@ -163,7 +163,7 @@ fn containment_object_subset() {
     let mut e = Engine::new();
     let v = one_value(
         &mut e,
-        r#"SELECT '{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb"#,
+        r#"SELECT '{"a": 1, "b": 2}'::jsonb @> '{"a": 1}'::jsonb"#,
     );
     assert_eq!(v, Value::Bool(true));
 }
@@ -171,7 +171,7 @@ fn containment_object_subset() {
 #[test]
 fn containment_not_subset() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb @> '{"a":2}'::jsonb"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb @> '{"a":2}'::jsonb"#);
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -182,13 +182,13 @@ fn jsonb_set_replaces_object_member() {
     let mut e = Engine::new();
     let v = one_value(
         &mut e,
-        r#"SELECT jsonb_set('{"a":1,"b":2}'::jsonb, '{a}', '99'::jsonb)"#,
+        r#"SELECT jsonb_set('{"a": 1, "b": 2}'::jsonb, '{a}', '99'::jsonb)"#,
     );
     let Value::Json(s) = v else { panic!() };
     // Round-trip back through the parser to compare canonical
     // shape (whitespace / member order is implementation-defined).
-    assert!(s.contains("\"a\":99"), "got {s}");
-    assert!(s.contains("\"b\":2"), "got {s}");
+    assert!(s.contains("\"a\": 99"), "got {s}");
+    assert!(s.contains("\"b\": 2"), "got {s}");
 }
 
 #[test]
@@ -196,11 +196,11 @@ fn jsonb_set_inserts_new_object_member() {
     let mut e = Engine::new();
     let v = one_value(
         &mut e,
-        r#"SELECT jsonb_set('{"a":1}'::jsonb, '{c}', '3'::jsonb)"#,
+        r#"SELECT jsonb_set('{"a": 1}'::jsonb, '{c}', '3'::jsonb)"#,
     );
     let Value::Json(s) = v else { panic!() };
-    assert!(s.contains("\"a\":1"));
-    assert!(s.contains("\"c\":3"));
+    assert!(s.contains("\"a\": 1"));
+    assert!(s.contains("\"c\": 3"));
 }
 
 // ─── #> / #>> (path access) — PG-canonical sanity ──
@@ -228,10 +228,10 @@ fn path_get_text() {
 #[test]
 fn contained_by_is_reverse_contains() {
     let mut e = Engine::new();
-    // `'{"a":1}' <@ '{"a":1,"b":2}'` ⇔ rhs @> lhs → true.
+    // `'{"a": 1}' <@ '{"a": 1, "b": 2}'` ⇔ rhs @> lhs → true.
     let v = one_value(
         &mut e,
-        r#"SELECT '{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb"#,
+        r#"SELECT '{"a": 1}'::jsonb <@ '{"a": 1, "b": 2}'::jsonb"#,
     );
     assert_eq!(v, Value::Bool(true));
 }
@@ -241,7 +241,7 @@ fn contained_by_negative() {
     let mut e = Engine::new();
     let v = one_value(
         &mut e,
-        r#"SELECT '{"a":1,"b":2}'::jsonb <@ '{"a":1}'::jsonb"#,
+        r#"SELECT '{"a": 1, "b": 2}'::jsonb <@ '{"a": 1}'::jsonb"#,
     );
     assert_eq!(v, Value::Bool(false));
 }
@@ -249,9 +249,9 @@ fn contained_by_negative() {
 #[test]
 fn key_exists_object_member() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a":1,"b":2}'::jsonb ? 'a'"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1, "b": 2}'::jsonb ? 'a'"#);
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb ? 'missing'"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb ? 'missing'"#);
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -265,16 +265,16 @@ fn key_exists_array_element_as_string() {
     let v = one_value(&mut e, r#"SELECT '["a","b","c"]'::jsonb ? 'z'"#);
     assert_eq!(v, Value::Bool(false));
     // PG: numeric array elements never match `?` (only strings do).
-    let v = one_value(&mut e, r#"SELECT '[1,2,3]'::jsonb ? '2'"#);
+    let v = one_value(&mut e, r#"SELECT '[1, 2, 3]'::jsonb ? '2'"#);
     assert_eq!(v, Value::Bool(false));
 }
 
 #[test]
 fn keys_any_with_text_array() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a":1,"b":2}'::jsonb ?| ARRAY['z','b']"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1, "b": 2}'::jsonb ?| ARRAY['z','b']"#);
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(&mut e, r#"SELECT '{"a":1}'::jsonb ?| ARRAY['x','y','z']"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb ?| ARRAY['x','y','z']"#);
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -286,6 +286,6 @@ fn keys_all_with_text_array() {
         r#"SELECT '{"a":1,"b":2,"c":3}'::jsonb ?& ARRAY['a','b']"#,
     );
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(&mut e, r#"SELECT '{"a":1,"b":2}'::jsonb ?& ARRAY['a','c']"#);
+    let v = one_value(&mut e, r#"SELECT '{"a": 1, "b": 2}'::jsonb ?& ARRAY['a','c']"#);
     assert_eq!(v, Value::Bool(false));
 }

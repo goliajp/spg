@@ -26,7 +26,7 @@ fn delete_path_nested_object_key() {
             &mut e,
             r#"SELECT jsonb_delete_path('{"a": {"b": 1, "c": 2}}', '{a,b}')"#
         )),
-        r#"{"a":{"c":2}}"#
+        r#"{"a": {"c": 2}}"#
     );
 }
 
@@ -38,7 +38,7 @@ fn delete_path_array_element() {
             &mut e,
             r#"SELECT jsonb_delete_path('{"items": [10, 20, 30]}', '{items,1}')"#
         )),
-        r#"{"items":[10,30]}"#
+        r#"{"items": [10, 30]}"#
     );
     // Negative index.
     assert_eq!(
@@ -46,7 +46,7 @@ fn delete_path_array_element() {
             &mut e,
             r#"SELECT jsonb_delete_path('{"items": [10, 20, 30]}', '{items,-1}')"#
         )),
-        r#"{"items":[10,20]}"#
+        r#"{"items": [10, 20]}"#
     );
 }
 
@@ -58,7 +58,7 @@ fn delete_path_missing_leaves_unchanged() {
             &mut e,
             r#"SELECT jsonb_delete_path('{"a": 1}', '{zzz,deep}')"#
         )),
-        r#"{"a":1}"#
+        r#"{"a": 1}"#
     );
 }
 
@@ -70,7 +70,7 @@ fn delete_path_top_level() {
             &mut e,
             r#"SELECT jsonb_delete_path('{"a": 1, "b": 2}', '{a}')"#
         )),
-        r#"{"b":2}"#
+        r#"{"b": 2}"#
     );
 }
 
@@ -84,7 +84,7 @@ fn delete_path_null_passthrough() {
     assert!(matches!(
         first(
             &mut e,
-            r#"SELECT jsonb_delete_path('{"a":1}', NULL::text)"#
+            r#"SELECT jsonb_delete_path('{"a": 1}', NULL::text)"#
         ),
         spg_storage::Value::Null
     ));

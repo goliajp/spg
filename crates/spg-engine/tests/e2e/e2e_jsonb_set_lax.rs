@@ -25,7 +25,7 @@ fn set_lax_non_null_behaves_like_set() {
     assert_eq!(
         text_or_json(&first(
             &mut e,
-            r#"SELECT jsonb_set_lax('{"a":1}', '{a}', '2')"#
+            r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', '2')"#
         )),
         r#"{"a":2}"#
     );
@@ -37,7 +37,7 @@ fn set_lax_null_default_uses_json_null() {
     assert_eq!(
         text_or_json(&first(
             &mut e,
-            r#"SELECT jsonb_set_lax('{"a":1}', '{a}', NULL)"#
+            r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL)"#
         )),
         r#"{"a":null}"#
     );
@@ -50,27 +50,27 @@ fn set_lax_treatments() {
     assert_eq!(
         text_or_json(&first(
             &mut e,
-            r#"SELECT jsonb_set_lax('{"a":1}', '{a}', NULL, true, 'return_target')"#
+            r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'return_target')"#
         )),
-        r#"{"a":1}"#
+        r#"{"a": 1}"#
     );
     // delete_key — the key is removed.
     assert_eq!(
         text_or_json(&first(
             &mut e,
-            r#"SELECT jsonb_set_lax('{"a":1,"b":2}', '{a}', NULL, true, 'delete_key')"#
+            r#"SELECT jsonb_set_lax('{"a": 1, "b": 2}', '{a}', NULL, true, 'delete_key')"#
         )),
-        r#"{"b":2}"#
+        r#"{"b": 2}"#
     );
     // raise_exception — errors.
     assert!(e
         .execute(
-            r#"SELECT jsonb_set_lax('{"a":1}', '{a}', NULL, true, 'raise_exception')"#
+            r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception')"#
         )
         .is_err());
     // Unknown treatment — errors.
     assert!(e
-        .execute(r#"SELECT jsonb_set_lax('{"a":1}', '{a}', NULL, true, 'bogus')"#)
+        .execute(r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'bogus')"#)
         .is_err());
 }
 
@@ -103,7 +103,7 @@ fn jsonb_to_tsvector_filters() {
     );
     // Unknown flag errors.
     assert!(e
-        .execute(r#"SELECT jsonb_to_tsvector('{"a":1}', '["bogus"]')"#)
+        .execute(r#"SELECT jsonb_to_tsvector('{"a": 1}', '["bogus"]')"#)
         .is_err());
 }
 

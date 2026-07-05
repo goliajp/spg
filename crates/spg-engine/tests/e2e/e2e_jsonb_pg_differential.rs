@@ -3,19 +3,15 @@
 //! Ground truth captured from live PostgreSQL 18.4 on 2026-07-04.
 //! Each `check` asserts SPG's output against the value observed.
 //!
-//! Two documented SEMANTIC representation choices mean SPG's jsonb
-//! text form is NOT byte-identical to PG's and this is intentional
-//! (see the DIVERGENCE notes below), so those cases assert SPG's own
-//! form with the PG value recorded in a comment:
-//!   * SPG renders jsonb compactly (no space after `:` / `,`);
-//!     PG inserts a space.
-//!   * SPG preserves object key insertion order; PG sorts keys and
-//!     de-dups keeping the LAST value.
-//!   * SPG preserves the original numeric lexeme (`1e2`, `1.0`);
-//!     PG canonicalises numbers (`1e2` -> `100`).
+//! SPG now canonicalises jsonb like PG on the `::jsonb` cast, jsonb
+//! columns, and the jsonb builder/mutator functions & operators: `, ` /
+//! `: ` whitespace, object keys sorted (length, then bytes) with dups
+//! collapsed last-wins, and numbers normalised (`1e2` -> `100`). The
+//! text form is byte-identical to PG for those. json (non-b) still keeps
+//! its input verbatim.
 //!
-//! The operator/containment cases below WERE bugs, fixed in the
-//! accompanying commit and locked here against a live-PG differential.
+//! The operator/containment cases below WERE bugs, fixed and locked here
+//! against a live-PG differential.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -165,18 +161,17 @@ fn jsonb_equality_operator() {
 #[test]
 fn jsonb_concat_operator() {
     let mut e = Engine::new();
-    // PG: {"a": 1, "b": 2}
-    check(&mut e, "SELECT ('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)::text", "{\"a\":1,\"b\":2}");
-    // PG: {"a": 1, "b": 9} — right wins on dup key
-    check(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb || '{\"b\":9}'::jsonb)::text", "{\"a\":1,\"b\":9}");
-    check(&mut e, "SELECT ('[1,2]'::jsonb || '[3,4]'::jsonb)::text", "[1,2,3,4]");
-    check(&mut e, "SELECT ('[1,2]'::jsonb || '3'::jsonb)::text", "[1,2,3]");
-    check(&mut e, "SELECT ('[1,2]'::jsonb || '{\"a\":1}'::jsonb)::text", "[1,2,{\"a\":1}]");
+    check(&mut e, "SELECT ('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)::text", "{\"a\": 1, \"b\": 2}");
+    // right wins on dup key
+    check(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb || '{\"b\":9}'::jsonb)::text", "{\"a\": 1, \"b\": 9}");
+    check(&mut e, "SELECT ('[1,2]'::jsonb || '[3,4]'::jsonb)::text", "[1, 2, 3, 4]");
+    check(&mut e, "SELECT ('[1,2]'::jsonb || '3'::jsonb)::text", "[1, 2, 3]");
+    check(&mut e, "SELECT ('[1,2]'::jsonb || '{\"a\":1}'::jsonb)::text", "[1, 2, {\"a\": 1}]");
     // still works through a real jsonb column
     e.execute("CREATE TABLE jc (id INT NOT NULL, o JSONB, a JSONB)").unwrap();
     e.execute("INSERT INTO jc VALUES (1, '{\"a\":1,\"b\":2,\"c\":3}', '[10,20,30]')").unwrap();
-    check(&mut e, "SELECT (o || '{\"d\":9}'::jsonb)::text FROM jc", "{\"a\":1,\"b\":2,\"c\":3,\"d\":9}");
-    check(&mut e, "SELECT (a || '[40]'::jsonb)::text FROM jc", "[10,20,30,40]");
+    check(&mut e, "SELECT (o || '{\"d\":9}'::jsonb)::text FROM jc", "{\"a\": 1, \"b\": 2, \"c\": 3, \"d\": 9}");
+    check(&mut e, "SELECT (a || '[40]'::jsonb)::text FROM jc", "[10, 20, 30, 40]");
     // text || text still concatenates (must NOT be affected)
     check(&mut e, "SELECT 'ab' || 'cd'", "abcd");
 }
@@ -185,31 +180,31 @@ fn jsonb_concat_operator() {
 #[test]
 fn jsonb_delete_operator() {
     let mut e = Engine::new();
-    check(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb - 'a')::text", "{\"b\":2}");
-    check(&mut e, "SELECT ('{\"a\":1}'::jsonb - 'x')::text", "{\"a\":1}");
-    check(&mut e, "SELECT ('[10,20,30]'::jsonb - 1)::text", "[10,30]");
-    check(&mut e, "SELECT ('[10,20,30]'::jsonb - -1)::text", "[10,20]");
+    check(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb - 'a')::text", "{\"b\": 2}");
+    check(&mut e, "SELECT ('{\"a\":1}'::jsonb - 'x')::text", "{\"a\": 1}");
+    check(&mut e, "SELECT ('[10,20,30]'::jsonb - 1)::text", "[10, 30]");
+    check(&mut e, "SELECT ('[10,20,30]'::jsonb - -1)::text", "[10, 20]");
     // jsonb - text[] (multi-key delete)
-    check(&mut e, "SELECT ('{\"a\":1,\"b\":2,\"c\":3}'::jsonb - array['a','c'])::text", "{\"b\":2}");
+    check(&mut e, "SELECT ('{\"a\":1,\"b\":2,\"c\":3}'::jsonb - array['a','c'])::text", "{\"b\": 2}");
     // numeric - still works (must NOT be affected)
     check(&mut e, "SELECT 5 - 3", "2");
     // via column
     e.execute("CREATE TABLE jd (id INT NOT NULL, o JSONB, a JSONB)").unwrap();
     e.execute("INSERT INTO jd VALUES (1, '{\"a\":1,\"b\":2,\"c\":3}', '[10,20,30]')").unwrap();
-    check(&mut e, "SELECT (o - 'a')::text FROM jd", "{\"b\":2,\"c\":3}");
-    check(&mut e, "SELECT (a - 1)::text FROM jd", "[10,30]");
+    check(&mut e, "SELECT (o - 'a')::text FROM jd", "{\"b\": 2, \"c\": 3}");
+    check(&mut e, "SELECT (a - 1)::text FROM jd", "[10, 30]");
 }
 
 // ---- FIXED: #- delete-path operator (was unrecognised token) ----
 #[test]
 fn jsonb_delete_path_operator() {
     let mut e = Engine::new();
-    check(&mut e, "SELECT ('{\"a\":{\"b\":1,\"c\":2}}'::jsonb #- '{a,b}')::text", "{\"a\":{\"c\":2}}");
-    check(&mut e, "SELECT ('{\"a\":[1,2,3]}'::jsonb #- '{a,1}')::text", "{\"a\":[1,3]}");
+    check(&mut e, "SELECT ('{\"a\":{\"b\":1,\"c\":2}}'::jsonb #- '{a,b}')::text", "{\"a\": {\"c\": 2}}");
+    check(&mut e, "SELECT ('{\"a\":[1,2,3]}'::jsonb #- '{a,1}')::text", "{\"a\": [1, 3]}");
     // via column
     e.execute("CREATE TABLE jp (id INT NOT NULL, o JSONB)").unwrap();
     e.execute("INSERT INTO jp VALUES (1, '{\"a\":{\"b\":1},\"z\":9}')").unwrap();
-    check(&mut e, "SELECT (o #- '{a,b}')::text FROM jp", "{\"a\":{},\"z\":9}");
+    check(&mut e, "SELECT (o #- '{a,b}')::text FROM jp", "{\"a\": {}, \"z\": 9}");
     // bare # (integer XOR) must NOT be affected
     check(&mut e, "SELECT 5 # 3", "6");
 }
@@ -218,20 +213,19 @@ fn jsonb_delete_path_operator() {
 #[test]
 fn jsonb_functions() {
     let mut e = Engine::new();
-    check(&mut e, "SELECT jsonb_build_object('a',1,'b',2)::text", "{\"a\":1,\"b\":2}");
-    // DIVERGENCE (key order): SPG preserves insertion order -> {"b":1,"a":2};
-    // PG sorts -> {"a": 2, "b": 1}. Documented representation choice.
-    check(&mut e, "SELECT jsonb_build_object('b',1,'a',2)::text", "{\"b\":1,\"a\":2}");
-    check(&mut e, "SELECT jsonb_build_array(1,'x',true,null)::text", "[1,\"x\",true,null]");
+    check(&mut e, "SELECT jsonb_build_object('a',1,'b',2)::text", "{\"a\": 1, \"b\": 2}");
+    // jsonb builders now emit canonical (sorted-key) output like PG.
+    check(&mut e, "SELECT jsonb_build_object('b',1,'a',2)::text", "{\"a\": 2, \"b\": 1}");
+    check(&mut e, "SELECT jsonb_build_array(1,'x',true,null)::text", "[1, \"x\", true, null]");
     check(&mut e, "SELECT to_jsonb(5)::text", "5");
     check(&mut e, "SELECT to_jsonb('hi'::text)::text", "\"hi\"");
-    check(&mut e, "SELECT jsonb_set('{\"a\":1,\"b\":2}','{a}','5')::text", "{\"a\":5,\"b\":2}");
-    check(&mut e, "SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,b}','9')::text", "{\"a\":{\"b\":9}}");
-    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3')::text", "{\"a\":1,\"c\":3}");
-    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3',true)::text", "{\"a\":1,\"c\":3}");
-    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3',false)::text", "{\"a\":1}");
-    check(&mut e, "SELECT jsonb_insert('{\"a\":[1,2,3]}','{a,1}','9')::text", "{\"a\":[1,9,2,3]}");
-    check(&mut e, "SELECT jsonb_insert('{\"a\":[1,2,3]}','{a,1}','9',true)::text", "{\"a\":[1,2,9,3]}");
+    check(&mut e, "SELECT jsonb_set('{\"a\":1,\"b\":2}','{a}','5')::text", "{\"a\": 5, \"b\": 2}");
+    check(&mut e, "SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,b}','9')::text", "{\"a\": {\"b\": 9}}");
+    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3')::text", "{\"a\": 1, \"c\": 3}");
+    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3',true)::text", "{\"a\": 1, \"c\": 3}");
+    check(&mut e, "SELECT jsonb_set('{\"a\":1}','{c}','3',false)::text", "{\"a\": 1}");
+    check(&mut e, "SELECT jsonb_insert('{\"a\":[1,2,3]}','{a,1}','9')::text", "{\"a\": [1, 9, 2, 3]}");
+    check(&mut e, "SELECT jsonb_insert('{\"a\":[1,2,3]}','{a,1}','9',true)::text", "{\"a\": [1, 2, 9, 3]}");
     check(&mut e, "SELECT jsonb_extract_path('{\"a\":{\"b\":5}}','a','b')::text", "5");
     check(&mut e, "SELECT jsonb_extract_path_text('{\"a\":{\"b\":5}}','a','b')", "5");
     // typeof / array_length via ::jsonb-cast argument
@@ -243,7 +237,7 @@ fn jsonb_functions() {
     check(&mut e, "SELECT jsonb_typeof('null'::jsonb)", "null");
     check(&mut e, "SELECT jsonb_array_length('[1,2,3,4]'::jsonb)", "4");
     check(&mut e, "SELECT jsonb_array_length('[]'::jsonb)", "0");
-    check(&mut e, "SELECT jsonb_strip_nulls('{\"a\":null,\"b\":1}'::jsonb)::text", "{\"b\":1}");
+    check(&mut e, "SELECT jsonb_strip_nulls('{\"a\":null,\"b\":1}'::jsonb)::text", "{\"b\": 1}");
     check(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.a')", "t");
     check(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.b')", "f");
     check(&mut e, "SELECT jsonb_agg(x)::text FROM (VALUES(1),(2),(3)) v(x)", "[1, 2, 3]");
