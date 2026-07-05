@@ -2151,3 +2151,29 @@ fn array_scalar_subquery() {
     assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v) FROM (VALUES (1),(NULL),(3)) t(v))::text"), "{1,NULL,3}");
     assert_eq!(q(&mut e, "SELECT array_length((SELECT array_agg(v) FROM (VALUES (1),(2),(3)) t(v)), 1)::text"), "3");
 }
+
+/// v7.37 D.28 — a VIEW whose body has a `(VALUES …) t(cols)` derived table now
+/// round-trips (view body stores the AST Display; the lateral_subquery Display
+/// dropped the column aliases → ColumnNotFound on re-parse). PG18.4-verified.
+#[test]
+fn view_over_values_derived() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    e.execute("CREATE VIEW vv AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)").unwrap();
+    // top-level view query
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||d, ',' ORDER BY g) FROM vv WHERE d > 10"), "2:20,3:30");
+    // aggregate over the view
+    assert_eq!(q(&mut e, "SELECT count(*)::text FROM vv"), "3");
+    // view inside a derived table + UNION
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text, ',' ORDER BY x) FROM (SELECT g x FROM vv UNION SELECT d FROM vv) u"), "1,2,3,10,20,30");
+    // real LATERAL still round-trips (regression: parser now reads AS t(cols) after LATERAL)
+    e.execute("CREATE TABLE lt(a int)").unwrap();
+    e.execute("INSERT INTO lt VALUES (1),(2)").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||b, ',' ORDER BY a) FROM lt CROSS JOIN LATERAL (SELECT lt.a*10 b) s"), "1:10,2:20");
+}
