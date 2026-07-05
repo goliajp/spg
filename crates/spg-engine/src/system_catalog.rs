@@ -3002,7 +3002,7 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Canonical defaults every admin tool expects to find.
     let defaults: &[(&str, &str, &str)] = &[
-        ("server_version", "16.0 (spg)", "Preset Options"),
+        ("server_version", "18.4 (spg)", "Preset Options"),
         ("server_encoding", "UTF8", "Client Connection Defaults"),
         ("client_encoding", "UTF8", "Client Connection Defaults"),
         ("DateStyle", "ISO, MDY", "Client Connection Defaults"),

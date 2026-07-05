@@ -8,7 +8,7 @@
 //! canned-response shortcuts which only fire on bare `SELECT fn()`):
 //!   * `current_database()` (PG) / `database()` (MySQL) → 'spg'
 //!   * `current_schema()` → 'public'
-//!   * `version()` → 'PostgreSQL 16 (SPG-compat)' (already shipped
+//!   * `version()` → 'PostgreSQL 18.4 (SPG-compat)' (already shipped
 //!     — corpus-locked here so regression notices)
 //!   * `current_user()` / `user()` → 'admin' (paren form)
 //!
@@ -88,4 +88,23 @@ fn database_in_select_list_alongside_table_column() {
     assert_eq!(row.len(), 2);
     assert!(matches!(row[0], Value::Int(1)));
     assert!(matches!(&row[1], Value::Text(s) if s == "spg"));
+}
+
+/// U21 (read01 A-group): SPG positions as a PG 18 drop-in, so the
+/// reported server version must be 18.x — clients gate feature
+/// availability on server_version / server_version_num. It used to
+/// report 16. Anchored to the live PG 18.4 the dropin panel targets.
+#[test]
+fn reported_server_version_is_pg18() {
+    let mut e = Engine::new();
+    let v = one_text(&mut e, "SELECT version()");
+    assert!(v.contains("18.4"), "version() should report 18.4, got {v:?}");
+    assert_eq!(
+        one_text(&mut e, "SELECT current_setting('server_version')"),
+        "18.4 (SPG-compat)"
+    );
+    assert_eq!(
+        one_text(&mut e, "SELECT current_setting('server_version_num')"),
+        "180004"
+    );
 }
