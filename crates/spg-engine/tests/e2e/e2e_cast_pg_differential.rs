@@ -1999,3 +1999,26 @@ fn window_over_aggregate() {
     e.execute("INSERT INTO wtab VALUES (1,10),(1,20),(2,5)").unwrap();
     assert_eq!(q(&mut e, "SELECT string_agg(g||':'||rk, ',' ORDER BY g) FROM (SELECT g, rank() OVER (ORDER BY sum(v) DESC) rk FROM wtab GROUP BY g) z"), "1:1,2:2");
 }
+
+/// v7.37 D.24 — substring(string FROM pattern) POSIX regex extraction (no capture
+/// group → whole match). Positional forms unchanged. PG18.4-verified.
+#[test]
+fn substring_regex_form() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"NULL".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(_)=>"ERR".into(),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '[a-z]+')"), "hello");
+    assert_eq!(q(&mut e, "SELECT COALESCE(substring('xyz' FROM '[0-9]+'), 'NULL')"), "NULL");
+    assert_eq!(q(&mut e, "SELECT substring('id-4567-end' FROM '[0-9]+')"), "4567");
+    assert_eq!(q(&mut e, "SELECT substring('abcdef' FROM 2 FOR 3)"), "bcd");
+    assert_eq!(q(&mut e, "SELECT substring('abcdef', 2)"), "bcdef");
+    assert_eq!(q(&mut e, "SELECT substring('foo@bar.com', '@[a-z.]+')"), "@bar.com");
+    // capturing-group pattern → honest error (regex capture-extraction gap), not a
+    // silent wrong result.
+    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"), "ERR");
+}
