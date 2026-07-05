@@ -7,7 +7,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::SelectStatement;
+use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, TableSchema, Value};
 
 use crate::{Engine, EngineError};
@@ -3300,32 +3300,9 @@ pub(crate) fn collect_view_refs(
 }
 
 pub(crate) fn select_references_meta_view(stmt: &SelectStatement) -> bool {
-    fn is_meta(name: &str) -> bool {
-        name.starts_with("__spg_info_")
-            || name.starts_with("__spg_pg_")
-            || name.starts_with("__spg_mysql_")
-    }
-    if let Some(from) = &stmt.from {
-        if is_meta(&from.primary.name) {
-            return true;
-        }
-        for j in &from.joins {
-            if is_meta(&j.table.name) {
-                return true;
-            }
-        }
-    }
-    for cte in &stmt.ctes {
-        // v7.37.43-T4.4 — only Select-bodied CTEs need meta-view
-        // scanning; data-modifying CTE bodies (INSERT/UPDATE/DELETE)
-        // never reference info_schema / pg_catalog views directly.
-        if let Some(s) = cte.body.as_select()
-            && select_references_meta_view(s)
-        {
-            return true;
-        }
-    }
-    false
+    let mut names = alloc::collections::BTreeSet::new();
+    collect_meta_view_names(stmt, &mut names);
+    !names.is_empty()
 }
 
 /// v7.16.2 — collect every meta-view name a SELECT touches.
@@ -3341,15 +3318,86 @@ pub(crate) fn collect_meta_view_names(
             || name.starts_with("__spg_pg_")
             || name.starts_with("__spg_mysql_")
     }
-    if let Some(from) = &stmt.from {
-        if is_meta(&from.primary.name) {
-            into.insert(from.primary.name.clone());
+    fn walk_table(t: &spg_sql::ast::TableRef, into: &mut alloc::collections::BTreeSet<String>) {
+        if is_meta(&t.name) {
+            into.insert(t.name.clone());
         }
+        // A derived table (`FROM (SELECT …) x`, LATERAL or not) rides
+        // the lateral_subquery channel.
+        if let Some(sub) = &t.lateral_subquery {
+            collect_meta_view_names(sub, into);
+        }
+    }
+    fn walk_expr(e: &Expr, into: &mut alloc::collections::BTreeSet<String>) {
+        match e {
+            Expr::ScalarSubquery(s) => collect_meta_view_names(s, into),
+            Expr::Exists { subquery, .. } => collect_meta_view_names(subquery, into),
+            Expr::InSubquery { expr, subquery, .. } => {
+                walk_expr(expr, into);
+                collect_meta_view_names(subquery, into);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk_expr(lhs, into);
+                walk_expr(rhs, into);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk_expr(expr, into),
+            Expr::FunctionCall { args, .. } => args.iter().for_each(|a| walk_expr(a, into)),
+            Expr::Case { operand, branches, else_branch } => {
+                if let Some(o) = operand {
+                    walk_expr(o, into);
+                }
+                for (c, v) in branches {
+                    walk_expr(c, into);
+                    walk_expr(v, into);
+                }
+                if let Some(x) = else_branch {
+                    walk_expr(x, into);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk_expr(expr, into);
+                list.iter().for_each(|it| walk_expr(it, into));
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                walk_expr(expr, into);
+                walk_expr(array, into);
+            }
+            Expr::Array(items) => items.iter().for_each(|it| walk_expr(it, into)),
+            Expr::ArraySubscript { target, index } => {
+                walk_expr(target, into);
+                walk_expr(index, into);
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = &stmt.from {
+        walk_table(&from.primary, into);
         for j in &from.joins {
-            if is_meta(&j.table.name) {
-                into.insert(j.table.name.clone());
+            walk_table(&j.table, into);
+            if let Some(on) = &j.on {
+                walk_expr(on, into);
             }
         }
+    }
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk_expr(expr, into);
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        walk_expr(w, into);
+    }
+    if let Some(h) = &stmt.having {
+        walk_expr(h, into);
+    }
+    if let Some(gs) = &stmt.group_by {
+        gs.iter().for_each(|g| walk_expr(g, into));
+    }
+    for o in &stmt.order_by {
+        walk_expr(&o.expr, into);
+    }
+    for (_, peer) in &stmt.unions {
+        collect_meta_view_names(peer, into);
     }
     for cte in &stmt.ctes {
         if let Some(s) = cte.body.as_select() {

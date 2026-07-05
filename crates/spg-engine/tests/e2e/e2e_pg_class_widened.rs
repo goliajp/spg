@@ -110,3 +110,38 @@ fn pg_class_relhasindex_after_create_index() {
         .unwrap();
     assert!(matches!(t2[13], Value::Bool(true)), "has index");
 }
+
+// read01 — a pg_catalog view referenced only inside a subquery must
+// still materialise. The `WHERE attrelid = (SELECT oid FROM pg_class
+// WHERE relname = …)` shape is how ORMs / pg_dump introspect a table's
+// columns; before the meta-view collector walked subqueries it failed
+// with "__spg_pg_class does not exist".
+#[test]
+fn catalog_view_inside_subquery_materialises() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    // pg_attribute filtered by a pg_class subquery.
+    let cols = rows(
+        &mut e,
+        "SELECT attname FROM pg_attribute \
+         WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') \
+           AND attnum > 0 ORDER BY attnum",
+    );
+    let names: Vec<String> = cols
+        .iter()
+        .filter_map(|r| match &r[0] {
+            Value::Text(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["id", "name"]);
+
+    // pg_index filtered by a pg_class subquery (no error / rows present).
+    let idx = rows(
+        &mut e,
+        "SELECT indexrelid FROM pg_index \
+         WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 't')",
+    );
+    assert!(!idx.is_empty(), "expected the primary-key index row");
+}
