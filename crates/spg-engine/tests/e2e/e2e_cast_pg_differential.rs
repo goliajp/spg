@@ -2491,3 +2491,20 @@ fn update_on_partition_parent_nonkey() {
     // the rejected UPDATE left the data untouched
     assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM t"), "1:5,2:15,3:8");
 }
+
+/// v7.37 D.49 — jsonb_array_length / json_array_length accept a TEXT arg (PG
+/// implicitly casts an unknown-type string literal to jsonb). PG18.4-verified.
+#[test]
+fn jsonb_array_length_text_arg() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => format!("{:?}", &rows[0].values[0]), Ok(o)=>format!("{o:?}"), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+    };
+    assert_eq!(q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]')"), "Int(4)");
+    assert_eq!(q(&mut e, "SELECT json_array_length('[1,2,3,4]')"), "Int(4)");
+    // explicit ::jsonb still works
+    assert_eq!(q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]'::jsonb)"), "Int(4)");
+    // NULL passthrough + non-array error preserved
+    assert_eq!(q(&mut e, "SELECT jsonb_array_length(NULL)"), "Null");
+    assert!(q(&mut e, "SELECT jsonb_array_length('{\"a\":1}')").starts_with("ERR"));
+}
