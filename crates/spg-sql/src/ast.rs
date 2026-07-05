@@ -2561,6 +2561,10 @@ pub enum Expr {
         /// `Respect` (PG / ANSI default — NULLs participate). Other
         /// window functions ignore this flag.
         null_treatment: NullTreatment,
+        /// v7.37 D.40 — `agg(...) FILTER (WHERE cond) OVER (...)`. `None`
+        /// = no FILTER. Only aggregate window functions honor it; the
+        /// predicate restricts which peer rows contribute within the frame.
+        filter: Option<Box<Expr>>,
     },
     /// v4.10 scalar subquery — `(SELECT ...)` used in expression
     /// position. Must return exactly one row × one column at eval
@@ -4964,6 +4968,7 @@ impl fmt::Display for Expr {
                 order_by,
                 frame,
                 null_treatment,
+                filter,
             } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
@@ -4973,6 +4978,11 @@ impl fmt::Display for Expr {
                     write!(f, "{a}")?;
                 }
                 f.write_str(")")?;
+                // v7.37 D.40 — `FILTER (WHERE …)` sits between the arg list and
+                // OVER; it round-trips so a window body's Display re-parses.
+                if let Some(cond) = filter {
+                    write!(f, " FILTER (WHERE {cond})")?;
+                }
                 // v7.30.1 (mailrs round-24 class audit) — IGNORE
                 // NULLS sits between the arg list and OVER; dropping
                 // it reverted replayed queries to RESPECT NULLS.

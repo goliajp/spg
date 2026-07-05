@@ -212,12 +212,29 @@ pub(crate) fn compute_window_partition(
     ordered: bool,
     frame: Option<&WindowFrame>,
     null_treatment: spg_sql::ast::NullTreatment,
+    filter: Option<&Expr>,
     slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
     filtered_rows: &[&Row<'static>],
     ctx: &EvalContext<'_>,
     out_vals: &mut [Value],
 ) -> Result<(), EngineError> {
     let ignore_nulls = matches!(null_treatment, spg_sql::ast::NullTreatment::Ignore);
+    // v7.37 D.40 — `agg(...) FILTER (WHERE cond) OVER (...)`: pre-evaluate the
+    // predicate per peer row (in slice order). A false/NULL predicate drops that
+    // row from the aggregate — the frame bounds are unchanged, only which rows
+    // inside the frame contribute. `None` = no FILTER (all pass).
+    let filter_pass: Vec<bool> = match filter {
+        None => alloc::vec![true; slice.len()],
+        Some(pred) => slice
+            .iter()
+            .map(|(_, _, idx)| {
+                Ok(matches!(
+                    eval::eval_expr(pred, filtered_rows[*idx], ctx).map_err(EngineError::Eval)?,
+                    Value::Bool(true)
+                ))
+            })
+            .collect::<Result<_, EngineError>>()?,
+    };
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "row_number" => {
@@ -297,6 +314,11 @@ pub(crate) fn compute_window_partition(
                         // EXCLUDE CURRENT ROW drops the current row
                         // from the aggregate frame.
                         if exclude == FrameExclusion::CurrentRow && j == i {
+                            continue;
+                        }
+                        // v7.37 D.40 — a FILTER (WHERE …) predicate that this peer
+                        // row fails drops it from the aggregate (frame unchanged).
+                        if !filter_pass[j] {
                             continue;
                         }
                         let v = &arg_values[j];

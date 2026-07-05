@@ -2318,3 +2318,25 @@ fn value_to_charn_cast() {
     assert_eq!(q(&mut e, "SELECT (true::char(1))"), "t");
     assert_eq!(q(&mut e, "SELECT ('abcdef'::varchar(3))"), "abc");
 }
+
+/// v7.37 D.40 — FILTER (WHERE …) on a window aggregate restricts contributing
+/// peer rows within the frame. PG18.4-verified.
+#[test]
+fn window_aggregate_filter() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(g int, v int)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(1,30),(2,5),(2,15)").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    // count FILTER over whole partition
+    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) FILTER (WHERE v > 15) OVER () c FROM t WHERE g=1) s"), "10:3,20:3,20:3,30:3");
+    // sum FILTER over a running (ORDER BY) frame — excludes v=20 rows
+    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||s, ',' ORDER BY v) FROM (SELECT v, sum(v) FILTER (WHERE v <> 20) OVER (ORDER BY v) s FROM t WHERE g=1) x"), "10:10,20:10,20:10,30:40");
+    // count FILTER over PARTITION BY
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||v||':'||c, ',' ORDER BY g,v) FROM (SELECT g, v, count(*) FILTER (WHERE v >= 15) OVER (PARTITION BY g) c FROM t) s"), "1:10:3,1:20:3,1:20:3,1:30:3,2:5:1,2:15:1");
+    // min FILTER (exact — avg would hit the D.33 avg(int)→float divergence)
+    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||m, ',' ORDER BY v) FROM (SELECT v, min(v) FILTER (WHERE v > 10) OVER () m FROM t WHERE g=1) x"), "10:20,20:20,20:20,30:20");
+    // plain OVER without FILTER unchanged (regression)
+    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) OVER () c FROM t WHERE g=1) s"), "10:4,20:4,20:4,30:4");
+}

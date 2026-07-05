@@ -14554,11 +14554,6 @@ impl Parser {
                 if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && s.eq_ignore_ascii_case("over")
                 {
-                    if filter.is_some() {
-                        return Err(
-                            self.err("FILTER on window functions is not supported yet".into())
-                        );
-                    }
                     self.advance();
                     let (partition_by, order_by, frame) = self.parse_over_clause()?;
                     return Ok(Expr::WindowFunction {
@@ -14568,6 +14563,7 @@ impl Parser {
                         order_by,
                         frame,
                         null_treatment,
+                        filter,
                     });
                 }
                 if let Some(filter) = filter {
@@ -15042,9 +15038,6 @@ impl Parser {
             if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                 && s.eq_ignore_ascii_case("over")
             {
-                if filter.is_some() {
-                    return Err(self.err("FILTER on window functions is not supported yet".into()));
-                }
                 self.advance();
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
@@ -15054,6 +15047,7 @@ impl Parser {
                     order_by,
                     frame,
                     null_treatment,
+                    filter,
                 });
             }
             if !agg_order_by.is_empty() || agg_distinct || filter.is_some() {
