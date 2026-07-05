@@ -10389,14 +10389,18 @@ fn apply_function_dispatch(
         // pgp_key_id(bytea) — key-ID extraction from a PGP packet.
         "pgp_key_id" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — convert_from / convert_to
-        // handle text ↔ bytea encoding conversion. SPG stores text
-        // as UTF-8 always so both simply reinterpret the bytes.
+        // handle text ↔ bytea encoding conversion. SPG stores text as
+        // UTF-8; UTF8 / SQL_ASCII therefore just reinterpret the bytes,
+        // while LATIN1 (ISO-8859-1) really transcodes — every byte maps
+        // 1:1 to U+0000..=U+00FF, so the conversion is exact.
         //
-        //   convert_from(bytea, 'UTF8') → text
-        //   convert_to(text, 'UTF8')    → bytea
+        //   convert_from(bytea, 'UTF8')   → text
+        //   convert_to(text, 'UTF8')      → bytea
+        //   convert_from(bytea, 'LATIN1') → text (byte b → codepoint b)
+        //   convert_to(text, 'LATIN1')    → bytea (codepoint ≤ 0xFF)
         //
-        // Any encoding name other than 'UTF8' / 'SQL_ASCII' errors;
-        // real transcoding queues with the collation/encoding epic.
+        // Any other encoding name errors; the wider transcoding matrix
+        // queues with the collation/encoding epic.
         "convert_from" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -10443,17 +10447,23 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let s = match core::str::from_utf8(b) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "convert_from(): input is not valid UTF-8: {e}"
-                        ),
-                    });
+            let s = if enc_up == "LATIN1" {
+                // ISO-8859-1: each byte is exactly its own codepoint.
+                b.iter().map(|&byte| byte as char).collect::<alloc::string::String>()
+            } else {
+                // UTF8 / SQL_ASCII: the bytes are already UTF-8.
+                match core::str::from_utf8(b) {
+                    Ok(v) => alloc::string::String::from(v),
+                    Err(e) => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "convert_from(): input is not valid UTF-8: {e}"
+                            ),
+                        });
+                    }
                 }
             };
-            Ok(Value::text(alloc::string::String::from(s)))
+            Ok(Value::text(s))
         }
         "convert_to" => {
             if args.len() != 2 {
@@ -10498,7 +10508,27 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            Ok(Value::Bytes(s.into_bytes().into()))
+            let bytes = if enc_up == "LATIN1" {
+                // UTF-8 text → ISO-8859-1 bytes. A codepoint above U+00FF
+                // has no LATIN1 equivalent, which PG reports as an error.
+                let mut out = alloc::vec::Vec::with_capacity(s.len());
+                for ch in s.chars() {
+                    let cp = ch as u32;
+                    if cp <= 0xFF {
+                        out.push(cp as u8);
+                    } else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "convert_to(): character {ch:?} has no equivalent in encoding LATIN1"
+                            ),
+                        });
+                    }
+                }
+                out
+            } else {
+                s.into_bytes()
+            };
+            Ok(Value::Bytes(bytes.into()))
         }
         "error_on_null" => error_on_null(args),
         // v7.12.1 — PG full-text search lexer / tsquery builders.
