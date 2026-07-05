@@ -128,6 +128,8 @@ pub enum Token {
     /// every key/value in `sub` is present in `j` with structural
     /// containment for objects + arrays.
     JsonContains,
+    /// `@?` jsonpath existence operator.
+    JsonPathExists,
     /// v7.37.6-A `<@` — JSON contained-by. `a <@ b` ⇔ `b @> a`.
     JsonContainedBy,
     /// v7.37.6-A `?` — JSON key exists (object), or element-as-text
@@ -498,6 +500,11 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b'@' => {
                 if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::JsonContains);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'?') {
+                    // v7.37 — `@?` jsonpath existence operator
+                    // (`jsonb @? jsonpath` = jsonb_path_exists).
+                    out.push(Token::JsonPathExists);
                     i += 2;
                 } else if peek_eq(bytes, i + 1, b'@')
                     && !is_session_var_ident_start(bytes.get(i + 2).copied())

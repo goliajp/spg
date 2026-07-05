@@ -2637,3 +2637,14 @@ fn pg_sequence_catalog_view() {
     // PG18.4: seqstart|seqincrement|seqmax|seqmin|seqcache|seqcycle = 5|2|100|1|1|true
     assert_eq!(q(&mut e, "SELECT seqstart::text||'|'||seqincrement::text||'|'||seqmax::text||'|'||seqmin::text||'|'||seqcache::text||'|'||seqcycle::text FROM pg_sequence"), "5|2|100|1|1|true");
 }
+
+/// v7.37 — `jsonb @? jsonpath` existence operator (= jsonb_path_exists). PG18.4-verified.
+#[test]
+fn jsonb_path_exists_operator() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Bool(b)=>format!("{b}"), Value::Null=>"".into(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    assert_eq!(q(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb @? '$.a')::text"), "true");
+    assert_eq!(q(&mut e, "SELECT ('{\"a\":1}'::jsonb @? '$.c')::text"), "false");
+    assert_eq!(q(&mut e, "SELECT ('{\"x\":{\"y\":5}}'::jsonb @? '$.x.y')::text"), "true");
+    assert_eq!(q(&mut e, "SELECT ('{\"a\":[1,2,3]}'::jsonb @? '$.a[*]')::text"), "true");
+}

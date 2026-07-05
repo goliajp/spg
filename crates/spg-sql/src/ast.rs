@@ -2999,6 +2999,8 @@ pub enum BinOp {
     /// when every key/value in `sub_json` is structurally present in
     /// the left side. Matches PG semantics (top-level + recursive).
     JsonContains,
+    /// `@?` — jsonb path existence (jsonb_path_exists).
+    JsonPathExists,
     /// v7.37.6-A `json <@ sub_json` — contained-by. Returns BOOL;
     /// `a <@ b` is defined as `b @> a` (same semantics, swapped
     /// sides). Eval dispatch reuses `JsonContains` with swapped args.
@@ -5304,6 +5306,7 @@ impl fmt::Display for BinOp {
             Self::JsonGetPath => "#>",
             Self::JsonGetPathText => "#>>",
             Self::JsonContains => "@>",
+            Self::JsonPathExists => "@?",
             Self::JsonContainedBy => "<@",
             Self::JsonKeyExists => "?",
             Self::JsonKeysAny => "?|",
