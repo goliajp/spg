@@ -5190,13 +5190,43 @@ impl Parser {
             )));
         }
         self.advance();
-        let source = self.expect_ident_like()?;
+        // v7.37 D.44 — `USING (SELECT …) alias` subquery source, or `USING
+        // <table> [alias]`. PG requires an alias after a subquery source.
+        let (source, source_select) = if matches!(self.peek(), Token::LParen) {
+            self.advance(); // (
+            let inner = self.parse_select_stmt()?;
+            match self.advance() {
+                Token::RParen => {}
+                other => {
+                    return Err(self.err(format!(
+                        "expected ')' after MERGE USING subquery, got {other:?}"
+                    )));
+                }
+            }
+            let Statement::Select(sub) = inner else {
+                return Err(self.err("MERGE USING subquery must be a SELECT".into()));
+            };
+            (String::new(), Some(Box::new(sub)))
+        } else {
+            (self.expect_ident_like()?, None)
+        };
         let source_alias = match self.peek() {
-            Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("on") => {
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if !s.eq_ignore_ascii_case("on") && !s.eq_ignore_ascii_case("as") =>
+            {
+                Some(self.expect_ident_like()?)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("as") => {
+                self.advance(); // AS
                 Some(self.expect_ident_like()?)
             }
             _ => None,
         };
+        if source_select.is_some() && source_alias.is_none() {
+            return Err(self.err(
+                "MERGE USING (subquery) requires an alias".into(),
+            ));
+        }
         // ON
         if !matches!(self.peek(), Token::On) {
             return Err(self.err(format!(
@@ -5395,6 +5425,7 @@ impl Parser {
             target_alias,
             source,
             source_alias,
+            source_select,
             on,
             clauses,
         }))

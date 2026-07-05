@@ -2389,3 +2389,28 @@ fn cte_in_scalar_subquery() {
     // non-subquery parenthesised expression still works (regression)
     assert_eq!(q(&mut e, "SELECT ((1 + 2) * 3)::text"), "9");
 }
+
+/// v7.37 D.44 — MERGE with a `USING (SELECT …) alias` subquery source.
+/// PG18.4-verified.
+#[test]
+fn merge_subquery_source() {
+    let mut e = Engine::new();
+    let agg = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), _=>"?".into() }, o=>format!("{o:?}") }
+    };
+    e.execute("CREATE TABLE tgt(id int primary key, v int)").unwrap();
+    e.execute("INSERT INTO tgt VALUES (1,10),(2,20)").unwrap();
+    e.execute("MERGE INTO tgt USING (SELECT * FROM (VALUES (1,100),(3,300)) s(id,v)) src ON tgt.id=src.id WHEN MATCHED THEN UPDATE SET v=src.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (src.id,src.v)").unwrap();
+    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tgt"), "1:100,2:20,3:300");
+    e.execute("CREATE TABLE t2(id int primary key, v int)").unwrap();
+    e.execute("INSERT INTO t2 VALUES (1,1),(2,2),(3,3)").unwrap();
+    e.execute("MERGE INTO t2 USING (SELECT id, v*10 w FROM (VALUES (2,5),(4,7)) s(id,v)) src ON t2.id=src.id WHEN MATCHED THEN UPDATE SET v=src.w WHEN NOT MATCHED THEN INSERT (id,v) VALUES (src.id, src.w)").unwrap();
+    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t2"), "1:1,2:50,3:3,4:70");
+    // plain table source unchanged (regression)
+    e.execute("CREATE TABLE tg3(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE sr3(id int, v int)").unwrap();
+    e.execute("INSERT INTO tg3 VALUES (1,10)").unwrap();
+    e.execute("INSERT INTO sr3 VALUES (1,99),(2,88)").unwrap();
+    e.execute("MERGE INTO tg3 USING sr3 ON tg3.id=sr3.id WHEN MATCHED THEN UPDATE SET v=sr3.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (sr3.id,sr3.v)").unwrap();
+    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tg3"), "1:99,2:88");
+}
