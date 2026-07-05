@@ -7159,50 +7159,64 @@ impl Parser {
         } else {
             None
         };
-        // v7.37 D.22 — a bare set-returning function in the projection with no
-        // FROM (`SELECT unnest(arr)`, `SELECT generate_series(a,b)`) expands to
-        // rows. Lower it to the equivalent FROM-position SRF, reusing the
-        // FROM-SRF machinery; PG names the output column after the function.
-        let srf_rewrite: Option<TableRef> = if from.is_none() && items.len() == 1 {
-            if let SelectItem::Expr {
-                expr: Expr::FunctionCall { name, args },
-                alias,
-            } = &items[0]
-            {
-                let lname = name.to_ascii_lowercase();
-                let colname = alias.clone().unwrap_or_else(|| lname.clone());
-                let mk = |unnest: Option<Box<Expr>>, gs: Option<Vec<Expr>>| TableRef {
-                    name: colname.clone(),
-                    alias: Some(colname.clone()),
-                    as_of_segment: None,
-                    unnest_expr: unnest,
-                    unnest_column_aliases: alloc::vec![colname.clone()],
-                    with_ordinality: false,
-                    generate_series_args: gs,
-                    lateral_subquery: None,
-                    jsonb_each_text_arg: None,
-                };
-                match lname.as_str() {
-                    "unnest" if args.len() == 1 => {
-                        Some(mk(Some(Box::new(args[0].clone())), None))
-                    }
-                    "generate_series" if (2..=3).contains(&args.len()) => {
-                        Some(mk(None, Some(args.clone())))
-                    }
-                    _ => None,
+        // v7.37 D.22 — a set-returning function in the projection with no FROM
+        // (`SELECT unnest(arr)`, `SELECT 'x', generate_series(a,b)`) expands to
+        // rows. Move the first SRF projection item to a FROM-position derived
+        // table and replace it in the projection with a reference to its output
+        // column; sibling scalar columns repeat per SRF row. PG names the output
+        // column after the function (or its AS alias). Reuses the FROM-SRF
+        // machinery. Only fires with no FROM — mixed SRF over a real FROM already
+        // works via the targetlist-SRF path.
+        if from.is_none() {
+            let mut found: Option<(usize, TableRef, String)> = None;
+            for (i, item) in items.iter().enumerate() {
+                if let SelectItem::Expr {
+                    expr: Expr::FunctionCall { name, args },
+                    alias,
+                } = item
+                {
+                    let lname = name.to_ascii_lowercase();
+                    let colname = alias.clone().unwrap_or_else(|| lname.clone());
+                    let (unnest, gs) = match lname.as_str() {
+                        "unnest" if args.len() == 1 => {
+                            (Some(Box::new(args[0].clone())), None)
+                        }
+                        "generate_series" if (2..=3).contains(&args.len()) => {
+                            (None, Some(args.clone()))
+                        }
+                        _ => continue,
+                    };
+                    found = Some((
+                        i,
+                        TableRef {
+                            name: colname.clone(),
+                            alias: Some(colname.clone()),
+                            as_of_segment: None,
+                            unnest_expr: unnest,
+                            unnest_column_aliases: alloc::vec![colname.clone()],
+                            with_ordinality: false,
+                            generate_series_args: gs,
+                            lateral_subquery: None,
+                            jsonb_each_text_arg: None,
+                        },
+                        colname,
+                    ));
+                    break;
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
-        if let Some(tref) = srf_rewrite {
-            from = Some(FromClause {
-                primary: tref,
-                joins: Vec::new(),
-            });
-            items = alloc::vec![SelectItem::Wildcard];
+            if let Some((idx, tref, colname)) = found {
+                from = Some(FromClause {
+                    primary: tref,
+                    joins: Vec::new(),
+                });
+                items[idx] = SelectItem::Expr {
+                    expr: Expr::Column(ColumnName {
+                        qualifier: None,
+                        name: colname.clone(),
+                    }),
+                    alias: Some(colname),
+                };
+            }
         }
         let sample_preds = core::mem::take(&mut self.pending_sample_preds);
         let where_ = if matches!(self.peek(), Token::Where) {
