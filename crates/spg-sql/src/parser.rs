@@ -13685,6 +13685,38 @@ impl Parser {
                 )),
             });
         }
+        // `(a, b, …) IS [NOT] NULL` — the SQL row null predicate. Per
+        // PG, `IS NULL` is true only when EVERY field is NULL, and
+        // `IS NOT NULL` is true only when every field is non-NULL — the
+        // latter is NOT the negation of the former (a mixed row is
+        // neither). Desugar to an AND chain of per-field `IS [NOT] NULL`,
+        // which reproduces exactly that all-fields semantics.
+        if matches!(self.peek(), Token::Is) {
+            self.advance();
+            let negated = if matches!(self.peek(), Token::Not) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            if !matches!(self.peek(), Token::Null) {
+                return Err(self.err(alloc::format!(
+                    "expected NULL after row IS [NOT], got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut it = row.iter().map(|e| Expr::IsNull {
+                expr: Box::new(e.clone()),
+                negated,
+            });
+            let first = it.next().expect("row has at least two elements");
+            return Ok(it.fold(first, |acc, e| Expr::Binary {
+                lhs: Box::new(acc),
+                op: BinOp::And,
+                rhs: Box::new(e),
+            }));
+        }
         let op = match self.peek() {
             Token::Eq => BinOp::Eq,
             Token::NotEq => BinOp::NotEq,
@@ -13695,7 +13727,7 @@ impl Parser {
             other => {
                 return Err(self.err(alloc::format!(
                     "row constructor must be followed by a comparison \
-                     operator or [NOT] IN; got {other:?}"
+                     operator, [NOT] IN, or IS [NOT] NULL; got {other:?}"
                 )));
             }
         };
