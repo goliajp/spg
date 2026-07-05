@@ -1764,7 +1764,11 @@ fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         l,
         r,
         |a, b| {
-            if b == 0 { None } else { Some(a / b) }
+            // `checked_div` returns None on b == 0 AND on the INT64_MIN / -1
+            // overflow (PG raises "bigint out of range" here; a bare `a / b`
+            // would panic the connection — the same trap `mod_op` already
+            // avoids with `wrapping_rem`).
+            if b == 0 { None } else { a.checked_div(b) }
         },
         |a, b| a / b,
         "/",
