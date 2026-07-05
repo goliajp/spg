@@ -99,6 +99,33 @@ fn to_date_out_of_range_errors() {
         .is_err());
 }
 
+/// U17 (read01 A-group): a 2-digit `YY` year used to be rendered as
+/// `2000 + v`, so `to_date('70', 'YY')` wrongly gave 2070. PG applies
+/// `adjust_partial_year_to_2020` (pivot at 70), and supports the `YYY`
+/// (3-digit) and `CC` (century) tokens too. Every expected value was
+/// captured live from PG 18.4.
+#[test]
+fn to_date_partial_year_pivot_matches_pg18() {
+    let mut e = Engine::new();
+    let d = |e: &mut Engine, sql: &str| match first(e, &format!("SELECT ({sql})::text")) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        other => panic!("{sql}: got {other:?}"),
+    };
+    // YY: < 70 → 2000s, >= 70 → 1900s (pivot at 70).
+    assert_eq!(d(&mut e, "to_date('70-01-15','YY-MM-DD')"), "1970-01-15");
+    assert_eq!(d(&mut e, "to_date('69-01-15','YY-MM-DD')"), "2069-01-15");
+    assert_eq!(d(&mut e, "to_date('00-01-15','YY-MM-DD')"), "2000-01-15");
+    assert_eq!(d(&mut e, "to_date('99-01-15','YY-MM-DD')"), "1999-01-15");
+    assert_eq!(d(&mut e, "to_date('50-01-15','YY-MM-DD')"), "2050-01-15");
+    // YYY: 3-digit fold ('970' → 1970).
+    assert_eq!(d(&mut e, "to_date('970-01-15','YYY-MM-DD')"), "1970-01-15");
+    // YYYY: literal, no pivot ('24' → year 24).
+    assert_eq!(d(&mut e, "to_date('24-01-15','YYYY-MM-DD')"), "0024-01-15");
+    assert_eq!(d(&mut e, "to_date('2024-01-15','YYYY-MM-DD')"), "2024-01-15");
+    // CC: century alone → first year of that century.
+    assert_eq!(d(&mut e, "to_date('21-01-15','CC-MM-DD')"), "2001-01-15");
+}
+
 #[test]
 fn to_date_null_passthrough() {
     let mut e = Engine::new();
