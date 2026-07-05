@@ -2133,3 +2133,21 @@ fn count_col_over_values_excludes_null() {
     // count(*) over VALUES counts all rows including NULL
     assert_eq!(q(&mut e, "SELECT count(*)::text FROM (VALUES (1),(NULL),(3)) t(v)"), "3");
 }
+
+/// v7.37 D.27 — an array-returning scalar subquery materialises (was "not yet
+/// materialisable"). PG18.4-verified.
+#[test]
+fn array_scalar_subquery() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(_)=>"ERR".into(),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES (3),(1),(2)) t(v))::text"), "{1,2,3}");
+    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES ('b'),('a'),('c')) t(v))::text"), "{a,b,c}");
+    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v) FROM (VALUES (1),(NULL),(3)) t(v))::text"), "{1,NULL,3}");
+    assert_eq!(q(&mut e, "SELECT array_length((SELECT array_agg(v) FROM (VALUES (1),(2),(3)) t(v)), 1)::text"), "3");
+}

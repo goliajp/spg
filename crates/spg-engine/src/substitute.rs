@@ -32,6 +32,49 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         Value::Float(x) => Literal::Float(x),
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
+        // v7.37 D.27 — an array-returning scalar subquery (`(SELECT
+        // array_agg(...) FROM …)`) materialises through an `Expr::Array` of
+        // element literals so the outer query re-evaluates it to the same array.
+        Value::IntArray(items) => {
+            return Ok(Expr::Array(
+                items
+                    .into_iter()
+                    .map(|o| Expr::Literal(o.map_or(Literal::Null, |n| Literal::Integer(i64::from(n)))))
+                    .collect(),
+            ));
+        }
+        Value::BigIntArray(items) => {
+            return Ok(Expr::Array(
+                items
+                    .into_iter()
+                    .map(|o| Expr::Literal(o.map_or(Literal::Null, Literal::Integer)))
+                    .collect(),
+            ));
+        }
+        Value::SmallIntArray(items) => {
+            return Ok(Expr::Array(
+                items
+                    .into_iter()
+                    .map(|o| Expr::Literal(o.map_or(Literal::Null, |n| Literal::Integer(i64::from(n)))))
+                    .collect(),
+            ));
+        }
+        Value::FloatArray(items) => {
+            return Ok(Expr::Array(
+                items
+                    .into_iter()
+                    .map(|o| Expr::Literal(o.map_or(Literal::Null, Literal::Float)))
+                    .collect(),
+            ));
+        }
+        Value::TextArray(items) => {
+            return Ok(Expr::Array(
+                items
+                    .into_iter()
+                    .map(|o| Expr::Literal(o.map_or(Literal::Null, Literal::String)))
+                    .collect(),
+            ));
+        }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "subquery result type {:?} not yet materialisable; cast to text or integer in the inner SELECT",
