@@ -128,6 +128,41 @@ fn grouping_sets_explicit_list() {
 }
 
 #[test]
+fn grouping_sets_without_aggregate_collapses_empty_set() {
+    // A GROUPING SETS query with NO aggregate in the projection still
+    // collapses the empty set `()` to a single grand-total row.
+    // Previously the `()` peer carried group_by = None, which — absent
+    // an aggregate to force the group path — fell through to a per-row
+    // SELECT and emitted one `(NULL, NULL)` row per input row.
+    // Verified vs live PG18.4: 5 rows for the data below —
+    //   (a,NULL) (b,NULL) [per g1] + (NULL,x) (NULL,y) [per g2] +
+    //   (NULL,NULL) [grand total, ONE row].
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE gs0 (g1 TEXT, g2 TEXT)").unwrap();
+    e.execute("INSERT INTO gs0 VALUES ('a','x'), ('a','y'), ('b','x')")
+        .unwrap();
+    let got = rows(
+        &mut e,
+        "SELECT g1, g2 FROM gs0 GROUP BY GROUPING SETS ((g1), (g2), ())",
+    );
+    assert_eq!(got.len(), 5);
+    // Exactly one all-NULL grand-total row.
+    let totals = got
+        .iter()
+        .filter(|r| cell(&r[0]).is_none() && cell(&r[1]).is_none())
+        .count();
+    assert_eq!(totals, 1);
+
+    // A lone empty grouping set is a single grand-total row too. A
+    // bare column here would be illegal (PG18.4: "must appear in the
+    // GROUP BY clause"), so project a constant — with no aggregate to
+    // force the group path, this is exactly what the fix repairs.
+    let got = rows(&mut e, "SELECT 1 FROM gs0 GROUP BY GROUPING SETS (())");
+    assert_eq!(got.len(), 1);
+    assert_eq!(as_i64(&got[0][0]), 1);
+}
+
+#[test]
 fn grouping_marker_bitmask() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE gm (a TEXT, b TEXT, v INT)").unwrap();
