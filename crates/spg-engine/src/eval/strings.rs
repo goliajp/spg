@@ -705,7 +705,37 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     if has_pct {
         pat = &pat[..pat.len() - 1];
     }
-    let has_sign_tok = pat.chars().any(|c| c == 'S' || c == 's');
+    // v7.37 — trailing sign / literal suffixes (stripped here, applied
+    // post-pass; the sign moves out of the leading column). Mutually
+    // exclusive by construction. `MI` = minus-if-negative, `PL` =
+    // plus-if-positive, `SG` = always-signed, a lone trailing `S` = trailing
+    // sign, `$` = literal currency.
+    let ends_kw = |p: &str, kw: &str| p.len() >= 2 && p[p.len() - 2..].eq_ignore_ascii_case(kw);
+    let has_mi = ends_kw(pat, "MI");
+    if has_mi {
+        pat = &pat[..pat.len() - 2];
+    }
+    let has_pl = !has_mi && ends_kw(pat, "PL");
+    if has_pl {
+        pat = &pat[..pat.len() - 2];
+    }
+    let has_sg = !has_mi && !has_pl && ends_kw(pat, "SG");
+    if has_sg {
+        pat = &pat[..pat.len() - 2];
+    }
+    let has_trailing_s = !has_sg
+        && (pat.ends_with('S') || pat.ends_with('s'))
+        && !pat.ends_with("SS")
+        && !pat.ends_with("ss");
+    if has_trailing_s {
+        pat = &pat[..pat.len() - 1];
+    }
+    let has_dollar = pat.ends_with('$');
+    if has_dollar {
+        pat = &pat[..pat.len() - 1];
+    }
+    let trailing_sign = has_mi || has_pl || has_sg || has_trailing_s;
+    let has_sign_tok = !trailing_sign && pat.chars().any(|c| c == 'S' || c == 's');
 
     // Split around the decimal separator ('.', 'D', or 'd').
     let dec_pos = pat
@@ -723,8 +753,12 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     let frac_digits = frac_pat.chars().filter(|c| is_slot(*c)).count();
     let has_group = int_pat.chars().any(is_group);
     // The field width reserved for the integer side plus one sign
-    // column (PG always keeps a slot for the sign in fixed width).
-    let int_field_width = int_pat.chars().filter(|c| is_slot(*c) || is_group(*c)).count() + 1;
+    // column (PG keeps a slot for the sign in fixed width). MI / SG and a
+    // trailing `S` position the sign at the end, so PG drops the reserved
+    // leading column (`PL` and `$` keep it).
+    let sign_col = usize::from(!(has_mi || has_sg || has_trailing_s));
+    let int_field_width =
+        int_pat.chars().filter(|c| is_slot(*c) || is_group(*c)).count() + sign_col;
     // Right-most integer slot char (units position) and left-most
     // `0` slot position from the right (units = 0).
     let int_slot_chars: alloc::vec::Vec<char> =
@@ -747,8 +781,8 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     let value_is_zero = scaled == 0;
     // A value that rounds to exactly zero carries no sign in PG.
     let neg = n < 0.0 && !value_is_zero;
-    let sign_str: &str = if has_pr {
-        // PR shows the sign via brackets, applied as a post-pass below.
+    let sign_str: &str = if has_pr || trailing_sign {
+        // PR and the trailing sign modes render the sign as a post-pass below.
         ""
     } else if neg {
         "-"
@@ -841,6 +875,19 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
         } else if !fill_mode {
             out.push(' ');
         }
+    }
+    // v7.37 — trailing sign / currency suffixes (see the strip block above).
+    if has_mi {
+        if neg {
+            out.push('-');
+        } else if !fill_mode {
+            out.push(' ');
+        }
+    } else if has_pl || has_sg || has_trailing_s {
+        out.push(if neg { '-' } else { '+' });
+    }
+    if has_dollar {
+        out.push('$');
     }
     // v7.37 — ordinal suffix (`TH`/`th`) based on the integer value, then a
     // trailing `%` literal.
