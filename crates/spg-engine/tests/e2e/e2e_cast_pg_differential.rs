@@ -2247,3 +2247,28 @@ fn numeric_division_scale() {
     let exp = "3.3333333333333333|3.3333333333333333|0.14285714285714285714|25.0000000000000000|15.0000000000000000|-3.3333333333333333|0.00000000000000000000|123.4560000000000000|20.3333333333333333|333333.333333333333";
     assert_eq!(out.join("|"), exp);
 }
+
+/// v7.37 D.32 — EXTRACT accepts PG's plural field spellings. PG18.4-verified.
+#[test]
+fn extract_plural_fields() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    let out = [
+        q(&mut e, "SELECT extract(years from interval '3 years')::text"),
+        q(&mut e, "SELECT extract(months from interval '5 months')::text"),
+        q(&mut e, "SELECT extract(days from interval '7 days')::text"),
+        q(&mut e, "SELECT extract(hours from interval '4 hours')::text"),
+        q(&mut e, "SELECT extract(minutes from interval '30 minutes')::text"),
+        q(&mut e, "SELECT extract(weeks from date '2024-06-15')::text"),
+        q(&mut e, "SELECT extract(decades from date '2024-06-15')::text"),
+        q(&mut e, "SELECT extract(centuries from date '2024-06-15')::text"),
+        q(&mut e, "SELECT extract(millenniums from date '2024-06-15')::text"),
+        q(&mut e, "SELECT extract(day from interval '7 days')::text"),
+        // date_part function form shares the plural aliases
+        q(&mut e, "SELECT date_part('days', interval '7 days')::text"),
+        q(&mut e, "SELECT date_part('months', interval '5 months')::text"),
+    ];
+    assert_eq!(out.join("|"), "3|5|7|4|30|24|202|21|3|7|7|5");
+}

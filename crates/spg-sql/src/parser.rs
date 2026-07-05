@@ -14027,23 +14027,26 @@ impl Parser {
         self.advance();
         let field_name = self.expect_ident_like()?;
         let field = match field_name.to_ascii_lowercase().as_str() {
-            "year" => ExtractField::Year,
-            "month" => ExtractField::Month,
-            "day" => ExtractField::Day,
-            "hour" => ExtractField::Hour,
-            "minute" => ExtractField::Minute,
-            "second" => ExtractField::Second,
+            // PG accepts the plural spellings (years/months/…/millenniums) as
+            // aliases for the singular fields — its datetime unit table has both.
+            // (quarter has no plural; dow/doy/isoyear/epoch/julian likewise.)
+            "year" | "years" => ExtractField::Year,
+            "month" | "months" => ExtractField::Month,
+            "day" | "days" => ExtractField::Day,
+            "hour" | "hours" => ExtractField::Hour,
+            "minute" | "minutes" => ExtractField::Minute,
+            "second" | "seconds" => ExtractField::Second,
             "microsecond" | "microseconds" => ExtractField::Microsecond,
             "epoch" => ExtractField::Epoch,
             "dow" => ExtractField::Dow,
             "isodow" => ExtractField::Isodow,
             "doy" => ExtractField::Doy,
-            "week" => ExtractField::Week,
+            "week" | "weeks" => ExtractField::Week,
             "isoyear" => ExtractField::Isoyear,
             "quarter" => ExtractField::Quarter,
-            "decade" => ExtractField::Decade,
-            "century" => ExtractField::Century,
-            "millennium" => ExtractField::Millennium,
+            "decade" | "decades" => ExtractField::Decade,
+            "century" | "centuries" => ExtractField::Century,
+            "millennium" | "millenniums" | "millennia" => ExtractField::Millennium,
             "julian" => ExtractField::Julian,
             "millisecond" | "milliseconds" => ExtractField::Millisecond,
             "timezone" => ExtractField::Timezone,
