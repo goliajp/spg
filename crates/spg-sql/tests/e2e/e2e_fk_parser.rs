@@ -150,3 +150,60 @@ fn multiple_fks_in_one_table() {
     assert_eq!(fks[1].parent_table, "p2");
     assert_eq!(fks[1].on_delete, FkAction::Cascade);
 }
+
+// read01 A-group U25 — the optional `MATCH {SIMPLE|FULL|PARTIAL}`
+// clause. SPG implements MATCH SIMPLE semantics; that spelling (the
+// default, and the only one pg_dump emits) parses as a no-op, while
+// FULL / PARTIAL are honestly rejected instead of silently applying
+// SIMPLE (PG itself errors on MATCH PARTIAL as "not yet implemented").
+
+#[test]
+fn match_simple_table_level_accepted() {
+    let fks = parse_create_table(
+        "CREATE TABLE c (a INT, b INT, \
+         FOREIGN KEY (a, b) REFERENCES p (a, b) MATCH SIMPLE)",
+    );
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].columns, vec!["a", "b"]);
+    assert_eq!(fks[0].parent_table, "p");
+}
+
+#[test]
+fn match_simple_column_level_accepted() {
+    let fks = parse_create_table("CREATE TABLE c (x INT REFERENCES q(id) MATCH SIMPLE)");
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].parent_table, "q");
+}
+
+#[test]
+fn match_simple_before_on_delete() {
+    // MATCH precedes the ON / DEFERRABLE trailers in PG's grammar.
+    let fks = parse_create_table(
+        "CREATE TABLE c (a INT, b INT, \
+         FOREIGN KEY (a, b) REFERENCES p (a, b) MATCH SIMPLE ON DELETE CASCADE)",
+    );
+    assert_eq!(fks[0].on_delete, FkAction::Cascade);
+}
+
+#[test]
+fn match_full_is_rejected() {
+    let err = parse_statement(
+        "CREATE TABLE c (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p (a, b) MATCH FULL)",
+    )
+    .expect_err("MATCH FULL should be rejected");
+    assert!(
+        format!("{err:?}").contains("MATCH FULL is not yet implemented"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn match_partial_is_rejected() {
+    let err =
+        parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH PARTIAL)")
+            .expect_err("MATCH PARTIAL should be rejected");
+    assert!(
+        format!("{err:?}").contains("MATCH PARTIAL is not yet implemented"),
+        "got {err:?}"
+    );
+}

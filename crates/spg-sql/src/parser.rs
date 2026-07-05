@@ -8736,6 +8736,42 @@ impl Parser {
                 parent_columns.len()
             )));
         }
+        // Optional `MATCH {SIMPLE | FULL | PARTIAL}`. PG's grammar puts
+        // it between the referenced column list and the ON / DEFERRABLE
+        // trailers. SPG implements MATCH SIMPLE semantics (the FK check
+        // is skipped when any referencing column is NULL), so SIMPLE —
+        // the default, and the only spelling pg_dump emits — is accepted
+        // as a no-op. MATCH FULL / MATCH PARTIAL need the per-FK
+        // mixed-NULL rule, which is not wired yet; reject them honestly
+        // rather than silently applying SIMPLE (PG itself errors on
+        // MATCH PARTIAL as "not yet implemented").
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("match")) {
+            self.advance();
+            // `FULL` is a reserved keyword token (FULL OUTER JOIN);
+            // SIMPLE / PARTIAL arrive as bare identifiers.
+            let kind = match self.advance() {
+                Token::Full => "FULL".to_string(),
+                Token::Ident(s) => s.to_uppercase(),
+                other => {
+                    return Err(self.err(format!(
+                        "expected FULL, PARTIAL or SIMPLE after MATCH, got {other:?}"
+                    )));
+                }
+            };
+            match kind.as_str() {
+                "SIMPLE" => {} // Default semantics — nothing to record.
+                "FULL" | "PARTIAL" => {
+                    return Err(self.err(format!(
+                        "MATCH {kind} is not yet implemented (only MATCH SIMPLE is supported)"
+                    )));
+                }
+                _ => {
+                    return Err(self.err(format!(
+                        "expected FULL, PARTIAL or SIMPLE after MATCH, got {kind}"
+                    )));
+                }
+            }
+        }
         // v7.6.7 / v7.17.0 Phase 3.1 — interleave `[NOT] DEFERRABLE
         // [INITIALLY {DEFERRED | IMMEDIATE}]` and `ON DELETE
         // <action>` / `ON UPDATE <action>` in either order. PG /
