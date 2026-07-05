@@ -2947,18 +2947,13 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            let len = match &args[0] {
-                Value::TextArray(items) => items.len(),
-                Value::IntArray(items) => items.len(),
-                Value::BigIntArray(items) => items.len(),
-                _ => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "cardinality() arg must be an array, got {:?}",
-                            args[0].data_type()
-                        ),
-                    });
-                }
+            let Some(len) = array_1d_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "cardinality() arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             let n = i32::try_from(len).unwrap_or(i32::MAX);
             Ok(Value::Int(n))
@@ -3019,18 +3014,13 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let len = match &args[0] {
-                Value::TextArray(items) => items.len(),
-                Value::IntArray(items) => items.len(),
-                Value::BigIntArray(items) => items.len(),
-                _ => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array_length() first arg must be an array, got {:?}",
-                            args[0].data_type()
-                        ),
-                    });
-                }
+            let Some(len) = array_1d_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_length() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             let dim: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
@@ -3070,18 +3060,13 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let len = match &args[0] {
-                Value::TextArray(items) => items.len(),
-                Value::IntArray(items) => items.len(),
-                Value::BigIntArray(items) => items.len(),
-                _ => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "{name}() first arg must be an array, got {:?}",
-                            args[0].data_type()
-                        ),
-                    });
-                }
+            let Some(len) = array_1d_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             let dim: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
@@ -3114,27 +3099,18 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::TextArray(items) => Ok(if items.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Int(1)
-                }),
-                Value::IntArray(items) => Ok(if items.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Int(1)
-                }),
-                Value::BigIntArray(items) => Ok(if items.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Int(1)
-                }),
-                other => Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_ndims() needs array, got {:?}",
-                        other.data_type()
-                    ),
-                }),
+                other => match array_1d_len(other) {
+                    // PG: an empty array has no dimensions → NULL; a 1-D
+                    // array → 1 (SPG only models 1-D arrays).
+                    Some(0) => Ok(Value::Null),
+                    Some(_) => Ok(Value::Int(1)),
+                    None => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_ndims() needs array, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
             }
         }
         "array_dims" => {
@@ -3143,19 +3119,16 @@ fn apply_function_dispatch(
                     detail: format!("array_dims() takes 1 arg, got {}", args.len()),
                 });
             }
-            let len = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                Value::TextArray(items) => items.len(),
-                Value::IntArray(items) => items.len(),
-                Value::BigIntArray(items) => items.len(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array_dims() needs array, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+            if matches!(&args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Some(len) = array_1d_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_dims() needs array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             if len == 0 {
                 Ok(Value::Null)
@@ -13702,6 +13675,35 @@ fn expect_text_arg<'a>(
 /// case-insensitively; AM/PM adjust HH12; every other template
 /// char consumes one input char (separator). Returns
 /// (year, month, day, hour, minute, second, microsecond).
+/// v7.38 (read01 U18) — element count of a 1-D array value, across every
+/// array element type SPG models. Returns `None` for non-array values.
+/// The dimension/length array functions (array_length / array_upper /
+/// array_lower / array_ndims / array_dims) are element-type-agnostic in
+/// PG, so they used to wrongly error on e.g. a `bool[]` / `date[]` /
+/// `numeric[]` argument that only the Text/Int/BigInt arms covered.
+fn array_1d_len(v: &Value) -> Option<usize> {
+    match v {
+        Value::TextArray(items)
+        | Value::VarcharArray(items)
+        | Value::CharArray(items)
+        | Value::JsonArray(items)
+        | Value::JsonbArray(items) => Some(items.len()),
+        Value::IntArray(items) => Some(items.len()),
+        Value::BigIntArray(items) => Some(items.len()),
+        Value::SmallIntArray(items) => Some(items.len()),
+        Value::BoolArray(items) => Some(items.len()),
+        Value::FloatArray(items) => Some(items.len()),
+        Value::NumericArray(items) => Some(items.len()),
+        Value::DateArray(items) => Some(items.len()),
+        Value::TimestampArray(items) | Value::TimestamptzArray(items) => Some(items.len()),
+        Value::MoneyArray(items) => Some(items.len()),
+        Value::IntervalArray(items) => Some(items.len()),
+        Value::UuidArray(items) => Some(items.len()),
+        Value::BytesArray(items) => Some(items.len()),
+        _ => None,
+    }
+}
+
 /// PG `adjust_partial_year_to_2020` (formatting.c): map a partial
 /// (< 4-digit) year field toward the 1970-2069 window. Two-digit years
 /// pivot at 70 ('70' → 1970, '69' → 2069); three-digit years fold via
