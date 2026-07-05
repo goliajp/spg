@@ -15478,6 +15478,39 @@ fn parse_year_month_interval(s: &str) -> Option<(i32, i32, i64)> {
     Some((if neg { -total } else { total }, 0, 0))
 }
 
+/// Parse a clock-time interval token `HH:MM[:SS[.ffffff]]` (optionally signed)
+/// into microseconds. Used for the `3 days 14:30:45` / bare `14:30:45` forms.
+fn parse_interval_clock(tok: &str) -> Option<i64> {
+    let (neg, body) = match tok.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, tok.strip_prefix('+').unwrap_or(tok)),
+    };
+    let mut it = body.split(':');
+    let h: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let s_tok = it.next().unwrap_or("0");
+    if it.next().is_some() {
+        return None;
+    }
+    let sec_us: i64 = if let Some((sec, frac)) = s_tok.split_once('.') {
+        let sec: i64 = sec.parse().ok()?;
+        let mut f = alloc::string::String::from(frac);
+        while f.len() < 6 {
+            f.push('0');
+        }
+        f.truncate(6);
+        let fus: i64 = f.parse().ok()?;
+        sec.checked_mul(1_000_000)?.checked_add(fus)?
+    } else {
+        s_tok.parse::<i64>().ok()?.checked_mul(1_000_000)?
+    };
+    let total = h
+        .checked_mul(3_600_000_000)?
+        .checked_add(m.checked_mul(60_000_000)?)?
+        .checked_add(sec_us)?;
+    Some(if neg { -total } else { total })
+}
+
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     let trimmed = s.trim();
     // ISO 8601 duration (`P1Y2M3DT4H`) and PG's year-month shorthand (`1-2`)
@@ -15490,13 +15523,23 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
             return Some(iv);
         }
     }
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.is_empty() || !parts.len().is_multiple_of(2) {
+    let mut parts: Vec<&str> = s.split_whitespace().collect();
+    // A bare clock-time token `HH:MM[:SS[.ffffff]]` carries the time-of-day
+    // part (PG: `3 days 14:30:45`, or `14:30:45` alone). Extract it; whatever
+    // remains is the `<n> <unit>` pair form handled below.
+    let mut clock_us: i64 = 0;
+    let mut had_clock = false;
+    if let Some(pos) = parts.iter().position(|p| p.contains(':')) {
+        clock_us = parse_interval_clock(parts[pos])?;
+        parts.remove(pos);
+        had_clock = true;
+    }
+    if !parts.len().is_multiple_of(2) || (parts.is_empty() && !had_clock) {
         return None;
     }
     let mut months: i32 = 0;
     let mut days: i32 = 0;
-    let mut micros: i64 = 0;
+    let mut micros: i64 = clock_us;
     let mut i = 0;
     while i < parts.len() {
         let unit = parts[i + 1].to_ascii_lowercase();

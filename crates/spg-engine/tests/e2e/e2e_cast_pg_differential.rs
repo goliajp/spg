@@ -2738,3 +2738,21 @@ fn to_char_num_trailing_sign() {
     }
     assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
 }
+
+/// v7.37 D.62 — INTERVAL literal clock-time notation `HH:MM:SS` + interval to_char. PG18.4-verified.
+#[test]
+fn interval_clock_literal_and_tochar() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    // clock-time interval literals, PG18.4-verified
+    assert_eq!(q(&mut e, "SELECT (INTERVAL '14:30:45')::text"), "14:30:45");
+    assert_eq!(q(&mut e, "SELECT (INTERVAL '3 days 14:30:45')::text"), "3 days 14:30:45");
+    assert_eq!(q(&mut e, "SELECT (INTERVAL '1 day 05:00')::text"), "1 day 05:00:00");
+    assert_eq!(q(&mut e, "SELECT (INTERVAL '14:30:45.123456')::text"), "14:30:45.123456");
+    // no regression on worded form
+    assert_eq!(q(&mut e, "SELECT (INTERVAL '2 days 3 hours')::text"), "2 days 03:00:00");
+    // interval to_char now works end to end (walker was fine; literal blocked it)
+    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'HH24:MI:SS')"), "14:30:45");
+    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'SSSS')"), "52245");
+    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'DD HH24:MI')"), "03 14:30");
+}

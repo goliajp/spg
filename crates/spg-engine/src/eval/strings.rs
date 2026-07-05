@@ -628,6 +628,14 @@ fn to_char_interval(months: i64, days: i64, micros: i128, fmt: &str) -> String {
             (pad(hh12, 2, fm), 2)
         } else if rest.starts_with(b"MI") {
             (pad(mi, 2, fm), 2)
+        } else if rest.starts_with(b"SSSS") {
+            // v7.37 — seconds of the time-of-day part; must precede `SS`.
+            (alloc::format!("{}", hh24 * 3600 + mi * 60 + ss), 4)
+        } else if rest.starts_with(b"FF") && rest.get(2).is_some_and(u8::is_ascii_digit) {
+            // v7.37 — `FF1`..`FF6`: first N digits of the fractional second.
+            let n = usize::from(rest[2] - b'0');
+            let frac = alloc::format!("{us:06}");
+            (frac[..n.min(6)].to_string(), 3)
         } else if rest.starts_with(b"SS") {
             (pad(ss, 2, fm), 2)
         } else if rest.starts_with(b"DD") {
