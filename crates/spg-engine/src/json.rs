@@ -1312,22 +1312,26 @@ pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value<'static>, Eva
 /// the matched values wrapped as a single JSON array.
 pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
     let q = path_query(doc, path)?;
-    match q {
+    let arr = match q {
         Value::TextArray(items) => {
             let mut buf = String::from("[");
             let mut first = true;
             for s in items.into_iter().flatten() {
                 if !first {
-                    buf.push(',');
+                    buf.push_str(", ");
                 }
                 buf.push_str(&s);
                 first = false;
             }
             buf.push(']');
-            Ok(Value::json(buf))
+            Value::json(buf)
         }
-        other => Ok(other),
-    }
+        other => other,
+    };
+    // jsonb_path_query_array yields a jsonb array — emit PG-canonical
+    // text (`[1, 2, 3]`, `, ` after each element) instead of the raw
+    // `,`-joined buffer. Matches jsonb_agg / jsonb_build_array output.
+    Ok(canonicalize_value(arr))
 }
 
 // ─── v7.17.0 Phase 3.P0-28 — JSON builder family ───────────────

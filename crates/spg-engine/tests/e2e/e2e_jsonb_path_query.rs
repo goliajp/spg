@@ -133,7 +133,37 @@ fn path_query_array_returns_wrapped() {
         e.execute(r#"SELECT jsonb_path_query_array('{"items":[10,20,30]}'::JSONB, '$.items[*]')"#)
             .unwrap(),
     );
-    assert_eq!(r[0][0], Value::json("[10,20,30]"));
+    // jsonb output is canonical: `, ` after each element (live PG18.4
+    // renders `[10, 20, 30]`, matching jsonb_agg / jsonb_build_array).
+    assert_eq!(r[0][0], Value::json("[10, 20, 30]"));
+}
+
+#[test]
+fn path_query_array_canonicalizes_output() {
+    let mut e = Engine::new();
+    // Nested objects and number normalization ride the canonical
+    // renderer too (verified vs live PG18.4):
+    //   $.a[*] over [{"x":1},{"x":2}] → [{"x": 1}, {"x": 2}]
+    //   $[*]   over [1.10, 2e2, 3]    → [1.10, 200, 3]
+    //   no match                      → []
+    let case = |e: &mut Engine, doc: &str, path: &str| -> Value<'static> {
+        rows(
+            e.execute(&format!(
+                "SELECT jsonb_path_query_array('{doc}'::JSONB, '{path}')"
+            ))
+            .unwrap(),
+        )[0][0]
+            .clone()
+    };
+    assert_eq!(
+        case(&mut e, r#"{"a":[{"x":1},{"x":2}]}"#, "$.a[*]"),
+        Value::json(r#"[{"x": 1}, {"x": 2}]"#)
+    );
+    assert_eq!(
+        case(&mut e, "[1.10, 2e2, 3]", "$[*]"),
+        Value::json("[1.10, 200, 3]")
+    );
+    assert_eq!(case(&mut e, r#"{"a":1}"#, "$.nope"), Value::json("[]"));
 }
 
 #[test]
