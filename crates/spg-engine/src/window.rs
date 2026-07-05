@@ -748,13 +748,25 @@ fn frame_bounds_for_row(
     // FOLLOWING`): the frame is value-based — row j is in it iff its single
     // ORDER BY key sits within the offset window around row i's key. Handled
     // before the peer-aware Range arm below (which covers UNBOUNDED / CURRENT).
-    let has_offset = matches!(
-        start,
-        FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-    ) || matches!(
-        end,
-        FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
-    );
+    let is_int_offset =
+        |b: &FrameBound| matches!(b, FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_));
+    let is_interval_offset = |b: &FrameBound| {
+        matches!(
+            b,
+            FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. }
+        )
+    };
+    // An INTERVAL offset is only meaningful in a RANGE frame over a
+    // temporal ORDER BY column — PG rejects it for ROWS / GROUPS.
+    if (is_interval_offset(start) || is_interval_offset(end)) && !matches!(kind, FrameKind::Range) {
+        return Err(EngineError::Unsupported(
+            "INTERVAL frame offset is only valid in a RANGE frame".into(),
+        ));
+    }
+    let has_offset = is_int_offset(start)
+        || is_int_offset(end)
+        || is_interval_offset(start)
+        || is_interval_offset(end);
     if has_offset && matches!(kind, FrameKind::Range) {
         return range_offset_bounds(start, end, i, slice);
     }
@@ -783,6 +795,10 @@ fn frame_bounds_for_row(
                     FrameBound::CurrentRow => i_s,
                     FrameBound::OffsetFollowing(k) => i_s + (*k as i64),
                     FrameBound::UnboundedFollowing => last_s,
+                    // INTERVAL offsets are rejected for ROWS above.
+                    FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. } => {
+                        unreachable!("INTERVAL offset rejected for ROWS frames")
+                    }
                 }
             };
             let lo_s = bound(start);
@@ -864,6 +880,18 @@ fn range_offset_bounds(
     i: usize,
     slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
 ) -> Result<(usize, usize), EngineError> {
+    // An INTERVAL offset drives the temporal path (DATE / TIMESTAMP
+    // ORDER BY key); the numeric-f64 path below handles integer /
+    // numeric offsets.
+    if matches!(
+        start,
+        FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. }
+    ) || matches!(
+        end,
+        FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. }
+    ) {
+        return range_offset_bounds_interval(start, end, i, slice);
+    }
     let unsupported = || {
         EngineError::Unsupported(
             "RANGE offset frame requires a single numeric ORDER BY column".into(),
@@ -879,6 +907,9 @@ fn range_offset_bounds(
             FrameBound::OffsetFollowing(k) => Some(if asc { v + *k as f64 } else { v - *k as f64 }),
             FrameBound::CurrentRow => Some(v),
             FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => None,
+            FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. } => {
+                unreachable!("interval offsets routed to range_offset_bounds_interval")
+            }
         }
     };
     // Window in value space [lo_val, hi_val] (inclusive). Under ASC the start
@@ -896,6 +927,95 @@ fn range_offset_bounds(
         let (x, _) = range_order_key_f64(&row.1).ok_or_else(unsupported)?;
         let ge_lo = lo_val.is_none_or(|lv| x >= lv - 1e-9);
         let le_hi = hi_val.is_none_or(|hv| x <= hv + 1e-9);
+        if ge_lo && le_hi {
+            if !found {
+                lo = j;
+                found = true;
+            }
+            hi = j;
+        }
+    }
+    if !found {
+        return Ok((1, 0)); // empty frame
+    }
+    Ok((lo, hi))
+}
+
+/// A single DATE / TIMESTAMP ORDER BY key as microseconds-since-epoch,
+/// for INTERVAL RANGE-offset arithmetic. `None` unless there is exactly
+/// one order column and it is temporal.
+fn range_order_key_micros(key: &[(Value, bool, Option<bool>)]) -> Option<(i64, bool)> {
+    if key.len() != 1 {
+        return None;
+    }
+    let (v, desc, _) = &key[0];
+    let micros = match v {
+        Value::Date(d) => i64::from(*d) * 86_400_000_000,
+        Value::Timestamp(t) => *t,
+        _ => return None,
+    };
+    Some((micros, !*desc))
+}
+
+/// `RANGE BETWEEN <interval> PRECEDING/FOLLOWING` over a DATE / TIMESTAMP
+/// ORDER BY column — PG time-series windows. Row `j` is in the frame iff
+/// its temporal key lies within the calendar-aware interval window around
+/// row `i`'s key. The boundary is computed by applying the interval to
+/// row `i`'s own instant (so month offsets get PG's clamp-to-last-day),
+/// then compared against every other row's instant.
+#[allow(clippy::type_complexity)]
+fn range_offset_bounds_interval(
+    start: &FrameBound,
+    end: &FrameBound,
+    i: usize,
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
+) -> Result<(usize, usize), EngineError> {
+    let unsupported = || {
+        EngineError::Unsupported(
+            "RANGE INTERVAL offset frame requires a single DATE/TIMESTAMP ORDER BY column".into(),
+        )
+    };
+    let (v, asc) = range_order_key_micros(&slice[i].1).ok_or_else(unsupported)?;
+    // The instant a bound resolves to. PRECEDING is "earlier in the
+    // order" — subtract the interval under ASC, add it under DESC;
+    // FOLLOWING mirrors. Interval subtraction negates all components,
+    // matching PG's `timestamp - interval`.
+    let bound_value = |b: &FrameBound| -> Result<Option<i64>, EngineError> {
+        let (mo, da, mi, subtract) = match b {
+            FrameBound::IntervalPreceding {
+                months,
+                days,
+                micros,
+            } => (*months, *days, *micros, asc),
+            FrameBound::IntervalFollowing {
+                months,
+                days,
+                micros,
+            } => (*months, *days, *micros, !asc),
+            FrameBound::CurrentRow => return Ok(Some(v)),
+            FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => return Ok(None),
+            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_) => {
+                return Err(unsupported());
+            }
+        };
+        let sign = if subtract { -1 } else { 1 };
+        let boundary =
+            eval::add_interval_to_micros(v, sign * i64::from(mo), sign * i64::from(da), sign * mi)
+                .map_err(EngineError::Eval)?;
+        Ok(Some(boundary))
+    };
+    let (lo_val, hi_val) = if asc {
+        (bound_value(start)?, bound_value(end)?)
+    } else {
+        (bound_value(end)?, bound_value(start)?)
+    };
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    let mut found = false;
+    for (j, row) in slice.iter().enumerate() {
+        let (x, _) = range_order_key_micros(&row.1).ok_or_else(unsupported)?;
+        let ge_lo = lo_val.is_none_or(|lv| x >= lv);
+        let le_hi = hi_val.is_none_or(|hv| x <= hv);
         if ge_lo && le_hi {
             if !found {
                 lo = j;
@@ -969,6 +1089,8 @@ fn groups_offset_bounds(
         }
         Some(e)
     };
+    // INTERVAL offsets are rejected for GROUPS frames upstream.
+    let interval_unreachable = || unreachable!("INTERVAL offset rejected for GROUPS frames");
     let lo = match start {
         FrameBound::UnboundedPreceding => 0,
         FrameBound::CurrentRow => peer_group_start(slice, i),
@@ -978,6 +1100,9 @@ fn groups_offset_bounds(
             None => return Ok((1, 0)),
         },
         FrameBound::UnboundedFollowing => last,
+        FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. } => {
+            interval_unreachable()
+        }
     };
     let hi = match end {
         FrameBound::UnboundedFollowing => last,
@@ -988,6 +1113,9 @@ fn groups_offset_bounds(
             None => return Ok((1, 0)),
         },
         FrameBound::UnboundedPreceding => 0,
+        FrameBound::IntervalPreceding { .. } | FrameBound::IntervalFollowing { .. } => {
+            interval_unreachable()
+        }
     };
     if lo > hi {
         return Ok((1, 0));

@@ -155,6 +155,65 @@ fn frames() {
     ck(&mut e, "max(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)", "20|20|20|30|40|50|50");
 }
 
+/// `RANGE BETWEEN <interval> PRECEDING/FOLLOWING` — value-based frame over a
+/// DATE / TIMESTAMP ORDER BY column (PG time-series window). All values are
+/// live-PG18.4-verified; the outer query orders deterministically so the
+/// per-row window results line up.
+#[test]
+fn range_interval_offset_frame() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE wf(d date, ts timestamp, v int)").unwrap();
+    for row in [
+        "('2020-01-01','2020-01-01 10:00',1)",
+        "('2020-01-02','2020-01-01 11:00',2)",
+        "('2020-01-02','2020-01-01 12:30',3)",
+        "('2020-01-05','2020-01-01 13:00',4)",
+    ] {
+        e.execute(&format!("INSERT INTO wf VALUES {row}")).unwrap();
+    }
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => rows
+                .iter()
+                .map(|r| render(&r.values[r.values.len() - 1]))
+                .collect::<Vec<_>>()
+                .join("|"),
+            Ok(o) => format!("<NONROWS:{o:?}>"),
+            Err(er) => format!("<ERR:{er:?}>"),
+        }
+    };
+    // DATE key, 1-day PRECEDING window (peers within a day collapse).
+    assert_eq!(
+        q(&mut e, "SELECT count(*) OVER (ORDER BY d RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf ORDER BY d, v"),
+        "1|3|3|1"
+    );
+    // TIMESTAMP key, 2-hour PRECEDING sliding sum.
+    assert_eq!(
+        q(&mut e, "SELECT sum(v) OVER (ORDER BY ts RANGE BETWEEN interval '2 hours' PRECEDING AND CURRENT ROW) FROM wf ORDER BY ts"),
+        "1|3|5|9"
+    );
+    // Calendar-aware 1-month FOLLOWING window.
+    assert_eq!(
+        q(&mut e, "SELECT count(*) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND '1 month'::interval FOLLOWING) FROM wf ORDER BY d, v"),
+        "4|3|3|1"
+    );
+    // DESC ordering flips the offset direction; results emitted in d,v order.
+    assert_eq!(
+        q(&mut e, "SELECT count(*) OVER (ORDER BY d DESC RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf ORDER BY d, v"),
+        "3|2|2|1"
+    );
+    // Honest errors: an INTERVAL offset is RANGE-only, and RANGE INTERVAL
+    // needs a temporal ORDER BY key.
+    assert!(matches!(
+        e.execute("SELECT count(*) OVER (ORDER BY v ROWS BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf"),
+        Err(_)
+    ));
+    assert!(matches!(
+        e.execute("SELECT count(*) OVER (ORDER BY v RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf"),
+        Err(_)
+    ));
+}
+
 #[test]
 fn aggregates_as_window() {
     let mut e = seed();
