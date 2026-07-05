@@ -26,7 +26,7 @@ fn concat_objects_right_wins() {
             &mut e,
             r#"SELECT jsonb_concat('{"a": 1, "b": 2}', '{"b": 3, "c": 4}')"#
         )),
-        r#"{"a":1,"b":3,"c":4}"#
+        r#"{"a": 1, "b": 3, "c": 4}"#
     );
 }
 
@@ -35,17 +35,17 @@ fn concat_arrays_appends() {
     let mut e = Engine::new();
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_concat('[1, 2]', '[3, 4]')")),
-        "[1,2,3,4]"
+        "[1, 2, 3, 4]"
     );
     // Array + scalar appends.
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_concat('[1, 2]', '3')")),
-        "[1,2,3]"
+        "[1, 2, 3]"
     );
     // Scalar + scalar makes a 2-array.
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_concat('1', '2')")),
-        "[1,2]"
+        "[1, 2]"
     );
 }
 
@@ -57,7 +57,7 @@ fn delete_object_key() {
             &mut e,
             r#"SELECT jsonb_delete('{"a": 1, "b": 2}', 'a')"#
         )),
-        r#"{"b":2}"#
+        r#"{"b": 2}"#
     );
     // Missing key: unchanged.
     assert_eq!(
@@ -65,7 +65,7 @@ fn delete_object_key() {
             &mut e,
             r#"SELECT jsonb_delete('{"a": 1}', 'zzz')"#
         )),
-        r#"{"a":1}"#
+        r#"{"a": 1}"#
     );
 }
 
@@ -74,12 +74,12 @@ fn delete_array_index() {
     let mut e = Engine::new();
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_delete('[10, 20, 30]', 1)")),
-        "[10,30]"
+        "[10, 30]"
     );
     // Negative index counts from the end.
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_delete('[10, 20, 30]', -1)")),
-        "[10,20]"
+        "[10, 20]"
     );
 }
 
@@ -91,7 +91,7 @@ fn concat_delete_null_passthrough() {
         spg_storage::Value::Null
     ));
     assert!(matches!(
-        first(&mut e, r#"SELECT jsonb_delete('{"a":1}', NULL::text)"#),
+        first(&mut e, r#"SELECT jsonb_delete('{"a": 1}', NULL::text)"#),
         spg_storage::Value::Null
     ));
 }
