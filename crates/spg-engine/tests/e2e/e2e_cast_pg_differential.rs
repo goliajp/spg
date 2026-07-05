@@ -2443,3 +2443,27 @@ fn range_partition_nontimestamp_key() {
     e.execute("INSERT INTO mb VALUES (1, 500000000000)").unwrap();
     assert_eq!(g(&mut e, "SELECT string_agg(id||':'||k,',' ORDER BY id) FROM mb_a"), "1:500000000000");
 }
+
+/// v7.37 D.46 — DELETE on a partition parent fans out to children (RANGE + LIST).
+/// PG18.4-verified.
+#[test]
+fn delete_on_partition_parent() {
+    let mut e = Engine::new();
+    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
+    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)").unwrap();
+    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)").unwrap();
+    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)").unwrap();
+    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12)").unwrap();
+    // DELETE on the parent removes matching rows from every child.
+    let del = e.execute("DELETE FROM mi WHERE g < 10").unwrap();
+    assert!(matches!(del, QueryResult::CommandOk { affected: 2, .. }), "{del:?}");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi"), "2:15,4:12");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"), "");
+    // LIST parent DELETE fans out across the value + DEFAULT partitions.
+    e.execute("CREATE TABLE l(id int, c text) PARTITION BY LIST (c)").unwrap();
+    e.execute("CREATE TABLE l_a PARTITION OF l FOR VALUES IN ('a','b')").unwrap();
+    e.execute("CREATE TABLE l_def PARTITION OF l DEFAULT").unwrap();
+    e.execute("INSERT INTO l VALUES (1,'a'),(2,'z'),(3,'b'),(4,'y')").unwrap();
+    e.execute("DELETE FROM l WHERE c IN ('a','z')").unwrap();
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||c,',' ORDER BY id) FROM l"), "3:b,4:y");
+}

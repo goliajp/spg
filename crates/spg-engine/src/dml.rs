@@ -897,6 +897,37 @@ impl Engine {
             rewritten.table = base;
             return self.exec_delete_cancel(&rewritten, cancel);
         }
+        // v7.37 D.46 — DELETE on a partition parent fans out to every child;
+        // the parent table holds no rows of its own, so a parent-targeted DELETE
+        // would otherwise silently affect nothing. Each child DELETE re-evaluates
+        // the same WHERE against that child's rows (and recurses for sub-partitions,
+        // since a child is not itself a parent unless further partitioned).
+        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
+            let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            let mut total_affected = 0usize;
+            let mut ret_columns: Option<Vec<ColumnSchema>> = None;
+            let mut ret_rows: Vec<Row<'static>> = Vec::new();
+            for child in children {
+                let mut child_stmt = stmt.clone();
+                child_stmt.table = child;
+                match self.exec_delete_cancel(&child_stmt, cancel)? {
+                    QueryResult::CommandOk { affected, .. } => total_affected += affected,
+                    QueryResult::Rows { columns, rows } => {
+                        total_affected += rows.len();
+                        ret_columns = Some(columns);
+                        ret_rows.extend(rows);
+                    }
+                }
+            }
+            return Ok(match ret_columns {
+                // DELETE … RETURNING: merge every child's returned rows.
+                Some(columns) => QueryResult::Rows { columns, rows: ret_rows },
+                None => QueryResult::CommandOk {
+                    affected: total_affected,
+                    modified_catalog: true,
+                },
+            });
+        }
         // v7.12.5 — snapshot BEFORE/AFTER DELETE row triggers + the
         // session FTS config before the mut borrow (same shape as
         // INSERT / UPDATE).
