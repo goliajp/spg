@@ -447,6 +447,12 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 #[derive(Clone, PartialEq)]
 pub(crate) enum OrderKey {
     Num(f64),
+    /// v7.38 (read01 U31) — EXACT integer key for the integer-valued types
+    /// (SmallInt/Int/BigInt/Date/Year/Timestamp/Time/TimeTz/Money). An f64
+    /// projection silently collapses adjacent BigInt/Timestamp/Time/Money
+    /// values past 2^53 (`9007199254740993` == `9007199254740992` as f64),
+    /// giving a wrong ORDER BY. i128 holds every such value exactly.
+    Int(i128),
     Text(alloc::string::String),
     /// v7.37 — byte-orderable key for types PG sorts byte-wise but that
     /// have no meaningful f64 projection: bytea, uuid, macaddr(8), inet/cidr
@@ -466,8 +472,35 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a, b) {
         (OrderKey::Num(x), OrderKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // Exact same-type integer comparison — the load-bearing path that
+        // U31 fixes (no f64 rounding).
+        (OrderKey::Int(x), OrderKey::Int(y)) => x.cmp(y),
         (OrderKey::Text(x), OrderKey::Text(y)) => x.cmp(y),
         (OrderKey::Bytes(x), OrderKey::Bytes(y)) => x.cmp(y),
+        // Int vs Num: the only Num a value-typed Int meets is the ±INF NULL
+        // sentinel (rides to the far ends) or, in a genuinely heterogeneous
+        // ORDER BY expression, a finite float — compared via f64 widening
+        // (lossy only in that rare cross-type case, never same-type).
+        #[allow(clippy::cast_precision_loss)]
+        (OrderKey::Int(x), OrderKey::Num(y)) => {
+            if *y == f64::INFINITY {
+                Ordering::Less
+            } else if *y == f64::NEG_INFINITY {
+                Ordering::Greater
+            } else {
+                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        (OrderKey::Num(x), OrderKey::Int(y)) => {
+            if *x == f64::INFINITY {
+                Ordering::Greater
+            } else if *x == f64::NEG_INFINITY {
+                Ordering::Less
+            } else {
+                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+            }
+        }
         (OrderKey::Num(x), OrderKey::Text(_) | OrderKey::Bytes(_)) => {
             // Finite Num sorts before Text/Bytes; the ±INF NULL sentinels ride
             // to the far ends (`+INF` last, `-INF` first).
@@ -484,6 +517,9 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
                 Ordering::Greater
             }
         }
+        // A finite Int sorts before Text/Bytes, same as a finite Num.
+        (OrderKey::Int(_), OrderKey::Text(_) | OrderKey::Bytes(_)) => Ordering::Less,
+        (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Int(_)) => Ordering::Greater,
         // Text sorts before Bytes in the rare heterogeneous case.
         (OrderKey::Text(_), OrderKey::Bytes(_)) => Ordering::Less,
         (OrderKey::Bytes(_), OrderKey::Text(_)) => Ordering::Greater,

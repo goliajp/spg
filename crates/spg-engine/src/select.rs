@@ -4430,30 +4430,32 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         }
         _ => {}
     }
+    // v7.38 (read01 U31) — the integer-valued types carry an EXACT i128 key.
+    // Projecting these to f64 (the historic path) silently collapses BigInt /
+    // Timestamp / Time / TimeTz / Money values past 2^53, so `ORDER BY` gave
+    // the wrong order for large ids and microsecond timestamps.
+    match v {
+        Value::SmallInt(n) => return Ok(OrderKey::Int(i128::from(*n))),
+        Value::Int(n) => return Ok(OrderKey::Int(i128::from(*n))),
+        Value::BigInt(n) => return Ok(OrderKey::Int(i128::from(*n))),
+        // PG TIME/TIMESTAMP/DATE/MONEY/YEAR are ordered by their underlying
+        // integer (days / micros / cents / calendar year); TIMETZ by the
+        // UTC-equivalent micros (local wall - offset) so the same physical
+        // instant in different zones sorts equal.
+        Value::Date(d) => return Ok(OrderKey::Int(i128::from(*d))),
+        Value::Timestamp(t) => return Ok(OrderKey::Int(i128::from(*t))),
+        Value::Time(us) => return Ok(OrderKey::Int(i128::from(*us))),
+        Value::Year(y) => return Ok(OrderKey::Int(i128::from(*y))),
+        Value::TimeTz { us, offset_secs } => {
+            return Ok(OrderKey::Int(
+                i128::from(*us) - i128::from(*offset_secs) * 1_000_000,
+            ));
+        }
+        Value::Money(c) => return Ok(OrderKey::Int(i128::from(*c))),
+        _ => {}
+    }
     let num = match v {
         Value::Null => f64::INFINITY,
-        Value::SmallInt(n) => f64::from(*n),
-        Value::Int(n) => f64::from(*n),
-        Value::Date(d) => f64::from(*d),
-        #[allow(clippy::cast_precision_loss)]
-        Value::Timestamp(t) => *t as f64,
-        // v7.17.0 Phase 3.P0-32 — PG TIME ordered by underlying
-        // i64 microseconds (matches wall-clock ordering).
-        #[allow(clippy::cast_precision_loss)]
-        Value::Time(us) => *us as f64,
-        // v7.17.0 Phase 3.P0-33 — MySQL YEAR ordered by underlying
-        // u16 (matches calendar ordering; zero-year sentinel
-        // sorts before 1901).
-        Value::Year(y) => f64::from(*y),
-        // v7.17.0 Phase 3.P0-34 — PG TIMETZ ordered by the
-        // UTC-equivalent microseconds (local wall - offset). Two
-        // values for the same physical instant in different zones
-        // sort equal — matches PG TIMETZ index behaviour.
-        #[allow(clippy::cast_precision_loss)]
-        Value::TimeTz { us, offset_secs } => (us - i64::from(*offset_secs) * 1_000_000) as f64,
-        // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
-        #[allow(clippy::cast_precision_loss)]
-        Value::Money(c) => *c as f64,
         // v7.17.0 Phase 3.P0-38 — range ordering is not supported
         // in v7.17.0 (needs lex-then-inclusivity tiebreak).
         Value::Range { .. } => {
@@ -4486,8 +4488,6 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             }
             (*scaled as f64) / divisor
         }
-        #[allow(clippy::cast_precision_loss)]
-        Value::BigInt(n) => *n as f64,
         Value::Float(x) => *x,
         Value::Bool(b) => {
             if *b {
