@@ -4992,18 +4992,84 @@ impl Parser {
                 offset: None,
                 limit_with_ties: false,
             };
+            // v7.37 D.30 — replace each FROM-qualified column *leaf* in the
+            // assignment RHS with a correlated scalar subquery, instead of
+            // wrapping the whole RHS. Wrapping the whole expr moved a target-
+            // column reference (`SET v = v + u.bonus`, where `v` is the target
+            // table's column) inside a subquery whose FROM only has the source
+            // table, so the unqualified `v` resolved against the source and
+            // errored ColumnNotFound. Leaving target columns in the outer UPDATE
+            // context — where they belong — fixes it; only the source columns
+            // (`u.bonus`) become subqueries. A whole-expr fallback covers
+            // compound variants the leaf-walk doesn't decompose.
+            fn wrap_from_leaves(
+                e: &mut Expr,
+                names: &[String],
+                make: &dyn Fn(Expr) -> Expr,
+                refs: &dyn Fn(&Expr) -> bool,
+            ) {
+                if let Expr::Column(c) = e {
+                    if c
+                        .qualifier
+                        .as_deref()
+                        .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q)))
+                    {
+                        let taken = core::mem::replace(e, Expr::Literal(Literal::Null));
+                        *e = make(taken);
+                    }
+                    return;
+                }
+                match e {
+                    Expr::Binary { lhs, rhs, .. } => {
+                        wrap_from_leaves(lhs, names, make, refs);
+                        wrap_from_leaves(rhs, names, make, refs);
+                    }
+                    Expr::Unary { expr, .. }
+                    | Expr::Cast { expr, .. }
+                    | Expr::IsNull { expr, .. } => wrap_from_leaves(expr, names, make, refs),
+                    Expr::FunctionCall { args, .. } => {
+                        for a in args.iter_mut() {
+                            wrap_from_leaves(a, names, make, refs);
+                        }
+                    }
+                    Expr::Case {
+                        operand,
+                        branches,
+                        else_branch,
+                    } => {
+                        if let Some(o) = operand.as_deref_mut() {
+                            wrap_from_leaves(o, names, make, refs);
+                        }
+                        for (w, t) in branches.iter_mut() {
+                            wrap_from_leaves(w, names, make, refs);
+                            wrap_from_leaves(t, names, make, refs);
+                        }
+                        if let Some(el) = else_branch.as_deref_mut() {
+                            wrap_from_leaves(el, names, make, refs);
+                        }
+                    }
+                    // Compound variants the walk doesn't decompose: keep the
+                    // pre-D.30 behavior — wrap the whole sub-expr if it touches
+                    // a source table, so nothing regresses.
+                    other => {
+                        if refs(other) {
+                            let taken = core::mem::replace(other, Expr::Literal(Literal::Null));
+                            *other = make(taken);
+                        }
+                    }
+                }
+            }
+            let make_subq = |inner: Expr| {
+                Expr::ScalarSubquery(Box::new(sub_select(alloc::vec![SelectItem::Expr {
+                    expr: inner,
+                    alias: None,
+                }])))
+            };
             let assignments = assignments
                 .into_iter()
-                .map(|(col, expr)| {
-                    if refs_list(&expr) {
-                        let sub = sub_select(alloc::vec![SelectItem::Expr {
-                            expr,
-                            alias: None,
-                        }]);
-                        (col, Expr::ScalarSubquery(Box::new(sub)))
-                    } else {
-                        (col, expr)
-                    }
+                .map(|(col, mut expr)| {
+                    wrap_from_leaves(&mut expr, &names, &make_subq, &refs_list);
+                    (col, expr)
                 })
                 .collect();
             let exists = Expr::Exists {

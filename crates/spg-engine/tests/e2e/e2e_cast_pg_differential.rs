@@ -2197,3 +2197,29 @@ fn view_in_scalar_subquery() {
     assert_eq!(q(&mut e, "SELECT (EXISTS (SELECT 1 FROM vw WHERE d > 25))::text"), "true");
     assert_eq!(q(&mut e, "SELECT string_agg(g::text,',' ORDER BY g) FROM vw WHERE d IN (SELECT d FROM vw WHERE g > 1)"), "2,3");
 }
+
+/// v7.37 D.30 — UPDATE ... FROM with a target-column reference in the SET RHS
+/// (`SET v = v + u.bonus`) now resolves the target column instead of erroring.
+/// PG18.4-verified.
+#[test]
+fn update_from_target_col_in_set() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    e.execute("CREATE TABLE t(id int primary key, v int, note text)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b')").unwrap();
+    e.execute("CREATE TABLE u(id int, bonus int)").unwrap();
+    e.execute("INSERT INTO u VALUES (1,5),(2,7)").unwrap();
+    e.execute("UPDATE t SET v = v + u.bonus FROM u WHERE u.id = t.id").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:15,2:27");
+    e.execute("UPDATE t SET v = v * 2, note = note || u.bonus::text FROM u WHERE u.id = t.id").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v||':'||note, ',' ORDER BY id) FROM t"), "1:30:a5,2:54:b7");
+    e.execute("UPDATE t SET v = CASE WHEN u.bonus > 6 THEN v + 100 ELSE v END FROM u WHERE u.id = t.id").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:30,2:154");
+    e.execute("UPDATE t SET v = GREATEST(v, u.bonus) FROM u WHERE u.id = t.id").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:30,2:154");
+    // whole-RHS-is-source-col still works (regression)
+    e.execute("UPDATE t SET v = u.bonus FROM u WHERE u.id = t.id").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:5,2:7");
+}
