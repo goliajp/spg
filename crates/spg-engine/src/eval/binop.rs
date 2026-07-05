@@ -1029,6 +1029,15 @@ fn apply_binary_numeric(
             }),
         };
     }
+    // v7.37 D.34 — `numeric || anything` / `anything || numeric` is text
+    // concatenation (PG has no `||` operator on numeric); handle it before
+    // numeric_or_widen, which rejects a non-numeric operand. Previously
+    // `'x' || 1.5::numeric` errored "NUMERIC op against non-numeric Text"
+    // because the numeric fast-path claimed the expression but couldn't widen
+    // the text side. (The float path already special-cases Concat this way.)
+    if matches!(op, BinOp::Concat) {
+        return Ok(text_concat(&l, &r));
+    }
     // Promote integer ↔ numeric to a shared scale (max of both sides).
     let (a, sa) = numeric_or_widen(&l).ok_or_else(|| EvalError::TypeMismatch {
         detail: format!("NUMERIC op against non-numeric {:?}", l.data_type()),
