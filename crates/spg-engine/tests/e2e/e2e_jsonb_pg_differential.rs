@@ -147,11 +147,15 @@ fn jsonb_equality_operator() {
     // cast, so `{"a":1,"a":2}` canonicalises to `{"a":2}` and the
     // equality matches PG 18.4 (t).
     check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb = '{\"a\":2}'::jsonb", "t");
-    // REMAINING DIVERGENCE (number equality): PG compares jsonb numbers
-    // numerically so `'1' = '1.0'` is PG-TRUE. Canonicalisation renders
-    // them as `1` / `1.0`, but json::equals still compares the lexeme
-    // textually -> false. Numeric-aware equality is a separate follow-up.
-    check(&mut e, "SELECT '1'::jsonb = '1.0'::jsonb", "f"); // PG: t
+    // jsonb numbers compare by value now (PG 18.4): 1 == 1.0 == 1e0,
+    // 1.50 == 1.5, 1e3 == 1000.00; a real difference still false.
+    check(&mut e, "SELECT '1'::jsonb = '1.0'::jsonb", "t");
+    check(&mut e, "SELECT '1.50'::jsonb = '1.5'::jsonb", "t");
+    check(&mut e, "SELECT '1e3'::jsonb = '1000.00'::jsonb", "t");
+    check(&mut e, "SELECT '{\"a\":1}'::jsonb = '{\"a\":1.0}'::jsonb", "t");
+    check(&mut e, "SELECT '1.5'::jsonb = '1.6'::jsonb", "f");
+    // Containment routes through the same value comparison.
+    check(&mut e, "SELECT '[1,2]'::jsonb @> '[1.0]'::jsonb", "t");
     // NOTE (ordering deferred): PG defines a total order on jsonb so
     // `'1'::jsonb < '2'::jsonb` is PG-TRUE, but SPG's compare wires
     // only = / <> for jsonb; the ordering operators stay a type error.
