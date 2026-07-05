@@ -1974,3 +1974,28 @@ fn srf_in_projection() {
     // UNION of two projection-SRFs (the D.22 trigger)
     assert_eq!(q(&mut e, "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v UNION SELECT unnest(ARRAY[3,1])) z"), "1,3,5");
 }
+
+/// v7.37 D.23 — window functions compose with GROUP BY aggregation: the
+/// aggregate runs first, then window functions over the grouped rows.
+/// PG18.4-verified.
+#[test]
+fn window_over_aggregate() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // rank() OVER (ORDER BY sum(v)) — window ORDER BY an aggregate
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||s||':'||rk, ',' ORDER BY g) FROM (SELECT g, sum(v) s, rank() OVER (ORDER BY sum(v) DESC) rk FROM (VALUES (1,10),(1,20),(2,5)) t(g,v) GROUP BY g) z"), "1:30:1,2:5:2");
+    // plain aggregate + row_number window coexisting
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||rn, ',' ORDER BY g) FROM (SELECT g, sum(v), row_number() OVER (ORDER BY g) rn FROM (VALUES (1,10),(2,5),(3,7)) t(g,v) GROUP BY g) z"), "1:1,2:2,3:3");
+    // window AGGREGATE over a plain aggregate (sum(count(*)) OVER ())
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||c||':'||tot, ',' ORDER BY g) FROM (SELECT g, count(*) c, sum(count(*)) OVER () tot FROM (VALUES (1,1),(1,1),(2,1)) t(g,v) GROUP BY g) z"), "1:2:3,2:1:3");
+    // real table too
+    e.execute("CREATE TABLE wtab(g INT, v INT)").unwrap();
+    e.execute("INSERT INTO wtab VALUES (1,10),(1,20),(2,5)").unwrap();
+    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||rk, ',' ORDER BY g) FROM (SELECT g, rank() OVER (ORDER BY sum(v) DESC) rk FROM wtab GROUP BY g) z"), "1:1,2:2");
+}
