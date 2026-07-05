@@ -1004,13 +1004,39 @@ pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
     let mut out = alloc::string::String::new();
     out.push(if *lower_inc { '[' } else { '(' });
     if let Some(l) = lower {
-        out.push_str(&format_range_element(l));
+        out.push_str(&quote_range_bound(&format_range_element(l)));
     }
     out.push(',');
     if let Some(u) = upper {
-        out.push_str(&format_range_element(u));
+        out.push_str(&quote_range_bound(&format_range_element(u)));
     }
     out.push(if *upper_inc { ']' } else { ')' });
+    out
+}
+
+/// PG's `range_out` double-quotes a bound whose text is empty or
+/// contains a range-syntax metacharacter (`"` `\` `(` `)` `[` `]` `,`)
+/// or whitespace — so a timestamp bound `2020-01-01 10:00:00` prints
+/// as `"2020-01-01 10:00:00"` inside the range. `"` and `\` are
+/// backslash-escaped within the quotes. Numeric / date bounds (no
+/// spaces) pass through unquoted, matching PG.
+fn quote_range_bound(s: &str) -> alloc::string::String {
+    let needs_quote = s.is_empty()
+        || s.chars().any(|c| {
+            matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || c.is_whitespace()
+        });
+    if !needs_quote {
+        return s.into();
+    }
+    let mut out = alloc::string::String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
     out
 }
 
@@ -1513,11 +1539,11 @@ pub fn format_multirange(ranges: &[spg_storage::RangeSpan]) -> alloc::string::St
         }
         out.push(if r.lower_inc { '[' } else { '(' });
         if let Some(l) = &r.lower {
-            out.push_str(&format_range_element(l));
+            out.push_str(&quote_range_bound(&format_range_element(l)));
         }
         out.push(',');
         if let Some(u) = &r.upper {
-            out.push_str(&format_range_element(u));
+            out.push_str(&quote_range_bound(&format_range_element(u)));
         }
         out.push(if r.upper_inc { ']' } else { ')' });
     }

@@ -284,3 +284,31 @@ fn range_display_round_trips_canonical_text() {
         _ => panic!(),
     }
 }
+
+#[test]
+fn timestamp_range_bounds_are_quoted() {
+    // PG's range_out double-quotes a bound containing whitespace, so a
+    // tsrange prints its timestamp bounds in quotes (verified vs live
+    // PG18.4). A multirange quotes each member's bounds the same way.
+    // Space-free bounds (numrange / int4range) stay unquoted.
+    let mut eng = Engine::new();
+    let got = select(
+        &mut eng,
+        "SELECT tsrange('2020-01-01 10:00','2020-02-01 12:00')::text",
+    );
+    assert_eq!(
+        got[0][0],
+        Value::text("[\"2020-01-01 10:00:00\",\"2020-02-01 12:00:00\")")
+    );
+    let got = select(
+        &mut eng,
+        "SELECT tsmultirange(tsrange('2020-01-01 10:00','2020-02-01 12:00'))::text",
+    );
+    assert_eq!(
+        got[0][0],
+        Value::text("{[\"2020-01-01 10:00:00\",\"2020-02-01 12:00:00\")}")
+    );
+    // Control: numeric bounds have no whitespace → no quoting.
+    let got = select(&mut eng, "SELECT numrange(1.5, 3.5)::text");
+    assert_eq!(got[0][0], Value::text("[1.5,3.5)"));
+}
