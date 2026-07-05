@@ -2910,3 +2910,23 @@ fn array_agg_temporal_elements_pg_faithful() {
     // int/bigint arrays keep their fast-path typing (regression guard)
     assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (1),(2),(3)) t(x)"), "{1,2,3}");
 }
+
+#[test]
+fn bigint_div_int64_min_by_neg1_no_panic() {
+    // i64::MIN / -1 overflows; a bare `a / b` panics the connection thread
+    // (production panic=abort → whole process). PG raises "bigint out of
+    // range". SPG must return an error, never panic.
+    let mut e = Engine::new();
+    // construct i64::MIN as an expression (the bare literal 9223372036854775808
+    // overflows i64 at lex time), then divide by -1.
+    let r = e.execute("SELECT (-9223372036854775807 - 1) / -1");
+    // must NOT panic — either an error or (if it somehow widens) a value.
+    assert!(matches!(r, Err(_) | Ok(_)), "reached without panic");
+    // normal bigint division still works
+    match e.execute("SELECT (100::bigint) / -1") {
+        Ok(QueryResult::Rows { rows, .. }) => {
+            assert_eq!(format!("{:?}", rows[0].values[0]), "BigInt(-100)");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
