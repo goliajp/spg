@@ -713,6 +713,20 @@ fn apply_binary_calendar(
         return Ok(Some(out));
     }
     match (l, r) {
+        // v7.37 D.35 — `date + time` (and `time + date`) → timestamp at that
+        // date's midnight plus the time-of-day. PG: date '2024-06-15' + time
+        // '10:30' → 2024-06-15 10:30:00.
+        (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d))
+            if op == BinOp::Add =>
+        {
+            let micros = i64::from(*d)
+                .checked_mul(86_400_000_000)
+                .and_then(|day_us| day_us.checked_add(*t))
+                .ok_or(EvalError::TypeMismatch {
+                    detail: "DATE + TIME overflows TIMESTAMP range".into(),
+                })?;
+            return Ok(Some(Value::Timestamp(micros)));
+        }
         (Value::Date(d), other) if op == BinOp::Add => {
             if let Some(n) = int_value(other) {
                 let days = i64::from(*d).saturating_add(n);
