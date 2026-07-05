@@ -2799,3 +2799,31 @@ fn to_char_eeee_scientific() {
     assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
     assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
 }
+
+/// v7.37 D.65 — to_char V scale multiplier. PG18.4-verified.
+#[test]
+fn to_char_v_scale() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let cases = [
+        ("1.5","9V9"," 15"),
+        ("1.23","9V99"," 123"),
+        ("12.345","99V99"," 1235"),
+        ("1.5","FM9V9","15"),
+        ("0.5","9V99","  50"),
+        ("-1.5","9V9","-15"),
+        ("1.234","9V999"," 1234"),
+        ("5","9V99"," 500"),
+        ("1.5","99V9","  15"),
+        ("2","99V9","  20"),
+    ];
+    let mut bad = Vec::new();
+    for (n,f,pg) in &cases {
+        let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
+        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+    }
+    // no regression on ordinary + EEEE
+    assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
+    assert_eq!(q(&mut e, "SELECT to_char(1234.567,'9.9EEEE')"), " 1.2e+03");
+    assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
+}

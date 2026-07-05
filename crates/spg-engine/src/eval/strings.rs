@@ -677,6 +677,28 @@ fn format_fixed_abs(x: f64, d: usize) -> String {
     alloc::format!("{ip}.{fp:0width$}", width = d)
 }
 
+/// PG `V` scale: multiply by 10^(digit count after `V`) and render as an
+/// integer (the `V` drops the decimal point). Field width = all digit slots
+/// (before + after V) plus a sign column; non-FM left-pads with blanks.
+fn to_char_v_scale(n: f64, before: &str, after: &str, fill_mode: bool) -> String {
+    let count_slots = |s: &str| s.chars().filter(|c| matches!(c, '9' | '0')).count();
+    let vdigits = count_slots(after);
+    let total_slots = count_slots(before) + vdigits;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let scaled = libm::round(n.abs() * libm::pow(10.0, vdigits as f64)) as i128;
+    let neg = n < 0.0 && scaled != 0;
+    let core = if neg {
+        alloc::format!("-{scaled}")
+    } else {
+        alloc::format!("{scaled}")
+    };
+    if fill_mode {
+        core
+    } else {
+        left_pad_spaces(&core, total_slots + 1)
+    }
+}
+
 /// PG `EEEE` scientific notation. `mant_fmt` is the format preceding `EEEE`
 /// (e.g. `9.9`); its post-decimal digit count sets the mantissa precision.
 /// Mantissa is normalised to one leading digit; rounding is not
@@ -754,6 +776,10 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     // `EEEE`; the digit count after its decimal sets the mantissa precision.
     if let Some(epos) = pat.to_ascii_uppercase().find("EEEE") {
         return to_char_scientific(n, &pat[..epos], fill_mode);
+    }
+    // `V`: scale — multiply by 10^(digits after V) and drop the decimal.
+    if let Some(vpos) = pat.find(['V', 'v']) {
+        return to_char_v_scale(n, &pat[..vpos], &pat[vpos + 1..], fill_mode);
     }
     // `PR` suffix: PG's accounting-negative notation — a negative value is
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a
