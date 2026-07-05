@@ -14833,8 +14833,33 @@ impl Parser {
     }
 
     /// Parse one frame bound: `UNBOUNDED PRECEDING`, `<n> PRECEDING`,
-    /// `CURRENT ROW`, `<n> FOLLOWING`, `UNBOUNDED FOLLOWING`.
+    /// `<interval> PRECEDING`, `CURRENT ROW`, `<n>/<interval> FOLLOWING`,
+    /// `UNBOUNDED FOLLOWING`.
     fn parse_frame_bound(&mut self) -> Result<FrameBound, ParseError> {
+        // Interval-typed offset for a value-based RANGE frame over a
+        // DATE / TIMESTAMP ORDER BY column (PG time-series windows),
+        // spelled `INTERVAL '1 day' PRECEDING` or `'1 day'::interval
+        // PRECEDING`.
+        if let Some((months, days, micros)) = self.try_take_interval_offset()? {
+            let dir = self.expect_ident_like()?;
+            return if dir.eq_ignore_ascii_case("preceding") {
+                Ok(FrameBound::IntervalPreceding {
+                    months,
+                    days,
+                    micros,
+                })
+            } else if dir.eq_ignore_ascii_case("following") {
+                Ok(FrameBound::IntervalFollowing {
+                    months,
+                    days,
+                    micros,
+                })
+            } else {
+                Err(self.err(format!(
+                    "expected PRECEDING or FOLLOWING after interval offset, got {dir:?}"
+                )))
+            };
+        }
         // Number-led: "<n> PRECEDING" / "<n> FOLLOWING".
         if let Token::Integer(n) = *self.peek() {
             self.advance();
@@ -14877,6 +14902,51 @@ impl Parser {
         Err(self.err(format!(
             "expected frame bound (UNBOUNDED/CURRENT/<n>), got {first:?}"
         )))
+    }
+
+    /// Detect and consume a leading interval offset in a frame bound —
+    /// `INTERVAL '1 day'` or `'1 day'::interval` — returning its folded
+    /// `(months, days, micros)`. Leaves the cursor on the trailing
+    /// PRECEDING / FOLLOWING keyword. Returns `None` (without advancing)
+    /// when the next tokens are not an interval offset.
+    fn try_take_interval_offset(&mut self) -> Result<Option<(i32, i32, i64)>, ParseError> {
+        // Shape A — `INTERVAL '1 day'`.
+        if matches!(self.peek(), Token::Interval) {
+            self.advance(); // INTERVAL
+            let atom = self.parse_interval_atom()?;
+            if let Expr::Literal(Literal::Interval {
+                months,
+                days,
+                micros,
+                ..
+            }) = atom
+            {
+                return Ok(Some((months, days, micros)));
+            }
+            return Err(self.err("expected an interval literal in frame offset".to_string()));
+        }
+        // Shape B — `'1 day'::interval`. Look ahead for the exact
+        // string / `::` / interval-target triple before committing.
+        if let Token::String(text) = self.peek() {
+            let target_is_interval = match self.tokens.get(self.pos + 2) {
+                Some(Token::Interval) => true,
+                Some(Token::Ident(s)) => s.eq_ignore_ascii_case("interval"),
+                _ => false,
+            };
+            let is_cast = matches!(self.tokens.get(self.pos + 1), Some(Token::DoubleColon))
+                && target_is_interval;
+            if is_cast {
+                let text = text.clone();
+                self.advance(); // string
+                self.advance(); // ::
+                self.advance(); // interval
+                let parts = parse_interval_text(&text).ok_or_else(|| {
+                    self.err(format!("cannot parse INTERVAL {text:?} in frame offset"))
+                })?;
+                return Ok(Some(parts));
+            }
+        }
+        Ok(None)
     }
 
     fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {

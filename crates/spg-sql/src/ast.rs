@@ -2757,6 +2757,12 @@ pub enum FrameBound {
     CurrentRow,
     OffsetFollowing(u64),
     UnboundedFollowing,
+    /// `RANGE BETWEEN <interval> PRECEDING …` — value-based offset over a
+    /// DATE / TIMESTAMP ORDER BY column (PG time-series windows). The
+    /// interval is folded to its (months, days, micros) components at
+    /// parse time.
+    IntervalPreceding { months: i32, days: i32, micros: i64 },
+    IntervalFollowing { months: i32, days: i32, micros: i64 },
 }
 
 impl fmt::Display for FrameBound {
@@ -2767,6 +2773,8 @@ impl fmt::Display for FrameBound {
             Self::CurrentRow => f.write_str("CURRENT ROW"),
             Self::OffsetFollowing(n) => write!(f, "{n} FOLLOWING"),
             Self::UnboundedFollowing => f.write_str("UNBOUNDED FOLLOWING"),
+            Self::IntervalPreceding { .. } => f.write_str("INTERVAL PRECEDING"),
+            Self::IntervalFollowing { .. } => f.write_str("INTERVAL FOLLOWING"),
         }
     }
 }
