@@ -85,8 +85,11 @@ fn single_range_multirange_round_trip() {
         panic!();
     };
     assert_eq!(ranges.len(), 1);
+    // Discrete int4 ranges canonicalize to '[)' (read01 U26), so
+    // '[100,200]' becomes '[100,201)' — live PG 18.4 agrees.
     assert!(ranges[0].lower_inc);
-    assert!(ranges[0].upper_inc); // ']' inclusive upper
+    assert!(!ranges[0].upper_inc);
+    assert_eq!(ranges[0].upper.as_deref(), Some(&Value::Int(201)));
 }
 
 #[test]

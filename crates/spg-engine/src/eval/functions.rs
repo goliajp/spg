@@ -3983,12 +3983,16 @@ fn apply_function_dispatch(
             };
             let lower = coerce(&args[0])?;
             let upper = coerce(&args[1])?;
-            // PG: equal bounds that don't include both ends collapse
-            // to 'empty'.
-            let empty = match (&lower, &upper) {
-                (Some(l), Some(u)) => l == u && !(lower_inc && upper_inc),
-                _ => false,
-            };
+            // Canonicalize (infinite→exclusive + discrete `[)` fold) via the
+            // shared helper so the constructors and the `'…'::int4range`
+            // text-input path agree — `int4range(1,3,'[]')` is `[1,4)`.
+            let (lower, upper, lower_inc, upper_inc, empty) =
+                crate::conversions::canonicalize_range_bounds(
+                    kind, lower, upper, lower_inc, upper_inc,
+                )
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: format!("{name}(): range bound overflow while canonicalizing"),
+                })?;
             if empty {
                 return Ok(Value::Range {
                     kind,
