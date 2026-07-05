@@ -39,10 +39,18 @@ fn ln_of_e_is_one() {
 #[test]
 fn log10_of_100_is_2() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT log10(100.0)");
-    assert!(approx(as_f64(&v), 2.0, 1e-9), "got {}", as_f64(&v));
-    let v = first(&mut e, "SELECT log(100.0)");
-    assert!(approx(as_f64(&v), 2.0, 1e-9), "got {}", as_f64(&v));
+    // libm::log10 lands exact powers of ten on whole numbers (live
+    // PG18.4: log10(1000) = 3, not the 2.9999999999999996 that
+    // ln(x)/ln(10) produced). PG's log(x) is base-10 too.
+    assert_eq!(as_f64(&first(&mut e, "SELECT log10(100.0)")), 2.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT log(100.0)")), 2.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT log10(1000.0)")), 3.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT log10(0.001)")), -3.0);
+    // Non-power argument matches PG's exact double.
+    assert_eq!(
+        as_f64(&first(&mut e, "SELECT log10(2.0)")),
+        0.301_029_995_663_981_2
+    );
 }
 
 #[test]
@@ -67,6 +75,22 @@ fn cbrt_of_27_is_3() {
     assert_eq!(
         as_f64(&first(&mut e, "SELECT cbrt(2.0)")),
         1.259_921_049_894_873_2
+    );
+}
+
+#[test]
+fn sqrt_matches_pg_to_the_ulp() {
+    let mut e = Engine::new();
+    // libm::sqrt is correctly rounded (IEEE-754) — the same square
+    // root PG calls via C libm. Perfect squares are exact and
+    // non-squares match PG's double bit-for-bit (the old Newton
+    // iteration returned 1.414213562373095, a ULP shy of PG's
+    // 1.4142135623730951).
+    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(16.0)")), 4.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(2.0)")), 1.414_213_562_373_095_1);
+    assert_eq!(
+        as_f64(&first(&mut e, "SELECT sqrt(130.0)")),
+        11.401_754_250_991_38
     );
 }
 

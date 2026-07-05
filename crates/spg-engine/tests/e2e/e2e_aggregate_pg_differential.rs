@@ -199,14 +199,25 @@ fn stddev_variance_family() {
     check(&mut e, "SELECT var_pop(x) FROM t", "104");
     check(&mut e, "SELECT var_samp(x) FROM t", "130");
     check(&mut e, "SELECT variance(x) FROM t", "130");
-    // stddev_pop = sqrt(104), stddev_samp = stddev = sqrt(130)
+    // stddev_pop = sqrt(104), stddev_samp = stddev = sqrt(130).
+    // live PG18.4: stddev_samp == sqrt(130::float8) (verified equal),
+    // whose shortest round-trip is 11.40175425099138 — the prior
+    // 11.401754250991381 was a 1-ULP artifact of the old hand-rolled
+    // Newton sqrt, now replaced by libm::sqrt.
     check(&mut e, "SELECT stddev_pop(x) FROM t", "10.198039027185569");
-    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.401754250991381");
-    check(&mut e, "SELECT stddev(x) FROM t", "11.401754250991381");
+    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.40175425099138");
+    check(&mut e, "SELECT stddev(x) FROM t", "11.40175425099138");
     // single-row group: samp undefined -> NULL, pop -> 0
     check(&mut e, "SELECT stddev_samp(x) FROM t WHERE id=1", "<NULL>");
     check(&mut e, "SELECT var_samp(x) FROM t WHERE id=1", "<NULL>");
     check(&mut e, "SELECT stddev_pop(x) FROM t WHERE id=1", "0");
+    // Float data exercises the operation-order sensitivity: variance
+    // uses PG's `(N*Σx² - (Σx)²)/N²` form (float.c float8_var_pop),
+    // so these match live PG18.4 bit-for-bit (y = 1.5,2.5,3.5,3.5).
+    check(&mut e, "SELECT var_pop(y) FROM t", "0.6875");
+    check(&mut e, "SELECT var_samp(y) FROM t", "0.9166666666666666");
+    check(&mut e, "SELECT stddev_pop(y) FROM t", "0.82915619758885");
+    check(&mut e, "SELECT stddev_samp(y) FROM t", "0.9574271077563381");
 }
 
 // ---- bool / bit aggregates ----

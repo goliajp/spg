@@ -3326,15 +3326,21 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 return Value::Null;
             }
             let nf = n as f64;
-            // Sum of squared deviations from the mean.
-            let ss = st.sum_sq - (st.sum_float * st.sum_float) / nf;
             let pop = name.ends_with("_pop");
-            let denom = if pop { nf } else { nf - 1.0 };
-            if denom <= 0.0 {
+            if !pop && n < 2 {
                 // var_samp / stddev (samp) with n == 1 → NULL.
                 return Value::Null;
             }
-            let var = (ss / denom).max(0.0); // clamp fp noise below 0
+            // Match PG's float8 accumulator operation order exactly
+            // (utils/adt/float.c float8_var_pop / _samp): the numerator
+            // is `N*Σx² - (Σx)²` and the divisor is `N²` (pop) or
+            // `N*(N-1)` (samp). SPG previously used the algebraically
+            // equal `(Σx² - (Σx)²/N) / denom`, whose different float
+            // rounding drifted a ULP from PG on stddev (only masked
+            // before by an imprecise hand-rolled sqrt).
+            let numerator = (nf * st.sum_sq - st.sum_float * st.sum_float).max(0.0);
+            let divisor = if pop { nf * nf } else { nf * (nf - 1.0) };
+            let var = numerator / divisor;
             if name.starts_with("stddev") {
                 Value::Float(crate::eval::f64_sqrt(var))
             } else {
