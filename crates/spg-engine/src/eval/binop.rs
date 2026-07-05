@@ -529,6 +529,19 @@ pub(super) fn apply_binary(
             ))
         }
         BinOp::JsonContains => crate::json::contains(&l, &r),
+        // v7.37 — `jsonb @? jsonpath` = jsonb_path_exists: does the path
+        // return any item? Reuses the jsonpath query engine.
+        BinOp::JsonPathExists => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                match crate::json::path_query(&l, &r)? {
+                    Value::TextArray(items) => Ok(Value::Bool(!items.is_empty())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::Bool(true)),
+                }
+            }
+        }
         // v7.37.6-A `<@` reuses `@>` with swapped args.
         BinOp::JsonContainedBy => crate::json::contains(&r, &l),
         BinOp::JsonKeyExists => crate::json::key_exists(&l, &r),
@@ -3016,6 +3029,7 @@ pub(super) fn compare(
         | BinOp::JsonGetPath
         | BinOp::JsonGetPathText
         | BinOp::JsonContains
+        | BinOp::JsonPathExists
         | BinOp::JsonContainedBy
         | BinOp::JsonKeyExists
         | BinOp::JsonKeysAny

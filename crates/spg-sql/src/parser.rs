@@ -15329,6 +15329,7 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::JsonGetPath => (BinOp::JsonGetPath, 7),
         Token::JsonGetPathText => (BinOp::JsonGetPathText, 7),
         Token::JsonContains => (BinOp::JsonContains, 7),
+        Token::JsonPathExists => (BinOp::JsonPathExists, 7),
         Token::JsonContainedBy => (BinOp::JsonContainedBy, 7),
         Token::JsonKeyExists => (BinOp::JsonKeyExists, 7),
         Token::JsonKeysAny => (BinOp::JsonKeysAny, 7),
