@@ -136,6 +136,92 @@ fn timestamp_interval_one_hour_count_only() {
 }
 
 #[test]
+fn date_bounds_coerce_to_midnight_timestamp() {
+    // PG resolves `generate_series(date, date, interval)` to the
+    // timestamp/timestamptz overload by casting each date bound up to
+    // midnight. Verified vs live PG18.4:
+    //   generate_series('2020-01-01'::date,'2020-01-10'::date,'2 days')
+    //     → 2020-01-01 00:00:00 .. 2020-01-09 00:00:00 (5 rows)
+    // SPG is TZ-naive, so we compare against the naive midnight
+    // Timestamp instants (PG renders a `+08` suffix its timestamptz
+    // model carries; SPG drops it uniformly).
+    let mut e = Engine::new();
+    let r = rows(
+        e.execute(
+            "SELECT * FROM generate_series(\
+                '2020-01-01'::DATE, '2020-01-10'::DATE, '2 days'::INTERVAL)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r.len(), 5);
+    assert_eq!(
+        r[0][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-01 00:00:00"))
+    );
+    assert_eq!(
+        r[4][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-09 00:00:00"))
+    );
+}
+
+#[test]
+fn date_bounds_sub_day_interval_and_descending() {
+    let mut e = Engine::new();
+    // Sub-day interval on date bounds: PG18.4 →
+    //   2020-01-01 00:00:00 / 12:00:00 / 2020-01-02 00:00:00 (3 rows).
+    let r = rows(
+        e.execute(
+            "SELECT * FROM generate_series(\
+                '2020-01-01'::DATE, '2020-01-02'::DATE, '12 hours'::INTERVAL)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r.len(), 3);
+    assert_eq!(
+        r[1][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-01 12:00:00"))
+    );
+    // Descending date bounds with a negative interval (PG18.4 → 3 rows
+    // counting down by two days).
+    let r = rows(
+        e.execute(
+            "SELECT * FROM generate_series(\
+                '2020-01-05'::DATE, '2020-01-01'::DATE, '-2 days'::INTERVAL)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r.len(), 3);
+    assert_eq!(
+        r[0][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-05 00:00:00"))
+    );
+    assert_eq!(
+        r[2][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-01 00:00:00"))
+    );
+}
+
+#[test]
+fn mixed_date_and_timestamp_bounds() {
+    // A date lower bound with a timestamp upper bound — PG casts the
+    // date up so both bounds share the timestamp overload (PG18.4 → 3
+    // midnight rows two days apart).
+    let mut e = Engine::new();
+    let r = rows(
+        e.execute(
+            "SELECT * FROM generate_series(\
+                '2020-01-01'::DATE, '2020-01-05'::TIMESTAMP, '2 days'::INTERVAL)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r.len(), 3);
+    assert_eq!(
+        r[2][0],
+        Value::Timestamp(parse_iso_to_micros("2020-01-05 00:00:00"))
+    );
+}
+
+#[test]
 fn unsupported_arg_shape_errors_cleanly() {
     let mut e = Engine::new();
     // Mixed shape (timestamp + integer) — should error, not panic.
