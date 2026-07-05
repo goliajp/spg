@@ -3301,7 +3301,12 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                         .map(|v| match v {
                             Value::Text(s) => Some(s.to_string()),
                             Value::Null => None,
-                            other => Some(format!("{other:?}")),
+                            // Date / Numeric / Interval / Timestamp / Uuid /
+                            // … render via the canonical PG-faithful text form
+                            // (TextArray's formatter re-quotes as needed to match
+                            // PG's `{2.5,3.5}` / `{"1 day",02:00:00}`), never a
+                            // Rust debug dump.
+                            other => Some(crate::eval::values::value_to_text(other)),
                         })
                         .collect();
                     Value::TextArray(items)
