@@ -53,15 +53,31 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         // is supported (the mailrs idiom: `$1::INTERVAL` where the
         // bound param is a string like `'7 days'`).
         CastTarget::Interval => cast_to_interval(v),
-        // v7.9.25 — `::json` / `::jsonb`. Routes Text → Json
-        // (validation is the producer's responsibility, same as
-        // the column-INSERT path).
-        CastTarget::Json | CastTarget::Jsonb => match v {
+        // v7.9.25 — `::json` keeps the input text verbatim (PG's json
+        // type preserves whitespace / key order / duplicates).
+        CastTarget::Json => match v {
             Value::Json(s) => Ok(Value::json(s)),
             Value::Text(s) => Ok(Value::json(s)),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::json / ::jsonb only accepts TEXT-shape inputs, got {:?}",
+                    "::json only accepts TEXT-shape inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
+        // v7.38 (read01) — `::jsonb` canonicalises like PG: object keys
+        // sorted (length, then bytes) + duplicates collapsed last-wins,
+        // `, ` / `: ` whitespace, and numbers normalised. Invalid JSON
+        // falls back to the verbatim text (validation stays a separate
+        // concern from this representation fix).
+        CastTarget::Jsonb => match v {
+            Value::Json(s) | Value::Text(s) => Ok(Value::json(
+                crate::json::canonicalize_jsonb(s.as_ref())
+                    .unwrap_or_else(|_| s.as_ref().to_string()),
+            )),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::jsonb only accepts TEXT-shape inputs, got {:?}",
                     other.data_type()
                 ),
             }),

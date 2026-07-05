@@ -35,7 +35,7 @@ fn ddl_accepts_jsonb_keyword() {
 }
 
 #[test]
-fn insert_and_select_jsonb_round_trips_verbatim() {
+fn insert_and_select_jsonb_canonicalises() {
     let mut eng = engine_with(&[
         "CREATE TABLE t (id INT NOT NULL, payload JSONB)",
         "INSERT INTO t VALUES (1, '{\"k\":\"v\",\"n\":42}')",
@@ -45,7 +45,7 @@ fn insert_and_select_jsonb_round_trips_verbatim() {
     let Value::Json(s) = &rows[0][0] else {
         panic!("expected Value::Json, got {:?}", rows[0][0])
     };
-    assert_eq!(s, r#"{"k":"v","n":42}"#);
+    assert_eq!(s, r#"{"k": "v", "n": 42}"#);
 }
 
 #[test]

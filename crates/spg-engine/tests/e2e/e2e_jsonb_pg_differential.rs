@@ -143,15 +143,15 @@ fn jsonb_equality_operator() {
     check(&mut e, "SELECT 1 = 1", "t");
     check(&mut e, "SELECT 'ab' = 'ab'", "t");
 
-    // ---- DIVERGENCES tied to the jsonb normalization slices (OOS) ----
-    // DIVERGENCE (number canonicalisation, Slice 3): PG canonicalises
-    // jsonb numbers so `'1' = '1.0'` is PG-TRUE. SPG preserves the
-    // numeric lexeme (NumberText) and compares it textually -> false.
+    // Duplicate object keys now collapse last-wins on the `::jsonb`
+    // cast, so `{"a":1,"a":2}` canonicalises to `{"a":2}` and the
+    // equality matches PG 18.4 (t).
+    check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb = '{\"a\":2}'::jsonb", "t");
+    // REMAINING DIVERGENCE (number equality): PG compares jsonb numbers
+    // numerically so `'1' = '1.0'` is PG-TRUE. Canonicalisation renders
+    // them as `1` / `1.0`, but json::equals still compares the lexeme
+    // textually -> false. Numeric-aware equality is a separate follow-up.
     check(&mut e, "SELECT '1'::jsonb = '1.0'::jsonb", "f"); // PG: t
-    // DIVERGENCE (duplicate object key, Slice 2): PG keeps only the
-    // LAST value so `{"a":1,"a":2}` collapses to `{"a":2}` and the
-    // equality is PG-TRUE. SPG preserves both keys (len 2 vs 1) -> false.
-    check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb = '{\"a\":2}'::jsonb", "f"); // PG: t
     // NOTE (ordering deferred): PG defines a total order on jsonb so
     // `'1'::jsonb < '2'::jsonb` is PG-TRUE, but SPG's compare wires
     // only = / <> for jsonb; the ordering operators stay a type error.
@@ -269,18 +269,17 @@ fn jsonb_rendering_divergences() {
     check(&mut e, "SELECT '{}'::jsonb::text", "{}");
     check(&mut e, "SELECT '[]'::jsonb::text", "[]");
     check(&mut e, "SELECT '\"A\"'::jsonb::text", "\"A\"");
-    check(&mut e, "SELECT '{\"k\":\"é\"}'::jsonb::text", "{\"k\":\"é\"}");
+    // jsonb now canonicalises like PG 18.4: `, ` / `: ` whitespace,
+    // keys sorted (length, then bytes) + dups collapsed last-wins,
+    // numbers normalised. Non-ASCII stays verbatim UTF-8.
+    check(&mut e, "SELECT '{\"k\":\"é\"}'::jsonb::text", "{\"k\": \"é\"}");
     check(&mut e, "SELECT '100000000000000000000'::jsonb::text", "100000000000000000000");
-    check(&mut e, "SELECT '{\"n\":-0.5}'::jsonb::text", "{\"n\":-0.5}");
-    // DIVERGENCE (key order): PG sorts -> {"a": 2, "b": 1}
-    check(&mut e, "SELECT '{\"b\":1,\"a\":2}'::jsonb::text", "{\"b\":1,\"a\":2}");
-    // DIVERGENCE (dup key): PG keeps last -> {"a": 2}. SPG keeps both.
-    check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb::text", "{\"a\":1,\"a\":2}");
-    // DIVERGENCE (number canonicalisation): PG -> {"n": 100}
-    check(&mut e, "SELECT '{\"n\":1e2}'::jsonb::text", "{\"n\":1e2}");
-    // number that already looks integral round-trips the same as PG
-    check(&mut e, "SELECT '{\"n\":1.0}'::jsonb::text", "{\"n\":1.0}");
-    // json (non-b) preserves input verbatim in both engines
+    check(&mut e, "SELECT '{\"n\":-0.5}'::jsonb::text", "{\"n\": -0.5}");
+    check(&mut e, "SELECT '{\"b\":1,\"a\":2}'::jsonb::text", "{\"a\": 2, \"b\": 1}");
+    check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::jsonb::text", "{\"a\": 2}");
+    check(&mut e, "SELECT '{\"n\":1e2}'::jsonb::text", "{\"n\": 100}");
+    check(&mut e, "SELECT '{\"n\":1.0}'::jsonb::text", "{\"n\": 1.0}");
+    // json (non-b) still preserves the input verbatim — no canonicalise.
     check(&mut e, "SELECT '{\"b\":1,\"a\":2}'::json::text", "{\"b\":1,\"a\":2}");
     check(&mut e, "SELECT '{\"a\":1,\"a\":2}'::json::text", "{\"a\":1,\"a\":2}");
 }

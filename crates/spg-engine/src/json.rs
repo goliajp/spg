@@ -109,12 +109,134 @@ fn write_json(v: &JsonValue, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                write_json(&JsonValue::String(k.clone()), out);
+                write_json_string(k, out);
                 out.push(':');
                 write_json(val, out);
             }
             out.push('}');
         }
+    }
+}
+
+/// Escape a string into a JSON string literal (shared by the verbatim
+/// and canonical serializers). Matches PG: `\n \r \t \" \\`, control
+/// chars as `\uXXXX`, everything else (incl. non-ASCII) verbatim UTF-8.
+fn write_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&alloc::format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Canonicalise a jsonb text value the way PostgreSQL does on input:
+/// object keys sorted by (length, then bytewise) with duplicate keys
+/// collapsed last-wins, `, ` / `: ` whitespace, and numbers normalised
+/// to plain decimal (exponents expanded, `-0` → `0`, but trailing zeros
+/// from the input scale preserved — `1e2` → `100`, `1E-3` → `0.001`,
+/// `1.10` stays `1.10`). `json` keeps its input verbatim; only `jsonb`
+/// runs through this.
+pub fn canonicalize_jsonb(src: &str) -> Result<String, ParseError> {
+    let v = parse(src)?;
+    let mut out = String::new();
+    write_json_canonical(&v, &mut out);
+    Ok(out)
+}
+
+fn write_json_canonical(v: &JsonValue, out: &mut String) {
+    match v {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JsonValue::Number(x) => out.push_str(&canon_json_number(&alloc::format!("{x}"))),
+        JsonValue::NumberText(s) => out.push_str(&canon_json_number(s)),
+        JsonValue::String(s) => write_json_string(s, out),
+        JsonValue::Array(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json_canonical(it, out);
+            }
+            out.push(']');
+        }
+        JsonValue::Object(entries) => {
+            // Duplicate keys collapse last-wins (keep the final value),
+            // preserving first-seen order only until the stable sort.
+            let mut deduped: Vec<(&String, &JsonValue)> = Vec::new();
+            for (k, val) in entries {
+                if let Some(slot) = deduped.iter_mut().find(|(mk, _)| *mk == k) {
+                    slot.1 = val;
+                } else {
+                    deduped.push((k, val));
+                }
+            }
+            deduped.sort_by(|a, b| {
+                a.0.len()
+                    .cmp(&b.0.len())
+                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            });
+            out.push('{');
+            for (i, (k, val)) in deduped.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json_string(k, out);
+                out.push_str(": ");
+                write_json_canonical(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Render a JSON number lexeme in PostgreSQL's canonical jsonb form: a
+/// plain decimal with the exponent applied, `-0` normalised to `0`, and
+/// the input's fractional scale preserved. Digits are manipulated as
+/// strings so arbitrarily large numbers round-trip without overflow.
+fn canon_json_number(lexeme: &str) -> String {
+    let neg = lexeme.starts_with('-');
+    let body = lexeme.trim_start_matches(['-', '+']);
+    // Split into mantissa (int '.' frac) and exponent.
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i64>().unwrap_or(0)),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let digits: String = alloc::format!("{int_part}{frac_part}");
+    // `shift` = number of fractional digits in the output. Applying the
+    // exponent moves the point right by `exp`, i.e. reduces the fraction
+    // count by `exp`.
+    let shift = frac_part.len() as i64 - exp;
+    let all_zero = digits.bytes().all(|b| b == b'0');
+    let sign = if neg && !all_zero { "-" } else { "" };
+    let strip = |s: &str| -> String {
+        let t = s.trim_start_matches('0');
+        if t.is_empty() { "0".into() } else { t.into() }
+    };
+    if shift <= 0 {
+        // Integer: append `-shift` trailing zeros.
+        let zeros = "0".repeat((-shift) as usize);
+        alloc::format!("{sign}{}{zeros}", strip(&digits))
+    } else {
+        let shift = shift as usize;
+        let (int_str, frac_str) = if digits.len() > shift {
+            (digits[..digits.len() - shift].to_string(), digits[digits.len() - shift..].to_string())
+        } else {
+            ("0".to_string(), alloc::format!("{}{}", "0".repeat(shift - digits.len()), digits))
+        };
+        alloc::format!("{sign}{}.{frac_str}", strip(&int_str))
     }
 }
 
@@ -1763,6 +1885,52 @@ fn path_text_arg(v: &Value, fname: &str) -> Result<Vec<String>, EvalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canon(s: &str) -> String {
+        canonicalize_jsonb(s).unwrap()
+    }
+
+    #[test]
+    fn canon_number_rules() {
+        // Values from live PG 18.4 jsonb.
+        assert_eq!(canon_json_number("1.0"), "1.0");
+        assert_eq!(canon_json_number("1e2"), "100");
+        assert_eq!(canon_json_number("1.10"), "1.10");
+        assert_eq!(canon_json_number("100.00"), "100.00");
+        assert_eq!(canon_json_number("0.5"), "0.5");
+        assert_eq!(canon_json_number("-0"), "0");
+        assert_eq!(canon_json_number("1E-3"), "0.001");
+        assert_eq!(canon_json_number("42"), "42");
+        assert_eq!(canon_json_number("-2.5"), "-2.5");
+        assert_eq!(canon_json_number("2.5e3"), "2500");
+    }
+
+    #[test]
+    fn canon_key_order_dedup_and_whitespace() {
+        // Keys sort by (length, bytes); ""/a/b/z/aa. PG 18.4.
+        assert_eq!(
+            canon(r#"{"b":1,"a":2,"aa":3,"":9,"z":4}"#),
+            r#"{"": 9, "a": 2, "b": 1, "z": 4, "aa": 3}"#
+        );
+        // Duplicate keys collapse last-wins.
+        assert_eq!(canon(r#"{"a":1,"a":2,"a":3}"#), r#"{"a": 3}"#);
+        // Arrays get `, ` and are not reordered.
+        assert_eq!(canon("[3,2,1]"), "[3, 2, 1]");
+    }
+
+    #[test]
+    fn canon_nested_and_scalars() {
+        assert_eq!(
+            canon(r#"{"x":{"b":1,"a":2},"y":[3,{"d":1,"c":2}]}"#),
+            r#"{"x": {"a": 2, "b": 1}, "y": [3, {"c": 2, "d": 1}]}"#
+        );
+        assert_eq!(canon("  true "), "true");
+        assert_eq!(canon(" 42 "), "42");
+        assert_eq!(canon("{}"), "{}");
+        assert_eq!(canon("[]"), "[]");
+        // Non-ASCII stays verbatim UTF-8; escapes preserved.
+        assert_eq!(canon(r#"{"e":"café","t":"a\nb"}"#), r#"{"e": "café", "t": "a\nb"}"#);
+    }
 
     #[test]
     fn parse_atoms() {
