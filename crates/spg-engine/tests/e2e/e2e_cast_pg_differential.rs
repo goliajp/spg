@@ -2543,3 +2543,23 @@ fn tsquery_adjacency_operator() {
     // <-> binds tighter than & (no stop words here to keep it about the operator)
     assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'foo <-> bar & baz'))::text"), "'foo' <-> 'bar' & 'baz'");
 }
+
+/// v7.37 D.53 — `UPDATE t SET arr[i] = v` array element assignment, PG NULL-pads
+/// when i exceeds the array length. PG18.4-verified.
+#[test]
+fn update_set_array_element() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int primary key, arr int[], tags text[])").unwrap();
+    e.execute("INSERT INTO t VALUES (1, ARRAY[10,20,30], ARRAY['x','y']), (2, ARRAY[5], NULL)").unwrap();
+    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, o=>format!("{o:?}") } };
+    e.execute("UPDATE t SET arr[2] = 99 WHERE id=1").unwrap();
+    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=1"), "{10,99,30}");
+    e.execute("UPDATE t SET tags[1] = 'z' WHERE id=1").unwrap();
+    assert_eq!(g(&mut e, "SELECT tags::text FROM t WHERE id=1"), "{z,y}");
+    // out-of-bounds NULL-pads
+    e.execute("UPDATE t SET arr[10] = 7 WHERE id=2").unwrap();
+    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=2"), "{5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,7}");
+    // two element assignments in one SET
+    e.execute("UPDATE t SET arr[1] = 100, arr[3] = 300 WHERE id=1").unwrap();
+    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=1"), "{100,99,300}");
+}
