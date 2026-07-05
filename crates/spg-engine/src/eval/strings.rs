@@ -1100,6 +1100,19 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             num!(d, 2);
         } else if rest.starts_with(b"MI") {
             num!(mi, 2);
+        } else if rest.starts_with(b"SSSS") {
+            // v7.37 — seconds past midnight (0..86399), no zero padding.
+            // Must precede the `SS` arm (which `SSSS` also prefix-matches).
+            let _ = write!(out, "{}", hh24 * 3600 + mi * 60 + ss);
+            consumed = 4;
+        } else if rest.starts_with(b"FF") && rest.get(2).is_some_and(u8::is_ascii_digit) {
+            // v7.37 — `FF1`..`FF6`: the first N digits of the fractional
+            // second (from the 6-digit microsecond field). Previously the
+            // `FFn` pattern was emitted verbatim.
+            let n = usize::from(rest[2] - b'0');
+            let frac = alloc::format!("{us:06}");
+            out.push_str(&frac[..n.min(6)]);
+            consumed = 3;
         } else if rest.starts_with(b"SS") {
             num!(ss, 2);
         } else if rest.starts_with(b"MS") {
