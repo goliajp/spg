@@ -82,7 +82,10 @@ use textsearch::{
     fts_websearch_to_tsquery, ts_match, tsvector_concat,
 };
 pub use values::gen_random_uuid_bytes;
-use values::{value_cmp_for_min_max, value_to_f64, value_to_text, values_equal_for_nullif};
+use values::{
+    array_element_at, array_len, value_cmp_for_min_max, value_to_f64, value_to_text,
+    values_equal_for_nullif,
+};
 
 /// Resolution context for evaluating a single row. `table_alias` is the alias
 /// (or table name) callers should accept as the qualifier on a column ref —
@@ -547,23 +550,17 @@ pub fn eval_expr(
                 return Ok(Value::Null);
             }
             let pos = (i - 1) as usize;
-            match target_v {
-                Value::TextArray(items) => match items.get(pos) {
-                    Some(Some(s)) => Ok(Value::text(s.clone())),
-                    Some(None) | None => Ok(Value::Null),
-                },
-                Value::IntArray(items) => match items.get(pos) {
-                    Some(Some(n)) => Ok(Value::Int(*n)),
-                    Some(None) | None => Ok(Value::Null),
-                },
-                Value::BigIntArray(items) => match items.get(pos) {
-                    Some(Some(n)) => Ok(Value::BigInt(*n)),
-                    Some(None) | None => Ok(Value::Null),
-                },
-                other => Err(EvalError::TypeMismatch {
+            // Covers every 1-D array element type uniformly. An in-range
+            // element (or NULL hole) yields the element / NULL; an
+            // out-of-range index on a real array yields NULL; a non-array
+            // target errors.
+            match array_element_at(&target_v, pos) {
+                Some(v) => Ok(v),
+                None if array_len(&target_v).is_some() => Ok(Value::Null),
+                None => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "subscript target must be an array, got {:?}",
-                        other.data_type()
+                        target_v.data_type()
                     ),
                 }),
             }

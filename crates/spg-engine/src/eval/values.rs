@@ -276,3 +276,74 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         _ => format!("{v:?}"),
     }
 }
+
+/// Element count of a 1-D array value, or `None` when `v` is not a 1-D
+/// array. Element-type-agnostic — every PG array element type is covered
+/// so count-only callers (array_length / array_upper / array_lower /
+/// array_ndims / array_dims / cardinality) stay uniform.
+pub(super) fn array_len(v: &Value) -> Option<usize> {
+    match v {
+        Value::TextArray(items)
+        | Value::VarcharArray(items)
+        | Value::CharArray(items)
+        | Value::JsonArray(items)
+        | Value::JsonbArray(items) => Some(items.len()),
+        Value::IntArray(items) => Some(items.len()),
+        Value::BigIntArray(items) => Some(items.len()),
+        Value::SmallIntArray(items) => Some(items.len()),
+        Value::BoolArray(items) => Some(items.len()),
+        Value::FloatArray(items) => Some(items.len()),
+        Value::NumericArray(items) => Some(items.len()),
+        Value::DateArray(items) => Some(items.len()),
+        Value::TimestampArray(items) | Value::TimestamptzArray(items) => Some(items.len()),
+        Value::MoneyArray(items) => Some(items.len()),
+        Value::IntervalArray(items) => Some(items.len()),
+        Value::UuidArray(items) => Some(items.len()),
+        Value::BytesArray(items) => Some(items.len()),
+        _ => None,
+    }
+}
+
+/// The `pos`-th (0-based) element of a 1-D array as an owned scalar
+/// `Value` (a NULL hole becomes `Value::Null`), or `None` when `pos` is
+/// out of range or `v` is not a 1-D array. O(1) per element. This is the
+/// single per-type element menu shared by array subscript and
+/// array_position / array_positions, which previously only matched
+/// Text/Int/BigInt arrays and errored on every other element type.
+pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> {
+    use alloc::borrow::Cow;
+    macro_rules! nth {
+        ($items:expr, $map:expr) => {
+            $items.get(pos).map(|e| e.as_ref().map_or(Value::Null, $map))
+        };
+    }
+    match v {
+        Value::TextArray(items) | Value::VarcharArray(items) | Value::CharArray(items) => {
+            nth!(items, |s| Value::Text(Cow::Owned(s.clone())))
+        }
+        Value::JsonArray(items) | Value::JsonbArray(items) => {
+            nth!(items, |s| Value::Json(Cow::Owned(s.clone())))
+        }
+        Value::IntArray(items) => nth!(items, |n| Value::Int(*n)),
+        Value::BigIntArray(items) => nth!(items, |n| Value::BigInt(*n)),
+        Value::SmallIntArray(items) => nth!(items, |n| Value::SmallInt(*n)),
+        Value::BoolArray(items) => nth!(items, |b| Value::Bool(*b)),
+        Value::FloatArray(items) => nth!(items, |f| Value::Float(*f)),
+        Value::NumericArray(items) => {
+            nth!(items, |t: &(i128, u8)| Value::Numeric { scaled: t.0, scale: t.1 })
+        }
+        Value::DateArray(items) => nth!(items, |d| Value::Date(*d)),
+        Value::TimestampArray(items) | Value::TimestamptzArray(items) => {
+            nth!(items, |t| Value::Timestamp(*t))
+        }
+        Value::MoneyArray(items) => nth!(items, |m| Value::Money(*m)),
+        Value::IntervalArray(items) => nth!(items, |s| Value::Interval {
+            months: s.months,
+            days: s.days,
+            micros: s.micros,
+        }),
+        Value::UuidArray(items) => nth!(items, |u| Value::Uuid(*u)),
+        Value::BytesArray(items) => nth!(items, |b| Value::Bytes(Cow::Owned(b.clone()))),
+        _ => None,
+    }
+}

@@ -2947,7 +2947,7 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_1d_len(&args[0]) else {
+            let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "cardinality() arg must be an array, got {:?}",
@@ -3014,7 +3014,7 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_1d_len(&args[0]) else {
+            let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_length() first arg must be an array, got {:?}",
@@ -3060,7 +3060,7 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_1d_len(&args[0]) else {
+            let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "{name}() first arg must be an array, got {:?}",
@@ -3099,7 +3099,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                other => match array_1d_len(other) {
+                other => match array_len(other) {
                     // PG: an empty array has no dimensions → NULL; a 1-D
                     // array → 1 (SPG only models 1-D arrays).
                     Some(0) => Ok(Value::Null),
@@ -3122,7 +3122,7 @@ fn apply_function_dispatch(
             if matches!(&args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_1d_len(&args[0]) else {
+            let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_dims() needs array, got {:?}",
@@ -3149,91 +3149,26 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            // PG compares with IS NOT DISTINCT FROM semantics, so a
-            // NULL search value matches a NULL array element:
-            // `array_position(ARRAY[1,NULL,2], NULL)` → 2.
-            if matches!(args[1], Value::Null) {
-                let first_null = match &args[0] {
-                    Value::TextArray(items) => items.iter().position(Option::is_none),
-                    Value::IntArray(items) => items.iter().position(Option::is_none),
-                    Value::BigIntArray(items) => items.iter().position(Option::is_none),
-                    _ => None,
-                };
-                return Ok(match first_null {
-                    Some(idx) => Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)),
-                    None => Value::Null,
-                });
-            }
-            match (&args[0], &args[1]) {
-                (Value::TextArray(items), Value::Text(needle)) => {
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(s) = item
-                            && s == needle
-                        {
-                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
-                        }
-                    }
-                    Ok(Value::Null)
-                }
-                (Value::IntArray(items), needle_v)
-                    if matches!(
-                        needle_v,
-                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
-                    ) =>
-                {
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => unreachable!(),
-                    };
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(n) = item
-                            && i64::from(*n) == needle
-                        {
-                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
-                        }
-                    }
-                    Ok(Value::Null)
-                }
-                (Value::BigIntArray(items), needle_v)
-                    if matches!(
-                        needle_v,
-                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
-                    ) =>
-                {
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => unreachable!(),
-                    };
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(n) = item
-                            && *n == needle
-                        {
-                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
-                        }
-                    }
-                    Ok(Value::Null)
-                }
-                (
-                    arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)),
-                    other,
-                ) => Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_position() needle type {:?} doesn't match array {:?}",
-                        other.data_type(),
-                        arr.data_type()
-                    ),
-                }),
-                (other, _) => Err(EvalError::TypeMismatch {
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_position() first arg must be an array, got {:?}",
-                        other.data_type()
+                        args[0].data_type()
                     ),
-                }),
+                });
+            };
+            // PG compares with IS NOT DISTINCT FROM semantics across every
+            // element type (a NULL search value matches a NULL element:
+            // `array_position(ARRAY[1,NULL,2], NULL)` → 2), reusing the
+            // scalar `=` dispatch so cross-width numerics / date / uuid /
+            // bytea / interval / money / jsonb all match consistently.
+            for i in 0..len {
+                let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
+                if array_search_match(&elem, &args[1])? {
+                    return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                }
             }
+            Ok(Value::Null)
         }
         // v7.37.17 (17.6 siblings) — PG 16+ array_shuffle(arr)
         // returns a randomly-permuted copy. Fisher-Yates using the
@@ -3528,82 +3463,23 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_positions() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
+            };
+            // Same IS NOT DISTINCT FROM element match as array_position,
+            // across every element type — a NULL search value collects the
+            // positions of NULL elements (PG allows it here, unlike some
+            // array functions).
             let mut hits: alloc::vec::Vec<Option<i32>> = alloc::vec::Vec::new();
-            match (&args[0], &args[1]) {
-                (Value::TextArray(items), Value::Text(needle)) => {
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(s) = item
-                            && s == needle
-                        {
-                            hits.push(Some(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
-                        }
-                    }
-                }
-                (Value::IntArray(items), needle_v)
-                    if matches!(
-                        needle_v,
-                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
-                    ) =>
-                {
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => unreachable!(),
-                    };
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(n) = item
-                            && i64::from(*n) == needle
-                        {
-                            hits.push(Some(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
-                        }
-                    }
-                }
-                (Value::BigIntArray(items), needle_v)
-                    if matches!(
-                        needle_v,
-                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
-                    ) =>
-                {
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => unreachable!(),
-                    };
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(n) = item
-                            && *n == needle
-                        {
-                            hits.push(Some(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
-                        }
-                    }
-                }
-                (
-                    arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)),
-                    other,
-                ) => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array_positions() needle type {:?} doesn't match array {:?}",
-                            other.data_type(),
-                            arr.data_type()
-                        ),
-                    });
-                }
-                (other, _) => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array_positions() first arg must be an array, got {:?}",
-                            other.data_type()
-                        ),
-                    });
+            for i in 0..len {
+                let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
+                if array_search_match(&elem, &args[1])? {
+                    hits.push(Some(i32::try_from(i + 1).unwrap_or(i32::MAX)));
                 }
             }
             Ok(Value::IntArray(hits))
@@ -13681,30 +13557,29 @@ fn expect_text_arg<'a>(
 /// (year, month, day, hour, minute, second, microsecond).
 /// v7.38 (read01 U18) — element count of a 1-D array value, across every
 /// array element type SPG models. Returns `None` for non-array values.
-/// The dimension/length array functions (array_length / array_upper /
-/// array_lower / array_ndims / array_dims) are element-type-agnostic in
-/// PG, so they used to wrongly error on e.g. a `bool[]` / `date[]` /
-/// `numeric[]` argument that only the Text/Int/BigInt arms covered.
-fn array_1d_len(v: &Value) -> Option<usize> {
-    match v {
-        Value::TextArray(items)
-        | Value::VarcharArray(items)
-        | Value::CharArray(items)
-        | Value::JsonArray(items)
-        | Value::JsonbArray(items) => Some(items.len()),
-        Value::IntArray(items) => Some(items.len()),
-        Value::BigIntArray(items) => Some(items.len()),
-        Value::SmallIntArray(items) => Some(items.len()),
-        Value::BoolArray(items) => Some(items.len()),
-        Value::FloatArray(items) => Some(items.len()),
-        Value::NumericArray(items) => Some(items.len()),
-        Value::DateArray(items) => Some(items.len()),
-        Value::TimestampArray(items) | Value::TimestamptzArray(items) => Some(items.len()),
-        Value::MoneyArray(items) => Some(items.len()),
-        Value::IntervalArray(items) => Some(items.len()),
-        Value::UuidArray(items) => Some(items.len()),
-        Value::BytesArray(items) => Some(items.len()),
-        _ => None,
+/// PG `array_position` / `array_positions` element match: IS NOT
+/// DISTINCT FROM between an array element and the search value. A NULL
+/// element matches only a NULL search value; otherwise the scalar `=`
+/// dispatch (`apply_binary`) decides, so cross-width numerics and every
+/// scalar element type compare exactly as the `=` operator would.
+fn array_search_match(elem: &Value, needle: &Value) -> Result<bool, EvalError> {
+    match (matches!(elem, Value::Null), matches!(needle, Value::Null)) {
+        (true, true) => Ok(true),
+        (true, false) | (false, true) => Ok(false),
+        (false, false) => match apply_binary(
+            BinOp::Eq,
+            elem.clone().into_owned(),
+            needle.clone().into_owned(),
+        )? {
+            Value::Bool(b) => Ok(b),
+            Value::Null => Ok(false),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "array element comparison didn't return Bool: {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
     }
 }
 

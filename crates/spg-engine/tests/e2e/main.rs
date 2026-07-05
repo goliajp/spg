@@ -145,6 +145,7 @@ mod e2e_regexp_count;
 mod e2e_regexp_15plus_family;
 mod e2e_xact_id_probes;
 mod e2e_array_positions;
+mod e2e_array_position_element_types;
 mod e2e_array_remove_replace;
 mod e2e_bit_count;
 mod e2e_array_to_string;
