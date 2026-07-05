@@ -7707,11 +7707,14 @@ impl Parser {
                 grouping_universe = universe;
                 let primary = sets.first().cloned().unwrap_or_default();
                 grouping_sets = sets;
-                if primary.is_empty() {
-                    None
-                } else {
-                    Some(primary)
-                }
+                // The empty grouping set `()` is the grand-total group,
+                // NOT "no GROUP BY". Emit `Some(vec![])` so the engine's
+                // aggregate path runs (uses_aggregate keys off
+                // group_by.is_some()) and collapses every row into one
+                // group even when the projection carries no aggregate —
+                // `None` here would fall through to a plain per-row
+                // SELECT (PG: one grand-total row, not N rows).
+                Some(primary)
             } else {
                 let mut groups = Vec::new();
                 loop {
@@ -7845,11 +7848,10 @@ impl Parser {
                     .iter()
                     .filter(|u| !set.iter().any(|k| k == *u))
                     .collect();
-                peer.group_by = if set.is_empty() {
-                    None
-                } else {
-                    Some(set.clone())
-                };
+                // Empty set = grand-total group: `Some(vec![])` forces
+                // the aggregate path (one collapsed row) instead of a
+                // per-row passthrough. See the primary-set note above.
+                peer.group_by = Some(set.clone());
                 let dropped_owned: Vec<Expr> = dropped.iter().map(|d| (*d).clone()).collect();
                 for item in &mut peer.items {
                     if let SelectItem::Expr { expr, .. } = item {
