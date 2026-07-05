@@ -24,7 +24,7 @@ fn indexdef_reconstructs_create_index() {
     e.execute("CREATE TABLE ti (id INT, name TEXT)").unwrap();
     e.execute("CREATE INDEX idx_ti_name ON ti (name)").unwrap();
     let def = text(&first(&mut e, "SELECT pg_get_indexdef('idx_ti_name')"));
-    assert_eq!(def, "CREATE INDEX idx_ti_name ON public.ti (name)");
+    assert_eq!(def, "CREATE INDEX idx_ti_name ON public.ti USING btree (name)");
     // Matches the pg_indexes view's construction exactly.
     let view_def = text(&first(
         &mut e,
@@ -71,4 +71,45 @@ fn indexdef_unknown_is_null() {
         first(&mut e, "SELECT pg_get_indexdef(NULL::text)"),
         spg_storage::Value::Null
     ));
+}
+
+// read01 — pg_get_indexdef / pg_get_constraintdef accept a numeric OID
+// (the pg_index.indexrelid / pg_constraint.oid form pg_dump uses),
+// resolved via the same synth views that assign those OIDs.
+#[test]
+fn pg_get_def_by_oid() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE d (id INT PRIMARY KEY, a INT, UNIQUE(a))")
+        .unwrap();
+    e.execute("CREATE INDEX idx_d_a ON d (a)").unwrap();
+    // pg_get_indexdef(indexrelid) — the explicit index reconstructs.
+    let defs: Vec<String> = {
+        let r = e
+            .execute(
+                "SELECT pg_get_indexdef(indexrelid) FROM pg_index \
+                 WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 'd')",
+            )
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        rows.iter()
+            .filter_map(|row| match &row.values[0] {
+                spg_storage::Value::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        defs.iter().any(|d| d == "CREATE INDEX idx_d_a ON public.d USING btree (a)"),
+        "got {defs:?}"
+    );
+    // pg_get_constraintdef(oid) resolves the PK constraint by OID.
+    let pk = e
+        .execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'd') \
+               AND contype = 'p'",
+        )
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = pk else { panic!() };
+    assert!(matches!(&rows[0].values[0], spg_storage::Value::Text(s) if s.as_ref() == "PRIMARY KEY (id)"));
 }

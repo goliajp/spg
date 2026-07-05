@@ -11161,13 +11161,43 @@ fn apply_function_dispatch(
         // oids can't map (synthetic) → NULL. The 3-arg column form
         // returns the indexed column's name when col > 0.
         "pg_get_indexdef" => {
-            let name_arg = match args.first() {
-                None | Some(Value::Null) => return Ok(Value::Null),
-                Some(Value::Text(s)) => s.as_ref(),
-                Some(_) => return Ok(Value::Null),
-            };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
+            };
+            // Resolve a pg_class/pg_index OID to the index name by
+            // replaying synth_pg_index_raw's assignment (100000 + the
+            // running index count over table_names()), so the reverse
+            // tracks the forward exactly. A name arg is used directly.
+            let resolved: String;
+            let name_arg: &str = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)) => {
+                    let oid = match &args[0] {
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        Value::SmallInt(n) => i64::from(*n),
+                        _ => unreachable!(),
+                    };
+                    let mut counter = 100_000i64;
+                    let mut found = None;
+                    'find: for tname in cat.table_names() {
+                        let Some(t) = cat.get(&tname) else { continue };
+                        for idx in t.indices() {
+                            counter += 1;
+                            if counter == oid {
+                                found = Some(idx.name.clone());
+                                break 'find;
+                            }
+                        }
+                    }
+                    let Some(nm) = found else {
+                        return Ok(Value::Null);
+                    };
+                    resolved = nm;
+                    resolved.as_str()
+                }
+                Some(_) => return Ok(Value::Null),
             };
             let bare = name_arg
                 .strip_prefix("public.")
@@ -11185,26 +11215,29 @@ fn apply_function_dispatch(
                     if idx.name != bare {
                         continue;
                     }
-                    let col_name = t
-                        .schema()
-                        .columns
-                        .get(idx.column_position)
-                        .map_or_else(|| String::from("?"), |c| c.name.clone());
+                    let col_at = |pos: usize| -> String {
+                        t.schema()
+                            .columns
+                            .get(pos)
+                            .map_or_else(|| String::from("?"), |c| c.name.clone())
+                    };
+                    // Full ordered column list (leading + trailing keys).
+                    let mut positions = alloc::vec![idx.column_position];
+                    positions.extend(idx.extra_column_positions.iter().copied());
+                    let col_names: Vec<String> = positions.iter().map(|&p| col_at(p)).collect();
                     if col_no > 0 {
-                        // Column form: SPG indices are single-column
-                        // today, so only position 1 resolves.
-                        return Ok(if col_no == 1 {
-                            Value::text(col_name)
-                        } else {
-                            Value::Null
-                        });
+                        // Column form: the N-th (1-based) key column.
+                        return Ok(col_names.get((col_no - 1) as usize).map_or(
+                            Value::Null,
+                            |c| Value::text(c.clone()),
+                        ));
                     }
                     let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
                     return Ok(Value::text(alloc::format!(
-                        "CREATE {unique_kw}INDEX {} ON public.{} ({})",
+                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({})",
                         idx.name,
                         tname,
-                        col_name
+                        col_names.join(", ")
                     )));
                 }
             }
@@ -11216,13 +11249,39 @@ fn apply_function_dispatch(
         // ({t}_pkey / {t}_uniq{i} / fk.name-or-{t}_fk{i}).
         // Numeric-oid input can't map (synthetic) → NULL.
         "pg_get_constraintdef" => {
-            let name_arg = match args.first() {
-                None | Some(Value::Null) => return Ok(Value::Null),
-                Some(Value::Text(s)) => s.as_ref(),
-                Some(_) => return Ok(Value::Null),
-            };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
+            };
+            // The name is either given directly (Text) or reached through
+            // a pg_constraint OID. SPG has no OID space, so resolve the
+            // OID against the pg_constraint synth view itself — its OID
+            // assignment is the single source of truth, so the reverse
+            // can never drift from the forward.
+            let resolved: String;
+            let name_arg: &str = match args.first() {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => s.as_ref(),
+                Some(Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)) => {
+                    let oid = match &args[0] {
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        Value::SmallInt(n) => i64::from(*n),
+                        _ => unreachable!(),
+                    };
+                    let (_, rows) = crate::system_catalog::synth_pg_constraint(cat);
+                    let Some(row) = rows
+                        .iter()
+                        .find(|r| matches!(r.values.first(), Some(Value::BigInt(n)) if *n == oid))
+                    else {
+                        return Ok(Value::Null);
+                    };
+                    match row.values.get(1) {
+                        Some(Value::Text(s)) => resolved = s.to_string(),
+                        _ => return Ok(Value::Null),
+                    }
+                    resolved.as_str()
+                }
+                Some(_) => return Ok(Value::Null),
             };
             let bare = name_arg.trim_matches('"');
             for tname in cat.table_names() {
