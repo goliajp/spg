@@ -13714,6 +13714,9 @@ fn parse_by_format(
     let mut micros: u32 = 0;
     let mut pm_shift = false;
     let mut is_hh12 = false;
+    // v7.37 — `DDD` day-of-year, resolved to month/day after the loop (the
+    // year may appear after DDD in the format).
+    let mut doy: Option<u32> = None;
 
     let fmt_bytes: alloc::vec::Vec<char> = fmt.chars().collect();
     let in_bytes: alloc::vec::Vec<char> = input.chars().collect();
@@ -13780,6 +13783,13 @@ fn parse_by_format(
                 .ok_or_else(|| alloc::format!("expected month digits at position {ii}"))?;
             month = v as u32;
             fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "DDD") {
+            // Day of year (1-366); resolved to month/day post-loop. Must
+            // precede the `DD` arm which shares the prefix.
+            let v = take_digits(&in_bytes, &mut ii, 3)
+                .ok_or_else(|| alloc::format!("expected day-of-year digits at position {ii}"))?;
+            doy = Some(v as u32);
+            fi += 3;
         } else if starts_with_ci(&fmt_bytes, fi, "DD") {
             let v = take_digits(&in_bytes, &mut ii, 2)
                 .ok_or_else(|| alloc::format!("expected day digits at position {ii}"))?;
@@ -13849,6 +13859,17 @@ fn parse_by_format(
         } else if !pm_shift && hour == 12 {
             hour = 0;
         }
+    }
+    // v7.37 — resolve DDD (day of year) to month/day now that the year is
+    // known (Jan 1 + doy - 1).
+    if let Some(d) = doy {
+        if d < 1 || d > 366 {
+            return Err(alloc::format!("day-of-year {d} out of range"));
+        }
+        let abs = super::days_from_civil(year, 1, 1) + (d as i32) - 1;
+        let (_y, m, dd) = super::civil_from_days(abs);
+        month = m;
+        day = dd;
     }
     if !(1..=12).contains(&month) {
         return Err(alloc::format!("month {month} out of range"));

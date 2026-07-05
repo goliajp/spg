@@ -2756,3 +2756,20 @@ fn interval_clock_literal_and_tochar() {
     assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'SSSS')"), "52245");
     assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'DD HH24:MI')"), "03 14:30");
 }
+
+/// v7.37 D.63 — to_timestamp/to_date DDD day-of-year parsing. PG18.4-verified.
+#[test]
+fn to_timestamp_ddd_day_of_year() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    // DDD=064 → March 5 (Jan 31 + Feb 28 + 5)
+    assert_eq!(q(&mut e, "SELECT to_date('2026-064','YYYY-DDD')::text"), "2026-03-05");
+    // year after DDD
+    assert_eq!(q(&mut e, "SELECT to_date('064 2026','DDD YYYY')::text"), "2026-03-05");
+    // day 1 and day 365
+    assert_eq!(q(&mut e, "SELECT to_date('2026-001','YYYY-DDD')::text"), "2026-01-01");
+    assert_eq!(q(&mut e, "SELECT to_date('2024-060','YYYY-DDD')::text"), "2024-02-29"); // leap
+    // no regression on the plain forms
+    assert_eq!(q(&mut e, "SELECT to_date('2026-03-05','YYYY-MM-DD')::text"), "2026-03-05");
+    assert_eq!(q(&mut e, "SELECT to_date('05/03/2026','DD/MM/YYYY')::text"), "2026-03-05");
+}
