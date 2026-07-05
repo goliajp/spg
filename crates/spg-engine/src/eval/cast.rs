@@ -547,11 +547,28 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
                     detail: "timestamp out of DATE range".into(),
                 })
         }
-        Value::Text(s) => parse_date_literal(&s)
-            .map(Value::Date)
-            .ok_or(EvalError::TypeMismatch {
+        Value::Text(s) => {
+            if let Some(d) = parse_date_literal(&s) {
+                return Ok(Value::Date(d));
+            }
+            // PG accepts a full timestamp string in a DATE cast and
+            // truncates to the day (verified vs live PG18.4:
+            // `'2020-01-01 12:00:00'::date` → 2020-01-01; a bad time
+            // like `'... 25:00:00'` still raises). Reuse the timestamp
+            // parser — it validates the time-of-day + optional TZ — then
+            // floor to the date via the same path as the Timestamp arm.
+            if let Some(t) = parse_timestamp_literal(&s) {
+                let days = t.div_euclid(86_400_000_000);
+                return i32::try_from(days)
+                    .map(Value::Date)
+                    .map_err(|_| EvalError::TypeMismatch {
+                        detail: "timestamp out of DATE range".into(),
+                    });
+            }
+            Err(EvalError::TypeMismatch {
                 detail: format!("cannot parse {s:?} as DATE (expected YYYY-MM-DD)"),
-            }),
+            })
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to DATE", other.data_type()),
         }),
