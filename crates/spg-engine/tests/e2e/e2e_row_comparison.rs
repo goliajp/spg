@@ -58,3 +58,38 @@ fn arity_mismatch_errors() {
     let msg = format!("{err:?}");
     assert!(msg.contains("arity"), "unexpected error: {msg}");
 }
+
+// read01 U3/U4 sibling — the SQL row null predicate. `(row) IS NULL` is
+// true only when EVERY field is NULL; `(row) IS NOT NULL` only when every
+// field is non-NULL (a mixed row is neither). Values vs live PG 18.4.
+#[test]
+fn row_is_null_all_fields() {
+    let mut e = Engine::new();
+    assert!(!b(&mut e, "SELECT (1, NULL) IS NULL"));
+    assert!(b(&mut e, "SELECT (NULL, NULL) IS NULL"));
+    assert!(!b(&mut e, "SELECT (1, 2) IS NULL"));
+    // Three-element rows.
+    assert!(!b(&mut e, "SELECT (1, NULL, 3) IS NULL"));
+    assert!(b(&mut e, "SELECT (NULL, NULL, NULL) IS NULL"));
+}
+
+#[test]
+fn row_is_not_null_all_fields() {
+    let mut e = Engine::new();
+    // IS NOT NULL is all-fields-non-null, NOT the negation of IS NULL.
+    assert!(!b(&mut e, "SELECT (1, NULL) IS NOT NULL"));
+    assert!(b(&mut e, "SELECT (1, 2) IS NOT NULL"));
+    assert!(!b(&mut e, "SELECT (NULL, NULL) IS NOT NULL"));
+}
+
+#[test]
+fn row_is_null_over_columns() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE rn (a INT, b INT)").unwrap();
+    e.execute("INSERT INTO rn VALUES (1, 2), (3, NULL), (NULL, NULL)")
+        .unwrap();
+    // Only the all-NULL row satisfies (a,b) IS NULL.
+    assert!(b(&mut e, "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NULL"));
+    // Only the all-non-NULL row satisfies (a,b) IS NOT NULL.
+    assert!(b(&mut e, "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NOT NULL"));
+}
