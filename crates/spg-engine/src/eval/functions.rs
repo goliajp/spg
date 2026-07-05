@@ -1443,7 +1443,10 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Json(s) => {
+                // v7.37 D.49 — accept a TEXT arg too: PG implicitly casts an
+                // unknown-type string literal (`jsonb_array_length('[1,2]')`) to
+                // jsonb. Other jsonb builtins here already accept `Json | Text`.
+                Value::Json(s) | Value::Text(s) => {
                     let parsed = crate::json::parse(s).map_err(|e| {
                         EvalError::TypeMismatch {
                             detail: format!("{name}(): JSON parse failed: {e}"),
