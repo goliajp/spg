@@ -2173,6 +2173,53 @@ fn coerce_text_array_to(
 /// Parse a PG integer literal in text: decimal, plus the PG 16+ forms —
 /// radix prefixes (`0x1F` hex / `0o17` octal / `0b101` binary) and `_` digit
 /// separators (`1_000`). An optional leading sign applies to the magnitude.
+/// Map a built-in type OID to its SQL-standard name, PG's `format_type`
+/// / `oid::regtype` spelling (without the typmod). `None` for OIDs SPG
+/// doesn't recognise (callers render the numeric OID, as PG does for an
+/// unknown regtype). Shared by the `::regtype` cast and `format_type`.
+pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
+    Some(match oid {
+        16 => "boolean",
+        17 => "bytea",
+        18 => "\"char\"",
+        19 => "name",
+        20 => "bigint",
+        21 => "smallint",
+        23 => "integer",
+        25 => "text",
+        26 => "oid",
+        114 => "json",
+        142 => "xml",
+        650 => "cidr",
+        700 => "real",
+        701 => "double precision",
+        774 => "macaddr8",
+        790 => "money",
+        829 => "macaddr",
+        869 => "inet",
+        1042 => "character",
+        1043 => "character varying",
+        1082 => "date",
+        1083 => "time without time zone",
+        1114 => "timestamp without time zone",
+        1184 => "timestamp with time zone",
+        1186 => "interval",
+        1266 => "time with time zone",
+        1700 => "numeric",
+        2950 => "uuid",
+        3614 => "tsvector",
+        3615 => "tsquery",
+        3802 => "jsonb",
+        3904 => "int4range",
+        3906 => "numrange",
+        3908 => "tstzrange",
+        3910 => "tsrange",
+        3912 => "daterange",
+        3926 => "int8range",
+        _ => return None,
+    })
+}
+
 pub(crate) fn parse_pg_int(s: &str) -> Option<i64> {
     let s = s.trim();
     let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
