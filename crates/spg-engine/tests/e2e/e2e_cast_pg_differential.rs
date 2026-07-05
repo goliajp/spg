@@ -2827,3 +2827,30 @@ fn to_char_v_scale() {
     assert_eq!(q(&mut e, "SELECT to_char(1234.567,'9.9EEEE')"), " 1.2e+03");
     assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
 }
+
+/// v7.37 D.66 — to_char L currency symbol. PG18.4-verified (C locale → $).
+#[test]
+fn to_char_l_currency() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let cases = [
+        ("1234.5","L9999.99","$ 1234.50"),
+        ("1234.5","FML9999.99","$1234.5"),
+        ("1234.5","L99999.99","$  1234.50"),
+        ("-1234.5","L9999.99","$-1234.50"),
+        ("5","L9999","$    5"),
+        ("1234.5","FML99G999D99","$1,234.5"),
+        ("0","L9999.99","$     .00"),
+    ];
+    let mut bad = Vec::new();
+    for (n,f,pg) in &cases {
+        let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
+        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+    }
+    // no-regression: V, EEEE, trailing $, ordinary
+    assert_eq!(q(&mut e, "SELECT to_char(1.5,'9V9')"), " 15");
+    assert_eq!(q(&mut e, "SELECT to_char(1234.567,'9.9EEEE')"), " 1.2e+03");
+    assert_eq!(q(&mut e, "SELECT to_char(1234.5,'9999.99$')"), " 1234.50$");
+    assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
+    assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
+}

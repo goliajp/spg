@@ -801,6 +801,12 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     if has_pct {
         pat = &pat[..pat.len() - 1];
     }
+    // v7.37 — leading `L` currency locale symbol (C locale → `$`). Stripped
+    // here; the rest formats normally and `$` is prepended post-pass.
+    let has_currency = pat.starts_with(['L', 'l']);
+    if has_currency {
+        pat = &pat[1..];
+    }
     // v7.37 — trailing sign / literal suffixes (stripped here, applied
     // post-pass; the sign moves out of the leading column). Mutually
     // exclusive by construction. `MI` = minus-if-negative, `PL` =
@@ -997,6 +1003,9 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
     }
     if has_pct {
         out.push('%');
+    }
+    if has_currency {
+        out.insert(0, '$');
     }
     out
 }
