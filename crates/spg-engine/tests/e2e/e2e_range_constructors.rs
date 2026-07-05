@@ -86,3 +86,36 @@ fn numrange_and_daterange() {
         first(&mut e, "SELECT '[2003-01-01,2003-02-01)'::daterange")
     );
 }
+
+/// U26 (read01 A-group): discrete range types (int4/int8/date)
+/// canonicalize to the `[)` form; both the constructor functions and
+/// the `'…'::int4range` text-input path must agree. Continuous types
+/// (num/ts/tstz) keep their bounds. Every form asserted below was
+/// captured from live PG 18.4.
+#[test]
+fn discrete_range_canonicalization_matches_pg18() {
+    let mut e = Engine::new();
+    let r = |e: &mut Engine, sql: &str| text(&first(e, &format!("SELECT ({sql})::text")));
+    // int4/int8/date fold to [).
+    assert_eq!(r(&mut e, "int4range(1,3,'[]')"), "[1,4)");
+    assert_eq!(r(&mut e, "int4range(1,3,'()')"), "[2,3)");
+    assert_eq!(r(&mut e, "int4range(1,3)"), "[1,3)");
+    assert_eq!(r(&mut e, "int8range(1,3,'[]')"), "[1,4)");
+    assert_eq!(
+        r(&mut e, "daterange('2024-01-01','2024-01-03','[]')"),
+        "[2024-01-01,2024-01-04)"
+    );
+    // Continuous numrange keeps '[]'.
+    assert_eq!(r(&mut e, "numrange(1,3,'[]')"), "[1,3]");
+    // Empty via canonicalization collapse: (1,2) → [2,2) → empty.
+    assert_eq!(r(&mut e, "int4range(1,2,'()')"), "empty");
+    assert_eq!(r(&mut e, "int4range(1,1,'[]')"), "[1,2)");
+    // The constructor and the text-input path agree after both canonicalize.
+    assert_eq!(
+        first(&mut e, "SELECT int4range(1,3,'[]')"),
+        first(&mut e, "SELECT '[1,3]'::int4range")
+    );
+    // Infinite bound stays exclusive; finite side still folds.
+    assert_eq!(r(&mut e, "int4range(NULL,5,'[]')"), "(,6)");
+    assert_eq!(r(&mut e, "int4range(1,NULL,'[]')"), "[1,)");
+}

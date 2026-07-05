@@ -127,7 +127,12 @@ fn insert_int4range_closed_round_trips() {
         "INSERT INTO t VALUES (1, '[1,10]')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
+    // PG canonicalizes a discrete int4range to the `[)` form, so
+    // '[1,10]' round-trips as '[1,11)' (read01 U26). Live PG 18.4:
+    // `'[1,10]'::int4range` = `[1,11)`.
     let Value::Range {
+        lower,
+        upper,
         lower_inc,
         upper_inc,
         ..
@@ -135,8 +140,10 @@ fn insert_int4range_closed_round_trips() {
     else {
         panic!()
     };
+    assert_eq!(lower.as_deref(), Some(&Value::Int(1)));
+    assert_eq!(upper.as_deref(), Some(&Value::Int(11)));
     assert!(*lower_inc);
-    assert!(*upper_inc);
+    assert!(!*upper_inc);
 }
 
 #[test]
@@ -146,11 +153,14 @@ fn insert_int4range_unbounded_lower() {
         "INSERT INTO t VALUES (1, '(,10]')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { lower, upper, .. } = &rows[0][0] else {
+    let Value::Range { lower, upper, upper_inc, .. } = &rows[0][0] else {
         panic!()
     };
+    // Discrete canonicalization: '(,10]' → '(,11)' (read01 U26). The
+    // inclusive upper bumps to an exclusive 11; live PG 18.4 agrees.
     assert!(lower.is_none());
-    assert_eq!(upper.as_deref(), Some(&Value::Int(10)));
+    assert_eq!(upper.as_deref(), Some(&Value::Int(11)));
+    assert!(!*upper_inc);
 }
 
 #[test]

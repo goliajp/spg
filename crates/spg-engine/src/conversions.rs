@@ -784,6 +784,54 @@ pub fn format_text_2d_text_pub(
 /// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
 /// `'empty'`. Lower / upper may be empty (unbounded). Returns
 /// `None` on any parse failure; caller surfaces as hard error.
+/// v7.38 (read01 U26) — PG range canonicalization, shared by the
+/// `int4range(...)` constructors and the `'...'::int4range` text-input
+/// path so both agree. PG forces an infinite (missing) bound to be
+/// exclusive, then for DISCRETE element kinds (int4/int8/date) rewrites
+/// to the `[)` form: an exclusive lower bumps to inclusive lower+1, an
+/// inclusive upper bumps to exclusive upper+1 — so `[1,3]` becomes
+/// `[1,4)`. Continuous kinds (num/ts/tstz) keep their bounds. Returns
+/// the canonical `(lower, upper, lower_inc, upper_inc, empty)`, or
+/// `None` if a discrete successor overflows the element type.
+pub(crate) fn canonicalize_range_bounds(
+    kind: spg_storage::RangeKind,
+    lower: Option<Value<'static>>,
+    upper: Option<Value<'static>>,
+    lower_inc: bool,
+    upper_inc: bool,
+) -> Option<(Option<Value<'static>>, Option<Value<'static>>, bool, bool, bool)> {
+    use spg_storage::RangeKind as K;
+    // An infinite bound is always exclusive.
+    let mut lower_inc = lower.is_some() && lower_inc;
+    let mut upper_inc = upper.is_some() && upper_inc;
+    let mut lower = lower;
+    let mut upper = upper;
+    if matches!(kind, K::Int4 | K::Int8 | K::Date) {
+        fn succ(v: Value<'static>) -> Option<Value<'static>> {
+            Some(match v {
+                Value::Int(n) => Value::Int(n.checked_add(1)?),
+                Value::BigInt(n) => Value::BigInt(n.checked_add(1)?),
+                Value::Date(d) => Value::Date(d.checked_add(1)?),
+                other => other,
+            })
+        }
+        if let Some(l) = lower {
+            lower = Some(if lower_inc { l } else { succ(l)? });
+            lower_inc = true;
+        }
+        if let Some(u) = upper {
+            upper = Some(if upper_inc { succ(u)? } else { u });
+            upper_inc = false;
+        }
+    }
+    // Equal bounds that don't include both ends collapse to 'empty'.
+    let empty = match (&lower, &upper) {
+        (Some(l), Some(u)) => l == u && !(lower_inc && upper_inc),
+        _ => false,
+    };
+    Some((lower, upper, lower_inc, upper_inc, empty))
+}
+
 pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value<'static>> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("empty") {
@@ -815,20 +863,24 @@ pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<V
     let lower = if lo_text.is_empty() {
         None
     } else {
-        Some(alloc::boxed::Box::new(parse_range_element(lo_text, kind)?))
+        Some(parse_range_element(lo_text, kind)?)
     };
     let upper = if up_text.is_empty() {
         None
     } else {
-        Some(alloc::boxed::Box::new(parse_range_element(up_text, kind)?))
+        Some(parse_range_element(up_text, kind)?)
     };
+    // Canonicalize (discrete `[)` fold + infinite→exclusive) so text
+    // input agrees with the constructor functions.
+    let (lower, upper, lower_inc, upper_inc, empty) =
+        canonicalize_range_bounds(kind, lower, upper, lower_inc, upper_inc)?;
     Some(Value::Range {
         kind,
-        lower,
-        upper,
+        lower: lower.map(alloc::boxed::Box::new),
+        upper: upper.map(alloc::boxed::Box::new),
         lower_inc,
         upper_inc,
-        empty: false,
+        empty,
     })
 }
 
