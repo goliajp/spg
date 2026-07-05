@@ -11868,6 +11868,53 @@ fn apply_function_dispatch(
                 Some(Value::Int(n)) => i64::from(*n),
                 Some(Value::BigInt(n)) => *n,
                 Some(Value::SmallInt(n)) => i64::from(*n),
+                // SPG's `::regtype` yields the type NAME (no OID space),
+                // so format_type('int4'::regtype, …) arrives as Text.
+                // Map the internal / SQL spelling back to an OID and reuse
+                // the OID path (which also renders the typmod).
+                Some(Value::Text(s)) => {
+                    let name = s.trim().trim_start_matches("pg_catalog.").to_ascii_lowercase();
+                    match name.as_str() {
+                        "bool" | "boolean" => 16,
+                        "bytea" => 17,
+                        "\"char\"" | "char" => 18,
+                        "name" => 19,
+                        "int8" | "bigint" => 20,
+                        "int2" | "smallint" => 21,
+                        "int4" | "integer" | "int" => 23,
+                        "text" => 25,
+                        "oid" => 26,
+                        "json" => 114,
+                        "xml" => 142,
+                        "float4" | "real" => 700,
+                        "float8" | "double precision" => 701,
+                        "cidr" => 650,
+                        "inet" => 869,
+                        "macaddr" => 829,
+                        "macaddr8" => 774,
+                        "money" => 790,
+                        "bpchar" | "character" => 1042,
+                        "varchar" | "character varying" => 1043,
+                        "date" => 1082,
+                        "time" | "time without time zone" => 1083,
+                        "timestamp" | "timestamp without time zone" => 1114,
+                        "timestamptz" | "timestamp with time zone" => 1184,
+                        "interval" => 1186,
+                        "timetz" | "time with time zone" => 1266,
+                        "numeric" | "decimal" => 1700,
+                        "uuid" => 2950,
+                        "jsonb" => 3802,
+                        "tsvector" => 3614,
+                        "tsquery" => 3615,
+                        "int4range" => 3904,
+                        "numrange" => 3906,
+                        "tstzrange" => 3908,
+                        "tsrange" => 3910,
+                        "daterange" => 3912,
+                        "int8range" => 3926,
+                        _ => return Ok(Value::text(name)),
+                    }
+                }
                 Some(_) => return Ok(Value::Null),
             };
             let typmod = match args.get(1) {
