@@ -2335,11 +2335,25 @@ pub(crate) fn coerce_value(
         }
         // Text → DATE / TIMESTAMP: parse canonical text forms.
         (Value::Text(s), DataType::Date) => {
-            let d = eval::parse_date_literal(&s).ok_or_else(|| {
-                EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("cannot parse {s:?} as DATE for column `{col_name}`"),
+            // PG truncates a full timestamp string on the way into a
+            // DATE column (verified vs live PG18.4: INSERT
+            // '2020-01-01 12:00:00' into a date column stores
+            // 2020-01-01). Try the plain date parser first, then fall
+            // back to the timestamp parser (validates the time) floored
+            // to the day — mirroring the ::date cast path.
+            let d = eval::parse_date_literal(&s)
+                .or_else(|| {
+                    eval::parse_timestamp_literal(&s).and_then(|t| {
+                        i32::try_from(t.div_euclid(86_400_000_000)).ok()
+                    })
                 })
-            })?;
+                .ok_or_else(|| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot parse {s:?} as DATE for column `{col_name}`"
+                        ),
+                    })
+                })?;
             Some(Value::Date(d))
         }
         // v7.14.0 — MySQL DEFAULT clauses quote integer / float
