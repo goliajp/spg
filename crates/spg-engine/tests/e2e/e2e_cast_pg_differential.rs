@@ -2065,3 +2065,20 @@ fn derived_setop_group_and_cte() {
     // regression: plain (SELECT ... UNION ...) without inner parens still works
     assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM (SELECT 1 UNION SELECT 2) s(x)"), "1,2");
 }
+
+/// v7.37 D.20 follow-up — a (VALUES…) list as a set-op group operand, as a
+/// derived table. PG18.4-verified. Completes D.20.
+#[test]
+fn derived_values_group() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION (VALUES (2),(3))) s(x)"), "1,2,3");
+    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION ALL (VALUES (2),(3))) s(x)"), "1,2,2,3");
+    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY x) FROM ((VALUES ('a')) UNION (SELECT 'b')) s(x)"), "a,b");
+}
