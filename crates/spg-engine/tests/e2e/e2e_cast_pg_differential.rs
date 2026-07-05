@@ -2022,3 +2022,24 @@ fn substring_regex_form() {
     // silent wrong result.
     assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"), "ERR");
 }
+
+/// v7.37 D.25 — PG operator spellings of LIKE/ILIKE: ~~ / ~~* / !~~ / !~~*.
+/// PG18.4-verified. Regex ~ still works (distinct operator).
+#[test]
+fn like_operators() {
+    let mut e = Engine::new();
+    let b = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Bool(v)=>v.to_string(), Value::Text(s)=>s.to_string(), Value::Null=>"N".into(), o=>format!("{o:?}") },
+            Ok(_)=>"OK".into(), Err(_)=>"ERR".into(),
+        }
+    };
+    assert_eq!(b(&mut e, "SELECT 'hello' ~~ 'h%'"), "true");
+    assert_eq!(b(&mut e, "SELECT 'HELLO' ~~* 'h%'"), "true");
+    assert_eq!(b(&mut e, "SELECT 'hello' !~~ 'x%'"), "true");
+    assert_eq!(b(&mut e, "SELECT 'hello' !~~* 'X%'"), "true");
+    assert_eq!(b(&mut e, "SELECT 'hello' ~~ 'H%'"), "false");
+    assert_eq!(b(&mut e, "SELECT ('abc' ~ 'b')::text"), "true"); // regex ~ still distinct
+    assert_eq!(b(&mut e, "SELECT string_agg(v, ',' ORDER BY v) FROM (VALUES ('apple'),('banana'),('avocado')) t(v) WHERE v ~~ 'a%'"), "apple,avocado");
+}
