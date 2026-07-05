@@ -304,6 +304,31 @@ pub(super) fn pg_quote_ident(s: &str) -> String {
     out
 }
 
+/// PG `quote_literal(text)`: wrap `s` in single quotes, doubling any
+/// embedded single quote. When the string contains a backslash, PG
+/// emits the `E'…'` escape-string form with backslashes doubled, so
+/// the result stays a valid literal regardless of the reader's
+/// `standard_conforming_strings` setting — e.g. `quote_literal('c:\p')`
+/// → `E'c:\\p'`. This is the shared body for both `quote_literal` and
+/// the non-null branch of `quote_nullable`.
+pub(super) fn pg_quote_literal(s: &str) -> String {
+    let has_backslash = s.contains('\\');
+    let mut out = String::with_capacity(s.len() + 4);
+    if has_backslash {
+        out.push('E');
+    }
+    out.push('\'');
+    for ch in s.chars() {
+        match ch {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() {
         return Err(EvalError::TypeMismatch {

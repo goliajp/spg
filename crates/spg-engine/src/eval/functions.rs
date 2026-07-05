@@ -11930,21 +11930,27 @@ fn apply_function_dispatch(
             Some(Value::Null) | None => Ok(Value::Null),
             Some(other) => Ok(Value::text(pg_quote_ident(&value_to_format_text(other)))),
         },
+        // quote_literal / quote_nullable are the anyelement→text cast
+        // followed by literal-quoting, so non-text values render as PG's
+        // `::text` cast would (bool → true/false, not the t/f wire form;
+        // numbers/date/timestamp via the canonical renderer) rather than
+        // leaking a Rust debug dump. pg_quote_literal handles the E'…'
+        // backslash-escape form for both.
         "quote_literal" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
-            Some(Value::Text(s)) => {
-                let escaped = s.replace('\'', "''");
-                Ok(Value::text(alloc::format!("'{escaped}'")))
+            Some(Value::Text(s)) => Ok(Value::text(pg_quote_literal(s))),
+            Some(Value::Bool(b)) => {
+                Ok(Value::text(pg_quote_literal(if *b { "true" } else { "false" })))
             }
-            Some(other) => Ok(Value::text(alloc::format!("'{other:?}'"))),
+            Some(other) => Ok(Value::text(pg_quote_literal(&value_to_format_text(other)))),
         },
         "quote_nullable" => match args.first() {
             None | Some(Value::Null) => Ok(Value::text::<String>("NULL".into())),
-            Some(Value::Text(s)) => {
-                let escaped = s.replace('\'', "''");
-                Ok(Value::text(alloc::format!("'{escaped}'")))
+            Some(Value::Text(s)) => Ok(Value::text(pg_quote_literal(s))),
+            Some(Value::Bool(b)) => {
+                Ok(Value::text(pg_quote_literal(if *b { "true" } else { "false" })))
             }
-            Some(other) => Ok(Value::text(alloc::format!("'{other:?}'"))),
+            Some(other) => Ok(Value::text(pg_quote_literal(&value_to_format_text(other)))),
         },
         // format_type(type_oid [, typmod]) — REAL: canonical SQL
         // display names for the pg_type oid map SPG ships, with

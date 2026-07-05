@@ -70,8 +70,8 @@ use resolve::{
 };
 pub(crate) use resolve::{column_collation, find_column_pos};
 use strings::{
-    TrimSide, format_string, pg_quote_ident, pg_typeof_name, string_left_right, string_pad,
-    string_trim, to_char, value_to_format_text,
+    TrimSide, format_string, pg_quote_ident, pg_quote_literal, pg_typeof_name, string_left_right,
+    string_pad, string_trim, to_char, value_to_format_text,
 };
 pub use textsearch::{
     decode_tsquery_external, decode_tsvector_external, format_tsquery, format_tsvector,

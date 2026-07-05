@@ -69,6 +69,44 @@ fn to_regclass_missing_relation_is_null() {
     ));
 }
 
+/// U24 (read01 A-group): quote_literal / quote_nullable on a
+/// non-text argument used to leak a Rust debug dump
+/// (`quote_literal(42)` → `'Int(42)'`). PG performs the
+/// anyelement→text cast then literal-quotes. Every expected value
+/// below was captured live from PG 18.4 (`psql -tAc`).
+#[test]
+fn quote_literal_non_text_matches_pg18() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| match first(e, sql) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        spg_storage::Value::Null => "NULL".to_string(),
+        other => panic!("{sql}: got {other:?}"),
+    };
+    // Numbers / bool / temporal — no debug leak.
+    assert_eq!(q(&mut e, "SELECT quote_literal(42)"), "'42'");
+    assert_eq!(q(&mut e, "SELECT quote_literal(3.14)"), "'3.14'");
+    assert_eq!(q(&mut e, "SELECT quote_literal(12345678901234::bigint)"), "'12345678901234'");
+    assert_eq!(q(&mut e, "SELECT quote_literal(1.5::numeric)"), "'1.5'");
+    // bool renders as the ::text cast (true/false), not the t/f wire form.
+    assert_eq!(q(&mut e, "SELECT quote_literal(true)"), "'true'");
+    assert_eq!(q(&mut e, "SELECT quote_literal(false)"), "'false'");
+    assert_eq!(q(&mut e, "SELECT quote_literal(DATE '2024-01-15')"), "'2024-01-15'");
+    assert_eq!(
+        q(&mut e, "SELECT quote_literal(TIMESTAMP '2024-01-15 10:30:00')"),
+        "'2024-01-15 10:30:00'"
+    );
+    // Backslash triggers PG's E'…' escape-string form (both text and
+    // non-text inputs). PG18: quote_literal('c:\p') = E'c:\\p'.
+    assert_eq!(q(&mut e, "SELECT quote_literal('c:\\path')"), "E'c:\\\\path'");
+    assert_eq!(q(&mut e, "SELECT quote_literal('a\\b''c')"), "E'a\\\\b''c'");
+    // Embedded quote still doubled without backslash.
+    assert_eq!(q(&mut e, "SELECT quote_literal('a''b')"), "'a''b'");
+    // quote_nullable mirrors quote_literal for non-null, NULL→'NULL'.
+    assert_eq!(q(&mut e, "SELECT quote_nullable(42)"), "'42'");
+    assert_eq!(q(&mut e, "SELECT quote_nullable(true)"), "'true'");
+    assert_eq!(q(&mut e, "SELECT quote_nullable(NULL::int)"), "NULL");
+}
+
 #[test]
 fn recovery_and_encoding_probes() {
     let mut e = Engine::new();
