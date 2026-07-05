@@ -108,8 +108,24 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
                 Ok(Value::text(bare))
             }
-            Value::Int(n) => Ok(Value::text(alloc::format!("{n}"))),
-            Value::BigInt(n) => Ok(Value::text(alloc::format!("{n}"))),
+            // A numeric OID → its type name for `::regtype` (the common
+            // `atttypid::regtype` column-type-name shape). `::regclass`
+            // needs a catalog reverse-lookup for user relations, which
+            // this cast has no access to, so it keeps rendering the OID.
+            Value::Int(_) | Value::BigInt(_) => {
+                let n = match v {
+                    Value::Int(n) => i64::from(n),
+                    Value::BigInt(n) => n,
+                    _ => unreachable!(),
+                };
+                if matches!(target, CastTarget::RegType)
+                    && let Some(name) = crate::conversions::regtype_oid_to_name(n)
+                {
+                    Ok(Value::text::<String>(name.into()))
+                } else {
+                    Ok(Value::text(alloc::format!("{n}")))
+                }
+            }
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {:?}",

@@ -11923,49 +11923,9 @@ fn apply_function_dispatch(
                 Some(Value::SmallInt(n)) => i64::from(*n),
                 _ => -1,
             };
-            // PG's deparse names (format_type uses SQL-standard
-            // spellings, not the internal typname).
-            let base: Option<&str> = match oid {
-                16 => Some("boolean"),
-                17 => Some("bytea"),
-                18 => Some("\"char\""),
-                19 => Some("name"),
-                20 => Some("bigint"),
-                21 => Some("smallint"),
-                23 => Some("integer"),
-                25 => Some("text"),
-                26 => Some("oid"),
-                114 => Some("json"),
-                142 => Some("xml"),
-                700 => Some("real"),
-                701 => Some("double precision"),
-                650 => Some("cidr"),
-                869 => Some("inet"),
-                829 => Some("macaddr"),
-                774 => Some("macaddr8"),
-                790 => Some("money"),
-                1042 => Some("character"),
-                1043 => Some("character varying"),
-                1082 => Some("date"),
-                1083 => Some("time without time zone"),
-                1114 => Some("timestamp without time zone"),
-                1184 => Some("timestamp with time zone"),
-                1186 => Some("interval"),
-                1266 => Some("time with time zone"),
-                1700 => Some("numeric"),
-                2950 => Some("uuid"),
-                3802 => Some("jsonb"),
-                3614 => Some("tsvector"),
-                3615 => Some("tsquery"),
-                3904 => Some("int4range"),
-                3906 => Some("numrange"),
-                3908 => Some("tstzrange"),
-                3910 => Some("tsrange"),
-                3912 => Some("daterange"),
-                3926 => Some("int8range"),
-                _ => None,
-            };
-            let Some(base) = base else {
+            // PG's deparse names (SQL-standard spellings, not the
+            // internal typname) — shared with the `::regtype` cast.
+            let Some(base) = crate::conversions::regtype_oid_to_name(oid) else {
                 return Ok(Value::text::<String>("???".into()));
             };
             let rendered = if typmod >= 4 {

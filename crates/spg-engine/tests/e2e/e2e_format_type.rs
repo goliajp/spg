@@ -92,3 +92,21 @@ fn format_type_accepts_regtype_name() {
     );
     assert_eq!(text(&first(&mut e, "SELECT format_type('bool'::regtype, NULL)")), "boolean");
 }
+
+// read01 — a numeric OID cast to `::regtype` renders the type name (the
+// common `atttypid::regtype` shape from pg_attribute introspection);
+// an unrecognised OID renders the number, as PG does. vs live PG 18.4.
+#[test]
+fn regtype_numeric_oid_renders_type_name() {
+    let mut e = Engine::new();
+    assert_eq!(text(&first(&mut e, "SELECT 23::regtype::text")), "integer");
+    assert_eq!(text(&first(&mut e, "SELECT 1043::regtype::text")), "character varying");
+    assert_eq!(text(&first(&mut e, "SELECT 20::regtype::text")), "bigint");
+    assert_eq!(
+        text(&first(&mut e, "SELECT 1114::regtype::text")),
+        "timestamp without time zone"
+    );
+    assert_eq!(text(&first(&mut e, "SELECT 3802::regtype::text")), "jsonb");
+    // Unknown OID falls back to the number.
+    assert_eq!(text(&first(&mut e, "SELECT 99999::regtype::text")), "99999");
+}
