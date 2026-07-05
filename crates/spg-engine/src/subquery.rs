@@ -483,15 +483,15 @@ impl Engine {
                         break;
                     }
                 }
-                let bit = if found {
-                    !*negated
-                } else if any_null {
-                    return Err(EngineError::Unsupported(
-                        "IN-subquery with NULL in result and no match: NULL semantics not yet implemented".into(),
-                    ));
-                } else {
-                    *negated
-                };
+                if !found && any_null {
+                    // SQL three-valued logic: no match but the IN-list held a
+                    // NULL → the predicate is UNKNOWN (NULL), not false. This is
+                    // the classic `x NOT IN (… NULL …)` gotcha — every non-match
+                    // row evaluates to NULL and is filtered. PG-verified.
+                    *e = Expr::Literal(Literal::Null);
+                    return Ok(());
+                }
+                let bit = if found { !*negated } else { *negated };
                 *e = Expr::Literal(Literal::Bool(bit));
             }
             Expr::Binary { lhs, rhs, .. } => {
