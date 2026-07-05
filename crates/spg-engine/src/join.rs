@@ -2888,9 +2888,15 @@ fn substitute_outer_in_select(
     outer_row: &Row<'static>,
     outer_schema: &[ColumnSchema],
 ) {
+    // A FROM-less SELECT (`LATERAL (SELECT <outer col> …)`) has no inner
+    // scope of its own, so an unqualified column in its projection /
+    // predicates must resolve to the outer row. A SELECT with a FROM
+    // keeps the conservative qualified-only rule: bare names resolve
+    // against its own tables first (PG lexical scoping).
+    let bare = stmt.from.is_none();
     for item in &mut stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
-            substitute_outer_in_expr(expr, outer_row, outer_schema);
+            substitute_outer_in_expr(expr, outer_row, outer_schema, bare);
         }
     }
     // v7.37.43-T4.5 — walk FROM-side SRF argument expressions
@@ -2903,23 +2909,23 @@ fn substitute_outer_in_select(
         for j in &mut from.joins {
             substitute_outer_in_table_ref(&mut j.table, outer_row, outer_schema);
             if let Some(on) = &mut j.on {
-                substitute_outer_in_expr(on, outer_row, outer_schema);
+                substitute_outer_in_expr(on, outer_row, outer_schema, bare);
             }
         }
     }
     if let Some(w) = &mut stmt.where_ {
-        substitute_outer_in_expr(w, outer_row, outer_schema);
+        substitute_outer_in_expr(w, outer_row, outer_schema, bare);
     }
     if let Some(gs) = &mut stmt.group_by {
         for g in gs {
-            substitute_outer_in_expr(g, outer_row, outer_schema);
+            substitute_outer_in_expr(g, outer_row, outer_schema, bare);
         }
     }
     if let Some(h) = &mut stmt.having {
-        substitute_outer_in_expr(h, outer_row, outer_schema);
+        substitute_outer_in_expr(h, outer_row, outer_schema, bare);
     }
     for o in &mut stmt.order_by {
-        substitute_outer_in_expr(&mut o.expr, outer_row, outer_schema);
+        substitute_outer_in_expr(&mut o.expr, outer_row, outer_schema, bare);
     }
     for (_, peer) in &mut stmt.unions {
         substitute_outer_in_select(peer, outer_row, outer_schema);
@@ -2931,15 +2937,18 @@ fn substitute_outer_in_table_ref(
     outer_row: &Row<'static>,
     outer_schema: &[ColumnSchema],
 ) {
+    // A set-returning FROM item's argument is evaluated with no inner
+    // scope, so its unqualified column refs are outer refs
+    // (`LATERAL unnest(<outer array col>)`).
     if let Some((_, arg)) = t.jsonb_each_text_arg.as_mut() {
-        substitute_outer_in_expr(arg, outer_row, outer_schema);
+        substitute_outer_in_expr(arg, outer_row, outer_schema, true);
     }
     if let Some(arg) = t.unnest_expr.as_deref_mut() {
-        substitute_outer_in_expr(arg, outer_row, outer_schema);
+        substitute_outer_in_expr(arg, outer_row, outer_schema, true);
     }
     if let Some(args) = t.generate_series_args.as_mut() {
         for a in args.iter_mut() {
-            substitute_outer_in_expr(a, outer_row, outer_schema);
+            substitute_outer_in_expr(a, outer_row, outer_schema, true);
         }
     }
     if let Some(inner) = t.lateral_subquery.as_deref_mut() {
@@ -2947,76 +2956,142 @@ fn substitute_outer_in_table_ref(
     }
 }
 
-fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row<'static>, outer_schema: &[ColumnSchema]) {
-    if let Expr::Column(c) = e
-        && let Some(qual) = &c.qualifier
-    {
-        let composite = alloc::format!("{qual}.{}", c.name);
-        if let Some(idx) = outer_schema
-            .iter()
-            .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
-        {
-            let v = outer_row.values.get(idx).cloned().unwrap_or(Value::Null);
-            // Array values have no Literal form — materialise as an
-            // ARRAY[…] constructor of element literals so a
-            // correlated `unnest(t.arr_col)` substitutes per row.
-            let lit = match v {
-                Value::TextArray(items) => Some(Expr::Array(
-                    items
-                        .into_iter()
-                        .map(|it| {
-                            Expr::Literal(match it {
-                                Some(s) => spg_sql::ast::Literal::String(s),
-                                None => spg_sql::ast::Literal::Null,
-                            })
-                        })
-                        .collect(),
-                )),
-                Value::IntArray(items) => Some(Expr::Array(
-                    items
-                        .into_iter()
-                        .map(|it| {
-                            Expr::Literal(match it {
-                                Some(n) => spg_sql::ast::Literal::Integer(i64::from(n)),
-                                None => spg_sql::ast::Literal::Null,
-                            })
-                        })
-                        .collect(),
-                )),
-                Value::BigIntArray(items) => Some(Expr::Array(
-                    items
-                        .into_iter()
-                        .map(|it| {
-                            Expr::Literal(match it {
-                                Some(n) => spg_sql::ast::Literal::Integer(n),
-                                None => spg_sql::ast::Literal::Null,
-                            })
-                        })
-                        .collect(),
-                )),
-                other => value_to_literal_expr(other).ok(),
-            };
-            if let Some(lit) = lit {
-                *e = lit;
-                return;
+/// Index of the outer column a reference targets, or `None`. Qualified
+/// refs (`outer_alias.col`) match the composite outer-schema name. When
+/// `bare_ok` — i.e. the expression is evaluated with no inner FROM scope
+/// of its own (a FROM-less LATERAL subquery, or a set-returning FROM
+/// item's argument) — an *unqualified* ref also resolves to the outer
+/// scope, matching the bare column against the last segment of each
+/// outer name, but only when that match is unique (an ambiguous bare ref
+/// is left for the normal resolver to reject, as PG does).
+fn outer_col_index(
+    outer_schema: &[ColumnSchema],
+    qualifier: Option<&str>,
+    name: &str,
+    bare_ok: bool,
+) -> Option<usize> {
+    match qualifier {
+        Some(q) => {
+            let composite = alloc::format!("{q}.{name}");
+            outer_schema
+                .iter()
+                .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
+        }
+        None if bare_ok => {
+            let mut found = None;
+            for (i, sc) in outer_schema.iter().enumerate() {
+                let bare = sc.name.rsplit('.').next().unwrap_or(sc.name.as_str());
+                if bare.eq_ignore_ascii_case(name) {
+                    if found.is_some() {
+                        return None; // ambiguous — don't guess
+                    }
+                    found = Some(i);
+                }
             }
+            found
+        }
+        None => None,
+    }
+}
+
+/// Materialise an outer-row value as a substitutable `Expr`. Array values
+/// have no scalar `Literal` form, so they become an `ARRAY[…]`
+/// constructor of element literals — this is what lets a correlated
+/// `unnest(<outer array>)` expand per row.
+fn outer_value_to_expr(v: Value<'static>) -> Option<Expr> {
+    match v {
+        Value::TextArray(items) => Some(Expr::Array(
+            items
+                .into_iter()
+                .map(|it| {
+                    Expr::Literal(match it {
+                        Some(s) => spg_sql::ast::Literal::String(s),
+                        None => spg_sql::ast::Literal::Null,
+                    })
+                })
+                .collect(),
+        )),
+        Value::IntArray(items) => Some(Expr::Array(
+            items
+                .into_iter()
+                .map(|it| {
+                    Expr::Literal(match it {
+                        Some(n) => spg_sql::ast::Literal::Integer(i64::from(n)),
+                        None => spg_sql::ast::Literal::Null,
+                    })
+                })
+                .collect(),
+        )),
+        Value::BigIntArray(items) => Some(Expr::Array(
+            items
+                .into_iter()
+                .map(|it| {
+                    Expr::Literal(match it {
+                        Some(n) => spg_sql::ast::Literal::Integer(n),
+                        None => spg_sql::ast::Literal::Null,
+                    })
+                })
+                .collect(),
+        )),
+        other => value_to_literal_expr(other).ok(),
+    }
+}
+
+fn substitute_outer_in_expr(
+    e: &mut Expr,
+    outer_row: &Row<'static>,
+    outer_schema: &[ColumnSchema],
+    bare_ok: bool,
+) {
+    if let Expr::Column(c) = e
+        && let Some(idx) = outer_col_index(outer_schema, c.qualifier.as_deref(), &c.name, bare_ok)
+    {
+        let v = outer_row.values.get(idx).cloned().unwrap_or(Value::Null);
+        if let Some(lit) = outer_value_to_expr(v) {
+            *e = lit;
+            return;
         }
     }
+    let mut rec = |e: &mut Expr| substitute_outer_in_expr(e, outer_row, outer_schema, bare_ok);
     match e {
         Expr::Binary { lhs, rhs, .. } => {
-            substitute_outer_in_expr(lhs, outer_row, outer_schema);
-            substitute_outer_in_expr(rhs, outer_row, outer_schema);
+            rec(lhs);
+            rec(rhs);
         }
-        Expr::Unary { expr: inner, .. } => {
-            substitute_outer_in_expr(inner, outer_row, outer_schema);
-        }
+        Expr::Unary { expr: inner, .. } => rec(inner),
         Expr::FunctionCall { args, .. } => {
             for a in args {
-                substitute_outer_in_expr(a, outer_row, outer_schema);
+                rec(a);
             }
         }
-        Expr::Cast { expr: inner, .. } => {
-            substitute_outer_in_expr(inner, outer_row, outer_schema);
+        Expr::Cast { expr: inner, .. } => rec(inner),
+        // v7.38 (read01 LATERAL) — recurse the array/subscript nodes too,
+        // so `LATERAL unnest(ARRAY[<outer col>, …])` and `arr[<outer>]`
+        // substitute the outer reference (previously these fell through
+        // to the no-op arm, stranding the reference unresolved).
+        Expr::Array(items) => {
+            for it in items {
+                rec(it);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            rec(target);
+            rec(index);
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            rec(target);
+            if let Some(lo) = lo {
+                rec(lo);
+            }
+            if let Some(hi) = hi {
+                rec(hi);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            rec(expr);
+            for it in list {
+                rec(it);
+            }
         }
         Expr::Case {
             operand,
@@ -3024,14 +3099,14 @@ fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row<'static>, outer_schema
             else_branch,
         } => {
             if let Some(op) = operand {
-                substitute_outer_in_expr(op, outer_row, outer_schema);
+                rec(op);
             }
             for (cond, val) in branches {
-                substitute_outer_in_expr(cond, outer_row, outer_schema);
-                substitute_outer_in_expr(val, outer_row, outer_schema);
+                rec(cond);
+                rec(val);
             }
             if let Some(e) = else_branch {
-                substitute_outer_in_expr(e, outer_row, outer_schema);
+                rec(e);
             }
         }
         _ => {}
