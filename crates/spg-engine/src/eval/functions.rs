@@ -11374,16 +11374,13 @@ fn apply_function_dispatch(
                     }
                     return Ok(Value::text(def));
                 }
-                // CHECK constraints — mirror synth_pg_constraint's naming
-                // (`{t}_check` / `{t}_check{i}`). PG wraps the predicate in
-                // an outer `CHECK (…)`.
+                // CHECK constraints — mirror synth_pg_constraint's PG-style
+                // naming (`{t}_{col}_check` / `{t}_check`). PG wraps the
+                // predicate in an outer `CHECK (…)`.
+                let check_names =
+                    crate::system_catalog::pg_check_connames(t, &tname, &t.schema().checks);
                 for (ci, pred) in t.schema().checks.iter().enumerate() {
-                    let conname = if ci == 0 {
-                        alloc::format!("{tname}_check")
-                    } else {
-                        alloc::format!("{tname}_check{ci}")
-                    };
-                    if conname != bare {
+                    if check_names.get(ci).map(String::as_str) != Some(bare) {
                         continue;
                     }
                     let inner = pred.trim();

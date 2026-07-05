@@ -38,6 +38,79 @@ pub(crate) fn pg_unique_conname(
     alloc::format!("{tname}_{cols}_key")
 }
 
+/// Distinct table columns referenced by a CHECK predicate string, in
+/// first-seen order. A lightweight quote-aware identifier scan (skips
+/// single-quoted string literals) matched against the table's column
+/// names — enough to reproduce PG's CHECK auto-naming without a full
+/// re-parse.
+fn referenced_columns(t: &spg_storage::Table, check: &str) -> Vec<String> {
+    let bytes = check.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &check[start..i];
+            if let Some(col) = t
+                .schema()
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(ident))
+                && !found.iter().any(|f| f.eq_ignore_ascii_case(&col.name))
+            {
+                found.push(col.name.clone());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// PG's auto-generated names for a table's CHECK constraints, in
+/// declaration order. A check over exactly one column is
+/// `{table}_{col}_check`; a multi-column / table-level check is
+/// `{table}_check`. Collisions get PG's `1`, `2`, … suffix. Shared so
+/// every synth view and pg_get_constraintdef agree.
+pub(crate) fn pg_check_connames(t: &spg_storage::Table, tname: &str, checks: &[String]) -> Vec<String> {
+    let mut seen: alloc::collections::BTreeMap<String, usize> =
+        alloc::collections::BTreeMap::new();
+    let mut out = Vec::with_capacity(checks.len());
+    for chk in checks {
+        let cols = referenced_columns(t, chk);
+        let base = if cols.len() == 1 {
+            alloc::format!("{tname}_{}_check", cols[0])
+        } else {
+            alloc::format!("{tname}_check")
+        };
+        let count = seen.entry(base.clone()).or_insert(0);
+        out.push(if *count == 0 {
+            base.clone()
+        } else {
+            alloc::format!("{base}{count}")
+        });
+        *count += 1;
+    }
+    out
+}
+
 /// v7.16.2 — map an SPG [`DataType`] to the PG-canonical
 /// `information_schema.columns.data_type` text. Covers the
 /// values mailrs's migrations probe (`'ARRAY'`, `'integer'`,
@@ -2799,12 +2872,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously
         // omitted, so pg_constraint enumeration missed every CHECK.
-        for (ci, _pred) in t.schema().checks.iter().enumerate() {
-            let conname = if ci == 0 {
-                alloc::format!("{tname}_check")
-            } else {
-                alloc::format!("{tname}_check{ci}")
-            };
+        let check_names = pg_check_connames(t, &tname, &t.schema().checks);
+        for conname in check_names {
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),

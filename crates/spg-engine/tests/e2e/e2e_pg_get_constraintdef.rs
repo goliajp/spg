@@ -71,7 +71,7 @@ fn constraintdef_check_and_not_null() {
         .unwrap();
     // CHECK — PG wraps the predicate: `CHECK ((a > 0))`.
     assert_eq!(
-        text(&first(&mut e, "SELECT pg_get_constraintdef('cc_check')")),
+        text(&first(&mut e, "SELECT pg_get_constraintdef('cc_a_check')")),
         "CHECK ((a > 0))"
     );
     // NOT NULL — one per NOT NULL column.
@@ -128,4 +128,46 @@ fn unique_constraint_pg_naming() {
         panic!()
     };
     assert!(matches!(rows[0].values[0], spg_storage::Value::BigInt(1)));
+}
+
+// read01 — CHECK auto-names follow PG: single-column check
+// `{t}_{col}_check`, multi-column `{t}_check` (+ collision suffix), with
+// string literals skipped. vs live PG 18.4.
+#[test]
+fn check_constraint_pg_naming() {
+    let mut e = Engine::new();
+    e.execute(
+        "CREATE TABLE ck (a INT CHECK (a > 0), b INT, c INT, \
+         CHECK (b > c), CHECK (a + b > 0))",
+    )
+    .unwrap();
+    let names = {
+        let r = e
+            .execute(
+                "SELECT conname FROM pg_constraint \
+                 WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck') \
+                   AND contype = 'c' ORDER BY conname",
+            )
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        rows.iter()
+            .filter_map(|row| match &row.values[0] {
+                spg_storage::Value::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // a>0 → ck_a_check; b>c and a+b>0 are multi-column → ck_check / ck_check1.
+    assert_eq!(names, ["ck_a_check", "ck_check", "ck_check1"]);
+    // A column name inside a string literal is not matched.
+    e.execute("CREATE TABLE q (name TEXT CHECK (name <> 'x'))")
+        .unwrap();
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT conname FROM pg_constraint \
+             WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'q') AND contype = 'c'",
+        )),
+        "q_name_check"
+    );
 }
