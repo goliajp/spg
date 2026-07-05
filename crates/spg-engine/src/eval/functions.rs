@@ -1220,7 +1220,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Json(s) => {
+                // v7.37 D.49 — accept a TEXT arg (PG casts an unknown-type string
+                // literal to jsonb).
+                Value::Json(s) | Value::Text(s) => {
                     let mut parsed =
                         crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
                             detail: format!("{name}(): JSON parse failed: {e}"),
@@ -1406,7 +1408,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Json(s) => {
+                // v7.37 D.49 — accept a TEXT arg (PG casts an unknown-type string
+                // literal to jsonb).
+                Value::Json(s) | Value::Text(s) => {
                     let trimmed = s.trim_start();
                     let type_name = if let Some(first) = trimmed.chars().next() {
                         match first {
