@@ -622,7 +622,17 @@ impl Engine {
                     .collect::<Vec<Row<'static>>>(),
             )
         };
-        let (source_cols, source_rows) = {
+        let (source_cols, source_rows) = if let Some(sub) = &stmt.source_select {
+            // v7.37 D.44 — `USING (SELECT …) alias` subquery source: materialise
+            // the SELECT and use its result columns/rows as the merge input.
+            let QueryResult::Rows { columns, rows } = self.exec_select_cancel(sub, cancel)?
+            else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "MERGE USING subquery did not return rows"
+                )));
+            };
+            (columns, rows)
+        } else {
             let s = self.active_catalog().get(&stmt.source).ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.source.clone(),

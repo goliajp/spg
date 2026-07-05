@@ -2033,6 +2033,11 @@ pub struct MergeStatement {
     pub target_alias: Option<String>,
     pub source: String,
     pub source_alias: Option<String>,
+    /// v7.37 D.44 — `USING (SELECT …) alias` subquery source. When present,
+    /// the engine materialises this SELECT for the source rows and `source`
+    /// is empty; the alias (required by PG for a subquery source) is in
+    /// `source_alias`. `None` = plain `USING <table>` (source names a table).
+    pub source_select: Option<Box<SelectStatement>>,
     pub on: Expr,
     pub clauses: Vec<MergeWhenClause>,
 }
@@ -3201,7 +3206,11 @@ impl fmt::Display for Statement {
                     write!(f, " {}", quote_ident(a))?;
                 }
                 f.write_str(" USING ")?;
-                write!(f, "{}", quote_ident(&s.source))?;
+                if let Some(sub) = &s.source_select {
+                    write!(f, "({sub})")?;
+                } else {
+                    write!(f, "{}", quote_ident(&s.source))?;
+                }
                 if let Some(a) = &s.source_alias {
                     write!(f, " {}", quote_ident(a))?;
                 }
