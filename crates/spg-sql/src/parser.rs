@@ -6692,6 +6692,7 @@ impl Parser {
             "pg_namespace",
             "pg_proc",
             "pg_roles",
+            "pg_sequence",
             "pg_settings",
             "pg_trigger",
             "pg_type",
