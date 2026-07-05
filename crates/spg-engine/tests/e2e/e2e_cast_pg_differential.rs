@@ -2660,3 +2660,19 @@ fn to_char_ordinal_and_percent() {
     assert_eq!(q(&mut e, "SELECT to_char(1234567.891, 'FM999,999,999.00')"), "1,234,567.89");
     assert_eq!(q(&mut e, "SELECT to_char(-1234.5, 'FM999,990.00PR')"), "<1,234.50>");
 }
+
+/// v7.37 D.58 — to_char timestamp SSSS (seconds-of-day) + FF1-FF6 fractional. PG18.4-verified.
+#[test]
+fn to_char_ts_ssss_and_ff() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    // PG18.4: SSSS=52245, FF3=14:30:45.123, FF6=...123456, FF1=...1
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'SSSS')"), "52245");
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'HH24:MI:SS.FF3')"), "14:30:45.123");
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF6')"), "123456");
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF1')"), "1");
+    // no regression: plain SS still works
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', 'HH24:MI:SS')"), "14:30:45");
+    // midnight SSSS=0
+    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 00:00:00', 'SSSS')"), "0");
+}
