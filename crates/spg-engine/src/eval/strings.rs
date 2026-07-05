@@ -992,6 +992,9 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     // `FM` prefix suppresses the leading zeros / blank padding of the
     // one field it precedes.
     let mut fm = false;
+    // v7.37 — the numeric value emitted by the immediately preceding field,
+    // so a following `TH`/`th` renders its ordinal suffix (e.g. `DDth` → 21st).
+    let mut last_num: Option<i128> = None;
     // write! against a String never fails — discard the Result.
     while i < bytes.len() {
         // Try the longest prefixes first so "YYYY" wins over "YY".
@@ -1021,6 +1024,10 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         // trailing blanks; the width is the longest member (9 for
         // day/month names, 4 for roman months).
         let pad = |width: usize| if fm { None } else { Some(width) };
+        // Ordinal pending from the previous field (see `last_num`); `take`
+        // clears it so a non-`TH` field drops the pending suffix.
+        let pending_ord = last_num.take();
+        let mut next_num: Option<i128> = None;
         // Numeric fields honour FM by dropping the zero pad.
         macro_rules! num {
             ($val:expr, $width:literal) => {{
@@ -1029,6 +1036,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
                 } else {
                     let _ = write!(out, "{:0width$}", $val, width = $width);
                 }
+                next_num = Some(i128::from($val));
             }};
         }
         let mut consumed = 2usize;
@@ -1138,10 +1146,43 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             out.push_str(&cased_name(MONTH_ROMAN[(mo - 1) as usize], false, true, pad(4)));
         } else if rest.starts_with(b"HH") {
             num!(hh12, 2);
+        } else if rest.starts_with(b"A.M.") || rest.starts_with(b"P.M.") {
+            // v7.37 — dotted meridiem (uppercase). PG renders the actual
+            // half-day regardless of which spelling was requested.
+            out.push_str(if hh24 < 12 { "A.M." } else { "P.M." });
+            consumed = 4;
+        } else if rest.starts_with(b"a.m.") || rest.starts_with(b"p.m.") {
+            out.push_str(if hh24 < 12 { "a.m." } else { "p.m." });
+            consumed = 4;
+        } else if rest.starts_with(b"B.C.") || rest.starts_with(b"A.D.") {
+            // v7.37 — dotted era. Proleptic year <= 0 is BC; PG shows the
+            // actual era regardless of the requested spelling.
+            out.push_str(if i64::from(y) <= 0 { "B.C." } else { "A.D." });
+            consumed = 4;
+        } else if rest.starts_with(b"b.c.") || rest.starts_with(b"a.d.") {
+            out.push_str(if i64::from(y) <= 0 { "b.c." } else { "a.d." });
+            consumed = 4;
         } else if rest.starts_with(b"AM") || rest.starts_with(b"PM") {
             out.push_str(ampm);
         } else if rest.starts_with(b"am") || rest.starts_with(b"pm") {
             out.push_str(if hh24 < 12 { "am" } else { "pm" });
+        } else if rest.starts_with(b"BC") || rest.starts_with(b"AD") {
+            // v7.37 — era indicator (uppercase, no dots).
+            out.push_str(if i64::from(y) <= 0 { "BC" } else { "AD" });
+        } else if rest.starts_with(b"bc") || rest.starts_with(b"ad") {
+            out.push_str(if i64::from(y) <= 0 { "bc" } else { "ad" });
+        } else if (rest.starts_with(b"TH") || rest.starts_with(b"th"))
+            && pending_ord.is_some()
+        {
+            // v7.37 — ordinal suffix for the preceding numeric field
+            // (`DDth` → 21st, `HH12th` → 02nd). Only fires right after a
+            // number; a bare `th`/`TH` still passes through as a literal.
+            let suf = ordinal_suffix(pending_ord.unwrap_or(0));
+            if rest.starts_with(b"TH") {
+                out.push_str(&suf.to_ascii_uppercase());
+            } else {
+                out.push_str(suf);
+            }
         } else if rest.starts_with(b"Y") || rest.starts_with(b"I") {
             // Single-digit year / ISO-year (last digit).
             let base = if rest[0] == b'I' { iso_year } else { i64::from(y) };
@@ -1155,6 +1196,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             consumed = 1;
         } else if rest.starts_with(b"D") {
             let _ = write!(out, "{dow_sun1}");
+            next_num = Some(i128::from(dow_sun1));
             consumed = 1;
         } else if rest.starts_with(b"J") {
             let _ = write!(out, "{julian}");
@@ -1167,6 +1209,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             // A literal byte doesn't consume the pending FM.
             continue;
         }
+        last_num = next_num;
         fm = false;
         i += consumed;
     }
