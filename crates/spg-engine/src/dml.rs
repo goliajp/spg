@@ -129,6 +129,69 @@ impl Engine {
             rewritten.table = base;
             return self.exec_update_cancel(&rewritten, cancel);
         }
+        // v7.37 D.47 (partial) — UPDATE on a partition parent fans out to every
+        // child (the parent holds no rows of its own, so a parent-targeted UPDATE
+        // would otherwise affect nothing). An UPDATE whose SET list touches the
+        // partition-key column may move a row across a partition boundary, which
+        // needs row movement (delete-from-source + reinsert-through-routing) — a
+        // focused follow-up. Until then, reject a key-touching parent UPDATE
+        // honestly rather than fan it out in place and leave a row in the wrong
+        // partition (silent-wrong). A non-key UPDATE is always safe to fan out.
+        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
+            let key_cols: Vec<String> = {
+                let parent = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?;
+                match &parent.schema().partition_role {
+                    Some(spg_storage::PartitionRole::Parent {
+                        key_column_positions,
+                        ..
+                    }) => key_column_positions
+                        .iter()
+                        .filter_map(|&p| parent.schema().columns.get(p).map(|c| c.name.clone()))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            let touches_key = stmt
+                .assignments
+                .iter()
+                .any(|(col, _)| key_cols.iter().any(|k| k.eq_ignore_ascii_case(col)));
+            if touches_key {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "UPDATE on partition parent {:?} that changes a partition-key \
+                     column may move a row across partitions (row movement is a \
+                     focused follow-up) — UPDATE the child partition directly, or \
+                     use DELETE + INSERT",
+                    stmt.table
+                )));
+            }
+            let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            let mut total_affected = 0usize;
+            let mut ret_columns: Option<Vec<ColumnSchema>> = None;
+            let mut ret_rows: Vec<Row<'static>> = Vec::new();
+            for child in children {
+                let mut child_stmt = stmt.clone();
+                child_stmt.table = child;
+                match self.exec_update_cancel(&child_stmt, cancel)? {
+                    QueryResult::CommandOk { affected, .. } => total_affected += affected,
+                    QueryResult::Rows { columns, rows } => {
+                        total_affected += rows.len();
+                        ret_columns = Some(columns);
+                        ret_rows.extend(rows);
+                    }
+                }
+            }
+            return Ok(match ret_columns {
+                Some(columns) => QueryResult::Rows { columns, rows: ret_rows },
+                None => QueryResult::CommandOk {
+                    affected: total_affected,
+                    modified_catalog: true,
+                },
+            });
+        }
         // v7.12.5 — snapshot BEFORE/AFTER UPDATE row triggers + the
         // session FTS config before the table mut-borrow opens (the
         // INSERT path uses the same pattern). Empty vecs are the
