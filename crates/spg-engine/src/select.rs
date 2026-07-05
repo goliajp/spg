@@ -1683,8 +1683,10 @@ impl Engine {
         head.unions = Vec::new();
         head.order_by = Vec::new();
         head.limit = None;
-        let QueryResult::Rows { columns, mut rows } =
-            self.exec_bare_select_cancel(&head, cancel)?
+        let QueryResult::Rows {
+            mut columns,
+            mut rows,
+        } = self.exec_bare_select_cancel(&head, cancel)?
         else {
             unreachable!("bare SELECT cannot return CommandOk")
         };
@@ -1711,6 +1713,16 @@ impl Engine {
                     columns.len(),
                     peer_cols.len()
                 )));
+            }
+            // v7.37 D.26 — a UNION result column is nullable when ANY branch is
+            // nullable (PG semantics). Previously the result kept only the head's
+            // nullability, so `VALUES (1),(NULL)` (a UNION-ALL chain seeded by the
+            // non-null `1`) wrongly reported the column NOT NULL, which let
+            // `count(col)`'s NOT-NULL fast-path count the NULL row.
+            for (i, pc) in peer_cols.iter().enumerate() {
+                if pc.nullable {
+                    columns[i].nullable = true;
+                }
             }
             match kind {
                 UnionKind::All => rows.extend(peer_rows),

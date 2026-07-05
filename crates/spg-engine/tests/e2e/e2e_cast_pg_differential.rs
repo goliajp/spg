@@ -2107,3 +2107,29 @@ fn mixed_srf_in_projection() {
     e.execute("INSERT INTO mt VALUES (1, ARRAY[10,20]),(2,ARRAY[30])").unwrap();
     assert_eq!(q(&mut e, "SELECT string_agg(id||':'||u, ',' ORDER BY id, u) FROM (SELECT id, unnest(tags) u FROM mt) s"), "1:10,1:20,2:30");
 }
+
+/// v7.37 D.26 — count(col) over a VALUES/UNION-derived table excludes NULL rows.
+/// The union result column is nullable when any branch is. PG18.4-verified.
+#[test]
+fn count_col_over_values_excludes_null() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
+            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+        }
+    };
+    // count(col) over VALUES with a NULL → 2 (was 3)
+    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (VALUES (1),(NULL),(3)) t(v)"), "2");
+    // explicit UNION ALL with a NULL branch
+    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (SELECT 1 v UNION ALL SELECT NULL UNION ALL SELECT 3) t"), "2");
+    // count(col) with no NULLs still all rows
+    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (VALUES (1),(2),(3)) t(v)"), "3");
+    // real-table count(col) with NULL unchanged (was already correct)
+    e.execute("CREATE TABLE ct2(v int)").unwrap();
+    e.execute("INSERT INTO ct2 VALUES (1),(NULL),(3)").unwrap();
+    assert_eq!(q(&mut e, "SELECT count(v)::text FROM ct2"), "2");
+    // count(*) over VALUES counts all rows including NULL
+    assert_eq!(q(&mut e, "SELECT count(*)::text FROM (VALUES (1),(NULL),(3)) t(v)"), "3");
+}
