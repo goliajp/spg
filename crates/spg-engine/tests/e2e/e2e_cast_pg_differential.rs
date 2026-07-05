@@ -2340,3 +2340,19 @@ fn window_aggregate_filter() {
     // plain OVER without FILTER unchanged (regression)
     assert_eq!(q(&mut e, "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) OVER () c FROM t WHERE g=1) s"), "10:4,20:4,20:4,30:4");
 }
+
+/// v7.37 D.41 — SELECT DISTINCT dedups over a window projection. PG18.4-verified.
+#[test]
+fn distinct_over_window() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(g int, v int)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(2,5),(2,15),(3,7)").unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Null=>"".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT g||':'||(count(*) OVER (PARTITION BY g)) x FROM t) s"), "1:3,2:2,3:1");
+    assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM (SELECT DISTINCT g, sum(v) OVER (PARTITION BY g) FROM t) s)::text"), "3");
+    assert_eq!(q(&mut e, "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT (rank() OVER (ORDER BY g))::text x FROM t) s"), "1,4,6");
+    // plain DISTINCT (no window) unchanged
+    assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM (SELECT DISTINCT g FROM t) s)::text"), "3");
+}
