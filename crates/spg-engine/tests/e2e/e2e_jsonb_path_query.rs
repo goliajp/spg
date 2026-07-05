@@ -24,7 +24,7 @@ fn path_query_root() {
         e.execute(r#"SELECT jsonb_path_query('{"k":1}'::JSONB, '$')"#)
             .unwrap(),
     );
-    assert_eq!(text_array(&r[0][0]), vec![Some(r#"{"k":1}"#.into())]);
+    assert_eq!(text_array(&r[0][0]), vec![Some(r#"{"k": 1}"#.into())]);
 }
 
 #[test]

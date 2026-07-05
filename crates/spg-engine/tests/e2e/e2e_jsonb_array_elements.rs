@@ -28,7 +28,7 @@ fn texts(got: &[Vec<spg_storage::Value<'static>>]) -> Vec<Option<String>> {
 fn from_jsonb_array_elements_rows() {
     let mut e = Engine::new();
     // PG doc vector: jsonb_array_elements('[1,true, [2,false]]')
-    // → 1 / true / [2, false] (as jsonb, rendered compact here).
+    // → 1 / true / [2, false] (as jsonb, canonical form).
     let got = rows(
         &mut e,
         "SELECT value FROM jsonb_array_elements('[1, true, [2, false]]')",
@@ -38,7 +38,7 @@ fn from_jsonb_array_elements_rows() {
         [
             Some("1".to_string()),
             Some("true".to_string()),
-            Some("[2,false]".to_string())
+            Some("[2, false]".to_string())
         ]
     );
 }

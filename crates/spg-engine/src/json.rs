@@ -175,13 +175,19 @@ fn accessor_result(v: &JsonValue, as_text: bool) -> Value<'static> {
     if as_text && !matches!(v, JsonValue::Array(_) | JsonValue::Object(_)) {
         return Value::text(v.as_text());
     }
-    let mut s = String::new();
-    write_json_canonical(v, &mut s);
+    let s = json_canonical_string(v);
     if as_text {
         Value::text(s)
     } else {
         Value::json(s)
     }
+}
+
+/// Serialise a `JsonValue` in PG's canonical jsonb text form.
+fn json_canonical_string(v: &JsonValue) -> String {
+    let mut s = String::new();
+    write_json_canonical(v, &mut s);
+    s
 }
 
 fn write_json_canonical(v: &JsonValue, out: &mut String) {
@@ -331,11 +337,11 @@ pub fn each_rows(
                         | JsonValue::NumberText(_)
                         | JsonValue::String(_) => Some(v.as_text()),
                         JsonValue::Array(_) | JsonValue::Object(_) => {
-                            Some(v.to_json_text())
+                            Some(json_canonical_string(&v))
                         }
                     }
                 } else {
-                    Some(v.to_json_text())
+                    Some(json_canonical_string(&v))
                 };
                 out.push((k, text));
             }
@@ -394,11 +400,12 @@ pub fn array_element_rows(
                         | JsonValue::NumberText(_)
                         | JsonValue::String(_) => Some(v.as_text()),
                         JsonValue::Array(_) | JsonValue::Object(_) => {
-                            Some(v.to_json_text())
+                            Some(json_canonical_string(&v))
                         }
                     }
                 } else {
-                    Some(v.to_json_text())
+                    // Plain form renders each element as canonical jsonb.
+                    Some(json_canonical_string(&v))
                 };
                 out.push(text);
             }
@@ -1280,7 +1287,7 @@ pub fn path_query(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError
     let matches = apply_jsonpath(&root, &steps);
     let arr: Vec<Option<String>> = matches
         .into_iter()
-        .map(|v| Some(v.to_json_text()))
+        .map(|v| Some(json_canonical_string(&v)))
         .collect();
     Ok(Value::TextArray(arr))
 }
