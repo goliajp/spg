@@ -2773,3 +2773,29 @@ fn to_timestamp_ddd_day_of_year() {
     assert_eq!(q(&mut e, "SELECT to_date('2026-03-05','YYYY-MM-DD')::text"), "2026-03-05");
     assert_eq!(q(&mut e, "SELECT to_date('05/03/2026','DD/MM/YYYY')::text"), "2026-03-05");
 }
+
+/// v7.37 D.64 — to_char EEEE scientific notation. PG18.4-verified.
+#[test]
+fn to_char_eeee_scientific() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let cases = [
+        ("1234.567","9.9EEEE"," 1.2e+03"),
+        ("1234.567","9.99EEEE"," 1.23e+03"),
+        ("1234.567","9EEEE"," 1e+03"),
+        ("-1234.567","9.9EEEE","-1.2e+03"),
+        ("0","9.9EEEE"," 0.0e+00"),
+        ("0.001234","9.99EEEE"," 1.23e-03"),
+        ("9.99","9.9EEEE"," 10.0e+00"),
+        ("1000000","9.999EEEE"," 1.000e+06"),
+        ("5","9.9EEEE"," 5.0e+00"),
+    ];
+    let mut bad = Vec::new();
+    for (n,f,pg) in &cases {
+        let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
+        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+    }
+    // no regression on ordinary numeric to_char
+    assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
+    assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
+}
