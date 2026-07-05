@@ -2467,3 +2467,27 @@ fn delete_on_partition_parent() {
     e.execute("DELETE FROM l WHERE c IN ('a','z')").unwrap();
     assert_eq!(g(&mut e, "SELECT string_agg(id||':'||c,',' ORDER BY id) FROM l"), "3:b,4:y");
 }
+
+/// v7.37 D.47 (partial) — UPDATE on a partition parent fans out to children for
+/// non-key SET lists; a key-touching UPDATE is rejected (row movement is a
+/// follow-up). PG18.4-verified for the fan-out cases.
+#[test]
+fn update_on_partition_parent_nonkey() {
+    let mut e = Engine::new();
+    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
+    e.execute("CREATE TABLE t(id int, g int, label text) PARTITION BY RANGE (g)").unwrap();
+    e.execute("CREATE TABLE t_lo PARTITION OF t FOR VALUES FROM (0) TO (10)").unwrap();
+    e.execute("CREATE TABLE t_hi PARTITION OF t FOR VALUES FROM (10) TO (20)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,5,'a'),(2,15,'b'),(3,8,'c')").unwrap();
+    // non-key UPDATE with WHERE fans out and applies SET in each child
+    let u1 = e.execute("UPDATE t SET label = upper(label) WHERE g < 10").unwrap();
+    assert!(matches!(u1, QueryResult::CommandOk { affected: 2, .. }), "{u1:?}");
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g||':'||label, ',' ORDER BY id) FROM t"), "1:5:A,2:15:b,3:8:C");
+    // non-key UPDATE with no WHERE touches every child row
+    e.execute("UPDATE t SET label = 'X'").unwrap();
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||label, ',' ORDER BY id) FROM t"), "1:X,2:X,3:X");
+    // key-touching UPDATE on the parent is rejected honestly (not silently misfiled)
+    assert!(e.execute("UPDATE t SET g = 17 WHERE id = 1").is_err());
+    // the rejected UPDATE left the data untouched
+    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM t"), "1:5,2:15,3:8");
+}
