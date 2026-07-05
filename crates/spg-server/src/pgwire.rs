@@ -3056,6 +3056,15 @@ struct CopyOptions {
     /// NULL; extra keys are ignored. Default (no FORMAT) is the
     /// existing tab-delimited text mode.
     pub format_json: bool,
+    /// `FORMAT CSV` — RFC-4180-style records: quoted fields, doubled
+    /// quotes, embedded delimiters/newlines inside quotes, and an
+    /// unquoted empty field reads as NULL while `""` is the empty
+    /// string. Mutually exclusive with `format_json`.
+    pub format_csv: bool,
+    /// CSV `DELIMITER 'c'` (default `,`).
+    pub csv_delimiter: Option<char>,
+    /// CSV `QUOTE 'c'` (default `"`).
+    pub csv_quote: Option<char>,
 }
 
 /// Detects `COPY <table> [(col1, col2, …)] FROM STDIN [WITH
@@ -3191,15 +3200,42 @@ fn parse_copy_options(lower: &str) -> CopyOptions {
                     opts.on_error_set_null = true;
                 }
             }
-            "format" => {
-                if val == "json" {
-                    opts.format_json = true;
+            "format" => match val {
+                "json" => opts.format_json = true,
+                "csv" => opts.format_csv = true,
+                _ => {}
+            },
+            // `HEADER [true|on]` (or bare `HEADER`) skips the first data
+            // row — the CSV header line. Reuses the SKIP machinery.
+            "header" => {
+                if val.is_empty() || val == "true" || val == "on" {
+                    opts.skip = opts.skip.max(1);
                 }
+            }
+            "delimiter" => {
+                opts.csv_delimiter = unquote_copy_char(val);
+            }
+            "quote" => {
+                opts.csv_quote = unquote_copy_char(val);
             }
             _ => {}
         }
     }
     opts
+}
+
+/// Strip the surrounding quotes from a COPY option value like `','` or
+/// `'#'` and return the single character. Returns `None` if the value
+/// is not exactly one character (PG requires single-character DELIMITER
+/// / QUOTE).
+fn unquote_copy_char(val: &str) -> Option<char> {
+    let s = val.trim_matches(|c| c == '\'' || c == '"');
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(c)
 }
 
 /// COPY FROM STDIN — server sends CopyInResponse, reads CopyData
@@ -3321,6 +3357,54 @@ fn process_copy_chunk(
     skipped: &mut u64,
     opts: &CopyOptions,
 ) -> Result<(), String> {
+    // FORMAT CSV: records are delimited by a newline that is NOT inside
+    // a quoted field, so split with the quote-aware boundary scanner
+    // rather than the plain `\n` split the text/JSON path uses.
+    if opts.format_csv {
+        let delim = opts.csv_delimiter.unwrap_or(',') as u8;
+        let quote = opts.csv_quote.unwrap_or('"') as u8;
+        while let Some(end) = spg_engine::copy::csv_record_end(buf, delim, quote) {
+            let record: Vec<u8> = buf.drain(..end).collect();
+            // Drop the terminating '\n' and an optional preceding '\r'.
+            let mut rec = &record[..record.len() - 1];
+            if rec.last() == Some(&b'\r') {
+                rec = &rec[..rec.len() - 1];
+            }
+            if rec == b"\\." {
+                return Ok(());
+            }
+            if rec.is_empty() {
+                continue;
+            }
+            let row_text =
+                std::str::from_utf8(rec).map_err(|_| "COPY row not valid UTF-8".to_string())?;
+            if *skipped < opts.skip {
+                *skipped += 1;
+                continue;
+            }
+            let values = spg_engine::copy::decode_copy_csv_record(
+                row_text,
+                delim as char,
+                quote as char,
+                "",
+            );
+            let sql = build_copy_insert(table, &values);
+            let mut engine = state
+                .engine
+                .write()
+                .map_err(|_| "engine rwlock poisoned".to_string())?;
+            match engine.execute(&sql) {
+                Ok(_) => *inserted += 1,
+                Err(e) => {
+                    if opts.on_error_set_null {
+                        continue;
+                    }
+                    return Err(format!("COPY row INSERT failed: {e}"));
+                }
+            }
+        }
+        return Ok(());
+    }
     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=nl).collect();
         let line = &line[..line.len() - 1]; // strip the '\n'
@@ -5087,6 +5171,35 @@ mod tests {
         assert!(parse_copy_intent("SELECT 1").is_none());
         // File-based COPY: pgwire intentionally doesn't handle.
         assert!(parse_copy_intent("COPY t FROM '/etc/passwd'").is_none());
+    }
+
+    #[test]
+    fn parse_copy_from_csv_options() {
+        let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER true, DELIMITER ';', QUOTE '#')";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::From(table, opts)) => {
+                assert_eq!(table, "t");
+                assert!(opts.format_csv);
+                assert!(!opts.format_json);
+                assert_eq!(opts.skip, 1); // HEADER → skip the header row
+                assert_eq!(opts.csv_delimiter, Some(';'));
+                assert_eq!(opts.csv_quote, Some('#'));
+            }
+            other => panic!("expected From(t) csv opts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_from_bare_csv_header() {
+        // Bare HEADER (no boolean) still skips the header row.
+        let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER)";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::From(_, opts)) => {
+                assert!(opts.format_csv);
+                assert_eq!(opts.skip, 1);
+            }
+            other => panic!("expected csv, got {other:?}"),
+        }
     }
 
     /// v7.37.5 α — `decode_binary_param` OID 2950 (UUID) round-trips the
