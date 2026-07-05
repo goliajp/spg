@@ -618,14 +618,10 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
 /// `jsonb = jsonb` structural equality (PG18-compatible). PG's jsonb
 /// equality is order-INDEPENDENT for object keys but order-SENSITIVE
 /// for array elements, and it compares numbers by value (so
-/// `'1'::jsonb = '1.0'::jsonb`). `json_eq` already encodes exactly
-/// those rules; this just parses both operands and delegates.
-///
-/// Two documented representation divergences (tracked by the jsonb
-/// normalization slices, out of scope here) can make SPG disagree
-/// with PG on corner inputs: SPG preserves DUPLICATE object keys
-/// where PG keeps only the last, so `'{"a":1,"a":2}' = '{"a":2}'` is
-/// PG-true but SPG-false. Non-dup, well-formed documents match PG.
+/// `'1'::jsonb = '1.0'::jsonb` is true). `json_eq` encodes those rules;
+/// this parses both operands and delegates. Values reaching here through
+/// the `::jsonb` cast / a jsonb column are already canonicalised (keys
+/// sorted, duplicates collapsed), so object equality is exact.
 pub fn equals(lhs: &Value, rhs: &Value) -> Result<bool, EvalError> {
     let lhs_text = match lhs {
         Value::Json(s) | Value::Text(s) => s.as_ref(),
@@ -675,12 +671,14 @@ fn json_eq(a: &JsonValue, b: &JsonValue) -> bool {
         (JsonValue::Null, JsonValue::Null) => true,
         (JsonValue::Bool(x), JsonValue::Bool(y)) => x == y,
         (JsonValue::String(x), JsonValue::String(y)) => x == y,
-        (JsonValue::Number(x), JsonValue::Number(y)) => (x - y).abs() < 1e-12,
-        (JsonValue::NumberText(x), JsonValue::NumberText(y)) => x == y,
-        (JsonValue::NumberText(x), JsonValue::Number(y))
-        | (JsonValue::Number(y), JsonValue::NumberText(x)) => {
-            x.parse::<f64>().is_ok_and(|xn| (xn - y).abs() < 1e-12)
-        }
+        // PG compares jsonb numbers by value, not by lexeme, so
+        // `1` == `1.0` == `1e0` and `1.50` == `1.5`. Normalise both to
+        // an exact numeric-equality key (canonical decimal with trailing
+        // zeros stripped) rather than a lossy f64 subtraction.
+        (
+            JsonValue::Number(_) | JsonValue::NumberText(_),
+            JsonValue::Number(_) | JsonValue::NumberText(_),
+        ) => json_number_key(a) == json_number_key(b),
         (JsonValue::Array(x), JsonValue::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_eq(a, b))
         }
@@ -690,6 +688,27 @@ fn json_eq(a: &JsonValue, b: &JsonValue) -> bool {
                     .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && json_eq(v, v2)))
         }
         _ => false,
+    }
+}
+
+/// Normalise a JSON number to a key where numerically-equal values share
+/// one string (`1` / `1.0` / `1e0` → `1`, `1.50` → `1.5`), so jsonb `=`
+/// and containment compare numbers by value like PG — exactly, without
+/// f64 rounding.
+fn numeric_eq_key(lexeme: &str) -> String {
+    let c = canon_json_number(lexeme);
+    if c.contains('.') {
+        c.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        c
+    }
+}
+
+fn json_number_key(v: &JsonValue) -> Option<String> {
+    match v {
+        JsonValue::NumberText(s) => Some(numeric_eq_key(s)),
+        JsonValue::Number(x) => Some(numeric_eq_key(&alloc::format!("{x}"))),
+        _ => None,
     }
 }
 
@@ -1916,6 +1935,22 @@ mod tests {
         assert_eq!(canon(r#"{"a":1,"a":2,"a":3}"#), r#"{"a": 3}"#);
         // Arrays get `, ` and are not reordered.
         assert_eq!(canon("[3,2,1]"), "[3, 2, 1]");
+    }
+
+    #[test]
+    fn json_number_equality_by_value() {
+        let eq = |a: &str, b: &str| {
+            json_eq(&parse(a).unwrap(), &parse(b).unwrap())
+        };
+        assert!(eq("1", "1.0"));
+        assert!(eq("1.50", "1.5"));
+        assert!(eq("1e3", "1000.00"));
+        assert!(eq("0", "-0"));
+        assert!(eq("2.5e3", "2500"));
+        assert!(!eq("1.5", "1.6"));
+        // Inside arrays / objects.
+        assert!(eq("[1, 2.0]", "[1.0, 2]"));
+        assert!(eq(r#"{"a":1}"#, r#"{"a":1.0}"#));
     }
 
     #[test]
