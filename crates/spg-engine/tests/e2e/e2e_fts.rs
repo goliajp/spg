@@ -172,8 +172,9 @@ fn websearch_handles_quoted_phrase_and_minus() {
         other => panic!("expected tsquery, got {other:?}"),
     };
     let rendered = spg_engine::eval::format_tsquery(&ast);
-    // Phrase `quick<1>brown` AND NOT lazi (english stem of `lazy`).
-    assert_eq!(rendered, "'quick' <1> 'brown' & !'lazi'");
+    // Phrase `quick<->brown` AND NOT lazi (english stem of `lazy`). v7.37 D.51 —
+    // PG renders a distance-1 phrase with the `<->` shorthand.
+    assert_eq!(rendered, "'quick' <-> 'brown' & !'lazi'");
 }
 
 // --- v7.12.1: SET default_text_search_config ---
