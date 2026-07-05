@@ -2272,3 +2272,19 @@ fn extract_plural_fields() {
     ];
     assert_eq!(out.join("|"), "3|5|7|4|30|24|202|21|3|7|7|5");
 }
+
+/// v7.37 D.34 — text || numeric (and numeric || text) is text concatenation,
+/// not a rejected NUMERIC op. PG18.4-verified.
+#[test]
+fn text_numeric_concat() {
+    let mut e = Engine::new();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+    };
+    assert_eq!(q(&mut e, "SELECT ('x' || 1.5::numeric)"), "x1.5");
+    assert_eq!(q(&mut e, "SELECT (1.5::numeric || 'x')"), "1.5x");
+    assert_eq!(q(&mut e, "SELECT ('val=' || 3.14::numeric || '!')"), "val=3.14!");
+    assert_eq!(q(&mut e, "SELECT ('n' || (10::numeric/4))"), "n2.5000000000000000");
+    // int || numeric still fine (int coerces to text)
+    assert_eq!(q(&mut e, "SELECT (5 || ':' || 2.5::numeric)"), "5:2.5");
+}
