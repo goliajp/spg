@@ -3640,6 +3640,121 @@ fn apply_function_dispatch(
         // an empty array of the element's type (array_append(NULL, 3)
         // → {3}); a NULL element is appended as a NULL item. Both
         // NULL → NULL (PG can't resolve the polymorphic type either).
+        // v7.37 D.53 — `UPDATE t SET arr[i] = v` desugars (in the parser) to
+        // `arr = __array_assign(arr, i, v)`. PG assigns to the i-th (1-based)
+        // element, NULL-padding the array when i exceeds its current length.
+        "__array_assign" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("__array_assign() takes 3 args, got {}", args.len()),
+                });
+            }
+            let idx: i64 = match &args[1] {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::Null => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "array subscript in an UPDATE must not be null".into(),
+                    });
+                }
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("array subscript must be integer, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            if idx < 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "array subscripts below 1 are not supported for assignment".into(),
+                });
+            }
+            let pos = (idx - 1) as usize;
+            let val = &args[2];
+            let as_i32 = |v: &Value| -> Option<Option<i32>> {
+                match v {
+                    Value::Null => Some(None),
+                    Value::Int(n) => Some(Some(*n)),
+                    Value::SmallInt(n) => Some(Some(i32::from(*n))),
+                    Value::BigInt(n) => i32::try_from(*n).ok().map(Some),
+                    _ => None,
+                }
+            };
+            let as_i64 = |v: &Value| -> Option<Option<i64>> {
+                match v {
+                    Value::Null => Some(None),
+                    Value::Int(n) => Some(Some(i64::from(*n))),
+                    Value::SmallInt(n) => Some(Some(i64::from(*n))),
+                    Value::BigInt(n) => Some(Some(*n)),
+                    _ => None,
+                }
+            };
+            // A NULL array with an element assignment becomes a fresh array
+            // padded up to the index (PG: `arr[3]=x` on NULL → `[NULL,NULL,x]`).
+            match &args[0] {
+                Value::TextArray(items) => {
+                    let mut out = items.clone();
+                    if pos >= out.len() {
+                        out.resize(pos + 1, None);
+                    }
+                    out[pos] = match val {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.to_string()),
+                        other => return Err(EvalError::TypeMismatch {
+                            detail: format!("cannot assign {:?} to a text[] element", other.data_type()),
+                        }),
+                    };
+                    Ok(Value::TextArray(out))
+                }
+                Value::IntArray(items) => {
+                    let mut out = items.clone();
+                    if pos >= out.len() {
+                        out.resize(pos + 1, None);
+                    }
+                    out[pos] = as_i32(val).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: format!("cannot assign {:?} to an int[] element", val.data_type()),
+                    })?;
+                    Ok(Value::IntArray(out))
+                }
+                Value::BigIntArray(items) => {
+                    let mut out = items.clone();
+                    if pos >= out.len() {
+                        out.resize(pos + 1, None);
+                    }
+                    out[pos] = as_i64(val).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: format!("cannot assign {:?} to a bigint[] element", val.data_type()),
+                    })?;
+                    Ok(Value::BigIntArray(out))
+                }
+                Value::Null => {
+                    // Infer the new array's type from the assigned value.
+                    match val {
+                        Value::Text(s) => {
+                            let mut out = alloc::vec![None; pos + 1];
+                            out[pos] = Some(s.to_string());
+                            Ok(Value::TextArray(out))
+                        }
+                        Value::Int(_) | Value::SmallInt(_) => {
+                            let mut out = alloc::vec![None; pos + 1];
+                            out[pos] = as_i32(val).unwrap();
+                            Ok(Value::IntArray(out))
+                        }
+                        Value::BigInt(_) => {
+                            let mut out = alloc::vec![None; pos + 1];
+                            out[pos] = as_i64(val).unwrap();
+                            Ok(Value::BigIntArray(out))
+                        }
+                        Value::Null => Ok(Value::Null),
+                        other => Err(EvalError::TypeMismatch {
+                            detail: format!("cannot infer array type for element {:?}", other.data_type()),
+                        }),
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("array element assignment target must be an array, got {:?}", other.data_type()),
+                }),
+            }
+        }
         "array_append" | "array_prepend" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {

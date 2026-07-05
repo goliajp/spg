@@ -4888,6 +4888,53 @@ impl Parser {
                 break;
             }
             let col = self.expect_ident_like()?;
+            // v7.37 D.53 — array element assignment target `SET arr[i] = v`,
+            // desugared to `arr = __array_assign(arr, i, v)` (mirrors the
+            // `__column_default` marker lowering just below). PG assigns to the
+            // i-th (1-based) element, NULL-padding when i exceeds the length.
+            if matches!(self.peek(), Token::LBracket) {
+                self.advance();
+                let index = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RBracket) {
+                    return Err(self.err(format!(
+                        "expected `]` after array subscript in UPDATE SET, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(format!(
+                        "expected `=` after array subscript in UPDATE SET, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let value = self.parse_expr(0)?;
+                // PG merges several subscript writes to the same column into one
+                // array (`SET arr[1]=x, arr[3]=y`), so chain onto any prior
+                // assignment to `col` rather than each overwriting the original.
+                let existing = assignments.iter().position(|(c, _)| c == &col);
+                let base = match existing {
+                    Some(i) => assignments[i].1.clone(),
+                    None => Expr::Column(ColumnName {
+                        qualifier: None,
+                        name: col.clone(),
+                    }),
+                };
+                let assigned = Expr::FunctionCall {
+                    name: "__array_assign".to_string(),
+                    args: alloc::vec![base, index, value],
+                };
+                match existing {
+                    Some(i) => assignments[i].1 = assigned,
+                    None => assignments.push((col, assigned)),
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             if !matches!(self.peek(), Token::Eq) {
                 return Err(self.err(format!(
                     "expected `=` after column name in UPDATE SET, got {:?}",
