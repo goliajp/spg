@@ -29,6 +29,63 @@ use crate::{
 /// typed `InjectedError`) so the wire layer sends a clean message; falls
 /// back to a generic string when the payload type is opaque.
 #[cfg(feature = "std")]
+/// v7.38 (read01 P3.17) — reject a clearly-invalid value for a handful of
+/// well-known typed GUCs (boolean / memory-size / duration), so a typo
+/// like `SET work_mem = 'bogus'` errors like PG instead of silently
+/// storing junk. Conservative: only GUCs whose type is unambiguous are
+/// checked; every other name is accepted so pg_dump preambles and
+/// unknown settings still load.
+fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
+    let key = name.to_ascii_lowercase();
+    let bad = || {
+        EngineError::Unsupported(alloc::format!(
+            "invalid value for parameter \"{name}\": \"{value}\""
+        ))
+    };
+    let is_bool = matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "on" | "off" | "true" | "false" | "yes" | "no" | "1" | "0"
+    );
+    // Split a `<number><unit>` GUC value into its numeric head + unit tail.
+    let split_unit = |s: &str| -> (String, String) {
+        let st = s.trim();
+        let cut = st
+            .find(|c: char| c.is_ascii_alphabetic())
+            .unwrap_or(st.len());
+        (
+            String::from(st[..cut].trim()),
+            st[cut..].trim().to_ascii_lowercase(),
+        )
+    };
+    let (num, unit) = split_unit(value);
+    let is_size =
+        num.parse::<f64>().is_ok() && matches!(unit.as_str(), "" | "b" | "kb" | "mb" | "gb" | "tb");
+    let is_duration = num.parse::<i64>().is_ok()
+        && matches!(unit.as_str(), "" | "us" | "ms" | "s" | "min" | "h" | "d");
+    match key.as_str() {
+        "enable_seqscan" | "enable_indexscan" | "enable_bitmapscan" | "enable_indexonlyscan"
+        | "enable_hashjoin" | "enable_mergejoin" | "enable_nestloop" | "autovacuum" | "fsync"
+        | "full_page_writes" => {
+            if !is_bool {
+                return Err(bad());
+            }
+        }
+        "work_mem" | "maintenance_work_mem" | "shared_buffers" | "temp_buffers"
+        | "effective_cache_size" | "wal_buffers" => {
+            if !is_size {
+                return Err(bad());
+            }
+        }
+        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
+            if !is_duration {
+                return Err(bad());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn panic_payload_to_engine_error(payload: &(dyn core::any::Any + Send)) -> EngineError {
     // The injection framework panics with a typed error; surface its
     // message so tests get a deterministic, informative string.
@@ -819,6 +876,16 @@ impl Engine {
                              (SPG serves UTF8 only)"
                         )));
                     }
+                }
+                // v7.38 (read01 P3.17) — reject a clearly-invalid value for
+                // a handful of well-known typed GUCs (`SET work_mem =
+                // 'bogus'` errors like PG). Unknown GUCs stay accept-and-
+                // record for pg_dump compat.
+                if let spg_sql::ast::SetValue::String(s)
+                | spg_sql::ast::SetValue::Ident(s)
+                | spg_sql::ast::SetValue::Number(s) = &value
+                {
+                    validate_known_guc(&name, s)?;
                 }
                 self.set_session_param(name, value);
                 Ok(QueryResult::CommandOk {
