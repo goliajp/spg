@@ -5495,6 +5495,25 @@ impl Parser {
         if clauses.is_empty() {
             return Err(self.err(String::from("MERGE requires at least one WHEN clause")));
         }
+        // v7.38 (read01 U-merge) — PG rejects a WHEN clause that follows an
+        // unconditional (no `AND`) WHEN of the same match kind: it could
+        // never fire. Check per match kind in clause order.
+        let mut seen_unconditional_matched = false;
+        let mut seen_unconditional_not_matched = false;
+        for c in &clauses {
+            let seen = match c.matched {
+                crate::ast::MergeMatched::Matched => &mut seen_unconditional_matched,
+                crate::ast::MergeMatched::NotMatched => &mut seen_unconditional_not_matched,
+            };
+            if *seen {
+                return Err(self.err(String::from(
+                    "unreachable WHEN clause specified after unconditional WHEN clause",
+                )));
+            }
+            if c.condition.is_none() {
+                *seen = true;
+            }
+        }
         Ok(Statement::Merge(crate::ast::MergeStatement {
             target,
             target_alias,
