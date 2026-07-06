@@ -825,8 +825,13 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         t.insert(Row::new(alloc::vec![Value::Int(0x2222)])).unwrap();
         t.insert(Row::new(alloc::vec![Value::Int(0x3333)])).unwrap();
     }
-    let v53 = c.serialize();
-    assert_eq!(v53[FILE_MAGIC.len()], FILE_VERSION, "writer emits v53");
+    // v7.38 (P5.05) — the current writer emits v54 with a trailing CRC32C;
+    // strip it so what remains is the pre-trailer body we downgrade to v52.
+    let v53 = {
+        let mut full = c.serialize();
+        full.truncate(full.len() - 4);
+        full
+    };
 
     // Locate + splice out the appendix (must be present exactly once).
     let appendix = mvcc_appendix_bytes(c.get("t").unwrap());
@@ -835,14 +840,15 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         .enumerate()
         .filter_map(|(i, w)| if w == appendix.as_slice() { Some(i) } else { None })
         .collect();
-    assert_eq!(hits.len(), 1, "MVCC appendix must appear exactly once in the v53 image");
+    assert_eq!(hits.len(), 1, "MVCC appendix must appear exactly once in the image");
     let start = hits[0];
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len());
     v52.extend_from_slice(&v53[..start]);
     v52.extend_from_slice(&v53[start + appendix.len()..]);
-    // Flip the version byte 53 -> 52: this is now byte-for-byte what the
-    // pre-slice released code would have written for this catalog.
-    v52[FILE_MAGIC.len()] = FILE_VERSION - 1;
+    // Set the version byte to 52 — the format before the MVCC appendix (v53)
+    // and before the CRC trailer (v54): byte-for-byte what the pre-slice
+    // released code would have written for this catalog.
+    v52[FILE_MAGIC.len()] = 52;
 
     let restored = Catalog::deserialize(&v52).expect("v52 image must still load");
     let t = restored.get("t").unwrap();
@@ -4681,4 +4687,37 @@ fn arena_row_clone_into_then_into_owned_round_trip() {
     let stored = back.get("t").unwrap().rows().get(0).cloned().unwrap();
     assert_eq!(stored, lifted, "catalog round-trip diverged");
     assert_eq!(bytes, back.serialize(), "catalog bytes round-trip diverged");
+}
+
+#[test]
+fn v54_snapshot_crc_detects_corruption() {
+    // v7.38 (read01 P5.05) — the CRC32C trailer round-trips and catches a
+    // single-bit corruption of the snapshot body.
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    c.get_mut("t")
+        .unwrap()
+        .insert(Row::new(alloc::vec![Value::Int(42)]))
+        .unwrap();
+
+    let bytes = c.serialize();
+    // Writer emits the current version with a 4-byte CRC trailer.
+    assert_eq!(bytes[FILE_MAGIC.len()], FILE_VERSION);
+    // Clean round-trip.
+    let restored = Catalog::deserialize(&bytes).expect("round-trips");
+    assert_eq!(restored.get("t").unwrap().rows().len(), 1);
+
+    // Flip a byte in the body (not the CRC trailer) → CRC mismatch.
+    let mut corrupt = bytes.clone();
+    let mid = corrupt.len() / 2;
+    corrupt[mid] ^= 0x01;
+    let err = Catalog::deserialize(&corrupt).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("CRC mismatch") || format!("{err:?}").contains("Corrupt"),
+        "expected a corruption error, got {err:?}"
+    );
 }
