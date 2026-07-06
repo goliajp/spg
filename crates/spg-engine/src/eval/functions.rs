@@ -12016,6 +12016,10 @@ fn apply_function_dispatch(
         // timestamp(n)). Unknown oid → PG returns "???"; SPG
         // matches. NULL oid → NULL.
         "format_type" => {
+            // An `_`-prefixed internal name (`_int4`, `_text`) is an array
+            // type: render the element spelling followed by `[]` (PG:
+            // `integer[]`, `text[]`).
+            let mut is_array = false;
             let oid = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(Value::Int(n)) => i64::from(*n),
@@ -12026,7 +12030,14 @@ fn apply_function_dispatch(
                 // Map the internal / SQL spelling back to an OID and reuse
                 // the OID path (which also renders the typmod).
                 Some(Value::Text(s)) => {
-                    let name = s.trim().trim_start_matches("pg_catalog.").to_ascii_lowercase();
+                    let raw = s.trim().trim_start_matches("pg_catalog.").to_ascii_lowercase();
+                    let name = match raw.strip_prefix('_') {
+                        Some(elem) => {
+                            is_array = true;
+                            alloc::string::String::from(elem)
+                        }
+                        None => raw,
+                    };
                     match name.as_str() {
                         "bool" | "boolean" => 16,
                         "bytea" => 17,
@@ -12065,7 +12076,13 @@ fn apply_function_dispatch(
                         "tsrange" => 3910,
                         "daterange" => 3912,
                         "int8range" => 3926,
-                        _ => return Ok(Value::text(name)),
+                        _ => {
+                            return Ok(Value::text(if is_array {
+                                alloc::format!("{name}[]")
+                            } else {
+                                name
+                            }));
+                        }
                     }
                 }
                 Some(_) => return Ok(Value::Null),
@@ -12111,7 +12128,11 @@ fn apply_function_dispatch(
             } else {
                 base.into()
             };
-            Ok(Value::text(rendered))
+            Ok(Value::text(if is_array {
+                alloc::format!("{rendered}[]")
+            } else {
+                rendered
+            }))
         }
         // obj_description / col_description / shobj_description —
         // COMMENT ON reader helpers. SPG doesn't yet retain
