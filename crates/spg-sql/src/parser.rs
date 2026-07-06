@@ -6500,6 +6500,20 @@ impl Parser {
                     crate::ast::AlterTableTarget::AlterColumnDropNotNull { column: col_name }
                 ])
             }
+            // `DROP EXPRESSION [IF EXISTS]` — de-generate a stored
+            // generated column into a plain column.
+            Token::Ident(s) if s.eq_ignore_ascii_case("expression") => {
+                self.advance();
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                    self.advance();
+                    if matches!(self.peek(), Token::Ident(e) if e.eq_ignore_ascii_case("exists")) {
+                        self.advance();
+                    }
+                }
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::AlterColumnDropExpression { column: col_name }
+                ])
+            }
             _ => {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())

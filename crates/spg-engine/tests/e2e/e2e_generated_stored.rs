@@ -174,3 +174,26 @@ fn sentori_issues_search_vector_shape() {
         "expected 'orphan' in tsvector text: {rendered2}"
     );
 }
+
+#[test]
+fn drop_expression_converts_to_plain_column() {
+    // v7.38 (read01 U10) — ALTER COLUMN … DROP EXPRESSION de-generates a
+    // stored column: a supplied value is then accepted verbatim instead of
+    // being recomputed. Existing rows keep their computed value.
+    // Live-PG18.4-verified: (5,10) then (10,999).
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int, g int GENERATED ALWAYS AS (id*2) STORED)")
+        .unwrap();
+    e.execute("INSERT INTO t(id) VALUES(5)").unwrap();
+    e.execute("ALTER TABLE t ALTER COLUMN g DROP EXPRESSION").unwrap();
+    // Now g is a plain column — a direct value is stored as given.
+    e.execute("INSERT INTO t(id,g) VALUES(10, 999)").unwrap();
+    let out = rows(&mut e, "SELECT id,g FROM t ORDER BY id");
+    assert_eq!(out[0], vec![Value::Int(5), Value::Int(10)]);
+    assert_eq!(out[1], vec![Value::Int(10), Value::Int(999)]);
+    // DROP EXPRESSION on a non-generated column errors.
+    assert!(
+        e.execute("ALTER TABLE t ALTER COLUMN id DROP EXPRESSION")
+            .is_err()
+    );
+}
