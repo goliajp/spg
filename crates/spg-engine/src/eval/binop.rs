@@ -1032,14 +1032,14 @@ fn apply_binary_numeric(
         let af = as_f64(&l)?;
         let bf = as_f64(&r)?;
         return match op {
-            BinOp::Add => Ok(Value::Float(af + bf)),
-            BinOp::Sub => Ok(Value::Float(af - bf)),
-            BinOp::Mul => Ok(Value::Float(af * bf)),
+            BinOp::Add => Ok(Value::Float(check_float8_range(af + bf, af, bf, "+")?)),
+            BinOp::Sub => Ok(Value::Float(check_float8_range(af - bf, af, bf, "-")?)),
+            BinOp::Mul => Ok(Value::Float(check_float8_range(af * bf, af, bf, "*")?)),
             BinOp::Div => {
                 if bf == 0.0 {
                     Err(EvalError::DivisionByZero)
                 } else {
-                    Ok(Value::Float(af / bf))
+                    Ok(Value::Float(check_float8_range(af / bf, af, bf, "/")?))
                 }
             }
             BinOp::Mod => {
@@ -1580,6 +1580,27 @@ fn array_contains_all(l: &Value<'_>, r: &Value<'_>) -> bool {
     right.iter().all(|b| left.contains(b))
 }
 
+/// PG's float8 range guard (utils/adt/float.c `check_float8_val`): a
+/// finite ⊕ finite operation that overflows to ±Infinity is an error,
+/// not a silent Inf; a multiply/divide whose non-zero operands underflow
+/// to exactly 0 is an error too. Inf/NaN operands (whose Inf result is
+/// legitimate) and additive cancellation to 0 pass through. Learned from
+/// read01 float.c study — a silent Inf is exactly the kind of quiet
+/// wrong answer SPG refuses to emit.
+fn check_float8_range(result: f64, a: f64, b: f64, op_name: &str) -> Result<f64, EvalError> {
+    if result.is_infinite() && !a.is_infinite() && !b.is_infinite() {
+        return Err(EvalError::TypeMismatch {
+            detail: "value out of range: overflow".into(),
+        });
+    }
+    if (op_name == "*" || op_name == "/") && result == 0.0 && a != 0.0 && b != 0.0 {
+        return Err(EvalError::TypeMismatch {
+            detail: "value out of range: underflow".into(),
+        });
+    }
+    Ok(result)
+}
+
 fn arith(
     l: Value<'static>,
     r: Value<'static>,
@@ -1638,7 +1659,7 @@ fn arith(
         {
             let af = as_f64(&a)?;
             let bf = as_f64(&b)?;
-            Ok(Value::Float(float_op(af, bf)))
+            Ok(Value::Float(check_float8_range(float_op(af, bf), af, bf, op_name)?))
         }
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1763,7 +1784,7 @@ fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         if b == 0.0 {
             return Err(EvalError::DivisionByZero);
         }
-        return Ok(Value::Float(a / b));
+        return Ok(Value::Float(check_float8_range(a / b, a, b, "/")?));
     }
     arith(
         l,

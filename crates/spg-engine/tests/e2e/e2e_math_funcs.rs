@@ -121,3 +121,29 @@ fn radians_degrees_roundtrip() {
     let v = first(&mut e, "SELECT degrees(radians(90.0))");
     assert!(approx(as_f64(&v), 90.0, 1e-9), "got {}", as_f64(&v));
 }
+
+#[test]
+fn float8_overflow_and_underflow_error_like_pg() {
+    // PG's check_float8_val: a finite operation overflowing to ±Inf, or a
+    // multiply/divide underflowing a non-zero result to 0, is an error —
+    // not a silent Inf/0. Inf/NaN operands and additive cancellation pass.
+    // All live-PG18.4-verified.
+    let mut e = Engine::new();
+    for sql in [
+        "SELECT 1e308::float8 * 10",
+        "SELECT 1e308::float8 + 1e308",
+        "SELECT (-1e308::float8) - 1e308",
+        "SELECT 1e308::float8 / 1e-10",
+        "SELECT 1e-300::float8 * 1e-300", // underflow
+    ] {
+        assert!(e.execute(sql).is_err(), "{sql} should error (overflow/underflow)");
+    }
+    // Legitimate results are unaffected.
+    assert_eq!(as_f64(&first(&mut e, "SELECT 2.0::float8 * 3.0")), 6.0);
+    // An Inf operand keeps its Inf result (no overflow error), and
+    // additive cancellation to 0 is fine.
+    assert!(as_f64(&first(&mut e, "SELECT 'inf'::float8 * 2")).is_infinite());
+    assert_eq!(as_f64(&first(&mut e, "SELECT 1e-300::float8 - 1e-300")), 0.0);
+    // NaN propagates without erroring.
+    assert!(as_f64(&first(&mut e, "SELECT 'nan'::float8 * 2")).is_nan());
+}
