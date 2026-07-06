@@ -311,3 +311,25 @@ fn format_star_width() {
         ("SELECT format('%10s', 'x') || '|'", "         x|"),
     ]);
 }
+
+/// E-string escapes: `\v` vertical tab and `\uHHHH` / `\UHHHHHHHH`
+/// Unicode (incl. surrogate pairs) were missing — `\v` decoded to a
+/// literal 'v' and `A` to the text "u0041". Live-PG18.4-verified.
+#[test]
+fn estring_v_and_unicode_escapes() {
+    check(&[
+        ("SELECT ascii(E'\\v')::text", "11"),
+        ("SELECT E'\\u0041'", "A"),
+        ("SELECT E'\\u00e9'", "é"),
+        ("SELECT E'\\U00000041'", "A"),
+        // Surrogate pair 😀 (one codepoint).
+        ("SELECT length(E'\\uD83D\\uDE00')::text", "1"),
+        // Existing escapes unchanged.
+        ("SELECT ascii(E'\\n')::text", "10"),
+        ("SELECT ascii(E'\\f')::text", "12"),
+    ]);
+    // Malformed Unicode escapes are rejected.
+    let mut e = Engine::new();
+    assert!(e.execute("SELECT E'\\uXY'").is_err());
+    assert!(e.execute("SELECT E'\\uD800'").is_err(), "lone surrogate");
+}
