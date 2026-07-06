@@ -3281,6 +3281,48 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     (schema, rows)
 }
 
+/// v7.38 (read01 P3.22/P3.23) — the canonical GUC inventory:
+/// `(name, boot_val, category, vartype, context)`. Single source of truth
+/// shared by `pg_settings`, `SHOW <name>`, and `SHOW ALL` so all three
+/// agree on which parameters exist and their defaults. vartype is
+/// annotated (not inferred) because SPG stores memory / duration settings
+/// in human form ("4MB") where inference would read "string" — PG
+/// classifies work_mem as integer.
+pub(crate) fn canonical_gucs() -> &'static [(&'static str, &'static str, &'static str, &'static str, &'static str)]
+{
+    &[
+        ("server_version", "18.4 (spg)", "Preset Options", "string", "internal"),
+        ("server_version_num", "180004", "Preset Options", "integer", "internal"),
+        ("server_encoding", "UTF8", "Client Connection Defaults", "string", "internal"),
+        ("client_encoding", "UTF8", "Client Connection Defaults", "string", "user"),
+        ("DateStyle", "ISO, MDY", "Client Connection Defaults", "string", "user"),
+        ("TimeZone", "UTC", "Client Connection Defaults", "string", "user"),
+        ("IntervalStyle", "postgres", "Client Connection Defaults", "enum", "user"),
+        ("extra_float_digits", "1", "Client Connection Defaults", "integer", "user"),
+        ("bytea_output", "hex", "Client Connection Defaults", "enum", "user"),
+        ("standard_conforming_strings", "on", "Compatibility", "bool", "user"),
+        ("integer_datetimes", "on", "Compatibility", "bool", "internal"),
+        ("max_connections", "100", "Connections and Authentication", "integer", "postmaster"),
+        ("lock_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("transaction_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("statement_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("client_min_messages", "notice", "Client Connection Defaults", "enum", "user"),
+        ("default_tablespace", "", "Client Connection Defaults", "string", "user"),
+        ("default_table_access_method", "heap", "Client Connection Defaults", "string", "user"),
+        ("row_security", "on", "Client Connection Defaults", "bool", "user"),
+        ("check_function_bodies", "on", "Client Connection Defaults", "bool", "user"),
+        ("xmloption", "content", "Client Connection Defaults", "enum", "user"),
+        ("work_mem", "4MB", "Resource Usage / Memory", "integer", "user"),
+        ("maintenance_work_mem", "64MB", "Resource Usage / Memory", "integer", "user"),
+        ("shared_buffers", "128MB", "Resource Usage / Memory", "integer", "postmaster"),
+        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants", "integer", "user"),
+        ("search_path", "\"$user\", public", "Client Connection Defaults", "string", "user"),
+        ("application_name", "", "Reporting and Logging", "string", "user"),
+        ("default_transaction_isolation", "read committed", "Client Connection Defaults", "enum", "user"),
+    ]
+}
+
 /// v7.17.0 Phase 3.P0-57 — synthesise `pg_catalog.pg_settings`. ORM
 /// connection-checkers (sqlx pre-flight, Diesel migrator) and admin
 /// tools read `pg_settings` to discover server-side configuration.
@@ -3310,39 +3352,7 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("pending_restart", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    // Canonical defaults: (name, boot_val, category, vartype, context).
-    // vartype is annotated (not inferred) because SPG stores memory /
-    // duration settings in human form ("4MB") where inference would read
-    // "string" — PG classifies work_mem as integer.
-    let defaults: &[(&str, &str, &str, &str, &str)] = &[
-        ("server_version", "18.4 (spg)", "Preset Options", "string", "internal"),
-        ("server_version_num", "180004", "Preset Options", "integer", "internal"),
-        ("server_encoding", "UTF8", "Client Connection Defaults", "string", "internal"),
-        ("client_encoding", "UTF8", "Client Connection Defaults", "string", "user"),
-        ("DateStyle", "ISO, MDY", "Client Connection Defaults", "string", "user"),
-        ("TimeZone", "UTC", "Client Connection Defaults", "string", "user"),
-        ("IntervalStyle", "postgres", "Client Connection Defaults", "enum", "user"),
-        ("standard_conforming_strings", "on", "Compatibility", "bool", "user"),
-        ("integer_datetimes", "on", "Compatibility", "bool", "internal"),
-        ("max_connections", "100", "Connections and Authentication", "integer", "postmaster"),
-        ("lock_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("transaction_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("statement_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("client_min_messages", "notice", "Client Connection Defaults", "enum", "user"),
-        ("default_tablespace", "", "Client Connection Defaults", "string", "user"),
-        ("default_table_access_method", "heap", "Client Connection Defaults", "string", "user"),
-        ("row_security", "on", "Client Connection Defaults", "bool", "user"),
-        ("check_function_bodies", "on", "Client Connection Defaults", "bool", "user"),
-        ("xmloption", "content", "Client Connection Defaults", "enum", "user"),
-        ("work_mem", "4MB", "Resource Usage / Memory", "integer", "user"),
-        ("maintenance_work_mem", "64MB", "Resource Usage / Memory", "integer", "user"),
-        ("shared_buffers", "128MB", "Resource Usage / Memory", "integer", "postmaster"),
-        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants", "integer", "user"),
-        ("search_path", "\"$user\", public", "Client Connection Defaults", "string", "user"),
-        ("application_name", "", "Reporting and Logging", "string", "user"),
-        ("default_transaction_isolation", "read committed", "Client Connection Defaults", "enum", "user"),
-    ];
+    let defaults = canonical_gucs();
     // Build a full 17-column row. `setting` honours session overrides;
     // `source` reflects whether the value came from a SET; `boot_val` /
     // `reset_val` stay at the compiled-in default.
