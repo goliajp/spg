@@ -976,7 +976,12 @@ impl Engine {
     /// worker calls this under `engine.read()` then drops the lock
     /// before re-acquiring `engine.write()` for the actual ANALYZE.
     pub fn tables_needing_analyze(&self) -> Vec<String> {
-        const MIN_ROWS: u64 = 100;
+        // v7.38 (read01 P5.29) — PG's autovacuum analyze threshold:
+        // autovacuum_analyze_threshold (50) + autovacuum_analyze_scale_factor
+        // (0.1) × reltuples. The prior formula (0.1 × max(rows, 100)) dropped
+        // the 50-row base, so it re-analyzed small and mid-size tables far
+        // more eagerly than PG.
+        const ANALYZE_THRESHOLD_BASE: u64 = 50;
         let mut out = Vec::new();
         for name in self.catalog.table_names() {
             if is_internal_table_name(&name) {
@@ -987,12 +992,9 @@ impl Engine {
             };
             let row_count = table.rows().len() as u64;
             let modified = self.statistics.modified_since_last_analyze(&name);
-            // Threshold: ceil(0.1 × max(row_count, MIN_ROWS)),
-            // computed in integer arithmetic so spg-engine stays
-            // no_std without pulling in libm. `(n + 9) / 10` is
-            // `ceil(n / 10)` for non-negative `n`.
-            let base = row_count.max(MIN_ROWS);
-            let threshold = base.saturating_add(9) / 10;
+            // `(n + 9) / 10` is `ceil(n / 10)` for non-negative `n`, computed
+            // in integer arithmetic so spg-engine stays no_std (no libm).
+            let threshold = ANALYZE_THRESHOLD_BASE.saturating_add(row_count.saturating_add(9) / 10);
             if modified >= threshold {
                 out.push(name);
             }

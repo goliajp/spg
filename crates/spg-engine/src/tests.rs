@@ -1348,20 +1348,25 @@ fn statistics_persist_across_envelope_v5_round_trip() {
 // ── v6.2.1 auto-analyze threshold ───────────────────────────
 
 #[test]
-fn auto_analyze_threshold_fires_after_10pct_of_min_rows_on_small_table() {
-    // For a table with 0 rows then 10 inserts → modified=10,
-    // row_count=10. Threshold = 0.1 × max(10, 100) = 10. So
-    // after the 10th INSERT the threshold is met.
+fn auto_analyze_threshold_honours_pg_50_row_base_on_small_table() {
+    // v7.38 (read01 P5.29) — PG threshold = 50 + 0.1 × reltuples. A small
+    // table therefore needs to cross the 50-row base before it re-analyzes,
+    // not just 10% of a 100-row floor. After N inserts modified = row_count =
+    // N, so it fires once N >= 50 + ceil(N/10), i.e. at N = 56.
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
-    for i in 0..9 {
+    for i in 0..50 {
         e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
             .unwrap();
     }
-    assert!(e.tables_needing_analyze().is_empty(), "9 < threshold");
-    e.execute("INSERT INTO t VALUES (9)").unwrap();
-    let needs = e.tables_needing_analyze();
-    assert_eq!(needs, alloc::vec!["t".to_string()]);
+    // 50 mods vs threshold 50 + ceil(50/10) = 55 → no analyze yet.
+    assert!(e.tables_needing_analyze().is_empty(), "50 < base+scale threshold");
+    for i in 50..60 {
+        e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
+    }
+    // 60 mods vs threshold 50 + ceil(60/10) = 56 → fires.
+    assert_eq!(e.tables_needing_analyze(), alloc::vec!["t".to_string()]);
 }
 
 #[test]
@@ -1419,15 +1424,16 @@ fn auto_analyze_threshold_tracks_updates_and_deletes() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT)")
         .unwrap();
-    for i in 0..50 {
+    for i in 0..200 {
         e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, 'x')"))
             .unwrap();
     }
     e.execute("ANALYZE t").unwrap();
-    // UPDATE 20 rows + DELETE 5 → modified=25. Threshold = 0.1
-    // × max(50, 100) = 10. So 25 >= 10 → trigger.
-    e.execute("UPDATE t SET label = 'y' WHERE id < 20").unwrap();
-    e.execute("DELETE FROM t WHERE id >= 45").unwrap();
+    // v7.38 (read01 P5.29) — UPDATE + DELETE both count toward n_mod. With
+    // 200 rows the threshold is 50 + ceil(200/10) = 70; UPDATE 60 + DELETE 20
+    // = 80 modifications > 70 → fires (and confirms updates/deletes count).
+    e.execute("UPDATE t SET label = 'y' WHERE id < 60").unwrap();
+    e.execute("DELETE FROM t WHERE id >= 180").unwrap();
     assert_eq!(e.tables_needing_analyze(), alloc::vec!["t".to_string()]);
 }
 
