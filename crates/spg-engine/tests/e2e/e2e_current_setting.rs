@@ -218,3 +218,33 @@ fn pg_settings_has_full_17_column_shape() {
         "4MB"
     );
 }
+
+#[test]
+fn show_covers_more_params_and_unifies_with_pg_settings() {
+    // v7.38 (read01 P3.23) — SHOW reads the same canonical GUC inventory as
+    // pg_settings, so extra_float_digits / bytea_output resolve, SHOW ALL
+    // lists the full set, and SET → SHOW → pg_settings agree.
+    let mut e = Engine::new();
+    // Previously "parameter not recognised". Values verified vs live PG 18.4.
+    assert_eq!(text(&first(&mut e, "SHOW extra_float_digits")), "1");
+    assert_eq!(text(&first(&mut e, "SHOW bytea_output")), "hex");
+    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180004");
+    // SHOW ALL now lists the full canonical set (was a curated 13).
+    let show_all = match e.execute("SHOW ALL").unwrap() {
+        QueryResult::Rows { rows, .. } => rows.len(),
+        _ => panic!(),
+    };
+    assert!(show_all >= 30, "SHOW ALL should list the full set, got {show_all}");
+    // A SET is reflected by both SHOW and pg_settings (one store).
+    e.execute("SET extra_float_digits = '3'").unwrap();
+    assert_eq!(text(&first(&mut e, "SHOW extra_float_digits")), "3");
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT setting FROM pg_settings WHERE name = 'extra_float_digits'"
+        )),
+        "3"
+    );
+    // A truly unknown parameter still errors.
+    assert!(e.execute("SHOW totally_bogus_param").is_err());
+}

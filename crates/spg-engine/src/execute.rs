@@ -1034,122 +1034,66 @@ impl Engine {
                 // Emitting a fixed curated inventory here keeps the
                 // client shape stable without wire-tapping every
                 // per-session parameter.
+                // v7.38 (read01 P3.20/P3.23) — SHOW reads the same canonical
+                // GUC inventory as pg_settings, so `SHOW <name>` / `SHOW ALL`
+                // and pg_settings never disagree on which params exist.
+                let canon = crate::system_catalog::canonical_gucs();
+                let effective = |n: &str, boot: &str| -> alloc::string::String {
+                    self.session_params
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| boot.into())
+                };
                 if name.eq_ignore_ascii_case("all") {
-                    let params: &[(&str, &str, &str)] = &[
-                        ("server_version", "18.4 (spg)", "Reports the server version."),
-                        ("server_encoding", "UTF8", "Sets the server's encoding."),
-                        ("client_encoding", "UTF8", "Sets the client's encoding."),
-                        ("is_superuser", "on", "Reports superuser status."),
-                        ("TimeZone", "UTC", "Sets the time zone for displaying and interpreting timestamps."),
-                        ("DateStyle", "ISO, MDY", "Sets the display format for date/time values."),
-                        ("IntervalStyle", "postgres", "Sets the display format for interval values."),
-                        ("search_path", "\"$user\", public", "Sets the schema search order."),
-                        ("standard_conforming_strings", "on", "Causes '...' strings to treat backslashes literally."),
-                        ("statement_timeout", "0", "Sets the maximum allowed duration of any statement."),
-                        ("application_name", "", "Sets the application name for status displays."),
-                        ("transaction_isolation", self.current_isolation_level.as_pg_str(), "Sets the current transaction's isolation level."),
-                        ("default_transaction_isolation", "read committed", "Sets the transaction isolation level of each new transaction."),
-                    ];
                     let cols = alloc::vec![
                         ColumnSchema::new("name", DataType::Text, false),
                         ColumnSchema::new("setting", DataType::Text, false),
                         ColumnSchema::new("description", DataType::Text, false),
                     ];
-                    let rows: Vec<Row> = params
-                        .iter()
-                        .map(|(n, v, d)| {
-                            Row::new(alloc::vec![
-                                Value::text(alloc::string::String::from(*n)),
-                                Value::text(alloc::string::String::from(*v)),
-                                Value::text(alloc::string::String::from(*d)),
-                            ])
-                        })
-                        .collect();
+                    let mut rows: Vec<Row> = Vec::new();
+                    // Dynamic params outside the static canonical table.
+                    rows.push(Row::new(alloc::vec![
+                        Value::text(alloc::string::String::from("transaction_isolation")),
+                        Value::text(alloc::string::String::from(
+                            self.current_isolation_level.as_pg_str(),
+                        )),
+                        Value::text(alloc::string::String::from(
+                            "Shows the current transaction's isolation level.",
+                        )),
+                    ]));
+                    rows.push(Row::new(alloc::vec![
+                        Value::text(alloc::string::String::from("is_superuser")),
+                        Value::text(alloc::string::String::from("on")),
+                        Value::text(alloc::string::String::from("Reports superuser status.")),
+                    ]));
+                    for (n, boot, cat, _, _) in canon {
+                        rows.push(Row::new(alloc::vec![
+                            Value::text(alloc::string::String::from(*n)),
+                            Value::text(effective(n, boot)),
+                            Value::text(alloc::string::String::from(*cat)),
+                        ]));
+                    }
                     return Ok(QueryResult::Rows { columns: cols, rows });
                 }
-                let owned;
-                let value: &str = match name.as_str() {
-                    "transaction_isolation" => self.current_isolation_level.as_pg_str(),
-                    "server_version" => "18.4 (spg)",
-                    // PG's numeric version (major*10000 + minor); drivers
-                    // read it to gate feature use. 18.4 → 180004.
-                    "server_version_num" => "180004",
-                    "server_encoding" => "UTF8",
-                    "is_superuser" => "on",
-                    "TimeZone" | "timezone" => self
-                        .session_param("TimeZone")
-                        .or_else(|| self.session_param("timezone"))
-                        .unwrap_or("UTC"),
-                    "DateStyle" | "datestyle" => self
-                        .session_param("DateStyle")
-                        .or_else(|| self.session_param("datestyle"))
-                        .unwrap_or("ISO, MDY"),
-                    "client_encoding" => self.session_param("client_encoding").unwrap_or("UTF8"),
-                    "standard_conforming_strings" => self
-                        .session_param("standard_conforming_strings")
-                        .unwrap_or("on"),
-                    "search_path" => self
-                        .session_param("search_path")
-                        .unwrap_or("\"$user\", public"),
-                    "application_name" => self.session_param("application_name").unwrap_or(""),
-                    "statement_timeout" => self.session_param("statement_timeout").unwrap_or("0"),
-                    "default_transaction_isolation" => self
-                        .session_param("default_transaction_isolation")
-                        .unwrap_or("read committed"),
-                    "intervalstyle" | "IntervalStyle" => self
-                        .session_param("IntervalStyle")
-                        .or_else(|| self.session_param("intervalstyle"))
-                        .unwrap_or("postgres"),
-                    // v7.37.17 (17.6 siblings) — PG defaults for
-                    // parameters SPG doesn't yet honor at the engine
-                    // level. Drivers probe these with SHOW right
-                    // after a matching SET to verify the SET worked;
-                    // reporting the PG default keeps drivers happy
-                    // without having to plumb every param into
-                    // engine state.
-                    "lock_timeout" => self.session_param("lock_timeout").unwrap_or("0"),
-                    "idle_in_transaction_session_timeout" => self
-                        .session_param("idle_in_transaction_session_timeout")
-                        .unwrap_or("0"),
-                    "transaction_timeout" => self
-                        .session_param("transaction_timeout")
-                        .unwrap_or("0"),
-                    "client_min_messages" => self
-                        .session_param("client_min_messages")
-                        .unwrap_or("notice"),
-                    "default_tablespace" => self
-                        .session_param("default_tablespace")
-                        .unwrap_or(""),
-                    "default_table_access_method" => self
-                        .session_param("default_table_access_method")
-                        .unwrap_or("heap"),
-                    "row_security" => self.session_param("row_security").unwrap_or("on"),
-                    "check_function_bodies" => self
-                        .session_param("check_function_bodies")
-                        .unwrap_or("on"),
-                    "xmloption" => self.session_param("xmloption").unwrap_or("content"),
-                    "work_mem" => self.session_param("work_mem").unwrap_or("4MB"),
-                    "maintenance_work_mem" => self
-                        .session_param("maintenance_work_mem")
-                        .unwrap_or("64MB"),
-                    "max_connections" => {
-                        self.session_param("max_connections").unwrap_or("100")
+                let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
+                    "transaction_isolation" => {
+                        alloc::string::String::from(self.current_isolation_level.as_pg_str())
                     }
-                    "shared_buffers" => {
-                        self.session_param("shared_buffers").unwrap_or("128MB")
-                    }
-                    "effective_cache_size" => self
-                        .session_param("effective_cache_size")
-                        .unwrap_or("4GB"),
-                    other => {
-                        // Fall through to session_params for any user-set
-                        // override that didn't fall into a named bucket.
-                        if let Some(v) = self.session_param(other) {
-                            owned = alloc::string::String::from(v);
-                            &owned
+                    "is_superuser" => alloc::string::String::from("on"),
+                    _ => {
+                        // Canonical GUC? report the session override or its
+                        // boot default. Otherwise a user-set custom GUC, or a
+                        // recognised-name error pointing at pg_settings.
+                        if let Some((_, boot, ..)) =
+                            canon.iter().find(|(n, ..)| n.eq_ignore_ascii_case(&name))
+                        {
+                            effective(&name, boot)
+                        } else if let Some(v) = self.session_param(&name) {
+                            alloc::string::String::from(v)
                         } else {
                             return Err(EngineError::Unsupported(alloc::format!(
-                                "SHOW {other:?}: parameter not recognised; \
+                                "SHOW {name:?}: parameter not recognised; \
                                  see `SELECT name, setting FROM pg_settings` for \
                                  the full inventory"
                             )));
