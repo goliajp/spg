@@ -11851,19 +11851,41 @@ impl Parser {
                 )));
             }
             self.advance();
+            // REPEATABLE(seed) → a deterministic per-row draw seeded by
+            // `seed`, so the sample is stable across repeats and rescans.
+            // Non-REPEATABLE keeps the non-deterministic `random()` draw.
+            let mut sample_seed: Option<Expr> = None;
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("repeatable")) {
-                return Err(self.err(
-                    "TABLESAMPLE REPEATABLE(seed) requires deterministic per-row \
-                     sampling SPG does not support yet; drop REPEATABLE for a \
-                     non-deterministic sample"
-                        .into(),
-                ));
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after REPEATABLE, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let seed = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after REPEATABLE seed, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                sample_seed = Some(seed);
             }
-            self.pending_sample_preds.push(Expr::Binary {
-                lhs: Box::new(Expr::FunctionCall {
+            let draw = match sample_seed {
+                Some(seed) => Expr::FunctionCall {
+                    name: "__tsm_fract".to_string(),
+                    args: alloc::vec![seed],
+                },
+                None => Expr::FunctionCall {
                     name: "random".to_string(),
                     args: Vec::new(),
-                }),
+                },
+            };
+            self.pending_sample_preds.push(Expr::Binary {
+                lhs: Box::new(draw),
                 op: crate::ast::BinOp::Lt,
                 rhs: Box::new(Expr::Binary {
                     lhs: Box::new(percent),

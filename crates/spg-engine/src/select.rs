@@ -3237,7 +3237,13 @@ impl Engine {
         indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let ctx = self.ev_ctx(schema_cols, Some(alias));
+        // v7.38 (read01 U15) — per-scan sampler cell for TABLESAMPLE
+        // REPEATABLE (see run_single_table_scan). Aggregates
+        // (`count(*) FROM t TABLESAMPLE …`) filter through this ctx too.
+        let sample_cell: core::cell::Cell<Option<u64>> = core::cell::Cell::new(None);
+        let ctx = self
+            .ev_ctx(schema_cols, Some(alias))
+            .with_sample_rng(&sample_cell);
         let mut filtered: Vec<&Row<'static>> = Vec::new();
         // v6.2.6 — Memoize: per-query LRU cache for correlated
         // scalar subqueries. Fresh per row-loop entry so each
@@ -3363,7 +3369,16 @@ impl Engine {
         indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let ctx = self.ev_ctx(schema_cols, Some(alias));
+        // v7.38 (read01 U15) — a fresh per-scan sampler cell for
+        // `TABLESAMPLE … REPEATABLE(seed)`. Created before the ctx so the
+        // deterministic `__tsm_fract(seed)` draws share one scan-local
+        // state (isolated from the global random() PRNG); a fresh cell per
+        // scan makes a repeat / rescan reproduce the same sample. Unused
+        // and cheap when the query carries no sample.
+        let sample_cell: core::cell::Cell<Option<u64>> = core::cell::Cell::new(None);
+        let ctx = self
+            .ev_ctx(schema_cols, Some(alias))
+            .with_sample_rng(&sample_cell);
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
         // v7.19 P5 — single-table SELECT path for SRF
         // `SELECT unnest(arr) FROM t` shape. Detect a top-level

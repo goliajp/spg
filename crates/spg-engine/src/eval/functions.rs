@@ -7383,6 +7383,56 @@ fn apply_function_dispatch(
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.38 (read01 U15) — internal per-row draw for `TABLESAMPLE …
+        // REPEATABLE(seed)`. Uses the scan-local sampler cell in the eval
+        // context (seeded lazily from the literal seed on the first draw),
+        // so the sequence is deterministic and isolated from the global
+        // `random()` PRNG. Never surfaced to SQL directly — the parser
+        // synthesises `__tsm_fract(seed) < prob/100` for a REPEATABLE
+        // sample.
+        "__tsm_fract" => {
+            let Some(cell) = ctx.sample_rng else {
+                // Reached only when a REPEATABLE sample sits on a FROM item
+                // that isn't a direct single-table scan (e.g. a JOIN or
+                // derived-table primary), whose filter runs without a
+                // sampler cell. Honest, clear message rather than a silent
+                // wrong sample.
+                return Err(EvalError::TypeMismatch {
+                    detail: "TABLESAMPLE REPEATABLE is supported on a direct table scan; \
+                             a joined / derived-table sample is not deterministic yet"
+                        .into(),
+                });
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let mut state = match cell.get() {
+                Some(s) => s,
+                None => {
+                    // Seed lazily from the REPEATABLE literal; splitmix64 the
+                    // float bits to a well-diffused nonzero xorshift state.
+                    let seed_f = match args.first() {
+                        Some(Value::Float(x)) => *x,
+                        Some(Value::Int(n)) => f64::from(*n),
+                        Some(Value::BigInt(n)) => *n as f64,
+                        Some(Value::SmallInt(n)) => f64::from(*n),
+                        _ => 0.0,
+                    };
+                    let mut z = seed_f.to_bits().wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^= z >> 31;
+                    if z == 0 { 0x2545_F491_4F6C_DD1D } else { z }
+                }
+            };
+            // xorshift64* step.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            cell.set(Some(state));
+            #[allow(clippy::cast_precision_loss)]
+            let fract = ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64)
+                / ((1u64 << 53) as f64);
+            Ok(Value::Float(fract))
+        }
         // MySQL rand([seed]) — same [0,1) uniform; the optional
         // seed reseeds the PRNG first (repeatable series).
         "rand" => {
