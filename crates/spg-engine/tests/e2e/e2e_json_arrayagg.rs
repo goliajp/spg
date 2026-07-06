@@ -47,3 +47,32 @@ fn json_objectagg_matches_json_object_agg() {
         text_or_json(&pg_form[0][0]),
     );
 }
+
+#[test]
+fn json_agg_honours_order_by() {
+    // The aggregate's own ORDER BY reorders the elements (live PG18.4:
+    // json_agg(x ORDER BY x DESC) → [3, 2, 1]). Previously json_agg
+    // ignored the ORDER BY (unlike string_agg / array_agg) because it
+    // never recorded the sort keys.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ja (v INT, k TEXT)").unwrap();
+    e.execute("INSERT INTO ja VALUES (2,'b'),(1,'a'),(3,'c')").unwrap();
+    assert_eq!(
+        text_or_json(&rows(&mut e, "SELECT json_agg(v ORDER BY v DESC) FROM ja")[0][0]),
+        "[3, 2, 1]"
+    );
+    // Order by a different column (k: a→1, b→2, c→3).
+    assert_eq!(
+        text_or_json(&rows(&mut e, "SELECT json_agg(v ORDER BY k) FROM ja")[0][0]),
+        "[1, 2, 3]"
+    );
+    // jsonb variant + no-ORDER-BY control.
+    assert_eq!(
+        text_or_json(&rows(&mut e, "SELECT jsonb_agg(v ORDER BY v) FROM ja")[0][0]),
+        "[1, 2, 3]"
+    );
+    assert_eq!(
+        text_or_json(&rows(&mut e, "SELECT json_agg(v ORDER BY v) FROM ja")[0][0]),
+        "[1, 2, 3]"
+    );
+}
