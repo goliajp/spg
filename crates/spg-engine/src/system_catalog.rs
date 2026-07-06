@@ -117,22 +117,73 @@ pub(crate) fn pg_check_connames(t: &spg_storage::Table, tname: &str, checks: &[S
 /// `'text'`, …). Unknown variants fall back to the SPG name
 /// downcased — better than panicking on a future DataType.
 pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
+    // Ranges report their concrete type name (`int4range`, `numrange`,
+    // …); multiranges append `multirange` (`int4multirange`).
+    if let DataType::Range(k) = ty {
+        return alloc::string::String::from(k.keyword());
+    }
+    if let DataType::Multirange(k) = ty {
+        let base = k.keyword();
+        // keyword() yields e.g. "int4range" → "int4multirange".
+        return alloc::string::String::from(base).replace("range", "multirange");
+    }
     let s = match ty {
         DataType::Int => "integer",
         DataType::BigInt => "bigint",
         DataType::SmallInt => "smallint",
         DataType::Float => "double precision",
+        DataType::Numeric { .. } => "numeric",
         DataType::Bool => "boolean",
         DataType::Text => "text",
         DataType::Varchar(_) => "character varying",
+        DataType::Char(_) => "character",
+        DataType::Char1 => "\"char\"",
         DataType::Date => "date",
+        DataType::Time => "time without time zone",
         DataType::Timestamp => "timestamp without time zone",
         DataType::Timestamptz => "timestamp with time zone",
+        DataType::Interval => "interval",
         DataType::Json => "jsonb",
+        DataType::Jsonb => "jsonb",
         DataType::Bytes => "bytea",
-        DataType::TextArray | DataType::IntArray | DataType::BigIntArray => "ARRAY",
+        DataType::Uuid => "uuid",
+        DataType::Money => "money",
+        DataType::Inet => "inet",
+        DataType::Cidr => "cidr",
+        DataType::Macaddr => "macaddr",
+        DataType::Macaddr8 => "macaddr8",
+        DataType::Bit => "bit",
+        DataType::BitVarying => "bit varying",
+        DataType::Xml => "xml",
+        DataType::Point => "point",
+        DataType::Lseg => "lseg",
+        DataType::Path => "path",
+        DataType::PgBox => "box",
+        DataType::Polygon => "polygon",
+        DataType::Line => "line",
+        DataType::Circle => "circle",
         DataType::TsVector => "tsvector",
         DataType::TsQuery => "tsquery",
+        // Every array type surfaces as PG's `ARRAY` pseudo-name in
+        // information_schema.columns.data_type.
+        DataType::TextArray
+        | DataType::IntArray
+        | DataType::BigIntArray
+        | DataType::SmallIntArray
+        | DataType::FloatArray
+        | DataType::NumericArray
+        | DataType::BoolArray
+        | DataType::DateArray
+        | DataType::TimestampArray
+        | DataType::TimestamptzArray
+        | DataType::IntervalArray
+        | DataType::UuidArray
+        | DataType::JsonArray
+        | DataType::JsonbArray
+        | DataType::BytesArray
+        | DataType::VarcharArray
+        | DataType::CharArray
+        | DataType::MoneyArray => "ARRAY",
         DataType::Vector { .. } => "USER-DEFINED",
         // Non-exhaustive — fall back to "USER-DEFINED" the way
         // PG labels any pg_type it doesn't recognise.
@@ -188,6 +239,18 @@ pub(crate) fn synth_information_schema_columns(
                     Value::SmallInt(n) => n.to_string(),
                     Value::Float(f) => f.to_string(),
                     Value::Bool(b) => b.to_string(),
+                    // Typed literal defaults render via the engine's
+                    // canonical text formatters (PG stores the default
+                    // expression text) instead of leaking Rust Debug
+                    // (`Numeric { scaled: 0, scale: 2 }`).
+                    Value::Numeric { scaled, scale } => {
+                        crate::eval::format_numeric(*scaled, *scale)
+                    }
+                    Value::Date(d) => alloc::format!("'{}'::date", crate::eval::format_date(*d)),
+                    Value::Timestamp(t) => {
+                        alloc::format!("'{}'::timestamp", crate::eval::format_timestamp(*t))
+                    }
+                    Value::Uuid(b) => alloc::format!("'{}'::uuid", spg_storage::format_uuid(b)),
                     other => alloc::format!("{other:?}"),
                 };
                 Value::text(rendered)
@@ -205,7 +268,10 @@ pub(crate) fn synth_information_schema_columns(
                     DataType::Int => (Value::Int(32), Value::Int(0)),
                     DataType::BigInt => (Value::Int(64), Value::Int(0)),
                     DataType::Float => (Value::Int(53), Value::Null),
-                    DataType::Numeric { .. } => (Value::Null, Value::Null),
+                    DataType::Numeric { precision, scale } => (
+                        Value::Int(i32::from(precision)),
+                        Value::Int(i32::from(scale)),
+                    ),
                     _ => (Value::Null, Value::Null),
                 };
             // udt_name is PG's internal typname (int4, not integer).
