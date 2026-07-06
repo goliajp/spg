@@ -617,6 +617,15 @@ pub struct Engine {
     pub(crate) stat_tup_inserted: u64,
     pub(crate) stat_tup_updated: u64,
     pub(crate) stat_tup_deleted: u64,
+    /// v7.38 (read01 P3.19) — `SET LOCAL` undo log for the current
+    /// transaction. Each entry is `(param_name, prior_value)` captured
+    /// just before a `SET LOCAL` overwrote it (`None` = the param had no
+    /// session value, so restoring means removing it). Replayed in
+    /// reverse at COMMIT / ROLLBACK to revert transaction-local settings;
+    /// `savepoint_guc_marks` records the stack depth at each open
+    /// savepoint so `ROLLBACK TO` can unwind just the later ones.
+    pub(crate) local_guc_saves: Vec<(String, Option<String>)>,
+    pub(crate) savepoint_guc_marks: Vec<(String, usize)>,
     /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
     /// Each time the engine executes a `DeferredEmbeddedStmt` it
     /// increments this; the recursive `execute_stmt_with_cancel`
@@ -769,6 +778,8 @@ impl Engine {
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
+            local_guc_saves: Vec::new(),
+            savepoint_guc_marks: Vec::new(),
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1064,6 +1075,8 @@ impl Engine {
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
+            local_guc_saves: Vec::new(),
+            savepoint_guc_marks: Vec::new(),
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1147,6 +1160,8 @@ impl Engine {
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
+            local_guc_saves: Vec::new(),
+            savepoint_guc_marks: Vec::new(),
                     trigger_recursion_depth: 0,
                     foreign_key_checks: true,
                     meta_views_materialised: false,

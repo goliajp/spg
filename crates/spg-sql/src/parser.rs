@@ -1698,13 +1698,19 @@ impl Parser {
             // dump output loads.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set") => {
                 self.advance();
-                // PG allows `SET LOCAL` / `SET SESSION` qualifiers
-                // — accept and ignore. MySQL adds `SET GLOBAL` too
-                // (and the alias `SET @@global.name = …` which the
-                // SessionVar path handles).
-                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("local") || s.eq_ignore_ascii_case("session") || s.eq_ignore_ascii_case("global"))
-                {
-                    self.advance();
+                // PG allows `SET LOCAL` / `SET SESSION` qualifiers; MySQL
+                // adds `SET GLOBAL` too (and the alias `SET @@global.name =
+                // …` which the SessionVar path handles). `LOCAL` is the only
+                // one that changes semantics — it scopes the change to the
+                // current transaction — so capture it; SESSION / GLOBAL are
+                // accepted and treated as the default session scope.
+                let mut set_local = false;
+                if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
+                    let q = s.to_ascii_lowercase();
+                    if q == "local" || q == "session" || q == "global" {
+                        set_local = q == "local";
+                        self.advance();
+                    }
                 }
                 // v7.14.0 — MySQL `SET NAMES <charset> [COLLATE
                 // <collation>]` — change the connection client
@@ -1883,7 +1889,11 @@ impl Parser {
                 }
                 if pairs.len() == 1 {
                     let (name, value) = pairs.into_iter().next().unwrap();
-                    Ok(Statement::SetParameter { name, value })
+                    Ok(Statement::SetParameter {
+                        name,
+                        value,
+                        local: set_local,
+                    })
                 } else {
                     Ok(Statement::SetParameterList(pairs))
                 }

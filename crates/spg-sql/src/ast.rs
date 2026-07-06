@@ -241,6 +241,11 @@ pub enum Statement {
     SetParameter {
         name: String,
         value: SetValue,
+        /// v7.38 (read01 P3.19) — `SET LOCAL` scopes the change to the
+        /// current transaction; the engine saves the prior value and
+        /// restores it at COMMIT / ROLLBACK. Plain `SET` (and `SET
+        /// SESSION`) leave this false and persist for the session.
+        local: bool,
     },
     /// v7.14.0 — `SET a = 1, b = 2, …` MySQL-flavoured
     /// multi-assignment (mysqldump preamble uses
@@ -3521,8 +3526,8 @@ impl fmt::Display for Statement {
             Self::DropPublication(name) => {
                 write!(f, "DROP PUBLICATION {}", quote_ident(name))
             }
-            Self::SetParameter { name, value } => {
-                write!(f, "SET {name} = ")?;
+            Self::SetParameter { name, value, local } => {
+                write!(f, "SET {}{name} = ", if *local { "LOCAL " } else { "" })?;
                 match value {
                     SetValue::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
                     SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s),

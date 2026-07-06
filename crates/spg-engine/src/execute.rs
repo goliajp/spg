@@ -851,7 +851,11 @@ impl Engine {
             // tracks the value in `session_params`; FTS dispatcher
             // reads `default_text_search_config`. Everything else
             // is a recorded no-op (PG dump compat).
-            Statement::SetParameter { name, value } => {
+            Statement::SetParameter {
+                name,
+                value,
+                local,
+            } => {
                 // v7.38 (read01) — SPG serves the wire as UTF8, so a
                 // non-UTF8 client_encoding can't be honoured (the bytes
                 // stay UTF8). Reject it rather than silently store a value
@@ -887,7 +891,21 @@ impl Engine {
                 {
                     validate_known_guc(&name, s)?;
                 }
-                self.set_session_param(name, value);
+                // v7.38 (read01 P3.19) — `SET LOCAL` scopes the change to
+                // the current transaction: record the prior value in the
+                // undo log so COMMIT / ROLLBACK (and ROLLBACK TO) restore
+                // it. Outside a transaction block it has no lasting effect
+                // (PG scopes it to the implicit single-statement txn), so
+                // it is dropped rather than persisted to the session.
+                if local {
+                    if self.in_transaction() {
+                        let prior = self.session_param(&name).map(String::from);
+                        self.local_guc_saves.push((name.clone(), prior));
+                        self.set_session_param(name, value);
+                    }
+                } else {
+                    self.set_session_param(name, value);
+                }
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: false,

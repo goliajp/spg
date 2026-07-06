@@ -10,6 +10,33 @@ use alloc::vec::Vec;
 use crate::{Engine, EngineError, QueryResult, TxState};
 
 impl Engine {
+    /// v7.38 (read01 P3.19) — replay the `SET LOCAL` undo log down to
+    /// `floor`, reverting each transaction-local GUC to the value it held
+    /// before it was set (or removing it if it had none). Popping to
+    /// `floor = 0` reverts every local change (COMMIT / ROLLBACK); a
+    /// non-zero floor reverts only the entries above a savepoint mark
+    /// (`ROLLBACK TO`). Restores go through `set_session_param` so its
+    /// side effects (foreign_key_checks, escape-mode plan-cache flush) are
+    /// replayed too.
+    pub(crate) fn restore_local_gucs_to(&mut self, floor: usize) {
+        while self.local_guc_saves.len() > floor {
+            let (name, prior) = self.local_guc_saves.pop().expect("len checked");
+            match prior {
+                Some(v) => self.set_session_param(name, spg_sql::ast::SetValue::String(v)),
+                None => {
+                    self.session_params.remove(&name.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    /// Revert every `SET LOCAL` of the current transaction and clear the
+    /// savepoint marks — used at COMMIT and ROLLBACK.
+    pub(crate) fn restore_all_local_gucs(&mut self) {
+        self.restore_local_gucs_to(0);
+        self.savepoint_guc_marks.clear();
+    }
+
     pub(crate) fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
         if self.tx_catalogs.contains_key(&tx_id) {
@@ -80,6 +107,9 @@ impl Engine {
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with
         // `state`).
+        // v7.38 (read01 P3.19) — SET LOCAL settings expire at the
+        // transaction boundary, reverting to the pre-transaction values.
+        self.restore_all_local_gucs();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -107,6 +137,8 @@ impl Engine {
             self.release_tx_locks(v);
         }
         // savepoints discarded with the TxState
+        // v7.38 (read01 P3.19) — SET LOCAL settings expire at ROLLBACK too.
+        self.restore_all_local_gucs();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -115,6 +147,9 @@ impl Engine {
 
     pub(crate) fn exec_savepoint(&mut self, name: String) -> Result<QueryResult, EngineError> {
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        // v7.38 (read01 P3.19) — remember the SET LOCAL undo-log depth at
+        // this savepoint so `ROLLBACK TO` can unwind only the later ones.
+        let guc_depth = self.local_guc_saves.len();
         let state = self
             .tx_catalogs
             .get_mut(&tx_id)
@@ -124,7 +159,9 @@ impl Engine {
         // application code can `SAVEPOINT sp; ...; SAVEPOINT sp` freely.
         state.savepoints.retain(|(n, _)| n != &name);
         let snapshot = state.catalog.clone();
-        state.savepoints.push((name, snapshot));
+        state.savepoints.push((name.clone(), snapshot));
+        self.savepoint_guc_marks.retain(|(n, _)| n != &name);
+        self.savepoint_guc_marks.push((name, guc_depth));
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -153,6 +190,14 @@ impl Engine {
         let snapshot = state.savepoints[pos].1.clone();
         state.savepoints.truncate(pos + 1);
         state.catalog = snapshot;
+        // v7.38 (read01 P3.19) — undo any SET LOCAL made after this
+        // savepoint (they roll back with the subtransaction), and drop the
+        // marks nested under it.
+        if let Some(mpos) = self.savepoint_guc_marks.iter().rposition(|(n, _)| n == name) {
+            let floor = self.savepoint_guc_marks[mpos].1;
+            self.savepoint_guc_marks.truncate(mpos + 1);
+            self.restore_local_gucs_to(floor);
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -178,6 +223,11 @@ impl Engine {
         // RELEASE keeps the work since the savepoint, just discards the
         // bookmark plus everything nested under it.
         state.savepoints.truncate(pos);
+        // v7.38 (read01 P3.19) — RELEASE keeps the SET LOCAL changes (they
+        // survive to the outer transaction), only the bookmarks go.
+        if let Some(mpos) = self.savepoint_guc_marks.iter().rposition(|(n, _)| n == name) {
+            self.savepoint_guc_marks.truncate(mpos);
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
