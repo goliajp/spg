@@ -5904,12 +5904,15 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let parsed: f64 = cleaned.parse().map_err(|_| EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "to_number(): could not parse {cleaned:?}"
-                ),
-            })?;
-            Ok(Value::Float(parsed))
+            // v7.38 (read01 P6.02) — PG's to_number returns `numeric`, not a
+            // float; parse into the exact (scaled, scale) representation so
+            // long / high-precision inputs don't lose digits to f64.
+            match crate::numeric::parse_numeric_text(&cleaned) {
+                Some((scaled, scale)) => Ok(Value::Numeric { scaled, scale }),
+                None => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("to_number(): could not parse {cleaned:?}"),
+                }),
+            }
         }
         // v7.37.17 (17.6 siblings) — fuzzystrmatch soundex(text)
         // returns the 4-char Soundex code (Russell / Odell 1918
