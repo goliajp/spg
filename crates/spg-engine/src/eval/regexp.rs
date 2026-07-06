@@ -883,7 +883,11 @@ fn re_match_at(
         } else {
             None
         }),
-        ReNode::AnyChar => Ok(if pos < s.len() && s[pos] != '\n' {
+        // v7.38 (read01 P6.15) — PG's ARE is non-newline-sensitive by default,
+        // so `.` matches ANY character including `\n` (unlike Perl, where a
+        // separate `s`/DOTALL flag is needed). SPG previously excluded `\n`,
+        // diverging from PG on multi-line input.
+        ReNode::AnyChar => Ok(if pos < s.len() {
             Some(pos + 1)
         } else {
             None
@@ -1103,22 +1107,22 @@ fn re_find(node: &ReNode, s: &[char], from: usize) -> Result<Option<(usize, usiz
 /// with nothing but `.` and dot-quantifiers between the anchors — then a
 /// whole-string match reduces to a length test and no backtracking is
 /// needed: the string matches iff its CHARACTER length lies in
-/// `[min, max]` (`max == None` = unbounded) AND — because SPG's `.`
-/// excludes `\n` (see `ReNode::AnyChar` in `re_match_at`) — the string
-/// contains no newline. Returns `Some((min, max))` for such a pattern,
-/// or `None` to leave everything else on the backtracker.
+/// `[min, max]` (`max == None` = unbounded). Since SPG's `.` matches ANY
+/// character including `\n` (PG's non-newline-sensitive default — see
+/// `ReNode::AnyChar` in `re_match_at`), no separate newline test is needed.
+/// Returns `Some((min, max))` for such a pattern, or `None` to leave
+/// everything else on the backtracker.
 ///
 /// Equivalence argument (why the caller's length test is byte-for-byte
 /// identical to the backtracker):
 ///
 ///  * Fully anchored `^…$` forces the dot-run to span the WHOLE string,
 ///    so exactly `len` dots must match, one per character. Every `.`
-///    requires a non-`\n` char, so a match needs the whole string to be
-///    newline-free; and the reachable total-length set of a sequence of
-///    integer ranges `[aᵢ,bᵢ]` is the contiguous interval `[Σaᵢ, Σbᵢ]`
-///    (Minkowski sum of consecutive-integer intervals), so `len ∈
-///    [Σmin, Σmax]` is exactly decomposability. Hence match ⇔
-///    `Σmin ≤ len ≤ Σmax ∧ no '\n'`.
+///    matches any single character; the reachable total-length set of a
+///    sequence of integer ranges `[aᵢ,bᵢ]` is the contiguous interval
+///    `[Σaᵢ, Σbᵢ]` (Minkowski sum of consecutive-integer intervals), so
+///    `len ∈ [Σmin, Σmax]` is exactly decomposability. Hence match ⇔
+///    `Σmin ≤ len ≤ Σmax`.
 ///  * The "at most one variable-width quantifier" gate keeps the
 ///    backtracker's cost at O(len) (two or more free `.*`/`.{m,n}` in
 ///    sequence can enumerate combinatorially on a non-matching input and
@@ -1588,9 +1592,10 @@ pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     if let Some((min, max)) = matchall_length_bounds(&node) {
         let len = chars.len();
         if (len as u64) <= MATCHALL_SAFE_LEN {
-            let matched = min <= len
-                && max.map_or(true, |mx| len <= mx)
-                && !chars.contains(&'\n');
+            // v7.38 (read01 P6.15) — `.` now matches `\n` (PG default), so a
+            // fully-anchored dot-run matches the whole string regardless of
+            // embedded newlines; the length test alone is exact.
+            let matched = min <= len && max.map_or(true, |mx| len <= mx);
             return Ok(Value::Bool(matched));
         }
     }
@@ -1967,8 +1972,8 @@ mod matchall_tests {
 
     // Differential: for every fast-pathed pattern the length short-circuit
     // must agree with a forced-backtracking match on a spread of inputs —
-    // INCLUDING newline-containing inputs (SPG's `.` excludes `\n`, so a
-    // pure length check would be wrong without the newline guard).
+    // INCLUDING newline-containing inputs (SPG's `.` matches `\n` per PG's
+    // default, so the pure length check is exact).
     #[test]
     fn matchall_fast_path_agrees_with_backtracker() {
         let pats = [
@@ -1984,8 +1989,9 @@ mod matchall_tests {
             for s in inputs {
                 let cs = chars(s);
                 let len = cs.len();
-                let fast =
-                    min <= len && max.map_or(true, |mx| len <= mx) && !cs.contains(&'\n');
+                // v7.38 (read01 P6.15) — `.` matches `\n` (PG default), so the
+                // fast path is a pure length test with no newline guard.
+                let fast = min <= len && max.map_or(true, |mx| len <= mx);
                 let slow = super::re_find(&node, &cs, 0).unwrap().is_some();
                 assert_eq!(
                     fast, slow,
@@ -2006,11 +2012,11 @@ mod matchall_tests {
                 other => panic!("regexp_like returned {other:?}"),
             }
         };
-        // `^.*$` (what `SIMILAR TO '%'` lowers to) matches anything with no
-        // newline; a newline defeats it (SPG's `.` excludes `\n`).
+        // v7.38 (read01 P6.15) — `^.*$` matches ANY string, newlines
+        // included, because PG's `.` is non-newline-sensitive by default.
         assert!(like("", "^.*$"));
         assert!(like("anything at all", "^.*$"));
-        assert!(!like("two\nlines", "^.*$"));
+        assert!(like("two\nlines", "^.*$"));
         // `^.{2,4}$` window.
         assert!(!like("a", "^.{2,4}$"));
         assert!(like("abc", "^.{2,4}$"));
