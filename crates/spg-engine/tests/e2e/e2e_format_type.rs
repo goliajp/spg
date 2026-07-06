@@ -110,3 +110,20 @@ fn regtype_numeric_oid_renders_type_name() {
     // Unknown OID falls back to the number.
     assert_eq!(text(&first(&mut e, "SELECT 99999::regtype::text")), "99999");
 }
+
+#[test]
+fn format_type_renders_array_as_element_brackets() {
+    // PG renders an array type as `<element>[]`, not the internal `_int4`
+    // spelling. Live-PG18.4-verified.
+    let mut e = Engine::new();
+    assert_eq!(text(&first(&mut e, "SELECT format_type('_int4'::regtype, null)")), "integer[]");
+    assert_eq!(text(&first(&mut e, "SELECT format_type('_text'::regtype, null)")), "text[]");
+    assert_eq!(text(&first(&mut e, "SELECT format_type('_numeric'::regtype, null)")), "numeric[]");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('_timestamp'::regtype, null)")),
+        "timestamp without time zone[]"
+    );
+    // Scalar spelling + typmod unchanged.
+    assert_eq!(text(&first(&mut e, "SELECT format_type('int4'::regtype, null)")), "integer");
+    assert_eq!(text(&first(&mut e, "SELECT format_type('varchar'::regtype, 14)")), "character varying(10)");
+}
