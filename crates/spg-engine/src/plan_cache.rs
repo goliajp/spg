@@ -274,6 +274,12 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             collect_expr(expr, out);
             collect_from_select(subquery, out);
         }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            for el in row {
+                collect_expr(el, out);
+            }
+            collect_from_select(subquery, out);
+        }
         Expr::Binary { lhs, rhs, .. } => {
             collect_expr(lhs, out);
             collect_expr(rhs, out);

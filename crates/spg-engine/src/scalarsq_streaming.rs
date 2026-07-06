@@ -122,7 +122,7 @@ pub fn is_scalarsq_streaming_shape(stmt: &SelectStatement) -> bool {
 fn expr_has_scalar_subquery(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) => true,
-        Expr::Exists { .. } | Expr::InSubquery { .. } => false,
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => false,
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_scalar_subquery(call)
                 || order_by.iter().any(|o| expr_has_scalar_subquery(&o.expr))
@@ -192,7 +192,7 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
 fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
     match e {
         Expr::WindowFunction { .. } => true,
-        Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => true,
         // Top-level SRF. `is_top_level_unnest` (in select.rs) is the
         // authority on SRF detection at the SELECT level; for the
         // detector we recognise the canonical UNNEST call by name.

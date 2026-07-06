@@ -334,7 +334,10 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
         // Stored predicate sources never contain subqueries —
         // CHECK / partial-index / runtime_default are all scalar.
         // If a future feature changes that, recurse here.
-        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. } => {}
         Expr::Literal(_) | Expr::Placeholder(_) => {}
     }
 }
@@ -705,6 +708,12 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
         Expr::Exists { subquery, .. } => substitute_select(subquery, params)?,
         Expr::InSubquery { expr, subquery, .. } => {
             substitute_expr(expr, params)?;
+            substitute_select(subquery, params)?;
+        }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            for el in row.iter_mut() {
+                substitute_expr(el, params)?;
+            }
             substitute_select(subquery, params)?;
         }
         Expr::WindowFunction {

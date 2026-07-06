@@ -46,6 +46,7 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_) => false,

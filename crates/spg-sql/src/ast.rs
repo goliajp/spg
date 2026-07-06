@@ -2629,6 +2629,16 @@ pub enum Expr {
         subquery: Box<SelectStatement>,
         negated: bool,
     },
+    /// `(a, b, …) [NOT] IN (SELECT x, y, …)` — a row constructor tested
+    /// against a multi-column subquery. Row comparisons against a *list*
+    /// decompose to OR-of-AND at parse time, but the subquery form can't
+    /// (its rows are only known at runtime), so this survives as its own
+    /// node evaluated with PG's row-comparison three-valued logic.
+    RowInSubquery {
+        row: Vec<Expr>,
+        subquery: Box<SelectStatement>,
+        negated: bool,
+    },
     /// v7.30.2 (mailrs round-25) — `expr [NOT] IN (a, b, …)` as a FLAT
     /// list. Both the parser's literal-list path and the engine's
     /// IN-subquery materialisation used to desugar into a left-deep
@@ -5157,6 +5167,21 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "({expr} IN ({subquery}))")
                 }
+            }
+            Self::RowInSubquery {
+                row,
+                subquery,
+                negated,
+            } => {
+                write!(f, "(")?;
+                for (i, e) in row.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                let kw = if *negated { ") NOT IN (" } else { ") IN (" };
+                write!(f, "{kw}{subquery})")
             }
             Self::InList {
                 expr,

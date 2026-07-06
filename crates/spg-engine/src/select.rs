@@ -1342,6 +1342,7 @@ impl Engine {
             Expr::ScalarSubquery(_)
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}

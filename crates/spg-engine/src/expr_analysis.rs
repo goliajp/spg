@@ -291,6 +291,9 @@ pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
             select_refers_to(subquery, target)
         }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            row.iter().any(|el| expr_refers_to(el, target)) || select_refers_to(subquery, target)
+        }
         Expr::Binary { lhs, rhs, .. } => expr_refers_to(lhs, target) || expr_refers_to(rhs, target),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             expr_refers_to(expr, target)

@@ -621,6 +621,12 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(expr, f);
             walk_select(subquery, f);
         }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            for el in row {
+                walk_expr(el, f);
+            }
+            walk_select(subquery, f);
+        }
         Expr::Extract { source, .. } => walk_expr(source, f),
         Expr::Array(items) => {
             for elem in items {
