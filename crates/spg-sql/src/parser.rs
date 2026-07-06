@@ -6232,11 +6232,26 @@ impl Parser {
                                     }
                                 ]);
                             }
+                            // `SET EXPRESSION AS (expr)` (PG 17) — change a
+                            // stored generated column's expression and
+                            // recompute existing rows.
+                            Token::Ident(s) if s.eq_ignore_ascii_case("expression") => {
+                                self.advance(); // EXPRESSION
+                                if matches!(self.peek(), Token::As) {
+                                    self.advance();
+                                }
+                                let expr = self.parse_expr(0)?;
+                                return Ok(alloc::vec![
+                                    crate::ast::AlterTableTarget::AlterColumnSetExpression {
+                                        column: col_name,
+                                        expr,
+                                    }
+                                ]);
+                            }
                             other => {
                                 // Other SET subjects (STATISTICS,
-                                // STORAGE, COMPRESSION, …) currently
-                                // stay no-ops — they'll surface in
-                                // their own 18.x sub-items.
+                                // STORAGE, COMPRESSION, …) stay no-ops —
+                                // storage hints with no SPG semantics.
                                 let _ = other;
                                 self.consume_until_statement_boundary();
                                 return Ok(Vec::new());
