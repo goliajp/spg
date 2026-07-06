@@ -115,3 +115,23 @@ fn custom_namespaced_guc_round_trips() {
         spg_storage::Value::Null
     ));
 }
+
+#[test]
+fn set_client_encoding_rejects_non_utf8() {
+    // v7.38 (read01) — SPG serves the wire as UTF8, so a non-UTF8
+    // client_encoding is rejected rather than silently stored (which would
+    // mislabel the byte stream). UTF8 / UNICODE (and utf-8 spelling) are
+    // accepted; an invalid name is rejected like PG.
+    let mut e = Engine::new();
+    e.execute("SET client_encoding='UTF8'").unwrap();
+    e.execute("SET client_encoding='utf-8'").unwrap();
+    e.execute("SET client_encoding=UNICODE").unwrap();
+    e.execute("SET client_encoding='UTF8'").unwrap();
+    for bad in ["SET client_encoding='SJIS'", "SET client_encoding='LATIN1'", "SET client_encoding='BOGUS'"] {
+        assert!(e.execute(bad).is_err(), "should reject: {bad}");
+    }
+    // A rejected SET leaves the prior (UTF8) value in place, and other
+    // GUCs are unaffected.
+    assert_eq!(text(&first(&mut e, "SELECT current_setting('client_encoding')")), "UTF8");
+    e.execute("SET application_name='ok'").unwrap();
+}
