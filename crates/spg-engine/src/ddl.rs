@@ -2039,7 +2039,18 @@ impl Engine {
                 // participate(they're a catch-all, not a range).
                 let siblings =
                     crate::partition::children_of_parent(self.active_catalog(), &spec.parent_name);
-                let mut default_count = 0usize;
+                // Partition-key column of the parent (RANGE uses one key).
+                let key_pos = match &self
+                    .active_catalog()
+                    .get(&spec.parent_name)
+                    .and_then(|p| Some(p.schema().partition_role.clone()))
+                    .flatten()
+                {
+                    Some(PartitionRole::Parent { key_column_positions, .. }) => {
+                        key_column_positions.first().copied().unwrap_or(0)
+                    }
+                    _ => 0,
+                };
                 for sib in &siblings {
                     let Some(t) = self.active_catalog().get(sib) else {
                         continue;
@@ -2061,11 +2072,33 @@ impl Engine {
                                 )));
                             }
                         }
-                        Some(PartitionRole::Default { .. }) => default_count += 1,
+                        // v7.38 (read01) — DEFAULT-partition cross-check:
+                        // any row already parked in the default partition
+                        // that falls in the new range means adding it would
+                        // strand that row in the wrong partition. PG rejects
+                        // rather than allow the inconsistency.
+                        Some(PartitionRole::Default { .. }) => {
+                            for row in t.rows().iter() {
+                                let Some(v) = row.values.get(key_pos) else {
+                                    continue;
+                                };
+                                if v.is_null() {
+                                    continue;
+                                }
+                                let Some(kb) = crate::partition::value_to_bound(v) else {
+                                    continue;
+                                };
+                                if crate::partition::value_in_range(&kb, &lower_b, &upper_b) {
+                                    return Err(EngineError::Unsupported(alloc::format!(
+                                        "updated partition constraint for default partition \
+                                         {sib:?} would be violated by some row"
+                                    )));
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
-                let _ = default_count;
                 PartitionRole::Range {
                     parent_name: spec.parent_name.clone(),
                     lower: lower_b,

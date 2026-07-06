@@ -452,3 +452,25 @@ fn sentori_acceptance_probe() {
         1
     );
 }
+
+#[test]
+fn add_partition_rejects_conflicting_default_rows() {
+    // v7.38 (read01) — adding a range partition when the DEFAULT partition
+    // already holds a row that would belong to the new range is rejected,
+    // matching PG ("updated partition constraint for default partition …
+    // would be violated by some row"). Otherwise the row would be stranded.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE p(id int) PARTITION BY RANGE(id)").unwrap();
+    e.execute("CREATE TABLE p_lo PARTITION OF p FOR VALUES FROM (1) TO (10)")
+        .unwrap();
+    e.execute("CREATE TABLE p_def PARTITION OF p DEFAULT").unwrap();
+    e.execute("INSERT INTO p VALUES(5),(50)").unwrap();
+    // 50 sits in the default and falls in [40,60) → reject.
+    assert!(
+        e.execute("CREATE TABLE p_hi PARTITION OF p FOR VALUES FROM (40) TO (60)")
+            .is_err()
+    );
+    // A range the default holds no row for is fine.
+    e.execute("CREATE TABLE p_mid PARTITION OF p FOR VALUES FROM (10) TO (20)")
+        .unwrap();
+}
