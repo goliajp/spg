@@ -337,7 +337,8 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::RowInSubquery { .. } => {}
+        | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. } => {}
         Expr::Literal(_) | Expr::Placeholder(_) => {}
     }
 }
@@ -711,6 +712,12 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
             substitute_select(subquery, params)?;
         }
         Expr::RowInSubquery { row, subquery, .. } => {
+            for el in row.iter_mut() {
+                substitute_expr(el, params)?;
+            }
+            substitute_select(subquery, params)?;
+        }
+        Expr::RowCmpSubquery { row, subquery, .. } => {
             for el in row.iter_mut() {
                 substitute_expr(el, params)?;
             }

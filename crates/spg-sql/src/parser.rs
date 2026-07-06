@@ -13974,6 +13974,27 @@ impl Parser {
             )));
         }
         self.advance();
+        // `(a, b) <op> (SELECT x, y)` — compare against a single-row
+        // subquery. Kept as a node (the subquery's row is a runtime value);
+        // the literal-RHS form below still decomposes at parse time.
+        if matches!(self.peek(), Token::Select) {
+            let inner = self.parse_select_stmt()?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after row comparison subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let Statement::Select(s) = inner else {
+                unreachable!("parse_select_stmt always returns Statement::Select")
+            };
+            return Ok(Expr::RowCmpSubquery {
+                row,
+                op,
+                subquery: Box::new(s),
+            });
+        }
         let mut rhs = alloc::vec![self.parse_expr(0)?];
         while matches!(self.peek(), Token::Comma) {
             self.advance();

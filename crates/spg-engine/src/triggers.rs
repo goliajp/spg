@@ -1283,7 +1283,8 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
         | Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::RowInSubquery { .. } => {}
+        | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. } => {}
     }
 }
 
@@ -1422,7 +1423,8 @@ fn substitute_new_old(
         | Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::RowInSubquery { .. } => {}
+        | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. } => {}
     }
     Ok(())
 }
