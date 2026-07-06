@@ -268,6 +268,7 @@ pub enum LexErrorKind {
     UnterminatedQuotedIdent,
     UnterminatedBlockComment,
     BadNumber(String),
+    InvalidUnicodeEscape,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +292,9 @@ impl fmt::Display for LexError {
             }
             LexErrorKind::BadNumber(s) => {
                 write!(f, "invalid number literal {s:?} at byte {}", self.pos)
+            }
+            LexErrorKind::InvalidUnicodeEscape => {
+                write!(f, "invalid Unicode escape at byte {}", self.pos)
             }
         }
     }
@@ -1245,6 +1249,49 @@ fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexErr
                     s.push('\u{000C}');
                     i += 2;
                 }
+                b'v' => {
+                    s.push('\u{000B}');
+                    i += 2;
+                }
+                // \uHHHH (4 hex) / \UHHHHHHHH (8 hex) Unicode escapes. A
+                // `\u` high surrogate combines with a following `\uLLLL`
+                // low surrogate (PG's `😀` → emoji); a lone
+                // surrogate or short/invalid hex run is an error.
+                b'u' | b'U' => {
+                    let is_u = bytes[i + 1] == b'u';
+                    let ndigits = if is_u { 4 } else { 8 };
+                    let Some(cp) = read_hex_run(bytes, i + 2, ndigits) else {
+                        return Err(LexError {
+                            kind: LexErrorKind::InvalidUnicodeEscape,
+                            pos: i,
+                        });
+                    };
+                    if is_u && (0xD800..=0xDBFF).contains(&cp) {
+                        let lo = (bytes.get(i + 6) == Some(&b'\\')
+                            && bytes.get(i + 7) == Some(&b'u'))
+                        .then(|| read_hex_run(bytes, i + 8, 4))
+                        .flatten()
+                        .filter(|l| (0xDC00..=0xDFFF).contains(l));
+                        let Some(lo) = lo else {
+                            return Err(LexError {
+                                kind: LexErrorKind::InvalidUnicodeEscape,
+                                pos: i,
+                            });
+                        };
+                        let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        s.push(char::from_u32(combined).ok_or(LexError {
+                            kind: LexErrorKind::InvalidUnicodeEscape,
+                            pos: i,
+                        })?);
+                        i += 12;
+                    } else {
+                        s.push(char::from_u32(cp).ok_or(LexError {
+                            kind: LexErrorKind::InvalidUnicodeEscape,
+                            pos: i,
+                        })?);
+                        i += 2 + ndigits;
+                    }
+                }
                 b'0' if i + 2 >= bytes.len() || !bytes[i + 2].is_ascii_digit() => {
                     s.push('\0');
                     i += 2;
@@ -1308,6 +1355,16 @@ fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexErr
         }
     }
     Ok((Token::String(s), i - start))
+}
+
+/// Read exactly `n` hex digits starting at `start`, returning their value
+/// (or `None` if fewer than `n` hex digits are present).
+fn read_hex_run(bytes: &[u8], start: usize, n: usize) -> Option<u32> {
+    let mut v = 0u32;
+    for k in 0..n {
+        v = (v << 4) | hex_digit_value(*bytes.get(start + k)?)?;
+    }
+    Some(v)
 }
 
 fn hex_digit_value(b: u8) -> Option<u32> {
