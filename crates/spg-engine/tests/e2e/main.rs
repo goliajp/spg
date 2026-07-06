@@ -356,6 +356,7 @@ mod e2e_inline_column_constraints;
 mod e2e_inline_pk;
 mod e2e_insert_select;
 mod e2e_int_overflow;
+mod e2e_int_type_aliases;
 mod e2e_int_array;
 mod e2e_interval_array;
 mod e2e_interval_cast;
