@@ -3332,22 +3332,26 @@ impl Database {
     /// Sticky errors from a prior async run surface here (via
     /// `try_enqueue`), so a failed background checkpoint still reaches
     /// the caller eventually rather than vanishing.
-    fn trigger_checkpoint(&self) -> Result<(), EngineError> {
+    /// v7.38 (read01 P5.02) — returns `true` only when the job was actually
+    /// enqueued. The worker drops a job (returns `false`) when a checkpoint
+    /// is already pending / inflight; the caller must NOT then advance its
+    /// `last_checkpoint_at` bookkeeping, or it would record a checkpoint that
+    /// never ran and delay the retry, widening the data-loss window.
+    fn trigger_checkpoint(&self) -> Result<bool, EngineError> {
         if self.persistence.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let Some(job) = self.snapshot_checkpoint_job() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(worker) = self
             .persistence
             .as_ref()
             .and_then(|p| p.checkpoint_worker.as_ref())
         else {
-            return Ok(());
+            return Ok(false);
         };
-        let _accepted = worker.try_enqueue(job)?;
-        Ok(())
+        worker.try_enqueue(job)
     }
 
     /// v7.37.13 (A1.1) — public façade over the sync
@@ -3363,7 +3367,7 @@ impl Database {
     /// last worker run so a failed background checkpoint reaches
     /// the caller.
     pub fn maybe_trigger_checkpoint(&self) -> Result<(), EngineError> {
-        self.trigger_checkpoint()
+        self.trigger_checkpoint().map(|_accepted| ())
     }
 
     /// v7.37.13 (A1.1) — current checkpoint time threshold, or
@@ -3769,7 +3773,14 @@ impl Database {
                 // crossed the threshold doesn't stall on a multi-hundred-ms
                 // snapshot write. Any sticky error from a prior async
                 // checkpoint surfaces here.
-                self.trigger_checkpoint()?;
+                // v7.38 (read01 P5.02) — only advance the checkpoint
+                // bookkeeping when the job was actually enqueued. If the
+                // worker dropped it (a prior checkpoint still pending /
+                // inflight), leaving last_checkpoint_at untouched lets the
+                // next commit re-trigger so the newer writes still get a
+                // checkpoint instead of waiting a full interval.
+                let accepted = self.trigger_checkpoint()?;
+                if accepted {
                 // v7.37.13 (A1.8) — feed the EWMA + recompute the
                 // adaptive byte threshold from observed WAL growth
                 // rate. Read the prior markers BEFORE we overwrite
@@ -3811,6 +3822,7 @@ impl Database {
                 *p.last_checkpoint_wal_len
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = now_len;
+                }
             }
         }
         Ok(ticket)
