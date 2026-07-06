@@ -103,7 +103,41 @@ impl Engine {
             T::AlterColumnDropNotNull { column } => {
                 self.alter_column_drop_not_null(tbl, column)
             }
+            T::AlterColumnDropExpression { column } => {
+                self.alter_column_drop_expression(tbl, column)
+            }
         }
+    }
+
+    /// v7.38 (read01 U10) — `ALTER COLUMN col DROP EXPRESSION` converts a
+    /// stored generated column to a plain column: clear the generation
+    /// expression so future INSERT/UPDATE accept a supplied value instead
+    /// of recomputing it. Existing stored values are left as-is.
+    fn alter_column_drop_expression(
+        &mut self,
+        tbl: &str,
+        column: String,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN DROP EXPRESSION: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        if table.schema().columns[pos].generated_stored_expr.is_none() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER COLUMN DROP EXPRESSION: column {column:?} is not a stored generated column"
+            )));
+        }
+        table.schema_mut().columns[pos].generated_stored_expr = None;
+        Ok(())
     }
 
     /// v7.37.18 (18.1) — set / drop column default.
