@@ -48,3 +48,30 @@ fn no_duplicates_unchanged() {
         "{\"x\": 1, \"y\": 2}"
     );
 }
+
+#[test]
+fn jsonb_object_agg_canonicalises_key_order() {
+    // jsonb_object_agg emits canonical jsonb — keys sorted regardless of
+    // insertion order (live PG18.4: {"a": 1, "b": 2}). json_object_agg
+    // keeps first-seen order.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ord (k TEXT, v INT)").unwrap();
+    e.execute("INSERT INTO ord VALUES ('b',2),('a',1),('c',3)").unwrap();
+    assert_eq!(
+        json_text(&mut e, "SELECT jsonb_object_agg(k, v) FROM ord"),
+        "{\"a\": 1, \"b\": 2, \"c\": 3}"
+    );
+    // json_object_agg keeps insertion order.
+    assert_eq!(
+        json_text(&mut e, "SELECT json_object_agg(k, v) FROM ord"),
+        "{\"b\": 2, \"a\": 1, \"c\": 3}"
+    );
+    // jsonb_agg canonicalises nested object keys.
+    assert_eq!(
+        json_text(
+            &mut e,
+            "SELECT jsonb_agg(x) FROM (VALUES ('{\"b\":2,\"a\":1}'::jsonb)) t(x)"
+        ),
+        "[{\"a\": 1, \"b\": 2}]"
+    );
+}
