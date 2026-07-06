@@ -1111,7 +1111,20 @@ impl Parser {
                     // so a driver that issues `SHOW spam_setting`
                     // gets a clear runtime error instead of a
                     // confusing "unknown SHOW target".
-                    other => Ok(Statement::ShowParameter(other.to_string())),
+                    other => {
+                        // v7.38 (read01 P3.20) — a custom namespaced GUC
+                        // (`SHOW app.foo`) arrives as `app` + `.` + `foo`;
+                        // consume the dotted tail so it round-trips with
+                        // `SET app.foo` / `current_setting('app.foo')`.
+                        let mut full = other.to_string();
+                        while matches!(self.peek(), Token::Dot) {
+                            self.advance();
+                            let seg = self.expect_ident_like()?;
+                            full.push('.');
+                            full.push_str(&seg.to_ascii_lowercase());
+                        }
+                        Ok(Statement::ShowParameter(full))
+                    }
                 }
             }
             // v6.1.2: `DROP` is now a reserved keyword (it dispatches

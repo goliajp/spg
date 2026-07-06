@@ -108,6 +108,84 @@ impl Engine {
         self.execute_in_with_cancel(sql, IMPLICIT_TX, CancelToken::none())
     }
 
+    /// v7.38 (read01 P3.20) — handle a bare `SELECT set_config(name, value,
+    /// is_local)` by writing the GUC to the same session store `SET` uses
+    /// (honouring `is_local` via the transaction undo log), so set_config,
+    /// SHOW, current_setting, and pg_settings all agree. Returns `None`
+    /// (fall through to the ordinary read-only path) unless the statement is
+    /// exactly that shape — set_config buried in a FROM/WHERE/CTE, or over a
+    /// non-text name, keeps the old value-returning behaviour.
+    fn try_exec_set_config(
+        &mut self,
+        s: &spg_sql::ast::SelectStatement,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        use spg_sql::ast::{Expr, SelectItem};
+        if s.from.is_some() || s.where_.is_some() || !s.ctes.is_empty() || s.items.len() != 1 {
+            return Ok(None);
+        }
+        let SelectItem::Expr { expr, .. } = &s.items[0] else {
+            return Ok(None);
+        };
+        let Expr::FunctionCall { name, args } = expr else {
+            return Ok(None);
+        };
+        if !(name.eq_ignore_ascii_case("set_config")
+            || name.eq_ignore_ascii_case("pg_catalog.set_config"))
+            || !(args.len() == 2 || args.len() == 3)
+        {
+            return Ok(None);
+        }
+        // Evaluate the arguments against an empty row.
+        let empty: Vec<ColumnSchema> = Vec::new();
+        let (name_v, value_v, local_v);
+        {
+            let ctx = self.ev_ctx(&empty, None);
+            let dummy = spg_storage::Row::new(Vec::new());
+            name_v = crate::eval::eval_expr(&args[0], &dummy, &ctx).map_err(EngineError::Eval)?;
+            value_v = crate::eval::eval_expr(&args[1], &dummy, &ctx).map_err(EngineError::Eval)?;
+            local_v = if args.len() == 3 {
+                crate::eval::eval_expr(&args[2], &dummy, &ctx).map_err(EngineError::Eval)?
+            } else {
+                Value::Bool(false)
+            };
+        }
+        let single = |v: Value<'static>| QueryResult::Rows {
+            columns: alloc::vec![ColumnSchema::new(
+                "set_config",
+                spg_storage::DataType::Text,
+                true
+            )],
+            rows: alloc::vec![spg_storage::Row::new(alloc::vec![v])],
+        };
+        let pname = match name_v {
+            Value::Text(s) => s.into_owned(),
+            // set_config(NULL, …) is a no-op returning NULL (PG).
+            Value::Null => return Ok(Some(single(Value::Null))),
+            _ => return Ok(None),
+        };
+        let is_local = matches!(local_v, Value::Bool(true));
+        // A NULL value resets the GUC to its default (PG), returning NULL.
+        let pval = match value_v {
+            Value::Text(s) => s.into_owned(),
+            Value::Null => {
+                self.session_params.remove(&pname.to_ascii_lowercase());
+                return Ok(Some(single(Value::Null)));
+            }
+            _ => return Ok(None),
+        };
+        validate_known_guc(&pname, &pval)?;
+        if is_local {
+            if self.in_transaction() {
+                let prior = self.session_param(&pname).map(String::from);
+                self.local_guc_saves.push((pname.clone(), prior));
+                self.set_session_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
+            }
+        } else {
+            self.set_session_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
+        }
+        Ok(Some(single(Value::text(pval))))
+    }
+
     /// v4.5 — write path with cooperative cancellation. Same dispatch
     /// as `execute_in_with_cancel(sql, IMPLICIT_TX, cancel)`. Kept as
     /// a separate entry point for backward-compat with the v4.5
@@ -786,6 +864,14 @@ impl Engine {
             }
             Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
             Statement::Select(s) => {
+                // v7.38 (read01 P3.20) — `SELECT set_config(name, value,
+                // is_local)` is the writing sibling of SHOW / current_setting;
+                // apply it to the session store (respecting is_local) so the
+                // four GUC surfaces stay unified. pg_dump's
+                // `SELECT set_config('search_path', '', false)` relies on this.
+                if let Some(r) = self.try_exec_set_config(&s)? {
+                    return Ok(r);
+                }
                 if s.ctes.iter().any(|c| c.body.is_modifying()) {
                     self.exec_select_with_modifying_ctes(s, cancel)
                 } else {
