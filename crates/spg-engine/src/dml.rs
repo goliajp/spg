@@ -2417,6 +2417,7 @@ pub(crate) fn apply_generated_stored_columns(
                 catalog: None,
                 session_gucs: None,
                 sample_rng: None,
+                recursion_base: core::cell::Cell::new(0),
             };
             let value = crate::eval::eval_expr(&pe.expr, &row, &ctx).map_err(EngineError::Eval)?;
             let coerced = crate::coerce_value(value, pe.ty, &pe.col_name, idx)?;
