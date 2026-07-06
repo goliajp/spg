@@ -198,6 +198,7 @@ mod e2e_pg_hash_ops;
 mod e2e_pg_bytes_pretty;
 mod e2e_pg_backup_probes;
 mod e2e_random_normal;
+mod e2e_to_char_numeric_precision;
 mod e2e_to_number;
 mod e2e_setseed;
 mod e2e_random_int;

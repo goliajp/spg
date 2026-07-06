@@ -838,7 +838,12 @@ fn to_char_roman(n: f64, fill_mode: bool) -> String {
     }
 }
 
-fn to_char_numeric(n: f64, fmt: &str) -> String {
+// v7.38 (read01 P6.01) — `exact` carries the input's exact (scaled, scale)
+// when it came in as `numeric`, so the digit-slot path can build the value
+// from integer arithmetic instead of the lossy f64 `n`. `n` is still used by
+// the RN / EEEE / V paths (roman / scientific / V-scale), which are inherently
+// float-shaped, and as the fallback when the exact form overflows i128.
+fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
     // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
@@ -947,15 +952,36 @@ fn to_char_numeric(n: f64, fmt: &str) -> String {
         .position(|c| *c == '0')
         .map_or(0, |i| int_slot_chars.len() - i);
 
-    // Round to the requested scale, split into integer / fraction.
+    // Round to the requested scale, split into integer / fraction. When the
+    // input is exact numeric (P6.01), rescale it to `frac_digits` decimals in
+    // pure i128 arithmetic so high-precision values keep every digit; only
+    // fall back to the lossy f64 path for floats or on i128 overflow.
     let pow = 10_i128.pow(frac_digits as u32);
     #[allow(clippy::cast_possible_truncation)]
-    let scaled = libm::round(n.abs() * pow as f64) as i128;
+    let f64_scaled = || libm::round(n.abs() * pow as f64) as i128;
+    let exact_scaled = exact.and_then(|(in_scaled, in_scale)| {
+        let abs = in_scaled.unsigned_abs();
+        let fd = u32::try_from(frac_digits).ok()?;
+        let insc = u32::from(in_scale);
+        let rescaled: u128 = if fd >= insc {
+            10_u128.checked_pow(fd - insc).and_then(|m| abs.checked_mul(m))?
+        } else {
+            // Drop excess fraction digits, rounding half away from zero.
+            let divisor = 10_u128.checked_pow(insc - fd)?;
+            (abs / divisor) + u128::from(abs % divisor >= divisor.div_ceil(2))
+        };
+        i128::try_from(rescaled).ok()
+    });
+    let (scaled, neg) = match exact_scaled {
+        Some(s) => (s, exact.is_some_and(|(v, _)| v < 0) && s != 0),
+        None => {
+            let s = f64_scaled();
+            (s, n < 0.0 && s != 0)
+        }
+    };
     let int_part = scaled / pow;
     let frac_part = scaled % pow;
     let value_is_zero = scaled == 0;
-    // A value that rounds to exactly zero carries no sign in PG.
-    let neg = n < 0.0 && !value_is_zero;
     let sign_str: &str = if has_pr || trailing_sign {
         // PR and the trailing sign modes render the sign as a post-pass below.
         ""
@@ -1157,7 +1183,13 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     }
     // Numeric form: to_char(number, 'FM9999.00' / '999,990.9' / …).
     if let Some(n) = numeric_value_for_to_char(&args[0]) {
-        return Ok(Value::text(to_char_numeric(n, fmt)));
+        // v7.38 (read01 P6.01) — thread the exact (scaled, scale) for numeric
+        // inputs so to_char never rounds a high-precision value through f64.
+        let exact = match &args[0] {
+            Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+            _ => None,
+        };
+        return Ok(Value::text(to_char_numeric(n, exact, fmt)));
     }
     let (days, day_micros) = match &args[0] {
         Value::Date(d) => (*d, 0_i64),
