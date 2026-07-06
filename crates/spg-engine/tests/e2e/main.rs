@@ -520,9 +520,9 @@ mod e2e_trunc;
     clippy::uninlined_format_args
 )]
 mod e2e_two_tier;
+mod e2e_unique_nulls_not_distinct;
 mod e2e_unique_collation;
 mod e2e_unique_index;
-mod e2e_unique_nulls_not_distinct;
 mod e2e_unsigned;
 mod e2e_update_correlated;
 mod e2e_uuid;

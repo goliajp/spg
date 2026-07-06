@@ -8099,7 +8099,7 @@ impl Parser {
                     table_constraints.push(crate::ast::TableConstraint::Unique {
                         name: None,
                         columns: alloc::vec![col.name.clone()],
-                        nulls_not_distinct: false,
+                        nulls_not_distinct: col.unique_nulls_not_distinct,
                     });
                 }
                 if let Some(check_expr) = col.check.clone() {
@@ -10234,6 +10234,7 @@ impl Parser {
         let mut auto_increment = implied_auto_increment;
         let mut is_primary_key = false;
         let mut is_unique = false;
+        let mut unique_nulls_not_distinct = false;
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
         let mut generated_stored_expr: Option<Box<Expr>> = None;
@@ -10507,6 +10508,21 @@ impl Parser {
                 }
                 self.advance();
                 is_unique = true;
+                // v7.38 (read01 P4.19) — optional `NULLS [NOT] DISTINCT`
+                // (PG 15+); default is NULLS DISTINCT per the SQL standard.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nulls")) {
+                    let n1 = self.tokens.get(self.pos + 1);
+                    let n2 = self.tokens.get(self.pos + 2);
+                    if matches!(n1, Some(Token::Not)) && matches!(n2, Some(Token::Distinct)) {
+                        self.advance(); // NULLS
+                        self.advance(); // NOT
+                        self.advance(); // DISTINCT
+                        unique_nulls_not_distinct = true;
+                    } else if matches!(n1, Some(Token::Distinct)) {
+                        self.advance(); // NULLS
+                        self.advance(); // DISTINCT
+                    }
+                }
                 continue;
             }
             // v7.13.0 — inline `CHECK (<expr>)` column constraint
@@ -10552,6 +10568,7 @@ impl Parser {
             auto_increment,
             is_primary_key,
             is_unique,
+            unique_nulls_not_distinct,
             check,
             user_type_ref,
             on_update_runtime,
