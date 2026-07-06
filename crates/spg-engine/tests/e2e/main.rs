@@ -67,6 +67,7 @@ mod e2e_create_index_concurrently;
 mod e2e_reindex_pg_dump_compat;
 mod e2e_maintenance_pg_dump_compat;
 mod e2e_session_state_pg_dump_compat;
+mod e2e_set_config_unified;
 mod e2e_set_local;
 mod e2e_set_constraints_pg_dump_compat;
 mod e2e_role_cleanup_pg_dump_compat;
