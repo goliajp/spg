@@ -34,7 +34,7 @@
 //!   * sum(NUMERIC) / avg(NUMERIC) previously raised a TypeMismatch;
 //!     PG returns an exact NUMERIC. Fixed with an exact i128-mantissa
 //!     accumulator (scales aligned on the max, no f64) + a NUMERIC
-//!     finalize; avg replicates PG's `select_div_scale` result scale
+//!     finalize; avg replicates PG's PG's division display scale
 //!     (e.g. `avg('1.50')` → `1.50000000000000000000`, 20 fractional
 //!     digits). The int/float sum fast path is byte-identical — the
 //!     numeric arm only fires on `Value::Numeric` cells. See
@@ -311,7 +311,7 @@ fn sum_avg_numeric() {
     // sum(numeric) → exact NUMERIC at the column scale (was TypeMismatch).
     check(&mut e, "SELECT sum(nm)::text FROM nd", "117.74");
     check(&mut e, "SELECT sum(n3)::text FROM nd", "6.600");
-    // avg(numeric) → NUMERIC at PG's select_div_scale display scale.
+    // avg(numeric) → NUMERIC at PG's division display scale display scale.
     // PG: 117.74/3 carries 16 fractional digits.
     check(&mut e, "SELECT avg(nm)::text FROM nd", "39.2466666666666667");
     // PG: 6.600/3 = 2.2 padded to 16 fractional digits.
