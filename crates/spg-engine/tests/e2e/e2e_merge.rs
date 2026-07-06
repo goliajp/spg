@@ -154,3 +154,46 @@ fn insert_on_conflict_do_nothing_alternative() {
     assert_eq!(r.len(), 3, "id=4 inserted; id=1 preserved");
     assert_eq!(r[0][1], Value::Int(100), "id=1 NOT updated");
 }
+
+#[test]
+fn merge_rejects_unreachable_when_clause() {
+    // v7.38 (read01) — PG rejects a WHEN clause that follows an
+    // unconditional WHEN of the same match kind ("unreachable WHEN clause
+    // specified after unconditional WHEN clause"). Live-PG18.4-verified.
+    let mut e = Engine::new();
+    setup(&mut e);
+    // Unconditional MATCHED then another MATCHED → unreachable.
+    assert!(
+        e.execute(
+            "MERGE INTO target t USING source s ON t.id=s.id \
+             WHEN MATCHED THEN DELETE \
+             WHEN MATCHED THEN UPDATE SET val=s.val"
+        )
+        .is_err()
+    );
+    // Same for NOT MATCHED.
+    assert!(
+        e.execute(
+            "MERGE INTO target t USING source s ON t.id=s.id \
+             WHEN NOT MATCHED THEN DO NOTHING \
+             WHEN NOT MATCHED THEN INSERT (id,val) VALUES(s.id,s.val)"
+        )
+        .is_err()
+    );
+    // Conditional-then-unconditional of the same kind is reachable → OK.
+    e.execute(
+        "MERGE INTO target t USING source s ON t.id=s.id \
+         WHEN MATCHED AND s.val>140 THEN DELETE \
+         WHEN MATCHED THEN UPDATE SET val=s.val",
+    )
+    .unwrap();
+    // Unconditional MATCHED + unconditional NOT MATCHED (different kinds) → OK.
+    let mut e2 = Engine::new();
+    setup(&mut e2);
+    e2.execute(
+        "MERGE INTO target t USING source s ON t.id=s.id \
+         WHEN MATCHED THEN DELETE \
+         WHEN NOT MATCHED THEN INSERT (id,val) VALUES(s.id,s.val)",
+    )
+    .unwrap();
+}
