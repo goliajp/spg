@@ -2259,11 +2259,24 @@ fn apply_function_dispatch(
             }
             let n = n as usize;
             let mut buf = alloc::vec::Vec::with_capacity(n);
-            while buf.len() < n {
-                let word = super::math::prng_next_u64();
-                for b in word.to_le_bytes() {
-                    if buf.len() < n {
-                        buf.push(b);
+            // v7.38 (read01 P5.24) — draw cryptographic bytes from the host
+            // CSPRNG (server injects /dev/urandom). Only if none is attached
+            // do we fall back to the non-cryptographic xorshift PRNG.
+            if let Some(salt) = ctx.salt_fn {
+                while buf.len() < n {
+                    for b in salt() {
+                        if buf.len() < n {
+                            buf.push(b);
+                        }
+                    }
+                }
+            } else {
+                while buf.len() < n {
+                    let word = super::math::prng_next_u64();
+                    for b in word.to_le_bytes() {
+                        if buf.len() < n {
+                            buf.push(b);
+                        }
                     }
                 }
             }
@@ -2304,7 +2317,14 @@ fn apply_function_dispatch(
                     const ITOA64: &[u8; 64] =
                         b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                     let mut salt = alloc::string::String::from("$1$");
-                    let mut bits = super::math::prng_next_u64();
+                    // v7.38 (read01 P5.24) — cryptographic salt from the host
+                    // CSPRNG when available, PRNG only as a last resort.
+                    let mut bits = if let Some(salt_fn) = ctx.salt_fn {
+                        let s = salt_fn();
+                        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+                    } else {
+                        super::math::prng_next_u64()
+                    };
                     for _ in 0..8 {
                         salt.push(ITOA64[(bits & 63) as usize] as char);
                         bits >>= 6;
