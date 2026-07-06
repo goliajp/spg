@@ -390,6 +390,28 @@ pub fn eval_expr(
             cast_value(v, target.clone())
         }
         Expr::IsNull { expr, negated } => {
+            // v7.38 (read01 P4.11) — `ROW(...) IS [NOT] NULL` is evaluated
+            // field-wise, not as a whole-value null test: a row IS NULL when
+            // every field is null, and IS NOT NULL when every field is
+            // non-null — so the two are NOT simple negations (ROW(1,NULL) is
+            // neither). A field that is itself a row is a non-null value, so
+            // the check does not recurse. The `(a, b) IS NULL` tuple spelling
+            // is already desugared to `a IS NULL AND b IS NULL` in the parser;
+            // this covers the explicit `ROW(...)` constructor.
+            if let Expr::FunctionCall { name, args } = expr.as_ref()
+                && name.eq_ignore_ascii_case("row")
+            {
+                let mut all_null = true;
+                let mut all_non_null = true;
+                for a in args {
+                    if matches!(eval_expr(a, row, ctx)?, Value::Null) {
+                        all_non_null = false;
+                    } else {
+                        all_null = false;
+                    }
+                }
+                return Ok(Value::Bool(if *negated { all_non_null } else { all_null }));
+            }
             let v = eval_expr(expr, row, ctx)?;
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
