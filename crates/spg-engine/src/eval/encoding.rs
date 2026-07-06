@@ -45,7 +45,11 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         }
     };
     let out = match fmt.as_str() {
-        "base64" => b64_encode(bytes, B64_STD),
+        // PG's encode(bytea,'base64') breaks the body into 76-char lines
+        // separated by `\n` (no trailing newline); decode ignores the
+        // whitespace on the way back. base64url is an SPG extension and
+        // stays single-line (URL-safe payloads shouldn't carry newlines).
+        "base64" => wrap_base64_76(&b64_encode(bytes, B64_STD)),
         "base64url" => b64_encode(bytes, B64_URL),
         "base32hex" => b32hex_encode(bytes),
         "hex" => hex_encode(bytes),
@@ -92,6 +96,7 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         "base64url" => b64_decode(text, B64_URL)?,
         "base32hex" => b32hex_decode(text)?,
         "hex" => hex_decode(text)?,
+        "escape" => escape_decode(text)?,
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!("decode(): unknown format `{other}`"),
@@ -114,6 +119,66 @@ fn escape_encode(bytes: &[u8]) -> String {
             0x20..=0x7e => out.push(b as char),
             _ => out.push_str(&format!("\\{b:03o}")),
         }
+    }
+    out
+}
+
+/// Inverse of `escape_encode` (PG `byteain` escape form): `\\` → one
+/// backslash, `\ooo` (3 octal digits) → that byte, any other byte is
+/// literal. A lone `\` not forming one of those errors, matching PG's
+/// "invalid input syntax for type bytea".
+fn escape_decode(text: &str) -> Result<Vec<u8>, EvalError> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let is_octal = |b: u8| (b'0'..=b'7').contains(&b);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            out.push(b'\\');
+            i += 2;
+        } else if i + 3 < bytes.len()
+            && is_octal(bytes[i + 1])
+            && is_octal(bytes[i + 2])
+            && is_octal(bytes[i + 3])
+        {
+            let d = |b: u8| u32::from(b - b'0');
+            let v = d(bytes[i + 1]) * 64 + d(bytes[i + 2]) * 8 + d(bytes[i + 3]);
+            // \777 = 511 > 255; PG rejects an out-of-range octal escape.
+            let byte = u8::try_from(v).map_err(|_| EvalError::TypeMismatch {
+                detail: "decode(escape): octal escape out of range".into(),
+            })?;
+            out.push(byte);
+            i += 4;
+        } else {
+            return Err(EvalError::TypeMismatch {
+                detail: "decode(escape): invalid escape sequence".into(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Break a base64 body into 76-character lines joined by `\n`, with no
+/// trailing newline — PG's `encode(bytea,'base64')` wire form.
+fn wrap_base64_76(body: &str) -> String {
+    if body.len() <= 76 {
+        return alloc::string::String::from(body);
+    }
+    // base64 is pure ASCII, so byte offsets are char offsets.
+    let mut out = String::with_capacity(body.len() + body.len() / 76 + 1);
+    let mut i = 0;
+    while i < body.len() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let end = (i + 76).min(body.len());
+        out.push_str(&body[i..end]);
+        i = end;
     }
     out
 }

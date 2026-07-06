@@ -105,3 +105,58 @@ fn error_on_null_errors_on_null() {
         "error mentions function name"
     );
 }
+
+#[test]
+fn encode_base64_wraps_at_76_like_pg() {
+    // PG breaks the base64 body into 76-char lines with `\n` (no trailing
+    // newline); decode ignores the whitespace on the way back. 60 bytes →
+    // 80 base64 chars → 76 + '\n' + 4 = 81. Live-PG18.4-verified.
+    let mut eng = Engine::new();
+    let wrapped = one_value(&mut eng, "SELECT encode(decode(repeat('61',60),'hex'),'base64')");
+    let spg_storage::Value::Text(s) = &wrapped else { panic!("expected Text, got {wrapped:?}") };
+    assert_eq!(s.len(), 81, "{s:?}");
+    assert!(s.contains('\n'));
+    assert!(!s.ends_with('\n'));
+    // Short bodies (<=76) stay single-line.
+    let short = one_value(&mut eng, "SELECT encode('abc'::bytea,'base64')");
+    let spg_storage::Value::Text(s) = &short else { panic!() };
+    assert_eq!(s.as_ref(), "YWJj");
+    // Round-trips: decode tolerates the embedded newlines.
+    let rt = one_value(
+        &mut eng,
+        "SELECT decode(encode(decode(repeat('61',60),'hex'),'base64'),'base64') \
+             = decode(repeat('61',60),'hex')",
+    );
+    assert_eq!(rt, spg_storage::Value::Bool(true));
+}
+
+#[test]
+fn decode_escape_matches_pg() {
+    // decode(text,'escape'): `\ooo` octal → byte, `\\` → one backslash,
+    // else literal. Live-PG18.4: decode('a\134b','escape') = \x615c62.
+    let mut eng = Engine::new();
+    assert_eq!(
+        one_value(&mut eng, "SELECT decode('a\\134b','escape')"),
+        spg_storage::Value::Bytes(alloc_cow(&[0x61, 0x5c, 0x62]))
+    );
+    assert_eq!(
+        one_value(&mut eng, "SELECT decode('a\\\\b','escape')"),
+        spg_storage::Value::Bytes(alloc_cow(&[0x61, 0x5c, 0x62]))
+    );
+    assert_eq!(
+        one_value(&mut eng, "SELECT decode('abc','escape')"),
+        spg_storage::Value::Bytes(alloc_cow(&[0x61, 0x62, 0x63]))
+    );
+    // Round-trip through encode(...,'escape').
+    let rt = one_value(
+        &mut eng,
+        "SELECT decode(encode(E'\\x000141ff'::bytea,'escape'),'escape') = E'\\x000141ff'::bytea",
+    );
+    assert_eq!(rt, spg_storage::Value::Bool(true));
+    // Malformed lone backslash errors.
+    assert!(eng.execute("SELECT decode('a\\x','escape')").is_err());
+}
+
+fn alloc_cow(b: &[u8]) -> std::borrow::Cow<'static, [u8]> {
+    std::borrow::Cow::Owned(b.to_vec())
+}
