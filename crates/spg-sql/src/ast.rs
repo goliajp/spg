@@ -838,6 +838,10 @@ pub enum AlterTableTarget {
     /// EXPRESSION` turns a stored generated column into a plain column
     /// (its generation expression is removed; existing values are kept).
     AlterColumnDropExpression { column: String },
+    /// v7.38 (read01 U12) — `ALTER TABLE … ALTER COLUMN col SET
+    /// EXPRESSION AS (expr)` (PG 17) changes a stored generated column's
+    /// expression and recomputes every existing row.
+    AlterColumnSetExpression { column: String, expr: Expr },
 }
 
 /// v7.16.1 — target of `ALTER TABLE … { ENABLE | DISABLE }
@@ -4438,6 +4442,9 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         }
         AlterTableTarget::AlterColumnDropExpression { column } => {
             write!(f, "ALTER COLUMN {} DROP EXPRESSION", quote_ident(column))
+        }
+        AlterTableTarget::AlterColumnSetExpression { column, expr } => {
+            write!(f, "ALTER COLUMN {} SET EXPRESSION AS ({expr})", quote_ident(column))
         }
     }
 }

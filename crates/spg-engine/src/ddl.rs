@@ -106,7 +106,65 @@ impl Engine {
             T::AlterColumnDropExpression { column } => {
                 self.alter_column_drop_expression(tbl, column)
             }
+            T::AlterColumnSetExpression { column, expr } => {
+                self.alter_column_set_expression(tbl, column, expr)
+            }
         }
+    }
+
+    /// v7.38 (read01 U12) — `ALTER COLUMN col SET EXPRESSION AS (expr)`
+    /// (PG 17): swap a stored generated column's expression and recompute
+    /// every existing row against the new expression.
+    fn alter_column_set_expression(
+        &mut self,
+        tbl: &str,
+        column: String,
+        expr: spg_sql::ast::Expr,
+    ) -> Result<(), EngineError> {
+        let expr_str = alloc::format!("{expr}");
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN SET EXPRESSION: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        if table.schema().columns[pos].generated_stored_expr.is_none() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER COLUMN SET EXPRESSION: column {column:?} is not a stored generated column"
+            )));
+        }
+        table.schema_mut().columns[pos].generated_stored_expr = Some(expr_str);
+        // Recompute existing rows against the new expression.
+        let schema_cols = table.schema().columns.clone();
+        let col_ty = schema_cols[pos].ty;
+        let ctx = crate::eval::EvalContext::new(&schema_cols, None);
+        let mut new_values: Vec<Value<'static>> = Vec::with_capacity(table.rows().len());
+        for row in table.rows().iter() {
+            let v = eval::eval_expr(&expr, row, &ctx).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN SET EXPRESSION: recompute failed: {e:?}"
+                ))
+            })?;
+            new_values.push(coerce_value(v, col_ty, &column, pos)?);
+        }
+        for (i, v) in new_values.into_iter().enumerate() {
+            let mut row_values = table
+                .rows()
+                .get(i)
+                .expect("bounds-checked by the loop above")
+                .values
+                .clone();
+            row_values[pos] = v;
+            table.update_row(i, row_values)?;
+        }
+        Ok(())
     }
 
     /// v7.38 (read01 U10) — `ALTER COLUMN col DROP EXPRESSION` converts a

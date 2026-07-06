@@ -197,3 +197,25 @@ fn drop_expression_converts_to_plain_column() {
             .is_err()
     );
 }
+
+#[test]
+fn set_expression_swaps_and_recomputes() {
+    // v7.38 (read01 U12) — ALTER COLUMN … SET EXPRESSION AS (expr) swaps a
+    // stored generated column's expression and recomputes existing rows.
+    // Live-PG18.4-verified: (5,50) then (7,70).
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int, g int GENERATED ALWAYS AS (id*2) STORED)")
+        .unwrap();
+    e.execute("INSERT INTO t(id) VALUES(5)").unwrap();
+    e.execute("ALTER TABLE t ALTER COLUMN g SET EXPRESSION AS (id*10)")
+        .unwrap();
+    e.execute("INSERT INTO t(id) VALUES(7)").unwrap();
+    let out = rows(&mut e, "SELECT id,g FROM t ORDER BY id");
+    assert_eq!(out[0], vec![Value::Int(5), Value::Int(50)]); // recomputed
+    assert_eq!(out[1], vec![Value::Int(7), Value::Int(70)]); // new expr
+    // SET EXPRESSION on a non-generated column errors.
+    assert!(
+        e.execute("ALTER TABLE t ALTER COLUMN id SET EXPRESSION AS (id*5)")
+            .is_err()
+    );
+}
