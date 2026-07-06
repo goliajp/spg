@@ -909,6 +909,205 @@ pub(crate) fn enforce_unique_index_inserts(
     Ok(())
 }
 
+/// v7.38 (read01 U1) — UPDATE-time uniqueness enforcement. INSERT has
+/// `enforce_uniqueness_inserts` + `enforce_unique_index_inserts`, but the
+/// UPDATE path checked FK / CHECK / NOT NULL and silently skipped every
+/// UNIQUE constraint and unique index — so an UPDATE could move a row onto
+/// a key another row already holds (`UPDATE t SET x=1 WHERE x=2` with a
+/// second row at `x=1`, or `UPDATE t SET email='A' ...` colliding on
+/// `lower(email)`). PG rejects these; SPG now does too.
+///
+/// `planned` is the update batch as `(row_position, new_values)`. The key
+/// difference from the INSERT check is that the pre-image of every updated
+/// row must be *excluded* from the "existing keys" set — otherwise a row
+/// whose key is unchanged would collide with its own old key, and a valid
+/// key swap would false-positive. So the existing-key scan skips the
+/// updated positions, then the new values probe against the remainder and
+/// against each other.
+///
+/// `changed_cols` is the set of column positions the UPDATE may have
+/// altered (SET targets + ON UPDATE overrides + stored-generated columns).
+/// A UNIQUE constraint or plain unique index whose key columns are all
+/// untouched cannot gain a new duplicate, so it is skipped — this keeps a
+/// hot `UPDATE … WHERE id=$1 SET non_key=…` off the O(table) scan.
+/// Expression / partial indexes may depend on any column, so they are
+/// always checked when present.
+///
+/// The check models PG's non-deferrable (immediate) semantics: it seeds a
+/// key set from every current row, then replays each update as
+/// remove-old-key + insert-new-key. Inserting a key that is still present
+/// is a violation — so a straight duplicate, a two-row swap
+/// (`SET x = CASE …`), and a shift (`SET x = x + 1` over adjacent keys)
+/// are all rejected exactly as PG rejects them, while a row whose key is
+/// unchanged, or reassigned to a genuinely free value, passes.
+pub(crate) fn enforce_unique_updates(
+    catalog: &Catalog,
+    table_name: &str,
+    planned: &[(usize, Vec<Value<'static>>)],
+    changed_cols: &hashbrown::HashSet<usize>,
+) -> Result<(), EngineError> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let schema = table.schema();
+
+    // Seed the key set from all current rows, then replay each update as
+    // remove-old + insert-new; `key_str` returns None for a row that isn't
+    // in the index (NULL key, or partial-predicate false) so it neither
+    // seeds nor conflicts.
+    let replay = |key_str: &dyn Fn(&[Value<'static>]) -> Result<Option<String>, EngineError>,
+                  on_conflict: &dyn Fn(usize) -> EngineError|
+     -> Result<(), EngineError> {
+        let mut index: hashbrown::HashSet<String> =
+            hashbrown::HashSet::with_capacity(table.rows().len());
+        for (row_idx, prow) in table.rows().iter().enumerate() {
+            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+                continue;
+            }
+            if let Some(k) = key_str(&prow.values)? {
+                index.insert(k);
+            }
+        }
+        for (pos, new_vals) in planned {
+            let old_key = match table.rows().get(*pos) {
+                Some(r) => key_str(&r.values)?,
+                None => None,
+            };
+            let new_key = key_str(new_vals)?;
+            if old_key == new_key {
+                continue; // key unchanged (incl. both absent) — no effect
+            }
+            if let Some(ok) = &old_key {
+                index.remove(ok);
+            }
+            if let Some(nk) = new_key
+                && !index.insert(nk)
+            {
+                return Err(on_conflict(*pos));
+            }
+        }
+        Ok(())
+    };
+
+    // ── composite / column UNIQUE + PRIMARY KEY constraints ──
+    for uc in &schema.uniqueness_constraints {
+        if !uc.columns.iter().any(|c| changed_cols.contains(c)) {
+            continue;
+        }
+        let key_str = |values: &[Value<'static>]| -> Result<Option<String>, EngineError> {
+            let key: Vec<Value<'static>> = uc
+                .columns
+                .iter()
+                .map(|&i| {
+                    let v = values.get(i).cloned().unwrap_or(Value::Null);
+                    collated_key_cell(&v, i, schema)
+                })
+                .collect();
+            if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
+                return Ok(None);
+            }
+            Ok(Some(aggregate::encode_key(&key)))
+        };
+        let on_conflict = |pos: usize| -> EngineError {
+            let kind = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+            let col_names: Vec<String> = uc
+                .columns
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect();
+            EngineError::Unsupported(alloc::format!(
+                "{kind} violation on {table_name:?} columns {col_names:?}: \
+                 UPDATE of row #{pos} duplicates an existing key"
+            ))
+        };
+        replay(&key_str, &on_conflict)?;
+    }
+
+    // ── CREATE UNIQUE INDEX (incl. expression / partial) ──
+    let ctx = eval::EvalContext::new(&schema.columns, None);
+    for idx in table.indices() {
+        if !idx.is_unique {
+            continue;
+        }
+        let is_expr_or_partial = idx.expression.is_some() || idx.partial_predicate.is_some();
+        let key_positions = unique_key_positions(idx);
+        // A plain unique index whose key columns are untouched can't gain
+        // a duplicate; an expression/partial index may read any column.
+        if !is_expr_or_partial && !key_positions.iter().any(|c| changed_cols.contains(c)) {
+            continue;
+        }
+        let predicate_expr = match idx.partial_predicate.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} predicate {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
+        let expr_key = match idx.expression.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
+        let key_str = |values: &[Value<'static>]| -> Result<Option<String>, EngineError> {
+            // Partial index: rows failing the predicate are not indexed.
+            if let Some(pred) = &predicate_expr {
+                let tmp_row = spg_storage::Row { values: values.to_vec() };
+                let v = eval::eval_expr(pred, &tmp_row, &ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} predicate eval: {e:?}",
+                        idx.name
+                    ))
+                })?;
+                if !predicate_truthy(&v) {
+                    return Ok(None);
+                }
+            }
+            let key: Vec<Value<'static>> = if let Some(expr) = &expr_key {
+                let tmp_row = spg_storage::Row { values: values.to_vec() };
+                let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} expression eval: {e:?}",
+                        idx.name
+                    ))
+                })?;
+                alloc::vec![v]
+            } else {
+                key_positions
+                    .iter()
+                    .map(|&p| {
+                        let v = values.get(p).cloned().unwrap_or(Value::Null);
+                        collated_key_cell(&v, p, schema)
+                    })
+                    .collect()
+            };
+            if key.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(None);
+            }
+            Ok(Some(aggregate::encode_key(&key)))
+        };
+        let on_conflict = |pos: usize| -> EngineError {
+            EngineError::Unsupported(alloc::format!(
+                "UNIQUE INDEX {:?} violation on {table_name:?}: \
+                 UPDATE of row #{pos} duplicates an existing key",
+                idx.name
+            ))
+        };
+        replay(&key_str, &on_conflict)?;
+    }
+    Ok(())
+}
+
 /// v7.13.0 — `UPDATE OF cols` filter helper (mailrs round-5 G7).
 /// Returns `true` when at least one of `filter_cols` has a
 /// different value in `new_row` vs `old_row`. Column lookup is
