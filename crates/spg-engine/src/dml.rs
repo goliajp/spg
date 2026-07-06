@@ -2220,6 +2220,8 @@ impl Engine {
                     body: CteBody::Select(s.clone()),
                     recursive: true,
                     column_overrides: cte.column_overrides.clone(),
+                    search: None,
+                    cycle: None,
                 };
                 let (columns, rows) =
                     self.materialise_recursive_cte(&synthetic, &snapshot, cancel)?;

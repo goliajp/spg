@@ -2076,6 +2076,8 @@ impl Engine {
             body: spg_sql::ast::CteBody::Select(body),
             recursive: false,
             column_overrides: Vec::new(),
+                    search: None,
+                    cycle: None,
         };
         // LEFT JOIN __cl1_N ON __cl1_N.jk = <outer_col>
         let join = FromJoin {
