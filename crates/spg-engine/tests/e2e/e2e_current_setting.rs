@@ -90,3 +90,28 @@ fn current_setting_null_passthrough() {
         spg_storage::Value::Null
     ));
 }
+
+#[test]
+fn custom_namespaced_guc_round_trips() {
+    // Apps stash request context in custom GUCs and read it back with
+    // current_setting for RLS (`SET app.user_id = '42'` →
+    // current_setting('app.user_id') = '42'). Verified vs live PG18.4.
+    let mut e = Engine::new();
+    e.execute("SET app.user_id = '42'").unwrap();
+    assert_eq!(text(&first(&mut e, "SELECT current_setting('app.user_id')")), "42");
+    // Two-segment namespace survives (the qualifier is NOT stripped as a
+    // schema would be).
+    e.execute("SET myapp.tenant = 'acme'").unwrap();
+    assert_eq!(text(&first(&mut e, "SELECT current_setting('myapp.tenant')")), "acme");
+    // A SET value wins over the static default for a standard GUC too.
+    e.execute("SET application_name = 'reports'").unwrap();
+    assert_eq!(
+        text(&first(&mut e, "SELECT current_setting('application_name')")),
+        "reports"
+    );
+    // Unknown custom GUC with missing_ok = true → NULL (PG).
+    assert!(matches!(
+        first(&mut e, "SELECT current_setting('app.absent', true)"),
+        spg_storage::Value::Null
+    ));
+}

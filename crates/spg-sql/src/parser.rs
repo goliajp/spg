@@ -4563,17 +4563,36 @@ impl Parser {
     /// All keywords after `WAIT` are bare idents in v6.1.x; no
     /// lexer churn. Both `<pos>` and `<ms>` are positive integers
     /// that fit `u64`.
-    /// v7.12.1 — parameter name in `SET <name>` may be dotted
-    /// (`pg_catalog.default_text_search_config` etc).
+    /// Parameter name in `SET <name>`. A GUC name may be dotted, but the
+    /// qualifier is a *namespace* the app owns (`app.user_id`,
+    /// `myapp.tenant` — the request-context / RLS pattern), NOT a schema
+    /// to discard. So parse the raw segments here instead of
+    /// `expect_ident_like`, which strips a leading `schema.` qualifier
+    /// and would collapse `SET app.foo` to just `foo`. Standard GUCs are
+    /// a single segment and round-trip unchanged.
     fn parse_set_param_name(&mut self) -> Result<String, ParseError> {
-        let mut name = self.expect_ident_like()?;
-        while matches!(self.peek(), Token::Dot) {
-            self.advance();
-            let next = self.expect_ident_like()?;
-            name.push('.');
-            name.push_str(&next);
+        let mut parts: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        loop {
+            let seg = match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                other if unreserved_keyword_text(&other).is_some() => {
+                    unreserved_keyword_text(&other).unwrap()
+                }
+                other => {
+                    return Err(ParseError {
+                        message: format!("expected parameter name, got {other:?}"),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            };
+            parts.push(seg);
+            if matches!(self.peek(), Token::Dot) {
+                self.advance();
+                continue;
+            }
+            break;
         }
-        Ok(name.to_ascii_lowercase())
+        Ok(parts.join(".").to_ascii_lowercase())
     }
 
     fn parse_set_value(&mut self) -> Result<crate::ast::SetValue, ParseError> {
