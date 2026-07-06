@@ -1750,6 +1750,26 @@ pub(crate) fn synth_information_schema_table_constraints(
                 Value::text("YES"),
             ]));
         }
+        // v7.38 (read01 P6.37) — PG 18 tracks each NOT NULL column as a CHECK
+        // constraint named `{table}_{col}_not_null`, so it appears in
+        // table_constraints with constraint_type CHECK.
+        for col in t.schema().columns.iter() {
+            if col.nullable {
+                continue;
+            }
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(alloc::format!("{tname}_{}_not_null", col.name)),
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text("CHECK"),
+                Value::text("NO"),
+                Value::text("NO"),
+                Value::text("YES"),
+            ]));
+        }
     }
     (schema, rows)
 }
