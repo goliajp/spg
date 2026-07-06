@@ -159,3 +159,57 @@ fn pg_constraint_fk_action_chars_match_pg() {
     assert_eq!(r[0][0], Value::text("n"));
     assert_eq!(r[0][1], Value::text("c"));
 }
+
+#[test]
+fn fk_default_name_and_referential_constraints_match_pg() {
+    // Verified vs live PG18.4: an unnamed FK is named
+    // `{table}_{col}_fkey`, information_schema.referential_constraints
+    // exposes the parent's unique_constraint_name, and the default
+    // referential action (no ON DELETE/UPDATE clause) is NO ACTION.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    e.execute(
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent (id), tag TEXT)",
+    )
+    .unwrap();
+
+    // key_column_usage: FK named child_parent_id_fkey (not child_fk0).
+    let r = rows(
+        e.execute(
+            "SELECT constraint_name, column_name FROM information_schema.key_column_usage \
+             WHERE table_name = 'child' ORDER BY constraint_name, ordinal_position",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::text("child_parent_id_fkey"));
+    assert_eq!(r[0][1], Value::text("parent_id"));
+
+    // referential_constraints: unique_constraint_name = parent_pkey,
+    // both rules NO ACTION by default.
+    let r = rows(
+        e.execute(
+            "SELECT unique_constraint_name, update_rule, delete_rule \
+             FROM information_schema.referential_constraints \
+             WHERE constraint_name = 'child_parent_id_fkey'",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::text("parent_pkey"));
+    assert_eq!(r[0][1], Value::text("NO ACTION"));
+    assert_eq!(r[0][2], Value::text("NO ACTION"));
+
+    // An explicit ON DELETE clause is still honoured.
+    e.execute(
+        "CREATE TABLE gc (id INT PRIMARY KEY, cid INT REFERENCES child (id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    let r = rows(
+        e.execute(
+            "SELECT delete_rule FROM information_schema.referential_constraints \
+             WHERE constraint_name = 'gc_cid_fkey'",
+        )
+        .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::text("CASCADE"));
+}

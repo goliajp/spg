@@ -8925,8 +8925,13 @@ impl Parser {
         // immediate; SPG is single-writer with no deferred-
         // constraint window so the runtime semantics are always
         // immediate even when INITIALLY DEFERRED is requested.
-        let mut on_delete = FkAction::Restrict;
-        let mut on_update = FkAction::Restrict;
+        // PG's default referential action (no ON DELETE / ON UPDATE
+        // clause) is NO ACTION, not RESTRICT — the two enforce
+        // identically in SPG (single-writer, no deferred window; see the
+        // shared match arm in constraints.rs) but information_schema.
+        // referential_constraints must report NO ACTION to match PG.
+        let mut on_delete = FkAction::NoAction;
+        let mut on_update = FkAction::NoAction;
         let mut seen_on_delete = false;
         let mut seen_on_update = false;
         loop {

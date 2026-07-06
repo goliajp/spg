@@ -38,6 +38,29 @@ pub(crate) fn pg_unique_conname(
     alloc::format!("{tname}_{cols}_key")
 }
 
+/// PG's default foreign-key constraint name: `{table}_{col…}_fkey` over
+/// the referencing (local) columns, matching pg_dump / pg_catalog. SPG
+/// previously fell back to `{table}_fk{index}`, which ORMs that key off
+/// the constraint name (Rails, Django introspection) don't recognise.
+pub(crate) fn pg_fk_conname(
+    t: &spg_storage::Table,
+    fk: &spg_storage::ForeignKeyConstraint,
+    tname: &str,
+) -> String {
+    let cols = fk
+        .local_columns
+        .iter()
+        .map(|&p| {
+            t.schema()
+                .columns
+                .get(p)
+                .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+        })
+        .collect::<Vec<_>>()
+        .join("_");
+    alloc::format!("{tname}_{cols}_fkey")
+}
+
 /// Distinct table columns referenced by a CHECK predicate string, in
 /// first-seen order. A lightweight quote-aware identifier scan (skips
 /// single-quoted string literals) matched against the table's column
@@ -1592,11 +1615,11 @@ pub(crate) fn synth_information_schema_table_constraints(
             ]));
         }
         // Foreign keys.
-        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+        for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
@@ -2409,11 +2432,11 @@ pub(crate) fn synth_info_constraint_column_usage(
                 push(&tname, col_name_at(p), conname.clone());
             }
         }
-        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+        for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
             // FK rows reference the PARENT table's columns.
             if let Some(parent) = cat.get(&fk.parent_table) {
                 for &p in &fk.parent_columns {
@@ -2549,11 +2572,11 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                 .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
         };
         // FKs.
-        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+        for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
             for (i, (&local, &parent)) in fk
                 .local_columns
                 .iter()
@@ -2605,6 +2628,10 @@ pub(crate) fn synth_info_referential_constraints(
         ColumnSchema::new("constraint_name", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
         ColumnSchema::new("referenced_table_name", DataType::Text, false),
+        // The PK/UNIQUE constraint on the parent that the FK targets —
+        // JDBC getImportedKeys / ORM reflection reads this to link the
+        // FK back to the referenced key.
+        ColumnSchema::new("unique_constraint_name", DataType::Text, true),
         ColumnSchema::new("update_rule", DataType::Text, false),
         ColumnSchema::new("delete_rule", DataType::Text, false),
     ];
@@ -2620,15 +2647,31 @@ pub(crate) fn synth_info_referential_constraints(
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
-        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+        for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
+            // The parent-side UNIQUE / PK constraint covering exactly the
+            // referenced columns.
+            let unique_name: Value<'static> = cat
+                .get(&fk.parent_table)
+                .and_then(|pt| {
+                    pt.schema()
+                        .uniqueness_constraints
+                        .iter()
+                        .find(|uc| {
+                            uc.columns.len() == fk.parent_columns.len()
+                                && fk.parent_columns.iter().all(|pc| uc.columns.contains(pc))
+                        })
+                        .map(|uc| pg_unique_conname(pt, uc, &fk.parent_table))
+                })
+                .map_or(Value::Null, Value::text);
             rows.push(Row::new(alloc::vec![
                 Value::text(conname),
                 Value::text(tname.clone()),
                 Value::text(fk.parent_table.clone()),
+                unique_name,
                 Value::text::<String>(rule_name(fk.on_update).into()),
                 Value::text::<String>(rule_name(fk.on_delete).into()),
             ]));
@@ -2881,11 +2924,11 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             ]));
         }
         // Foreign keys.
-        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+        for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
             let confrelid = by_table.get(&fk.parent_table).copied().unwrap_or(0);
             let conkey = conkey_vec(&fk.local_columns);
             let confkey = conkey_vec(&fk.parent_columns);
