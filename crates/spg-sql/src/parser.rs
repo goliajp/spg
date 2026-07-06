@@ -190,6 +190,16 @@ fn is_json_each_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("json_each")
 }
 
+/// `jsonb_to_record` / `jsonb_to_recordset` (+ `json_` variants) — the
+/// record-returning JSON functions that take a `AS alias(col type, …)`
+/// column-definition list in FROM position.
+fn is_json_to_record_name(s: &str) -> bool {
+    s.eq_ignore_ascii_case("jsonb_to_recordset")
+        || s.eq_ignore_ascii_case("jsonb_to_record")
+        || s.eq_ignore_ascii_case("json_to_recordset")
+        || s.eq_ignore_ascii_case("json_to_record")
+}
+
 fn is_vector_opclass_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
     matches!(
@@ -11419,6 +11429,16 @@ impl Parser {
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
             });
         }
+        // `jsonb_to_recordset(J) AS t(a int, b text)` / `jsonb_to_record`
+        // (+ json_ variants) — record-returning JSON functions with a
+        // column-definition list. Desugar to a derived table that
+        // projects each declared column from the JSON via `->>` + a cast,
+        // over `jsonb_array_elements(J)` for the *set (per-element) form.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if is_json_to_record_name(s))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            return self.parse_json_to_record_from();
+        }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
         // / json_ variants as a FROM item. Rewritten into
         // `unnest(<same fn>(<expr>))`: the scalar form returns the
@@ -12078,6 +12098,158 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
+        })
+    }
+
+    /// `jsonb_to_recordset(J) AS t(c1 t1, c2 t2, …)` (and record / json_
+    /// variants) → a derived table that reads each declared column out of
+    /// the JSON with `(row ->> 'ci')::ti`. The *set form iterates
+    /// `jsonb_array_elements(J)` (one row per element, column `value`);
+    /// the scalar *record form projects a single row straight off `J`.
+    /// Rides the existing lateral-subquery channel, so no new executor or
+    /// AST is needed.
+    fn parse_json_to_record_from(&mut self) -> Result<TableRef, ParseError> {
+        use crate::ast::{BinOp, ColumnName, Expr, FromClause, Literal, SelectItem, SelectStatement};
+        let fn_name = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+            _ => unreachable!("caller guarded is_json_to_record_name"),
+        };
+        self.advance(); // fn name
+        self.advance(); // (
+        let arg = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' after {fn_name}() argument, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        let is_set = fn_name.ends_with("recordset");
+        // Required `[AS] alias ( col type [, …] )` column-definition list.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+        }
+        let alias = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => {
+                let a = s.clone();
+                self.advance();
+                a
+            }
+            _ => {
+                return Err(self.err(alloc::format!(
+                    "{fn_name}(...) needs a column-definition list, e.g. AS t(a int, b text)"
+                )));
+            }
+        };
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' to start the {fn_name} column-definition list, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // (
+        let mut coldefs: Vec<(String, crate::ast::CastTarget)> = Vec::new();
+        loop {
+            let col = self.expect_ident_like()?;
+            let ty = self.parse_cast_target()?;
+            coldefs.push((col, ty));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+                break;
+            }
+            return Err(self.err(alloc::format!(
+                "expected ',' or ')' in {fn_name} column list, got {:?}",
+                self.peek()
+            )));
+        }
+        if coldefs.is_empty() {
+            return Err(self.err(alloc::format!(
+                "{fn_name} column-definition list must declare at least one column"
+            )));
+        }
+        // Per column: (base ->> 'col')::type AS col. The base is the
+        // per-element `value` column for the *set form, or the argument
+        // itself for the scalar record form.
+        let items: Vec<SelectItem> = coldefs
+            .into_iter()
+            .map(|(col, ty)| {
+                let base = if is_set {
+                    Expr::Column(ColumnName {
+                        qualifier: None,
+                        name: "value".to_string(),
+                    })
+                } else {
+                    arg.clone()
+                };
+                SelectItem::Expr {
+                    expr: Expr::Cast {
+                        expr: Box::new(Expr::Binary {
+                            lhs: Box::new(base),
+                            op: BinOp::JsonGetText,
+                            rhs: Box::new(Expr::Literal(Literal::String(col.clone()))),
+                        }),
+                        target: ty,
+                    },
+                    alias: Some(col),
+                }
+            })
+            .collect();
+        let from = if is_set {
+            let elem_fn = if fn_name.starts_with("jsonb") {
+                "jsonb_array_elements"
+            } else {
+                "json_array_elements"
+            };
+            Some(FromClause {
+                primary: TableRef {
+                    name: "value".to_string(),
+                    alias: None,
+                    as_of_segment: None,
+                    unnest_expr: Some(Box::new(Expr::FunctionCall {
+                        name: elem_fn.to_string(),
+                        args: alloc::vec![arg],
+                    })),
+                    unnest_column_aliases: alloc::vec!["value".to_string()],
+                    with_ordinality: false,
+                    generate_series_args: None,
+                    lateral_subquery: None,
+                    jsonb_each_text_arg: None,
+                },
+                joins: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let inner = SelectStatement {
+            ctes: Vec::new(),
+            distinct: false,
+            distinct_on: Vec::new(),
+            items,
+            from,
+            where_: None,
+            group_by: None,
+            group_by_all: false,
+            having: None,
+            unions: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_with_ties: false,
+        };
+        Ok(TableRef {
+            name: alias.clone(),
+            alias: Some(alias),
+            as_of_segment: None,
+            unnest_expr: None,
+            unnest_column_aliases: Vec::new(),
+            with_ordinality: false,
+            generate_series_args: None,
+            lateral_subquery: Some(Box::new(inner)),
+            jsonb_each_text_arg: None,
         })
     }
 

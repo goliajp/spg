@@ -84,3 +84,37 @@ fn non_object_input_errors() {
     let msg = format!("{err:?}");
     assert!(msg.contains("non-object"), "unexpected error: {msg}");
 }
+
+#[test]
+fn jsonb_to_recordset_and_record() {
+    use spg_storage::Value;
+    let mut e = Engine::new();
+
+    // jsonb_to_recordset: one typed row per array element; a missing key
+    // is NULL. Verified vs live PG18.4.
+    let got = rows(
+        &mut e,
+        "SELECT a, b FROM jsonb_to_recordset('[{\"a\":1,\"b\":\"hi\"},{\"a\":2}]') AS x(a int, b text) ORDER BY a",
+    );
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0][0], Value::Int(1));
+    assert!(matches!(&got[0][1], Value::Text(s) if s == "hi"));
+    assert_eq!(got[1][0], Value::Int(2));
+    assert_eq!(got[1][1], Value::Null); // missing "b"
+
+    // Scalar jsonb_to_record: a single row projected off the object.
+    let got = rows(
+        &mut e,
+        "SELECT a, b FROM jsonb_to_record('{\"a\":7,\"b\":\"x\"}') AS x(a int, b text)",
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0][0], Value::Int(7));
+    assert!(matches!(&got[0][1], Value::Text(s) if s == "x"));
+
+    // json_ variant resolves the same way.
+    let got = rows(
+        &mut e,
+        "SELECT string_agg(a::text, ',') FROM json_to_recordset('[{\"a\":10},{\"a\":20}]') AS x(a int)",
+    );
+    assert!(matches!(&got[0][0], Value::Text(s) if s == "10,20"));
+}
