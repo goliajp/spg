@@ -28,6 +28,19 @@ fn current_setting_server_version() {
         text(&first(&mut e, "SELECT current_setting('server_version_num')")),
         "180004"
     );
+    // SHOW and pg_settings agree with the function (drivers gate feature
+    // use on server_version_num; live PG18.4 = 180004).
+    assert_eq!(
+        text(&first(&mut e, "SHOW server_version_num")),
+        "180004"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT setting FROM pg_settings WHERE name = 'server_version_num'"
+        )),
+        "180004"
+    );
 }
 
 #[test]
