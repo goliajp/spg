@@ -2243,7 +2243,7 @@ fn update_from_target_col_in_set() {
     assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:5,2:7");
 }
 
-/// v7.37 D.31 — numeric / numeric keeps PG's select_div_scale (≥16 sig digits)
+/// v7.37 D.31 — numeric / numeric keeps PG's division display scale (≥16 sig digits)
 /// instead of truncating to the operands' scale. PG18.4-verified.
 #[test]
 fn numeric_division_scale() {
