@@ -3218,7 +3218,17 @@ impl Database {
             let tmp_path = p
                 .cold_segments_dir
                 .join(format!("seg_{}.spg.tmp", report.segment_id));
-            std::fs::write(&tmp_path, &report.segment_bytes).map_err(io_err)?;
+            // v7.38 (read01 P5.09) — fsync the segment bytes before the
+            // rename so a full durable_rename (file data + dir entry) is in
+            // effect. Previously std::fs::write left the content unflushed,
+            // so a crash after rename could expose a named-but-empty segment
+            // the catalog already references.
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp_path).map_err(io_err)?;
+                f.write_all(&report.segment_bytes).map_err(io_err)?;
+                f.sync_all().map_err(io_err)?;
+            }
             std::fs::rename(&tmp_path, &final_path).map_err(io_err)?;
             // v7.37.13 (A1.6) — fsync the parent directory so the
             // rename's directory entry is durable. `std::fs::rename`
