@@ -458,10 +458,18 @@ pub fn format_text_array(items: &[Option<String>]) -> String {
         match item {
             None => out.push_str("NULL"),
             Some(s) => {
+                // PG array_out quotes an element containing any structural
+                // char or any whitespace `array_isspace` recognises — space,
+                // tab, newline, carriage return, vertical tab, form feed —
+                // not just space/tab.
                 let needs_quote = s.is_empty()
                     || s.eq_ignore_ascii_case("NULL")
-                    || s.chars()
-                        .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t'));
+                    || s.chars().any(|c| {
+                        matches!(
+                            c,
+                            ',' | '{' | '}' | '"' | '\\' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
+                        )
+                    });
                 if needs_quote {
                     out.push('"');
                     for c in s.chars() {
