@@ -1824,25 +1824,22 @@ fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         }
         return Ok(Value::Float(check_float8_range(a / b, a, b, "/")?));
     }
+    // v7.38 (read01 P4.18) — a zero divisor is DivisionByZero; INT_MIN / -1
+    // has no representable quotient and is a separate overflow (PG: "out of
+    // range"), NOT a zero-divide. Check the divisor up front so the two stay
+    // distinct instead of both collapsing to DivisionByZero.
+    if matches!(r, Value::SmallInt(0) | Value::Int(0) | Value::BigInt(0)) {
+        return Err(EvalError::DivisionByZero);
+    }
     arith(
         l,
         r,
-        |a, b| {
-            // `checked_div` returns None on b == 0 AND on the INT64_MIN / -1
-            // overflow (PG raises "bigint out of range" here; a bare `a / b`
-            // would panic the connection — the same trap `mod_op` already
-            // avoids with `wrapping_rem`).
-            if b == 0 { None } else { a.checked_div(b) }
-        },
+        // Divisor is non-zero here, so `checked_div` returns None only on the
+        // INT_MIN / -1 overflow, which `arith` surfaces as an overflow error.
+        |a, b| a.checked_div(b),
         |a, b| a / b,
         "/",
     )
-    .map_err(|e| match e {
-        // The closure returns None on b == 0; translate that into the dedicated
-        // DivisionByZero variant instead of "integer overflow on /".
-        EvalError::TypeMismatch { detail } if detail.contains('/') => EvalError::DivisionByZero,
-        other => other,
-    })
 }
 
 fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
