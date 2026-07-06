@@ -223,14 +223,14 @@ pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, 
     }
 }
 
-/// PG-compatible `avg(numeric)` = `numeric_div(sum, count)`. Picks the
-/// division result scale via a faithful port of PostgreSQL's
-/// `select_div_scale` (base-10000 digit weights, `NUMERIC_MIN_SIG_DIGITS
-/// = 16`, `DEC_DIGITS = 4`), then rounds half-away-from-zero — matching
-/// PG18's exact avg output text including trailing digits. `count` must
-/// be > 0 (callers gate on `count == 0 → NULL`).
+/// PG-compatible `avg(numeric)` = sum / count. Picks the division result
+/// scale with `division_display_scale` (which reproduces PG's observable
+/// division scale — ~16 significant digits in 4-digit groups), then
+/// rounds half-away-from-zero, matching PG18's exact avg output text
+/// including trailing digits. `count` must be > 0 (callers gate on
+/// `count == 0 → NULL`).
 pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128, u8) {
-    let rscale = select_div_scale(sum_scaled, sum_scale, count, 0);
+    let rscale = division_display_scale(sum_scaled, sum_scale, count, 0);
     let (num, den) = if i32::from(rscale) >= i32::from(sum_scale) {
         let k = rscale - sum_scale;
         (sum_scaled.saturating_mul(pow10_sat(k)), count)
@@ -241,15 +241,15 @@ pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128
     (div_round_half_away(num, den), rscale)
 }
 
-/// PG-compatible `numeric / numeric` (`numeric.c:div_var`): picks the
-/// display scale via `select_div_scale` (which forces at least
-/// `NUMERIC_MIN_SIG_DIGITS = 16` significant digits — so `10 / 3` keeps 16
-/// fractional digits, not 0), then rounds half-away-from-zero. `a`/`b` are
+/// PG-compatible `numeric / numeric`: picks the display scale with
+/// `division_display_scale` (which keeps ~16 significant digits — so
+/// `10 / 3` yields 16 fractional digits, not 0), then rounds
+/// half-away-from-zero. `a`/`b` are
 /// `(scaled, scale)` pairs; `b != 0` is the caller's contract. Returns `None`
 /// only on i128 overflow of the pre-scale multiply (SPG's fixed-width limit,
 /// surfaced as an honest error rather than a silently-truncated result).
 pub(crate) fn numeric_div(a: i128, sa: u8, b: i128, sb: u8) -> Option<(i128, u8)> {
-    let rscale = select_div_scale(a, sa, b, sb);
+    let rscale = division_display_scale(a, sa, b, sb);
     // True value = (a / 10^sa) / (b / 10^sb) = (a * 10^sb) / (b * 10^sa).
     // Express it at `rscale`: result_scaled = round( a * 10^(sb+rscale) /
     // (b * 10^sa) ). Fold the exponents into one power of ten with a sign.
@@ -272,29 +272,39 @@ fn pow10_checked(p: u32) -> Option<i128> {
     Some(acc)
 }
 
-/// Port of PG `numeric.c:select_div_scale`. Returns the display scale
-/// PG would give `sum / count`, clamped to SPG's `u8` scale field
-/// (PG allows up to `NUMERIC_MAX_DISPLAY_SCALE = 1000`, but every
-/// `Value::Numeric` scale in SPG is `u8`; scales beyond 255 are a
-/// pre-existing SPG representation limit, not introduced here).
-fn select_div_scale(sum_scaled: i128, sum_scale: u8, count: i128, count_scale: u8) -> u8 {
-    let (w1, fd1) = base10000_weight_firstdigit(sum_scaled, sum_scale);
-    let (w2, fd2) = base10000_weight_firstdigit(count, count_scale);
-    // Estimate the weight of the quotient; if the two leading base-10000
-    // digits are equal we can't be sure, so PG assumes var1 < var2.
-    let mut qweight = w1 - w2;
-    if fd1 <= fd2 {
-        qweight -= 1;
+/// The display scale SPG gives a NUMERIC division result. This targets
+/// the scale PG's `/` operator produces — a differential-verified
+/// behaviour, not a transcription of PG's code: `10/3` →
+/// `3.3333333333333333` (16 fractional digits), `1/3` →
+/// `0.33333333333333333333` (20), `1000000/3` → `333333.333333333333`
+/// (12). The rule keeps roughly 16 significant decimal digits, shifted by
+/// the quotient's magnitude and floored by the dividend's own scale.
+///
+/// The magnitude is counted in 4-digit groups, because PG's result scale
+/// steps a whole group at a time (which is why `1/3` gains four more
+/// fractional digits than `10/3`, not one) — SPG has to group the same
+/// way to land on PG's exact scale. `base10000_weight_firstdigit` gives
+/// each operand's leading-group index and digit. The 1000 cap is PG's
+/// display-scale ceiling; SPG then clamps to its `u8` scale field.
+fn division_display_scale(dividend: i128, dividend_scale: u8, divisor: i128, divisor_scale: u8) -> u8 {
+    let (dividend_group, dividend_lead) = base10000_weight_firstdigit(dividend, dividend_scale);
+    let (divisor_group, divisor_lead) = base10000_weight_firstdigit(divisor, divisor_scale);
+    // Quotient magnitude ≈ dividend's leading group minus divisor's. When
+    // the leading digits tie, the quotient can land a group lower, so drop
+    // one group rather than risk under-scaling the result.
+    let mut quotient_group = dividend_group - divisor_group;
+    if dividend_lead <= divisor_lead {
+        quotient_group -= 1;
     }
-    // NUMERIC_MIN_SIG_DIGITS (16) - qweight * DEC_DIGITS (4), floored by
-    // both inputs' display scales and NUMERIC_MIN_DISPLAY_SCALE (0),
-    // capped at NUMERIC_MAX_DISPLAY_SCALE (1000).
-    let mut rscale = 16 - qweight * 4;
-    rscale = rscale.max(i32::from(sum_scale));
-    rscale = rscale.max(0);
-    rscale = rscale.min(1000);
-    // SPG stores scale as u8; clamp (see doc comment).
-    rscale.min(255) as u8
+    // 16 significant digits at 4 per group: more fractional digits when the
+    // quotient is small, fewer when it is large. Never below the dividend's
+    // own scale or 0, never above PG's 1000-digit display ceiling, then
+    // clamped to SPG's `u8` scale field.
+    let scale = (16 - quotient_group * 4)
+        .max(i32::from(dividend_scale))
+        .max(0)
+        .min(1000);
+    scale.min(255) as u8
 }
 
 /// Base-10000 weight + leading digit of `|scaled / 10^scale|`, matching

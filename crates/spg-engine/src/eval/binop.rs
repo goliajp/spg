@@ -1131,11 +1131,11 @@ fn apply_binary_numeric(
             if b == 0 {
                 return Err(EvalError::DivisionByZero);
             }
-            // PG `numeric / numeric` picks the result scale via
-            // `select_div_scale` — it forces at least NUMERIC_MIN_SIG_DIGITS
-            // (16) significant digits, so `10::numeric / 3` keeps 16
-            // fractional digits (3.3333333333333333) rather than truncating
-            // to the operands' scale-0 (which silently produced `3`).
+            // `numeric / numeric` picks the result scale from
+            // `division_display_scale`, which keeps ~16 significant digits
+            // (matching PG's observable division scale), so `10::numeric / 3`
+            // yields 16 fractional digits (3.3333333333333333) rather than
+            // truncating to the operands' scale-0 (which silently gave `3`).
             let (scaled, scale) =
                 crate::numeric::numeric_div(a, sa, b, sb).ok_or(EvalError::TypeMismatch {
                     detail: "NUMERIC overflow on / scaling".into(),
