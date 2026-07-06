@@ -598,6 +598,21 @@ pub(crate) fn cmp_multi_key(a: &[OrderKey], b: &[OrderKey], descs: &[bool]) -> c
 
 /// v6.4.0 — eval every ORDER BY expression for a row and pack the
 /// resulting keys into a `Vec<f64>`. NULL → `f64::INFINITY`.
+/// When the ORDER BY item is a bare reference to an enum column and the
+/// value is one of the type's labels, return its 0-based ordinal in the
+/// enum's declaration order — the key PG sorts by (enumsortorder). Else
+/// `None`, so the caller falls back to the normal value key.
+fn enum_order_ordinal(expr: &Expr, v: &Value, ctx: &EvalContext) -> Option<f64> {
+    let Expr::Column(c) = expr else { return None };
+    let Value::Text(label) = v else { return None };
+    let pos = eval::find_column_pos(c, ctx)?;
+    let enum_name = ctx.columns.get(pos)?.user_enum_type.as_deref()?;
+    let def = ctx.catalog?.enum_types().get(enum_name)?;
+    let ord = def.labels.iter().position(|l| l.as_str() == label.as_ref())?;
+    #[allow(clippy::cast_precision_loss)]
+    Some(ord as f64)
+}
+
 pub(crate) fn build_order_keys(
     order_by: &[OrderBy],
     row: &Row<'static>,
@@ -619,6 +634,11 @@ pub(crate) fn build_order_keys(
             } else {
                 f64::NEG_INFINITY
             }));
+        } else if let Some(ord) = enum_order_ordinal(&o.expr, &v, ctx) {
+            // Enum columns sort by declaration order (enumsortorder), not
+            // the label text: `ORDER BY mood` puts 'sad' < 'ok' < 'happy'
+            // when that is the CREATE TYPE order, not alphabetical.
+            keys.push(OrderKey::Num(ord));
         } else {
             keys.push(value_to_order_key(&v)?);
         }

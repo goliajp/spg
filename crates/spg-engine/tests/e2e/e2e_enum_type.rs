@@ -181,3 +181,30 @@ fn create_composite_type_collides_with_existing_type() {
     let err = e.execute("CREATE TYPE foo AS ENUM ('x')");
     assert!(err.is_err(), "name collision must be rejected");
 }
+
+#[test]
+fn enum_order_by_uses_declaration_order() {
+    // PG sorts an enum column by enumsortorder (CREATE TYPE order), not
+    // the label text: 'sad' < 'ok' < 'happy'. Live-PG18.4-verified.
+    let mut e = Engine::new();
+    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')").unwrap();
+    e.execute("CREATE TABLE t (m mood)").unwrap();
+    e.execute("INSERT INTO t VALUES ('happy'),('sad'),('ok')").unwrap();
+    let agg = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql).unwrap() {
+            spg_engine::QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
+                spg_storage::Value::Text(s) => s.to_string(),
+                o => panic!("{o:?}"),
+            },
+            _ => panic!("rows"),
+        }
+    };
+    assert_eq!(
+        agg(&mut e, "SELECT string_agg(m::text, ',') FROM (SELECT m FROM t ORDER BY m) s"),
+        "sad,ok,happy"
+    );
+    assert_eq!(
+        agg(&mut e, "SELECT string_agg(m::text, ',') FROM (SELECT m FROM t ORDER BY m DESC) s"),
+        "happy,ok,sad"
+    );
+}
