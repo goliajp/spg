@@ -73,3 +73,20 @@ fn other_kinds_construct() {
         "unexpected render: {got}"
     );
 }
+
+#[test]
+fn multirange_constructor_normalizes() {
+    // PG normalizes multirange members: overlapping/adjacent spans merge,
+    // empties drop, and the result is sorted. All live-PG18.4-verified.
+    let mut e = Engine::new();
+    let mr = |e: &mut Engine, expr: &str| text(&first(e, &format!("SELECT ({expr})::text")));
+    // Overlap and (int4-discrete) adjacency both merge.
+    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(4,8))"), "{[1,8)}");
+    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(5,8))"), "{[1,8)}");
+    // Disjoint spans stay separate; unsorted input is sorted.
+    assert_eq!(mr(&mut e, "int4multirange(int4range(1,3),int4range(5,8))"), "{[1,3),[5,8)}");
+    assert_eq!(mr(&mut e, "int4multirange(int4range(10,20),int4range(1,5))"), "{[1,5),[10,20)}");
+    // Empty member dropped; continuous (numeric) overlap merges.
+    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(3,3))"), "{[1,5)}");
+    assert_eq!(mr(&mut e, "nummultirange(numrange(1,5),numrange(4,8))"), "{[1,8)}");
+}

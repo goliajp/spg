@@ -3985,6 +3985,10 @@ fn apply_function_dispatch(
                     }
                 }
             }
+            // PG normalizes multirange members: sort + merge overlapping /
+            // adjacent spans + drop empty, so overlapping inputs collapse
+            // (`int4range(1,5),int4range(4,8)` → `{[1,8)}`).
+            let ranges = super::binop::normalize_multirange_spans(kind, &ranges);
             Ok(Value::Multirange { kind, ranges })
         }
         // v7.37.17 (17.6 siblings) — generate_subscripts(arr, dim
