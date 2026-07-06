@@ -78,6 +78,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
         | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_)
@@ -2733,6 +2734,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
         | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_)
@@ -3982,6 +3984,11 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             row: row.iter().map(|el| rewrite_expr(el, group_exprs, aggs)).collect(),
             subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
             negated: *negated,
+        },
+        Expr::RowCmpSubquery { row, op, subquery } => Expr::RowCmpSubquery {
+            row: row.iter().map(|el| rewrite_expr(el, group_exprs, aggs)).collect(),
+            op: *op,
+            subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
         },
         // v4.12 window / Literal / Column — clone-pass (these don't
         // participate in aggregate rewrite).

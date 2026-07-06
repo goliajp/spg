@@ -2639,6 +2639,16 @@ pub enum Expr {
         subquery: Box<SelectStatement>,
         negated: bool,
     },
+    /// `(a, b, …) <op> (SELECT x, y, …)` — a row constructor compared to a
+    /// single-row subquery (`=`, `<>`, `<`, `<=`, `>`, `>=`). Like
+    /// RowInSubquery, the literal-RHS form decomposes at parse time but the
+    /// subquery form can't, so it survives as its own node. The subquery
+    /// must yield at most one row (zero → NULL, PG scalar-subquery rule).
+    RowCmpSubquery {
+        row: Vec<Expr>,
+        op: BinOp,
+        subquery: Box<SelectStatement>,
+    },
     /// v7.30.2 (mailrs round-25) — `expr [NOT] IN (a, b, …)` as a FLAT
     /// list. Both the parser's literal-list path and the engine's
     /// IN-subquery materialisation used to desugar into a left-deep
@@ -5182,6 +5192,16 @@ impl fmt::Display for Expr {
                 }
                 let kw = if *negated { ") NOT IN (" } else { ") IN (" };
                 write!(f, "{kw}{subquery})")
+            }
+            Self::RowCmpSubquery { row, op, subquery } => {
+                write!(f, "(")?;
+                for (i, e) in row.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, ") {op} ({subquery})")
             }
             Self::InList {
                 expr,

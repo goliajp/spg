@@ -1343,6 +1343,7 @@ impl Engine {
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
         | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. }
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}

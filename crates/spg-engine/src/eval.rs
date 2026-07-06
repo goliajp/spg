@@ -426,7 +426,8 @@ pub fn eval_expr(
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
-        | Expr::RowInSubquery { .. } => {
+        | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. } => {
             Err(EvalError::TypeMismatch {
                 detail: "subquery reached row eval — engine resolver bug".into(),
             })
