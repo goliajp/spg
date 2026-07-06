@@ -537,7 +537,37 @@ fn resolve_path(cli: Option<String>, env_key: &str) -> Option<PathBuf> {
     })
 }
 
+/// v7.38 (read01 P5.25) — process-startup hardening. Pins LC_NUMERIC to the
+/// C locale (so any linked C code formats numbers with a '.' decimal even
+/// under a comma-decimal ambient locale — Rust itself already defaults to C)
+/// and warns when the server runs as root. We warn rather than refuse:
+/// containers routinely run as root and a hard refusal would break
+/// zero-change deployments; the warning still nudges operators toward a
+/// dedicated unprivileged user.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn startup_hardening() {
+    // SAFETY: `setlocale` and `geteuid` are async-signal-safe libc calls with
+    // no aliasing or lifetime concerns; the `c"C"` literal is a valid
+    // NUL-terminated string with 'static lifetime.
+    unsafe {
+        libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+        if libc::geteuid() == 0 {
+            eprintln!(
+                "[spg] warning: running as root is discouraged; run as a dedicated \
+                 unprivileged user so a database compromise can't escalate to the host."
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn startup_hardening() {}
+
 fn main() {
+    // v7.38 (read01 P5.25) — startup hardening: pin LC_NUMERIC=C and warn on
+    // running as root.
+    startup_hardening();
     // v6.10.4 — peek for `--replay-only` before parsing the
     // positional addr arg. The flag re-targets the boot path:
     // load the catalog snapshot + replay the WAL into the
