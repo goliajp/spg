@@ -3044,6 +3044,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::InFailedTransaction = e {
         return ("25P02", e.to_string());
     }
+    // v7.38 (read01 P4.02) — a single-row subquery that returned many rows
+    // is PG's 21000 CARDINALITY_VIOLATION.
+    if let EngineError::CardinalityViolation = e {
+        return ("21000", e.to_string());
+    }
     let msg = e.to_string();
     // Map constraint violations to their PG SQLSTATE class-23 codes so
     // clients can branch on them (23505 for a duplicate key, 23502 for a

@@ -454,10 +454,7 @@ impl Engine {
                     [] => Value::Null,
                     [r0] => r0.values.first().cloned().unwrap_or(Value::Null),
                     _ => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "scalar subquery returned {} rows; expected 0 or 1",
-                            rows.len()
-                        )));
+                        return Err(EngineError::CardinalityViolation);
                     }
                 };
                 if let (Some(cache), Some(k)) = (memo.as_deref_mut(), cache_key) {
@@ -644,9 +641,7 @@ impl Engine {
                     return Ok(());
                 }
                 if rows.len() > 1 {
-                    return Err(EngineError::Unsupported(
-                        "more than one row returned by a subquery used as an expression".into(),
-                    ));
+                    return Err(EngineError::CardinalityViolation);
                 }
                 if columns.len() != row_exprs.len() {
                     return Err(EngineError::Unsupported(alloc::format!(
@@ -786,10 +781,7 @@ impl Engine {
                     [] => Value::Null,
                     [row] => row.values.first().cloned().unwrap_or(Value::Null),
                     _ => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "scalar subquery returned {} rows; expected 0 or 1",
-                            rows.len()
-                        )));
+                        return Err(EngineError::CardinalityViolation);
                     }
                 };
                 Ok(Some(value_to_literal_expr(value)?))
@@ -950,9 +942,7 @@ impl Engine {
                     return Ok(Some(Expr::Literal(Literal::Null)));
                 }
                 if rows.len() > 1 {
-                    return Err(EngineError::Unsupported(
-                        "more than one row returned by a subquery used as an expression".into(),
-                    ));
+                    return Err(EngineError::CardinalityViolation);
                 }
                 if columns.len() != row.len() {
                     return Err(EngineError::Unsupported(alloc::format!(
