@@ -3022,12 +3022,58 @@ fn statement_cancel(settings: &std::collections::HashMap<String, String>) -> Can
 /// for. Everything else stays on the legacy `42000` to preserve
 /// existing client-side error parsing.
 fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
-    match e {
-        EngineError::Cancelled => (
+    if let EngineError::Cancelled = e {
+        return (
             "57014",
             "canceling statement due to statement timeout".to_string(),
-        ),
-        _ => ("42000", e.to_string()),
+        );
+    }
+    let msg = e.to_string();
+    // Map constraint violations to their PG SQLSTATE class-23 codes so
+    // clients can branch on them (23505 for a duplicate key, 23502 for a
+    // NOT NULL, 23503 for a foreign key, 23514 for a CHECK) instead of the
+    // generic 42000. Match the engine's violation phrasings; the
+    // "violation" / "NOT NULL column" qualifiers keep DDL errors that merely
+    // mention a constraint kind from being misclassified.
+    let code = if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY"))
+    {
+        "23505"
+    } else if msg.contains("FOREIGN KEY violation") {
+        "23503"
+    } else if msg.contains("CHECK constraint violation") {
+        "23514"
+    } else if msg.contains("NOT NULL column") {
+        "23502"
+    } else {
+        "42000"
+    };
+    (code, msg)
+}
+
+#[cfg(test)]
+mod engine_error_sqlstate_tests {
+    use super::engine_error_to_wire;
+    use spg_engine::EngineError;
+
+    fn code(msg: &str) -> &'static str {
+        engine_error_to_wire(&EngineError::Unsupported(msg.to_string())).0
+    }
+
+    #[test]
+    fn constraint_violations_map_to_class_23() {
+        assert_eq!(
+            code("PRIMARY KEY violation on \"t\" columns [\"id\"]: row #0 duplicates an existing key"),
+            "23505"
+        );
+        assert_eq!(code("UNIQUE INDEX \"i\" violation on \"t\": row #0 duplicates"), "23505");
+        assert_eq!(code("FOREIGN KEY violation: no parent row in \"t\" where id = Int(9)"), "23503");
+        assert_eq!(code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""), "23514");
+        // NOT NULL flows through Storage(NullInNotNull) whose Display is
+        // "NULL value in NOT NULL column …".
+        assert_eq!(code("storage: NULL value in NOT NULL column \"x\""), "23502");
+        // A DDL error mentioning a constraint kind is not a violation.
+        assert_eq!(code("cannot add UNIQUE constraint to column with duplicate data"), "42000");
+        assert_eq!(code("syntax error near \"FROM\""), "42000");
     }
 }
 
