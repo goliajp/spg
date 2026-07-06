@@ -1496,6 +1496,33 @@ impl Engine {
     /// loop; HNSW kNN graph walks and the aggregate executor don't
     /// honour it yet (deferred — those paths bound their work
     /// internally by `LIMIT k` and `GROUP BY` cardinality).
+    /// v7.38 (read01 P3.NEW3) — materialise a `spg_*` / `pg_*` meta-view by
+    /// its (lowercased) name, or None if the name isn't a virtual view.
+    /// Callers decide whether to return it directly (`SELECT *`) or stage
+    /// it as a temp table for the full query pipeline.
+    fn meta_view_result(&self, name: &str) -> Option<QueryResult> {
+        Some(match name {
+            "spg_statistic" => self.exec_spg_statistic(),
+            "spg_stat_replication" => self.exec_spg_stat_replication(),
+            "spg_stat_segment" => self.exec_spg_stat_segment(),
+            "spg_memory_stats" => self.exec_spg_memory_stats(),
+            "spg_stat_query" => self.exec_spg_stat_query(),
+            "pg_stat_statements" => self.exec_pg_stat_statements(),
+            "spg_stat_activity" => self.exec_spg_stat_activity(),
+            "pg_stat_activity" => self.exec_pg_stat_activity(),
+            "pg_locks" => self.exec_pg_locks(),
+            "pg_statio_user_tables" => self.exec_pg_statio_user_tables(),
+            "spg_stat_mvcc" => self.exec_spg_stat_mvcc(),
+            "spg_partition_health" => self.exec_spg_partition_health(),
+            "spg_audit_chain" => self.exec_spg_audit_chain(),
+            "spg_audit_verify" => self.exec_spg_audit_verify(),
+            "spg_table_ddl" => self.exec_spg_table_ddl(),
+            "spg_role_ddl" => self.exec_spg_role_ddl(),
+            "spg_database_ddl" => self.exec_spg_database_ddl(),
+            _ => return None,
+        })
+    }
+
     pub(crate) fn exec_select_cancel(
         &self,
         stmt: &SelectStatement,
@@ -1590,61 +1617,53 @@ impl Engine {
         // v6.2.0 / v6.5.0 — virtual-table short-circuits. Detected
         // pre-CTE because they don't read from the catalog and
         // shouldn't participate in regular FROM resolution.
+        // v6.2.0 / v6.5.0 / v7.38 (read01 P3.NEW3) — virtual-table
+        // short-circuits. A meta-view FROM materialises to a fixed row
+        // set. For a bare `SELECT *` we return it directly; otherwise we
+        // stage it as a temp table and run the normal pipeline, so
+        // projection / WHERE / ORDER BY / aggregates work over these views
+        // (they were `SELECT *`-only before). A real table shadowing the
+        // name wins (checked first), which also stops the staged re-run
+        // from recursing back into meta-view detection.
         if let Some(from) = &stmt.from
             && from.joins.is_empty()
-            && stmt.where_.is_none()
-            && stmt.group_by.is_none()
-            && stmt.having.is_none()
-            && stmt.unions.is_empty()
-            && stmt.order_by.is_empty()
-            && stmt.limit.is_none()
-            && stmt.offset.is_none()
-            && !stmt.distinct
-            && stmt.items.iter().all(|i| matches!(i, SelectItem::Wildcard))
+            && self.active_catalog().get(&from.primary.name).is_none()
         {
             let lower = from.primary.name.to_ascii_lowercase();
-            match lower.as_str() {
-                "spg_statistic" => return Ok(self.exec_spg_statistic()),
-                // v6.5.0 — observability v2 virtual tables.
-                "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
-                "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
-                // v7.31 — memory-campaign bucket meters.
-                "spg_memory_stats" => return Ok(self.exec_spg_memory_stats()),
-                "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
-                // v7.37.7 — PG's `pg_stat_statements` extension view.
-                // v7.37.22 (22.1) — full PG-shape view (38 columns)
-                // backed by the same query_stats registry that powers
-                // spg_stat_query. Tools that query specific PG columns
-                // (`SELECT total_exec_time FROM pg_stat_statements
-                // ORDER BY total_exec_time DESC`) now resolve those
-                // columns directly. `spg_stat_query` keeps its
-                // simplified shape for the human-facing spgctl path.
-                "pg_stat_statements" => return Ok(self.exec_pg_stat_statements()),
-                "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
-                // v7.38 (read01 P3.10) — canonical PG name + columns for
-                // monitoring tools; SPG-native shape stays `spg_stat_activity`.
-                "pg_stat_activity" => return Ok(self.exec_pg_stat_activity()),
-                // v7.37.14 (B6.5) — PG-compatibility surface; row
-                // set is empty until v7.37.15 lands tuple locks.
-                "pg_locks" => return Ok(self.exec_pg_locks()),
-                // v7.37.22 (22.2) — per-relation I/O counters.
-                "pg_statio_user_tables" => {
-                    return Ok(self.exec_pg_statio_user_tables());
+            if let Some(result) = self.meta_view_result(&lower) {
+                let bare = stmt.where_.is_none()
+                    && stmt.group_by.is_none()
+                    && stmt.having.is_none()
+                    && stmt.unions.is_empty()
+                    && stmt.order_by.is_empty()
+                    && stmt.limit.is_none()
+                    && stmt.offset.is_none()
+                    && !stmt.distinct
+                    && stmt.items.iter().all(|i| matches!(i, SelectItem::Wildcard));
+                if bare {
+                    return Ok(result);
                 }
-                // v7.37.15 (Phase F) — MVCC diagnostic view; per-
-                // process snapshot of the writer-version cursor +
-                // in-flight tx versions. Used by spgctl / dashboards
-                // to observe MVCC health (vacuum lag, in-flight
-                // tx count).
-                "spg_stat_mvcc" => return Ok(self.exec_spg_stat_mvcc()),
-                // v7.37.16 (16.11) — per-partition health row set.
-                "spg_partition_health" => return Ok(self.exec_spg_partition_health()),
-                "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
-                "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
-                "spg_table_ddl" => return Ok(self.exec_spg_table_ddl()),
-                "spg_role_ddl" => return Ok(self.exec_spg_role_ddl()),
-                "spg_database_ddl" => return Ok(self.exec_spg_database_ddl()),
-                _ => {}
+                if let QueryResult::Rows { columns, rows } = result {
+                    let mut catalog = self.active_catalog().clone();
+                    let cols = infer_column_types(&columns, &rows);
+                    let schema = TableSchema::new(from.primary.name.clone(), cols);
+                    catalog.create_table(schema).map_err(EngineError::Storage)?;
+                    let t = catalog
+                        .get_mut(&from.primary.name)
+                        .expect("just-created meta-view table must exist");
+                    for row in rows {
+                        t.insert(row).map_err(EngineError::Storage)?;
+                    }
+                    let mut eng = Engine::restore(catalog);
+                    if let Some(c) = self.clock {
+                        eng = eng.with_clock(c);
+                    }
+                    if let Some(f) = self.salt_fn {
+                        eng = eng.with_salt_fn(f);
+                    }
+                    return eng.exec_select_cancel(stmt, cancel);
+                }
+                return Ok(result);
             }
         }
         // v4.11: CTEs materialise into a temporary enriched catalog
