@@ -4536,6 +4536,15 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     if let Value::Text(s) = v {
         return Ok(OrderKey::Text(s.as_ref().into()));
     }
+    // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order, so
+    // carry the parsed value and compare it structurally (see
+    // `order_key_elem_cmp`). Unparseable text falls back to a Text key.
+    if let Value::Json(s) = v {
+        return Ok(match crate::json::parse(s) {
+            Ok(jv) => OrderKey::Json(jv),
+            Err(_) => OrderKey::Text(s.as_ref().into()),
+        });
+    }
     // v7.37 — byte-orderable types PG sorts byte-wise but that have no
     // meaningful f64 projection. bytea/uuid/macaddr sort by their raw bytes;
     // inet/cidr by `[family, addr.., bits]` (family, then address, then mask),
