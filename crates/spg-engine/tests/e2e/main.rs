@@ -537,6 +537,7 @@ mod e2e_array_slice;
 mod e2e_anyall_subquery;
 mod e2e_interval_scaling;
 mod e2e_trim_position_syntax;
+mod e2e_gen_random_csprng;
 mod e2e_row_is_null;
 mod e2e_row_constructor;
 mod e2e_extract_fields;

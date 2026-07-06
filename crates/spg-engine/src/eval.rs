@@ -146,6 +146,12 @@ pub struct EvalContext<'a> {
     /// process. Owned (not a borrowed cell) so it stays stack-local and
     /// never touches `Engine`'s `Sync` bound.
     pub recursion_base: core::cell::Cell<usize>,
+    /// v7.38 (read01 P5.24) — host-provided CSPRNG (the server injects
+    /// `/dev/urandom`). Cryptographic builtins (`gen_random_bytes`,
+    /// `gen_salt`) draw from this instead of the process-static xorshift
+    /// PRNG, so their output isn't predictable. `None` (no host CSPRNG)
+    /// falls back to the PRNG — fine for the non-cryptographic `random()`.
+    pub salt_fn: Option<crate::SaltFn>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -178,7 +184,16 @@ impl<'a> EvalContext<'a> {
             session_gucs: None,
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
+            salt_fn: None,
         }
+    }
+
+    /// v7.38 (read01 P5.24) — attach the host CSPRNG so cryptographic
+    /// builtins don't fall back to the predictable PRNG.
+    #[must_use]
+    pub const fn with_salt_fn(mut self, f: Option<crate::SaltFn>) -> Self {
+        self.salt_fn = f;
+        self
     }
 
     /// v7.38 (read01 U15) — attach a per-scan `TABLESAMPLE REPEATABLE`
