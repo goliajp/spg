@@ -2255,16 +2255,35 @@ pub(crate) fn parse_pg_int(s: &str) -> Option<i64> {
     } else {
         (false, s)
     };
-    let cleaned: alloc::string::String = rest.chars().filter(|&c| c != '_').collect();
-    let mag: i64 = if let Some(h) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
-        i64::from_str_radix(h, 16).ok()?
-    } else if let Some(o) = cleaned.strip_prefix("0o").or_else(|| cleaned.strip_prefix("0O")) {
-        i64::from_str_radix(o, 8).ok()?
-    } else if let Some(b) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
-        i64::from_str_radix(b, 2).ok()?
-    } else {
-        cleaned.parse::<i64>().ok()?
-    };
+    // Split off an optional radix prefix (PG 16+: 0x / 0o / 0b), leaving
+    // the digit portion. PG allows `_` group separators ONLY between two
+    // digits — a leading/trailing/doubled underscore (`_5`, `5_`, `1__2`)
+    // or one adjacent to the prefix is "invalid input syntax".
+    let (radix, digits, has_prefix) =
+        if let Some(h) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            (16u32, h, true)
+        } else if let Some(o) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+            (8, o, true)
+        } else if let Some(b) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+            (2, b, true)
+        } else {
+            (10, rest, false)
+        };
+    let db = digits.as_bytes();
+    // Reject a trailing or doubled underscore anywhere, and a leading
+    // underscore unless it follows a radix prefix (PG accepts `0x_FF` but
+    // not `_5` / `5_` / `1__2` / `0xFF_`).
+    if db.last() == Some(&b'_')
+        || digits.contains("__")
+        || (!has_prefix && db.first() == Some(&b'_'))
+    {
+        return None;
+    }
+    let cleaned: alloc::string::String = digits.chars().filter(|&c| c != '_').collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mag = i64::from_str_radix(&cleaned, radix).ok()?;
     Some(if neg { mag.checked_neg()? } else { mag })
 }
 

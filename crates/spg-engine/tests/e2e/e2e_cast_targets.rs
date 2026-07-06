@@ -137,3 +137,30 @@ fn regclass_integer_oid_renders_as_text() {
     };
     assert_eq!(rows[0].values[0], Value::text("16384"));
 }
+
+#[test]
+fn int_text_underscore_only_between_digits() {
+    // PG accepts `_` group separators only between two digits (and right
+    // after a 0x/0o/0b radix prefix); a leading/trailing/doubled
+    // underscore is "invalid input syntax". Live-PG18.4-verified.
+    let mut eng = Engine::new();
+    let ok = |eng: &mut Engine, sql: &str| -> i64 {
+        let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        match &rows[0].values[0] {
+            Value::Int(n) => i64::from(*n),
+            Value::BigInt(n) => *n,
+            o => panic!("{sql}: {o:?}"),
+        }
+    };
+    // Valid: between digits, hex with grouping, hex with underscore right
+    // after the prefix.
+    assert_eq!(ok(&mut eng, "SELECT '1_000'::int4"), 1000);
+    assert_eq!(ok(&mut eng, "SELECT '1_000_000'::int8"), 1_000_000);
+    assert_eq!(ok(&mut eng, "SELECT '0xFF_FF'::int4"), 65535);
+    assert_eq!(ok(&mut eng, "SELECT '0x_FF'::int4"), 255);
+    // Invalid: leading / trailing / doubled underscore.
+    for bad in ["SELECT '_5'::int4", "SELECT '5_'::int4", "SELECT '123__4'::int4", "SELECT '0xFF_'::int4"] {
+        assert!(eng.execute(bad).is_err(), "{bad} must be rejected");
+    }
+}
