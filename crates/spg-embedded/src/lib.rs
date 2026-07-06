@@ -922,14 +922,27 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
         t.set_file_name(name);
         t
     };
-    std::fs::write(&tmp, &snapshot).map_err(io_err)?;
+    // v7.38 (read01 P5.07) — the snapshot data must be durable BEFORE the
+    // WAL checkpoint marker is fsynced (step 4). Otherwise a crash could
+    // leave the marker (recovery believes the checkpoint completed) pointing
+    // at a snapshot the OS never flushed. fsync the tmp file, then fsync the
+    // parent directory after the rename so the rename itself survives a
+    // crash.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(io_err)?;
+        f.write_all(&snapshot).map_err(io_err)?;
+        f.sync_all().map_err(io_err)?;
+    }
     files_synced += 1; // snapshot file
     // v7.38 P0 元机制 A — checkpoint CoW swap boundary. Pre fires after
-    // the tmp file is written and fsynced (rename atomicity uses the
-    // kernel's directory metadata sync) but BEFORE the rename. Tests
+    // the tmp file is written and fsynced but BEFORE the rename. Tests
     // use this to race a concurrent read against an in-flight swap.
     spg_engine::injection_point!("checkpoint_cow_swap_pre", &tmp);
     std::fs::rename(&tmp, &job.db_path).map_err(io_err)?;
+    if let Some(parent) = job.db_path.parent() {
+        fsync_dir(parent);
+    }
     let write_us = write_start.elapsed().as_micros() as u64;
     let sync_start = std::time::Instant::now();
     // v7.38 P0 元机制 A — post-rename: the new snapshot is the
@@ -972,8 +985,17 @@ fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
             t.set_file_name(name);
             t
         };
-        std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
+        // v7.38 (read01 P5.07) — durable manifest before the marker too.
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&m_tmp).map_err(io_err)?;
+            f.write_all(&m_bytes).map_err(io_err)?;
+            f.sync_all().map_err(io_err)?;
+        }
         std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
+        if let Some(parent) = m_path.parent() {
+            fsync_dir(parent);
+        }
         files_synced += 1; // manifest file
     }
     // 4. Enqueue the v4 checkpoint marker carrying the captured LSN. The
