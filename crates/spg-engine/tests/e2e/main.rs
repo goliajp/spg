@@ -434,6 +434,7 @@ mod e2e_pg_settings_view;
 mod e2e_pg_stat_activity;
 mod e2e_pg_stat_archiver_replication;
 mod e2e_pg_stat_bgwriter_tablespace;
+mod e2e_pg_stat_checkpointer_wal;
 mod e2e_pg_stat_database;
 mod e2e_pg_stat_io_functions;
 mod e2e_pg_stat_progress_views;
