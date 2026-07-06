@@ -179,3 +179,25 @@ fn to_char_unchanged_tokens_regress() {
 //    resolves the `timestamptz` overload for a bare date. Value is
 //    correct — KNOWN-LIMITATION (SPG has no real-offset timestamptz).
 // -------------------------------------------------------------------
+
+#[test]
+fn to_char_interval_year_digit_forms() {
+    // to_char(interval, …) understands the trailing-N-digit year codes
+    // (live PG18.4: YYYY '0005', YYY '001', YY '01', Y '1'; YY of 123
+    // years wraps to '23'). Previously only YYYY was handled and YY/YYY/Y
+    // fell through as literal text.
+    let mut e = Engine::new();
+    assert_eq!(
+        scalar(&mut e, "SELECT to_char(INTERVAL '1 year 2 months', 'YY-MM')"),
+        "01-02"
+    );
+    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '1 year 2 months', 'YYY')"), "001");
+    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '1 year', 'Y')"), "1");
+    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '123 years', 'YY')"), "23");
+    // YYYY and the time codes are unaffected.
+    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '5 years', 'YYYY')"), "0005");
+    assert_eq!(
+        scalar(&mut e, "SELECT to_char(INTERVAL '2 hours 30 minutes', 'HH24:MI')"),
+        "02:30"
+    );
+}

@@ -648,6 +648,14 @@ fn to_char_interval(months: i64, days: i64, micros: i128, fmt: &str) -> String {
         }
         let (frag, consumed): (String, usize) = if rest.starts_with(b"YYYY") {
             (pad(yyyy, 4, fm), 4)
+        } else if rest.starts_with(b"YYY") {
+            // v — trailing-N-digit year forms (PG: interval '1 year' →
+            // YYY '001', YY '01', Y '1'; YY of 123 years → '23').
+            (pad(yyyy % 1000, 3, fm), 3)
+        } else if rest.starts_with(b"YY") {
+            (pad(yyyy % 100, 2, fm), 2)
+        } else if rest.starts_with(b"Y") {
+            (pad(yyyy % 10, 1, fm), 1)
         } else if rest.starts_with(b"HH24") {
             (pad(hh24, 2, fm), 4)
         } else if rest.starts_with(b"HH12") {
