@@ -14193,16 +14193,25 @@ impl Parser {
                     .into(),
             );
         };
-        let mut ch_iter = e.chars();
-        let (Some(esc_ch), None) = (ch_iter.next(), ch_iter.next()) else {
-            return Err(alloc::format!(
-                "ESCAPE must be a single character, got {e:?}"
-            ));
+        // v7.38 (read01 P6.18) — PG accepts `ESCAPE ''` to mean "no escape
+        // character" (every `%`/`_` is a wildcard, nothing is escaped). Only a
+        // multi-character escape is an error.
+        let esc_ch: Option<char> = {
+            let mut ch_iter = e.chars();
+            match (ch_iter.next(), ch_iter.next()) {
+                (Some(c), None) => Some(c),
+                (None, _) => None,
+                (Some(_), Some(_)) => {
+                    return Err(alloc::format!(
+                        "ESCAPE must be a single character, got {e:?}"
+                    ));
+                }
+            }
         };
         let mut out = String::with_capacity(p.len() + 4);
         let mut chars = p.chars();
         while let Some(c) = chars.next() {
-            if c == esc_ch {
+            if Some(c) == esc_ch {
                 match chars.next() {
                     // Escaped wildcard / escaped escape → keep the
                     // next char literal via backslash.
@@ -14214,9 +14223,9 @@ impl Parser {
                         return Err("LIKE pattern ends with the escape character".into());
                     }
                 }
-            } else if c == '\\' && esc_ch != '\\' {
-                // A raw backslash is literal under a custom escape —
-                // escape it for the backslash-based matcher.
+            } else if c == '\\' && esc_ch != Some('\\') {
+                // A raw backslash is literal under a custom (or absent) escape
+                // — escape it for the backslash-based matcher.
                 out.push('\\');
                 out.push('\\');
             } else {
