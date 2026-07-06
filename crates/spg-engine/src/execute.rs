@@ -768,7 +768,47 @@ impl Engine {
         result
     }
 
+    /// v7.38 (read01 P3.26) — transaction-abort firewall around the raw
+    /// statement dispatch. After a statement fails inside an explicit
+    /// transaction PG aborts the whole block: every later statement except
+    /// COMMIT / ROLLBACK / ROLLBACK TO SAVEPOINT is rejected, and a COMMIT
+    /// is downgraded to a ROLLBACK so no partial work slips through. We
+    /// mirror that here so both the embedded engine and the wire server
+    /// enforce it uniformly.
     pub(crate) fn execute_stmt_with_cancel(
+        &mut self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if self.tx_aborted {
+            match stmt {
+                Statement::Rollback | Statement::RollbackToSavepoint(_) => {}
+                // PG performs a ROLLBACK for a COMMIT in an aborted tx.
+                Statement::Commit => {
+                    let r = self.dispatch_stmt_inner(Statement::Rollback, cancel);
+                    self.tx_aborted = false;
+                    return r;
+                }
+                _ => return Err(EngineError::InFailedTransaction),
+            }
+        }
+        let is_rollback_to_savepoint = matches!(stmt, Statement::RollbackToSavepoint(_));
+        let result = self.dispatch_stmt_inner(stmt, cancel);
+        if !self.in_transaction() {
+            // The tx ended (COMMIT / ROLLBACK) or we were in autocommit;
+            // either way there is no aborted block to remember.
+            self.tx_aborted = false;
+        } else if result.is_ok() && is_rollback_to_savepoint {
+            // Rolling back to a savepoint recovers the transaction.
+            self.tx_aborted = false;
+        } else if result.is_err() {
+            // A failure inside an open transaction aborts the whole block.
+            self.tx_aborted = true;
+        }
+        result
+    }
+
+    fn dispatch_stmt_inner(
         &mut self,
         stmt: Statement,
         cancel: CancelToken<'_>,

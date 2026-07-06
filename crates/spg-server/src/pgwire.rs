@@ -3028,6 +3028,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "canceling statement due to statement timeout".to_string(),
         );
     }
+    // v7.38 (read01 P3.26) — an aborted-transaction rejection carries PG's
+    // 25P02 so clients recognise "commands ignored until end of block".
+    if let EngineError::InFailedTransaction = e {
+        return ("25P02", e.to_string());
+    }
     let msg = e.to_string();
     // Map constraint violations to their PG SQLSTATE class-23 codes so
     // clients can branch on them (23505 for a duplicate key, 23502 for a

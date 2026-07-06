@@ -213,6 +213,12 @@ pub enum EngineError {
     TransactionAlreadyOpen,
     /// `COMMIT` / `ROLLBACK` with no active transaction.
     NoActiveTransaction,
+    /// v7.38 (read01 P3.26) — a statement other than COMMIT / ROLLBACK /
+    /// ROLLBACK TO SAVEPOINT was issued after an earlier statement in the
+    /// same transaction failed. PG aborts the whole transaction on the
+    /// first error and rejects everything until it is ended (SQLSTATE
+    /// 25P02); this mirrors that so partial work can't slip through.
+    InFailedTransaction,
     /// v4.0 sentinel: `execute_readonly` got a statement that
     /// mutates engine state (INSERT / CREATE / BEGIN / COMMIT / …).
     /// The caller should retake the write lock and dispatch through
@@ -256,6 +262,9 @@ impl fmt::Display for EngineError {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::TransactionAlreadyOpen => f.write_str("a transaction is already open"),
             Self::NoActiveTransaction => f.write_str("no active transaction"),
+            Self::InFailedTransaction => f.write_str(
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
             Self::WriteRequired => {
                 f.write_str("statement requires a write lock (use execute, not execute_readonly)")
             }
@@ -626,6 +635,12 @@ pub struct Engine {
     /// savepoint so `ROLLBACK TO` can unwind just the later ones.
     pub(crate) local_guc_saves: Vec<(String, Option<String>)>,
     pub(crate) savepoint_guc_marks: Vec<(String, usize)>,
+    /// v7.38 (read01 P3.26) — set when a statement fails inside an explicit
+    /// transaction; while true every statement except COMMIT / ROLLBACK /
+    /// ROLLBACK TO SAVEPOINT is rejected with [`EngineError::InFailedTransaction`],
+    /// matching PG's aborted-transaction semantics. Cleared when the tx ends
+    /// or a ROLLBACK TO SAVEPOINT recovers it.
+    pub(crate) tx_aborted: bool,
     /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
     /// Each time the engine executes a `DeferredEmbeddedStmt` it
     /// increments this; the recursive `execute_stmt_with_cancel`
@@ -780,6 +795,7 @@ impl Engine {
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
             savepoint_guc_marks: Vec::new(),
+            tx_aborted: false,
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1077,6 +1093,7 @@ impl Engine {
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
             savepoint_guc_marks: Vec::new(),
+            tx_aborted: false,
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1162,6 +1179,7 @@ impl Engine {
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
             savepoint_guc_marks: Vec::new(),
+            tx_aborted: false,
                     trigger_recursion_depth: 0,
                     foreign_key_checks: true,
                     meta_views_materialised: false,
