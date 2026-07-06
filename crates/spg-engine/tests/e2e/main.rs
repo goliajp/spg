@@ -551,6 +551,7 @@ mod e2e_rows_from;
 mod e2e_table_shorthand_collate;
 mod e2e_tablesample;
 mod e2e_unnest_multi;
+mod e2e_row_in_subquery;
 mod e2e_update_from_delete_using;
 mod e2e_update_uniqueness;
 mod e2e_update_set_forms;

@@ -494,6 +494,67 @@ impl Engine {
                 let bit = if found { !*negated } else { *negated };
                 *e = Expr::Literal(Literal::Bool(bit));
             }
+            Expr::RowInSubquery {
+                row: row_exprs,
+                subquery,
+                negated,
+            } => {
+                // `(a, b, …) [NOT] IN (SELECT x, y, …)` with PG's row
+                // three-valued logic: the result is OR over subquery rows
+                // of the per-row AND of column equalities. A row is a
+                // definite mismatch as soon as one column is unequal (both
+                // non-NULL); if no column is definitely unequal but some
+                // comparison involved a NULL, that row is UNKNOWN. So the
+                // predicate is TRUE if any row fully matches, else NULL if
+                // any row was UNKNOWN, else FALSE.
+                for el in row_exprs.iter_mut() {
+                    self.resolve_correlated_in_expr(el, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+                let lhs_vals: Vec<Value> = row_exprs
+                    .iter()
+                    .map(|el| eval::eval_expr(el, row, ctx).map_err(EngineError::Eval))
+                    .collect::<Result<_, _>>()?;
+                let mut s = (**subquery).clone();
+                substitute_outer_columns(&mut s, row, ctx);
+                let r = self.exec_select_cancel(&s, cancel)?;
+                let QueryResult::Rows { columns, rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "row IN-subquery: inner did not return rows".into(),
+                    ));
+                };
+                if columns.len() != lhs_vals.len() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "row IN-subquery: left side has {} column(s), subquery returns {}",
+                        lhs_vals.len(),
+                        columns.len()
+                    )));
+                }
+                let mut found = false;
+                let mut any_null = false;
+                'rows: for r0 in rows {
+                    let mut has_null = false;
+                    for (j, sub_v) in r0.values.iter().enumerate() {
+                        let lv = &lhs_vals[j];
+                        if lv.is_null() || sub_v.is_null() {
+                            has_null = true;
+                        } else if value_cmp(lv, sub_v) != core::cmp::Ordering::Equal {
+                            continue 'rows; // one column unequal → row is FALSE
+                        }
+                    }
+                    if has_null {
+                        any_null = true; // all non-NULL columns matched → UNKNOWN
+                    } else {
+                        found = true; // full definite match
+                        break;
+                    }
+                }
+                if !found && any_null {
+                    *e = Expr::Literal(Literal::Null);
+                    return Ok(());
+                }
+                let bit = if found { !*negated } else { *negated };
+                *e = Expr::Literal(Literal::Bool(bit));
+            }
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_correlated_in_expr(lhs, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(rhs, row, ctx, cancel, memo.as_deref_mut())?;
@@ -682,6 +743,81 @@ impl Engine {
                     list,
                     negated: *negated,
                 }))
+            }
+            Expr::RowInSubquery {
+                row,
+                subquery,
+                negated,
+            } => {
+                use alloc::boxed::Box;
+                // Correlated → per-row `resolve_correlated_in_expr` handles
+                // it; leave the node in place.
+                if select_is_correlated(subquery) {
+                    return Ok(None);
+                }
+                let mut s = (**subquery).clone();
+                self.resolve_select_subqueries(&mut s, cancel)?;
+                let r = match self.exec_select_cancel(&s, cancel) {
+                    Ok(r) => r,
+                    Err(e) if is_correlation_error(&e) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let QueryResult::Rows { columns, rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "row IN-subquery: inner statement did not return rows".into(),
+                    ));
+                };
+                if columns.len() != row.len() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "row IN-subquery: left side has {} column(s), subquery returns {}",
+                        row.len(),
+                        columns.len()
+                    )));
+                }
+                // Uncorrelated: the subquery's rows are now constants, so fold
+                // to `(a=r1c1 AND …) OR (a=r2c1 AND …) …`. This defers the
+                // left row's evaluation to the per-row loop and reproduces
+                // PG's row-IN three-valued logic for free (`=` / AND / OR all
+                // propagate NULL). An empty result is `false`.
+                let mut alts: Vec<Expr> = Vec::with_capacity(rows.len());
+                for r0 in rows {
+                    let mut conj: Option<Expr> = None;
+                    for (lhs_el, v) in row.iter().zip(r0.values.into_iter()) {
+                        let eq = Expr::Binary {
+                            lhs: Box::new(lhs_el.clone()),
+                            op: BinOp::Eq,
+                            rhs: Box::new(value_to_literal_expr(v)?),
+                        };
+                        conj = Some(match conj {
+                            None => eq,
+                            Some(prev) => Expr::Binary {
+                                lhs: Box::new(prev),
+                                op: BinOp::And,
+                                rhs: Box::new(eq),
+                            },
+                        });
+                    }
+                    if let Some(c) = conj {
+                        alts.push(c);
+                    }
+                }
+                let combined = match alts.into_iter().reduce(|acc, e| Expr::Binary {
+                    lhs: Box::new(acc),
+                    op: BinOp::Or,
+                    rhs: Box::new(e),
+                }) {
+                    Some(c) => c,
+                    None => Expr::Literal(Literal::Bool(false)),
+                };
+                let result = if *negated {
+                    Expr::Unary {
+                        op: UnOp::Not,
+                        expr: Box::new(combined),
+                    }
+                } else {
+                    combined
+                };
+                Ok(Some(result))
             }
             _ => Ok(None),
         }
@@ -3459,7 +3595,7 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
 pub(crate) fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
     match e {
         Expr::ScalarSubquery(s) => out.push(s),
-        Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             collect_scalar_subqueries(lhs, out);
             collect_scalar_subqueries(rhs, out);
@@ -3523,7 +3659,7 @@ fn hollow_scalar_subqueries(e: &mut Expr) {
             };
             **s = hollow;
         }
-        Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             hollow_scalar_subqueries(lhs);
             hollow_scalar_subqueries(rhs);
@@ -3612,7 +3748,7 @@ fn splice_planned_subqueries(
             *e = value_to_literal_expr(v)?;
             Ok(true)
         }
-        Expr::Exists { .. } | Expr::InSubquery { .. } => Ok(true),
+        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => Ok(true),
         Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_subqueries(lhs, plan, idx, row, ctx)?
             && splice_planned_subqueries(rhs, plan, idx, row, ctx)?),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
@@ -3693,7 +3829,7 @@ fn splice_planned_subqueries(
 pub(crate) fn collect_exists_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
     match e {
         Expr::Exists { subquery, .. } => out.push(subquery.as_ref()),
-        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => {}
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             collect_exists_subqueries(lhs, out);
             collect_exists_subqueries(rhs, out);
@@ -3782,7 +3918,7 @@ fn splice_planned_exists(
             *e = Expr::Literal(Literal::Bool(bit));
             Ok(true)
         }
-        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => Ok(true),
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => Ok(true),
         Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_exists(lhs, plan, idx, row, ctx)?
             && splice_planned_exists(rhs, plan, idx, row, ctx)?),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
@@ -4100,6 +4236,12 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
             substitute_in_select(subquery, row, ctx, outer_alias);
         }
+        Expr::RowInSubquery { row: row_exprs, subquery, .. } => {
+            for el in row_exprs.iter_mut() {
+                substitute_in_expr(el, row, ctx, outer_alias);
+            }
+            substitute_in_select(subquery, row, ctx, outer_alias);
+        }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         Expr::Array(items) => {
             for elem in items {
@@ -4175,7 +4317,7 @@ pub fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
 
 pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. } => true,
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_subquery(call) || order_by.iter().any(|o| expr_has_subquery(&o.expr))
         }

@@ -402,6 +402,7 @@ fn rewrite_unqualified(e: &mut Expr, pick: &BTreeMap<String, Expr>) {
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_) => {}
     }

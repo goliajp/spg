@@ -176,6 +176,12 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(expr, now);
             rewrite_select_clock(subquery, now);
         }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            for el in row {
+                rewrite_expr_clock(el, now);
+            }
+            rewrite_select_clock(subquery, now);
+        }
         // v4.12 window functions — args + PARTITION BY + ORDER BY
         // may all reference clock literals.
         Expr::WindowFunction {

@@ -77,6 +77,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_)
@@ -2731,6 +2732,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Placeholder(_)
@@ -3969,6 +3971,15 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             negated,
         } => Expr::InSubquery {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
+            negated: *negated,
+        },
+        Expr::RowInSubquery {
+            row,
+            subquery,
+            negated,
+        } => Expr::RowInSubquery {
+            row: row.iter().map(|el| rewrite_expr(el, group_exprs, aggs)).collect(),
             subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
             negated: *negated,
         },

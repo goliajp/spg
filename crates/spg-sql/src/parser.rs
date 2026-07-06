@@ -13773,6 +13773,28 @@ impl Parser {
                 )));
             }
             self.advance();
+            // `(a, b) [NOT] IN (SELECT x, y)` — a multi-column subquery,
+            // not a list of literal rows. Row-vs-list decomposes to
+            // OR-of-AND above, but the subquery's rows are only known at
+            // runtime, so keep it as a RowInSubquery node.
+            if matches!(self.peek(), Token::Select) {
+                let inner = self.parse_select_stmt()?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after row IN-subquery, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let Statement::Select(s) = inner else {
+                    unreachable!("parse_select_stmt always returns Statement::Select")
+                };
+                return Ok(Expr::RowInSubquery {
+                    row,
+                    subquery: Box::new(s),
+                    negated: negated_in,
+                });
+            }
             let mut alternatives: Vec<Expr> = Vec::new();
             loop {
                 // Optional ROW keyword before the paren row.
