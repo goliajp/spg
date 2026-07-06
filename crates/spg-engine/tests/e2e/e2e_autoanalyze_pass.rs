@@ -18,10 +18,9 @@ fn autoanalyze_pass_returns_empty_when_no_modifications() {
 fn autoanalyze_pass_picks_up_tables_with_pending_modifications() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
-    // Insert enough rows to trigger the analyze threshold
-    // (ceil(0.1 × max(rows, 100)) — for an empty starting table
-    // any insert ≥ 10 rows crosses the floor).
-    for i in 0..20 {
+    // Insert enough rows to cross PG's threshold 50 + ceil(0.1 × rows):
+    // at 60 inserts modified = row_count = 60 > 50 + 6 = 56.
+    for i in 0..60 {
         e.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
     }
     let analyzed = e.autoanalyze_pass().unwrap();
@@ -44,7 +43,8 @@ fn autoanalyze_pass_skips_internal_tables() {
     // tables.
     let mut e = Engine::new();
     e.execute("CREATE TABLE users (id INT)").unwrap();
-    for i in 0..50 {
+    // 60 > PG threshold 50 + ceil(60/10) = 56 → the user table analyzes.
+    for i in 0..60 {
         e.execute(&format!("INSERT INTO users VALUES ({i})")).unwrap();
     }
     let analyzed = e.autoanalyze_pass().unwrap();
