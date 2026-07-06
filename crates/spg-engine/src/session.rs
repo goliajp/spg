@@ -143,6 +143,9 @@ impl Engine {
             // v7.38 (read01 P5.24) — thread the host CSPRNG so gen_random_bytes
             // / gen_salt use real entropy instead of the predictable PRNG.
             .with_salt_fn(self.salt_fn)
+            // v7.38 (read01 P6.08) — thread the host wall clock so uuidv7 gets
+            // a real time-ordered prefix.
+            .with_clock(self.clock)
     }
 }
 

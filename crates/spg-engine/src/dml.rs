@@ -2419,9 +2419,10 @@ pub(crate) fn apply_generated_stored_columns(
                 sample_rng: None,
                 recursion_base: core::cell::Cell::new(0),
                 // This DEFAULT-expression eval path has no engine handle;
-                // gen_random_bytes isn't expected in a column DEFAULT, so the
-                // PRNG fallback (salt_fn None) is acceptable here.
+                // gen_random_bytes / uuidv7 aren't expected in a column
+                // DEFAULT, so the deterministic fallbacks are acceptable here.
                 salt_fn: None,
+                clock: None,
             };
             let value = crate::eval::eval_expr(&pe.expr, &row, &ctx).map_err(EngineError::Eval)?;
             let coerced = crate::coerce_value(value, pe.ty, &pe.col_name, idx)?;

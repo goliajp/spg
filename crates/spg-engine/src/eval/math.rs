@@ -51,6 +51,35 @@ pub(super) fn prng_next_u64() -> u64 {
     }
 }
 
+/// v7.38 (read01 P6.08) — process-wide monotonic guard for `uuidv7`. Packs the
+/// last-issued 48-bit millisecond and its 12-bit intra-millisecond counter as
+/// `(ms << 12) | counter`. Given the current wall-clock `base_ms`, returns a
+/// `(ms, counter)` pair strictly greater than every prior result so generated
+/// UUIDs stay time-ordered even within one millisecond or if the clock steps
+/// backward; the counter rolls into the next millisecond once it saturates.
+static UUIDV7_MONO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn uuidv7_monotonic(base_ms: u64) -> (u64, u16) {
+    use core::sync::atomic::Ordering;
+    let mut packed = UUIDV7_MONO.load(Ordering::Relaxed);
+    loop {
+        let last_ms = packed >> 12;
+        let last_ctr = (packed & 0xFFF) as u16;
+        let (ms, ctr) = if base_ms > last_ms {
+            (base_ms, 0)
+        } else if last_ctr < 0xFFF {
+            (last_ms, last_ctr + 1)
+        } else {
+            (last_ms + 1, 0)
+        };
+        let next = (ms << 12) | u64::from(ctr);
+        match UUIDV7_MONO.compare_exchange_weak(packed, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return (ms, ctr),
+            Err(seen) => packed = seen,
+        }
+    }
+}
+
 /// v7.37.17 (17.6 siblings) — Reseed the PRNG. PG's setseed(f)
 /// accepts a value in [-1, 1] and uses it as the seed source.
 /// We map that range into 64 bits deterministically.

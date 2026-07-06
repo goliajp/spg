@@ -8120,25 +8120,30 @@ fn apply_function_dispatch(
             Ok(Value::Uuid(b))
         }
         // v7.37.17 (17.6 siblings) — PG 18 uuidv7() — time-ordered
-        // UUID v7 (RFC 9562). 48-bit millis-since-epoch prefix +
-        // random tail; sorts by generation time, making it the
-        // preferred PK for write-heavy indexes. SPG uses the same
-        // deterministic 2020-01-01 anchor as the other wall-clock
-        // stubs; v7.38 wall-clock plumbing swaps in real time. The
-        // random tail keeps generated IDs unique within a run.
+        // UUID v7 (RFC 9562). 48-bit millis-since-epoch prefix + a
+        // 12-bit intra-millisecond monotonic counter + random tail;
+        // sorts by generation time, making it the preferred PK for
+        // write-heavy indexes.
+        //
+        // v7.38 (read01 P6.08) — the prefix is now the host wall clock
+        // (µs → ms) when one is attached, giving a real time-ordered
+        // value; with no host clock it falls back to the deterministic
+        // 2020-01-01 anchor. Either way the process-wide monotonic guard
+        // (`uuidv7_monotonic`) keeps successive UUIDs strictly ordered
+        // within a millisecond and across a backward clock step.
         "uuidv7" | "uuid_generate_v7" | "gen_uuid_v7" => {
             if !args.is_empty() {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!("{name}() takes 0 args, got {}", args.len()),
                 });
             }
-            // Deterministic anchor millis (2020-01-01 UTC) + a
-            // monotonic per-run offset from the PRNG so consecutive
-            // calls in one run still sort.
             const ANCHOR_MS: u64 = 1_577_836_800_000;
-            let rand_a = super::math::prng_next_u64();
             let rand_b = super::math::prng_next_u64();
-            let ts = ANCHOR_MS + (rand_a >> 52); // small offset, keeps 48-bit range
+            let base_ms = match ctx.clock {
+                Some(f) => (f().max(0) as u64) / 1000,
+                None => ANCHOR_MS,
+            };
+            let (ts, counter) = super::math::uuidv7_monotonic(base_ms);
             let mut b = [0u8; 16];
             // 48-bit big-endian timestamp.
             b[0] = (ts >> 40) as u8;
@@ -8147,9 +8152,10 @@ fn apply_function_dispatch(
             b[3] = (ts >> 16) as u8;
             b[4] = (ts >> 8) as u8;
             b[5] = ts as u8;
-            // ver (7) in high nibble of byte 6 + rand_a bits.
-            b[6] = 0x70 | ((rand_a >> 8) & 0x0F) as u8;
-            b[7] = rand_a as u8;
+            // ver (7) in high nibble of byte 6 + the 12-bit monotonic
+            // counter in the `rand_a` field (RFC 9562 method 2).
+            b[6] = 0x70 | ((counter >> 8) & 0x0F) as u8;
+            b[7] = counter as u8;
             // variant (10xx) in byte 8 + rand_b tail.
             b[8] = 0x80 | ((rand_b >> 56) & 0x3F) as u8;
             b[9] = (rand_b >> 48) as u8;
