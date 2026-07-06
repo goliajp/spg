@@ -107,3 +107,30 @@ fn inet_family_null_passthrough() {
         );
     }
 }
+
+#[test]
+fn abbrev_inet_vs_cidr_and_same_family_values() {
+    // abbrev(inet) keeps the full canonical text; abbrev(cidr) drops the
+    // octets past the prefix. inet_same_family accepts real inet/cidr
+    // values (not just text). All live-PG18.4-verified.
+    let mut e = Engine::new();
+    // inet: full form.
+    assert_eq!(text(&first(&mut e, "SELECT abbrev(inet '192.168.1.0/24')")), "192.168.1.0/24");
+    assert_eq!(text(&first(&mut e, "SELECT abbrev(inet '192.168.1.5')")), "192.168.1.5");
+    // cidr: abbreviated.
+    assert_eq!(text(&first(&mut e, "SELECT abbrev(cidr '192.168.1.0/24')")), "192.168.1/24");
+    assert_eq!(text(&first(&mut e, "SELECT abbrev(cidr '10.0.0.0/8')")), "10/8");
+    // inet_same_family over inet/cidr values.
+    assert_eq!(
+        first(&mut e, "SELECT inet_same_family(inet '192.168.1.1', inet '10.0.0.1')"),
+        spg_storage::Value::Bool(true)
+    );
+    assert_eq!(
+        first(&mut e, "SELECT inet_same_family(inet '192.168.1.1', inet '::1')"),
+        spg_storage::Value::Bool(false)
+    );
+    assert_eq!(
+        first(&mut e, "SELECT inet_same_family(cidr '192.168.1.0/24', inet '10.0.0.1')"),
+        spg_storage::Value::Bool(true)
+    );
+}

@@ -312,14 +312,27 @@ pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 
 /// v7.37.17 (17.6 siblings) — inet_same_family(a, b).
 pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    match args {
-        [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
-        [Value::Text(a), Value::Text(b)] => {
-            let fam = |s: &str| if s.split('/').next().unwrap_or("").contains(':') { 6 } else { 4 };
-            Ok(Value::Bool(fam(a) == fam(b)))
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    // Accept real inet/cidr values (family is stored directly) as well
+    // as the textual form — mirrors the other inet builtins that no
+    // longer insist on TEXT.
+    let fam_of = |v: &Value| -> Option<u8> {
+        match v {
+            Value::Inet { family, .. } | Value::Cidr { family, .. } => Some(*family),
+            Value::Text(s) => Some(if s.split('/').next().unwrap_or("").contains(':') {
+                6
+            } else {
+                4
+            }),
+            _ => None,
         }
+    };
+    match (args.first().and_then(fam_of), args.get(1).and_then(fam_of)) {
+        (Some(a), Some(b)) => Ok(Value::Bool(a == b)),
         _ => Err(EvalError::TypeMismatch {
-            detail: "inet_same_family() takes 2 TEXT args".into(),
+            detail: "inet_same_family() takes two inet/cidr/text arguments".into(),
         }),
     }
 }
@@ -383,10 +396,9 @@ pub(super) fn inet_set_masklen(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 /// (`192.168.1.0/24` → `192.168.1/24`, `10.0.0.0/8` → `10/8`). IPv6 falls
 /// back to the full text form.
 pub(super) fn inet_abbrev(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (family, bits, addr) = match args.first() {
-        Some(Value::Cidr { family, bits, addr } | Value::Inet { family, bits, addr }) => {
-            (*family, *bits, *addr)
-        }
+    let (family, bits, addr, is_cidr) = match args.first() {
+        Some(Value::Cidr { family, bits, addr }) => (*family, *bits, *addr, true),
+        Some(Value::Inet { family, bits, addr }) => (*family, *bits, *addr, false),
         Some(Value::Null) => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
@@ -394,7 +406,10 @@ pub(super) fn inet_abbrev(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
             });
         }
     };
-    if family != 4 {
+    // abbrev(inet) keeps the full canonical text (PG: `192.168.1.0/24`
+    // stays intact, a /32 host drops the mask); only abbrev(cidr) drops
+    // the octets past the network prefix.
+    if !is_cidr || family != 4 {
         return Ok(Value::text(crate::conversions::format_inet(family, bits, &addr)));
     }
     let sig = ((usize::from(bits) + 7) / 8).max(1);
