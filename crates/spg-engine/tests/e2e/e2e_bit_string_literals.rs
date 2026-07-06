@@ -69,3 +69,24 @@ fn bit_concat_yields_bitstring() {
     // Equality with the literal confirms the packed bits.
     assert_eq!(one(&mut e, "SELECT (B'101' || B'1') = B'1011'"), spg_storage::Value::Bool(true));
 }
+
+#[test]
+fn pg_typeof_bit_reports_bit_varying_not_unknown() {
+    // SPG carries bit / bit varying in one BitString variant, so
+    // pg_typeof reports "bit varying" (its data_type) — matching PG for
+    // varbit values and the concat result. (A `bit` literal reads as
+    // "bit varying" here vs PG's "bit"; that needs a fixed-vs-varying tag
+    // SPG doesn't keep.) The point of this test is that it is no longer
+    // "unknown". Live-PG18.4: pg_typeof('101'::varbit) = "bit varying".
+    let mut e = Engine::new();
+    let t = |e: &mut Engine, sql: &str| -> String {
+        match one(e, sql) {
+            spg_storage::Value::Text(s) => s.to_string(),
+            o => panic!("{o:?}"),
+        }
+    };
+    assert_eq!(t(&mut e, "SELECT pg_typeof('101'::varbit)::text"), "bit varying");
+    assert_eq!(t(&mut e, "SELECT pg_typeof(B'10' || B'11')::text"), "bit varying");
+    // No longer "unknown" for a plain bit literal either.
+    assert_eq!(t(&mut e, "SELECT pg_typeof(B'101')::text"), "bit varying");
+}

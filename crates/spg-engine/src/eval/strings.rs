@@ -549,6 +549,12 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::TsVector(_) => "tsvector",
         Value::TsQuery(_) => "tsquery",
         Value::Uuid(_) => "uuid",
+        // SPG carries both `bit` and `bit varying` in one BitString
+        // variant (no fixed-vs-varying tag), so it reports the varying
+        // spelling — the same as its data_type() — rather than "unknown".
+        // A `bit` literal reads as "bit varying" here vs PG's "bit"; that
+        // needs a bit-vs-varbit value tag SPG doesn't yet keep.
+        Value::BitString { .. } => "bit varying",
         Value::Null => "unknown",
         // Value is #[non_exhaustive]; future variants land here
         // until the table is updated.
