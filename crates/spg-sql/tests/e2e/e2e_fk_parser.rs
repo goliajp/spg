@@ -28,8 +28,10 @@ fn column_level_references_normalises_to_table_level() {
     assert_eq!(fk.columns, vec!["uid"]);
     assert_eq!(fk.parent_table, "u");
     assert_eq!(fk.parent_columns, vec!["id"]);
-    assert_eq!(fk.on_delete, FkAction::Restrict);
-    assert_eq!(fk.on_update, FkAction::Restrict);
+    // PG's default referential action with no ON DELETE/UPDATE clause is
+    // NO ACTION (not RESTRICT).
+    assert_eq!(fk.on_delete, FkAction::NoAction);
+    assert_eq!(fk.on_update, FkAction::NoAction);
 }
 
 #[test]
@@ -59,7 +61,8 @@ fn on_delete_cascade() {
          FOREIGN KEY (uid) REFERENCES u(id) ON DELETE CASCADE)",
     );
     assert_eq!(fks[0].on_delete, FkAction::Cascade);
-    assert_eq!(fks[0].on_update, FkAction::Restrict);
+    // No ON UPDATE clause → PG default NO ACTION.
+    assert_eq!(fks[0].on_update, FkAction::NoAction);
 }
 
 #[test]
