@@ -1558,6 +1558,14 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "BEGIN" => "BEGIN".to_string(),
         "COMMIT" => "COMMIT".to_string(),
         "ROLLBACK" => "ROLLBACK".to_string(),
+        // v7.38 (read01 P3.27) — the first word does not name the command
+        // for a data-modifying CTE (`WITH … INSERT/UPDATE/DELETE`) or a
+        // MERGE, so PG tags them by the real top-level statement. Parse to
+        // recover it; fall back to the keyword if parsing somehow fails
+        // (it won't for a statement that already executed).
+        "WITH" | "MERGE" => spg_sql::parser::parse_statement(sql)
+            .map(|stmt| command_tag_for_ast(&stmt, affected))
+            .unwrap_or(first),
         other => other.to_string(), // CREATE TABLE / DROP USER / etc.
     }
 }
@@ -2782,6 +2790,9 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         Statement::Insert(_) => format!("INSERT 0 {affected}"),
         Statement::Update(_) => format!("UPDATE {affected}"),
         Statement::Delete(_) => format!("DELETE {affected}"),
+        // v7.38 (read01 P3.27) — PG tags MERGE with its total touched-row
+        // count, no leading OID field.
+        Statement::Merge(_) => format!("MERGE {affected}"),
         Statement::CreateTable(_) => "CREATE TABLE".to_string(),
         Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
         Statement::AlterIndex(_) => "ALTER INDEX".to_string(),
@@ -4994,6 +5005,27 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_tag_derives_verb_from_ast_not_first_word() {
+        // v7.38 (read01 P3.27) — plain statements tag off the first word.
+        assert_eq!(command_tag("INSERT INTO t VALUES (1)", 1), "INSERT 0 1");
+        assert_eq!(command_tag("UPDATE t SET x = 1", 4), "UPDATE 4");
+        assert_eq!(command_tag("DELETE FROM t", 2), "DELETE 2");
+        // A data-modifying CTE is named by its real top-level verb, not WITH.
+        assert_eq!(
+            command_tag("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c", 3),
+            "INSERT 0 3"
+        );
+        assert_eq!(
+            command_tag("WITH c AS (SELECT 1) UPDATE t SET x = 1", 5),
+            "UPDATE 5"
+        );
+        assert_eq!(
+            command_tag("WITH c AS (SELECT 1) DELETE FROM t WHERE id > 9", 0),
+            "DELETE 0"
+        );
+    }
 
     fn read_cell(buf: &[u8]) -> &[u8] {
         let len = i32::from_be_bytes(buf[..4].try_into().unwrap());
