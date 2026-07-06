@@ -54,3 +54,31 @@ fn slru_and_subscription_stats_shell_views() {
         ]
     );
 }
+
+#[test]
+fn catalog_views_resolve_without_pg_catalog_qualifier() {
+    // v7.38 (read01 P3.21) — bare catalog names resolve like PG's implicit
+    // pg_catalog search_path; they no longer require the pg_catalog. prefix.
+    let mut e = Engine::new();
+    for v in [
+        "pg_stat_database",
+        "pg_stat_user_tables",
+        "pg_stat_checkpointer",
+        "pg_stat_wal",
+        "pg_stat_slru",
+        "pg_replication_slots",
+        "pg_statistic",
+        "pg_stat_activity",
+    ] {
+        e.execute(&format!("SELECT * FROM {v}"))
+            .unwrap_or_else(|err| panic!("bare {v}: {err:?}"));
+    }
+    // A user table whose name starts with pg_ but isn't a known catalog
+    // view still resolves as the user's table.
+    e.execute("CREATE TABLE pg_myapp(id int)").unwrap();
+    e.execute("INSERT INTO pg_myapp VALUES(1)").unwrap();
+    assert!(matches!(
+        e.execute("SELECT count(*)::int FROM pg_myapp").unwrap(),
+        QueryResult::Rows { .. }
+    ));
+}

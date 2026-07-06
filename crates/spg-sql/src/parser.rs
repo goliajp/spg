@@ -6896,20 +6896,53 @@ impl Parser {
     /// names the engine actually synthesises are recognised — any
     /// other `pg_*` ident stays a user table (mailrs embed round-12).
     fn try_peek_meta_bare(&mut self) -> Option<String> {
+        // v7.38 (read01 P3.21) — every catalog view SPG synthesises
+        // (`__spg_pg_*`) is bare-resolvable, matching PG's implicit
+        // `pg_catalog` at the front of every search_path. (pg_stat_activity
+        // / pg_stat_statements / pg_locks / pg_statio_user_tables route
+        // through the meta_view_result path instead, and already resolve
+        // bare — they must NOT be listed here or the __spg_ rewrite would
+        // mis-target them.)
         const PG_META_TABLES: &[&str] = &[
+            "pg_am",
             "pg_attribute",
             "pg_class",
+            "pg_collation",
             "pg_constraint",
             "pg_database",
+            "pg_depend",
+            "pg_enum",
             "pg_extension",
             "pg_index",
             "pg_indexes",
+            "pg_inherits",
             "pg_matviews",
             "pg_namespace",
             "pg_proc",
+            "pg_publication",
+            "pg_replication_slots",
             "pg_roles",
             "pg_sequence",
             "pg_settings",
+            "pg_stat_archiver",
+            "pg_stat_bgwriter",
+            "pg_stat_checkpointer",
+            "pg_stat_database",
+            "pg_stat_io",
+            "pg_stat_progress_analyze",
+            "pg_stat_progress_create_index",
+            "pg_stat_progress_vacuum",
+            "pg_stat_replication",
+            "pg_stat_slru",
+            "pg_stat_subscription_stats",
+            "pg_stat_user_functions",
+            "pg_stat_user_indexes",
+            "pg_stat_user_tables",
+            "pg_stat_wal",
+            "pg_statistic",
+            "pg_statistic_ext",
+            "pg_subscription",
+            "pg_tablespace",
             "pg_trigger",
             "pg_type",
             "pg_user",
