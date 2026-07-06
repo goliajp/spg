@@ -860,6 +860,9 @@ impl Engine {
                 let value: &str = match name.as_str() {
                     "transaction_isolation" => self.current_isolation_level.as_pg_str(),
                     "server_version" => "18.4 (spg)",
+                    // PG's numeric version (major*10000 + minor); drivers
+                    // read it to gate feature use. 18.4 → 180004.
+                    "server_version_num" => "180004",
                     "server_encoding" => "UTF8",
                     "is_superuser" => "on",
                     "TimeZone" | "timezone" => self
