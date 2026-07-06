@@ -1633,12 +1633,13 @@ pub(crate) fn synth_information_schema_table_constraints(
                 Value::text("YES"),
             ]));
         }
-        // CHECK constraints.
+        // CHECK constraints — PG-canonical `{table}_{col}_check` names.
+        let check_names = pg_check_connames(t, &tname, &t.schema().checks);
         for (ci, _check) in t.schema().checks.iter().enumerate() {
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
-                Value::text(alloc::format!("{tname}_check{ci}")),
+                Value::text(check_names[ci].clone()),
                 Value::text("spg"),
                 Value::text("public"),
                 Value::text(tname.clone()),
@@ -2504,11 +2505,14 @@ pub(crate) fn synth_info_check_constraints(
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
+        // Same PG-canonical `{table}_{col}_check` naming pg_constraint
+        // and pg_get_constraintdef use, so the three agree.
+        let check_names = pg_check_connames(t, &tname, &t.schema().checks);
         for (ci, clause) in t.schema().checks.iter().enumerate() {
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
-                Value::text(alloc::format!("{tname}_check{ci}")),
+                Value::text(check_names[ci].clone()),
                 Value::text(clause.clone()),
             ]));
         }
@@ -3287,7 +3291,21 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
             let mut positions = alloc::vec![idx.column_position];
             positions.extend(idx.extra_column_positions.iter().copied());
             let cols = positions.iter().map(|&p| col_at(p)).collect::<Vec<_>>().join(", ");
-            let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+            // An index backs a PK / UNIQUE constraint when its column set
+            // equals a uniqueness constraint's — PG reports those as
+            // `CREATE UNIQUE INDEX` even though SPG enforces uniqueness
+            // via the constraint, not the index's own flag. Never
+            // over-claims: a plain index whose columns don't match any
+            // constraint stays non-unique.
+            let backs_unique_constraint = t.schema().uniqueness_constraints.iter().any(|uc| {
+                uc.columns.len() == positions.len()
+                    && positions.iter().all(|p| uc.columns.contains(p))
+            });
+            let unique_kw = if idx.is_unique || backs_unique_constraint {
+                "UNIQUE "
+            } else {
+                ""
+            };
             // Matches PG's pg_get_indexdef spelling (with `USING btree`).
             let indexdef = alloc::format!(
                 "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({})",
