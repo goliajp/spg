@@ -882,6 +882,62 @@ pub fn parse(src: &str) -> Result<JsonValue, ParseError> {
     Ok(value)
 }
 
+/// v7.38 (read01 P6.24) — PG's `jsonb` total order (ORDER BY / DISTINCT /
+/// btree). First by type rank `Null < String < Number < Boolean < Array <
+/// Object`; then within a type: strings by content, numbers numerically,
+/// booleans `false < true`, arrays by length then element-wise, objects by
+/// pair-count then key/value pairwise (keys in canonical stored order).
+/// Mirrors the observable behaviour of `jsonb.c`'s `compareJsonbContainers`.
+#[must_use]
+pub fn jsonb_compare(a: &JsonValue, b: &JsonValue) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    fn rank(v: &JsonValue) -> u8 {
+        match v {
+            JsonValue::Null => 0,
+            JsonValue::String(_) => 1,
+            JsonValue::Number(_) | JsonValue::NumberText(_) => 2,
+            JsonValue::Bool(_) => 3,
+            JsonValue::Array(_) => 4,
+            JsonValue::Object(_) => 5,
+        }
+    }
+    fn num(v: &JsonValue) -> f64 {
+        match v {
+            JsonValue::Number(x) => *x,
+            JsonValue::NumberText(s) => s.parse::<f64>().unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+    let (ra, rb) = (rank(a), rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (JsonValue::String(x), JsonValue::String(y)) => x.cmp(y),
+        (JsonValue::Bool(x), JsonValue::Bool(y)) => x.cmp(y),
+        (
+            JsonValue::Number(_) | JsonValue::NumberText(_),
+            JsonValue::Number(_) | JsonValue::NumberText(_),
+        ) => num(a).partial_cmp(&num(b)).unwrap_or(Ordering::Equal),
+        (JsonValue::Array(x), JsonValue::Array(y)) => x.len().cmp(&y.len()).then_with(|| {
+            x.iter()
+                .zip(y.iter())
+                .map(|(ea, eb)| jsonb_compare(ea, eb))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        }),
+        (JsonValue::Object(x), JsonValue::Object(y)) => x.len().cmp(&y.len()).then_with(|| {
+            x.iter()
+                .zip(y.iter())
+                .map(|((ka, va), (kb, vb))| ka.cmp(kb).then_with(|| jsonb_compare(va, vb)))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        }),
+        // Same rank, both Null (or the impossible cross-variant) → equal.
+        _ => Ordering::Equal,
+    }
+}
+
 fn skip_ws(bytes: &[u8], p: &mut usize) {
     while *p < bytes.len() && matches!(bytes[*p], b' ' | b'\t' | b'\n' | b'\r') {
         *p += 1;

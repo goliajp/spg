@@ -78,6 +78,13 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
         (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order
+        // (Null<String<Number<Boolean<Array<Object, recursive), not by its
+        // text spelling. Fall back to text only if either side fails to parse.
+        (Value::Json(x), Value::Json(y)) => match (crate::json::parse(x), crate::json::parse(y)) {
+            (Ok(jx), Ok(jy)) => crate::json::jsonb_compare(&jx, &jy),
+            _ => x.cmp(y),
+        },
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         // Mixed integer / float — widen the integer to f64.
@@ -207,7 +214,17 @@ pub(crate) fn sort_values_for_histogram(a: &Value, b: &Value) -> core::cmp::Orde
         (Value::SmallInt(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
         (Value::BigInt(a), Value::SmallInt(b)) => a.cmp(&i64::from(*b)),
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (Value::Text(a), Value::Text(b)) | (Value::Json(a), Value::Json(b)) => a.cmp(b),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order
+        // (Null<String<Number<Boolean<Array<Object, recursive), not by its
+        // text spelling. Fall back to text order only if either side fails to
+        // parse (should not happen for stored jsonb).
+        (Value::Json(a), Value::Json(b)) => {
+            match (crate::json::parse(a), crate::json::parse(b)) {
+                (Ok(ja), Ok(jb)) => crate::json::jsonb_compare(&ja, &jb),
+                _ => a.cmp(b),
+            }
+        }
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
@@ -459,6 +476,9 @@ pub(crate) enum OrderKey {
     /// (encoded `[family, addr.., bits]`). Sorts after finite Num / Text in
     /// the rare heterogeneous case; same-type is the load-bearing path.
     Bytes(alloc::vec::Vec<u8>),
+    /// v7.38 (read01 P6.24) — jsonb sorted by PG's type-aware total order
+    /// (`crate::json::jsonb_compare`), not its text spelling.
+    Json(crate::json::JsonValue),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -477,6 +497,31 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         (OrderKey::Int(x), OrderKey::Int(y)) => x.cmp(y),
         (OrderKey::Text(x), OrderKey::Text(y)) => x.cmp(y),
         (OrderKey::Bytes(x), OrderKey::Bytes(y)) => x.cmp(y),
+        // v7.38 (read01 P6.24) — jsonb total order. Same-type is the
+        // load-bearing path; a Json key only meets a foreign key via a NULL
+        // sentinel (`Num(±INF)`) or a degenerate heterogeneous ORDER BY, where
+        // Json is placed after every finite scalar key deterministically.
+        (OrderKey::Json(x), OrderKey::Json(y)) => crate::json::jsonb_compare(x, y),
+        (OrderKey::Json(_), OrderKey::Num(y)) => {
+            if *y == f64::INFINITY {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (OrderKey::Num(x), OrderKey::Json(_)) => {
+            if *x == f64::INFINITY {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (OrderKey::Json(_), OrderKey::Int(_) | OrderKey::Text(_) | OrderKey::Bytes(_)) => {
+            Ordering::Greater
+        }
+        (OrderKey::Int(_) | OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Json(_)) => {
+            Ordering::Less
+        }
         // Int vs Num: the only Num a value-typed Int meets is the ±INF NULL
         // sentinel (rides to the far ends) or, in a genuinely heterogeneous
         // ORDER BY expression, a finite float — compared via f64 widening
