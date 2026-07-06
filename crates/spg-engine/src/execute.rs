@@ -691,7 +691,14 @@ impl Engine {
             Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
             Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
             Statement::CreateIndex(s) => self.exec_create_index(s),
-            Statement::Insert(s) => self.exec_insert(s),
+            Statement::Insert(s) => {
+                let r = self.exec_insert(s)?;
+                if let QueryResult::CommandOk { affected, .. } = &r {
+                    self.stat_tup_inserted =
+                        self.stat_tup_inserted.saturating_add(*affected as u64);
+                }
+                Ok(r)
+            }
             Statement::Update(mut s) => {
                 // Materialise uncorrelated subqueries in SET / WHERE
                 // before the row walk — the SELECT path has done this
@@ -704,13 +711,21 @@ impl Engine {
                 if let Some(w) = &mut s.where_ {
                     self.resolve_expr_subqueries(w, cancel)?;
                 }
-                self.exec_update_cancel(&s, cancel)
+                let r = self.exec_update_cancel(&s, cancel)?;
+                if let QueryResult::CommandOk { affected, .. } = &r {
+                    self.stat_tup_updated = self.stat_tup_updated.saturating_add(*affected as u64);
+                }
+                Ok(r)
             }
             Statement::Delete(mut s) => {
                 if let Some(w) = &mut s.where_ {
                     self.resolve_expr_subqueries(w, cancel)?;
                 }
-                self.exec_delete_cancel(&s, cancel)
+                let r = self.exec_delete_cancel(&s, cancel)?;
+                if let QueryResult::CommandOk { affected, .. } = &r {
+                    self.stat_tup_deleted = self.stat_tup_deleted.saturating_add(*affected as u64);
+                }
+                Ok(r)
             }
             Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
             Statement::Select(s) => {
