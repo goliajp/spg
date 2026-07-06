@@ -703,10 +703,17 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
         Value::Int(n) => Ok(Value::Bool(n != 0)),
         Value::BigInt(n) => Ok(Value::Bool(n != 0)),
         Value::Text(s) => {
+            // PG boolin accepts any unambiguous prefix of true/false/yes/no
+            // plus on/off/1/0 (case-insensitive, trimmed); `o` alone is
+            // ambiguous (on vs off) and errors.
             let lo = s.trim().to_ascii_lowercase();
             match lo.as_str() {
-                "true" | "t" | "yes" | "y" | "1" | "on" => Ok(Value::Bool(true)),
-                "false" | "f" | "no" | "n" | "0" | "off" => Ok(Value::Bool(false)),
+                "1" | "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" => {
+                    Ok(Value::Bool(true))
+                }
+                "0" | "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" => {
+                    Ok(Value::Bool(false))
+                }
                 _ => Err(EvalError::TypeMismatch {
                     detail: format!("cannot parse {s:?} as bool"),
                 }),

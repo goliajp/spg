@@ -70,3 +70,26 @@ fn tinyint_one_accepts_boolean_inserts() {
 // can wrap their dump's boolean values as `TRUE` / `FALSE` via
 // a `sed` pass, or use the application-side coercion the
 // driver already does.
+
+#[test]
+fn bool_cast_accepts_pg_prefixes() {
+    // PG boolin accepts any unambiguous prefix of true/false/yes/no plus
+    // on/off/1/0, case-insensitive and whitespace-trimmed; 'o' alone is
+    // ambiguous. All live-PG18.4-verified.
+    let mut e = Engine::new();
+    let b = |e: &mut Engine, sql: &str| -> bool {
+        match e.execute(sql).unwrap() {
+            QueryResult::Rows { rows, .. } => matches!(rows[0].values[0], Value::Bool(true)),
+            _ => panic!(),
+        }
+    };
+    for t in ["t", "tr", "tru", "true", "y", "ye", "yes", "on", "1", "  TRUE "] {
+        assert!(b(&mut e, &format!("SELECT '{t}'::bool")), "{t} should be true");
+    }
+    for f in ["f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0"] {
+        assert!(!b(&mut e, &format!("SELECT '{f}'::bool")), "{f} should be false");
+    }
+    // Ambiguous / garbage rejected.
+    assert!(e.execute("SELECT 'o'::bool").is_err(), "'o' is ambiguous");
+    assert!(e.execute("SELECT 'maybe'::bool").is_err());
+}
