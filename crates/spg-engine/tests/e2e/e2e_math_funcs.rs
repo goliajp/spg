@@ -147,3 +147,49 @@ fn float8_overflow_and_underflow_error_like_pg() {
     // NaN propagates without erroring.
     assert!(as_f64(&first(&mut e, "SELECT 'nan'::float8 * 2")).is_nan());
 }
+
+#[test]
+fn float8_out_uses_scientific_notation_like_pg() {
+    // PG float8out: shortest round-trip, scientific when the base-10
+    // exponent is < -4 or > 14, fixed otherwise. Every value is
+    // live-PG18.4-verified (scalar, array literal, and float8[] column).
+    let mut e = Engine::new();
+    let txt = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                spg_storage::Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    for (expr, want) in [
+        ("1e14", "100000000000000"),   // E=14 → fixed
+        ("1e15", "1e+15"),             // E=15 → scientific
+        ("1e20", "1e+20"),
+        ("0.0001", "0.0001"),          // E=-4 → fixed
+        ("0.00001", "1e-05"),          // E=-5 → scientific
+        ("123456.789", "123456.789"),
+        ("1234567890123456", "1.234567890123456e+15"),
+        ("-2.5e-10", "-2.5e-10"),
+        ("3.14e100", "3.14e+100"),
+        ("1000000.0", "1000000"),
+        ("0.0", "0"),
+        ("-0.0", "-0"),
+    ] {
+        assert_eq!(
+            txt(&mut e, &format!("SELECT ({expr})::float8::text")),
+            want,
+            "float8out({expr})"
+        );
+    }
+    // Array literal + column paths use float8out too.
+    assert_eq!(
+        txt(&mut e, "SELECT (ARRAY[1e30::float8, 2.0, 0.00001])::text"),
+        "{1e+30,2,1e-05}"
+    );
+    // Non-finite values keep their float8out spelling.
+    assert_eq!(txt(&mut e, "SELECT ('inf'::float8)::text"), "Infinity");
+    assert_eq!(txt(&mut e, "SELECT ('-inf'::float8)::text"), "-Infinity");
+    assert_eq!(txt(&mut e, "SELECT ('nan'::float8)::text"), "NaN");
+}

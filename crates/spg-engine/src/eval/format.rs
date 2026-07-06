@@ -41,6 +41,39 @@ pub fn format_timestamptz(micros: i64) -> String {
 }
 
 /// v7.17.0 Phase 3.P0-35 — PG `money` canonical text form, en_US
+/// PG `float8out` — the shortest round-trip decimal, rendered in
+/// scientific notation when the base-10 exponent is `< -4` or `> 14`
+/// (matching float.c's choice), otherwise fixed. Learned from read01
+/// float.c study: PG switches to `1e+15` / `1e-05` where SPG used to
+/// spell every digit (`1000000000000000000000000000000`). The exponent
+/// is read from Rust's `{:e}` (exact — avoids log10 rounding at powers
+/// of ten) and reformatted to PG's `e±NN` (sign always shown, ≥ 2
+/// digits). Infinities / NaN / signed zero match `float8out` too.
+pub fn format_float(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let sci = alloc::format!("{x:e}"); // e.g. "1.234e15", "1e-5", "-2.5e-10"
+    let epos = sci.find('e').expect("{:e} always has an 'e'");
+    let exp_val: i32 = sci[epos + 1..].parse().unwrap_or(0);
+    if (-4..=14).contains(&exp_val) {
+        return alloc::format!("{x}"); // fixed-point shortest
+    }
+    let mant = &sci[..epos];
+    let exp = &sci[epos + 1..];
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', exp),
+    };
+    alloc::format!("{mant}e{sign}{digits:0>2}")
+}
+
 /// locale: `$N,NNN.CC`, negative → `-$1.23`. Mirrors PG's
 /// `cash_out` for `lc_monetary = 'en_US.UTF-8'`.
 pub fn format_money(cents: i64) -> String {
@@ -533,7 +566,9 @@ pub fn format_float_array(items: &[Option<f64>]) -> String {
         }
         match item {
             None => out.push_str("NULL"),
-            Some(x) => out.push_str(&x.to_string()),
+            // PG float8[] elements use float8out too — scientific past
+            // the exponent thresholds (`{1e+30,2}`), not every digit.
+            Some(x) => out.push_str(&format_float(*x)),
         }
     }
     out.push('}');

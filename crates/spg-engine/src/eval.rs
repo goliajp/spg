@@ -51,7 +51,8 @@ use datetime::{
 use encoding::{decode_text, encode_text};
 pub use format::{
     days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
-    format_date, format_date_array, format_float_array, format_int_array, format_interval,
+    format_date, format_date_array, format_float, format_float_array, format_int_array,
+    format_interval,
     format_interval_array, format_money, format_numeric, format_numeric_array,
     format_smallint_array, format_text_array, format_time, format_timestamp,
     format_timestamp_array, format_timestamptz, format_timetz, format_uuid_array,
@@ -805,7 +806,7 @@ fn value_to_text_for_array(v: &Value) -> String {
                 "f".into()
             }
         }
-        Value::Float(x) => format!("{x}"),
+        Value::Float(x) => format::format_float(*x),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
