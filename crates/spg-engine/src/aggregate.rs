@@ -3408,7 +3408,14 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 out.push_str(&crate::json::value_to_json_text(item));
             }
             out.push(']');
-            Value::json(out)
+            // jsonb_agg yields canonical jsonb (nested object keys sorted,
+            // numbers normalised); json_agg keeps the input verbatim.
+            let result = Value::json(out);
+            if name == "jsonb_agg" {
+                crate::json::canonicalize_value(result)
+            } else {
+                result
+            }
         }
         // v7.32 (round-29) — json_object_agg: a JSON object built from
         // the parallel key (`items`) / value (`aux_items`) streams.
@@ -3450,7 +3457,14 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 out.push_str(&crate::json::value_to_json_text(val));
             }
             out.push('}');
-            Value::json(out)
+            // jsonb_object_agg emits canonical jsonb — keys sorted by PG's
+            // (length, byte) order; json_object_agg keeps first-seen order.
+            let result = Value::json(out);
+            if dedup {
+                crate::json::canonicalize_value(result)
+            } else {
+                result
+            }
         }
         // Ordered-set aggregates are finalized in `run` (they need the
         // sorted items + the direct fraction argument), never here.
