@@ -219,6 +219,10 @@ pub enum EngineError {
     /// first error and rejects everything until it is ended (SQLSTATE
     /// 25P02); this mirrors that so partial work can't slip through.
     InFailedTransaction,
+    /// v7.38 (read01 P4.02) — a scalar / row subquery used as an
+    /// expression returned more than one row. PG raises this as
+    /// SQLSTATE 21000 (CARDINALITY_VIOLATION) with a fixed message.
+    CardinalityViolation,
     /// v4.0 sentinel: `execute_readonly` got a statement that
     /// mutates engine state (INSERT / CREATE / BEGIN / COMMIT / …).
     /// The caller should retake the write lock and dispatch through
@@ -265,6 +269,9 @@ impl fmt::Display for EngineError {
             Self::InFailedTransaction => f.write_str(
                 "current transaction is aborted, commands ignored until end of transaction block",
             ),
+            Self::CardinalityViolation => {
+                f.write_str("more than one row returned by a subquery used as an expression")
+            }
             Self::WriteRequired => {
                 f.write_str("statement requires a write lock (use execute, not execute_readonly)")
             }
