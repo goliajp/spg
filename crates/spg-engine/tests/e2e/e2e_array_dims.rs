@@ -101,3 +101,22 @@ fn dimension_funcs_cover_all_element_types() {
         spg_storage::Value::Null
     ));
 }
+
+#[test]
+fn array_out_quotes_whitespace_elements() {
+    // PG array_out quotes an element containing newline / carriage-return /
+    // form-feed (array_isspace), not just space/tab. Live-PG18.4-verified.
+    let mut e = Engine::new();
+    let txt = |e: &mut Engine, sql: &str| -> String {
+        match first(e, sql) {
+            spg_storage::Value::Text(s) => s.to_string(),
+            o => panic!("{sql}: {o:?}"),
+        }
+    };
+    assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\nb'])::text"), "{\"a\nb\"}");
+    assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\rb'])::text"), "{\"a\rb\"}");
+    assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\fb'])::text"), "{\"a\u{c}b\"}");
+    // Tab still quotes (regression guard) and a plain element does not.
+    assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\tb'])::text"), "{\"a\tb\"}");
+    assert_eq!(txt(&mut e, "SELECT (ARRAY['ab'])::text"), "{ab}");
+}
