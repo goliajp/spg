@@ -608,6 +608,15 @@ pub struct Engine {
     /// All other names are accepted + recorded so PG-dump output
     /// loads, but have no behavioural effect.
     pub(crate) session_params: BTreeMap<String, String>,
+    /// v7.38 (read01 P3.12) — cumulative row-write counters feeding
+    /// `pg_stat_database` (database-wide `tup_inserted` / `tup_updated` /
+    /// `tup_deleted`). Bumped by the affected-row count of each successful
+    /// INSERT / UPDATE / DELETE statement. Per-Engine (so tests stay
+    /// isolated); on the server's shared engine they read as the
+    /// since-start database totals PG reports.
+    pub(crate) stat_tup_inserted: u64,
+    pub(crate) stat_tup_updated: u64,
+    pub(crate) stat_tup_deleted: u64,
     /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
     /// Each time the engine executes a `DeferredEmbeddedStmt` it
     /// increments this; the recursive `execute_stmt_with_cancel`
@@ -757,6 +766,9 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            stat_tup_inserted: 0,
+            stat_tup_updated: 0,
+            stat_tup_deleted: 0,
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1049,6 +1061,9 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            stat_tup_inserted: 0,
+            stat_tup_updated: 0,
+            stat_tup_deleted: 0,
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
             meta_views_materialised: false,
@@ -1129,6 +1144,9 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
+            stat_tup_inserted: 0,
+            stat_tup_updated: 0,
+            stat_tup_deleted: 0,
                     trigger_recursion_depth: 0,
                     foreign_key_checks: true,
                     meta_views_materialised: false,

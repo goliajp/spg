@@ -1194,7 +1194,12 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
 ///     (0 — SPG aggregate spill lands in v7.37.19 (19.15))
 ///   * blk_read_time / blk_write_time (Float) — accumulated
 ///     I/O wait time (0 until per-statement timing lands)
-pub(crate) fn synth_pg_stat_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_stat_database(
+    _cat: &Catalog,
+    tup_inserted: u64,
+    tup_updated: u64,
+    tup_deleted: u64,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("datid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
@@ -1228,9 +1233,9 @@ pub(crate) fn synth_pg_stat_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
         Value::BigInt(0),      // blks_hit
         Value::BigInt(0),      // tup_returned
         Value::BigInt(0),      // tup_fetched
-        Value::BigInt(0),      // tup_inserted
-        Value::BigInt(0),      // tup_updated
-        Value::BigInt(0),      // tup_deleted
+        Value::BigInt(i64::try_from(tup_inserted).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(tup_updated).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(tup_deleted).unwrap_or(i64::MAX)),
         Value::BigInt(0),      // conflicts (PG: replication-conflict count)
         Value::BigInt(0),      // deadlocks (SPG single-writer; always 0)
         Value::BigInt(0),      // temp_files (spill; pending 19.15)

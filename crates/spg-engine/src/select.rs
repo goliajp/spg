@@ -445,8 +445,12 @@ impl Engine {
                 // (one row for SPG's single database; counters are
                 // shape-stable 0 until wiring lands).
                 "__spg_pg_stat_database" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_database(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_stat_database(
+                        self.active_catalog(),
+                        self.stat_tup_inserted,
+                        self.stat_tup_updated,
+                        self.stat_tup_deleted,
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.14) — pg_catalog.pg_stat_user_tables
