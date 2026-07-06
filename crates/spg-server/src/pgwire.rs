@@ -4576,7 +4576,10 @@ fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
 
 // ---- Type mapping ----
 
-/// PG type OIDs lifted from postgres `src/include/catalog/pg_type.dat`.
+/// The stable PG wire-protocol type OIDs (16 = bool, 23 = int4, …). These
+/// numbers are part of the on-the-wire interface a PG client decodes by,
+/// so SPG must emit the same values to stay drop-in compatible — the same
+/// interface constants every PG-compatible server / driver conforms to.
 /// Catch-all is `text` (25) so an unknown / new SPG type round-trips
 /// as a readable string rather than confusing the client.
 const fn pg_type_oid(ty: DataType) -> u32 {

@@ -3207,8 +3207,8 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 let q = (st.sum_money * 2 + if st.sum_money >= 0 { n } else { -n }) / (2 * n);
                 Value::Money(q as i64)
             } else if st.use_numeric {
-                // Exact NUMERIC avg = numeric_div(sum, count) at PG's
-                // display scale (select_div_scale).
+                // Exact NUMERIC avg = sum / count at the same display
+                // scale PG's division produces (division_display_scale).
                 let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
                     st.sum_num_scaled,
                     st.sum_num_scale,
