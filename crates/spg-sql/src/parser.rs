@@ -14262,6 +14262,52 @@ impl Parser {
     /// to FALSE (TRUE under NOT IN), matching standard SQL semantics.
     /// v4.11: parse `WITH name AS (SELECT ...) [, ...] SELECT ...`.
     /// Caller already consumed the leading `WITH` ident.
+    /// v7.38 (read01) — recursive-CTE well-formedness. PG rejects ORDER BY
+    /// / LIMIT / OFFSET anywhere in a recursive query, and a recursive
+    /// self-reference that appears more than once in a single term.
+    fn validate_recursive_cte(&self, cte: &crate::ast::Cte) -> Result<(), ParseError> {
+        use crate::ast::{CteBody, SelectStatement};
+        if !cte.recursive {
+            return Ok(());
+        }
+        let CteBody::Select(body) = &cte.body else {
+            return Ok(());
+        };
+        // A recursive CTE body is `base UNION [ALL] recursive [UNION …]`;
+        // check the anchor and every peer term.
+        let has_order = |s: &SelectStatement| !s.order_by.is_empty();
+        let has_limit = |s: &SelectStatement| s.limit.is_some() || s.offset.is_some();
+        if has_order(body) || body.unions.iter().any(|(_, u)| has_order(u)) {
+            return Err(self.err(String::from(
+                "ORDER BY in a recursive query is not implemented",
+            )));
+        }
+        if has_limit(body) || body.unions.iter().any(|(_, u)| has_limit(u)) {
+            return Err(self.err(String::from(
+                "LIMIT in a recursive query is not implemented",
+            )));
+        }
+        let self_refs = |s: &SelectStatement| -> usize {
+            let Some(from) = &s.from else {
+                return 0;
+            };
+            let mut n = usize::from(from.primary.name.eq_ignore_ascii_case(&cte.name));
+            for j in &from.joins {
+                if j.table.name.eq_ignore_ascii_case(&cte.name) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        if body.unions.iter().any(|(_, u)| self_refs(u) > 1) {
+            return Err(self.err(alloc::format!(
+                "recursive reference to query \"{}\" must not appear more than once",
+                cte.name
+            )));
+        }
+        Ok(())
+    }
+
     /// v7.38 (read01 U16) — desugar a CTE's SEARCH / CYCLE clause into
     /// extra body columns, mirroring PG's `rewriteSearchAndCycle`. Runs
     /// right after parse so the engine sees a plain recursive CTE with the
@@ -14649,6 +14695,7 @@ impl Parser {
                 search,
                 cycle,
             };
+            self.validate_recursive_cte(&cte)?;
             self.desugar_cte_search_cycle(&mut cte)?;
             ctes.push(cte);
             if matches!(self.peek(), Token::Comma) {
