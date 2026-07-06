@@ -200,6 +200,7 @@ mod e2e_pg_backup_probes;
 mod e2e_random_normal;
 mod e2e_to_char_numeric_precision;
 mod e2e_uuidv7_wallclock;
+mod e2e_like_empty_escape;
 mod e2e_regex_dot_newline;
 mod e2e_regex_extended_flag;
 mod e2e_to_number;
