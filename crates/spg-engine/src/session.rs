@@ -130,6 +130,9 @@ impl Engine {
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
+            // Thread the session GUC map so current_setting resolves
+            // custom `SET app.foo = …` settings (request-context / RLS).
+            .with_session_gucs(&self.session_params)
             // v7.37.16 (16.12) — thread the read-only catalog so
             // builtins like pg_partition_root can walk partition
             // roles. Other EvalContext call sites (scan paths,

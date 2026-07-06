@@ -123,6 +123,12 @@ pub struct EvalContext<'a> {
     /// engine populates `Some(&self.catalog)` only at the engine's
     /// top-level entry points where the borrow is unambiguous.
     pub catalog: Option<&'a spg_storage::Catalog>,
+    /// Session GUCs set via `SET name = value` / `set_config`, keyed by
+    /// lowercased name. `current_setting('app.foo')` reads custom
+    /// (namespaced) settings from here — the mechanism apps use for
+    /// request context / RLS. `None` in read-only contexts that have no
+    /// session; unknown names then fall through to PG defaults.
+    pub session_gucs: Option<&'a alloc::collections::BTreeMap<String, String>>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -152,7 +158,19 @@ impl<'a> EvalContext<'a> {
             default_text_search_config: None,
             sequence_resolver: None,
             catalog: None,
+            session_gucs: None,
         }
+    }
+
+    /// Attach the session's GUC map so `current_setting` can resolve
+    /// custom (namespaced) settings written with `SET` / `set_config`.
+    #[must_use]
+    pub const fn with_session_gucs(
+        mut self,
+        gucs: &'a alloc::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.session_gucs = Some(gucs);
+        self
     }
 
     /// v7.37.16 (16.12) — attach a read-only catalog reference

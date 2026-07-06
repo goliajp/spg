@@ -11151,7 +11151,17 @@ fn apply_function_dispatch(
             } else {
                 false
             };
-            let val = match name.to_ascii_lowercase().as_str() {
+            let lname = name.to_ascii_lowercase();
+            // A value written with SET / set_config wins over the static
+            // default (PG: `SET application_name = 'x'` then
+            // current_setting('application_name') → 'x'). Custom
+            // namespaced GUCs (`app.user_id`) only live here.
+            if let Some(gucs) = ctx.session_gucs
+                && let Some(v) = gucs.get(lname.as_str())
+            {
+                return Ok(Value::text(v.clone()));
+            }
+            let val = match lname.as_str() {
                 "server_version" => "18.4 (SPG-compat)",
                 "server_version_num" => "180004",
                 "server_encoding" => "UTF8",
