@@ -295,3 +295,19 @@ fn like_any_all_quantified() {
         "<NULL>"
     );
 }
+
+/// format() `*` width — the width is taken from an argument
+/// (`format('%*s', 5, 'x')` right-pads to 5). A negative width
+/// argument left-justifies. Live-PG18.4-verified.
+#[test]
+fn format_star_width() {
+    check(&[
+        ("SELECT format('%*s', 5, 'x') || '|'", "    x|"),
+        ("SELECT format('%-*s', 5, 'x') || '|'", "x    |"),
+        ("SELECT format('[%*s]', 3, 'ab')", "[ ab]"),
+        ("SELECT format('%*s', -5, 'x') || '|'", "x    |"),
+        ("SELECT format('%s=%*s', 'k', 4, 'v') || '|'", "k=   v|"),
+        // Literal width still works.
+        ("SELECT format('%10s', 'x') || '|'", "         x|"),
+    ]);
+}

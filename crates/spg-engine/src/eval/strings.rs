@@ -388,23 +388,50 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
             width_digits = digit_buf.clone();
         }
         // `-` flag (left-justify) then width — but only when the width wasn't
-        // already captured as the pre-`$` digits above.
+        // already captured as the pre-`$` digits above. The width may be a
+        // literal number or `*`, which pulls it from the next argument (PG:
+        // `format('%*s', 5, 'x')` right-pads 'x' to width 5).
         let mut left_justify = false;
+        let mut width_from_arg = false;
         if width_digits.is_empty() {
             if matches!(chars.peek(), Some(&'-')) {
                 chars.next();
                 left_justify = true;
             }
-            while let Some(&d) = chars.peek() {
-                if d.is_ascii_digit() {
-                    width_digits.push(d);
-                    chars.next();
-                } else {
-                    break;
+            if matches!(chars.peek(), Some(&'*')) {
+                chars.next();
+                width_from_arg = true;
+            } else {
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        width_digits.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
             }
         }
-        let width: usize = width_digits.parse().unwrap_or(0);
+        let width: usize = if width_from_arg {
+            // The `*` consumes one implicit argument as the width. PG: a
+            // negative width means left-justify with the absolute width.
+            let w_arg = arg_values.get(implicit_cursor).cloned().unwrap_or(Value::Null);
+            implicit_cursor += 1;
+            let w = match w_arg {
+                Value::SmallInt(n) => i64::from(n),
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                _ => 0,
+            };
+            if w < 0 {
+                left_justify = true;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let uw = w.unsigned_abs() as usize;
+            uw
+        } else {
+            width_digits.parse().unwrap_or(0)
+        };
         // Specifier character.
         let spec = match chars.next() {
             Some(c) => c,
