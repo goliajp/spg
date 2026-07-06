@@ -41,3 +41,31 @@ fn hex_form_expands_to_bits() {
     assert_eq!(nbits, 4);
     assert!(e.execute("SELECT X'G1'").is_err());
 }
+
+#[test]
+fn bit_concat_yields_bitstring() {
+    // PG `bit || bit` = a bit-varying of length nbits(a)+nbits(b); the
+    // second operand's bits shift to start at offset nbits(a) (cross-byte
+    // aware). SPG previously fell through to text concat → Text. Values
+    // are live-PG18.4-verified.
+    let mut e = Engine::new();
+    let txt = |e: &mut Engine, sql: &str| -> String {
+        match one(e, sql) {
+            spg_storage::Value::Text(s) => s.to_string(),
+            o => panic!("{sql}: expected Text, got {o:?}"),
+        }
+    };
+    // The result must be a BitString (not Text) and hold the right bits.
+    assert!(matches!(
+        one(&mut e, "SELECT B'10' || B'11'"),
+        spg_storage::Value::BitString { .. }
+    ));
+    assert_eq!(txt(&mut e, "SELECT (B'10' || B'11')::text"), "1011");
+    assert_eq!(txt(&mut e, "SELECT (B'1010' || B'0101')::text"), "10100101");
+    // Cross-byte alignment (first operand not byte-aligned).
+    assert_eq!(txt(&mut e, "SELECT (B'101' || B'1')::text"), "1011");
+    assert_eq!(txt(&mut e, "SELECT (B'11111111' || B'0000')::text"), "111111110000");
+    assert_eq!(txt(&mut e, "SELECT (B'' || B'11')::text"), "11");
+    // Equality with the literal confirms the packed bits.
+    assert_eq!(one(&mut e, "SELECT (B'101' || B'1') = B'1011'"), spg_storage::Value::Bool(true));
+}
