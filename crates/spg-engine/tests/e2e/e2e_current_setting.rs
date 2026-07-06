@@ -135,3 +135,33 @@ fn set_client_encoding_rejects_non_utf8() {
     assert_eq!(text(&first(&mut e, "SELECT current_setting('client_encoding')")), "UTF8");
     e.execute("SET application_name='ok'").unwrap();
 }
+
+#[test]
+fn set_validates_known_typed_gucs() {
+    // v7.38 (read01 P3.17) — a clearly-invalid value for a well-known typed
+    // GUC errors like PG; valid values and unknown GUCs still succeed.
+    let mut e = Engine::new();
+    // Valid.
+    for ok in [
+        "SET work_mem='64MB'",
+        "SET work_mem=1024",
+        "SET statement_timeout='5min'",
+        "SET statement_timeout=0",
+        "SET enable_seqscan=off",
+        "SET maintenance_work_mem='512MB'",
+    ] {
+        e.execute(ok).unwrap_or_else(|err| panic!("{ok}: {err:?}"));
+    }
+    // Invalid → error.
+    for bad in [
+        "SET work_mem='bogus'",
+        "SET statement_timeout='notanumber'",
+        "SET enable_seqscan='maybe'",
+        "SET lock_timeout='abc'",
+    ] {
+        assert!(e.execute(bad).is_err(), "should reject: {bad}");
+    }
+    // Unknown GUC still accepted (pg_dump compat).
+    e.execute("SET some_random_guc='whatever'").unwrap();
+    e.execute("SET application_name='x'").unwrap();
+}
