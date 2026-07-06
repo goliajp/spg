@@ -2419,9 +2419,16 @@ pub(crate) fn coerce_value(
         }
         (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
         (Value::Text(s), DataType::Float) => s.trim().parse::<f64>().ok().map(Value::Float),
-        (Value::Text(s), DataType::Bool) => match s.to_ascii_lowercase().as_str() {
-            "0" | "false" | "f" | "no" | "off" => Some(Value::Bool(false)),
-            "1" | "true" | "t" | "yes" | "on" => Some(Value::Bool(true)),
+        // PG boolin accepts any unambiguous prefix of true/false/yes/no,
+        // plus on/off/1/0, case-insensitively with surrounding whitespace
+        // trimmed. `o` alone is ambiguous (on vs off) → error.
+        (Value::Text(s), DataType::Bool) => match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" => {
+                Some(Value::Bool(false))
+            }
+            "1" | "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" => {
+                Some(Value::Bool(true))
+            }
             _ => None,
         },
         // v7.17.0 Phase 3.P0-46 — MySQL TINYINT(1) (which Phase 4.3
