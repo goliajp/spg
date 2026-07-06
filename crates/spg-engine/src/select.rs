@@ -491,6 +491,19 @@ impl Engine {
                         crate::system_catalog::synth_pg_stat_wal(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.38 (read01 P3.15) — pg_catalog.pg_stat_slru /
+                // pg_stat_subscription_stats shell views.
+                "__spg_pg_stat_slru" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_stat_slru(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_stat_subscription_stats" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_stat_subscription_stats(
+                        self.active_catalog(),
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.22 (22.17) — pg_catalog.pg_stat_archiver.
                 "__spg_pg_stat_archiver" => {
                     let (schema, rows) =

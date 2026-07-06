@@ -980,6 +980,47 @@ pub(crate) fn synth_pg_stat_replication(
 ///     buffers_backend_fsync / buffers_alloc (BigInt)
 ///   * maxwritten_clean (BigInt)
 ///   * stats_reset (TIMESTAMPTZ)
+/// v7.38 (read01 P3.15) — `pg_catalog.pg_stat_slru`. SPG has no SLRU
+/// caches (its tiered storage is a different subsystem), so the view is
+/// empty; the PG columns are present so monitoring queries parse.
+pub(crate) fn synth_pg_stat_slru(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("name", DataType::Text, false),
+        ColumnSchema::new("blks_zeroed", DataType::BigInt, false),
+        ColumnSchema::new("blks_hit", DataType::BigInt, false),
+        ColumnSchema::new("blks_read", DataType::BigInt, false),
+        ColumnSchema::new("blks_written", DataType::BigInt, false),
+        ColumnSchema::new("blks_exists", DataType::BigInt, false),
+        ColumnSchema::new("flushes", DataType::BigInt, false),
+        ColumnSchema::new("truncates", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    (schema, Vec::new())
+}
+
+/// v7.38 (read01 P3.15) — `pg_catalog.pg_stat_subscription_stats`. One
+/// row per subscription would carry apply/sync error + conflict counts;
+/// SPG doesn't track them yet, so this is an empty shape-stable shell.
+pub(crate) fn synth_pg_stat_subscription_stats(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("subid", DataType::BigInt, false),
+        ColumnSchema::new("subname", DataType::Text, false),
+        ColumnSchema::new("apply_error_count", DataType::BigInt, false),
+        ColumnSchema::new("sync_error_count", DataType::BigInt, false),
+        ColumnSchema::new("confl_insert_exists", DataType::BigInt, false),
+        ColumnSchema::new("confl_update_origin_differs", DataType::BigInt, false),
+        ColumnSchema::new("confl_update_exists", DataType::BigInt, false),
+        ColumnSchema::new("confl_update_missing", DataType::BigInt, false),
+        ColumnSchema::new("confl_delete_origin_differs", DataType::BigInt, false),
+        ColumnSchema::new("confl_delete_missing", DataType::BigInt, false),
+        ColumnSchema::new("confl_multiple_unique_conflicts", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    (schema, Vec::new())
+}
+
 /// v7.38 (read01 P3.14) — `pg_catalog.pg_stat_checkpointer` (PG 17+).
 /// SPG checkpoints WAL/segments on its own schedule; the cumulative
 /// counters aren't wired yet, so this is a shape-stable single row of
