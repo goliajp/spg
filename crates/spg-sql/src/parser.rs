@@ -9647,7 +9647,11 @@ impl Parser {
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
             // 24-bit) → INT. UNSIGNED modifiers are consumed below
             // without semantic effect.
-            "smallint" => {
+            // v7.38 (read01 P4.19-sibling) — `int2` / `int4` / `int8` are
+            // PG's internal type names; pg_dump and hand-written PG schemas
+            // use them interchangeably with smallint / int / bigint (the cast
+            // path already accepted them, only the column grammar didn't).
+            "smallint" | "int2" => {
                 // v7.14.0 — MySQL display-width on integers
                 // (`SMALLINT(5)`, `INT(11)`, `BIGINT(20)`). The
                 // parenthesised number is purely cosmetic — it
@@ -9674,11 +9678,11 @@ impl Parser {
                     ColumnTypeName::SmallInt
                 }
             }
-            "int" | "integer" | "mediumint" => {
+            "int" | "integer" | "int4" | "mediumint" => {
                 self.consume_optional_paren_size();
                 ColumnTypeName::Int
             }
-            "bigint" => {
+            "bigint" | "int8" => {
                 self.consume_optional_paren_size();
                 ColumnTypeName::BigInt
             }
