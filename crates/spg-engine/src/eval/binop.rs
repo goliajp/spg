@@ -1221,9 +1221,47 @@ const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
 /// lexemes present on both sides merge (positions concatenated,
 /// the higher weight wins — SPG models weight per lexeme, PG per
 /// position, so the stronger label is the faithful collapse).
+/// Concatenate two MSB-packed bit strings (`bit || bit`): copy `a`'s
+/// `an` bits, then append `b`'s `bn` bits starting at bit offset `an`.
+/// Returns `(total_bits, packed_bytes)`.
+fn bit_concat(an: u32, ab: &[u8], bn: u32, bb: &[u8]) -> (u32, alloc::vec::Vec<u8>) {
+    let total = an + bn;
+    let mut out = alloc::vec![0u8; ((total + 7) / 8) as usize];
+    let get = |src: &[u8], i: u32| -> bool {
+        src.get((i / 8) as usize)
+            .is_some_and(|&byte| byte & (0x80 >> (i % 8)) != 0)
+    };
+    for i in 0..an {
+        if get(ab, i) {
+            out[(i / 8) as usize] |= 0x80 >> (i % 8);
+        }
+    }
+    for i in 0..bn {
+        if get(bb, i) {
+            let p = an + i;
+            out[(p / 8) as usize] |= 0x80 >> (p % 8);
+        }
+    }
+    (total, out)
+}
+
 fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
     if let (Value::TsVector(a), Value::TsVector(b)) = (l, r) {
         return tsvector_concat(a, b);
+    }
+    // PG `bit || bit` = a `bit varying` of length nbits(a)+nbits(b). Both
+    // operands are MSB-packed and zero-padded, so the second string's bits
+    // must be shifted to start at bit offset nbits(a), not byte-appended.
+    if let (
+        Value::BitString { nbits: an, bytes: ab },
+        Value::BitString { nbits: bn, bytes: bb },
+    ) = (l, r)
+    {
+        let (total, out) = bit_concat(*an, ab, *bn, bb);
+        return Value::BitString {
+            nbits: total,
+            bytes: alloc::borrow::Cow::Owned(out),
+        };
     }
     // v7.11.8 — PG `||` overloads: TEXT[] || TEXT[] = concatenated array;
     // TEXT[] || TEXT (or TEXT || TEXT[]) prepends/appends the single
