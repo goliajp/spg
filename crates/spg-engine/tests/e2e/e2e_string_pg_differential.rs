@@ -269,3 +269,29 @@ fn documented_boundaries() {
     // ASCII collation (PG18 default-collation value: true).
     assert_eq!(scalar(&mut e, "SELECT ('a' < 'B')::text"), "false");
 }
+
+/// `x [NOT] LIKE/ILIKE ANY|ALL (ARRAY[...])` — quantified pattern match,
+/// desugared to an OR/AND chain of per-element LIKEs. Every value is
+/// live-PG18.4-verified, including the three-valued NULL case.
+#[test]
+fn like_any_all_quantified() {
+    check(&[
+        ("SELECT ('hello' LIKE ALL(ARRAY['h%', '%o']))::text", "true"),
+        ("SELECT ('hello' LIKE ALL(ARRAY['h%', 'x%']))::text", "false"),
+        ("SELECT ('hello' LIKE ANY(ARRAY['x%', '%o']))::text", "true"),
+        ("SELECT ('hello' LIKE ANY(ARRAY['x%', 'y%']))::text", "false"),
+        ("SELECT ('hello' NOT LIKE ANY(ARRAY['x%', 'y%']))::text", "true"),
+        // NOT LIKE ALL: false because 'hello' DOES match 'h%'.
+        ("SELECT ('hello' NOT LIKE ALL(ARRAY['h%', 'x%']))::text", "false"),
+        ("SELECT ('hello' NOT LIKE ALL(ARRAY['x%', 'y%']))::text", "true"),
+        // Case-insensitive quantified match.
+        ("SELECT ('HeLLo' ILIKE ANY(ARRAY['h%', 'z%']))::text", "true"),
+    ]);
+    // A NULL pattern under ANY yields SQL NULL (three-valued logic), not
+    // false — the OR desugar preserves it.
+    let mut e = Engine::new();
+    assert_eq!(
+        scalar(&mut e, "SELECT ('hello' LIKE ANY(ARRAY['x%', NULL]))::text"),
+        "<NULL>"
+    );
+}

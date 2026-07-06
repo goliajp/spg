@@ -13394,6 +13394,11 @@ impl Parser {
             }
             if matches!(self.peek(), Token::Like) {
                 self.advance();
+                // `x [NOT] LIKE ANY/ALL (ARRAY[...])` — quantified LIKE.
+                if let Some(q) = self.try_like_any_all(&expr, negated, false)? {
+                    expr = q;
+                    continue;
+                }
                 // Pattern at the same precedence as other comparison RHSes —
                 // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
                 let mut pattern = self.parse_expr(5)?;
@@ -13419,6 +13424,10 @@ impl Parser {
             // keyword reaches us as a plain identifier.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
                 self.advance();
+                if let Some(q) = self.try_like_any_all(&expr, negated, true)? {
+                    expr = q;
+                    continue;
+                }
                 let pattern = self.parse_expr(5)?;
                 expr = Expr::Like {
                     expr: Box::new(expr),
@@ -13848,6 +13857,66 @@ impl Parser {
             }
         }
         Ok(Expr::Literal(Literal::String(out)))
+    }
+
+    /// `x [NOT] LIKE ANY/ALL (ARRAY[p1, p2, …])` — quantified pattern
+    /// match. Desugars to an OR (ANY) / AND (ALL) chain of per-element
+    /// `x [NOT] LIKE pi`, which reproduces PG's three-valued semantics
+    /// exactly (a NULL pattern makes an element NULL; `false OR NULL` =
+    /// NULL, `true AND NULL` = NULL, …). ANY over an empty array is
+    /// FALSE, ALL over empty is TRUE. Returns `None` when the token after
+    /// LIKE is not `ANY(`/`ALL(`, so the caller falls back to a plain
+    /// pattern. Only a literal `ARRAY[...]` is accepted today — a runtime
+    /// array expression errors honestly rather than silently mismatching.
+    fn try_like_any_all(
+        &mut self,
+        base: &Expr,
+        negated: bool,
+        case_insensitive: bool,
+    ) -> Result<Option<Expr>, ParseError> {
+        let is_any = match self.peek() {
+            Token::All if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) => false,
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("any")
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
+            {
+                true
+            }
+            _ => return Ok(None),
+        };
+        self.advance(); // ANY / ALL
+        self.advance(); // '('
+        let arr = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' after LIKE {} argument, got {:?}",
+                if is_any { "ANY" } else { "ALL" },
+                self.peek()
+            )));
+        }
+        self.advance(); // ')'
+        let Expr::Array(items) = arr else {
+            return Err(self.err(
+                "LIKE ANY/ALL currently requires a literal ARRAY[...] of patterns".to_string(),
+            ));
+        };
+        let mut clauses = items.into_iter().map(|p| Expr::Like {
+            expr: Box::new(base.clone()),
+            pattern: Box::new(p),
+            negated,
+            case_insensitive,
+        });
+        let Some(first) = clauses.next() else {
+            // ANY(empty) = FALSE, ALL(empty) = TRUE.
+            return Ok(Some(Expr::Literal(Literal::Bool(!is_any))));
+        };
+        let op = if is_any { BinOp::Or } else { BinOp::And };
+        let combined = clauses.fold(first, |acc, c| Expr::Binary {
+            lhs: Box::new(acc),
+            op,
+            rhs: Box::new(c),
+        });
+        Ok(Some(combined))
     }
 
     /// `x BETWEEN low AND high`  →  `(x >= low) AND (x <= high)`, wrapped in
