@@ -12569,6 +12569,14 @@ fn apply_function_dispatch(
             // Normalize the input to (dollars: i64, cents: i64).
             let (dollars, cents, negative) = match &args[0] {
                 Value::Null => return Ok(Value::Null),
+                // v7.38 (read01 P6.33) — the money type is i64 cents; split
+                // into dollars + cents so `cash_words(x::money)` works (was
+                // rejected as an unknown type).
+                Value::Money(c) => {
+                    let neg = *c < 0;
+                    let abs = c.unsigned_abs();
+                    ((abs / 100) as i64, (abs % 100) as i64, neg)
+                }
                 Value::Int(n) => (i64::from(n.unsigned_abs()), 0, *n < 0),
                 Value::SmallInt(n) => (i64::from(n.unsigned_abs()), 0, *n < 0),
                 Value::BigInt(n) => (n.wrapping_abs(), 0, *n < 0),
