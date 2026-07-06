@@ -228,25 +228,37 @@ fn is_word_char(c: char) -> bool {
 }
 
 fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
-    let chars: Vec<char> = pat.chars().collect();
-    let mut p = 0;
-    // Leading inline option group `(?flags)` applies to the whole pattern. The
-    // only flag that changes matching in this engine is `i` (case-insensitive);
-    // the rest (m/s/n/x/…) are accepted and ignored. A `(?:…)` non-capturing
-    // group is NOT an option group (its `:` isn't a flag letter) — it is handled
-    // in re_parse_atom, so this leading-flag scan skips it.
+    let all: Vec<char> = pat.chars().collect();
+    // Leading inline option group `(?flags)` applies to the whole pattern. `i`
+    // (case-insensitive) and `x` (extended / whitespace-ignoring) change
+    // matching; the rest (m/s/n/…) are accepted and ignored. A `(?:…)`
+    // non-capturing group is NOT an option group (its `:` isn't a flag letter)
+    // — it is handled in re_parse_atom, so this leading-flag scan skips it.
     let mut fold = false;
-    if chars.len() >= 3 && chars[0] == '(' && chars[1] == '?' {
-        if let Some(close) = chars[2..].iter().position(|&c| c == ')') {
-            let flags = &chars[2..2 + close];
+    let mut extended = false;
+    let mut start = 0;
+    if all.len() >= 3 && all[0] == '(' && all[1] == '?' {
+        if let Some(close) = all[2..].iter().position(|&c| c == ')') {
+            let flags = &all[2..2 + close];
             if !flags.is_empty() && flags.iter().all(|c| "bceimnpqstwx".contains(*c)) {
                 fold = flags.contains(&'i');
-                p = 2 + close + 1;
+                extended = flags.contains(&'x');
+                start = 2 + close + 1;
             }
         }
     }
-    let mut n = re_parse_alt(&chars, &mut p, 0)?;
-    if p != chars.len() {
+    // v7.38 (read01 P6.11) — `x` extended mode: unescaped whitespace outside a
+    // character class is ignored and `#` starts a comment to end-of-line, so a
+    // pattern can be laid out readably. Previously `x` was silently dropped,
+    // which made a spaced-out pattern fail to match instead of matching.
+    let body: Vec<char> = if extended {
+        strip_regex_extended_whitespace(&all[start..])
+    } else {
+        all[start..].to_vec()
+    };
+    let mut p = 0;
+    let mut n = re_parse_alt(&body, &mut p, 0)?;
+    if p != body.len() {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("regex compile: trailing chars at pos {p} in {pat:?}"),
         });
@@ -255,6 +267,50 @@ fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
         fold_case(&mut n);
     }
     Ok(n)
+}
+
+/// v7.38 (read01 P6.11) — implement the regex `x` (extended) flag: drop
+/// unescaped whitespace and `#`-to-EOL comments, but keep whitespace that is
+/// escaped (`\ `) or inside a `[...]` character class, matching PG / POSIX ARE.
+fn strip_regex_extended_whitespace(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            // Escaped pair is literal — keep both characters verbatim.
+            out.push(c);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if in_class {
+            out.push(c);
+            if c == ']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                in_class = true;
+                out.push(c);
+            }
+            ' ' | '\t' | '\n' | '\r' | '\x0c' => {} // ignore unescaped whitespace
+            '#' => {
+                // Comment to end-of-line.
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn re_parse_alt(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, EvalError> {
