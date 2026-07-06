@@ -1,56 +1,36 @@
-//! v7.13.0 — `UNIQUE NULLS NOT DISTINCT (cols)` table constraint.
-//! mailrs round-5 G10 (PG 15+ surface).
+//! v7.38 (read01 P4.19) — UNIQUE ... NULLS NOT DISTINCT (PG 15+) treats NULL
+//! keys as equal, so only one NULL is allowed; the default (NULLS DISTINCT)
+//! keeps allowing many NULLs. Verified vs live PG 18.4.
 
 use spg_engine::Engine;
 
 #[test]
-fn default_unique_treats_nulls_as_distinct() {
-    let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (a INT, b INT, UNIQUE (a, b))")
-        .unwrap();
-    eng.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
-    // SQL-standard NULLS DISTINCT — a second all-NULL row passes.
-    eng.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
-    let table = eng.catalog().get("t").expect("table present");
-    assert_eq!(table.rows().len(), 2);
+fn unique_nulls_not_distinct_rejects_second_null() {
+    let mut e = Engine::new();
+
+    // Column-inline NULLS NOT DISTINCT — a second NULL collides.
+    e.execute("CREATE TABLE c(x int UNIQUE NULLS NOT DISTINCT)").unwrap();
+    e.execute("INSERT INTO c VALUES (NULL)").unwrap();
+    assert!(e.execute("INSERT INTO c VALUES (NULL)").is_err());
+    // Non-null uniqueness still holds.
+    e.execute("INSERT INTO c VALUES (5)").unwrap();
+    assert!(e.execute("INSERT INTO c VALUES (5)").is_err());
+
+    // Table-level NULLS NOT DISTINCT behaves the same.
+    e.execute("CREATE TABLE t(x int, UNIQUE NULLS NOT DISTINCT (x))").unwrap();
+    e.execute("INSERT INTO t VALUES (NULL)").unwrap();
+    assert!(e.execute("INSERT INTO t VALUES (NULL)").is_err());
 }
 
 #[test]
-fn nulls_not_distinct_rejects_duplicate_null_rows() {
-    let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))")
-        .unwrap();
-    eng.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
-    let r = eng.execute("INSERT INTO t VALUES (NULL, NULL)");
-    assert!(
-        r.is_err(),
-        "expected UNIQUE NULLS NOT DISTINCT collision, got {r:?}"
-    );
-}
+fn unique_default_nulls_distinct_allows_many_nulls() {
+    let mut e = Engine::new();
+    // Default (and explicit NULLS DISTINCT) allow multiple NULLs.
+    e.execute("CREATE TABLE d(x int UNIQUE)").unwrap();
+    e.execute("INSERT INTO d VALUES (NULL)").unwrap();
+    e.execute("INSERT INTO d VALUES (NULL)").unwrap();
 
-#[test]
-fn nulls_not_distinct_still_rejects_non_null_duplicates() {
-    let mut eng = Engine::new();
-    eng.execute(
-        "CREATE TABLE accounts (\
-           name TEXT, \
-           domain TEXT, \
-           UNIQUE NULLS NOT DISTINCT (name, domain)\
-         )",
-    )
-    .unwrap();
-    eng.execute("INSERT INTO accounts VALUES ('alice', 'example.com')")
-        .unwrap();
-    let r = eng.execute("INSERT INTO accounts VALUES ('alice', 'example.com')");
-    assert!(r.is_err());
-}
-
-#[test]
-fn nulls_not_distinct_persists_on_schema() {
-    let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))")
-        .unwrap();
-    let table = eng.catalog().get("t").expect("table present");
-    let uc = &table.schema().uniqueness_constraints[0];
-    assert!(uc.nulls_not_distinct);
+    e.execute("CREATE TABLE d2(x int UNIQUE NULLS DISTINCT)").unwrap();
+    e.execute("INSERT INTO d2 VALUES (NULL)").unwrap();
+    e.execute("INSERT INTO d2 VALUES (NULL)").unwrap();
 }

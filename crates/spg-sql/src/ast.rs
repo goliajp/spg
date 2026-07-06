@@ -1567,6 +1567,11 @@ pub struct ColumnDef {
     /// into a single-column `TableConstraint::Unique` so the
     /// engine path stays uniform with table-level UNIQUE.
     pub is_unique: bool,
+    /// v7.38 (read01 P4.19) — `UNIQUE NULLS NOT DISTINCT` (PG 15+) on the
+    /// inline column constraint: treat NULL keys as equal so only one NULL
+    /// is allowed. Ignored unless `is_unique`. Folded into the table-level
+    /// `TableConstraint::Unique { nulls_not_distinct }`.
+    pub unique_nulls_not_distinct: bool,
     /// v7.13.0 — inline `CHECK (<expr>)` column constraint
     /// (mailrs round-5 G3). Stored alongside the column so the
     /// CREATE TABLE handler can fold these into table-level
