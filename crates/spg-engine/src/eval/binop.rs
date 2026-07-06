@@ -2221,6 +2221,27 @@ fn normalize_multirange(kind: spg_storage::RangeKind, spans: &[spg_storage::Rang
     out
 }
 
+/// Normalize a multirange's member spans into PG-canonical form: drop
+/// empty, canonicalize each (discrete `(a` → `[a+1`, `b]` → `b+1)`),
+/// sort by lower bound, and merge overlapping/adjacent spans. This is
+/// what `multirange` constructors must store — `int4multirange(int4range
+/// (1,5), int4range(4,8))` is `{[1,8)}`, not two spans.
+pub(crate) fn normalize_multirange_spans(
+    kind: spg_storage::RangeKind,
+    spans: &[spg_storage::RangeSpan],
+) -> alloc::vec::Vec<spg_storage::RangeSpan> {
+    normalize_multirange(kind, spans)
+        .into_iter()
+        .map(|(lo, li, up, ui)| spg_storage::RangeSpan {
+            lower: lo.map(alloc::boxed::Box::new),
+            upper: up.map(alloc::boxed::Box::new),
+            lower_inc: li,
+            upper_inc: ui,
+            empty: false,
+        })
+        .collect()
+}
+
 /// Compare two already-canonicalised spans by lower then upper bound.
 fn canon_span_cmp(a: &CanonSpan, b: &CanonSpan) -> core::cmp::Ordering {
     lower_cmp(&a.0, a.1, &b.0, b.1).then_with(|| upper_cmp(&a.2, a.3, &b.2, b.3))
