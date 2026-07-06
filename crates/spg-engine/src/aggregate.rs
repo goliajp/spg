@@ -3119,6 +3119,12 @@ fn update_state(
         // (NULL becomes JSON null, per PG) in row order.
         AggKind::JsonAgg => {
             st.items.push(v.clone().into_owned());
+            // Attach the ORDER BY key so finalize_synth_rows sorts the
+            // elements (`json_agg(x ORDER BY x DESC)`), the same way
+            // string_agg / array_agg do.
+            if let Some(k) = order_keys {
+                st.item_keys.push(k);
+            }
             st.count += 1;
         }
         // v7.32 (round-29) — json_object_agg(key, value): keys in
