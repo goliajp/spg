@@ -5858,7 +5858,13 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     a gate-off database's rows are all frozen/alive, so
 ///     persisting + restoring their headers is observationally a
 ///     no-op.
-const FILE_VERSION: u8 = 53;
+/// v7.38 (read01 P5.05) — v54 appends a CRC32C over the whole preceding
+/// image so a corrupted `base.spg` is caught on load instead of silently
+/// deserialising garbage. Older images (v8..=53) carry no trailer and load
+/// unchanged.
+const FILE_VERSION: u8 = 54;
+/// First version that appends the trailing CRC32C integrity trailer.
+const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6603,6 +6609,11 @@ impl Catalog {
                 write_data_type(&mut out, *fty);
             }
         }
+        // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
+        // corrupted snapshot is rejected on load. FILE_VERSION is >= the
+        // trailer version, so this always runs for freshly-written images.
+        let crc = spg_crypto::crc32c::crc32c(&out);
+        write_u32(&mut out, crc);
         out
     }
 
@@ -6869,6 +6880,19 @@ impl Catalog {
                 }
                 cat.composite_types
                     .insert(name.clone(), CompositeDef { name, fields });
+            }
+        }
+        // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
+        // preceding byte; verify it before accepting the snapshot. Older
+        // images have no trailer and fall through to the trailing-byte check.
+        if version >= FILE_VERSION_CRC_TRAILER {
+            let crc_start = cur.pos;
+            let stored = cur.read_u32()?;
+            let computed = spg_crypto::crc32c::crc32c(&buf[..crc_start]);
+            if computed != stored {
+                return Err(StorageError::Corrupt(format!(
+                    "base snapshot CRC mismatch: computed {computed:#010x}, stored {stored:#010x}"
+                )));
             }
         }
         if cur.pos < buf.len() {
