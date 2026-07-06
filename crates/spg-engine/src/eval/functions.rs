@@ -4608,8 +4608,19 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Int(n) => Ok(Value::Int(n.wrapping_abs())),
-                Value::BigInt(n) => Ok(Value::BigInt(n.wrapping_abs())),
+                // v7.38 (read01 P4.18) — abs(INT_MIN) has no representable
+                // result; error like PG ("out of range") instead of wrapping
+                // back to the negative INT_MIN.
+                Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: "integer out of range".into(),
+                    }
+                }),
+                Value::BigInt(n) => n.checked_abs().map(Value::BigInt).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: "bigint out of range".into(),
+                    }
+                }),
                 Value::Float(x) => Ok(Value::Float(x.abs())),
                 // PG `abs(numeric)` returns numeric — preserve the type
                 // and scale, negating only the sign of the mantissa.
