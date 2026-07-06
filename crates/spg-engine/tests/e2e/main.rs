@@ -552,6 +552,7 @@ mod e2e_table_shorthand_collate;
 mod e2e_tablesample;
 mod e2e_unnest_multi;
 mod e2e_update_from_delete_using;
+mod e2e_update_uniqueness;
 mod e2e_update_set_forms;
 mod e2e_with_ordinality;
 mod e2e_writable_cte;

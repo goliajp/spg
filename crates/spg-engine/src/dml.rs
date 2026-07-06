@@ -88,7 +88,8 @@ use crate::{
     CancelToken, Engine, EngineError, QueryResult, any_column_changed, apply_fk_child_step,
     apply_on_conflict_assignments, canonicalize_set_value, check_unsigned_range, coerce_value,
     enforce_check_constraints, enforce_enum_label, enforce_fk_inserts,
-    enforce_unique_index_inserts, enforce_uniqueness_inserts, eval, eval_runtime_default_free,
+    enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
+    eval_runtime_default_free,
     expr_has_subquery, literal_expr_to_value, lookup_row_position_by_keys, on_conflict_keys_exist,
     plan_fk_parent_deletions, plan_fk_parent_updates, resolve_column_default_free,
     resolve_on_conflict_columns, triggers, try_index_seek_positions, try_pk_predicate,
@@ -465,6 +466,21 @@ impl Engine {
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
             enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows)?;
+        }
+        // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
+        // enforcement on UPDATE. The pre-image of each updated row is
+        // excluded from the existing-key set (see enforce_unique_updates),
+        // and only keys whose columns actually changed are scanned.
+        {
+            let mut changed_cols: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+            for (_pos, old_vals, new_vals) in &plan_with_old {
+                for (i, (o, n)) in old_vals.iter().zip(new_vals.iter()).enumerate() {
+                    if o != n {
+                        changed_cols.insert(i);
+                    }
+                }
+            }
+            enforce_unique_updates(self.active_catalog(), &stmt.table, &planned, &changed_cols)?;
         }
         // v7.6.6 — Stage 2b: inbound FK check. For every row that
         // changed value in a column that *some other table* uses as
