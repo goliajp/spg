@@ -165,3 +165,56 @@ fn set_validates_known_typed_gucs() {
     e.execute("SET some_random_guc='whatever'").unwrap();
     e.execute("SET application_name='x'").unwrap();
 }
+
+#[test]
+fn pg_settings_has_full_17_column_shape() {
+    // v7.38 (read01 P3.22) — pg_settings exposes PG 18's 17 columns with
+    // accurate context / vartype / source, so admin tools can filter on
+    // them. Verified vs live PG 18.4.
+    let mut e = Engine::new();
+    let cols = match e.execute("SELECT * FROM pg_settings").unwrap() {
+        QueryResult::Rows { columns, .. } => {
+            columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        }
+        _ => panic!(),
+    };
+    assert_eq!(
+        cols,
+        vec![
+            "name", "setting", "unit", "category", "short_desc", "extra_desc",
+            "context", "vartype", "source", "min_val", "max_val", "enumvals",
+            "boot_val", "reset_val", "sourcefile", "sourceline", "pending_restart",
+        ]
+    );
+    // vartype is annotated (work_mem is integer even though shown as "4MB").
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT vartype FROM pg_settings WHERE name = 'work_mem'"
+        )),
+        "integer"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT context FROM pg_settings WHERE name = 'max_connections'"
+        )),
+        "postmaster"
+    );
+    // A SET marks the row source = session while boot_val stays put.
+    e.execute("SET work_mem = '64MB'").unwrap();
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT source FROM pg_settings WHERE name = 'work_mem'"
+        )),
+        "session"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT boot_val FROM pg_settings WHERE name = 'work_mem'"
+        )),
+        "4MB"
+    );
+}

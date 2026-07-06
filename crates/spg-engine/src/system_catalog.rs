@@ -3287,80 +3287,136 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
 /// SPG surfaces every session_param + a small set of canonical PG
 /// defaults so the pre-flight queries match.
 pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.38 (read01 P3.22) — PG 18's full 17-column pg_settings shape so
+    // admin tools that filter on context / vartype / source (pgAdmin's
+    // parameter editor, postgres_exporter) get the columns they expect.
     let schema = alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("setting", DataType::Text, false),
+        ColumnSchema::new("unit", DataType::Text, true),
         ColumnSchema::new("category", DataType::Text, false),
+        ColumnSchema::new("short_desc", DataType::Text, true),
+        ColumnSchema::new("extra_desc", DataType::Text, true),
+        ColumnSchema::new("context", DataType::Text, false),
+        ColumnSchema::new("vartype", DataType::Text, false),
+        ColumnSchema::new("source", DataType::Text, false),
+        ColumnSchema::new("min_val", DataType::Text, true),
+        ColumnSchema::new("max_val", DataType::Text, true),
+        ColumnSchema::new("enumvals", DataType::Text, true),
+        ColumnSchema::new("boot_val", DataType::Text, true),
+        ColumnSchema::new("reset_val", DataType::Text, true),
+        ColumnSchema::new("sourcefile", DataType::Text, true),
+        ColumnSchema::new("sourceline", DataType::Int, true),
+        ColumnSchema::new("pending_restart", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    // Canonical defaults every admin tool expects to find.
-    let defaults: &[(&str, &str, &str)] = &[
-        ("server_version", "18.4 (spg)", "Preset Options"),
-        ("server_version_num", "180004", "Preset Options"),
-        ("server_encoding", "UTF8", "Client Connection Defaults"),
-        ("client_encoding", "UTF8", "Client Connection Defaults"),
-        ("DateStyle", "ISO, MDY", "Client Connection Defaults"),
-        ("TimeZone", "UTC", "Client Connection Defaults"),
-        ("IntervalStyle", "postgres", "Client Connection Defaults"),
-        ("standard_conforming_strings", "on", "Compatibility"),
-        ("integer_datetimes", "on", "Compatibility"),
-        ("max_connections", "100", "Connections and Authentication"),
-        // v7.37.17 (17.6 siblings) — parity with the SHOW <param>
-        // PG-default fallbacks so `SELECT setting FROM pg_settings
-        // WHERE name = 'lock_timeout'` and `SHOW lock_timeout`
-        // return the same value (matches PG semantics + keeps
-        // pgpool / pgbouncer / postgres_exporter probes happy).
-        ("lock_timeout", "0", "Client Connection Defaults"),
-        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults"),
-        ("transaction_timeout", "0", "Client Connection Defaults"),
-        ("statement_timeout", "0", "Client Connection Defaults"),
-        ("client_min_messages", "notice", "Client Connection Defaults"),
-        ("default_tablespace", "", "Client Connection Defaults"),
-        ("default_table_access_method", "heap", "Client Connection Defaults"),
-        ("row_security", "on", "Client Connection Defaults"),
-        ("check_function_bodies", "on", "Client Connection Defaults"),
-        ("xmloption", "content", "Client Connection Defaults"),
-        ("work_mem", "4MB", "Resource Usage / Memory"),
-        ("maintenance_work_mem", "64MB", "Resource Usage / Memory"),
-        ("shared_buffers", "128MB", "Resource Usage / Memory"),
-        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants"),
-        ("search_path", "\"$user\", public", "Client Connection Defaults"),
-        ("application_name", "", "Reporting and Logging"),
-        ("default_transaction_isolation", "read committed", "Client Connection Defaults"),
+    // Canonical defaults: (name, boot_val, category, vartype, context).
+    // vartype is annotated (not inferred) because SPG stores memory /
+    // duration settings in human form ("4MB") where inference would read
+    // "string" — PG classifies work_mem as integer.
+    let defaults: &[(&str, &str, &str, &str, &str)] = &[
+        ("server_version", "18.4 (spg)", "Preset Options", "string", "internal"),
+        ("server_version_num", "180004", "Preset Options", "integer", "internal"),
+        ("server_encoding", "UTF8", "Client Connection Defaults", "string", "internal"),
+        ("client_encoding", "UTF8", "Client Connection Defaults", "string", "user"),
+        ("DateStyle", "ISO, MDY", "Client Connection Defaults", "string", "user"),
+        ("TimeZone", "UTC", "Client Connection Defaults", "string", "user"),
+        ("IntervalStyle", "postgres", "Client Connection Defaults", "enum", "user"),
+        ("standard_conforming_strings", "on", "Compatibility", "bool", "user"),
+        ("integer_datetimes", "on", "Compatibility", "bool", "internal"),
+        ("max_connections", "100", "Connections and Authentication", "integer", "postmaster"),
+        ("lock_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("transaction_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("statement_timeout", "0", "Client Connection Defaults", "integer", "user"),
+        ("client_min_messages", "notice", "Client Connection Defaults", "enum", "user"),
+        ("default_tablespace", "", "Client Connection Defaults", "string", "user"),
+        ("default_table_access_method", "heap", "Client Connection Defaults", "string", "user"),
+        ("row_security", "on", "Client Connection Defaults", "bool", "user"),
+        ("check_function_bodies", "on", "Client Connection Defaults", "bool", "user"),
+        ("xmloption", "content", "Client Connection Defaults", "enum", "user"),
+        ("work_mem", "4MB", "Resource Usage / Memory", "integer", "user"),
+        ("maintenance_work_mem", "64MB", "Resource Usage / Memory", "integer", "user"),
+        ("shared_buffers", "128MB", "Resource Usage / Memory", "integer", "postmaster"),
+        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants", "integer", "user"),
+        ("search_path", "\"$user\", public", "Client Connection Defaults", "string", "user"),
+        ("application_name", "", "Reporting and Logging", "string", "user"),
+        ("default_transaction_isolation", "read committed", "Client Connection Defaults", "enum", "user"),
     ];
-    // v7.37.17 (17.6 siblings) — pg_settings row shape now honors
-    // session-set overrides on the default row itself (not just as
-    // extra rows), so `SELECT setting FROM pg_settings WHERE name =
-    // 'lock_timeout'` returns whatever the session most recently
-    // SET. Matches PG semantics.
-    for &(name, val, cat) in defaults {
-        let effective = engine
+    // Build a full 17-column row. `setting` honours session overrides;
+    // `source` reflects whether the value came from a SET; `boot_val` /
+    // `reset_val` stay at the compiled-in default.
+    let mut push = |name: &str, boot: &str, cat: &str, vartype: &str, context: &str| {
+        let overridden = engine
             .session_params
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| val.into());
+            .map(|(_, v)| v.clone());
+        let source = if overridden.is_some() { "session" } else { "default" };
+        let setting = overridden.unwrap_or_else(|| boot.into());
         rows.push(Row::new(alloc::vec![
             Value::text::<String>(name.into()),
-            Value::text(effective),
+            Value::text(setting),
+            Value::Null,                              // unit (setting is self-describing)
             Value::text::<String>(cat.into()),
+            Value::Null,                              // short_desc
+            Value::Null,                              // extra_desc
+            Value::text::<String>(context.into()),
+            Value::text::<String>(vartype.into()),
+            Value::text::<String>(source.into()),
+            Value::Null,                              // min_val
+            Value::Null,                              // max_val
+            Value::Null,                              // enumvals
+            Value::text::<String>(boot.into()),
+            Value::text::<String>(boot.into()),       // reset_val = boot_val
+            Value::Null,                              // sourcefile
+            Value::Null,                              // sourceline
+            Value::Bool(false),                       // pending_restart
+        ]));
+    };
+    for &(name, val, cat, vartype, context) in defaults {
+        push(name, val, cat, vartype, context);
+    }
+    // Session-set params not in the canonical list get their own rows;
+    // vartype is inferred from the value and source is always "session".
+    for (k, v) in &engine.session_params {
+        if defaults.iter().any(|(n, ..)| (*n).eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        let vartype = infer_guc_vartype(v);
+        rows.push(Row::new(alloc::vec![
+            Value::text(k.clone()),
+            Value::text(v.clone()),
+            Value::Null,
+            Value::text::<String>("Session".into()),
+            Value::Null,
+            Value::Null,
+            Value::text::<String>("user".into()),
+            Value::text::<String>(vartype.into()),
+            Value::text::<String>("session".into()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text(v.clone()),
+            Value::text(v.clone()),
+            Value::Null,
+            Value::Null,
+            Value::Bool(false),
         ]));
     }
-    // Session-set params NOT in the canonical defaults get their
-    // own rows under the Session category.
-    for (k, v) in &engine.session_params {
-        if !defaults
-            .iter()
-            .any(|(n, _, _)| (*n).eq_ignore_ascii_case(k))
-        {
-            rows.push(Row::new(alloc::vec![
-                Value::text(k.clone()),
-                Value::text(v.clone()),
-                Value::text::<String>("Session".into()),
-            ]));
-        }
-    }
     (schema, rows)
+}
+
+/// v7.38 (read01 P3.22) — best-effort `vartype` for a session GUC whose
+/// type SPG doesn't track: bool for on/off/true/false, integer/real for
+/// numeric text, string otherwise. Annotated defaults bypass this.
+fn infer_guc_vartype(v: &str) -> &'static str {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "on" | "off" | "true" | "false" => "bool",
+        s if s.parse::<i64>().is_ok() => "integer",
+        s if s.parse::<f64>().is_ok() => "real",
+        _ => "string",
+    }
 }
 
 /// v7.17.0 Phase 3.P0-53 — synthesise `pg_catalog.pg_indexes`.
