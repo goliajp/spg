@@ -152,6 +152,10 @@ pub struct EvalContext<'a> {
     /// PRNG, so their output isn't predictable. `None` (no host CSPRNG)
     /// falls back to the PRNG — fine for the non-cryptographic `random()`.
     pub salt_fn: Option<crate::SaltFn>,
+    /// v7.38 (read01 P6.08) — host wall clock (µs since Unix epoch). `uuidv7`
+    /// uses it for the real time-ordered 48-bit millisecond prefix; `None`
+    /// (no host clock) falls back to the deterministic anchor.
+    pub clock: Option<crate::ClockFn>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -185,6 +189,7 @@ impl<'a> EvalContext<'a> {
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
             salt_fn: None,
+            clock: None,
         }
     }
 
@@ -193,6 +198,14 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_salt_fn(mut self, f: Option<crate::SaltFn>) -> Self {
         self.salt_fn = f;
+        self
+    }
+
+    /// v7.38 (read01 P6.08) — attach the host wall clock so `uuidv7` gets a
+    /// real time-ordered prefix instead of the deterministic anchor.
+    #[must_use]
+    pub const fn with_clock(mut self, f: Option<crate::ClockFn>) -> Self {
+        self.clock = f;
         self
     }
 
