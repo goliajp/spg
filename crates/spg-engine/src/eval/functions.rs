@@ -4643,16 +4643,21 @@ fn apply_function_dispatch(
             }
             // stride: Interval (months=0 or reject — PG rejects
             // month-strides because months aren't a fixed length).
-            let stride_us: i64 = match &args[0] {
-                Value::Interval { months, days, micros } => {
-                    if *months != 0 {
+            // PG coerces an unadorned interval string ('15 minutes') to
+            // interval for the stride argument, so accept both a real
+            // Interval value and a Text literal.
+            let (stride_months, stride_days, stride_micros) = match &args[0] {
+                Value::Interval { months, days, micros } => (*months, *days, *micros),
+                Value::Text(s) => match spg_sql::parser::parse_interval_text(s) {
+                    Some(parts) => parts,
+                    None => {
                         return Err(EvalError::TypeMismatch {
-                            detail: "date_bin(): stride with months not supported".into(),
+                            detail: alloc::format!(
+                                "date_bin(): cannot parse stride interval {s:?}"
+                            ),
                         });
                     }
-                    const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
-                    i64::from(*days) * DAY_US + micros
-                }
+                },
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -4662,6 +4667,13 @@ fn apply_function_dispatch(
                     });
                 }
             };
+            if stride_months != 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "date_bin(): stride with months not supported".into(),
+                });
+            }
+            const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+            let stride_us: i64 = i64::from(stride_days) * DAY_US + stride_micros;
             if stride_us <= 0 {
                 return Err(EvalError::TypeMismatch {
                     detail: "date_bin(): stride must be positive".into(),
