@@ -780,6 +780,31 @@ impl Engine {
             // reads `default_text_search_config`. Everything else
             // is a recorded no-op (PG dump compat).
             Statement::SetParameter { name, value } => {
+                // v7.38 (read01) — SPG serves the wire as UTF8, so a
+                // non-UTF8 client_encoding can't be honoured (the bytes
+                // stay UTF8). Reject it rather than silently store a value
+                // that would mislabel the stream; an unusable name is
+                // rejected the way PG rejects an invalid one.
+                if name.eq_ignore_ascii_case("client_encoding") {
+                    let v: &str = match &value {
+                        spg_sql::ast::SetValue::String(s)
+                        | spg_sql::ast::SetValue::Ident(s)
+                        | spg_sql::ast::SetValue::Number(s) => s.as_str(),
+                        spg_sql::ast::SetValue::Default => "UTF8",
+                    };
+                    let norm: alloc::string::String = v
+                        .trim()
+                        .to_ascii_uppercase()
+                        .chars()
+                        .filter(|c| *c != '-' && *c != '_')
+                        .collect();
+                    if !matches!(norm.as_str(), "UTF8" | "UNICODE") {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "invalid value for parameter \"client_encoding\": \"{v}\" \
+                             (SPG serves UTF8 only)"
+                        )));
+                    }
+                }
                 self.set_session_param(name, value);
                 Ok(QueryResult::CommandOk {
                     affected: 0,
