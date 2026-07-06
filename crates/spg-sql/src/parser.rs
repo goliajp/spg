@@ -14214,6 +14214,236 @@ impl Parser {
     /// to FALSE (TRUE under NOT IN), matching standard SQL semantics.
     /// v4.11: parse `WITH name AS (SELECT ...) [, ...] SELECT ...`.
     /// Caller already consumed the leading `WITH` ident.
+    /// v7.38 (read01 U16) — desugar a CTE's SEARCH / CYCLE clause into
+    /// extra body columns, mirroring PG's `rewriteSearchAndCycle`. Runs
+    /// right after parse so the engine sees a plain recursive CTE with the
+    /// tracking columns already projected. DEPTH FIRST and CYCLE are
+    /// supported; BREADTH FIRST needs numeric-composite ordering SPG's
+    /// text-rendered rows can't provide, and errors honestly.
+    fn desugar_cte_search_cycle(&self, cte: &mut crate::ast::Cte) -> Result<(), ParseError> {
+        use crate::ast::{BinOp, ColumnName, CteBody, Expr, Literal, SelectItem, UnOp};
+        if cte.search.is_none() && cte.cycle.is_none() {
+            return Ok(());
+        }
+        let cte_name = cte.name.clone();
+        let col_names = cte.column_overrides.clone();
+        if col_names.is_empty() {
+            return Err(self.err(
+                "SEARCH / CYCLE requires an explicit WITH name(cols) column list".into(),
+            ));
+        }
+        let search = cte.search.take();
+        let cycle = cte.cycle.take();
+        let mut extra_cols: Vec<String> = Vec::new();
+        let col_ref = |name: &str| {
+            Expr::Column(ColumnName {
+                qualifier: Some(cte_name.clone()),
+                name: name.to_string(),
+            })
+        };
+        // Position of a SEARCH/CYCLE column within the CTE's column list.
+        let pos_of = |name: &str| -> Result<usize, ParseError> {
+            col_names
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    self.err(format!("SEARCH/CYCLE column {name:?} is not a CTE column"))
+                })
+        };
+        let row_of = |items: &[SelectItem], positions: &[usize]| -> Result<Expr, ParseError> {
+            let mut args = Vec::with_capacity(positions.len());
+            for &p in positions {
+                match items.get(p) {
+                    Some(SelectItem::Expr { expr, .. }) => args.push(expr.clone()),
+                    _ => {
+                        return Err(self.err(
+                            "SEARCH/CYCLE column maps to a non-expression select item".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(Expr::FunctionCall { name: "row".into(), args })
+        };
+        let CteBody::Select(body) = &mut cte.body else {
+            return Err(self.err("SEARCH / CYCLE requires a SELECT CTE body".into()));
+        };
+        if body.unions.is_empty() {
+            return Err(self.err("SEARCH / CYCLE requires a recursive (UNION) CTE".into()));
+        }
+        let rec = body.unions.len() - 1; // recursive term = last UNION peer
+
+        if search.is_some() {
+            // SEARCH's SET column is meant to be ORDER BY'd, which needs a
+            // typed composite / array comparison (PG's `record[]`). SPG
+            // renders a row as text, so ordering it compares
+            // lexicographically and diverges from PG for multi-digit or
+            // multi-value keys (`(10)` sorts before `(2)`). Rather than
+            // return a silently-wrong order, error honestly. CYCLE below is
+            // equality-based and unaffected.
+            return Err(self.err(
+                "SEARCH DEPTH/BREADTH FIRST needs typed row ordering SPG doesn't have yet \
+                 (rows render as text, which mis-orders multi-digit keys); CYCLE is supported"
+                    .into(),
+            ));
+        }
+
+        if let Some(cyc) = cycle {
+            let positions: Vec<usize> = cyc
+                .columns
+                .iter()
+                .map(|c| pos_of(c))
+                .collect::<Result<_, _>>()?;
+            let base_row = row_of(&body.items, &positions)?;
+            let rec_row = row_of(&body.unions[rec].1.items, &positions)?;
+            let mark = cyc.mark_value.clone().unwrap_or(Literal::Bool(true));
+            let dflt = cyc.default_value.clone().unwrap_or(Literal::Bool(false));
+            // base: <default> AS mark, ARRAY[ROW(cols)] AS path.
+            body.items.push(SelectItem::Expr {
+                expr: Expr::Literal(dflt.clone()),
+                alias: Some(cyc.mark_column.clone()),
+            });
+            body.items.push(SelectItem::Expr {
+                expr: Expr::Array(alloc::vec![base_row]),
+                alias: Some(cyc.path_column.clone()),
+            });
+            // rec mark: ROW(cols) already in the path → cycle.
+            let hit = Expr::AnyAll {
+                expr: Box::new(rec_row.clone()),
+                op: BinOp::Eq,
+                array: Box::new(col_ref(&cyc.path_column)),
+                is_any: true,
+            };
+            let mark_expr = if cyc.mark_value.is_some() || cyc.default_value.is_some() {
+                Expr::Case {
+                    operand: None,
+                    branches: alloc::vec![(hit, Expr::Literal(mark))],
+                    else_branch: Some(Box::new(Expr::Literal(dflt))),
+                }
+            } else {
+                hit
+            };
+            body.unions[rec].1.items.push(SelectItem::Expr {
+                expr: mark_expr,
+                alias: Some(cyc.mark_column.clone()),
+            });
+            // rec path: array_append(cte.path, ROW(cols)).
+            body.unions[rec].1.items.push(SelectItem::Expr {
+                expr: Expr::FunctionCall {
+                    name: "array_append".into(),
+                    args: alloc::vec![col_ref(&cyc.path_column), rec_row],
+                },
+                alias: Some(cyc.path_column.clone()),
+            });
+            // rec WHERE: AND NOT cte.mark — stop expanding a cycled row.
+            let stop = Expr::Unary {
+                op: UnOp::Not,
+                expr: Box::new(col_ref(&cyc.mark_column)),
+            };
+            let w = &mut body.unions[rec].1.where_;
+            *w = Some(match w.take() {
+                Some(prev) => Expr::Binary {
+                    lhs: Box::new(prev),
+                    op: BinOp::And,
+                    rhs: Box::new(stop),
+                },
+                None => stop,
+            });
+            extra_cols.push(cyc.mark_column);
+            extra_cols.push(cyc.path_column);
+        }
+        cte.column_overrides.extend(extra_cols);
+        Ok(())
+    }
+
+    /// v7.38 (read01 U16) — `SEARCH { DEPTH | BREADTH } FIRST BY col [,
+    /// col…] SET seqcol`. Returns None when the next token isn't SEARCH.
+    fn parse_cte_search_clause(&mut self) -> Result<Option<crate::ast::SearchClause>, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("search")) {
+            return Ok(None);
+        }
+        self.advance(); // SEARCH
+        let depth_first = match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("depth") => true,
+            Token::Ident(s) if s.eq_ignore_ascii_case("breadth") => false,
+            other => {
+                return Err(self.err(format!("expected DEPTH or BREADTH after SEARCH, got {other:?}")));
+            }
+        };
+        self.advance();
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("first")) {
+            return Err(self.err(format!("expected FIRST after SEARCH mode, got {:?}", self.peek())));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::By) {
+            return Err(self.err(format!("expected BY after SEARCH … FIRST, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut by_columns = alloc::vec![self.expect_ident_like()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            by_columns.push(self.expect_ident_like()?);
+        }
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("set")) {
+            return Err(self.err(format!("expected SET in SEARCH clause, got {:?}", self.peek())));
+        }
+        self.advance();
+        let set_column = self.expect_ident_like()?;
+        Ok(Some(crate::ast::SearchClause { depth_first, by_columns, set_column }))
+    }
+
+    /// v7.38 (read01 U16) — `CYCLE col [, col…] SET markcol [TO v DEFAULT w]
+    /// USING pathcol`. Returns None when the next token isn't CYCLE.
+    fn parse_cte_cycle_clause(&mut self) -> Result<Option<crate::ast::CycleClause>, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("cycle")) {
+            return Ok(None);
+        }
+        self.advance(); // CYCLE
+        let mut columns = alloc::vec![self.expect_ident_like()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            columns.push(self.expect_ident_like()?);
+        }
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("set")) {
+            return Err(self.err(format!("expected SET in CYCLE clause, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mark_column = self.expect_ident_like()?;
+        let mut mark_value = None;
+        let mut default_value = None;
+        if matches!(self.peek(), Token::To) {
+            self.advance();
+            mark_value = Some(self.parse_cycle_literal()?);
+            if !matches!(self.peek(), Token::Default) {
+                return Err(self.err(format!("expected DEFAULT after CYCLE … TO, got {:?}", self.peek())));
+            }
+            self.advance();
+            default_value = Some(self.parse_cycle_literal()?);
+        }
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            return Err(self.err(format!("expected USING in CYCLE clause, got {:?}", self.peek())));
+        }
+        self.advance();
+        let path_column = self.expect_ident_like()?;
+        Ok(Some(crate::ast::CycleClause {
+            columns,
+            mark_column,
+            mark_value,
+            default_value,
+            path_column,
+        }))
+    }
+
+    /// The mark / default value in a CYCLE `TO v DEFAULT w` — a bare
+    /// literal (string / bool / number) in PG.
+    fn parse_cycle_literal(&mut self) -> Result<crate::ast::Literal, ParseError> {
+        match self.parse_expr(0)? {
+            Expr::Literal(l) => Ok(l),
+            other => Err(self.err(format!(
+                "CYCLE mark/default value must be a literal, got {other:?}"
+            ))),
+        }
+    }
+
     fn parse_with_cte_then_select(&mut self) -> Result<Statement, ParseError> {
         // v4.22: WITH RECURSIVE — optional keyword right after WITH.
         // Comes through as an identifier; consume it if present and
@@ -14359,12 +14589,20 @@ impl Parser {
                 )));
             }
             self.advance();
-            ctes.push(crate::ast::Cte {
+            // v7.38 (read01 U16) — optional SEARCH / CYCLE on a recursive
+            // CTE, desugared into extra body columns by the engine.
+            let search = self.parse_cte_search_clause()?;
+            let cycle = self.parse_cte_cycle_clause()?;
+            let mut cte = crate::ast::Cte {
                 name,
                 body,
                 recursive,
                 column_overrides,
-            });
+                search,
+                cycle,
+            };
+            self.desugar_cte_search_cycle(&mut cte)?;
+            ctes.push(cte);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;

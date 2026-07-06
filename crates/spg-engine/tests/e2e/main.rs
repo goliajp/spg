@@ -135,6 +135,7 @@ mod e2e_derived_table;
 mod e2e_from_values;
 mod e2e_bare_values;
 mod e2e_intersect_except;
+mod e2e_cte_cycle;
 mod e2e_cte_values_materialized;
 mod e2e_distinct_on;
 mod e2e_rollup;

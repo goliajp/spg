@@ -2303,6 +2303,41 @@ pub struct Cte {
     /// position-by-position; the engine errors out if the count
     /// doesn't match the body's projection width.
     pub column_overrides: Vec<String>,
+    /// v7.38 (read01 U16) — `SEARCH { DEPTH | BREADTH } FIRST BY cols
+    /// SET seqcol` on a recursive CTE. Desugared at parse time into an
+    /// extra ordering column on the body (see `rewrite_search_and_cycle`).
+    pub search: Option<SearchClause>,
+    /// v7.38 (read01 U16) — `CYCLE cols SET markcol [TO v DEFAULT w]
+    /// USING pathcol` cycle detection, desugared at parse time.
+    pub cycle: Option<CycleClause>,
+}
+
+/// v7.38 (read01 U16) — parsed `SEARCH … FIRST BY … SET …` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchClause {
+    /// `true` = DEPTH FIRST, `false` = BREADTH FIRST.
+    pub depth_first: bool,
+    /// The CTE output columns the search orders by.
+    pub by_columns: Vec<String>,
+    /// The new column holding the ordering key (a row-array for depth,
+    /// a `(depth, keys…)` row for breadth).
+    pub set_column: String,
+}
+
+/// v7.38 (read01 U16) — parsed `CYCLE … SET … [TO … DEFAULT …] USING …`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleClause {
+    /// Columns whose repetition along a path marks a cycle.
+    pub columns: Vec<String>,
+    /// The new boolean-ish column set to `mark_value` on a cycle.
+    pub mark_column: String,
+    /// Value written to `mark_column` when a cycle is detected (default
+    /// `true`); `default_value` otherwise. PG allows any type; SPG carries
+    /// them as literals.
+    pub mark_value: Option<Literal>,
+    pub default_value: Option<Literal>,
+    /// The new column accumulating the visited-row path array.
+    pub path_column: String,
 }
 
 /// v7.37.43-T4.4 — CTE body. Read-only (Select) or data-modifying

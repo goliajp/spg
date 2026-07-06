@@ -820,6 +820,8 @@ impl Engine {
                     body: spg_sql::ast::CteBody::Select(body_select.clone()),
                     recursive: true,
                     column_overrides: cte.column_overrides.clone(),
+                    search: None,
+                    cycle: None,
                 };
                 self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
             } else {
@@ -905,6 +907,8 @@ impl Engine {
                         body: spg_sql::ast::CteBody::Select(body.clone()),
                         recursive: true,
                         column_overrides: cte.column_overrides.clone(),
+                    search: None,
+                    cycle: None,
                     };
                     self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
                 }
@@ -4751,6 +4755,16 @@ pub(crate) fn infer_column_types(
                     dim: 0,
                     encoding: VecEncoding::F32,
                 },
+                // v7.38 (read01 U16) — carry array values through with an
+                // array type so a recursive CTE that projects an array
+                // (e.g. a SEARCH/CYCLE ord / path column) types the working
+                // column as an array, not Text.
+                Value::TextArray(_) => DataType::TextArray,
+                Value::IntArray(_) => DataType::IntArray,
+                Value::BigIntArray(_) => DataType::BigIntArray,
+                Value::SmallIntArray(_) => DataType::SmallIntArray,
+                Value::FloatArray(_) => DataType::FloatArray,
+                Value::BoolArray(_) => DataType::BoolArray,
                 _ => DataType::Text,
             };
             all_null = false;
@@ -5258,6 +5272,8 @@ impl Engine {
                 body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: view.columns.clone(),
+                    search: None,
+                    cycle: None,
             });
         }
         let mut out = stmt.clone();
@@ -5323,6 +5339,8 @@ impl Engine {
                 body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: Vec::new(),
+                    search: None,
+                    cycle: None,
             });
             expanded_parents.push(parent_name.clone());
         }
