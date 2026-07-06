@@ -138,6 +138,14 @@ pub struct EvalContext<'a> {
     /// `random()` PRNG, so it's deterministic and rescan-stable). `None`
     /// here means no sampler is attached.
     pub sample_rng: Option<&'a core::cell::Cell<Option<u64>>>,
+    /// v7.38 (read01 P3.25) — native-stack-overflow guard. Lazily seeded
+    /// with the stack pointer of the outermost `eval_expr` call; deeper
+    /// calls compare their own pointer against it and bail with
+    /// [`EvalError::StackDepthExceeded`] once usage crosses a safe margin,
+    /// so a pathologically nested expression errors instead of aborting the
+    /// process. Owned (not a borrowed cell) so it stays stack-local and
+    /// never touches `Engine`'s `Sync` bound.
+    pub recursion_base: core::cell::Cell<usize>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -169,6 +177,7 @@ impl<'a> EvalContext<'a> {
             catalog: None,
             session_gucs: None,
             sample_rng: None,
+            recursion_base: core::cell::Cell::new(0),
         }
     }
 
@@ -249,6 +258,10 @@ pub enum EvalError {
         n: u16,
         bound: u16,
     },
+    /// v7.38 (read01 P3.25) — the expression tree recursed deep enough to
+    /// threaten a native stack overflow; we bail out with an error the way
+    /// PG's `check_stack_depth()` does instead of aborting the process.
+    StackDepthExceeded,
 }
 
 impl core::fmt::Display for EvalError {
@@ -264,8 +277,25 @@ impl core::fmt::Display for EvalError {
                 f,
                 "parameter ${n} referenced but only {bound} bound by client"
             ),
+            Self::StackDepthExceeded => f.write_str(
+                "stack depth limit exceeded (expression nested too deeply)",
+            ),
         }
     }
+}
+
+/// v7.38 (read01 P3.25) — native-stack budget below the outermost
+/// `eval_expr` frame. Native stacks are typically 2–8 MB; 768 KiB leaves
+/// generous headroom while still permitting PG-class nesting depth (in a
+/// release build ~hundreds-to-thousands of frames fit under this).
+const MAX_EVAL_STACK_BYTES: usize = 768 * 1024;
+
+/// Address of a local in the current frame — a portable stand-in for the
+/// stack pointer (stacks grow downward on all supported targets).
+#[inline(never)]
+fn eval_stack_ptr() -> usize {
+    let probe = 0u8;
+    core::ptr::addr_of!(probe) as usize
 }
 
 pub fn eval_expr(
@@ -273,6 +303,18 @@ pub fn eval_expr(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01 P3.25) — guard against a native stack overflow on a
+    // pathologically nested expression (`a AND a AND … ` × thousands): the
+    // recursion base is seeded on the outermost call, and once a deeper
+    // call has consumed more than the budget we return an error the way
+    // PG's check_stack_depth() does, rather than aborting the process.
+    let sp = eval_stack_ptr();
+    let base = ctx.recursion_base.get();
+    if base == 0 {
+        ctx.recursion_base.set(sp);
+    } else if base.saturating_sub(sp) > MAX_EVAL_STACK_BYTES {
+        return Err(EvalError::StackDepthExceeded);
+    }
     match expr {
         Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
             detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
