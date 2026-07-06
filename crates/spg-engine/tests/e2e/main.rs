@@ -431,6 +431,7 @@ mod e2e_pg_replication_slots;
 mod e2e_pg_subscription_view;
 mod e2e_pg_range;
 mod e2e_pg_settings_view;
+mod e2e_pg_stat_activity;
 mod e2e_pg_stat_archiver_replication;
 mod e2e_pg_stat_bgwriter_tablespace;
 mod e2e_pg_stat_database;

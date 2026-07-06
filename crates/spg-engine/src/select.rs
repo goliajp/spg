@@ -1621,6 +1621,9 @@ impl Engine {
                 // simplified shape for the human-facing spgctl path.
                 "pg_stat_statements" => return Ok(self.exec_pg_stat_statements()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
+                // v7.38 (read01 P3.10) — canonical PG name + columns for
+                // monitoring tools; SPG-native shape stays `spg_stat_activity`.
+                "pg_stat_activity" => return Ok(self.exec_pg_stat_activity()),
                 // v7.37.14 (B6.5) — PG-compatibility surface; row
                 // set is empty until v7.37.15 lands tuple locks.
                 "pg_locks" => return Ok(self.exec_pg_locks()),

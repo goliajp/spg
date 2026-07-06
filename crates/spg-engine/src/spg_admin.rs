@@ -372,6 +372,85 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v7.38 (read01 P3.10) — the canonical `pg_stat_activity` view with
+    /// PG's column names, so monitoring tools (which query the standard
+    /// name + columns) work. SPG's `spg_stat_activity` carries the same
+    /// data under SPG-native names; here it is re-projected to PG's 22
+    /// columns, with the fields SPG doesn't track surfaced as NULL and
+    /// `state` derived from the in-transaction / running-query flags.
+    pub(crate) fn exec_pg_stat_activity(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("datid", DataType::BigInt, true),
+            ColumnSchema::new("datname", DataType::Text, true),
+            ColumnSchema::new("pid", DataType::Int, false),
+            ColumnSchema::new("leader_pid", DataType::Int, true),
+            ColumnSchema::new("usesysid", DataType::BigInt, true),
+            ColumnSchema::new("usename", DataType::Text, true),
+            ColumnSchema::new("application_name", DataType::Text, false),
+            ColumnSchema::new("client_addr", DataType::Text, true),
+            ColumnSchema::new("client_hostname", DataType::Text, true),
+            ColumnSchema::new("client_port", DataType::Int, true),
+            ColumnSchema::new("backend_start", DataType::Timestamptz, true),
+            ColumnSchema::new("xact_start", DataType::Timestamptz, true),
+            ColumnSchema::new("query_start", DataType::Timestamptz, true),
+            ColumnSchema::new("state_change", DataType::Timestamptz, true),
+            ColumnSchema::new("wait_event_type", DataType::Text, true),
+            ColumnSchema::new("wait_event", DataType::Text, true),
+            ColumnSchema::new("state", DataType::Text, true),
+            ColumnSchema::new("backend_xid", DataType::BigInt, true),
+            ColumnSchema::new("backend_xmin", DataType::BigInt, true),
+            ColumnSchema::new("query_id", DataType::BigInt, true),
+            ColumnSchema::new("query", DataType::Text, false),
+            ColumnSchema::new("backend_type", DataType::Text, false),
+        ];
+        let datname = self
+            .session_param("database")
+            .map_or(Value::Null, |d| Value::text(alloc::string::String::from(d)));
+        let rows: Vec<Row<'static>> = self
+            .activity_provider
+            .map(|f| f())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                // PG `state`: a running query is 'active'; otherwise
+                // 'idle in transaction' inside a txn, else 'idle'.
+                let state = if !r.current_sql.is_empty() {
+                    "active"
+                } else if r.in_transaction {
+                    "idle in transaction"
+                } else {
+                    "idle"
+                };
+                let started = Value::Timestamp(r.started_at_us);
+                Row::new(alloc::vec![
+                    Value::Null,           // datid
+                    datname.clone(),       // datname
+                    Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
+                    Value::Null,           // leader_pid
+                    Value::Null,           // usesysid
+                    Value::text(r.user),   // usename
+                    Value::text(r.application_name),
+                    Value::Null,           // client_addr
+                    Value::Null,           // client_hostname
+                    Value::Null,           // client_port
+                    started.clone(),       // backend_start
+                    if r.in_transaction { started.clone() } else { Value::Null }, // xact_start
+                    if r.current_sql.is_empty() { Value::Null } else { started }, // query_start
+                    Value::Null,           // state_change
+                    Value::text(r.wait_event_type),
+                    Value::text(r.wait_event),
+                    Value::text(alloc::string::String::from(state)),
+                    Value::Null,           // backend_xid
+                    Value::Null,           // backend_xmin
+                    Value::Null,           // query_id
+                    Value::text(r.current_sql), // query
+                    Value::text(alloc::string::String::from("client backend")),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v7.37.15 (Phase F) — MVCC diagnostic view. Single-row
     /// snapshot of the engine's per-row visibility state so
     /// `spgctl` / monitoring can observe vacuum lag + in-flight
