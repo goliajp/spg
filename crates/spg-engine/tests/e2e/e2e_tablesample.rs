@@ -61,12 +61,23 @@ fn combines_with_where_and_alias() {
 }
 
 #[test]
-fn repeatable_errors_honestly() {
+fn repeatable_is_deterministic() {
+    // v7.38 (read01 U15) — REPEATABLE(seed) now yields a deterministic,
+    // rescan-stable sample (was an honest "not supported" error before).
+    // SPG's row order differs from PG's page order, so the exact rows
+    // differ, but the observable contract — same seed → same sample on
+    // repeat — matches PG.
     let mut e = Engine::new();
     e.execute("CREATE TABLE tr (v INT)").unwrap();
-    let err = e
-        .execute("SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(10) REPEATABLE(42)")
-        .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("REPEATABLE"), "unexpected error: {msg}");
+    for i in 0..1000 {
+        e.execute(&format!("INSERT INTO tr VALUES({i})")).unwrap();
+    }
+    let c1 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)");
+    let c2 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)");
+    assert_eq!(c1, c2, "same seed must reproduce the same sample");
+    // A different seed generally selects a different subset.
+    let c3 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(7)");
+    assert_ne!(c1, c3, "different seed should give a different sample");
+    // Non-REPEATABLE still parses and samples.
+    let _ = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30)");
 }

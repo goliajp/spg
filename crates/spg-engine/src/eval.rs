@@ -130,6 +130,14 @@ pub struct EvalContext<'a> {
     /// request context / RLS. `None` in read-only contexts that have no
     /// session; unknown names then fall through to PG defaults.
     pub session_gucs: Option<&'a alloc::collections::BTreeMap<String, String>>,
+    /// v7.38 (read01 U15) — per-scan deterministic sampler state for
+    /// `TABLESAMPLE … REPEATABLE(seed)`. A fresh cell is created before a
+    /// scan whose predicate may draw `__tsm_fract(seed)`; the cell holds
+    /// `None` until the first draw seeds it from that literal, then a
+    /// scan-local xorshift sequence (isolated from the process-global
+    /// `random()` PRNG, so it's deterministic and rescan-stable). `None`
+    /// here means no sampler is attached.
+    pub sample_rng: Option<&'a core::cell::Cell<Option<u64>>>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -160,7 +168,18 @@ impl<'a> EvalContext<'a> {
             sequence_resolver: None,
             catalog: None,
             session_gucs: None,
+            sample_rng: None,
         }
+    }
+
+    /// v7.38 (read01 U15) — attach a per-scan `TABLESAMPLE REPEATABLE`
+    /// sampler cell. The cell (seeded lazily on first `__tsm_fract` draw)
+    /// must outlive the context and be created fresh per scan so a rescan
+    /// re-seeds and reproduces the same sample.
+    #[must_use]
+    pub const fn with_sample_rng(mut self, cell: &'a core::cell::Cell<Option<u64>>) -> Self {
+        self.sample_rng = Some(cell);
+        self
     }
 
     /// Attach the session's GUC map so `current_setting` can resolve
