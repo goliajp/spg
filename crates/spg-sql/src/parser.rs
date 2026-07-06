@@ -10310,23 +10310,28 @@ impl Parser {
                             self.advance();
                             true
                         }
+                        // v7.38 (read01 P4.14) — accept PG 18's VIRTUAL
+                        // generated columns. SPG computes them on write and
+                        // persists like STORED; the two are observably
+                        // identical for query results (the value, recompute
+                        // on base-column change, and NOT NULL enforcement all
+                        // match), so a PG 18 schema/dump using VIRTUAL loads
+                        // and behaves correctly. The compute-on-read storage
+                        // saving is an invisible internal difference.
                         Token::Ident(s) | Token::QuotedIdent(s)
                             if s.eq_ignore_ascii_case("virtual") =>
                         {
-                            return Err(self.err(
-                                "GENERATED ALWAYS AS (expr) VIRTUAL is not supported \
-                                 at v7.37.7; use STORED"
-                                    .into(),
-                            ));
+                            self.advance();
+                            false
                         }
                         other => {
                             return Err(self.err(alloc::format!(
-                                "expected STORED after GENERATED ALWAYS AS (<expr>), \
+                                "expected STORED or VIRTUAL after GENERATED ALWAYS AS (<expr>), \
                                  got {other:?}"
                             )));
                         }
                     };
-                    let _ = stored; // currently STORED-only; flag reserved for VIRTUAL.
+                    let _ = stored; // STORED / VIRTUAL both compute-and-store.
                     generated_stored_expr = Some(Box::new(expr));
                     continue;
                 }

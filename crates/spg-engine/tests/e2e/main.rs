@@ -333,6 +333,7 @@ mod e2e_generate_series_join;
 mod e2e_lateral_generate_series;
 mod e2e_lateral_unnest;
 mod e2e_generate_series_ordinality;
+mod e2e_generated_virtual;
 mod e2e_generated_stored;
 mod e2e_geometry;
 mod e2e_get_ddl;
