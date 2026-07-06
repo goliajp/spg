@@ -980,6 +980,61 @@ pub(crate) fn synth_pg_stat_replication(
 ///     buffers_backend_fsync / buffers_alloc (BigInt)
 ///   * maxwritten_clean (BigInt)
 ///   * stats_reset (TIMESTAMPTZ)
+/// v7.38 (read01 P3.14) — `pg_catalog.pg_stat_checkpointer` (PG 17+).
+/// SPG checkpoints WAL/segments on its own schedule; the cumulative
+/// counters aren't wired yet, so this is a shape-stable single row of
+/// zeros so monitoring queries parse.
+pub(crate) fn synth_pg_stat_checkpointer(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("num_timed", DataType::BigInt, false),
+        ColumnSchema::new("num_requested", DataType::BigInt, false),
+        ColumnSchema::new("num_done", DataType::BigInt, false),
+        ColumnSchema::new("restartpoints_timed", DataType::BigInt, false),
+        ColumnSchema::new("restartpoints_req", DataType::BigInt, false),
+        ColumnSchema::new("restartpoints_done", DataType::BigInt, false),
+        ColumnSchema::new("write_time", DataType::Float, false),
+        ColumnSchema::new("sync_time", DataType::Float, false),
+        ColumnSchema::new("buffers_written", DataType::BigInt, false),
+        ColumnSchema::new("slru_written", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::Null,
+    ])];
+    (schema, rows)
+}
+
+/// v7.38 (read01 P3.14) — `pg_catalog.pg_stat_wal`. Shell view; the WAL
+/// throughput counters aren't wired yet, so a shape-stable single row of
+/// zeros (monitoring queries parse; `stats_reset` is NULL).
+pub(crate) fn synth_pg_stat_wal(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("wal_records", DataType::BigInt, false),
+        ColumnSchema::new("wal_fpi", DataType::BigInt, false),
+        ColumnSchema::new("wal_bytes", DataType::BigInt, false),
+        ColumnSchema::new("wal_buffers_full", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::Null,
+    ])];
+    (schema, rows)
+}
+
 pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("checkpoints_timed", DataType::BigInt, false),
