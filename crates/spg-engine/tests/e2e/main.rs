@@ -229,6 +229,7 @@ mod e2e_numeric_array_coercion_matrix;
 mod e2e_numeric_to_int_rounds;
 mod e2e_ipv6_canonical;
 mod e2e_function_style_typecast;
+mod e2e_geometric_constructors;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
