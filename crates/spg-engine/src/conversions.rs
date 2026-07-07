@@ -3137,6 +3137,59 @@ pub(crate) fn coerce_value(
                 })
                 .collect(),
         )),
+        // v7.38 (read01) — the rest of the numeric-array coercion matrix PG
+        // accepts on INSERT / cast. Widening int→bigint / int·bigint→numeric /
+        // float→numeric never fails; narrowing bigint→int fails the whole
+        // coercion (→ None) if any element overflows i32.
+        (Value::IntArray(items), DataType::BigIntArray) => Some(Value::BigIntArray(
+            items.into_iter().map(|o| o.map(i64::from)).collect(),
+        )),
+        (Value::BigIntArray(items), DataType::IntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some(n) => match i32::try_from(n) {
+                        Ok(v) => out.push(Some(v)),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if ok { Some(Value::IntArray(out)) } else { None }
+        }
+        (Value::IntArray(items), DataType::NumericArray) => Some(Value::NumericArray(
+            items
+                .into_iter()
+                .map(|o| o.map(|n| (i128::from(n), 0_u8)))
+                .collect(),
+        )),
+        (Value::BigIntArray(items), DataType::NumericArray) => Some(Value::NumericArray(
+            items
+                .into_iter()
+                .map(|o| o.map(|n| (i128::from(n), 0_u8)))
+                .collect(),
+        )),
+        (Value::FloatArray(items), DataType::NumericArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some(x) => match parse_numeric_text(&alloc::format!("{x}")) {
+                        Some((mantissa, scale)) => out.push(Some((mantissa, scale))),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if ok { Some(Value::NumericArray(out)) } else { None }
+        }
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
         }
