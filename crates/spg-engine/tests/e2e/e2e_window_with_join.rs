@@ -120,13 +120,13 @@ fn sum_window_over_inner_join() {
     );
     assert_eq!(r.len(), 5);
     // Eng: 100 + 90 + 90 = 280. Sales: 80 + 70 = 150.
-    // Window SUM widens to Float (matches the per-row aggregate
-    // accumulator's PG-style numeric ladder).
-    assert_eq!(r[0][1], Value::Float(280.0));
-    assert_eq!(r[1][1], Value::Float(280.0));
-    assert_eq!(r[2][1], Value::Float(280.0));
-    assert_eq!(r[3][1], Value::Float(150.0));
-    assert_eq!(r[4][1], Value::Float(150.0));
+    // v7.38 (read01 sweep) — SUM over an INTEGER column is BIGINT (PG), not
+    // double, matching the GROUP BY sum() path.
+    assert_eq!(r[0][1], Value::BigInt(280));
+    assert_eq!(r[1][1], Value::BigInt(280));
+    assert_eq!(r[2][1], Value::BigInt(280));
+    assert_eq!(r[3][1], Value::BigInt(150));
+    assert_eq!(r[4][1], Value::BigInt(150));
 }
 
 #[test]
