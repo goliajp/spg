@@ -235,6 +235,7 @@ mod e2e_generate_series_string_step;
 mod e2e_float_round_half_even;
 mod e2e_sum_bigint_numeric;
 mod e2e_regex_group_capture;
+mod e2e_interval_component_arith;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

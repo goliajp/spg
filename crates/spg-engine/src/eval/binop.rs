@@ -923,34 +923,20 @@ pub(crate) fn apply_binary_interval(
                 .ok_or(EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL micros overflows i64".into(),
                 })?;
-            // v7.38 P1 (轴 1 pg_regress closure) — PG normalises
-            // INTERVAL arithmetic at the day / sub-day boundary so
-            // mixed-sign components (e.g. `1 day - 12 hours`) collapse
-            // to a single sign before display. Rule:
-            //   total_us = days·86_400e6 + micros
-            //   new_days  = total_us / 86_400e6   (truncate toward 0)
-            //   new_micros = total_us % 86_400e6  (keeps total_us sign)
-            // No-op when signs already align (both positive or both
-            // negative); kills the `1 day -12:00:00` artefact.
-            // Months stay separate — their length is ambiguous (28-31
-            // days), and PG never merges them into the day count
-            // implicitly.
-            const US_PER_DAY: i64 = 86_400_000_000;
-            let total_us = raw_days
-                .checked_mul(US_PER_DAY)
-                .and_then(|x| x.checked_add(raw_micros))
-                .ok_or(EvalError::TypeMismatch {
-                    detail: "INTERVAL ± INTERVAL day-micros normalise overflows i64".into(),
-                })?;
-            let norm_days_i64 = total_us / US_PER_DAY;
-            let norm_micros = total_us % US_PER_DAY;
-            let new_days = i32::try_from(norm_days_i64).map_err(|_| EvalError::TypeMismatch {
+            // v7.38 (read01) — PG interval arithmetic is PURELY component-wise:
+            // it does NOT justify days ↔ micros, so `1 day - 2 hours` stays
+            // `1 day -02:00:00` (mixed sign) and `1 day - 26 hours` stays
+            // `1 day -26:00:00` (micros beyond a day). Months, days and micros
+            // each subtract independently; only explicit justify_* reshuffles
+            // them. (An earlier fix normalised at the day boundary, mistaking
+            // PG's `1 day -12:00:00` for an artefact — it is PG's real output.)
+            let new_days = i32::try_from(raw_days).map_err(|_| EvalError::TypeMismatch {
                 detail: "INTERVAL ± INTERVAL day count exceeds i32".into(),
             })?;
             Ok(Some(Value::Interval {
                 months: new_months,
                 days: new_days,
-                micros: norm_micros,
+                micros: raw_micros,
             }))
         }
         _ => Err(EvalError::TypeMismatch {
