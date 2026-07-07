@@ -14025,9 +14025,22 @@ fn apply_function_dispatch(
                 .collect();
             Ok(Value::TextArray(trigrams))
         }
-        other => Err(EvalError::TypeMismatch {
-            detail: format!("unknown function `{other}`"),
-        }),
+        other => {
+            // v7.38 (read01) — function-style typecast: PG treats `typename(expr)`
+            // as shorthand for `expr::typename` (`int4('5')`, `float8('1.5')`,
+            // `text(42)`, `circle('<(0,0),5>')`, `box('...')`). Fall back to it
+            // when the unmatched name resolves to a type and there is exactly one
+            // argument; real functions were already matched above.
+            if args.len() == 1 && crate::conversions::type_name_to_data_type(other).is_some() {
+                return crate::eval::cast::cast_value(
+                    args[0].clone().into_owned(),
+                    spg_sql::ast::CastTarget::Named(other.to_string()),
+                );
+            }
+            Err(EvalError::TypeMismatch {
+                detail: format!("unknown function `{other}`"),
+            })
+        }
     }
 }
 

@@ -266,6 +266,13 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // overflow. Stringify a non-text source first, then truncate up
             // front so the coerce path's length contract never fires here.
             let v = match (&dt, v) {
+                // v7.38 (read01) — an explicit cast to TEXT stringifies any
+                // value (`text(42)` → '42'), matching `42::text`. (coerce_value
+                // deliberately rejects a bare INT→TEXT so INSERT stays strict.)
+                (spg_storage::DataType::Text, v) => match v {
+                    Value::Text(s) => Value::Text(s),
+                    other => Value::text(value_to_text(&other)),
+                },
                 (
                     spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n),
                     v,
