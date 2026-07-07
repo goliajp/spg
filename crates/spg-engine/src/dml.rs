@@ -2476,6 +2476,25 @@ fn parse_insert_rows(
     // table; subsequent rows increment.
     let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
         alloc::collections::BTreeMap::new();
+    // v7.38 (read01 P6.41) — PG rejects an explicit value for a generated
+    // column ("cannot insert a non-DEFAULT value into column …"). SPG has no
+    // DEFAULT keyword in VALUES, so any slot provided for a generated column
+    // is a real user value and must be refused; the column list must omit it.
+    for (i, col) in column_meta.iter().enumerate() {
+        if col.generated_stored_expr.is_none() {
+            continue;
+        }
+        let provided = match tuple_pos {
+            Some(map) => map.get(i).copied().flatten().is_some(),
+            None => i < expected_tuple_len,
+        };
+        if provided {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "cannot insert a non-DEFAULT value into column {:?} — it is a generated column",
+                col.name
+            )));
+        }
+    }
     for tuple in rows {
         if tuple.len() != expected_tuple_len {
             return Err(EngineError::Storage(StorageError::ArityMismatch {

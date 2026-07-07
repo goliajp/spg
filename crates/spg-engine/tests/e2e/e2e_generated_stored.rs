@@ -70,7 +70,10 @@ fn insert_auto_fills_generated_stored_column() {
 /// by the recomputed value — PG-strict "you don't get to set it"
 /// semantics.
 #[test]
-fn insert_overrides_user_supplied_generated_value() {
+fn insert_rejects_user_supplied_generated_value() {
+    // v7.38 (read01 P6.41) — PG rejects an explicit value for a generated
+    // column ("cannot insert a non-DEFAULT value into column …") rather than
+    // silently ignoring it; the column list must omit the generated column.
     let mut e = Engine::new();
     e.execute(
         "CREATE TABLE box_with_area (
@@ -81,9 +84,14 @@ fn insert_overrides_user_supplied_generated_value() {
          )",
     )
     .unwrap();
-    e.execute("INSERT INTO box_with_area (id, w, h, area) VALUES (1, 5, 6, 999)")
-        .expect("user-supplied area is ignored");
-    // 30 = 5 * 6 (not 999).
+    assert!(
+        e.execute("INSERT INTO box_with_area (id, w, h, area) VALUES (1, 5, 6, 999)")
+            .is_err(),
+        "explicit value for a generated column must be rejected"
+    );
+    // Omitting the generated column works and computes it.
+    e.execute("INSERT INTO box_with_area (id, w, h) VALUES (1, 5, 6)")
+        .expect("omitting the generated column is fine");
     assert_eq!(
         one_i64(&mut e, "SELECT area FROM box_with_area WHERE id = 1"),
         30,
