@@ -882,7 +882,9 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     }
     // v7.37 — leading `L` currency locale symbol (C locale → `$`). Stripped
     // here; the rest formats normally and `$` is prepended post-pass.
-    let has_currency = pat.starts_with(['L', 'l']);
+    // v7.38 (read01) — a leading literal `$` (`FM$9,999.00`) anchors the dollar
+    // sign at the front too, matching PG (`$1,234.50`).
+    let has_currency = pat.starts_with(['L', 'l', '$']);
     if has_currency {
         pat = &pat[1..];
     }
