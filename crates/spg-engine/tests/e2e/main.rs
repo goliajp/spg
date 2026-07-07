@@ -233,6 +233,7 @@ mod e2e_geometric_constructors;
 mod e2e_to_char_leading_dollar;
 mod e2e_generate_series_string_step;
 mod e2e_float_round_half_even;
+mod e2e_sum_bigint_numeric;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

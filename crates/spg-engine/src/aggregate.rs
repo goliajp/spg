@@ -1188,8 +1188,19 @@ fn accumulate_groups(
                         sum_int += i64::from(*n);
                         count += 1;
                     }
+                    // v7.38 (read01, T4) — sum/avg over BIGINT accumulate as
+                    // exact NUMERIC (scale 0), matching PG (sum(bigint)/avg(bigint)
+                    // → numeric) and defending the i64 sum against overflow.
                     Value::BigInt(n) => {
-                        sum_int += *n;
+                        let (s, sc) = crate::numeric::numeric_add(
+                            num_scaled,
+                            num_scale,
+                            i128::from(*n),
+                            0,
+                        );
+                        num_scaled = s;
+                        num_scale = sc;
+                        use_numeric = true;
                         count += 1;
                     }
                     Value::Float(x) => {
@@ -1271,8 +1282,17 @@ fn accumulate_groups(
                         sum_int += i64::from(n);
                         count += 1;
                     }
+                    // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
                     Value::BigInt(n) => {
-                        sum_int += n;
+                        let (s, sc) = crate::numeric::numeric_add(
+                            num_scaled,
+                            num_scale,
+                            i128::from(n),
+                            0,
+                        );
+                        num_scaled = s;
+                        num_scale = sc;
+                        use_numeric = true;
                         count += 1;
                     }
                     Value::Float(x) => {
@@ -2839,7 +2859,18 @@ fn update_state(
             st.count += 1;
             match v {
                 Value::Int(n) => st.sum_int += i64::from(*n),
-                Value::BigInt(n) => st.sum_int += *n,
+                // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
+                Value::BigInt(n) => {
+                    st.use_numeric = true;
+                    let (s, sc) = crate::numeric::numeric_add(
+                        st.sum_num_scaled,
+                        st.sum_num_scale,
+                        i128::from(*n),
+                        0,
+                    );
+                    st.sum_num_scaled = s;
+                    st.sum_num_scale = sc;
+                }
                 Value::Float(x) => {
                     st.use_float = true;
                     st.sum_float += *x;
@@ -3722,11 +3753,24 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
     }
     match spec.name.as_str() {
         "count" | "count_star" => DataType::BigInt,
+        // v7.38 (read01, T4) — sum(int) → bigint, sum(bigint) → numeric (PG
+        // widens to numeric to defend against i64 overflow), sum(float) → float.
         "sum" => match arg_ty {
             Some(DataType::Float) => DataType::Float,
+            Some(DataType::BigInt) => DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
             _ => DataType::BigInt,
         },
-        "avg" => DataType::Float,
+        // avg(int) → float (SPG keeps double here); avg(bigint) → numeric (PG).
+        "avg" => match arg_ty {
+            Some(DataType::BigInt) => DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+            _ => DataType::Float,
+        },
         // v7.17.0 — string_agg always returns TEXT.
         "string_agg" | "group_concat" | "xmlagg" => DataType::Text,
         "array_agg" => match arg_ty {

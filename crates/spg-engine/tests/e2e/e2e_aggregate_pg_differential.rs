@@ -50,6 +50,21 @@ fn render(v: &Value) -> String {
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
+        // v7.38 (read01, T4) — sum/avg(bigint) render as decimal text.
+        Value::Numeric { scaled, scale } => {
+            if *scale == 0 {
+                scaled.to_string()
+            } else {
+                let digits = scaled.unsigned_abs().to_string();
+                let sc = *scale as usize;
+                let (int_part, frac_part) = if digits.len() > sc {
+                    (digits[..digits.len() - sc].to_string(), digits[digits.len() - sc..].to_string())
+                } else {
+                    ("0".to_string(), format!("{digits:0>sc$}"))
+                };
+                format!("{}{int_part}.{frac_part}", if *scaled < 0 { "-" } else { "" })
+            }
+        }
         Value::Float(x) => x.to_string(),
         Value::Text(s) => s.to_string(),
         Value::Json(s) => s.to_string(),
