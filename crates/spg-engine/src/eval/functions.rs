@@ -5779,14 +5779,30 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            if !(1..=12).contains(&mo)
-                || !(1..=31).contains(&d)
-                || !(0..=23).contains(&h)
-                || !(0..=59).contains(&mi)
-                || !(0.0..60.0).contains(&s)
-            {
+            // v7.38 (read01) — validate the day against the month's real length
+            // (leap-aware), matching PG's out-of-range error instead of rolling
+            // an invalid date over (`make_timestamp(2024,2,30,...)` must fail).
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let max_day = match mo {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => {
+                    if leap {
+                        29
+                    } else {
+                        28
+                    }
+                }
+                _ => 0,
+            };
+            if !(1..=12).contains(&mo) || d < 1 || d > max_day {
                 return Err(EvalError::TypeMismatch {
-                    detail: "make_timestamp(): out-of-range component".into(),
+                    detail: alloc::format!("date field value out of range: {y}-{mo:02}-{d:02}"),
+                });
+            }
+            if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0.0..60.0).contains(&s) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "make_timestamp(): time field out of range".into(),
                 });
             }
             let days = super::days_from_civil(y as i32, mo as u32, d as u32);
