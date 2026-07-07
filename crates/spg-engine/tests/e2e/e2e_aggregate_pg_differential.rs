@@ -19,9 +19,9 @@
 //!
 //! DOCUMENTED REPRESENTATION / SEMANTIC divergences (SPG asserts its
 //! own form; PG value noted in a comment — NOT bugs):
-//!   * avg/stddev/variance/corr return FLOAT; PG returns NUMERIC, so
-//!     PG prints trailing zeros (`26.0000000000000000`) where SPG
-//!     prints `26`. Values are equal.
+//!   * v7.38 (T4): avg(int/bigint) now returns NUMERIC like PG
+//!     (`26.0000000000000000`). stddev/variance/corr still return FLOAT
+//!     (PG NUMERIC) — a remaining T4 residual; values are equal.
 //!   * array_agg(DISTINCT x) / string_agg(DISTINCT x): PG sorts the
 //!     distinct set (dedup is sort-based); SPG keeps first-seen order.
 //!     SQL leaves DISTINCT-without-ORDER-BY order UNSPECIFIED, so
@@ -161,8 +161,8 @@ fn null_handling() {
     check(&mut e, "SELECT count(x) FROM t WHERE id=3", "0");
     check(&mut e, "SELECT avg(x) FROM t WHERE id=3", "<NULL>");
     check(&mut e, "SELECT bool_and(b) FROM t WHERE id=3", "<NULL>");
-    // avg is FLOAT in SPG; PG NUMERIC prints 26.0000000000000000 (equal value)
-    check(&mut e, "SELECT avg(x) FROM t", "26");
+    // avg(int) is NUMERIC now (T4), matching PG's 26.0000000000000000.
+    check(&mut e, "SELECT avg(x) FROM t", "26.0000000000000000");
 }
 
 // ---- DISTINCT: dedup works. Ordering of DISTINCT-without-ORDER-BY is
@@ -174,7 +174,7 @@ fn distinct() {
     check(&mut e, "SELECT sum(DISTINCT x) FROM t", "100");
     check(&mut e, "SELECT count(DISTINCT s) FROM t", "3");
     // avg(DISTINCT) FLOAT; PG 25.0000000000000000
-    check(&mut e, "SELECT avg(DISTINCT x) FROM t", "25");
+    check(&mut e, "SELECT avg(DISTINCT x) FROM t", "25.0000000000000000");
     // SEMANTIC: PG sorts distinct set -> {10,20,30,40,NULL} / bar,baz,foo.
     // SPG keeps first-seen order (valid: DISTINCT order is unspecified).
     check(&mut e, "SELECT array_agg(DISTINCT x) FROM t", "{10,20,NULL,30,40}");
@@ -383,7 +383,7 @@ fn group_by_combos() {
     check(
         &mut e,
         "SELECT g||':'||coalesce(avg(x)::text,'<NULL>') FROM t GROUP BY g ORDER BY g",
-        "a:15|b:30|c:40",
+        "a:15.0000000000000000|b:30.0000000000000000|c:40.0000000000000000",
     );
 }
 

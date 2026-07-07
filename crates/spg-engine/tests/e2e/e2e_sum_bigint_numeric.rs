@@ -26,8 +26,8 @@ fn sum_avg_bigint_widen_to_numeric() {
     assert_eq!(text(&mut e, "SELECT pg_typeof(sum(b)) FROM t"), "numeric");
     assert_eq!(text(&mut e, "SELECT sum(b)::text FROM t"), "6000000000000");
 
-    // avg(int) stays double; avg(bigint) -> numeric.
-    assert_eq!(text(&mut e, "SELECT pg_typeof(avg(i)) FROM t"), "double precision");
+    // avg(int) and avg(bigint) -> numeric (T4).
+    assert_eq!(text(&mut e, "SELECT pg_typeof(avg(i)) FROM t"), "numeric");
     assert_eq!(text(&mut e, "SELECT pg_typeof(avg(b)) FROM t"), "numeric");
 
     // Overflow safety: two values near i64::MAX sum past 9.2e18 without wrapping.
