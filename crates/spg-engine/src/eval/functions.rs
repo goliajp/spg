@@ -83,6 +83,38 @@ fn count_tsquery_nodes(ast: &spg_storage::TsQueryAst) -> i32 {
     }
 }
 
+/// v7.38 (read01 P6.31) — the GIN-indexable part of a tsquery, per PG's
+/// querytree(): a NOT node is not indexable ("fake"); AND keeps whichever side
+/// is indexable; OR is indexable only if BOTH sides are. `None` means the whole
+/// query is non-indexable (PG prints "T").
+fn querytree_indexable(ast: &spg_storage::TsQueryAst) -> Option<spg_storage::TsQueryAst> {
+    use spg_storage::TsQueryAst as Q;
+    match ast {
+        Q::Term { .. } => Some(ast.clone()),
+        Q::Not(_) => None,
+        Q::And(l, r) => match (querytree_indexable(l), querytree_indexable(r)) {
+            (Some(a), Some(b)) => Some(Q::And(alloc::boxed::Box::new(a), alloc::boxed::Box::new(b))),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
+        Q::Or(l, r) => match (querytree_indexable(l), querytree_indexable(r)) {
+            (Some(a), Some(b)) => Some(Q::Or(alloc::boxed::Box::new(a), alloc::boxed::Box::new(b))),
+            _ => None,
+        },
+        Q::Phrase { left, right, distance } => {
+            match (querytree_indexable(left), querytree_indexable(right)) {
+                (Some(a), Some(b)) => Some(Q::Phrase {
+                    left: alloc::boxed::Box::new(a),
+                    right: alloc::boxed::Box::new(b),
+                    distance: *distance,
+                }),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -10972,6 +11004,12 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.38 (read01 P6.31) — a real tsquery value: return its
+                // GIN-indexable part (PG's querytree), formatted as text.
+                Value::TsQuery(ast) => match querytree_indexable(ast) {
+                    Some(q) => Ok(Value::text(super::textsearch::format_tsquery(&q))),
+                    None => Ok(Value::text::<String>("T".into())),
+                },
                 Value::Text(s) => {
                     // Drop '!term' segments.
                     let kept: alloc::vec::Vec<&str> = s
