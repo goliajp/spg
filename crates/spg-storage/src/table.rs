@@ -592,8 +592,12 @@ impl Table {
                     (actual, col.ty),
                     (
                         DataType::Numeric { scale: a, .. },
-                        DataType::Numeric { scale: b, .. },
-                    ) if a == b
+                        DataType::Numeric { precision: bp, scale: b },
+                    // v7.38 (read01 sweep) — an unconstrained `numeric` column
+                    // (the precision-0/scale-0 sentinel) stores a value at its
+                    // own natural scale, so accept any Numeric scale there; a
+                    // declared `numeric(p,s)` still requires the rescaled value.
+                    ) if a == b || (bp == 0 && b == 0)
                 );
             if !compatible {
                 return Err(StorageError::TypeMismatch {
@@ -1828,8 +1832,12 @@ impl Table {
                     (actual, col.ty),
                     (
                         DataType::Numeric { scale: a, .. },
-                        DataType::Numeric { scale: b, .. },
-                    ) if a == b
+                        DataType::Numeric { precision: bp, scale: b },
+                    // v7.38 (read01 sweep) — an unconstrained `numeric` column
+                    // (the precision-0/scale-0 sentinel) stores a value at its
+                    // own natural scale, so accept any Numeric scale there; a
+                    // declared `numeric(p,s)` still requires the rescaled value.
+                    ) if a == b || (bp == 0 && b == 0)
                 );
             if !compatible {
                 return Err(StorageError::TypeMismatch {
