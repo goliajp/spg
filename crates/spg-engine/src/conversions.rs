@@ -2287,6 +2287,93 @@ pub(crate) fn parse_pg_int(s: &str) -> Option<i64> {
     Some(if neg { mag.checked_neg()? } else { mag })
 }
 
+/// v7.38 (read01 P6.38) — well-formedness check for PG's `xml` CONTENT mode.
+/// Verifies element tags are balanced and properly nested; comments (`<!-- -->`),
+/// processing instructions (`<? ?>`), CDATA sections, `<!DOCTYPE …>`, plain
+/// text, self-closing tags and multiple top-level elements are all accepted.
+/// Attribute values are quote-aware so a `>` inside an attribute doesn't end a
+/// tag early. This catches the common malformedness (unclosed / mismatched
+/// tags) libxml2 rejects; deeper libxml2 checks (entity validity, duplicate
+/// attributes, char legality) are a documented follow-up.
+fn xml_content_is_well_formed(s: &str) -> bool {
+    let b = s.as_bytes();
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':') || c >= 0x80;
+    let mut stack: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        if rest.starts_with("<!--") {
+            match rest.find("-->") {
+                Some(p) => i += p + 3,
+                None => return false,
+            }
+        } else if rest.starts_with("<![CDATA[") {
+            match rest.find("]]>") {
+                Some(p) => i += p + 3,
+                None => return false,
+            }
+        } else if rest.starts_with("<?") {
+            match rest.find("?>") {
+                Some(p) => i += p + 2,
+                None => return false,
+            }
+        } else if rest.starts_with("<!") {
+            match rest.find('>') {
+                Some(p) => i += p + 1,
+                None => return false,
+            }
+        } else {
+            // Element open / close / self-close tag.
+            let close = i + 1 < b.len() && b[i + 1] == b'/';
+            let name_start = if close { i + 2 } else { i + 1 };
+            let mut j = name_start;
+            while j < b.len() && is_name(b[j]) {
+                j += 1;
+            }
+            if j == name_start {
+                return false; // `<` not followed by a tag name
+            }
+            let name = &b[name_start..j];
+            // Scan to the matching `>`, skipping quoted attribute values.
+            let mut k = j;
+            let mut quote = 0u8;
+            let mut prev = 0u8;
+            loop {
+                if k >= b.len() {
+                    return false; // unterminated tag
+                }
+                let c = b[k];
+                if quote != 0 {
+                    if c == quote {
+                        quote = 0;
+                    }
+                } else if c == b'"' || c == b'\'' {
+                    quote = c;
+                } else if c == b'>' {
+                    break;
+                }
+                prev = c;
+                k += 1;
+            }
+            let self_closing = prev == b'/';
+            i = k + 1;
+            if close {
+                match stack.pop() {
+                    Some(top) if top == name => {}
+                    _ => return false,
+                }
+            } else if !self_closing {
+                stack.push(name);
+            }
+        }
+    }
+    stack.is_empty()
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -2705,7 +2792,18 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
-        (Value::Text(s), DataType::Xml) => Some(Value::xml(s)),
+        (Value::Text(s), DataType::Xml) => {
+            // v7.38 (read01 P6.38) — `::xml` (PG's CONTENT mode) requires the
+            // text to be well-formed: element tags must be balanced and
+            // properly nested. Plain text, multiple top-level elements,
+            // comments/PIs/CDATA and self-closing tags are all fine.
+            if !xml_content_is_well_formed(&s) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid XML content: {s:?}"),
+                }));
+            }
+            Some(Value::xml(s))
+        }
         (Value::Text(s), DataType::Char1) => {
             let b = s.bytes().next().unwrap_or(0);
             Some(Value::Char1(b))
