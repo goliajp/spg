@@ -598,6 +598,25 @@ pub(super) fn apply_binary(
         BinOp::JsonKeyExists => crate::json::key_exists(&l, &r),
         BinOp::JsonKeysAny => crate::json::keys_any(&l, &r),
         BinOp::JsonKeysAll => crate::json::keys_all(&l, &r),
+        // v7.38 (read01, T8) — `jsonb @@ jsonpath` evaluates a boolean
+        // predicate (`'{"a":5}' @@ '$.a > 3'`), distinct from tsvector `@@`.
+        BinOp::TsMatch if matches!(l, Value::Json(_)) => {
+            if matches!(r, Value::Null) {
+                return Ok(Value::Null);
+            }
+            match crate::json::path_predicate(&l, &r)? {
+                Some(b) => Ok(Value::Bool(b)),
+                None => match crate::json::path_query(&l, &r)? {
+                    Value::TextArray(items) => Ok(Value::Bool(match items.first() {
+                        Some(Some(s)) if s == "false" => false,
+                        Some(_) => true,
+                        None => false,
+                    })),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::Bool(true)),
+                },
+            }
+        }
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
