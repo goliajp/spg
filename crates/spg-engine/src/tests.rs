@@ -492,9 +492,22 @@ fn insert_happy_path_reports_one_affected() {
 
 #[test]
 fn insert_arity_mismatch_propagates() {
+    // v7.38 (read01 sweep) — with no column list, supplying FEWER values than
+    // columns is legal in PG (the trailing columns take DEFAULT / NULL); only
+    // supplying MORE values than columns is an arity error.
     let mut e = Engine::new();
     e.execute("CREATE TABLE foo (a INT, b TEXT)").unwrap();
-    let err = e.execute("INSERT INTO foo VALUES (1)").unwrap_err();
+    // Fewer values: b (no default) becomes NULL.
+    e.execute("INSERT INTO foo VALUES (1)").unwrap();
+    match e.execute("SELECT a, b FROM foo").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_storage::Value::Int(1));
+            assert_eq!(rows[0].values[1], spg_storage::Value::Null);
+        }
+        _ => panic!("expected rows"),
+    }
+    // More values than columns is still an arity error.
+    let err = e.execute("INSERT INTO foo VALUES (1, 'x', 3)").unwrap_err();
     assert!(matches!(
         err,
         EngineError::Storage(StorageError::ArityMismatch { .. })

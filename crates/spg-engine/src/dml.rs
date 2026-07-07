@@ -2516,13 +2516,16 @@ fn parse_insert_rows(
     // column ("cannot insert a non-DEFAULT value into column …"). SPG has no
     // DEFAULT keyword in VALUES, so any slot provided for a generated column
     // is a real user value and must be refused; the column list must omit it.
+    // v7.38 (read01 sweep) — with no column list a short row omits its trailing
+    // positions, so a column is "provided" only when SOME row reaches its slot.
+    let max_tuple_len = rows.iter().map(Vec::len).max().unwrap_or(0);
     for (i, col) in column_meta.iter().enumerate() {
         if col.generated_stored_expr.is_none() {
             continue;
         }
         let provided = match tuple_pos {
             Some(map) => map.get(i).copied().flatten().is_some(),
-            None => i < expected_tuple_len,
+            None => i < max_tuple_len,
         };
         if provided {
             return Err(EngineError::Unsupported(alloc::format!(
@@ -2532,7 +2535,14 @@ fn parse_insert_rows(
         }
     }
     for tuple in rows {
-        if tuple.len() != expected_tuple_len {
+        // v7.38 (read01 sweep) — with no explicit column list, PG lets a row
+        // supply FEWER values than the table has columns; the trailing columns
+        // take their DEFAULT (or NULL). A row is still rejected for supplying
+        // MORE values than columns, and an explicit column list must match its
+        // value count exactly.
+        let too_many = tuple.len() > expected_tuple_len;
+        let list_mismatch = tuple_pos.is_some() && tuple.len() != expected_tuple_len;
+        if too_many || list_mismatch {
             return Err(EngineError::Storage(StorageError::ArityMismatch {
                 expected: expected_tuple_len,
                 actual: tuple.len(),
@@ -2578,9 +2588,17 @@ fn parse_insert_rows(
             out
         } else {
             // 1-1 mapping fast path: single Vec alloc, no raw_tuple.
+            // v7.38 (read01 sweep) — a short row (fewer values than columns, no
+            // column list) fills its trailing columns from their DEFAULT / NULL.
             let mut out = Vec::with_capacity(schema_cols_len);
-            for (i, (col, expr)) in column_meta.iter().zip(tuple).enumerate() {
-                let mut raw = literal_expr_to_value(expr)?;
+            let tuple_len = tuple.len();
+            let mut tuple_iter = tuple.into_iter();
+            for (i, col) in column_meta.iter().enumerate() {
+                let mut raw = if i < tuple_len {
+                    literal_expr_to_value(tuple_iter.next().expect("i < tuple_len has a value"))?
+                } else {
+                    resolve_column_default_free(col, clock)?
+                };
                 if col.auto_increment && raw.is_null() {
                     let next = match auto_cursors.get(&i) {
                         Some(n) => *n,
