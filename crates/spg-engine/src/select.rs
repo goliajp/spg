@@ -5062,6 +5062,21 @@ pub(crate) fn generate_series_rows(
         [Value::Timestamp(start), Value::Timestamp(stop), step] => {
             let interval_step = match step {
                 Value::Interval { .. } => step.clone(),
+                // v7.38 (read01) — PG resolves an unknown-type string step
+                // (`generate_series(date, date, '2 days')`) to INTERVAL; accept
+                // a bare text step by parsing it the same way `::interval` does.
+                Value::Text(s) => crate::conversions::coerce_value(
+                    Value::text(s.as_ref()),
+                    DataType::Interval,
+                    "",
+                    0,
+                )
+                .map_err(|_| {
+                    EngineError::Unsupported(alloc::format!(
+                        "generate_series(timestamp, timestamp, …): \
+                         could not parse step {s:?} as INTERVAL"
+                    ))
+                })?,
                 other => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "generate_series(timestamp, timestamp, …): \
