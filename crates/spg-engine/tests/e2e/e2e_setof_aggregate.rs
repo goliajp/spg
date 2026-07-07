@@ -44,8 +44,10 @@ fn sum_over_generate_series_with_column_alias() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    // 1 + 2 + ... + 10 = 55.
-    assert_eq!(r[0][0], Value::BigInt(55));
+    // 1 + 2 + ... + 10 = 55. v7.38 (read01, T4) — SPG's generate_series yields
+    // BIGINT (PG yields int4), and sum(bigint) is NUMERIC now, so the result is
+    // Numeric 55. (The generate_series element type vs PG is a separate residual.)
+    assert_eq!(r[0][0], Value::Numeric { scaled: 55, scale: 0 });
 }
 
 #[test]
