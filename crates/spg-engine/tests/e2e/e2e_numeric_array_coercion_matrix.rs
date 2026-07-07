@@ -38,3 +38,18 @@ fn numeric_array_coercion_matrix() {
         .execute("INSERT INTO aj VALUES (ARRAY[9999999999::bigint])")
         .is_err());
 }
+
+#[test]
+fn numeric_array_narrows_into_int_array_rounding() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ni (v int[])").unwrap();
+    e.execute("INSERT INTO ni VALUES (ARRAY[1.7::numeric, 2.5::numeric])")
+        .unwrap();
+    // Rounds half away from zero, matching the scalar numeric→int coercion.
+    assert_eq!(text(&mut e, "SELECT v::text FROM ni"), "{2,3}");
+
+    e.execute("CREATE TABLE nb (v bigint[])").unwrap();
+    e.execute("INSERT INTO nb VALUES (ARRAY[9.9::numeric, -0.5::numeric])")
+        .unwrap();
+    assert_eq!(text(&mut e, "SELECT v::text FROM nb"), "{10,-1}");
+}
