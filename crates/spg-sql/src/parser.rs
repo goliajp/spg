@@ -8163,6 +8163,10 @@ impl Parser {
         // SPG accepts all forms as no-ops (each option is
         // `<ident> [=] <ident-or-string>` separated by whitespace).
         self.consume_mysql_table_options();
+        // v7.38 (read01 P6.55) — PG storage parameters `WITH (opt=val, …)`.
+        // SPG has no per-table reloptions, so accept and ignore them so a
+        // pg_dump `CREATE TABLE … WITH (fillfactor=70, …)` restores cleanly.
+        self.consume_with_reloptions();
         // v7.37.6-B — declarative-partition-parent suffix
         // (`PARTITION BY RANGE (key_col)`) sits after the column
         // list + MySQL table-options. v7.37.6-B only accepts RANGE
@@ -8687,6 +8691,32 @@ impl Parser {
     /// the closing `)`: ENGINE=..., DEFAULT CHARSET=...,
     /// COLLATE=..., AUTO_INCREMENT=N, ROW_FORMAT=..., COMMENT='...'
     /// (in any order, separated by whitespace).
+    /// v7.38 (read01 P6.55) — consume and discard a PG `WITH (opt=val, …)`
+    /// storage-parameter clause on CREATE TABLE. SPG has no per-table
+    /// reloptions; accepting them keeps pg_dump restores working. `WITH` is a
+    /// bare ident here, and only the parenthesised form is reloptions (so this
+    /// never eats a `WITH DATA` / `WITH CHECK OPTION` trailer).
+    fn consume_with_reloptions(&mut self) {
+        let is_with = matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with")
+        );
+        if !is_with || !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
+            return;
+        }
+        self.advance(); // WITH
+        self.advance(); // (
+        let mut depth = 1u32;
+        while depth > 0 && !matches!(self.peek(), Token::Eof) {
+            match self.peek() {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
     fn consume_mysql_table_options(&mut self) {
         loop {
             // Heuristic: a table option is an ident (or `DEFAULT`
