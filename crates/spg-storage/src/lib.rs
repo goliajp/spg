@@ -786,6 +786,12 @@ pub enum Value<'arena> {
         upper_inc: bool,
         empty: bool,
     },
+    /// v7.38 (read01, T9) — a composite / record value (a `row(...)`
+    /// constructor or a whole-row reference). Fields are `(name, value)`; the
+    /// names are `f1..fN` for an anonymous `row(...)` or the source column
+    /// names for a table row. Transient — flows through row_to_json / to_json
+    /// and the composite text form `(a,b)`; not a storable column type here.
+    Composite(alloc::vec::Vec<(alloc::string::String, Value<'static>)>),
     Null,
 }
 
@@ -922,6 +928,9 @@ impl<'arena> Value<'arena> {
             Self::IntArray2D(_) => Some(DataType::IntArray2D),
             Self::BigIntArray2D(_) => Some(DataType::BigIntArray2D),
             Self::TextArray2D(_) => Some(DataType::TextArray2D),
+            // v7.38 (read01, T9) — a transient composite/record has no storable
+            // column DataType (it flows through row_to_json / to_json).
+            Self::Composite(_) => None,
             Self::Null => None,
         }
     }
@@ -981,6 +990,8 @@ impl<'arena> Value<'arena> {
             Value::VarcharArray(v) => Value::VarcharArray(v),
             Value::CharArray(v) => Value::CharArray(v),
             Value::Multirange { kind, ranges } => Value::Multirange { kind, ranges },
+            // v7.38 (read01, T9) — Composite fields are already `Value<'static>`.
+            Value::Composite(fields) => Value::Composite(fields),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
             Value::Path { points, closed } => Value::Path { points, closed },
@@ -1669,7 +1680,8 @@ impl IndexKey {
             | Value::BitString { .. }
             | Value::Xml(_)
             | Value::Char1(_)
-            | Value::MoneyArray(_) => None,
+            | Value::MoneyArray(_)
+            | Value::Composite(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

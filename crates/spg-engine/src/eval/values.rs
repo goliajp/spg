@@ -175,6 +175,39 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),
+        // v7.38 (read01, T9) — PG record_out: `(f1,f2,...)`, NULL fields empty,
+        // fields with special characters double-quoted (`\` and `"` escaped).
+        Value::Composite(fields) => {
+            let mut out = String::from("(");
+            for (i, (_, fv)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if matches!(fv, Value::Null) {
+                    continue;
+                }
+                let field = super::strings::value_to_format_text(fv);
+                let needs_quote = field.is_empty()
+                    || field
+                        .chars()
+                        .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace());
+                if needs_quote {
+                    out.push('"');
+                    for c in field.chars() {
+                        match c {
+                            '"' => out.push_str("\"\""),
+                            '\\' => out.push_str("\\\\"),
+                            other => out.push(other),
+                        }
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(&field);
+                }
+            }
+            out.push(')');
+            out
+        }
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))

@@ -7411,36 +7411,16 @@ fn apply_function_dispatch(
         // containing special characters double-quoted with `"`→`""`
         // and `\`→`\\` escapes. (Comparison forms never reach here —
         // the parser expands them fieldwise at parse time.)
+        // v7.38 (read01, T9) — a `row(...)` constructor builds a first-class
+        // composite value (fields `f1..fN`), so row_to_json / to_json can emit
+        // a JSON object and the text form renders as `(a,b)`.
         "row" => {
-            let mut out = String::from("(");
-            for (i, v) in args.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                if matches!(v, Value::Null) {
-                    continue;
-                }
-                let field = value_to_format_text(v);
-                let needs_quote = field.is_empty()
-                    || field.chars().any(|c| {
-                        matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace()
-                    });
-                if needs_quote {
-                    out.push('"');
-                    for c in field.chars() {
-                        match c {
-                            '"' => out.push_str("\"\""),
-                            '\\' => out.push_str("\\\\"),
-                            other => out.push(other),
-                        }
-                    }
-                    out.push('"');
-                } else {
-                    out.push_str(&field);
-                }
-            }
-            out.push(')');
-            Ok(Value::text(out))
+            let fields = args
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (alloc::format!("f{}", i + 1), v.clone().into_owned()))
+                .collect();
+            Ok(Value::Composite(fields))
         }
         // PG `concat_ws(sep, val1 [, val2 ...])` — like concat but
         // with a separator inserted between each pair of NON-NULL
@@ -9649,10 +9629,19 @@ fn apply_function_dispatch(
         // v7.17.0 Phase 3.P0-28 — PG JSON builder family.
         // to_json / to_jsonb coerce any value to JSON text (NULL
         // becomes the JSON literal 'null', not SQL NULL).
-        "to_json" | "to_jsonb" => {
-            if args.len() != 1 {
+        // v7.38 (read01, T9) — row_to_json is to_json restricted to a composite;
+        // it accepts an optional pretty-print flag (ignored here). A composite
+        // argument renders as a JSON object via value_to_json_text.
+        "to_json" | "to_jsonb" | "row_to_json" | "row_to_jsonb" => {
+            let is_row = name == "row_to_json" || name == "row_to_jsonb";
+            let ok_arity = if is_row {
+                args.len() == 1 || args.len() == 2
+            } else {
+                args.len() == 1
+            };
+            if !ok_arity {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("to_json() takes 1 arg, got {}", args.len()),
+                    detail: alloc::format!("{name}() takes 1 arg, got {}", args.len()),
                 });
             }
             // Json input passes through verbatim — PG identity.
@@ -9662,7 +9651,7 @@ fn apply_function_dispatch(
                 Value::json(crate::json::value_to_json_text(&args[0]))
             };
             // to_jsonb yields canonical jsonb; to_json stays verbatim.
-            if name == "to_jsonb" {
+            if name == "to_jsonb" || name == "row_to_jsonb" {
                 Ok(crate::json::canonicalize_value(out))
             } else {
                 Ok(out)
