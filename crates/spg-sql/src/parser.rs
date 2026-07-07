@@ -16127,6 +16127,29 @@ impl Parser {
                             target,
                         });
                     }
+                    // v7.38 (read01 P6.-) — `normalize(text, FORM)` where FORM is
+                    // a bare keyword NFC / NFD / NFKC / NFKD. PG parses these as
+                    // keywords; SPG's lexer makes them plain idents (so they'd be
+                    // read as column refs). Lower the keyword to the string form
+                    // the evaluator already accepts.
+                    if first.eq_ignore_ascii_case("normalize")
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::Comma)
+                    {
+                        let form = match self.tokens.get(self.pos + 1) {
+                            Some(Token::Ident(f) | Token::QuotedIdent(f)) => {
+                                let up = f.to_ascii_uppercase();
+                                matches!(up.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD")
+                                    .then_some(up)
+                            }
+                            _ => None,
+                        };
+                        if let Some(up) = form {
+                            self.advance(); // comma
+                            self.advance(); // form keyword
+                            args.push(Expr::Literal(Literal::String(up)));
+                        }
+                    }
                     // v7.37.7 C.1.8 — PG `substring(str FROM pos FOR len)` syntactic
                     // form. Desugars to the comma-list shape evaluator already
                     // handles. Triggered after the first arg when the function
