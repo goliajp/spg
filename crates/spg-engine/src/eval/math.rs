@@ -218,6 +218,30 @@ pub(super) fn f64_round_half_away(x: f64) -> f64 {
     }
 }
 
+/// no_std-compatible `rint(x)` for f64 with the half-to-even (banker's) rule —
+/// the semantic PG uses for FLOAT8 (`round(2.5::float8) → 2`,
+/// `(-2.5)::float8::int → -2`), as opposed to NUMERIC's half-away-from-zero.
+pub(crate) fn f64_round_half_even(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    let fl = f64_floor(x);
+    let diff = x - fl;
+    if diff < 0.5 {
+        fl
+    } else if diff > 0.5 {
+        fl + 1.0
+    } else {
+        // Exactly halfway → round to the even neighbour.
+        let half = fl / 2.0;
+        if half == f64_floor(half) {
+            fl
+        } else {
+            fl + 1.0
+        }
+    }
+}
+
 /// no_std-compatible `ceil(x)` for f64. Same shape as
 /// `f64_floor` but rounds toward +infinity for fractional
 /// values. Negative fractions round toward zero

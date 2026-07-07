@@ -31,7 +31,7 @@ mod encoding;
 mod format;
 mod functions;
 mod inet;
-mod math;
+pub(crate) mod math;
 mod regexp;
 mod resolve;
 mod strings;

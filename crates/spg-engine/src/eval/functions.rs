@@ -9147,14 +9147,12 @@ fn apply_function_dispatch(
                     Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
                         Ok(args[0].clone().into_owned())
                     }
-                    // NOTE: PG rounds true `double precision` half-to-even
-                    // (round(2.5::float8)=2), but SPG collapses bare decimal
-                    // literals (which PG types as `numeric`, half-away) into
-                    // Float. Keeping half-away matches the dominant
-                    // `round(2.5)=3` case; the explicit-float8 divergence is
-                    // a known representation limitation, not fixable here
-                    // without literal-type tracking.
-                    Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
+                    // v7.38 (read01) — PG rounds `double precision` half-to-even
+                    // (round(2.5::float8)=2). Now that a bare `2.5` is a NUMERIC
+                    // literal (routed through the half-away numeric arm below), a
+                    // genuine Float here is an explicit double, so banker's rounding
+                    // is correct and no longer clashes with `round(2.5)=3`.
+                    Value::Float(x) => Ok(Value::Float(super::math::f64_round_half_even(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
                         // Half-away-from-zero on the magnitude, then
