@@ -189,6 +189,27 @@ pub(crate) const fn numeric_truncate_to_integer(scaled: i128, scale: u8) -> i128
     scaled / factor
 }
 
+/// Round a scaled NUMERIC to the nearest integer, half away from zero — the
+/// behaviour PG uses when assigning / casting `numeric` to an integer type
+/// (`1.5 → 2`, `-1.5 → -2`, `1.4 → 1`). Used by the integer-column coercion
+/// arms so an INSERT rounds like the `::int` cast rather than truncating.
+pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u8) -> i128 {
+    if scale == 0 {
+        return scaled;
+    }
+    let factor = pow10_i128_const(scale);
+    let neg = scaled < 0;
+    let abs = scaled.unsigned_abs() as i128;
+    let q = abs / factor;
+    let r = abs % factor;
+    let mag = if 2 * r >= factor { q + 1 } else { q };
+    if neg {
+        -mag
+    } else {
+        mag
+    }
+}
+
 /// Verify a scaled NUMERIC value fits the column's declared precision.
 /// `precision == 0` is the "unconstrained" form (bare `NUMERIC`); we
 /// skip the check there.

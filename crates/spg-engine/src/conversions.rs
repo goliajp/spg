@@ -14,7 +14,7 @@ use spg_storage::{ColumnSchema, DataType, StorageError, Value, VecEncoding};
 use crate::EngineError;
 use crate::eval::{self, EvalContext, EvalError};
 use crate::numeric::{
-    numeric_from_float, numeric_from_integer, numeric_rescale, numeric_truncate_to_integer,
+    numeric_from_float, numeric_from_integer, numeric_rescale, numeric_round_to_integer,
     parse_numeric_text,
 };
 
@@ -3358,17 +3358,20 @@ pub(crate) fn coerce_value(
             }
             Some(Value::Float((scaled as f64) / div))
         }
+        // v7.38 (read01) — coercing NUMERIC into an integer column rounds half
+        // away from zero (PG assignment cast: `1.5 → 2`), matching the `::int`
+        // cast path; it previously truncated (`1.7 → 1`).
         (Value::Numeric { scaled, scale }, DataType::Int) => {
-            let truncated = numeric_truncate_to_integer(scaled, scale);
-            i32::try_from(truncated).ok().map(Value::Int)
+            let rounded = numeric_round_to_integer(scaled, scale);
+            i32::try_from(rounded).ok().map(Value::Int)
         }
         (Value::Numeric { scaled, scale }, DataType::BigInt) => {
-            let truncated = numeric_truncate_to_integer(scaled, scale);
-            i64::try_from(truncated).ok().map(Value::BigInt)
+            let rounded = numeric_round_to_integer(scaled, scale);
+            i64::try_from(rounded).ok().map(Value::BigInt)
         }
         (Value::Numeric { scaled, scale }, DataType::SmallInt) => {
-            let truncated = numeric_truncate_to_integer(scaled, scale);
-            i16::try_from(truncated).ok().map(Value::SmallInt)
+            let rounded = numeric_round_to_integer(scaled, scale);
+            i16::try_from(rounded).ok().map(Value::SmallInt)
         }
         // VARCHAR(n) enforces an upper bound on character count.
         (Value::Text(s), DataType::Varchar(max)) => {
