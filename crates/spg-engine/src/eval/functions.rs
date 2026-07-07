@@ -5652,10 +5652,26 @@ fn apply_function_dispatch(
             let y = int_of(&args[0])?;
             let m = int_of(&args[1])?;
             let d = int_of(&args[2])?;
-            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            // v7.38 (read01) — validate the day against the month's real length
+            // so PG's error (not SPG's silent roll-over: `make_date(2024,2,30)`
+            // must fail, not become 2024-03-01). Feb honours the leap year.
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let max_day = match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => {
+                    if leap {
+                        29
+                    } else {
+                        28
+                    }
+                }
+                _ => 0,
+            };
+            if !(1..=12).contains(&m) || d < 1 || d > max_day {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "make_date(): invalid date ({y}, {m}, {d})"
+                        "date field value out of range: {y}-{m:02}-{d:02}"
                     ),
                 });
             }
