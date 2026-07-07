@@ -1192,6 +1192,41 @@ enum PathStep {
     Field(String),
     Index(usize),
     Wildcard,
+    // v7.38 (read01, T8) — SQL/JSON path filter sublanguage.
+    /// `[N to M]` — an inclusive array-index range.
+    Range(usize, usize),
+    /// `? (@... <op> <literal>)` — keep the current items whose accessor
+    /// satisfies the comparison.
+    Filter(FilterPred),
+    /// `.size()` — the length of an array (or 1 for a scalar, per PG lax mode).
+    Size,
+    /// `.type()` — the JSON type name of the current item.
+    TypeOf,
+}
+
+#[derive(Debug, Clone)]
+struct FilterPred {
+    /// Accessor after `@`: empty = `@` itself, `["p"]` = `@.p`, etc.
+    path: Vec<String>,
+    op: FilterOp,
+    val: FilterVal,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FilterOp {
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Eq,
+    Ne,
+}
+
+#[derive(Debug, Clone)]
+enum FilterVal {
+    Num(f64),
+    Str(String),
+    Bool(bool),
 }
 
 fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
@@ -1226,6 +1261,7 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                     while i < chars.len()
                         && chars[i] != '.'
                         && chars[i] != '['
+                        && chars[i] != '('
                         && !chars[i].is_whitespace()
                     {
                         i += 1;
@@ -1235,8 +1271,39 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                             detail: "jsonpath: missing field name after '.'".into(),
                         });
                     }
-                    steps.push(PathStep::Field(chars[start..i].iter().collect()));
+                    let name: String = chars[start..i].iter().collect();
+                    // v7.38 (read01, T8) — `.size()` / `.type()` item methods.
+                    if i < chars.len() && chars[i] == '(' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != ')' {
+                            i += 1;
+                        }
+                        if i >= chars.len() {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "jsonpath: unterminated method call".into(),
+                            });
+                        }
+                        i += 1; // )
+                        match name.as_str() {
+                            "size" => steps.push(PathStep::Size),
+                            "type" => steps.push(PathStep::TypeOf),
+                            other => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: alloc::format!("jsonpath: unsupported method .{other}()"),
+                                });
+                            }
+                        }
+                    } else {
+                        steps.push(PathStep::Field(name));
+                    }
                 }
+            }
+            '?' => {
+                // v7.38 (read01, T8) — filter `? ( @... <op> <literal> )`.
+                i += 1;
+                let (pred, ni) = parse_filter_pred(&chars, i)?;
+                i = ni;
+                steps.push(PathStep::Filter(pred));
             }
             '[' => {
                 i += 1;
@@ -1269,13 +1336,43 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                             .map_err(|_| EvalError::TypeMismatch {
                                 detail: "jsonpath: invalid array index".into(),
                             })?;
-                    if i >= chars.len() || chars[i] != ']' {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "jsonpath: expected ']' after array index".into(),
-                        });
+                    // v7.38 (read01, T8) — `[N to M]` inclusive range.
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        i += 1;
                     }
-                    i += 1;
-                    steps.push(PathStep::Index(idx));
+                    if i + 1 < chars.len() && chars[i] == 't' && chars[i + 1] == 'o' {
+                        i += 2;
+                        while i < chars.len() && chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                        let s2 = i;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let hi: usize = chars[s2..i].iter().collect::<String>().parse().map_err(
+                            |_| EvalError::TypeMismatch {
+                                detail: "jsonpath: invalid range upper bound".into(),
+                            },
+                        )?;
+                        while i < chars.len() && chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                        if i >= chars.len() || chars[i] != ']' {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "jsonpath: expected ']' after range".into(),
+                            });
+                        }
+                        i += 1;
+                        steps.push(PathStep::Range(idx, hi));
+                    } else {
+                        if i >= chars.len() || chars[i] != ']' {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "jsonpath: expected ']' after array index".into(),
+                            });
+                        }
+                        i += 1;
+                        steps.push(PathStep::Index(idx));
+                    }
                 }
             }
             c if c.is_whitespace() => {
@@ -1284,13 +1381,189 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
             c => {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "jsonpath: unexpected char '{c}' (v7.17 supports `$.field`, `[N]`, `[*]` only)"
+                        "jsonpath: unexpected char '{c}' (supports `$.field`, `[N]`, `[N to M]`, `[*]`, `? (...)`, `.size()`, `.type()`)"
                     ),
                 });
             }
         }
     }
     Ok(steps)
+}
+
+/// v7.38 (read01, T8) — parse a filter predicate body `( @[.field]* <op>
+/// <literal> )` starting just after the `?`. Supports a single comparison of
+/// the current-item accessor against a number / string / boolean literal.
+fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize), EvalError> {
+    let err = |m: &str| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonpath filter: {m}"),
+    };
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] != '(' {
+        return Err(err("expected '(' after '?'"));
+    }
+    i += 1;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] != '@' {
+        return Err(err("only `@`-based predicates are supported"));
+    }
+    i += 1;
+    let mut path: Vec<String> = Vec::new();
+    while i < chars.len() && chars[i] == '.' {
+        i += 1;
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        path.push(chars[start..i].iter().collect());
+    }
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    // Operator: two-char forms first.
+    let op = if i + 1 < chars.len() && chars[i] == '>' && chars[i + 1] == '=' {
+        i += 2;
+        FilterOp::Ge
+    } else if i + 1 < chars.len() && chars[i] == '<' && chars[i + 1] == '=' {
+        i += 2;
+        FilterOp::Le
+    } else if i + 1 < chars.len() && chars[i] == '=' && chars[i + 1] == '=' {
+        i += 2;
+        FilterOp::Eq
+    } else if i + 1 < chars.len() && chars[i] == '!' && chars[i + 1] == '=' {
+        i += 2;
+        FilterOp::Ne
+    } else if i < chars.len() && chars[i] == '>' {
+        i += 1;
+        FilterOp::Gt
+    } else if i < chars.len() && chars[i] == '<' {
+        i += 1;
+        FilterOp::Lt
+    } else {
+        return Err(err("expected a comparison operator (> < >= <= == !=)"));
+    };
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    // Literal: quoted string, number, or true/false.
+    let val = if i < chars.len() && chars[i] == '"' {
+        i += 1;
+        let start = i;
+        while i < chars.len() && chars[i] != '"' {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return Err(err("unterminated string literal"));
+        }
+        let s: String = chars[start..i].iter().collect();
+        i += 1;
+        FilterVal::Str(s)
+    } else if chars[i..].starts_with(&['t', 'r', 'u', 'e']) {
+        i += 4;
+        FilterVal::Bool(true)
+    } else if chars[i..].starts_with(&['f', 'a', 'l', 's', 'e']) {
+        i += 5;
+        FilterVal::Bool(false)
+    } else {
+        let start = i;
+        if i < chars.len() && (chars[i] == '-' || chars[i] == '+') {
+            i += 1;
+        }
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        let num: f64 = chars[start..i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .map_err(|_| err("invalid numeric literal"))?;
+        FilterVal::Num(num)
+    };
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] != ')' {
+        return Err(err("expected ')' to close the filter"));
+    }
+    i += 1;
+    Ok((FilterPred { path, op, val }, i))
+}
+
+/// v7.38 (read01, T8) — the PG `.type()` name of a JSON value.
+fn json_type_name(v: &JsonValue) -> &'static str {
+    match v {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) | JsonValue::NumberText(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+/// Numeric value of a JSON scalar for a filter comparison, if it is a number.
+fn json_num(v: &JsonValue) -> Option<f64> {
+    match v {
+        JsonValue::Number(n) => Some(*n),
+        JsonValue::NumberText(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Resolve `@.a.b` (the accessor `path`) starting from `node`.
+fn resolve_accessor<'a>(node: &'a JsonValue, path: &[String]) -> Option<&'a JsonValue> {
+    let mut cur = node;
+    for key in path {
+        match cur {
+            JsonValue::Object(entries) => {
+                cur = &entries.iter().find(|(k, _)| k == key)?.1;
+            }
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// Evaluate a filter predicate against the current item.
+fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
+    let Some(target) = resolve_accessor(node, &pred.path) else {
+        return false;
+    };
+    match &pred.val {
+        FilterVal::Num(rhs) => match json_num(target) {
+            Some(lhs) => match pred.op {
+                FilterOp::Gt => lhs > *rhs,
+                FilterOp::Lt => lhs < *rhs,
+                FilterOp::Ge => lhs >= *rhs,
+                FilterOp::Le => lhs <= *rhs,
+                FilterOp::Eq => lhs == *rhs,
+                FilterOp::Ne => lhs != *rhs,
+            },
+            None => false,
+        },
+        FilterVal::Str(rhs) => match target {
+            JsonValue::String(lhs) => match pred.op {
+                FilterOp::Eq => lhs == rhs,
+                FilterOp::Ne => lhs != rhs,
+                FilterOp::Gt => lhs.as_str() > rhs.as_str(),
+                FilterOp::Lt => lhs.as_str() < rhs.as_str(),
+                FilterOp::Ge => lhs.as_str() >= rhs.as_str(),
+                FilterOp::Le => lhs.as_str() <= rhs.as_str(),
+            },
+            _ => false,
+        },
+        FilterVal::Bool(rhs) => match target {
+            JsonValue::Bool(lhs) => match pred.op {
+                FilterOp::Eq => lhs == rhs,
+                FilterOp::Ne => lhs != rhs,
+                _ => false,
+            },
+            _ => false,
+        },
+    }
 }
 
 fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
@@ -1311,6 +1584,27 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
                 }
                 (PathStep::Wildcard, JsonValue::Array(items)) => {
                     next.extend(items.iter().cloned());
+                }
+                // v7.38 (read01, T8) — range / filter / methods.
+                (PathStep::Range(lo, hi), JsonValue::Array(items)) => {
+                    for idx in *lo..=*hi {
+                        if let Some(v) = items.get(idx) {
+                            next.push(v.clone());
+                        }
+                    }
+                }
+                (PathStep::Filter(pred), node) => {
+                    if filter_matches(node, pred) {
+                        next.push(node.clone());
+                    }
+                }
+                (PathStep::Size, JsonValue::Array(items)) => {
+                    next.push(JsonValue::Number(items.len() as f64));
+                }
+                // PG lax mode: `.size()` of a non-array is 1.
+                (PathStep::Size, _) => next.push(JsonValue::Number(1.0)),
+                (PathStep::TypeOf, node) => {
+                    next.push(JsonValue::String(json_type_name(node).into()));
                 }
                 _ => {} // no match at this branch
             }
