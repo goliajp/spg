@@ -38,6 +38,32 @@ pub(super) fn extract_field(
         let mons = months % 12;
         let secs_total = micros / 1_000_000;
         let frac = micros % 1_000_000;
+        // v7.38 (read01 sweep) — the fraction-bearing fields keep sub-second
+        // precision as NUMERIC (PG), instead of truncating to an integer.
+        // Epoch / Second render microseconds (scale 6); Millisecond scale 3.
+        match field {
+            F::Epoch => {
+                let total_secs =
+                    i64::from(months) * 30 * 86_400 + i64::from(days) * 86_400 + secs_total;
+                return Ok(Value::Numeric {
+                    scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
+                    scale: 6,
+                });
+            }
+            F::Second => {
+                return Ok(Value::Numeric {
+                    scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
+                    scale: 6,
+                });
+            }
+            F::Millisecond => {
+                return Ok(Value::Numeric {
+                    scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
+                    scale: 3,
+                });
+            }
+            _ => {}
+        }
         let result = match field {
             F::Year => i64::from(years),
             F::Month => i64::from(mons),
@@ -101,6 +127,30 @@ pub(super) fn extract_field(
     let mm = (secs / 60) % 60;
     let ss = secs % 60;
     let frac = day_micros % 1_000_000;
+    // v7.38 (read01 sweep) — fraction-bearing fields keep sub-second precision
+    // as NUMERIC (PG). Epoch / Second scale 6 (microseconds); Millisecond scale 3.
+    match field {
+        F::Epoch => {
+            let total_secs = i64::from(days) * 86_400 + secs;
+            return Ok(Value::Numeric {
+                scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
+                scale: 6,
+            });
+        }
+        F::Second => {
+            return Ok(Value::Numeric {
+                scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
+                scale: 6,
+            });
+        }
+        F::Millisecond => {
+            return Ok(Value::Numeric {
+                scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
+                scale: 3,
+            });
+        }
+        _ => {}
+    }
     let result = match field {
         F::Year => i64::from(y),
         F::Month => i64::from(m),
