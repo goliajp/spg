@@ -3119,6 +3119,24 @@ pub(crate) fn coerce_value(
         (Value::BigIntArray(items), DataType::FloatArray) => Some(Value::FloatArray(
             items.into_iter().map(|o| o.map(|n| n as f64)).collect(),
         )),
+        // v7.38 (read01) — widen a NUMERIC[] into float8[] element-wise (PG
+        // accepts `ARRAY[1.5::numeric]::float8[]` and coerces a numeric array
+        // into a float8[] column on INSERT). Mirrors the scalar Numeric→Float.
+        #[allow(clippy::cast_precision_loss)]
+        (Value::NumericArray(items), DataType::FloatArray) => Some(Value::FloatArray(
+            items
+                .into_iter()
+                .map(|o| {
+                    o.map(|(scaled, scale)| {
+                        let mut div = 1.0_f64;
+                        for _ in 0..scale {
+                            div *= 10.0;
+                        }
+                        scaled as f64 / div
+                    })
+                })
+                .collect(),
+        )),
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
         }
