@@ -326,6 +326,49 @@ fn eval_stack_ptr() -> usize {
     core::ptr::addr_of!(probe) as usize
 }
 
+/// v7.38 (read01 P6.40) — enforce a user DOMAIN's NOT NULL + CHECK constraints
+/// on a value being cast to it (`x::domain`). NULL fails a NOT NULL domain;
+/// otherwise every CHECK (which references the pseudo-column `VALUE`) must not
+/// evaluate to false. Returns the value unchanged when all constraints pass.
+fn apply_domain_constraints<'a>(
+    v: Value<'a>,
+    dom: &spg_storage::DomainDef,
+    name: &str,
+) -> Result<Value<'a>, EvalError> {
+    if matches!(v, Value::Null) {
+        if dom.nullable {
+            return Ok(v);
+        }
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("domain {name} does not allow null values"),
+        });
+    }
+    for src in &dom.checks {
+        let expr = spg_sql::parser::parse_expression(src).map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("domain {name} CHECK ({src:?}) failed to re-parse: {e:?}"),
+        })?;
+        let synth_cols = alloc::vec![spg_storage::ColumnSchema::new(
+            "value",
+            dom.base_type,
+            dom.nullable,
+        )];
+        let synth_ctx = EvalContext::new(&synth_cols, None);
+        // Owned copy so the temporary row doesn't borrow `v`'s lifetime.
+        let synth_row = spg_storage::Row {
+            values: alloc::vec![v.clone().into_owned()],
+        };
+        let r = eval_expr(&expr, &synth_row, &synth_ctx)?;
+        if matches!(r, Value::Bool(false)) {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "value for domain {name} violates check constraint \"{name}_check\""
+                ),
+            });
+        }
+    }
+    Ok(v)
+}
+
 pub fn eval_expr(
     expr: &Expr,
     row: &Row<'static>,
@@ -415,6 +458,17 @@ pub fn eval_expr(
         }
         Expr::Cast { expr, target } => {
             let v = eval_expr(expr, row, ctx)?;
+            // v7.38 (read01 P6.40) — a cast to a user DOMAIN (`x::posint`)
+            // enforces the domain's NOT NULL + CHECK constraints, matching PG.
+            // The base-type coercion already happened when `v` was produced
+            // (the domain is a constrained alias of its base type); here we
+            // only run the constraints.
+            if let CastTarget::Named(name) = target
+                && let Some(cat) = ctx.catalog
+                && let Some(dom) = cat.domain_types().get(name.as_str())
+            {
+                return apply_domain_constraints(v, dom, name);
+            }
             cast_value(v, target.clone())
         }
         Expr::IsNull { expr, negated } => {
