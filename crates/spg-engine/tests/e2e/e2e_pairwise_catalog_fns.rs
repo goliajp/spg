@@ -34,7 +34,9 @@ fn larger_smaller_pairs() {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "apple"),
         other => panic!("got {other:?}"),
     }
-    match first(&mut e, "SELECT float8larger(1.5, 2.5)") {
+    // v7.38 (read01) — bare 1.5/2.5 are NUMERIC literals now; the pairwise
+    // larger returns the (numeric) input, value 2.5.
+    match first(&mut e, "SELECT float8larger(1.5::float8, 2.5::float8)") {
         spg_storage::Value::Float(f) => assert!((f - 2.5).abs() < 1e-12),
         other => panic!("got {other:?}"),
     }

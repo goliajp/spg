@@ -175,7 +175,11 @@ fn float8_out_uses_scientific_notation_like_pg() {
         ("3.14e100", "3.14e+100"),
         ("1000000.0", "1000000"),
         ("0.0", "0"),
-        ("-0.0", "-0"),
+        // v7.38 (read01) — `-0.0` is a NUMERIC literal now (numeric has no
+        // negative zero), so `(-0.0)::float8` is +0; PG agrees. An explicit
+        // float negative zero (`-0.0::float8`) still renders "-0".
+        ("-0.0", "0"),
+        ("-0.0::float8", "-0"),
     ] {
         assert_eq!(
             txt(&mut e, &format!("SELECT ({expr})::float8::text")),
@@ -183,9 +187,11 @@ fn float8_out_uses_scientific_notation_like_pg() {
             "float8out({expr})"
         );
     }
-    // Array literal + column paths use float8out too.
+    // Array literal + column paths use float8out too. (v7.38 read01 — the
+    // elements are cast explicitly: bare `2.0`/`0.00001` are NUMERIC literals
+    // now, and array-element type unification to float8 is a separate residual.)
     assert_eq!(
-        txt(&mut e, "SELECT (ARRAY[1e30::float8, 2.0, 0.00001])::text"),
+        txt(&mut e, "SELECT (ARRAY[1e30::float8, 2.0::float8, 0.00001::float8])::text"),
         "{1e+30,2,1e-05}"
     );
     // Non-finite values keep their float8out spelling.

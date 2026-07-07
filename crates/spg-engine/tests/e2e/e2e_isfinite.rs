@@ -34,7 +34,7 @@ fn isfinite_date_timestamp_interval() {
 #[test]
 fn isfinite_float_infinity() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT isfinite(1.5)")));
+    assert!(as_bool(&first(&mut e, "SELECT isfinite(1.5::float8)")));
     // Infinity via division overflow shape.
     assert!(!as_bool(&first(
         &mut e,

@@ -20,7 +20,12 @@ fn float_result(e: &mut Engine, sql: &str) -> f64 {
     );
     match &row[0] {
         Value::Float(x) => *x,
-        other => panic!("expected Float, got {other:?}"),
+        // v7.38 (read01) — a dotted literal is now NUMERIC, so ceil/floor over a
+        // bare-literal input returns NUMERIC; accept it and read the f64 value.
+        Value::Numeric { scaled, scale } => {
+            *scaled as f64 / 10f64.powi(i32::from(*scale))
+        }
+        other => panic!("expected numeric, got {other:?}"),
     }
 }
 
@@ -149,9 +154,16 @@ fn ceil_text_arg_errors() {
 
 #[test]
 fn ceil_column_type_is_float_for_float_input() {
+    // v7.38 (read01) — `1.5` is a NUMERIC literal (PG), so ceil() over it yields
+    // NUMERIC; a genuine float input (`::float8`) still yields float.
     let mut e = Engine::new();
     let r = e.execute("SELECT ceil(1.5)").unwrap();
     let QueryResult::Rows { columns, .. } = r else {
+        panic!()
+    };
+    assert!(matches!(columns[0].ty, spg_storage::DataType::Numeric { .. }));
+    let r2 = e.execute("SELECT ceil(1.5::float8)").unwrap();
+    let QueryResult::Rows { columns, .. } = r2 else {
         panic!()
     };
     assert_eq!(columns[0].ty, spg_storage::DataType::Float);

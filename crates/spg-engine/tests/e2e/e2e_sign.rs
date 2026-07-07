@@ -19,6 +19,9 @@ fn val_as_f64(v: &Value) -> f64 {
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
         Value::SmallInt(n) => f64::from(*n),
+        // v7.38 (read01) — a dotted literal is now NUMERIC, so sign() over a
+        // bare-literal input returns NUMERIC; read its f64 value.
+        Value::Numeric { scaled, scale } => *scaled as f64 / 10f64.powi(i32::from(*scale)),
         other => panic!("got {other:?}"),
     }
 }

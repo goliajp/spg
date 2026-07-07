@@ -1063,6 +1063,34 @@ fn apply_binary_numeric(
     l: Value<'static>,
     r: Value<'static>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01) — an unknown-type string operand against NUMERIC coerces to
+    // numeric (PG): `3.5::numeric = '3.5'`, `n <op> '2'`. Do it up front so both
+    // the comparison and arithmetic paths see two numerics; a string that isn't
+    // a valid numeric falls through to the type error (matching PG `n = 'abc'`).
+    // Concat is the exception — `numeric || text` is text concatenation.
+    if !matches!(op, BinOp::Concat) {
+        let to_num = |v: &Value<'static>| -> Option<Value<'static>> {
+            match v {
+                Value::Text(s) => crate::conversions::coerce_value(
+                    Value::text(s.as_ref()),
+                    spg_storage::DataType::Numeric {
+                        precision: 0,
+                        scale: 0,
+                    },
+                    "",
+                    0,
+                )
+                .ok(),
+                _ => None,
+            }
+        };
+        if let Some(nl) = to_num(&l) {
+            return apply_binary_numeric(op, nl, r);
+        }
+        if let Some(nr) = to_num(&r) {
+            return apply_binary_numeric(op, l, nr);
+        }
+    }
     // Float still wins — Numeric + Float coerces both to f64 and runs
     // through the float path. PG demotes Numeric to float in this mix
     // too (the documented behaviour for `numeric + double precision`).
@@ -2863,6 +2891,43 @@ pub(super) fn compare(
         (Value::Int(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
         (Value::BigInt(a), Value::Int(b)) => a.cmp(&i64::from(*b)),
         (Value::BigInt(a), Value::BigInt(b)) => a.cmp(b),
+        // v7.38 (read01) — NUMERIC vs NUMERIC / integer compares exactly on a
+        // shared scale (bare decimal literals are numeric now, so `n = 9.99`
+        // lands here). A numeric-vs-float mix still falls to the float arm.
+        (a, b)
+            if (matches!(a, Value::Numeric { .. }) || matches!(b, Value::Numeric { .. }))
+                && !matches!(a.data_type(), Some(DataType::Float))
+                && !matches!(b.data_type(), Some(DataType::Float)) =>
+        {
+            // Inline widen (numeric_or_widen wants `&Value<'static>`; these
+            // operands are shorter-lived but only their Copy fields are read).
+            let widen = |v: &Value<'_>| -> Option<(i128, u8)> {
+                match v {
+                    Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+                    Value::Int(n) => Some((i128::from(*n), 0)),
+                    Value::SmallInt(n) => Some((i128::from(*n), 0)),
+                    Value::BigInt(n) => Some((i128::from(*n), 0)),
+                    _ => None,
+                }
+            };
+            let mismatch = || EvalError::TypeMismatch {
+                detail: format!(
+                    "comparison between {:?} and {:?}",
+                    a.data_type(),
+                    b.data_type()
+                ),
+            };
+            let (na, sa) = widen(a).ok_or_else(mismatch)?;
+            let (nb, sb) = widen(b).ok_or_else(mismatch)?;
+            let target = sa.max(sb);
+            let lhs = rescale(na, sa, target).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            let rhs = rescale(nb, sb, target).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            lhs.cmp(&rhs)
+        }
         (a, b)
             if matches!(a.data_type(), Some(DataType::Float))
                 || matches!(b.data_type(), Some(DataType::Float)) =>

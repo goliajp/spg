@@ -190,6 +190,24 @@ fn is_json_each_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("json_each")
 }
 
+/// v7.38 (read01) — parse a lexer `Token::Numeric` source string (digits with
+/// an optional single `.`, no sign, no exponent) into `(unscaled, scale)` for
+/// `Literal::Numeric`. Returns `None` if the mantissa overflows i128.
+fn parse_decimal_literal(s: &str) -> Option<(i128, u8)> {
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    if frac_part.len() > u8::MAX as usize {
+        return None;
+    }
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    let mantissa: i128 = digits.parse().ok()?;
+    Some((mantissa, frac_part.len() as u8))
+}
+
 /// `jsonb_to_record` / `jsonb_to_recordset` (+ `json_` variants) — the
 /// record-returning JSON functions that take a `AS alias(col type, …)`
 /// column-definition list in FROM position.
@@ -13253,6 +13271,18 @@ impl Parser {
         match self.advance() {
             Token::Integer(n) => Ok(Expr::Literal(Literal::Integer(n))),
             Token::Float(x) => Ok(Expr::Literal(Literal::Float(x))),
+            // v7.38 (read01) — dotted / over-i64 literal → exact NUMERIC (PG),
+            // carrying the source mantissa + scale so no precision is lost. A
+            // literal too wide for i128 falls back to double precision.
+            Token::Numeric(s) => match parse_decimal_literal(&s) {
+                Some((unscaled, scale)) => {
+                    Ok(Expr::Literal(Literal::Numeric { unscaled, scale }))
+                }
+                None => s
+                    .parse::<f64>()
+                    .map(|x| Expr::Literal(Literal::Float(x)))
+                    .map_err(|_| self.err(format!("invalid numeric literal {s:?}"))),
+            },
             Token::String(s) => Ok(Expr::Literal(Literal::String(s))),
             Token::True => Ok(Expr::Literal(Literal::Bool(true))),
             Token::False => Ok(Expr::Literal(Literal::Bool(false))),
@@ -16587,6 +16617,16 @@ fn extract_numeric_literal(e: &Expr) -> Option<f32> {
     match e {
         Expr::Literal(Literal::Integer(n)) => Some(*n as f32),
         Expr::Literal(Literal::Float(x)) => Some(*x as f32),
+        // v7.38 (read01) — a dotted literal is now NUMERIC, so a vector element
+        // like `2.5` arrives as Literal::Numeric; widen it into f32. (`no_std`,
+        // so scale the divisor by hand instead of `f32::powi`.)
+        Expr::Literal(Literal::Numeric { unscaled, scale }) => {
+            let mut div = 1.0f32;
+            for _ in 0..*scale {
+                div *= 10.0;
+            }
+            Some(*unscaled as f32 / div)
+        }
         Expr::Unary {
             op: UnOp::Neg,
             expr,
