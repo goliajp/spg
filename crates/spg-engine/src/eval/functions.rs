@@ -68,6 +68,21 @@ pub(super) fn apply_function(
     apply_function_dispatch(&name.to_ascii_lowercase(), args, ctx)
 }
 
+/// v7.38 (read01 P6.31) — count the nodes of a tsquery AST the way PG's
+/// numnode() does: every lexeme term and every operator (AND / OR / NOT /
+/// PHRASE) counts as one node.
+fn count_tsquery_nodes(ast: &spg_storage::TsQueryAst) -> i32 {
+    use spg_storage::TsQueryAst as Q;
+    match ast {
+        Q::Term { .. } => 1,
+        Q::Not(inner) => 1 + count_tsquery_nodes(inner),
+        Q::And(l, r) | Q::Or(l, r) => 1 + count_tsquery_nodes(l) + count_tsquery_nodes(r),
+        Q::Phrase { left, right, .. } => {
+            1 + count_tsquery_nodes(left) + count_tsquery_nodes(right)
+        }
+    }
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -10928,6 +10943,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.38 (read01 P6.31) — a real tsquery value: count each
+                // lexeme and each operator node exactly (PG's numnode).
+                Value::TsQuery(ast) => Ok(Value::Int(count_tsquery_nodes(ast))),
                 Value::Text(s) => {
                     let words = s
                         .split(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == '!' || c == '(' || c == ')')
