@@ -53,13 +53,36 @@ fn delete_through_simple_view_removes_from_base() {
 }
 
 #[test]
-fn view_with_where_is_not_auto_updatable() {
+fn view_with_where_is_auto_updatable() {
+    // v7.38 (read01 P6.46) — a simple single-table view WITH a WHERE is
+    // auto-updatable in PG: the view's WHERE is AND-ed onto UPDATE/DELETE so
+    // only rows visible through the view are touched, and INSERT goes straight
+    // to the base (no WITH CHECK OPTION, so it need not satisfy the WHERE).
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE base (id INT, name TEXT)");
+    e.execute("INSERT INTO base VALUES (5, 'lo'), (20, 'hi')").unwrap();
     ddl(&mut e, "CREATE VIEW v AS SELECT id, name FROM base WHERE id > 10");
-    // INSERT should fail because the view isn't simple-query auto-updatable.
-    let err = e.execute("INSERT INTO v (id, name) VALUES (1, 'x')");
-    assert!(err.is_err(), "expected error inserting into non-auto-updatable view");
+
+    // UPDATE only touches rows visible through the view (id > 10).
+    e.execute("UPDATE v SET name = 'HI' WHERE id = 20").unwrap();
+    e.execute("UPDATE v SET name = 'nope' WHERE id = 5").unwrap(); // filtered out
+    let names = |e: &mut Engine, sql: &str| match e.execute(sql).unwrap() {
+        spg_engine::QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
+            spg_storage::Value::Text(s) => s.to_string(),
+            v => format!("{v:?}"),
+        },
+        _ => panic!(),
+    };
+    assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 20"), "HI");
+    assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 5"), "lo"); // untouched
+
+    // INSERT succeeds (no CHECK OPTION), landing in the base table.
+    e.execute("INSERT INTO v (id, name) VALUES (30, 'new')").unwrap();
+    assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 30"), "new");
+
+    // DELETE only removes view-visible rows.
+    e.execute("DELETE FROM v WHERE id = 5").unwrap(); // filtered out, no-op
+    assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 5"), "lo");
 }
 
 #[test]

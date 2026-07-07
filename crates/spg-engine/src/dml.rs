@@ -28,10 +28,15 @@ use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 ///   - view_name is not a view (a real table → caller's existing path)
 ///   - the view's body is not a simple-query shape
 ///   - the view's `columns:` field is non-empty (column rename)
+/// v7.38 (read01 P6.46) — resolve an auto-updatable simple view to its base
+/// table plus the view's own WHERE predicate (if any). UPDATE / DELETE on the
+/// view rewrite to the base table AND-ing the view's WHERE onto the caller's;
+/// INSERT ignores the WHERE (no WITH CHECK OPTION support yet). Returns `None`
+/// when the view is not a simple single-table projection.
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
-) -> Option<String> {
+) -> Option<(String, Option<spg_sql::ast::Expr>)> {
     let view = catalog.views().get(view_name)?;
     // Column-rename views are NOT auto-updatable: PG-faithful behavior
     // because the rename would need to be applied to caller's column
@@ -44,10 +49,10 @@ fn view_redirect_to_simple_base(
         spg_sql::ast::Statement::Select(s) => s,
         _ => return None,
     };
-    // simple-query shape: every reject clause must be empty / None.
+    // simple-query shape: every reject clause must be empty / None. A WHERE is
+    // allowed (PG-auto-updatable) — it is threaded back to the caller.
     if !select.ctes.is_empty()
         || select.distinct
-        || select.where_.is_some()
         || select.group_by.is_some()
         || select.group_by_all
         || select.having.is_some()
@@ -79,7 +84,24 @@ fn view_redirect_to_simple_base(
             }
         }
     }
-    Some(from.primary.name.clone())
+    Some((from.primary.name.clone(), select.where_))
+}
+
+/// v7.38 (read01 P6.46) — AND two optional predicates (the view's WHERE and the
+/// caller's WHERE) into one.
+fn and_optional_predicates(
+    a: Option<spg_sql::ast::Expr>,
+    b: Option<spg_sql::ast::Expr>,
+) -> Option<spg_sql::ast::Expr> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(spg_sql::ast::Expr::Binary {
+            lhs: alloc::boxed::Box::new(x),
+            op: spg_sql::ast::BinOp::And,
+            rhs: alloc::boxed::Box::new(y),
+        }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
 }
 use spg_storage::{ColumnSchema, Row, StorageError, Value};
 
@@ -124,10 +146,15 @@ impl Engine {
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
         }
-        // v7.37.19 (19.13) — auto-updatable view redirect.
-        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+        // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
+        // view WHERE is AND-ed onto the caller's so only rows visible through
+        // the view are updated.
+        if let Some((base, view_where)) =
+            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
+        {
             let mut rewritten = stmt.clone();
             rewritten.table = base;
+            rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
             return self.exec_update_cancel(&rewritten, cancel);
         }
         // v7.37 D.47 (partial) — UPDATE on a partition parent fans out to every
@@ -970,10 +997,15 @@ impl Engine {
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
         }
-        // v7.37.19 (19.13) — auto-updatable view redirect.
-        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+        // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
+        // view WHERE is AND-ed onto the caller's so only rows visible through
+        // the view are deleted.
+        if let Some((base, view_where)) =
+            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
+        {
             let mut rewritten = stmt.clone();
             rewritten.table = base;
+            rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
             return self.exec_delete_cancel(&rewritten, cancel);
         }
         // v7.37 D.46 — DELETE on a partition parent fans out to every child;
@@ -1490,7 +1522,11 @@ impl Engine {
         // INSERT INTO base_table (cols) VALUES (...) when the view
         // is a simple-query shape (SELECT col1, col2, ... FROM base
         // with no joins / WHERE / GROUP BY / aggregates / etc).
-        if let Some(base) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+        // v7.38 (P6.46) — INSERT into a WHERE-view goes straight to the base;
+        // the view's WHERE only filters reads (no WITH CHECK OPTION yet).
+        if let Some((base, _view_where)) =
+            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
+        {
             stmt.table = base;
         }
         // v7.37.6-B(sentori Epic 2 P0)— route INSERTs that target
