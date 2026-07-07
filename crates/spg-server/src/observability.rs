@@ -578,6 +578,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
             match c.ty {
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
+                DataType::Real => 4,
                 DataType::BigInt
                 | DataType::Date
                 | DataType::Timestamp

@@ -522,6 +522,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Int(_) => "integer",
         Value::BigInt(_) => "bigint",
         Value::Float(_) => "double precision",
+        Value::Real(_) => "real",
         Value::Text(_) => "text",
         Value::Bool(_) => "boolean",
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => "vector",

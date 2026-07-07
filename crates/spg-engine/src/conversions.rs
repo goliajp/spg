@@ -1869,7 +1869,8 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         }
         // Width-suffixed float spellings and OID — SPG has one
         // float representation and OIDs are plain integers.
-        "float4" | "real" | "float8" | "double precision" | "float" => DataType::Float,
+        "float4" | "real" => DataType::Real,
+        "float8" | "double precision" | "float" => DataType::Float,
         "oid" => DataType::BigInt,
         // TIME [WITHOUT TIME ZONE] — first-class since the codec
         // carries Value::Time; the coerce path parses HH:MM:SS.
@@ -2564,6 +2565,20 @@ pub(crate) fn coerce_value(
         }
         (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
         (Value::Text(s), DataType::Float) => s.trim().parse::<f64>().ok().map(Value::Float),
+        // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
+        (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
+        (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
+        (Value::BigInt(n), DataType::Real) => Some(Value::Real(n as f32)),
+        (Value::Float(x), DataType::Real) => Some(Value::Real(x as f32)),
+        (Value::Numeric { scaled, scale }, DataType::Real) => {
+            let mut div = 1.0f64;
+            for _ in 0..scale {
+                div *= 10.0;
+            }
+            Some(Value::Real((scaled as f64 / div) as f32))
+        }
+        (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
+        (Value::Text(s), DataType::Real) => s.trim().parse::<f32>().ok().map(Value::Real),
         // PG boolin accepts any unambiguous prefix of true/false/yes/no,
         // plus on/off/1/0, case-insensitively with surrounding whitespace
         // trimmed. `o` alone is ambiguous (on vs off) → error.

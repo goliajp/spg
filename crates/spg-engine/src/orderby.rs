@@ -188,6 +188,7 @@ pub(crate) fn value_to_f64(v: &Value) -> Option<f64> {
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
+        Value::Real(x) => Some(f64::from(*x)),
         _ => None,
     }
 }

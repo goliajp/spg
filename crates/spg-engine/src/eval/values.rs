@@ -79,6 +79,7 @@ pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value) -> core::cmp::Ordering
 pub(super) fn value_to_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Float(x) => Some(*x),
+        Value::Real(x) => Some(f64::from(*x)),
         Value::SmallInt(x) => Some(f64::from(*x)),
         Value::Int(x) => Some(f64::from(*x)),
         Value::BigInt(x) => Some(*x as f64),
@@ -172,6 +173,8 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         // the ±exponent thresholds, `Infinity` / `-Infinity` / `NaN` for
         // the non-finite values.
         Value::Float(x) => crate::eval::format_float(*x),
+        // v7.38 (read01, T-float4) — PG float4out (f32 shortest round-trip).
+        Value::Real(x) => crate::eval::format_real(*x),
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),

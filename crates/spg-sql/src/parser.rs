@@ -13499,7 +13499,7 @@ impl Parser {
                         CastTarget::BigInt
                     }
                 }
-                "float" | "double" | "real" => CastTarget::Float,
+                "float" | "double" => CastTarget::Float,
                 "text" => {
                     // v7.10.11 — `::TEXT[]` widens to TextArray.
                     if matches!(self.peek(), Token::LBracket)
