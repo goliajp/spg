@@ -9034,10 +9034,22 @@ impl Parser {
             };
             match kind.as_str() {
                 "SIMPLE" => {} // Default semantics — nothing to record.
-                "FULL" | "PARTIAL" => {
-                    return Err(self.err(format!(
-                        "MATCH {kind} is not yet implemented (only MATCH SIMPLE is supported)"
-                    )));
+                // v7.38 (read01 P6.44) — MATCH FULL differs from MATCH SIMPLE
+                // only in the mixed-NULL rule across MULTIPLE referencing
+                // columns (all-or-none NULL). For a single-column FK the two
+                // are identical, so accept MATCH FULL there (PG does too);
+                // multi-column MATCH FULL still needs the unwired rule.
+                "FULL" if expected_arity <= 1 => {}
+                "FULL" => {
+                    return Err(self.err(
+                        "MATCH FULL on a multi-column foreign key is not yet implemented".to_string(),
+                    ));
+                }
+                "PARTIAL" => {
+                    return Err(self.err(
+                        "MATCH PARTIAL is not implemented (PostgreSQL does not implement it either)"
+                            .to_string(),
+                    ));
                 }
                 _ => {
                     return Err(self.err(format!(
