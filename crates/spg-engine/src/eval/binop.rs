@@ -2841,7 +2841,10 @@ pub(super) fn compare(
     // its own arm, so both are left alone.
     let needs_text_coerce = |other: &Value<'_>| -> Option<DataType> {
         match other.data_type() {
-            Some(DataType::Text | DataType::Bool) | None => None,
+            // Text-vs-Text is a string comparison; an untyped operand can't
+            // drive a coercion. Everything else (numerics, bool, date/time,
+            // inet, uuid, …) coerces the Text side to it — e.g. `true = 't'`.
+            Some(DataType::Text) | None => None,
             dt => dt,
         }
     };
