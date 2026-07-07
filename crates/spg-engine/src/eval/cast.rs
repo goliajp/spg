@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use spg_sql::ast::CastTarget;
 use spg_storage::Value;
 
-use super::math::{f64_powi, f64_round_half_away};
+use super::math::{f64_powi, f64_round_half_even};
 use super::{
     EvalError, decode_tsquery_external, decode_tsvector_external, parse_date_literal,
     parse_timestamp_literal, value_to_text,
@@ -619,7 +619,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         // PG rounds (half-away) when coercing a real number to an
         // integer — 1.9::int = 2, 2.5::int = 3, not truncation.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::Int(f64_round_half_away(x) as i32)),
+        Value::Float(x) => Ok(Value::Int(f64_round_half_even(x) as i32)),
         Value::Numeric { scaled, scale } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i32::try_from(rounded)
@@ -652,7 +652,7 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         Value::BigInt(n) => Ok(Value::BigInt(n)),
         // PG rounds (half-away) coercing a real number to bigint.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::BigInt(f64_round_half_away(x) as i64)),
+        Value::Float(x) => Ok(Value::BigInt(f64_round_half_even(x) as i64)),
         Value::Numeric { scaled, scale } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i64::try_from(rounded)

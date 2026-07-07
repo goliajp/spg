@@ -3289,6 +3289,51 @@ pub(crate) fn coerce_value(
             }
             if ok { Some(Value::BigIntArray(out)) } else { None }
         }
+        // v7.38 (read01, T2) — float8[] → int[] / bigint[], rounding each element
+        // half-to-even (PG's float→int rule, distinct from numeric's half-away).
+        // A non-finite / out-of-range element fails the whole coercion.
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::FloatArray(items), DataType::IntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some(x) if x.is_finite() => {
+                        let r = crate::eval::math::f64_round_half_even(x);
+                        if r >= f64::from(i32::MIN) && r <= f64::from(i32::MAX) {
+                            out.push(Some(r as i32));
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok { Some(Value::IntArray(out)) } else { None }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::FloatArray(items), DataType::BigIntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some(x) if x.is_finite() => {
+                        out.push(Some(crate::eval::math::f64_round_half_even(x) as i64));
+                    }
+                    Some(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok { Some(Value::BigIntArray(out)) } else { None }
+        }
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
         }
