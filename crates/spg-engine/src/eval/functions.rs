@@ -10869,6 +10869,19 @@ fn apply_function_dispatch(
                         .collect();
                     Ok(Value::text(stripped.join(" ")))
                 }
+                // v7.38 (read01 P6.30) — strip a real tsvector value: drop
+                // every lexeme's positions and weight, keeping just the words.
+                Value::TsVector(lexemes) => {
+                    let stripped: alloc::vec::Vec<spg_storage::TsLexeme> = lexemes
+                        .iter()
+                        .map(|l| spg_storage::TsLexeme {
+                            word: l.word.clone(),
+                            positions: alloc::vec::Vec::new(),
+                            weight: 0,
+                        })
+                        .collect();
+                    Ok(Value::TsVector(stripped))
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "strip() needs tsvector text, got {:?}",
@@ -10974,18 +10987,6 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let vec_text = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s.as_ref(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "ts_delete() needs tsvector text, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
-            };
             let targets: alloc::vec::Vec<alloc::string::String> = match &args[1]
             {
                 Value::Null => return Ok(Value::Null),
@@ -11002,17 +11003,38 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let kept: alloc::vec::Vec<&str> = vec_text
-                .split_whitespace()
-                .filter(|lexeme| {
-                    let word = match lexeme.split_once(':') {
-                        Some((w, _)) => w,
-                        None => lexeme,
-                    };
-                    !targets.iter().any(|t| t == word)
-                })
-                .collect();
-            Ok(Value::text(kept.join(" ")))
+            // v7.38 (read01 P6.30) — accept a real tsvector value (filter its
+            // lexemes) as well as the text form.
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::TsVector(lexemes) => {
+                    let kept: alloc::vec::Vec<spg_storage::TsLexeme> = lexemes
+                        .iter()
+                        .filter(|l| !targets.iter().any(|t| t.as_str() == l.word.as_str()))
+                        .cloned()
+                        .collect();
+                    Ok(Value::TsVector(kept))
+                }
+                Value::Text(s) => {
+                    let kept: alloc::vec::Vec<&str> = s
+                        .split_whitespace()
+                        .filter(|lexeme| {
+                            let word = match lexeme.split_once(':') {
+                                Some((w, _)) => w,
+                                None => lexeme,
+                            };
+                            !targets.iter().any(|t| t == word)
+                        })
+                        .collect();
+                    Ok(Value::text(kept.join(" ")))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ts_delete() needs tsvector text, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
         }
         // ts_filter(tsvector, weights) — keep only lexemes that have
         // at least one position tagged with one of the given weight
