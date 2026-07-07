@@ -3190,6 +3190,47 @@ pub(crate) fn coerce_value(
             }
             if ok { Some(Value::NumericArray(out)) } else { None }
         }
+        // v7.38 (read01) — narrow a NUMERIC[] into int[] / bigint[] element-wise,
+        // rounding half away from zero (PG) like the scalar Numeric→Int coercion.
+        // An out-of-range element fails the whole coercion (→ None).
+        (Value::NumericArray(items), DataType::IntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some((scaled, scale)) => {
+                        match i32::try_from(numeric_round_to_integer(scaled, scale)) {
+                            Ok(v) => out.push(Some(v)),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if ok { Some(Value::IntArray(out)) } else { None }
+        }
+        (Value::NumericArray(items), DataType::BigIntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for o in items {
+                match o {
+                    None => out.push(None),
+                    Some((scaled, scale)) => {
+                        match i64::try_from(numeric_round_to_integer(scaled, scale)) {
+                            Ok(v) => out.push(Some(v)),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if ok { Some(Value::BigIntArray(out)) } else { None }
+        }
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
         }
