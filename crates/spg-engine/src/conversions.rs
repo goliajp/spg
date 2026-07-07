@@ -3264,9 +3264,21 @@ pub(crate) fn coerce_value(
                 scale: src_scale,
             },
             DataType::Numeric { precision, scale },
-        ) => Some(numeric_rescale(
-            scaled, src_scale, precision, scale, col_name,
-        )?),
+        ) => {
+            // v7.38 (read01) — the unconstrained `::numeric` sentinel (0, 0)
+            // keeps the value's natural scale, matching the Float/Text→Numeric
+            // arms above; only a declared numeric(p, s) rescales. Without this,
+            // casting an existing NUMERIC through unconstrained numeric
+            // (`n::numeric(5,2)::numeric`) rounded it to scale 0.
+            if precision == 0 && scale == 0 {
+                Some(Value::Numeric {
+                    scaled,
+                    scale: src_scale,
+                })
+            } else {
+                Some(numeric_rescale(scaled, src_scale, precision, scale, col_name)?)
+            }
+        }
         #[allow(clippy::cast_precision_loss)]
         (Value::Numeric { scaled, scale }, DataType::Float) => {
             let mut div = 1.0_f64;
