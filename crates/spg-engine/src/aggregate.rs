@@ -3253,13 +3253,15 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 let (scaled, scale) =
                     crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
                 Value::Numeric { scaled, scale }
+            } else if st.use_float {
+                Value::Float((st.sum_float + (st.sum_int as f64)) / (st.count as f64))
             } else {
-                let total = if st.use_float {
-                    st.sum_float + (st.sum_int as f64)
-                } else {
-                    st.sum_int as f64
-                };
-                Value::Float(total / (st.count as f64))
+                // v7.38 (read01, T4) — avg over integer input is exact NUMERIC
+                // (PG: avg(int)/avg(bigint) → numeric), at PG's division display
+                // scale. sum(int) is unaffected (it reads sum_int as BigInt).
+                let (scaled, scale) =
+                    crate::numeric::numeric_avg(i128::from(st.sum_int), 0, i128::from(st.count));
+                Value::Numeric { scaled, scale }
             }
         }
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
@@ -3763,13 +3765,14 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
             },
             _ => DataType::BigInt,
         },
-        // avg(int) → float (SPG keeps double here); avg(bigint) → numeric (PG).
+        // v7.38 (read01, T4) — avg over any integer / numeric input is NUMERIC
+        // (PG); only avg(float8) stays double precision.
         "avg" => match arg_ty {
-            Some(DataType::BigInt) => DataType::Numeric {
+            Some(DataType::Float) => DataType::Float,
+            _ => DataType::Numeric {
                 precision: 0,
                 scale: 0,
             },
-            _ => DataType::Float,
         },
         // v7.17.0 — string_agg always returns TEXT.
         "string_agg" | "group_concat" | "xmlagg" => DataType::Text,
