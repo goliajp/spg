@@ -3212,7 +3212,11 @@ impl Engine {
                 table.insert(row).map_err(EngineError::Storage)?;
             }
         }
-        cat.register_materialized_view(s.name.clone(), body_repr);
+        // v7.38 (read01 P6.49) — CTAS / SELECT INTO produce a plain table; only
+        // a real MATERIALIZED VIEW gets a registry entry (and REFRESH support).
+        if !s.as_plain_table {
+            cat.register_materialized_view(s.name.clone(), body_repr);
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
