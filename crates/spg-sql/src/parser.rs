@@ -2096,6 +2096,22 @@ impl Parser {
                     )))
                 }
             }
+            // v7.38 (read01 P6.57) — CREATE UNLOGGED TABLE. Unlike TEMP (a
+            // no-op below), an UNLOGGED table is a real, fully-usable table in
+            // PG — it only skips WAL. SPG creates a normal table (the WAL-skip
+            // durability optimisation is a follow-up), so a dump / app that
+            // declares UNLOGGED tables works instead of failing to parse.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("unlogged") => {
+                self.advance(); // UNLOGGED
+                if matches!(self.peek(), Token::Table) {
+                    self.parse_create_table_stmt_after_create()
+                } else {
+                    Err(self.err(format!(
+                        "expected TABLE after CREATE UNLOGGED, got {:?}",
+                        self.peek()
+                    )))
+                }
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
             {
