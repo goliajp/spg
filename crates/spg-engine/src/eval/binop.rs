@@ -422,7 +422,10 @@ pub(super) fn apply_binary(
             };
         }
     }
-    if (matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }))
+    if (matches!(l, Value::Numeric { .. })
+        || matches!(r, Value::Numeric { .. })
+        || matches!(l, Value::Real(_))
+        || matches!(r, Value::Real(_)))
         && !matches!(l, Value::Interval { .. })
         && !matches!(r, Value::Interval { .. })
         // A range containment/overlap op (`range @> numeric`, `<@`, `&&`) keeps
@@ -1111,7 +1114,36 @@ fn apply_binary_numeric(
     // Float still wins — Numeric + Float coerces both to f64 and runs
     // through the float path. PG demotes Numeric to float in this mix
     // too (the documented behaviour for `numeric + double precision`).
-    let float_path = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    // v7.38 (read01, T-float4) — `real op {real,int}` stays real (compute in
+    // f64, narrow to f32); a float8 / numeric operand widens to the float path.
+    let has_real = matches!(l, Value::Real(_)) || matches!(r, Value::Real(_));
+    let has_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    let has_numeric = matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. });
+    let both_real = matches!(l, Value::Real(_)) && matches!(r, Value::Real(_));
+    if both_real && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+    {
+        let af = as_f64(&l)?;
+        let bf = as_f64(&r)?;
+        return Ok(Value::Real(match op {
+            BinOp::Add => (af + bf) as f32,
+            BinOp::Sub => (af - bf) as f32,
+            BinOp::Mul => (af * bf) as f32,
+            BinOp::Div => {
+                if bf == 0.0 {
+                    return Err(EvalError::DivisionByZero);
+                }
+                (af / bf) as f32
+            }
+            BinOp::Mod => {
+                if bf == 0.0 {
+                    return Err(EvalError::DivisionByZero);
+                }
+                (af % bf) as f32
+            }
+            _ => unreachable!(),
+        }));
+    }
+    let float_path = has_float || has_real;
     if float_path {
         let af = as_f64(&l)?;
         let bf = as_f64(&r)?;
@@ -1933,6 +1965,7 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Ok(*n as f64),
         Value::Float(x) => Ok(*x),
+        Value::Real(x) => Ok(f64::from(*x)),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             let mut div = 1.0_f64;
@@ -2991,8 +3024,8 @@ pub(super) fn compare(
             lhs.cmp(&rhs)
         }
         (a, b)
-            if matches!(a.data_type(), Some(DataType::Float))
-                || matches!(b.data_type(), Some(DataType::Float)) =>
+            if matches!(a.data_type(), Some(DataType::Float | DataType::Real))
+                || matches!(b.data_type(), Some(DataType::Float | DataType::Real)) =>
         {
             let af = as_f64(a)?;
             let bf = as_f64(b)?;

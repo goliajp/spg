@@ -1208,6 +1208,11 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
+                    Value::Real(x) => {
+                        sum_float += f64::from(*x);
+                        use_float = true;
+                        count += 1;
+                    }
                     Value::Numeric { scaled, scale } => {
                         let (s, sc) = crate::numeric::numeric_add(
                             num_scaled, num_scale, *scaled, *scale,
@@ -1297,6 +1302,11 @@ fn accumulate_groups(
                     }
                     Value::Float(x) => {
                         sum_float += x;
+                        use_float = true;
+                        count += 1;
+                    }
+                    Value::Real(x) => {
+                        sum_float += f64::from(x);
                         use_float = true;
                         count += 1;
                     }
@@ -2875,6 +2885,10 @@ fn update_state(
                     st.use_float = true;
                     st.sum_float += *x;
                 }
+                Value::Real(x) => {
+                    st.use_float = true;
+                    st.sum_float += f64::from(*x);
+                }
                 // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
                 // scales on the running max; result stays exact.
                 Value::Numeric { scaled, scale } => {
@@ -3522,6 +3536,7 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
         Value::SmallInt(n) => Some(f64::from(*n)),
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
+        Value::Real(x) => Some(f64::from(*x)),
         Value::Numeric { scaled, scale } => Some(numeric_to_f64(*scaled, *scale)),
         _ => None,
     }
@@ -4150,6 +4165,9 @@ fn encode_one(out: &mut String, v: &Value) {
         Value::Float(x) => {
             let _ = write!(out, "F{x}|");
         }
+        Value::Real(x) => {
+            let _ = write!(out, "R{x}|");
+        }
         Value::Bool(b) => {
             out.push(if *b { 'T' } else { 'f' });
             out.push('|');
@@ -4404,6 +4422,7 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
         (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Equal),
         (Value::SmallInt(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),
         (Value::Float(x), Value::SmallInt(y)) => x.partial_cmp(&f64::from(*y)).unwrap_or(Equal),
         (Value::Int(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),

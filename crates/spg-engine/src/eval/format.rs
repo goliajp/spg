@@ -74,6 +74,35 @@ pub fn format_float(x: f64) -> String {
     alloc::format!("{mant}e{sign}{digits:0>2}")
 }
 
+/// v7.38 (read01, T-float4) — PG `float4out`: the f32 shortest round-trip, in
+/// fixed-point for decimal exponents in `-4..=5` and scientific otherwise
+/// (a tighter window than float8's `-4..=14`, so `12345678::real` =
+/// `1.2345678e+07` while `12345678::float8` stays `12345678`).
+pub fn format_real(x: f32) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let sci = alloc::format!("{x:e}");
+    let epos = sci.find('e').expect("{:e} always has an 'e'");
+    let exp_val: i32 = sci[epos + 1..].parse().unwrap_or(0);
+    if (-4..=5).contains(&exp_val) {
+        return alloc::format!("{x}");
+    }
+    let mant = &sci[..epos];
+    let exp = &sci[epos + 1..];
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', exp),
+    };
+    alloc::format!("{mant}e{sign}{digits:0>2}")
+}
+
 /// locale: `$N,NNN.CC`, negative → `-$1.23`. Mirrors PG's
 /// `cash_out` for `lc_monetary = 'en_US.UTF-8'`.
 pub fn format_money(cents: i64) -> String {

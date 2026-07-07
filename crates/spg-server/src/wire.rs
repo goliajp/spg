@@ -90,6 +90,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::SmallInt | DataType::Int => WireType::Int,
         DataType::BigInt => WireType::BigInt,
         DataType::Float => WireType::Float,
+        DataType::Real => WireType::Float,
         // VARCHAR / CHAR / NUMERIC / DATE / TIMESTAMP collapse to
         // TEXT on the wire. Schema tracks bounds and precision; values
         // are plain UTF-8 in their canonical text forms.

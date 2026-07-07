@@ -101,6 +101,10 @@ pub enum DataType {
     Int,    // 32-bit signed
     BigInt, // 64-bit signed
     Float,  // f64 (PG double precision)
+    /// v7.38 (read01, T-float4) — `real` / `float4`: 32-bit IEEE float (PG
+    /// `real`). Backed by `Value::Real(f32)`; behaves like `Float` for most
+    /// dispatch but renders / stores at f32 precision.
+    Real,
     Text,
     /// `VARCHAR(n)` — same byte representation as `Text`, but INSERT
     /// rejects values longer than `n` Unicode characters.
@@ -416,6 +420,7 @@ impl fmt::Display for DataType {
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
             Self::Float => f.write_str("FLOAT"),
+            Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
@@ -552,6 +557,8 @@ pub enum Value<'arena> {
     Int(i32),
     BigInt(i64),
     Float(f64),
+    /// v7.38 (read01, T-float4) — PG `real` (32-bit IEEE float).
+    Real(f32),
     Text(Cow<'arena, str>),
     Bool(bool),
     Vector(Cow<'arena, [f32]>),
@@ -850,6 +857,7 @@ impl<'arena> Value<'arena> {
             Self::Int(_) => Some(DataType::Int),
             Self::BigInt(_) => Some(DataType::BigInt),
             Self::Float(_) => Some(DataType::Float),
+            Self::Real(_) => Some(DataType::Real),
             // `Text` covers both unbounded TEXT and bounded VARCHAR/CHAR
             // — the constraint lives on the column schema, not the value.
             Self::Text(_) => Some(DataType::Text),
@@ -953,6 +961,7 @@ impl<'arena> Value<'arena> {
             Value::Int(n) => Value::Int(n),
             Value::BigInt(n) => Value::BigInt(n),
             Value::Float(f) => Value::Float(f),
+            Value::Real(f) => Value::Real(f),
             Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
             Value::Bool(b) => Value::Bool(b),
             Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
@@ -1699,7 +1708,8 @@ impl IndexKey {
             | Value::IntArray(_)
             | Value::BigIntArray(_)
             | Value::TsVector(_)
-            | Value::TsQuery(_) => None,
+            | Value::TsQuery(_)
+            | Value::Real(_) => None,
         }
     }
 }

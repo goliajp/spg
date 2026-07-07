@@ -727,6 +727,7 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Int => out.push(1),
         DataType::BigInt => out.push(2),
         DataType::Float => out.push(3),
+        DataType::Real => out.push(66),
         DataType::Text => out.push(4),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
@@ -1041,6 +1042,7 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // 4-byte body: i32 / Date.
         Value::Int(_) | Value::Date(_) => 4,
         // 8-byte body: i64 / f64 / Timestamp.
+        Value::Real(_) => 4,
         Value::BigInt(_) | Value::Float(_) | Value::Timestamp(_) => 8,
         Value::Bool(_) => 1,
         // Text/Varchar/Char/Json share the [u16 len][utf-8] layout;
@@ -1403,6 +1405,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::Int(n), DataType::Int) => out.extend_from_slice(&n.to_le_bytes()),
         (Value::BigInt(n), DataType::BigInt) => out.extend_from_slice(&n.to_le_bytes()),
         (Value::Float(x), DataType::Float) => out.extend_from_slice(&x.to_le_bytes()),
+        (Value::Real(x), DataType::Real) => out.extend_from_slice(&x.to_le_bytes()),
         (Value::Bool(b), DataType::Bool) => out.push(u8::from(*b)),
         (Value::Text(s), DataType::Text | DataType::Varchar(_) | DataType::Char(_)) => {
             write_str(out, s);
@@ -1962,6 +1965,10 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         }
         Value::Float(x) => {
             out.push(3);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Real(x) => {
+            out.push(32);
             out.extend_from_slice(&x.to_le_bytes());
         }
         // v4.9: JSON shares the tag-4 (Text) on-disk encoding —
@@ -2909,6 +2916,7 @@ impl<'a> Cursor<'a> {
             DataType::Int => Ok(Value::Int(self.read_i32()?)),
             DataType::BigInt => Ok(Value::BigInt(self.read_i64()?)),
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
+            DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
                 Ok(Value::Text(Cow::Owned(self.read_str()?)))
@@ -3618,6 +3626,7 @@ impl<'a> Cursor<'a> {
             1 => Ok(Value::Int(self.read_i32()?)),
             2 => Ok(Value::BigInt(self.read_i64()?)),
             3 => Ok(Value::Float(self.read_f64()?)),
+            32 => Ok(Value::Real(self.read_f32()?)),
             4 => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             5 => Ok(Value::Bool(self.read_u8()? != 0)),
             6 => {

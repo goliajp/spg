@@ -29,9 +29,11 @@ fn varchar_explicit_cast_truncates() {
 #[test]
 fn float_and_oid_spellings() {
     let mut e = Engine::new();
+    // v7.38 (read01, T-float4) — float4 / real are the first-class 32-bit REAL
+    // type now (Value::Real); float8 stays double precision (Value::Float).
     assert!(matches!(
         one(&mut e, "SELECT 2::float4"),
-        spg_storage::Value::Float(f) if (f - 2.0).abs() < 1e-9
+        spg_storage::Value::Real(f) if (f - 2.0).abs() < 1e-6
     ));
     assert!(matches!(
         one(&mut e, "SELECT 2::float8"),
@@ -39,7 +41,7 @@ fn float_and_oid_spellings() {
     ));
     assert!(matches!(
         one(&mut e, "SELECT '2.5'::real"),
-        spg_storage::Value::Float(f) if (f - 2.5).abs() < 1e-9
+        spg_storage::Value::Real(f) if (f - 2.5).abs() < 1e-6
     ));
     assert!(matches!(
         one(&mut e, "SELECT 42::oid"),
