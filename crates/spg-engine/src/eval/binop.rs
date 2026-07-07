@@ -2795,17 +2795,14 @@ pub(super) fn compare(
     r: &Value<'_>,
 ) -> Result<Value<'static>, EvalError> {
     // PG implicitly casts an unknown-type string literal to the other
-    // operand's type. When one side is Text and the other is a typed scalar
-    // that the arms below don't compare against Text (time/bytea/inet/interval/
-    // uuid/macaddr/date/timestamp/...), coerce the Text to that type first.
-    // Numeric variants already have Text-free arms, so leave them alone.
+    // operand's type (`i = '5'`, `1 = '1'`, `2 < '10'`). When one side is Text
+    // and the other is a typed scalar, coerce the Text to that type first; a
+    // Text that won't parse (`1 = 'abc'`) falls through to the type-mismatch
+    // error, matching PG. Text-vs-Text stays a string comparison, and Bool has
+    // its own arm, so both are left alone.
     let needs_text_coerce = |other: &Value<'_>| -> Option<DataType> {
         match other.data_type() {
-            Some(
-                DataType::Int | DataType::BigInt | DataType::SmallInt | DataType::Float
-                | DataType::Numeric { .. } | DataType::Text | DataType::Bool,
-            )
-            | None => None,
+            Some(DataType::Text | DataType::Bool) | None => None,
             dt => dt,
         }
     };
