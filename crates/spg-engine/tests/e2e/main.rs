@@ -200,6 +200,7 @@ mod e2e_pg_backup_probes;
 mod e2e_random_normal;
 mod e2e_to_char_numeric_precision;
 mod e2e_uuidv7_wallclock;
+mod e2e_xml_wellformed;
 mod e2e_infoschema_not_null;
 mod e2e_cash_words_money;
 mod e2e_jsonb_total_order;
