@@ -55,6 +55,11 @@ pub enum Token {
     // Literals
     Integer(i64),
     Float(f64),
+    // v7.38 (read01) — exact decimal literal (`1.5`, `0.1`) and any integer
+    // literal too large for i64. PG types a dotted literal as NUMERIC (not
+    // double) and an over-i64 integer as NUMERIC; the exact source text is
+    // carried so no precision is lost before it becomes a Value::Numeric.
+    Numeric(String),
     String(String),
 
     // Operators
@@ -1379,7 +1384,12 @@ fn hex_digit_value(b: u8) -> Option<u32> {
 fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
-    let mut is_float = false;
+    // v7.38 (read01) — track the dot and exponent separately. PG: a dotted
+    // literal with NO exponent is NUMERIC; an exponent (`1e5`, `1.5e3`) makes
+    // it double precision; a bare integer is INTEGER unless it overflows i64,
+    // in which case it is NUMERIC too.
+    let mut has_dot = false;
+    let mut has_exp = false;
 
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
@@ -1391,14 +1401,14 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
         && bytes[i] == b'.'
         && !(i + 1 < bytes.len() && bytes[i + 1] == b'.')
     {
-        is_float = true;
+        has_dot = true;
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        is_float = true;
+        has_exp = true;
         i += 1;
         if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
             i += 1;
@@ -1413,14 +1423,20 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     }
 
     let lit = &s[..i];
-    if is_float {
+    if has_exp {
+        // Exponent form → double precision.
         lit.parse::<f64>()
             .map(|v| (Token::Float(v), i))
             .map_err(|_| LexErrorKind::BadNumber(lit.to_string()))
+    } else if has_dot {
+        // Dotted literal → exact NUMERIC (keep the source text verbatim).
+        Ok((Token::Numeric(lit.to_string()), i))
     } else {
-        lit.parse::<i64>()
-            .map(|v| (Token::Integer(v), i))
-            .map_err(|_| LexErrorKind::BadNumber(lit.to_string()))
+        // Bare integer → INTEGER, or NUMERIC if it overflows i64.
+        match lit.parse::<i64>() {
+            Ok(v) => Ok((Token::Integer(v), i)),
+            Err(_) => Ok((Token::Numeric(lit.to_string()), i)),
+        }
     }
 }
 
@@ -1479,13 +1495,15 @@ mod tests {
 
     #[test]
     fn integer_and_float_literals() {
+        // v7.38 (read01) — a dotted literal lexes as NUMERIC (exact source
+        // text); an exponent form stays double precision.
         assert_eq!(
             lex("0 42 1.5 .5 1e10 2.5e-3"),
             vec![
                 Token::Integer(0),
                 Token::Integer(42),
-                Token::Float(1.5),
-                Token::Float(0.5),
+                Token::Numeric("1.5".to_string()),
+                Token::Numeric(".5".to_string()),
                 Token::Float(1e10),
                 Token::Float(2.5e-3),
                 Token::Eof,

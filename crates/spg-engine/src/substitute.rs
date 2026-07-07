@@ -30,6 +30,12 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         Value::Int(n) => Literal::Integer(i64::from(n)),
         Value::BigInt(n) => Literal::Integer(n),
         Value::Float(x) => Literal::Float(x),
+        // v7.38 (read01) — a scalar subquery returning NUMERIC (common now that
+        // decimal literals are numeric) materialises back through Literal::Numeric.
+        Value::Numeric { scaled, scale } => Literal::Numeric {
+            unscaled: scaled,
+            scale,
+        },
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
         // v7.37 D.27 — an array-returning scalar subquery (`(SELECT

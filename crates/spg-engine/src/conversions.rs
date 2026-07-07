@@ -2023,6 +2023,10 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
                 Ok(int_value_for(neg))
             }
             Expr::Literal(Literal::Float(x)) => Ok(Value::Float(-x)),
+            // v7.38 (read01) — a dotted literal is NUMERIC; negate the mantissa.
+            Expr::Literal(Literal::Numeric { unscaled, scale }) => {
+                Ok(Value::Numeric { scaled: -unscaled, scale })
+            }
             // v7.37.5 ship triage — fold the unary minus through a
             // `Cast { Literal, target }` wrapper (`-2::smallint`,
             // `-3.14::numeric(10,2)`). We negate the inner literal,
@@ -2040,6 +2044,9 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
                         Expr::Literal(Literal::Integer(neg))
                     }
                     Expr::Literal(Literal::Float(x)) => Expr::Literal(Literal::Float(-x)),
+                    Expr::Literal(Literal::Numeric { unscaled, scale }) => {
+                        Expr::Literal(Literal::Numeric { unscaled: -unscaled, scale })
+                    }
                     other => Expr::Unary {
                         op: spg_sql::ast::UnOp::Neg,
                         expr: alloc::boxed::Box::new(other),
