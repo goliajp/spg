@@ -1303,18 +1303,51 @@ pub fn format_inet(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::Stri
             }
         }
         6 => {
-            // Naive `xxxx:xxxx:...` colon-separated form. PG's
-            // `::` compression is a follow-up; the canonical text
-            // here still round-trips correctly through `parse_inet`.
-            let mut out = alloc::string::String::new();
-            for i in 0..8 {
-                if i > 0 {
-                    out.push(':');
+            // v7.38 (read01) — RFC 5952 canonical form: compress the longest
+            // run of consecutive all-zero groups (leftmost among ties) to `::`,
+            // but only when that run is ≥ 2 groups. PG always renders this form.
+            let mut groups = [0u16; 8];
+            for (i, g) in groups.iter_mut().enumerate() {
+                *g = (u16::from(addr[i * 2]) << 8) | u16::from(addr[i * 2 + 1]);
+            }
+            let (mut best_start, mut best_len) = (usize::MAX, 0usize);
+            let mut i = 0;
+            while i < 8 {
+                if groups[i] == 0 {
+                    let start = i;
+                    while i < 8 && groups[i] == 0 {
+                        i += 1;
+                    }
+                    if i - start > best_len {
+                        best_start = start;
+                        best_len = i - start;
+                    }
+                } else {
+                    i += 1;
                 }
-                let hi = addr[i * 2];
-                let lo = addr[i * 2 + 1];
-                let word = (u16::from(hi) << 8) | u16::from(lo);
-                out.push_str(&alloc::format!("{word:x}"));
+            }
+            let mut out = alloc::string::String::new();
+            if best_len >= 2 {
+                for (idx, g) in groups.iter().enumerate().take(best_start) {
+                    if idx > 0 {
+                        out.push(':');
+                    }
+                    out.push_str(&alloc::format!("{g:x}"));
+                }
+                out.push_str("::");
+                for (idx, g) in groups.iter().enumerate().skip(best_start + best_len) {
+                    if idx > best_start + best_len {
+                        out.push(':');
+                    }
+                    out.push_str(&alloc::format!("{g:x}"));
+                }
+            } else {
+                for (idx, g) in groups.iter().enumerate() {
+                    if idx > 0 {
+                        out.push(':');
+                    }
+                    out.push_str(&alloc::format!("{g:x}"));
+                }
             }
             if bits == 128 {
                 out

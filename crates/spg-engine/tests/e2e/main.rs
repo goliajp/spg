@@ -227,6 +227,7 @@ mod e2e_numeric_unconstrained_cast;
 mod e2e_numeric_array_to_float;
 mod e2e_numeric_array_coercion_matrix;
 mod e2e_numeric_to_int_rounds;
+mod e2e_ipv6_canonical;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
