@@ -250,12 +250,25 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             }),
         },
         CastTarget::Named(name) => {
+            // v7.38 (read01) — a temporal type with a fractional-seconds
+            // precision (`time(3)`, `timestamp(0)`, `timestamptz(2)`) rounds the
+            // sub-second field to that many digits, like PG. Resolve against the
+            // base type (`type_name_to_data_type` does not know the `(N)` form)
+            // and round the coerced result below.
+            let temporal_prec = temporal_typmod(&name);
+            let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
+                alloc::borrow::Cow::Owned(
+                    name.split('(').next().unwrap_or(&name).trim().to_string(),
+                )
+            } else {
+                alloc::borrow::Cow::Borrowed(name.as_str())
+            };
             // v7.37.5 ship triage — generic typed-cast dispatch.
             // Resolve the ident to a `DataType` and route the value
             // through the existing `coerce_value` text-decoder for
             // every v7.37.5 γ/δ/ε/ζ-A type that already speaks
             // Text→typed via codec.
-            let dt = crate::conversions::type_name_to_data_type(&name).ok_or_else(|| {
+            let dt = crate::conversions::type_name_to_data_type(&resolve_name).ok_or_else(|| {
                 EvalError::TypeMismatch {
                     detail: alloc::format!("unsupported cast target `::{name}`"),
                 }
@@ -293,10 +306,53 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 }
                 (_, v) => v,
             };
-            crate::conversions::coerce_value(v, dt, &name, 0).map_err(|e| EvalError::TypeMismatch {
-                detail: alloc::format!("{e}"),
+            let coerced = crate::conversions::coerce_value(v, dt, &resolve_name, 0)
+                .map_err(|e| EvalError::TypeMismatch {
+                    detail: alloc::format!("{e}"),
+                })?;
+            Ok(match temporal_prec {
+                Some(prec) => round_temporal_to_precision(coerced, prec),
+                None => coerced,
             })
         }
+    }
+}
+
+/// Extract the fractional-seconds precision from a temporal cast name like
+/// `time(3)` / `timestamp(0)` / `timestamptz(2)`; `None` for any non-temporal
+/// type or a bare temporal type with no `(N)`.
+fn temporal_typmod(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    let (base, rest) = lower.split_once('(')?;
+    if !matches!(
+        base.trim(),
+        "time" | "timetz" | "timestamp" | "timestamptz" | "datetime"
+    ) {
+        return None;
+    }
+    let digits: alloc::string::String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u8>().ok()
+}
+
+/// Round a TIME / TIMESTAMP value's microsecond field to `prec` fractional-
+/// second digits (`prec` 0..=6), half-away-from-zero as PG's AdjustTimestamp.
+fn round_temporal_to_precision(v: Value<'static>, prec: u8) -> Value<'static> {
+    if prec >= 6 {
+        return v;
+    }
+    let scale = 10i64.pow(u32::from(6 - prec));
+    let round = |micros: i64| -> i64 {
+        let half = scale / 2;
+        if micros >= 0 {
+            ((micros + half) / scale) * scale
+        } else {
+            -(((-micros + half) / scale) * scale)
+        }
+    };
+    match v {
+        Value::Timestamp(m) => Value::Timestamp(round(m)),
+        Value::Time(m) => Value::Time(round(m)),
+        other => other,
     }
 }
 

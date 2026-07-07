@@ -13456,6 +13456,24 @@ impl Parser {
     /// Both bind tighter than any binary op.
     /// Shared cast-target parser for postfix `::TYPE` and the
     /// standard `CAST(expr AS TYPE)` form (v7.25, round-17).
+    /// If the next tokens are `( N )`, consume them and return the canonical
+    /// `base(N)` name so a temporal cast (`::timestamp(2)`) carries its
+    /// fractional-seconds precision into `CastTarget::Named`; otherwise `None`.
+    fn consume_temporal_typmod(&mut self, base: &str) -> Option<alloc::string::String> {
+        if !matches!(self.peek(), Token::LParen) {
+            return None;
+        }
+        self.advance(); // (
+        let n = match self.advance() {
+            Token::Integer(n) => n,
+            _ => return Some(base.to_string()), // malformed → drop precision
+        };
+        if matches!(self.peek(), Token::RParen) {
+            self.advance();
+        }
+        Some(alloc::format!("{base}({n})"))
+    }
+
     fn parse_cast_target(&mut self) -> Result<CastTarget, ParseError> {
         let target = match self.advance() {
             Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
@@ -13497,8 +13515,17 @@ impl Parser {
                 "bool" | "boolean" => CastTarget::Bool,
                 "vector" => CastTarget::Vector,
                 "date" => CastTarget::Date,
-                "timestamp" | "datetime" => CastTarget::Timestamp,
-                "timestamptz" => CastTarget::Timestamptz,
+                // v7.38 (read01) — `::timestamp(N)` carries its fractional-
+                // seconds precision through the Named path (the engine rounds
+                // the sub-second field); bare `::timestamp` keeps the fast arm.
+                "timestamp" | "datetime" => match self.consume_temporal_typmod("timestamp") {
+                    Some(named) => CastTarget::Named(named),
+                    None => CastTarget::Timestamp,
+                },
+                "timestamptz" => match self.consume_temporal_typmod("timestamptz") {
+                    Some(named) => CastTarget::Named(named),
+                    None => CastTarget::Timestamptz,
+                },
                 "interval" => CastTarget::Interval,
                 "json" => CastTarget::Json,
                 "jsonb" => CastTarget::Jsonb,
