@@ -1827,10 +1827,18 @@ impl Engine {
                     },
                     true,
                 ) => {
-                    if !collides_with_table {
-                        skipped_count += 1;
-                        continue;
+                    // v7.38 (read01 sweep) — PG refuses to touch a row twice in
+                    // one command: if this conflict key already appeared in the
+                    // batch (either inserted by an earlier row or updated by an
+                    // earlier DO UPDATE), it is a cardinality violation
+                    // ("ON CONFLICT DO UPDATE command cannot affect row a second
+                    // time").
+                    if collides_with_batch {
+                        return Err(EngineError::CardinalityViolation);
                     }
+                    // Claim this key so a later duplicate in the same batch is
+                    // caught above.
+                    seen_keys.push(key_tuple_owned);
                     let target_pos = lookup_row_position_by_keys(
                         self.active_catalog(),
                         table_name,
