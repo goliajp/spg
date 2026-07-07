@@ -10602,16 +10602,33 @@ fn apply_function_dispatch(
                 && enc_up != "UTF-8"
                 && enc_up != "SQL_ASCII"
                 && enc_up != "LATIN1"
+                && !is_win1252(&enc_up)
             {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1"
+                        "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1 / WIN1252"
                     ),
                 });
             }
             let s = if enc_up == "LATIN1" {
                 // ISO-8859-1: each byte is exactly its own codepoint.
                 b.iter().map(|&byte| byte as char).collect::<alloc::string::String>()
+            } else if is_win1252(&enc_up) {
+                // Windows-1252: identity except the remapped 0x80–0x9F range.
+                let mut out = alloc::string::String::with_capacity(b.len());
+                for &byte in b.iter() {
+                    match win1252_byte_to_char(byte) {
+                        Some(c) => out.push(c),
+                        None => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "convert_from(): byte {byte:#04x} is not defined in encoding WIN1252"
+                                ),
+                            });
+                        }
+                    }
+                }
+                out
             } else {
                 // UTF8 / SQL_ASCII: the bytes are already UTF-8.
                 match core::str::from_utf8(b) {
@@ -10663,14 +10680,31 @@ fn apply_function_dispatch(
                 && enc_up != "UTF-8"
                 && enc_up != "SQL_ASCII"
                 && enc_up != "LATIN1"
+                && !is_win1252(&enc_up)
             {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1"
+                        "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1 / WIN1252"
                     ),
                 });
             }
-            let bytes = if enc_up == "LATIN1" {
+            let bytes = if is_win1252(&enc_up) {
+                // UTF-8 text → Windows-1252 bytes.
+                let mut out = alloc::vec::Vec::with_capacity(s.len());
+                for ch in s.chars() {
+                    match win1252_char_to_byte(ch) {
+                        Some(byte) => out.push(byte),
+                        None => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "convert_to(): character {ch:?} has no equivalent in encoding WIN1252"
+                                ),
+                            });
+                        }
+                    }
+                }
+                out
+            } else if enc_up == "LATIN1" {
                 // UTF-8 text → ISO-8859-1 bytes. A codepoint above U+00FF
                 // has no LATIN1 equivalent, which PG reports as an error.
                 let mut out = alloc::vec::Vec::with_capacity(s.len());
@@ -13858,6 +13892,41 @@ fn apply_function_dispatch(
 // `_wakeup` / `_detach`. With the `injection-points` feature OFF
 // (release builds) all three return an error so a production SPG
 // can't be coerced into deadlocking via SQL.
+
+/// v7.38 (read01 P6.32) — Windows-1252 high range (0x80–0x9F). It matches
+/// LATIN1 everywhere else; only these 32 bytes remap (five are undefined,
+/// stored as 0). Used by convert_to / convert_from for the WIN1252 encoding.
+const WIN1252_HIGH: [u32; 32] = [
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+    0x0152, 0, 0x017D, 0, 0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC,
+    0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+];
+
+fn win1252_byte_to_char(b: u8) -> Option<char> {
+    if (0x80..=0x9F).contains(&b) {
+        let cp = WIN1252_HIGH[(b - 0x80) as usize];
+        if cp == 0 { None } else { char::from_u32(cp) }
+    } else {
+        Some(b as char) // 0x00–0x7F and 0xA0–0xFF are identity, as in LATIN1.
+    }
+}
+
+fn win1252_char_to_byte(ch: char) -> Option<u8> {
+    let cp = ch as u32;
+    if cp <= 0x7F || (0xA0..=0xFF).contains(&cp) {
+        Some(cp as u8)
+    } else {
+        WIN1252_HIGH
+            .iter()
+            .position(|&c| c != 0 && c == cp)
+            .map(|i| 0x80 + i as u8)
+    }
+}
+
+/// v7.38 (read01 P6.32) — is `enc` a name for Windows-1252?
+fn is_win1252(enc_up: &str) -> bool {
+    matches!(enc_up, "WIN1252" | "CP1252" | "WINDOWS-1252")
+}
 
 fn expect_text_arg<'a>(
     args: &'a [Value<'_>],
