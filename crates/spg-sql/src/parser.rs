@@ -13683,6 +13683,52 @@ impl Parser {
                     };
                     continue;
                 }
+                // v7.38 (read01 sweep) — SQL:2016 `x IS [NOT] [form]
+                // NORMALIZED` (form ∈ NFC/NFD/NFKC/NFKD, default NFC).
+                // Lowers onto is_normalized(x [, 'FORM']); NOT negates.
+                {
+                    let form_kw = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if matches!(
+                                s.to_ascii_uppercase().as_str(),
+                                "NFC" | "NFD" | "NFKC" | "NFKD"
+                            ) && matches!(
+                                self.tokens.get(self.pos + 1),
+                                Some(Token::Ident(n) | Token::QuotedIdent(n))
+                                    if n.eq_ignore_ascii_case("normalized")
+                            ) =>
+                        {
+                            Some(s.to_ascii_uppercase())
+                        }
+                        _ => None,
+                    };
+                    let bare_normalized = form_kw.is_none()
+                        && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("normalized"));
+                    if form_kw.is_some() || bare_normalized {
+                        if form_kw.is_some() {
+                            self.advance(); // form keyword
+                        }
+                        self.advance(); // NORMALIZED
+                        let mut args = alloc::vec![expr];
+                        if let Some(f) = form_kw {
+                            args.push(Expr::Literal(Literal::String(f)));
+                        }
+                        let call = Expr::FunctionCall {
+                            name: "is_normalized".to_string(),
+                            args,
+                        };
+                        expr = if negated {
+                            Expr::Unary {
+                                op: UnOp::Not,
+                                expr: Box::new(call),
+                            }
+                        } else {
+                            call
+                        };
+                        continue;
+                    }
+                }
                 // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
                 // three-valued boolean tests. IS TRUE/FALSE never
                 // return NULL, so they lower to CASE forms whose

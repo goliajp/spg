@@ -209,6 +209,7 @@ mod e2e_numnode_tsquery;
 mod e2e_tsquery_eq;
 mod e2e_querytree;
 mod e2e_normalize_form;
+mod e2e_is_normalized;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
