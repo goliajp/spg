@@ -3079,6 +3079,20 @@ pub(super) fn compare(
                 }),
             };
         }
+        // v7.38 (read01 P6.31) — TSQUERY equality (=/<>). PG does NOT normalise
+        // operand order (`'a & b' <> 'b & a'`), so a structural compare of the
+        // ASTs matches PG exactly. Ordering (< etc.) needs PG's node total-order
+        // and is deferred.
+        (Value::TsQuery(a), Value::TsQuery(b)) => {
+            let eq = a == b;
+            return match op {
+                BinOp::Eq => Ok(Value::Bool(eq)),
+                BinOp::NotEq => Ok(Value::Bool(!eq)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: "tsquery ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
+                }),
+            };
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(

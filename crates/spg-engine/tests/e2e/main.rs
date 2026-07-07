@@ -206,6 +206,7 @@ mod e2e_with_reloptions;
 mod e2e_unlogged_table;
 mod e2e_tsvector_strip_delete;
 mod e2e_numnode_tsquery;
+mod e2e_tsquery_eq;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
