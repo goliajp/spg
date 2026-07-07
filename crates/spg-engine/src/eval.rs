@@ -369,6 +369,31 @@ fn apply_domain_constraints<'a>(
     Ok(v)
 }
 
+/// v7.38 (read01 P6.67) — validate a value cast to a user ENUM: a text label
+/// must be one of the enum's members (else error, as PG does); a NULL is a
+/// valid typed null. The stored representation stays the text label.
+fn apply_enum_cast<'a>(
+    v: Value<'a>,
+    en: &spg_storage::EnumDef,
+    name: &str,
+) -> Result<Value<'a>, EvalError> {
+    match &v {
+        Value::Null => Ok(v),
+        Value::Text(s) => {
+            if en.labels.iter().any(|l| l.as_str() == s.as_ref()) {
+                Ok(v)
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input value for enum {name}: {s:?}"),
+                })
+            }
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("cannot cast {:?} to enum {name}", other.data_type()),
+        }),
+    }
+}
+
 pub fn eval_expr(
     expr: &Expr,
     row: &Row<'static>,
@@ -465,9 +490,16 @@ pub fn eval_expr(
             // only run the constraints.
             if let CastTarget::Named(name) = target
                 && let Some(cat) = ctx.catalog
-                && let Some(dom) = cat.domain_types().get(name.as_str())
             {
-                return apply_domain_constraints(v, dom, name);
+                if let Some(dom) = cat.domain_types().get(name.as_str()) {
+                    return apply_domain_constraints(v, dom, name);
+                }
+                // v7.38 (read01 P6.67) — `'label'::<user enum>` validates the
+                // label against the enum's members (a non-member errors like
+                // PG). A typed NULL passes through carrying the enum type.
+                if let Some(en) = cat.enum_types().get(name.as_str()) {
+                    return apply_enum_cast(v, en, name);
+                }
             }
             cast_value(v, target.clone())
         }

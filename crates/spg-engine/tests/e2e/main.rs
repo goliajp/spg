@@ -201,6 +201,7 @@ mod e2e_random_normal;
 mod e2e_to_char_numeric_precision;
 mod e2e_uuidv7_wallclock;
 mod e2e_attgenerated;
+mod e2e_enum_cast;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
