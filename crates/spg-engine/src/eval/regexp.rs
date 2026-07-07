@@ -187,6 +187,17 @@ enum ReNode {
         negative: bool,
         inner: Box<ReNode>,
     },
+    /// v7.38 (read01) — a capturing group `(inner)`. `idx` is the 1-based
+    /// group number (assigned left-to-right at parse time). Matching is
+    /// transparent — it matches exactly what `inner` matches — but the matcher
+    /// additionally records the `[start, end)` span it spanned into the
+    /// captures array so regexp_replace `\N`, regexp_matches and
+    /// substring(from pattern) can read the sub-match. `(?:…)` non-capturing
+    /// groups and lookarounds are NOT wrapped in this node.
+    Group {
+        idx: usize,
+        inner: Box<ReNode>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +268,10 @@ fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
         all[start..].to_vec()
     };
     let mut p = 0;
-    let mut n = re_parse_alt(&body, &mut p, 0)?;
+    // v7.38 (read01) — 1-based capturing-group counter, assigned left-to-right
+    // as `(` groups are parsed. Group 0 is the whole match (handled by re_find).
+    let mut ng = 1usize;
+    let mut n = re_parse_alt(&body, &mut p, 0, &mut ng)?;
     if p != body.len() {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!("regex compile: trailing chars at pos {p} in {pat:?}"),
@@ -313,7 +327,12 @@ fn strip_regex_extended_whitespace(chars: &[char]) -> Vec<char> {
     out
 }
 
-fn re_parse_alt(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, EvalError> {
+fn re_parse_alt(
+    chars: &[char],
+    p: &mut usize,
+    depth: u32,
+    ng: &mut usize,
+) -> Result<ReNode, EvalError> {
     // v7.37.16 Epic Rx P0 — bound group nesting so `"((((…"` can't
     // blow the parser's own recursion stack.
     if depth > PARSE_DEPTH_LIMIT {
@@ -321,10 +340,10 @@ fn re_parse_alt(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Eva
             detail: "invalid regular expression: regular expression is too complex".into(),
         });
     }
-    let mut branches = alloc::vec![re_parse_concat(chars, p, depth)?];
+    let mut branches = alloc::vec![re_parse_concat(chars, p, depth, ng)?];
     while *p < chars.len() && chars[*p] == '|' {
         *p += 1;
-        branches.push(re_parse_concat(chars, p, depth)?);
+        branches.push(re_parse_concat(chars, p, depth, ng)?);
     }
     if branches.len() == 1 {
         Ok(branches.pop().unwrap())
@@ -333,14 +352,19 @@ fn re_parse_alt(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Eva
     }
 }
 
-fn re_parse_concat(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, EvalError> {
+fn re_parse_concat(
+    chars: &[char],
+    p: &mut usize,
+    depth: u32,
+    ng: &mut usize,
+) -> Result<ReNode, EvalError> {
     let mut items: Vec<ReNode> = Vec::new();
     while *p < chars.len() {
         let c = chars[*p];
         if c == '|' || c == ')' {
             break;
         }
-        let atom = re_parse_atom(chars, p, depth)?;
+        let atom = re_parse_atom(chars, p, depth, ng)?;
         // Optional quantifier suffix.
         let quantified = if *p < chars.len() {
             match chars[*p] {
@@ -415,7 +439,12 @@ fn re_parse_concat(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, 
     }
 }
 
-fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, EvalError> {
+fn re_parse_atom(
+    chars: &[char],
+    p: &mut usize,
+    depth: u32,
+    ng: &mut usize,
+) -> Result<ReNode, EvalError> {
     let c = chars[*p];
     match c {
         '(' => {
@@ -426,21 +455,37 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
             // arrays / substring(from pattern) / `\N` in regexp_replace — is a
             // separate D.9 slice.)
             let mut lookahead: Option<bool> = None;
+            // A capturing group unless it's `(?:…)` or a lookaround `(?=`/`(?!`.
+            let mut capturing = true;
             if *p + 1 < chars.len() && chars[*p] == '?' {
                 match chars[*p + 1] {
-                    ':' => *p += 2,
+                    ':' => {
+                        capturing = false;
+                        *p += 2;
+                    }
                     '=' => {
                         lookahead = Some(false);
+                        capturing = false;
                         *p += 2;
                     }
                     '!' => {
                         lookahead = Some(true);
+                        capturing = false;
                         *p += 2;
                     }
                     _ => {}
                 }
             }
-            let inner = re_parse_alt(chars, p, depth + 1)?;
+            // v7.38 (read01) — reserve this group's number BEFORE parsing the
+            // inner so nested groups number in source order (`(a(b))` → 1, 2).
+            let group_idx = if capturing {
+                let idx = *ng;
+                *ng += 1;
+                Some(idx)
+            } else {
+                None
+            };
+            let inner = re_parse_alt(chars, p, depth + 1, ng)?;
             if *p >= chars.len() || chars[*p] != ')' {
                 return Err(EvalError::TypeMismatch {
                     detail: "regex compile: unmatched '('".into(),
@@ -452,7 +497,13 @@ fn re_parse_atom(chars: &[char], p: &mut usize, depth: u32) -> Result<ReNode, Ev
                     negative,
                     inner: Box::new(inner),
                 }),
-                None => Ok(inner),
+                None => match group_idx {
+                    Some(idx) => Ok(ReNode::Group {
+                        idx,
+                        inner: Box::new(inner),
+                    }),
+                    None => Ok(inner),
+                },
             }
         }
         '[' => re_parse_class(chars, p),
@@ -969,6 +1020,9 @@ fn re_match_at(
             let hit = re_match_at(inner, s, pos, d, steps)?.is_some();
             Ok(if hit != *negative { Some(pos) } else { None })
         }
+        // v7.38 (read01) — Stage 1: a capturing group matches transparently
+        // (capture recording is threaded in a later stage).
+        ReNode::Group { inner, .. } => re_match_at(inner, s, pos, d, steps),
     }
 }
 
@@ -1635,7 +1689,9 @@ fn fold_case(node: &mut ReNode) {
             }
             members.extend(extra);
         }
-        ReNode::Quant { inner, .. } | ReNode::Lookahead { inner, .. } => fold_case(inner),
+        ReNode::Quant { inner, .. }
+        | ReNode::Lookahead { inner, .. }
+        | ReNode::Group { inner, .. } => fold_case(inner),
         ReNode::Concat(items) | ReNode::Alt(items) => {
             for it in items.iter_mut() {
                 fold_case(it);
