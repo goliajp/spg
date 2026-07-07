@@ -2687,6 +2687,7 @@ impl Parser {
                 columns,
                 body,
                 with_data,
+                as_plain_table: false,
             },
         ))
     }
@@ -8041,6 +8042,30 @@ impl Parser {
                 partition_by: None,
                 partition_of: Some(partition_of),
             }));
+        }
+        // v7.38 (read01 P6.49) — CTAS: `CREATE TABLE name AS <select>`. Reuses
+        // the materialized-view materialisation path (run the SELECT, infer the
+        // column types, create + populate the table) but marks the node so the
+        // executor creates a plain table without a mat-view registry entry.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+            let body_stmt = self.parse_select_stmt()?;
+            let Statement::Select(body) = body_stmt else {
+                return Err(self.err(format!(
+                    "CREATE TABLE {name:?} AS body must be a SELECT, got {body_stmt:?}"
+                )));
+            };
+            let with_data = self.parse_optional_with_data(true)?;
+            return Ok(Statement::CreateMaterializedView(
+                crate::ast::CreateMaterializedViewStatement {
+                    name,
+                    if_not_exists,
+                    columns: Vec::new(),
+                    body,
+                    with_data,
+                    as_plain_table: true,
+                },
+            ));
         }
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(

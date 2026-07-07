@@ -612,6 +612,11 @@ pub struct CreateMaterializedViewStatement {
     /// time. `WITH NO DATA` = create an empty backing table;
     /// callers must REFRESH before SELECT returns rows.
     pub with_data: bool,
+    /// v7.38 (read01 P6.49) — when true this node came from
+    /// `CREATE TABLE … AS <select>` (CTAS) / `SELECT … INTO`, so the
+    /// executor creates a plain table and does NOT register it in the
+    /// materialized-view registry (no REFRESH semantics).
+    pub as_plain_table: bool,
 }
 
 /// v7.17.0 Phase 1.2 — `CREATE VIEW` AST node.
