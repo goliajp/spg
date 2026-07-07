@@ -81,6 +81,13 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::Int(!i32::from(n))),
         (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
         (UnOp::BitNot, Value::BigInt(n)) => Ok(Value::BigInt(!n)),
+        // v7.38 (read01) — PG `~ inet` flips every host-address bit, keeping the
+        // operand's netmask (`~ 255.0.0.0/8` → `0.255.255.255/8`).
+        (UnOp::BitNot, Value::Inet { family, bits, addr }) => {
+            let mask = if family == 4 { u128::from(u32::MAX) } else { u128::MAX };
+            let flipped = !inet_addr_u128(family, &addr) & mask;
+            Ok(inet_from_u128(family, bits, flipped))
+        }
         (UnOp::BitNot, Value::BitString { nbits, bytes }) => {
             // PG `~ bit(n)`: flip every bit, then re-zero the padding bits
             // past `nbits` so the value stays canonical (MSB-packed).
@@ -465,6 +472,11 @@ pub(super) fn apply_binary(
         BinOp::Concat => Ok(text_concat(&l, &r)),
         // PG `jsonb #- text[]` deletes the value at a nested path.
         BinOp::JsonDeletePath => crate::json::delete_path(&[l, r]),
+        BinOp::BitOr | BinOp::BitAnd
+            if matches!(l, Value::Inet { .. }) && matches!(r, Value::Inet { .. }) =>
+        {
+            inet_bitwise(op, &l, &r)
+        }
         BinOp::BitOr => bitop(l, r, |a, b| a | b, "|"),
         BinOp::BitAnd => bitop(l, r, |a, b| a & b, "&"),
         BinOp::BitXor => bitop(l, r, |a, b| a ^ b, "#"),
@@ -2840,6 +2852,51 @@ pub(crate) fn range_merge_pair(a: &Value<'_>, b: &Value<'_>) -> Option<Value<'st
 fn inet_addr_u128(family: u8, addr: &[u8; 16]) -> u128 {
     let slice: &[u8] = if family == 4 { &addr[0..4] } else { &addr[..] };
     slice.iter().fold(0u128, |acc, &b| (acc << 8) | u128::from(b))
+}
+
+/// Rebuild a `Value::Inet` from a numeric address (inverse of
+/// `inet_addr_u128`), MSB-packing the low 4 (IPv4) or 16 (IPv6) bytes.
+fn inet_from_u128(family: u8, bits: u8, val: u128) -> Value<'static> {
+    let mut addr = [0u8; 16];
+    if family == 4 {
+        #[allow(clippy::cast_possible_truncation)]
+        addr[0..4].copy_from_slice(&(val as u32).to_be_bytes());
+    } else {
+        addr.copy_from_slice(&val.to_be_bytes());
+    }
+    Value::Inet { family, bits, addr }
+}
+
+/// v7.38 (read01) — PG `inet & inet` / `inet | inet`: both must be the same
+/// family, the addresses combine bitwise, and the result netmask is the wider
+/// of the two (`10.0.0.0/8 & 255.0.0.0` → `10.0.0.0/32`).
+fn inet_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    let (
+        Value::Inet { family: fa, bits: ba, addr: aa },
+        Value::Inet { family: fb, bits: bb, addr: ab },
+    ) = (l, r)
+    else {
+        return Err(EvalError::TypeMismatch {
+            detail: "inet bitwise operator needs two inet values".into(),
+        });
+    };
+    if fa != fb {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot AND/OR/XOR inet values of different sizes".into(),
+        });
+    }
+    let x = inet_addr_u128(*fa, aa);
+    let y = inet_addr_u128(*fb, ab);
+    let val = match op {
+        BinOp::BitAnd => x & y,
+        BinOp::BitOr => x | y,
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "unsupported inet bitwise operator".into(),
+            });
+        }
+    };
+    Ok(inet_from_u128(*fa, (*ba).max(*bb), val))
 }
 
 pub(super) fn compare(
