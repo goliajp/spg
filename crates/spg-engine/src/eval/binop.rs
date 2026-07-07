@@ -238,6 +238,45 @@ pub(super) fn apply_binary(
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
+    // v7.38 (read01 sweep) — arithmetic against an unknown-type string literal
+    // coerces the literal to the numeric operand's type (`5 + '3'`, `'10' - 2`,
+    // `1.5 + '2'`), mirroring PG's implicit unknown → typed cast. Only the
+    // arithmetic operators: `||` keeps its number→text rule and comparisons
+    // coerce inside compare(). A literal that won't parse falls through to the
+    // normal type-mismatch error.
+    if matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    ) {
+        let is_num = |v: &Value<'_>| {
+            matches!(
+                v.data_type(),
+                Some(
+                    DataType::Int
+                        | DataType::BigInt
+                        | DataType::SmallInt
+                        | DataType::Float
+                        | DataType::Numeric { .. }
+                )
+            )
+        };
+        if let Value::Text(s) = &l {
+            if let Some(dt) = is_num(&r).then(|| r.data_type()).flatten() {
+                if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0)
+                {
+                    return apply_binary(op, c, r);
+                }
+            }
+        }
+        if let Value::Text(s) = &r {
+            if let Some(dt) = is_num(&l).then(|| l.data_type()).flatten() {
+                if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0)
+                {
+                    return apply_binary(op, l, c);
+                }
+            }
+        }
+    }
     // NUMERIC arithmetic and comparisons run in fixed-point; promote
     // integers to a common NUMERIC scale and stay in i128 throughout.
     // A NUMERIC paired with an INTERVAL is interval scaling, not
