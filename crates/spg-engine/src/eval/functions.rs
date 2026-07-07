@@ -2258,6 +2258,33 @@ fn apply_function_dispatch(
                 }),
             }
         }
+        // v7.38 (read01 sweep) — PG 16 to_bin() / to_oct(): the binary /
+        // octal string of an int4 / int8 (two's-complement width, matching
+        // to_hex's `as u32` / `as u64`).
+        "to_bin" | "to_oct" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let oct = name == "to_oct";
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::text(if oct {
+                    alloc::format!("{:o}", *n as u32)
+                } else {
+                    alloc::format!("{:b}", *n as u32)
+                })),
+                Value::BigInt(n) => Ok(Value::text(if oct {
+                    alloc::format!("{:o}", *n as u64)
+                } else {
+                    alloc::format!("{:b}", *n as u64)
+                })),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() needs int/bigint, got {:?}", other.data_type()),
+                }),
+            }
+        }
         // v7.37.17 (17.6 siblings) — pgcrypto gen_random_bytes(n)
         // returns n cryptographically-random bytes. SPG uses the
         // internal prng_next_u64() splitter (same underlying
