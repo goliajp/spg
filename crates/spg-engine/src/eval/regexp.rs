@@ -1156,6 +1156,288 @@ fn re_find(node: &ReNode, s: &[char], from: usize) -> Result<Option<(usize, usiz
     }
 }
 
+/// Highest capturing-group index inside `node` (0 = no capturing groups).
+fn max_group(node: &ReNode) -> usize {
+    match node {
+        ReNode::Group { idx, inner } => (*idx).max(max_group(inner)),
+        ReNode::Concat(items) | ReNode::Alt(items) => {
+            items.iter().map(max_group).max().unwrap_or(0)
+        }
+        ReNode::Quant { inner, .. } | ReNode::Lookahead { inner, .. } => max_group(inner),
+        _ => 0,
+    }
+}
+
+// ── v7.38 (read01, T7) — capture-aware matcher ──────────────────────────────
+//
+// A PARALLEL copy of the matcher above, threaded with a capture buffer, used
+// ONLY by the group consumers (regexp_replace `\N`, regexp_matches,
+// substring(from pattern)). The hot LIKE / `~` path keeps calling the
+// capture-free matcher unchanged — so its ReDoS `MATCH_DEPTH_LIMIT`
+// no-overflow calibration is untouched. This variant carries two extra
+// pointers plus a per-backtrack journal mark, so it runs under its own,
+// lower depth bound.
+const CAP_MATCH_DEPTH_LIMIT: u32 = 300;
+
+type Caps = alloc::vec::Vec<Option<(usize, usize)>>;
+/// Undo log: `(group index, previous value)` recorded before each write, so a
+/// failed backtrack branch restores exactly the captures it overwrote.
+type CapJournal = alloc::vec::Vec<(usize, Option<(usize, usize)>)>;
+
+fn cap_set(caps: &mut Caps, journal: &mut CapJournal, idx: usize, val: (usize, usize)) {
+    if idx < caps.len() {
+        journal.push((idx, caps[idx]));
+        caps[idx] = Some(val);
+    }
+}
+
+fn cap_undo(caps: &mut Caps, journal: &mut CapJournal, mark: usize) {
+    while journal.len() > mark {
+        let (idx, old) = journal.pop().unwrap();
+        caps[idx] = old;
+    }
+}
+
+fn re_match_at_caps(
+    node: &ReNode,
+    s: &[char],
+    pos: usize,
+    depth: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<Option<usize>, EvalError> {
+    if depth > CAP_MATCH_DEPTH_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    *steps += 1;
+    if *steps > MATCH_STEP_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    let d = depth + 1;
+    match node {
+        // Non-recursive leaves are identical to the capture-free matcher.
+        ReNode::Literal(c) => Ok((s.get(pos).copied() == Some(*c)).then_some(pos + 1)),
+        ReNode::AnyChar => Ok((pos < s.len()).then_some(pos + 1)),
+        ReNode::Class { members, negated } => match s.get(pos) {
+            Some(&c) => {
+                let hit = members.iter().any(|m| class_matches(m, c));
+                Ok((hit ^ negated).then_some(pos + 1))
+            }
+            None => Ok(None),
+        },
+        ReNode::Start => Ok((pos == 0).then_some(pos)),
+        ReNode::End => Ok((pos == s.len()).then_some(pos)),
+        ReNode::WordBoundary(kind) => {
+            let before = pos > 0 && is_word_char(s[pos - 1]);
+            let after = pos < s.len() && is_word_char(s[pos]);
+            let ok = match kind {
+                WordBoundaryKind::Boundary => before != after,
+                WordBoundaryKind::NonBoundary => before == after,
+                WordBoundaryKind::BegWord => !before && after,
+                WordBoundaryKind::EndWord => before && !after,
+            };
+            Ok(ok.then_some(pos))
+        }
+        ReNode::Concat(items) => re_match_seq_caps(items, s, pos, d, steps, caps, journal),
+        ReNode::Alt(branches) => {
+            for b in branches {
+                let mark = journal.len();
+                if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
+                    return Ok(Some(p));
+                }
+                cap_undo(caps, journal, mark);
+            }
+            Ok(None)
+        }
+        ReNode::Quant { inner, min, max, greedy } => {
+            // Standalone quantifier (no tail): greedy = longest, lazy = fewest.
+            // Captures accumulate across reps (PG: `(a)*` keeps the LAST rep);
+            // a rep that fails past the minimum leaves the earlier caps intact.
+            let mut count = 0usize;
+            let mut p = pos;
+            loop {
+                if !*greedy && count >= *min {
+                    break;
+                }
+                if let Some(cap) = max {
+                    if count >= *cap {
+                        break;
+                    }
+                }
+                let mark = journal.len();
+                match re_match_at_caps(inner, s, p, d, steps, caps, journal)? {
+                    Some(np) if np > p => {
+                        p = np;
+                        count += 1;
+                    }
+                    _ => {
+                        cap_undo(caps, journal, mark);
+                        break;
+                    }
+                }
+            }
+            if count < *min {
+                return Ok(None);
+            }
+            Ok(Some(p))
+        }
+        ReNode::Lookahead { negative, inner } => {
+            // Zero-width: probe `inner`, then discard any captures it made
+            // (they must not leak out of the assertion) and consume nothing.
+            let mark = journal.len();
+            let hit = re_match_at_caps(inner, s, pos, d, steps, caps, journal)?.is_some();
+            cap_undo(caps, journal, mark);
+            Ok((hit != *negative).then_some(pos))
+        }
+        ReNode::Group { idx, inner } => {
+            let start = pos;
+            match re_match_at_caps(inner, s, pos, d, steps, caps, journal)? {
+                Some(end) => {
+                    cap_set(caps, journal, *idx, (start, end));
+                    Ok(Some(end))
+                }
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn re_match_seq_caps(
+    items: &[ReNode],
+    s: &[char],
+    pos: usize,
+    depth: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<Option<usize>, EvalError> {
+    if depth > CAP_MATCH_DEPTH_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    *steps += 1;
+    if *steps > MATCH_STEP_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    let d = depth + 1;
+    let Some((first, rest)) = items.split_first() else {
+        return Ok(Some(pos));
+    };
+    match first {
+        ReNode::Quant { inner, min, max, greedy } => {
+            // Enumerate reachable ends, recording a journal MARK before each
+            // rep so trying the tail at `k` reps can undo the captures made by
+            // the reps beyond `k` (otherwise a backtrack leaves stale caps).
+            let mut ends = alloc::vec![pos];
+            let mut marks = alloc::vec![journal.len()];
+            let mut p = pos;
+            let mut count = 0usize;
+            loop {
+                if let Some(cap) = max {
+                    if count >= *cap {
+                        break;
+                    }
+                }
+                let mark = journal.len();
+                match re_match_at_caps(inner, s, p, d, steps, caps, journal)? {
+                    Some(np) if np > p => {
+                        p = np;
+                        count += 1;
+                        ends.push(p);
+                        marks.push(mark);
+                    }
+                    _ => {
+                        cap_undo(caps, journal, mark);
+                        break;
+                    }
+                }
+            }
+            let n = ends.len();
+            for i in 0..n {
+                let reps = if *greedy { n - 1 - i } else { i };
+                if reps < *min {
+                    if *greedy {
+                        break;
+                    }
+                    continue;
+                }
+                // Roll captures back to exactly `reps` repetitions.
+                cap_undo(caps, journal, marks[reps]);
+                let tail_mark = journal.len();
+                if let Some(e) = re_match_seq_caps(rest, s, ends[reps], d, steps, caps, journal)? {
+                    return Ok(Some(e));
+                }
+                cap_undo(caps, journal, tail_mark);
+            }
+            Ok(None)
+        }
+        ReNode::Alt(branches) => {
+            for b in branches {
+                let mark = journal.len();
+                if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
+                    if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)? {
+                        return Ok(Some(e));
+                    }
+                }
+                cap_undo(caps, journal, mark);
+            }
+            Ok(None)
+        }
+        ReNode::Concat(nested) => {
+            let mut combined: alloc::vec::Vec<ReNode> =
+                alloc::vec::Vec::with_capacity(nested.len() + rest.len());
+            combined.extend(nested.iter().cloned());
+            combined.extend(rest.iter().cloned());
+            re_match_seq_caps(&combined, s, pos, d, steps, caps, journal)
+        }
+        other => {
+            let mark = journal.len();
+            match re_match_at_caps(other, s, pos, d, steps, caps, journal)? {
+                Some(p) => {
+                    if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)? {
+                        return Ok(Some(e));
+                    }
+                    cap_undo(caps, journal, mark);
+                    Ok(None)
+                }
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+/// Find the first match of `node` at or after `from`, returning the whole-match
+/// span plus each capturing group's span (index 1..=`ngroups`; `None` where a
+/// group did not participate). `ngroups` is the highest group index in `node`.
+fn re_find_caps(
+    node: &ReNode,
+    s: &[char],
+    from: usize,
+    ngroups: usize,
+) -> Result<Option<((usize, usize), Caps)>, EvalError> {
+    let mut steps: u64 = 0;
+    let mut start = from;
+    loop {
+        let mut caps: Caps = alloc::vec![None; ngroups + 1];
+        let mut journal: CapJournal = alloc::vec::Vec::new();
+        if let Some(end) = re_match_at_caps(node, s, start, 0, &mut steps, &mut caps, &mut journal)? {
+            return Ok(Some(((start, end), caps)));
+        }
+        if start >= s.len() {
+            return Ok(None);
+        }
+        start += 1;
+    }
+}
+
 /// v7.37.16 Epic Rx P2-⑧ — PG's `checkmatchall` (regexec.c). If the
 /// ENTIRE compiled pattern is `^ <dot-repetition> $` — fully anchored,
 /// with nothing but `.` and dot-quantifiers between the anchors — then a
@@ -1274,10 +1556,20 @@ pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         fold_case(&mut node);
     }
     let chars: Vec<char> = text.chars().collect();
+    // v7.38 (read01, T7) — PG returns the capturing GROUPS when the pattern has
+    // any (`(\w+) (\w+)` → {John,Smith}); a group that did not participate is a
+    // NULL element. With no groups it returns the whole match, as before.
+    let ngroups = max_group(&node);
     let mut out: Vec<Option<String>> = Vec::new();
     let mut from = 0usize;
-    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from)? {
-        out.push(Some(chars[s_pos..e_pos].iter().collect()));
+    while let Some(((s_pos, e_pos), caps)) = re_find_caps(&node, &chars, from, ngroups)? {
+        if ngroups == 0 {
+            out.push(Some(chars[s_pos..e_pos].iter().collect()));
+        } else {
+            for g in 1..=ngroups {
+                out.push(caps[g].map(|(a, b)| chars[a..b].iter().collect()));
+            }
+        }
         if !all_matches {
             break;
         }
@@ -1364,13 +1656,16 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         fold_case(&mut node);
     }
     let chars: Vec<char> = text.chars().collect();
+    // v7.38 (read01, T7) — the replacement may reference capture groups
+    // (`\1`..`\9`), the whole match (`\&`), or an escaped backslash (`\\`).
+    let ngroups = max_group(&node);
     let mut out = String::with_capacity(text.len());
     let mut from = 0usize;
     loop {
-        match re_find(&node, &chars, from)? {
-            Some((s_pos, e_pos)) => {
+        match re_find_caps(&node, &chars, from, ngroups)? {
+            Some(((s_pos, e_pos), caps)) => {
                 out.extend(chars[from..s_pos].iter());
-                out.push_str(&repl);
+                expand_replacement(&repl, &chars, (s_pos, e_pos), &caps, &mut out);
                 let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
                 from = step;
                 if !global {
@@ -1390,6 +1685,66 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         }
     }
     Ok(Value::text(out))
+}
+
+/// Expand a `regexp_replace` replacement string, substituting `\1`..`\9` with
+/// the matched group text (empty when the group did not participate), `\&`
+/// with the whole match, and `\\` with a literal backslash. A backslash before
+/// any other character keeps that character verbatim (PG drops the backslash).
+fn expand_replacement(
+    repl: &str,
+    chars: &[char],
+    whole: (usize, usize),
+    caps: &Caps,
+    out: &mut String,
+) {
+    let rep: Vec<char> = repl.chars().collect();
+    let mut i = 0;
+    while i < rep.len() {
+        if rep[i] == '\\' && i + 1 < rep.len() {
+            let c = rep[i + 1];
+            if let Some(d) = c.to_digit(10) {
+                let g = d as usize;
+                if g == 0 {
+                    out.extend(chars[whole.0..whole.1].iter());
+                } else if let Some(Some((a, b))) = caps.get(g) {
+                    out.extend(chars[*a..*b].iter());
+                }
+                // A `\N` for a non-participating / out-of-range group expands
+                // to nothing, matching PG.
+            } else if c == '&' {
+                out.extend(chars[whole.0..whole.1].iter());
+            } else {
+                out.push(c);
+            }
+            i += 2;
+        } else {
+            out.push(rep[i]);
+            i += 1;
+        }
+    }
+}
+
+/// v7.38 (read01, T7) — `substring(string FROM pattern)`: PG returns the first
+/// capturing group's text when the pattern has one, otherwise the whole match;
+/// SQL NULL when nothing matches (or the first group did not participate).
+pub(super) fn substring_pattern(text: &str, pat: &str) -> Result<Value<'static>, EvalError> {
+    let node = re_compile(pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let ngroups = max_group(&node);
+    match re_find_caps(&node, &chars, 0, ngroups)? {
+        Some(((s_pos, e_pos), caps)) => {
+            if ngroups == 0 {
+                Ok(Value::text(chars[s_pos..e_pos].iter().collect::<String>()))
+            } else {
+                match caps.get(1).copied().flatten() {
+                    Some((a, b)) => Ok(Value::text(chars[a..b].iter().collect::<String>())),
+                    None => Ok(Value::Null),
+                }
+            }
+        }
+        None => Ok(Value::Null),
+    }
 }
 
 /// v7.17.0 Phase 3.7 — `regexp_split_to_array(s, pat)`. Returns

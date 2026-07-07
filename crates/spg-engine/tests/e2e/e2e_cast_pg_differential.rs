@@ -2037,9 +2037,9 @@ fn substring_regex_form() {
     assert_eq!(q(&mut e, "SELECT substring('abcdef' FROM 2 FOR 3)"), "bcd");
     assert_eq!(q(&mut e, "SELECT substring('abcdef', 2)"), "bcdef");
     assert_eq!(q(&mut e, "SELECT substring('foo@bar.com', '@[a-z.]+')"), "@bar.com");
-    // capturing-group pattern → honest error (regex capture-extraction gap), not a
-    // silent wrong result.
-    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"), "ERR");
+    // v7.38 (read01, T7) — a capturing-group pattern returns the FIRST group
+    // (PG), via the capture-aware matcher.
+    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"), "hello");
 }
 
 /// v7.37 D.25 — PG operator spellings of LIKE/ILIKE: ~~ / ~~* / !~~ / !~~*.
