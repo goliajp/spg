@@ -3062,9 +3062,16 @@ fn apply_function_dispatch(
                     }
                     Ok(Value::BigInt(c))
                 }
+                // v7.38 (read01) — PG bit_count(bit)/bit_count(varbit): number of
+                // set bits. The padding past nbits is canonically zero, so a
+                // straight popcount over the packed bytes is exact.
+                Value::BitString { bytes, .. } => {
+                    let c: i64 = bytes.iter().map(|byte| i64::from(byte.count_ones())).sum();
+                    Ok(Value::BigInt(c))
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "bit_count() needs integer or bytea, got {:?}",
+                        "bit_count() needs integer, bit or bytea, got {:?}",
                         other.data_type()
                     ),
                 }),

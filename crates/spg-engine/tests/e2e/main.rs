@@ -240,6 +240,7 @@ mod e2e_make_date_validation;
 mod e2e_float_to_int_range;
 mod e2e_jsonb_subscript;
 mod e2e_inet_bitwise;
+mod e2e_bit_count_bitstring;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
