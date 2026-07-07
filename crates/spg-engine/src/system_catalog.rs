@@ -1974,7 +1974,9 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(!col.nullable),
                 Value::Bool(has_default),
                 Value::text(attidentity),
-                Value::text(""),        // attgenerated — '' (not stored generated)
+                // v7.38 (read01 P6.41) — 's' for a STORED generated column
+                // (SPG stores generated columns as STORED), '' otherwise.
+                Value::text(if col.generated_stored_expr.is_some() { "s" } else { "" }),
                 Value::Bool(false),     // attisdropped
                 Value::Bool(true),      // attislocal — true (not inherited)
                 Value::Int(0),          // attinhcount
