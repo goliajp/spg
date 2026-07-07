@@ -2116,6 +2116,57 @@ fn apply_function_dispatch(
             })?;
             Ok(Value::Point(spg_storage::Point2D { x, y }))
         }
+        // v7.38 (read01) — two-argument geometric constructors (PG). The
+        // one-argument spellings (`circle('<...>')`) fall through to the
+        // function-style typecast instead.
+        "circle" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let Value::Point(center) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "circle(point, radius) needs a point centre".into(),
+                });
+            };
+            let radius = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "circle(point, radius) needs a numeric radius".into(),
+            })?;
+            Ok(Value::Circle {
+                center: *center,
+                radius,
+            })
+        }
+        "box" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Point(a), Value::Point(b)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "box(point, point) needs two points".into(),
+                });
+            };
+            // PG stores a box as (upper-right, lower-left).
+            let ur = spg_storage::Point2D {
+                x: a.x.max(b.x),
+                y: a.y.max(b.y),
+            };
+            let ll = spg_storage::Point2D {
+                x: a.x.min(b.x),
+                y: a.y.min(b.y),
+            };
+            Ok(Value::PgBox(ur, ll))
+        }
+        "lseg" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Point(a), Value::Point(b)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "lseg(point, point) needs two points".into(),
+                });
+            };
+            Ok(Value::Lseg(*a, *b))
+        }
         // npoints(path | polygon) — the vertex count.
         "npoints" if args.len() == 1 => match &args[0] {
             Value::Null => Ok(Value::Null),
