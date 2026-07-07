@@ -189,13 +189,22 @@ fn match_simple_before_on_delete() {
 }
 
 #[test]
-fn match_full_is_rejected() {
+fn match_full_single_column_is_accepted() {
+    // v7.38 (read01 P6.44) — MATCH FULL on a single-column FK is identical to
+    // MATCH SIMPLE, so it parses (PG accepts it too).
+    parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH FULL)")
+        .expect("single-column MATCH FULL should parse");
+}
+
+#[test]
+fn match_full_multi_column_is_rejected() {
+    // Multi-column MATCH FULL needs the all-or-none-NULL rule, still unwired.
     let err = parse_statement(
         "CREATE TABLE c (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p (a, b) MATCH FULL)",
     )
-    .expect_err("MATCH FULL should be rejected");
+    .expect_err("multi-column MATCH FULL should be rejected");
     assert!(
-        format!("{err:?}").contains("MATCH FULL is not yet implemented"),
+        format!("{err:?}").contains("MATCH FULL on a multi-column foreign key"),
         "got {err:?}"
     );
 }
@@ -206,7 +215,7 @@ fn match_partial_is_rejected() {
         parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH PARTIAL)")
             .expect_err("MATCH PARTIAL should be rejected");
     assert!(
-        format!("{err:?}").contains("MATCH PARTIAL is not yet implemented"),
+        format!("{err:?}").contains("MATCH PARTIAL is not implemented"),
         "got {err:?}"
     );
 }
