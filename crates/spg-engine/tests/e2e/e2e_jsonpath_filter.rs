@@ -47,3 +47,11 @@ fn jsonpath_at_at_toplevel_predicate() {
     assert_eq!(text(&mut e, "SELECT '{\"a\":{\"b\":10}}'::jsonb @@ '$.a.b >= 10'"), "true");
     assert_eq!(text(&mut e, "SELECT jsonb_path_match('{\"a\":5}', '$.a > 3')"), "true");
 }
+
+#[test]
+fn jsonpath_filter_and_or() {
+    let mut e = Engine::new();
+    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[{\"a\":5,\"b\":2},{\"a\":5,\"b\":9},{\"a\":1,\"b\":2}]', '$[*] ? (@.a == 5 && @.b < 5)'))::text"), "[{\"a\": 5, \"b\": 2}]");
+    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[1,2,3,4,5]', '$[*] ? (@ < 2 || @ > 4)'))::text"), "[1, 5]");
+    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[1,2,3,4,5,6]', '$[*] ? ((@ > 1 && @ < 3) || @ == 6)'))::text"), "[2, 6]");
+}

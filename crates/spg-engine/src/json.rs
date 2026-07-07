@@ -1195,9 +1195,9 @@ enum PathStep {
     // v7.38 (read01, T8) — SQL/JSON path filter sublanguage.
     /// `[N to M]` — an inclusive array-index range.
     Range(usize, usize),
-    /// `? (@... <op> <literal>)` — keep the current items whose accessor
-    /// satisfies the comparison.
-    Filter(FilterPred),
+    /// `? (<predicate>)` — keep the current items whose accessor expression
+    /// satisfies the (possibly `&&`/`||`-combined) predicate.
+    Filter(FilterExpr),
     /// `.size()` — the length of an array (or 1 for a scalar, per PG lax mode).
     Size,
     /// `.type()` — the JSON type name of the current item.
@@ -1210,6 +1210,14 @@ struct FilterPred {
     path: Vec<String>,
     op: FilterOp,
     val: FilterVal,
+}
+
+/// A filter predicate tree — a single comparison or a `&&`/`||` combination.
+#[derive(Debug, Clone)]
+enum FilterExpr {
+    Cmp(FilterPred),
+    And(alloc::boxed::Box<FilterExpr>, alloc::boxed::Box<FilterExpr>),
+    Or(alloc::boxed::Box<FilterExpr>, alloc::boxed::Box<FilterExpr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1390,22 +1398,82 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
     Ok(steps)
 }
 
-/// v7.38 (read01, T8) — parse a filter predicate body `( @[.field]* <op>
-/// <literal> )` starting just after the `?`. Supports a single comparison of
-/// the current-item accessor against a number / string / boolean literal.
-fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize), EvalError> {
+fn jp_skip_ws(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && chars[*i].is_whitespace() {
+        *i += 1;
+    }
+}
+
+/// v7.38 (read01, T8) — parse a filter body `( <expr> )` starting just after
+/// the `?`, where `<expr>` is a comparison of a `@` accessor against a literal,
+/// optionally combined with `&&` / `||` and grouped with parentheses.
+fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterExpr, usize), EvalError> {
     let err = |m: &str| EvalError::TypeMismatch {
         detail: alloc::format!("jsonpath filter: {m}"),
     };
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
+    jp_skip_ws(chars, &mut i);
     if i >= chars.len() || chars[i] != '(' {
         return Err(err("expected '(' after '?'"));
     }
     i += 1;
-    while i < chars.len() && chars[i].is_whitespace() {
+    let (expr, ni) = parse_filter_or(chars, i)?;
+    i = ni;
+    jp_skip_ws(chars, &mut i);
+    if i >= chars.len() || chars[i] != ')' {
+        return Err(err("expected ')' to close the filter"));
+    }
+    i += 1;
+    Ok((expr, i))
+}
+
+/// `<and> ( '||' <and> )*`
+fn parse_filter_or(chars: &[char], i: usize) -> Result<(FilterExpr, usize), EvalError> {
+    let (mut left, mut i) = parse_filter_and(chars, i)?;
+    loop {
+        jp_skip_ws(chars, &mut i);
+        if i + 1 < chars.len() && chars[i] == '|' && chars[i + 1] == '|' {
+            i += 2;
+            let (right, ni) = parse_filter_and(chars, i)?;
+            i = ni;
+            left = FilterExpr::Or(alloc::boxed::Box::new(left), alloc::boxed::Box::new(right));
+        } else {
+            return Ok((left, i));
+        }
+    }
+}
+
+/// `<atom> ( '&&' <atom> )*`
+fn parse_filter_and(chars: &[char], i: usize) -> Result<(FilterExpr, usize), EvalError> {
+    let (mut left, mut i) = parse_filter_atom(chars, i)?;
+    loop {
+        jp_skip_ws(chars, &mut i);
+        if i + 1 < chars.len() && chars[i] == '&' && chars[i + 1] == '&' {
+            i += 2;
+            let (right, ni) = parse_filter_atom(chars, i)?;
+            i = ni;
+            left = FilterExpr::And(alloc::boxed::Box::new(left), alloc::boxed::Box::new(right));
+        } else {
+            return Ok((left, i));
+        }
+    }
+}
+
+/// `'(' <or> ')'` | `@[.field]* <op> <literal>`
+fn parse_filter_atom(chars: &[char], mut i: usize) -> Result<(FilterExpr, usize), EvalError> {
+    let err = |m: &str| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonpath filter: {m}"),
+    };
+    jp_skip_ws(chars, &mut i);
+    if i < chars.len() && chars[i] == '(' {
         i += 1;
+        let (expr, ni) = parse_filter_or(chars, i)?;
+        i = ni;
+        jp_skip_ws(chars, &mut i);
+        if i >= chars.len() || chars[i] != ')' {
+            return Err(err("expected ')' in grouped predicate"));
+        }
+        i += 1;
+        return Ok((expr, i));
     }
     if i >= chars.len() || chars[i] != '@' {
         return Err(err("only `@`-based predicates are supported"));
@@ -1422,14 +1490,7 @@ fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize)
     }
     let (op, val, ni) = parse_cmp_and_literal(chars, i)?;
     i = ni;
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() || chars[i] != ')' {
-        return Err(err("expected ')' to close the filter"));
-    }
-    i += 1;
-    Ok((FilterPred { path, op, val }, i))
+    Ok((FilterExpr::Cmp(FilterPred { path, op, val }), i))
 }
 
 /// Parse a comparison operator and its literal operand (`> 8`, `== "b"`,
@@ -1579,6 +1640,15 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
     }
 }
 
+/// Evaluate a (possibly `&&`/`||`-combined) filter predicate tree.
+fn filter_expr_matches(node: &JsonValue, expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::Cmp(pred) => filter_matches(node, pred),
+        FilterExpr::And(a, b) => filter_expr_matches(node, a) && filter_expr_matches(node, b),
+        FilterExpr::Or(a, b) => filter_expr_matches(node, a) || filter_expr_matches(node, b),
+    }
+}
+
 fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
     let mut cur: Vec<JsonValue> = alloc::vec![root.clone()];
     for step in steps {
@@ -1606,8 +1676,8 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
                         }
                     }
                 }
-                (PathStep::Filter(pred), node) => {
-                    if filter_matches(node, pred) {
+                (PathStep::Filter(expr), node) => {
+                    if filter_expr_matches(node, expr) {
                         next.push(node.clone());
                     }
                 }
