@@ -527,6 +527,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => "vector",
         Value::Numeric { .. } => "numeric",
         Value::Date(_) => "date",
+        Value::Time(_) => "time without time zone",
         Value::Timestamp(_) => "timestamp without time zone",
         Value::Interval { .. } => "interval",
         Value::Json(_) => {

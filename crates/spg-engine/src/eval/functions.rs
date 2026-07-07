@@ -5672,10 +5672,11 @@ fn apply_function_dispatch(
                 });
             }
             let us = h * 3_600_000_000 + m * 60_000_000 + (s * 1_000_000.0) as i64;
-            // SPG has no standalone TIME type in Value; return as
-            // micros-in-day via Timestamp shape (callers that cast
-            // to TIME get the canonical form).
-            Ok(Value::Timestamp(us))
+            // v7.38 (read01 sweep) — make_time returns TIME (micros-since-
+            // midnight), not TIMESTAMP. `Value::Time` is the standalone type;
+            // the old Timestamp shape rendered as "1970-01-01 12:30:00" and
+            // reported the wrong pg_typeof.
+            Ok(Value::Time(us))
         }
         "make_timestamp" => {
             if args.len() != 6 {
