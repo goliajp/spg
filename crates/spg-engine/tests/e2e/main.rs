@@ -224,6 +224,7 @@ mod e2e_math_fn_string_coerce;
 mod e2e_window_sum_int_type;
 mod e2e_extract_subsecond;
 mod e2e_numeric_unconstrained_cast;
+mod e2e_numeric_array_to_float;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
