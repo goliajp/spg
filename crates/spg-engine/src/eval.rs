@@ -753,6 +753,13 @@ pub fn eval_expr(
             if matches!(target_v, Value::Null) || matches!(idx_v, Value::Null) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01) — JSON/JSONB subscripting (`j['a']`, `j[0]`, chained
+            // `j['a']['b']`) is object/array access, identical to the `->`
+            // operator (text key → object field, integer → 0-based array
+            // element). PG 14+ subscript syntax.
+            if matches!(target_v, Value::Json(_)) {
+                return crate::json::path_get(&target_v, &idx_v, false);
+            }
             let i: i64 = match idx_v {
                 Value::Int(n) => i64::from(n),
                 Value::BigInt(n) => n,
