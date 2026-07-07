@@ -120,6 +120,30 @@ fn apply_function_dispatch(
     args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01 sweep) — PG resolves an unknown-type string literal in a
+    // numeric function's argument to numeric (`abs('-7')`, `sqrt('16')`,
+    // `round('3.567', 2)`). For the single-numeric-first-argument math
+    // functions, coerce a Text arg[0] that parses as a number and re-dispatch;
+    // a non-numeric string falls through to the normal type error unchanged.
+    // `trunc` is intentionally excluded: PG leaves `trunc('unknown')` ambiguous
+    // ("function trunc(unknown) is not unique"), so SPG lets it error too.
+    const NUMERIC_ARG0_FNS: &[&str] = &[
+        "abs", "sqrt", "cbrt", "sign", "ceil", "ceiling", "floor", "exp", "ln",
+        "round",
+    ];
+    if NUMERIC_ARG0_FNS.contains(&name)
+        && let Some(Value::Text(s)) = args.first()
+        && let Ok(coerced) = crate::conversions::coerce_value(
+            Value::text(s.as_ref()),
+            spg_storage::DataType::Numeric { precision: 0, scale: 0 },
+            "",
+            0,
+        )
+    {
+        let mut new_args: alloc::vec::Vec<Value> = args.to_vec();
+        new_args[0] = coerced;
+        return apply_function_dispatch(name, &new_args, ctx);
+    }
     match name {
         // v7.38 P0 元机制 A — SQL-facing handles for the injection
         // points framework. Tests call these to attach an action
