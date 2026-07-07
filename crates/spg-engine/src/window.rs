@@ -301,6 +301,11 @@ pub(crate) fn compute_window_partition(
                 let mut num_scaled: i128 = 0;
                 let mut num_scale: u8 = 0;
                 let mut use_numeric = false;
+                // v7.38 (read01 sweep) — sum() over integer inputs returns
+                // BIGINT (PG), not double. Accumulate integers exactly and only
+                // fall back to the f64 path if a non-integer value appears.
+                let mut int_sum: i128 = 0;
+                let mut all_int = true;
                 let mut count: i64 = 0;
                 // min/max compare the *actual* Value via value_cmp so
                 // they work on TEXT / DATE / NUMERIC (not just f64) and
@@ -346,8 +351,15 @@ pub(crate) fn compute_window_partition(
                                     num_scaled = s;
                                     num_scale = sc;
                                     use_numeric = true;
+                                    all_int = false;
                                     count += 1;
                                 } else if let Some(x) = value_to_f64(v) {
+                                    match v {
+                                        Value::Int(n) => int_sum += i128::from(*n),
+                                        Value::SmallInt(n) => int_sum += i128::from(*n),
+                                        Value::BigInt(n) => int_sum += i128::from(*n),
+                                        _ => all_int = false,
+                                    }
                                     sum += x;
                                     count += 1;
                                 }
@@ -379,6 +391,10 @@ pub(crate) fn compute_window_partition(
                             Value::Null
                         } else if use_numeric {
                             Value::Numeric { scaled: num_scaled, scale: num_scale }
+                        } else if all_int && i64::try_from(int_sum).is_ok() {
+                            // Integer inputs → BIGINT, matching PG and the
+                            // GROUP BY sum() path.
+                            Value::BigInt(int_sum as i64)
                         } else {
                             Value::Float(sum)
                         }

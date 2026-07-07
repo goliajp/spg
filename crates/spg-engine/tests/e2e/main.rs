@@ -221,6 +221,7 @@ mod e2e_bool_string_compare;
 mod e2e_unconstrained_numeric;
 mod e2e_on_conflict_cardinality;
 mod e2e_math_fn_string_coerce;
+mod e2e_window_sum_int_type;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

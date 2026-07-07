@@ -67,5 +67,6 @@ fn groups_offset_bounds_supported() {
         &mut e,
         "SELECT SUM(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
     );
-    assert_eq!(out, vec![vec![Value::Float(10.0)]]);
+    // v7.38 (read01 sweep) — SUM over integer input is BIGINT (PG), not double.
+    assert_eq!(out, vec![vec![Value::BigInt(10)]]);
 }
