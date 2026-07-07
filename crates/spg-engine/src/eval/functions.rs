@@ -10602,6 +10602,11 @@ fn apply_function_dispatch(
             if args[..2].iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01, T8) — a top-level predicate (`$.a > 3`) evaluates
+            // to a real boolean; other paths fall back to any-match.
+            if let Some(b) = crate::json::path_predicate(&args[0], &args[1])? {
+                return Ok(Value::Bool(b));
+            }
             let q = crate::json::path_query(&args[0], &args[1])?;
             match q {
                 Value::TextArray(items) => {

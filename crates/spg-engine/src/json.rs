@@ -1420,10 +1420,31 @@ fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize)
         }
         path.push(chars[start..i].iter().collect());
     }
+    let (op, val, ni) = parse_cmp_and_literal(chars, i)?;
+    i = ni;
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
     }
-    // Operator: two-char forms first.
+    if i >= chars.len() || chars[i] != ')' {
+        return Err(err("expected ')' to close the filter"));
+    }
+    i += 1;
+    Ok((FilterPred { path, op, val }, i))
+}
+
+/// Parse a comparison operator and its literal operand (`> 8`, `== "b"`,
+/// `>= 3`) starting at `i`; returns the op, the literal and the new index.
+/// Shared by the `? (...)` filter parser and the top-level `@@` predicate.
+fn parse_cmp_and_literal(
+    chars: &[char],
+    mut i: usize,
+) -> Result<(FilterOp, FilterVal, usize), EvalError> {
+    let err = |m: &str| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonpath predicate: {m}"),
+    };
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
     let op = if i + 1 < chars.len() && chars[i] == '>' && chars[i + 1] == '=' {
         i += 2;
         FilterOp::Ge
@@ -1448,7 +1469,6 @@ fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize)
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
     }
-    // Literal: quoted string, number, or true/false.
     let val = if i < chars.len() && chars[i] == '"' {
         i += 1;
         let start = i;
@@ -1482,14 +1502,7 @@ fn parse_filter_pred(chars: &[char], mut i: usize) -> Result<(FilterPred, usize)
             .map_err(|_| err("invalid numeric literal"))?;
         FilterVal::Num(num)
     };
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() || chars[i] != ')' {
-        return Err(err("expected ')' to close the filter"));
-    }
-    i += 1;
-    Ok((FilterPred { path, op, val }, i))
+    Ok((op, val, i))
 }
 
 /// v7.38 (read01, T8) — the PG `.type()` name of a JSON value.
@@ -1615,6 +1628,56 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
         }
     }
     cur
+}
+
+/// v7.38 (read01, T8) — evaluate a top-level jsonpath boolean predicate like
+/// `$.a > 3` (the form the `@@` operator / jsonb_path_match takes). Returns
+/// `Some(bool)` when the path is a top-level comparison, or `None` to let the
+/// caller fall back to the ordinary path-query match (`$.a ? (...)` etc.).
+pub fn path_predicate(doc: &Value, path: &Value) -> Result<Option<bool>, EvalError> {
+    let (src, ptext) = match (doc, path) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(None),
+        (Value::Json(s) | Value::Text(s), Value::Text(p) | Value::Json(p)) => (s, p),
+        _ => return Ok(None),
+    };
+    let chars: Vec<char> = ptext.chars().collect();
+    // Find a top-level comparison operator — depth 0, outside quotes, so a `>`
+    // inside a `? (...)` filter or `[...]` does not count.
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut op_at = None;
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += 1;
+                }
+            }
+            '>' | '<' | '=' | '!' if depth == 0 => {
+                op_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(pos) = op_at else { return Ok(None) };
+    let left: String = chars[..pos].iter().collect();
+    let steps = parse_jsonpath(left.trim())?;
+    let (op, val, _) = parse_cmp_and_literal(&chars, pos)?;
+    let root = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("{e}"),
+    })?;
+    let results = apply_jsonpath(&root, &steps);
+    let pred = FilterPred {
+        path: Vec::new(),
+        op,
+        val,
+    };
+    Ok(Some(results.iter().any(|v| filter_matches(v, &pred))))
 }
 
 /// v7.17.0 Phase 3.9 — `jsonb_path_query(doc, path)` — returns the
