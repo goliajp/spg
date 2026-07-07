@@ -616,10 +616,19 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             .map_err(|_| EvalError::TypeMismatch {
                 detail: format!("bigint {n} does not fit in int"),
             }),
-        // PG rounds (half-away) when coercing a real number to an
-        // integer — 1.9::int = 2, 2.5::int = 3, not truncation.
+        // PG rounds (half-to-even) coercing a real number to an integer, and
+        // errors on a non-finite or out-of-range value (`'inf'::int`,
+        // `1e20::int`) rather than saturating.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::Int(f64_round_half_even(x) as i32)),
+        Value::Float(x) => {
+            let r = f64_round_half_even(x);
+            if !r.is_finite() || r < -2_147_483_648.0 || r > 2_147_483_647.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                });
+            }
+            Ok(Value::Int(r as i32))
+        }
         Value::Numeric { scaled, scale } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i32::try_from(rounded)
@@ -650,9 +659,19 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Int(n) => Ok(Value::BigInt(i64::from(n))),
         Value::BigInt(n) => Ok(Value::BigInt(n)),
-        // PG rounds (half-away) coercing a real number to bigint.
+        // PG rounds (half-to-even) coercing a real number to bigint, and errors
+        // on a non-finite or out-of-range value rather than saturating.
         #[allow(clippy::cast_possible_truncation)]
-        Value::Float(x) => Ok(Value::BigInt(f64_round_half_even(x) as i64)),
+        Value::Float(x) => {
+            let r = f64_round_half_even(x);
+            if !r.is_finite() || r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_775_808.0
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: "bigint out of range".into(),
+                });
+            }
+            Ok(Value::BigInt(r as i64))
+        }
         Value::Numeric { scaled, scale } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i64::try_from(rounded)
