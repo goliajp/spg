@@ -211,6 +211,7 @@ mod e2e_querytree;
 mod e2e_normalize_form;
 mod e2e_is_normalized;
 mod e2e_json_object_text;
+mod e2e_to_timestamp_ww;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

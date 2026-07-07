@@ -14206,6 +14206,15 @@ fn parse_by_format(
                 .ok_or_else(|| alloc::format!("expected day-of-year digits at position {ii}"))?;
             doy = Some(v as u32);
             fi += 3;
+        } else if starts_with_ci(&fmt_bytes, fi, "WW") {
+            // v7.38 (read01 sweep) — week of year (1-53). PG's WW: week 1
+            // starts on Jan 1 and every week is 7 days, so the week's first
+            // day is day-of-year (W-1)*7 + 1. Resolved to month/day post-loop
+            // via the same `doy` path as DDD.
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected week digits at position {ii}"))?;
+            doy = Some((v as u32).saturating_sub(1) * 7 + 1);
+            fi += 2;
         } else if starts_with_ci(&fmt_bytes, fi, "DD") {
             let v = take_digits(&in_bytes, &mut ii, 2)
                 .ok_or_else(|| alloc::format!("expected day digits at position {ii}"))?;
