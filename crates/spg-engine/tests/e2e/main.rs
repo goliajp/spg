@@ -214,6 +214,7 @@ mod e2e_json_object_text;
 mod e2e_to_timestamp_ww;
 mod e2e_to_bin_oct;
 mod e2e_make_time_type;
+mod e2e_insert_fewer_values;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
