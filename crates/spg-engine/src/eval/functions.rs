@@ -9734,6 +9734,20 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01 sweep) — PG coerces an untyped `'{a,b}'` literal to
+            // text[] for the json_object(text[] [, text[]]) signature. SPG keeps
+            // it as text, so accept a Text arg that parses as an array literal
+            // (the ARRAY[...] and ::text[] spellings already arrive as TextArray).
+            let args: alloc::vec::Vec<Value> = args
+                .iter()
+                .map(|a| match a {
+                    Value::Text(s) => match crate::conversions::decode_text_array_literal(s) {
+                        Ok(arr) => Value::TextArray(arr),
+                        Err(_) => a.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
             fn escape_into(s: &str, out: &mut alloc::string::String) {
                 out.push('"');
                 for c in s.chars() {
