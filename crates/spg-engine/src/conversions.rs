@@ -1889,6 +1889,24 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "bytea_array" => DataType::BytesArray,
         "interval_array" => DataType::IntervalArray,
         "money_array" => DataType::MoneyArray,
+        // v7.38 (read01) — primitive scalar spellings. These reach here only
+        // via CastTarget::Named (e.g. the function-style typecast `int4('5')` /
+        // `text(42)` / `date('2024-01-15')`); the `expr::type` parser path maps
+        // them to dedicated CastTarget variants and never touches this table.
+        "int" | "int4" | "integer" => DataType::Int,
+        "bigint" | "int8" => DataType::BigInt,
+        "text" => DataType::Text,
+        "varchar" | "character varying" => DataType::Varchar(0),
+        "bpchar" | "character" => DataType::Char(0),
+        "bool" | "boolean" => DataType::Bool,
+        "date" => DataType::Date,
+        "timestamp" | "timestamp without time zone" => DataType::Timestamp,
+        "timestamptz" | "timestamp with time zone" => DataType::Timestamptz,
+        "uuid" => DataType::Uuid,
+        "json" => DataType::Json,
+        "jsonb" => DataType::Jsonb,
+        "bytea" => DataType::Bytes,
+        "interval" => DataType::Interval,
         _ => return None,
     })
 }
