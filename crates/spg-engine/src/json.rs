@@ -1863,6 +1863,20 @@ fn encode_value_into(v: &Value, out: &mut String) {
             // identity.
             out.push_str(s);
         }
+        // v7.38 (read01, T9) — a composite encodes as a JSON object keyed by
+        // field name (`to_json(row(1,'a'))` → `{"f1":1,"f2":"a"}`).
+        Value::Composite(fields) => {
+            out.push('{');
+            for (i, (name, fv)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(&JsonValue::String(name.clone()), out);
+                out.push(':');
+                encode_value_into(fv, out);
+            }
+            out.push('}');
+        }
         Value::TextArray(items) => {
             out.push('[');
             for (i, it) in items.iter().enumerate() {
@@ -2827,6 +2841,15 @@ fn value_to_jsonvalue(v: &Value) -> Result<JsonValue, EvalError> {
             detail: alloc::format!("invalid JSON value: {e}"),
         })?,
         Value::Text(s) => JsonValue::String(s.to_string()),
+        // v7.38 (read01, T9) — a composite becomes a JSON object keyed by field
+        // name (`row_to_json(row(1,'a'))` → `{"f1":1,"f2":"a"}`).
+        Value::Composite(fields) => {
+            let mut entries = alloc::vec::Vec::with_capacity(fields.len());
+            for (name, fv) in fields.iter() {
+                entries.push((name.clone(), value_to_jsonvalue(fv)?));
+            }
+            JsonValue::Object(entries)
+        }
         other => {
             // Numbers and everything else render through the
             // to_json text form, then parse back.

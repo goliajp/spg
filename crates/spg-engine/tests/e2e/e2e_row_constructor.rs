@@ -26,21 +26,25 @@ fn alloc_sql(cond: &str) -> String {
 
 #[test]
 fn bare_row_renders_record_text() {
+    // v7.38 (read01, T9) — ROW(...) is a first-class composite value; its text
+    // form is PG's record_out. Assert the rendered text via ::text.
     let mut e = Engine::new();
-    let spg_storage::Value::Text(s) = one(&mut e, "SELECT ROW(1, 'a')") else {
+    let spg_storage::Value::Text(s) = one(&mut e, "SELECT (ROW(1, 'a'))::text") else {
         panic!("expected Text");
     };
     assert_eq!(s.as_ref(), "(1,a)");
     // NULL field renders empty; special characters get quoted.
-    let spg_storage::Value::Text(s) = one(&mut e, "SELECT ROW(1, NULL, 'x,y')") else {
+    let spg_storage::Value::Text(s) = one(&mut e, "SELECT (ROW(1, NULL, 'x,y'))::text") else {
         panic!("expected Text");
     };
     assert_eq!(s.as_ref(), "(1,,\"x,y\")");
     // Single-element ROW is valid (unlike bare parens).
-    let spg_storage::Value::Text(s) = one(&mut e, "SELECT ROW(7)") else {
+    let spg_storage::Value::Text(s) = one(&mut e, "SELECT (ROW(7))::text") else {
         panic!("expected Text");
     };
     assert_eq!(s.as_ref(), "(7)");
+    // The bare value is a composite record.
+    assert!(matches!(one(&mut e, "SELECT ROW(1, 'a')"), spg_storage::Value::Composite(_)));
 }
 
 #[test]

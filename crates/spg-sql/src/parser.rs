@@ -14664,8 +14664,18 @@ impl Parser {
                 .iter()
                 .map(|c| pos_of(c))
                 .collect::<Result<_, _>>()?;
-            let base_row = row_of(&body.items, &positions)?;
-            let rec_row = row_of(&body.unions[rec].1.items, &positions)?;
+            // v7.38 (read01, T9) — ROW(cols) is now a first-class composite, so
+            // cast it to text for the cycle path: membership only needs equality,
+            // and the record text form gives SPG a TextArray path (SPG has no
+            // typed record[] array). Cycle detection is unaffected.
+            let base_row = Expr::Cast {
+                expr: Box::new(row_of(&body.items, &positions)?),
+                target: CastTarget::Text,
+            };
+            let rec_row = Expr::Cast {
+                expr: Box::new(row_of(&body.unions[rec].1.items, &positions)?),
+                target: CastTarget::Text,
+            };
             let mark = cyc.mark_value.clone().unwrap_or(Literal::Bool(true));
             let dflt = cyc.default_value.clone().unwrap_or(Literal::Bool(false));
             // base: <default> AS mark, ARRAY[ROW(cols)] AS path.
