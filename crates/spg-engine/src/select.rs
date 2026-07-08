@@ -5372,6 +5372,17 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
                 // set-returning function in the SELECT list (it returned an array
                 // there before); it shares the unnest expansion machinery.
                 || (name.eq_ignore_ascii_case("generate_subscripts") && args.len() == 2)
+                // v7.38 (read01, T15) — jsonb/json_array_elements[_text] over a
+                // real FROM's rows expand per element in the SELECT list too
+                // (they collapsed to a single TextArray row before).
+                || (args.len() == 1
+                    && matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "jsonb_array_elements"
+                            | "json_array_elements"
+                            | "jsonb_array_elements_text"
+                            | "json_array_elements_text"
+                    ))
         }
         _ => false,
     }
@@ -5397,6 +5408,29 @@ fn top_level_srf_output(
         }
         let len = array_value_to_elements(&arr)?.len();
         return Ok((1..=len).map(|i| Value::Int(i as i32)).collect());
+    }
+    // v7.38 (read01, T15) — jsonb/json_array_elements[_text]: one Value per
+    // array element (`_text` → text / SQL NULL, plain → the element's compact
+    // JSON text), the same element list the FROM-clause form materialises.
+    let lname = name.to_ascii_lowercase();
+    if matches!(
+        lname.as_str(),
+        "jsonb_array_elements"
+            | "json_array_elements"
+            | "jsonb_array_elements_text"
+            | "json_array_elements_text"
+    ) {
+        let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+        if matches!(arg, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let as_text = lname.ends_with("_text");
+        let items =
+            crate::json::array_element_rows(&arg, as_text, &lname).map_err(EngineError::Eval)?;
+        return Ok(items
+            .into_iter()
+            .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
+            .collect());
     }
     let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
     array_value_to_elements(&arr)

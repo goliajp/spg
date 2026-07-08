@@ -7788,6 +7788,25 @@ impl Parser {
                                 None,
                             )
                         }
+                        // v7.38 (read01, T15) — jsonb/json_array_elements[_text] in
+                        // a no-FROM projection expand per element. The scalar form
+                        // returns the elements as a TEXT array, so unnest over the
+                        // same call materialises one row each (same rewrite the
+                        // FROM-clause form uses).
+                        "jsonb_array_elements"
+                        | "json_array_elements"
+                        | "jsonb_array_elements_text"
+                        | "json_array_elements_text"
+                            if args.len() == 1 =>
+                        {
+                            (
+                                Some(Box::new(Expr::FunctionCall {
+                                    name: lname.clone(),
+                                    args: args.clone(),
+                                })),
+                                None,
+                            )
+                        }
                         _ => continue,
                     };
                     found = Some((
