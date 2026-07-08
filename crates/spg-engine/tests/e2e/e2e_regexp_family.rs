@@ -44,31 +44,50 @@ fn matches_digit_shortcut() {
 
 #[test]
 fn matches_global_flag() {
+    // v7.38 (read01, T15) — regexp_matches is set-returning: the `g` flag emits
+    // one ROW per match (each a text[]), not one flat array. No capture group →
+    // each row is the whole match. Oracle: live PG 18.4.
     let mut e = Engine::new();
     let r = rows(
         e.execute(r"SELECT regexp_matches('a1b22c333', '\d+', 'g')")
             .unwrap(),
     );
-    let a = unwrap_text_array(&r[0][0]);
-    assert_eq!(
-        a,
-        vec![Some("1".into()), Some("22".into()), Some("333".into())]
-    );
+    assert_eq!(r.len(), 3);
+    assert_eq!(unwrap_text_array(&r[0][0]), vec![Some("1".into())]);
+    assert_eq!(unwrap_text_array(&r[1][0]), vec![Some("22".into())]);
+    assert_eq!(unwrap_text_array(&r[2][0]), vec![Some("333".into())]);
 }
 
 #[test]
 fn matches_no_match_empty() {
+    // No match → zero rows (PG), not one row of an empty array.
     let mut e = Engine::new();
     let r = rows(e.execute(r"SELECT regexp_matches('hello', '\d+')").unwrap());
-    let a = unwrap_text_array(&r[0][0]);
-    assert!(a.is_empty());
+    assert!(r.is_empty());
 }
 
 #[test]
 fn matches_null_propagates() {
+    // A NULL argument yields zero rows (PG), not one NULL row.
     let mut e = Engine::new();
     let r = rows(e.execute(r"SELECT regexp_matches(NULL, '\d+')").unwrap());
-    assert_eq!(r[0][0], Value::Null);
+    assert!(r.is_empty());
+}
+
+#[test]
+fn matches_groups_and_sibling_broadcast() {
+    // v7.38 (read01, T15) — capture groups form each row's text[]; a sibling
+    // scalar column repeats per match row. Oracle: live PG 18.4.
+    let mut e = Engine::new();
+    let r = rows(
+        e.execute(r"SELECT 'x', regexp_matches('a1b2', '(\w)(\d)', 'g')")
+            .unwrap(),
+    );
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Text("x".into()));
+    assert_eq!(unwrap_text_array(&r[0][1]), vec![Some("a".into()), Some("1".into())]);
+    assert_eq!(r[1][0], Value::Text("x".into()));
+    assert_eq!(unwrap_text_array(&r[1][1]), vec![Some("b".into()), Some("2".into())]);
 }
 
 // ── regexp_replace ─────────────────────────────────────────────────

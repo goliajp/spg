@@ -66,6 +66,7 @@ use math::{
     f64_exp, f64_ln, f64_powi, f64_round_half_away, f64_trunc, prng_next_f64, prng_next_u64,
 };
 use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
+pub(crate) use regexp::regexp_matches_rows;
 use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
     is_owned_compare_value, resolve_column, resolve_column_borrowed, text_prefix_chars,

@@ -2945,6 +2945,34 @@ impl Engine {
                 });
             }
         }
+        // v7.38 (read01, T15) — a top-level SRF that the parser did NOT rewrite
+        // into a FROM item (regexp_matches, whose rows are arrays and so cannot
+        // desugar to unnest) expands here: one output row per SRF row, sibling
+        // scalar columns repeated. unnest / array_elements / path_query reach a
+        // real FROM via the parser rewrite and never land here.
+        if let Some(srf_idx) = projection.iter().position(|p| is_top_level_unnest(&p.expr)) {
+            let srf_rows = top_level_srf_output(&projection[srf_idx].expr, &dummy_row, &ctx)?;
+            let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(srf_rows.len());
+            for srf_val in srf_rows {
+                let mut values = Vec::with_capacity(projection.len());
+                for (i, p) in projection.iter().enumerate() {
+                    if i == srf_idx {
+                        values.push(srf_val.clone());
+                    } else {
+                        values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
+                    }
+                }
+                out_rows.push(Row::new(values));
+            }
+            let columns: Vec<ColumnSchema> = projection
+                .into_iter()
+                .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+                .collect();
+            return Ok(QueryResult::Rows {
+                columns,
+                rows: out_rows,
+            });
+        }
         let mut values = Vec::with_capacity(projection.len());
         for p in &projection {
             values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
@@ -5390,6 +5418,10 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
                         name.to_ascii_lowercase().as_str(),
                         "jsonb_path_query" | "json_path_query"
                     ))
+                // v7.38 (read01, T15) — regexp_matches(s, pat[, flags]) is set-
+                // returning: one row (a text[] of capture groups) per match.
+                || ((2..=3).contains(&args.len())
+                    && name.eq_ignore_ascii_case("regexp_matches"))
         }
         _ => false,
     }
@@ -5438,6 +5470,15 @@ fn top_level_srf_output(
             .into_iter()
             .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
             .collect());
+    }
+    // v7.38 (read01, T15) — regexp_matches(s, pat[, flags]): one row per match,
+    // each a text[] of the pattern's capture groups.
+    if lname == "regexp_matches" {
+        let vals: Vec<Value<'static>> = args
+            .iter()
+            .map(|a| eval::eval_expr(a, row, ctx).map_err(EngineError::Eval))
+            .collect::<Result<_, _>>()?;
+        return crate::eval::regexp_matches_rows(&vals).map_err(EngineError::Eval);
     }
     // v7.38 (read01, T15) — jsonb/json_path_query(doc, path): one Value per
     // matched JSON value.

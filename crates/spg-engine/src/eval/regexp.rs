@@ -1703,6 +1703,56 @@ pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     Ok(Value::TextArray(out))
 }
 
+/// v7.38 (read01, T15) — `regexp_matches` as the set-returning function it is
+/// in PG: one ROW per match, each row a `text[]` of the pattern's capture
+/// groups (or the whole match when the pattern has none). Without the `g` flag
+/// only the first match is emitted (one row); with `g`, every match. A NULL
+/// text / pattern yields no rows. Mirrors `regexp_matches`'s per-match logic
+/// but keeps each match as its own array instead of flattening them.
+pub(crate) fn regexp_matches_rows(args: &[Value<'_>]) -> Result<Vec<Value<'static>>, EvalError> {
+    let (text, pat, all_matches) = match args.len() {
+        2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),
+        3 => {
+            let flags = text_arg(&args[2])?.unwrap_or_default();
+            (text_arg(&args[0])?, text_arg(&args[1])?, flags.contains('g'))
+        }
+        n => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("regexp_matches() takes 2 or 3 args, got {n}"),
+            });
+        }
+    };
+    let (Some(text), Some(pat)) = (text, pat) else {
+        return Ok(Vec::new());
+    };
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 2)? {
+        fold_case(&mut node);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let ngroups = max_group(&node);
+    let mut rows: Vec<Value<'static>> = Vec::new();
+    let mut from = 0usize;
+    while let Some(((s_pos, e_pos), caps)) = re_find_caps(&node, &chars, from, ngroups)? {
+        let groups: Vec<Option<String>> = if ngroups == 0 {
+            alloc::vec![Some(chars[s_pos..e_pos].iter().collect())]
+        } else {
+            (1..=ngroups)
+                .map(|g| caps[g].map(|(a, b)| chars[a..b].iter().collect()))
+                .collect()
+        };
+        rows.push(Value::TextArray(groups));
+        if !all_matches {
+            break;
+        }
+        from = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+        if from > chars.len() {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
 /// v7.37.17 (17.6 siblings) — PG 10+ `regexp_match(s, pat[, flags])`
 /// (singular): the FIRST match as a 1-element text[], or SQL NULL
 /// when nothing matches. SPG's regex engine reports whole-match
