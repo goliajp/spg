@@ -573,7 +573,7 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
         Value::Float(x) => format!("{x}"),
         // PG renders numeric in concat/format/text-coercion as its exact
         // decimal (`x || 2.5::numeric` → `x2.5`), not a debug dump.
-        Value::Numeric { scaled, scale, .. } => super::format::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, kind } => super::format::format_numeric_kind(*kind, *scaled, *scale),
         Value::Bool(b) => {
             if *b {
                 "t".into()

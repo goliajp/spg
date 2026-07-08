@@ -3794,7 +3794,7 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
-        Value::Numeric { scaled, scale, .. } => spg_engine::eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, kind } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         Value::Interval {
@@ -4845,7 +4845,7 @@ fn value_to_pg_text<'a>(
             let _ = write!(&mut buf, "P{months}M{days}D{micros}U");
             buf.into_bump_str()
         }
-        Value::Numeric { scaled, scale, .. } => into_arena(&format_numeric(*scaled, *scale)),
+        Value::Numeric { scaled, scale, kind } => into_arena(&format_numeric_kind(*kind, *scaled, *scale)),
         Value::Vector(vec) => {
             // Inline join into the arena buffer — avoids
             // intermediate `Vec<String> + parts.join(", ")` heap
@@ -4985,6 +4985,16 @@ fn secs_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y_int + 1 } else { y_int };
     (y, m, d, hh, mm, ss)
+}
+
+fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u8) -> String {
+    use spg_storage::NumericKind;
+    match kind {
+        NumericKind::Finite => format_numeric(scaled, scale),
+        NumericKind::NaN => "NaN".to_string(),
+        NumericKind::PosInf => "Infinity".to_string(),
+        NumericKind::NegInf => "-Infinity".to_string(),
+    }
 }
 
 fn format_numeric(scaled: i128, scale: u8) -> String {

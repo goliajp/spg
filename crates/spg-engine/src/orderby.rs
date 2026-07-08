@@ -338,7 +338,7 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
             days,
             micros,
         } => eval::format_interval(*months, *days, *micros),
-        Value::Numeric { scaled, scale, .. } => eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, kind } => eval::format_numeric_kind(*kind, *scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
             // Unreachable in practice (vector columns are filtered
             // out before this). Defensive fallback so a future
