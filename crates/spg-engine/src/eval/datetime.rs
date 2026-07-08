@@ -285,7 +285,17 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
             });
         }
     };
-    extract_field(field, &args[1])
+    // v7.38 (read01) — date_part() returns `double precision`, whereas EXTRACT
+    // returns `numeric` (PG 14+). extract_field builds the numeric form; demote
+    // it to f64 so `date_part('epoch', …)` renders like PG's double (no trailing
+    // `.000000`) and pg_typeof reports double precision.
+    Ok(match extract_field(field, &args[1])? {
+        Value::Numeric { scaled, scale } => {
+            #[allow(clippy::cast_precision_loss)]
+            Value::Float(scaled as f64 / 10f64.powi(i32::from(scale)))
+        }
+        other => other,
+    })
 }
 
 /// `age(t1, t2)` — return `t1 - t2` as an INTERVAL. v2.12 produces a
