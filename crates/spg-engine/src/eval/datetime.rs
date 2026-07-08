@@ -1257,16 +1257,55 @@ pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
             });
         }
         h * 3_600_000_000
+    } else if let Some(off) = tz_abbrev_offset(z) {
+        // v7.38 (read01, T-timezone) — common fixed-offset zone abbreviations.
+        off
     } else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "timezone({z:?}): named time zones need tzdata SPG does not \
-                 carry; use UTC or an explicit '+HH:MM' offset"
+                "timezone({z:?}): named IANA zones with DST rules need tzdata \
+                 SPG does not carry; use UTC, a fixed abbreviation (EST/PST/JST/\
+                 CET/…), or an explicit '+HH:MM' offset"
             ),
         });
     };
     let ts = text_or_temporal_micros(&args[1], "timezone")?;
     Ok(Value::Timestamp(ts + offset))
+}
+
+/// v7.38 (read01, T-timezone) — the applied micro-offset for a fixed
+/// (non-DST-varying) time-zone abbreviation, as PG treats them. The value is
+/// `-utc_offset` (a naive TIMESTAMP in the zone is `ts + applied` in UTC), so
+/// EST (UTC-5) → +5h. Half-hour zones are included where unambiguous. Ambiguous
+/// abbreviations (e.g. IST) are intentionally omitted.
+fn tz_abbrev_offset(z: &str) -> Option<i64> {
+    const H: i64 = 3_600_000_000;
+    let m = |h: i64, min: i64| h * H + min * 60_000_000;
+    let off = match z.to_ascii_uppercase().as_str() {
+        "EST" => m(5, 0),
+        "EDT" => m(4, 0),
+        "CST" => m(6, 0),
+        "CDT" => m(5, 0),
+        "MST" => m(7, 0),
+        "MDT" => m(6, 0),
+        "PST" => m(8, 0),
+        "PDT" => m(7, 0),
+        "AKST" => m(9, 0),
+        "AKDT" => m(8, 0),
+        "HST" => m(10, 0),
+        "JST" | "KST" => m(-9, 0),
+        "CET" | "WEST" => m(-1, 0),
+        "CEST" | "EET" | "SAST" => m(-2, 0),
+        "EEST" | "MSK" => m(-3, 0),
+        "WET" | "GMT" | "UTC" => 0,
+        "BST" | "IST_IE" => m(-1, 0),
+        "AEST" => m(-10, 0),
+        "AEDT" => m(-11, 0),
+        "NZST" => m(-12, 0),
+        "ACST" => m(-9, -30),
+        _ => return None,
+    };
+    Some(off)
 }
 
 /// Parse a '+HH:MM' / '-HH:MM' timezone offset into micros.
