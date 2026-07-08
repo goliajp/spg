@@ -501,6 +501,27 @@ pub fn eval_expr(
                     return apply_enum_cast(v, en, name);
                 }
             }
+            // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks
+            // up the user relation name (PG's 16384+ band, assigned in
+            // table_names() order). System OIDs / non-matches fall through to
+            // the integer-rendering path in cast_value.
+            if matches!(target, CastTarget::RegClass) {
+                let oid = match &v {
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                };
+                if let (Some(oid), Some(cat)) = (oid, ctx.catalog) {
+                    if oid >= 16384 {
+                        if let Some(name) =
+                            cat.table_names().into_iter().nth((oid - 16384) as usize)
+                        {
+                            return Ok(Value::text(name));
+                        }
+                    }
+                }
+            }
             cast_value(v, target.clone())
         }
         Expr::IsNull { expr, negated } => {
