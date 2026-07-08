@@ -280,6 +280,173 @@ impl BigNumeric {
         out
     }
 
+    /// Multiply a magnitude by a small scalar `< BASE`, little-endian.
+    fn mul_scalar(limbs: &[u32], factor: u64) -> Vec<u32> {
+        if factor == 0 || limbs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limbs.len() + 1);
+        let mut carry: u64 = 0;
+        for &l in limbs {
+            let v = u64::from(l) * factor + carry;
+            out.push((v % BASE) as u32);
+            carry = v / BASE;
+        }
+        while carry != 0 {
+            out.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+        out
+    }
+
+    /// Integer magnitude division: `u / v` → `(quotient, remainder)`, both
+    /// little-endian, via Knuth's Algorithm D (TAOCP 4.3.1) over base-10^9 limbs.
+    /// `v` must be non-zero and normalized. Learned from the classic algorithm;
+    /// re-implemented on `u32` limbs with `u64`/`i64` intermediates.
+    fn div_rem_mag(u: &[u32], v: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        use core::cmp::Ordering;
+        // u < v → quotient 0, remainder u.
+        if Self::cmp_mag(u, v) == Ordering::Less {
+            let mut r = u.to_vec();
+            while r.last() == Some(&0) {
+                r.pop();
+            }
+            return (Vec::new(), r);
+        }
+        let n = v.len();
+        // Short division by a single limb.
+        if n == 1 {
+            let d = u64::from(v[0]);
+            let mut rem: u64 = 0;
+            let mut q = alloc::vec![0u32; u.len()];
+            for i in (0..u.len()).rev() {
+                let cur = rem * BASE + u64::from(u[i]);
+                q[i] = (cur / d) as u32;
+                rem = cur % d;
+            }
+            while q.last() == Some(&0) {
+                q.pop();
+            }
+            let r = if rem == 0 { Vec::new() } else { alloc::vec![rem as u32] };
+            return (q, r);
+        }
+        // D1. Normalize so the divisor's top limb is >= BASE/2.
+        let d = BASE / (u64::from(v[n - 1]) + 1);
+        let vn = Self::mul_scalar(v, d);
+        let vn = {
+            let mut vn = vn;
+            vn.resize(n, 0); // exactly n limbs (d keeps v the same length)
+            vn
+        };
+        let mut un = Self::mul_scalar(u, d);
+        let m = u.len() - n; // quotient has m+1 limbs
+        un.resize(u.len() + 1, 0); // room for a leading limb
+        let mut q = alloc::vec![0u32; m + 1];
+        // D2..D7. Loop over quotient limbs from most significant.
+        for j in (0..=m).rev() {
+            // D3. Estimate qhat.
+            let num = u128::from(un[j + n]) * u128::from(BASE) + u128::from(un[j + n - 1]);
+            let mut qhat = num / u128::from(vn[n - 1]);
+            let mut rhat = num % u128::from(vn[n - 1]);
+            while qhat >= u128::from(BASE)
+                || qhat * u128::from(vn[n - 2]) > rhat * u128::from(BASE) + u128::from(un[j + n - 2])
+            {
+                qhat -= 1;
+                rhat += u128::from(vn[n - 1]);
+                if rhat >= u128::from(BASE) {
+                    break;
+                }
+            }
+            // D4. Multiply and subtract qhat*vn from un[j..j+n+1].
+            let mut borrow: i64 = 0;
+            let mut carry: u64 = 0;
+            for i in 0..n {
+                let p = qhat * u128::from(vn[i]) + u128::from(carry);
+                carry = (p / u128::from(BASE)) as u64;
+                let sub = (p % u128::from(BASE)) as i64;
+                let mut t = i64::from(un[j + i]) - sub - borrow;
+                if t < 0 {
+                    t += BASE as i64;
+                    borrow = 1;
+                } else {
+                    borrow = 0;
+                }
+                un[j + i] = t as u32;
+            }
+            let mut t = i64::from(un[j + n]) - carry as i64 - borrow;
+            // D5/D6. If we subtracted too much, add back one multiple of vn.
+            if t < 0 {
+                qhat -= 1;
+                let mut c: u64 = 0;
+                for i in 0..n {
+                    let s = u64::from(un[j + i]) + u64::from(vn[i]) + c;
+                    un[j + i] = (s % BASE) as u32;
+                    c = s / BASE;
+                }
+                t += (BASE as i64) + c as i64;
+            }
+            un[j + n] = t as u32;
+            q[j] = qhat as u32;
+        }
+        // D8. Unnormalize the remainder: un[0..n] / d.
+        let mut rem = un[..n].to_vec();
+        while rem.last() == Some(&0) {
+            rem.pop();
+        }
+        let (rem, _) = Self::div_rem_mag(&rem, &[d as u32]);
+        let mut q = q;
+        while q.last() == Some(&0) {
+            q.pop();
+        }
+        (q, rem)
+    }
+
+    /// Signed integer division truncating toward zero (like `i128 / i128`),
+    /// ignoring scale. Returns `(quotient, remainder)`.
+    #[must_use]
+    pub fn div_rem_int(&self, other: &Self) -> (Self, Self) {
+        let (q, r) = Self::div_rem_mag(&self.limbs, &other.limbs);
+        let mut quo = BigNumeric { neg: self.neg != other.neg, limbs: q, scale: 0 };
+        let mut rem = BigNumeric { neg: self.neg, limbs: r, scale: 0 };
+        quo.normalize();
+        rem.normalize();
+        (quo, rem)
+    }
+
+    /// Fixed-point division to a target `result_scale`, rounded half-away-from-
+    /// zero — the shape PG's `numeric / numeric` uses. Errors are the caller's:
+    /// dividing by zero returns `None`.
+    #[must_use]
+    pub fn div(&self, other: &Self, result_scale: u8) -> Option<Self> {
+        if other.is_zero() {
+            return None;
+        }
+        // Scale the dividend so the integer quotient carries result_scale + 1
+        // guard digit, relative to the operands' own scales.
+        let want = i32::from(result_scale) + 1 + i32::from(other.scale) - i32::from(self.scale);
+        let num = if want > 0 {
+            Self::mul_pow10(&self.limbs, want as u32)
+        } else {
+            self.limbs.clone()
+        };
+        let den = if want < 0 {
+            Self::mul_pow10(&other.limbs, (-want) as u32)
+        } else {
+            other.limbs.clone()
+        };
+        let (mut q, _rem) = Self::div_rem_mag(&num, &den);
+        // The quotient carries one guard digit past result_scale. Round
+        // half-away-from-zero (PG numeric): guard >= 5 bumps, then drop it.
+        let guard = if q.is_empty() { 0 } else { q[0] % 10 };
+        q = Self::div_rem_mag(&q, &[10]).0; // drop the guard digit
+        if guard >= 5 {
+            q = Self::add_mag(&q, &[1]);
+        }
+        let mut out = BigNumeric { neg: self.neg != other.neg, limbs: q, scale: result_scale };
+        out.normalize();
+        Some(out)
+    }
+
     /// Render as a decimal string (`-123.4500` style), inserting the scale point.
     #[must_use]
     pub fn to_decimal_str(&self) -> String {
@@ -429,5 +596,47 @@ mod tests {
         let a = BigNumeric::from_decimal_str("1.5").unwrap();
         let b = BigNumeric::from_decimal_str("0.25").unwrap();
         assert_eq!(a.add(&b).to_decimal_str(), "1.75");
+    }
+
+    #[test]
+    fn fuzz_div_int_vs_i128() {
+        let mut rng = Lcg(0xdead_beef_cafe_babe);
+        for _ in 0..20_000 {
+            let a = rng.i128_small();
+            let mut b = rng.i128_small();
+            if b == 0 {
+                b = 1;
+            }
+            let (q, r) = BigNumeric::from_i128(a, 0).div_rem_int(&BigNumeric::from_i128(b, 0));
+            assert_eq!(q.to_i128(), Some(a / b), "quot {a}/{b}");
+            assert_eq!(r.to_i128(), Some(a % b), "rem {a}%{b}");
+        }
+    }
+
+    #[test]
+    fn div_multi_limb() {
+        // A quotient that exercises the full Knuth D loop (multi-limb divisor).
+        let a = BigNumeric::from_decimal_str("123456789012345678901234567890").unwrap();
+        let b = BigNumeric::from_decimal_str("987654321987654321").unwrap();
+        let (q, r) = a.div_rem_int(&b);
+        // reconstruct: q*b + r == a
+        let recon = q.mul(&b).add(&r);
+        assert_eq!(recon.to_decimal_str(), a.to_decimal_str());
+        assert_eq!(b.cmp(&r), core::cmp::Ordering::Greater); // r < b
+    }
+
+    #[test]
+    fn div_fixed_point() {
+        let ten = BigNumeric::from_decimal_str("10").unwrap();
+        let three = BigNumeric::from_decimal_str("3").unwrap();
+        assert_eq!(ten.div(&three, 4).unwrap().to_decimal_str(), "3.3333");
+        let one = BigNumeric::from_decimal_str("1").unwrap();
+        let seven = BigNumeric::from_decimal_str("7").unwrap();
+        assert_eq!(one.div(&seven, 6).unwrap().to_decimal_str(), "0.142857");
+        // half-away rounding: 1/8 = 0.125 → scale 2 rounds to 0.13.
+        let eight = BigNumeric::from_decimal_str("8").unwrap();
+        assert_eq!(one.div(&eight, 2).unwrap().to_decimal_str(), "0.13");
+        // division by zero → None.
+        assert!(one.div(&BigNumeric::from_decimal_str("0").unwrap(), 4).is_none());
     }
 }
