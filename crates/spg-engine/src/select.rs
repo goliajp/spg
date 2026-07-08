@@ -2099,12 +2099,9 @@ impl Engine {
         // single-SRF for redirect_uris.
         let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
         if let Some(srf_idx) = srf_position {
-            let srf_arg = top_level_unnest_arg(&projection[srf_idx].expr)
-                .expect("checked by is_top_level_unnest above");
             for row in &filtered {
-                let arr_val =
-                    eval::eval_expr(srf_arg, row, &scan_ctx).map_err(EngineError::Eval)?;
-                let elements = array_value_to_elements(&arr_val)?;
+                let elements =
+                    top_level_srf_output(&projection[srf_idx].expr, row, &scan_ctx)?;
                 // Empty array → zero rows for this input row (PG
                 // semantics: `SELECT unnest('{}'::int[])` returns
                 // 0 rows, not a single NULL row).
@@ -3565,10 +3562,7 @@ impl Engine {
                 build_order_keys(&stmt.order_by, row, &ctx)?
             };
             if let Some(srf_idx) = srf_position {
-                let srf_arg = top_level_unnest_arg(&projection[srf_idx].expr)
-                    .expect("checked by is_top_level_unnest above");
-                let arr_val = eval::eval_expr(srf_arg, row, &ctx)?;
-                let elements = array_value_to_elements(&arr_val)?;
+                let elements = top_level_srf_output(&projection[srf_idx].expr, row, &ctx)?;
                 for elem in elements {
                     let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
                     for (i, p) in projection.iter().enumerate() {
@@ -5371,24 +5365,39 @@ fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), Engin
 fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
     match expr {
         spg_sql::ast::Expr::FunctionCall { name, args } => {
-            name.eq_ignore_ascii_case("unnest") && args.len() == 1
+            (name.eq_ignore_ascii_case("unnest") && args.len() == 1)
+                // v7.38 (read01) — generate_subscripts(arr, dim) is also a
+                // set-returning function in the SELECT list (it returned an array
+                // there before); it shares the unnest expansion machinery.
+                || (name.eq_ignore_ascii_case("generate_subscripts") && args.len() == 2)
         }
         _ => false,
     }
 }
 
-/// v7.19 P5 — extract the array argument out of a top-level
-/// `unnest(arg)` call. `None` if `expr` isn't a `unnest` call
-/// of arity 1 (mirrors `is_top_level_unnest`).
-fn top_level_unnest_arg(expr: &spg_sql::ast::Expr) -> Option<&spg_sql::ast::Expr> {
-    match expr {
-        spg_sql::ast::Expr::FunctionCall { name, args }
-            if name.eq_ignore_ascii_case("unnest") && args.len() == 1 =>
-        {
-            Some(&args[0])
+/// v7.38 (read01) — the row-set a top-level SELECT-list SRF emits: the elements
+/// for `unnest(arr)`, or the 1-based subscripts `1..=length` for
+/// `generate_subscripts(arr, 1)` (a non-1 dimension over a 1-D array yields no
+/// rows, as in PG).
+fn top_level_srf_output(
+    expr: &spg_sql::ast::Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Vec<Value<'static>>, EngineError> {
+    let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+        return Err(EngineError::Unsupported("expected a SELECT-list SRF call".into()));
+    };
+    if name.eq_ignore_ascii_case("generate_subscripts") {
+        let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+        let dim = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
+        if !matches!(dim, Value::Int(1) | Value::BigInt(1) | Value::SmallInt(1)) {
+            return Ok(Vec::new());
         }
-        _ => None,
+        let len = array_value_to_elements(&arr)?.len();
+        return Ok((1..=len).map(|i| Value::Int(i as i32)).collect());
     }
+    let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+    array_value_to_elements(&arr)
 }
 
 /// v7.19 P5 — turn an array-typed `Value` into the element list

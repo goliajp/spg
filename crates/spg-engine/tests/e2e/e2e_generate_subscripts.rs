@@ -1,57 +1,36 @@
-//! v7.37.17 (17.6 siblings) — generate_subscripts(arr, dim
-//! [, reverse]), scalar IntArray surface + FROM-position SRF form.
+//! v7.38 (read01) — generate_subscripts(arr, dim) is a set-returning function in
+//! the SELECT list (with or without FROM), yielding the 1-based subscripts;
+//! previously the SELECT-list form returned a single array row. A non-1
+//! dimension over a 1-D array yields no rows, as in PG. Oracle: live PG 18.4.
 
 use spg_engine::{Engine, QueryResult};
 
-fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
-    let QueryResult::Rows { rows, .. } = r else {
-        panic!("expected Rows");
-    };
-    rows.into_iter()
-        .map(|row| row.values.into_iter().collect())
-        .collect()
-}
-
-fn ints(got: &[Vec<spg_storage::Value<'static>>]) -> Vec<i64> {
-    got.iter()
-        .map(|r| match &r[0] {
-            spg_storage::Value::Int(n) => i64::from(*n),
-            spg_storage::Value::BigInt(n) => *n,
-            other => panic!("expected Int, got {other:?}"),
-        })
-        .collect()
+fn ints(e: &mut Engine, sql: &str) -> Vec<i32> {
+    match e.execute(sql).unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match r.values.last().unwrap() {
+                spg_storage::Value::Int(n) => *n,
+                v => panic!("not int: {v:?}"),
+            })
+            .collect(),
+        _ => panic!("rows"),
+    }
 }
 
 #[test]
-fn from_generate_subscripts_rows() {
+fn generate_subscripts_is_srf() {
     let mut e = Engine::new();
-    // PG doc vector: generate_subscripts('{NULL,1,NULL,2}'::int[], 1)
-    // → 1 / 2 / 3 / 4 (subscripts, NULL items still count).
-    let got = rows(
-        &mut e,
-        "SELECT s FROM generate_subscripts(ARRAY[10, 20, 30, 40], 1) AS s",
-    );
-    assert_eq!(ints(&got), [1, 2, 3, 4]);
-}
-
-#[test]
-fn reverse_form_and_natural_column() {
-    let mut e = Engine::new();
-    let got = rows(
-        &mut e,
-        "SELECT generate_subscripts \
-         FROM generate_subscripts(ARRAY['a', 'b', 'c'], 1, true)",
-    );
-    assert_eq!(ints(&got), [3, 2, 1]);
-}
-
-#[test]
-fn missing_dimension_yields_no_rows() {
-    let mut e = Engine::new();
-    let got = rows(
-        &mut e,
-        "SELECT s FROM generate_subscripts(ARRAY[1, 2], 2) AS s",
-    );
-    assert!(got.is_empty());
+    // No-FROM projection form: 3 rows, not one array.
+    assert_eq!(ints(&mut e, "SELECT generate_subscripts(ARRAY[10,20,30], 1)"), vec![1, 2, 3]);
+    // Invalid dimension → no rows.
+    assert_eq!(ints(&mut e, "SELECT generate_subscripts(ARRAY[10,20,30], 2)").len(), 0);
+    // Sibling scalar column repeats per subscript row.
+    assert_eq!(ints(&mut e, "SELECT 'x', generate_subscripts(ARRAY[10,20], 1)"), vec![1, 2]);
+    // Over a real FROM column.
+    e.execute("CREATE TABLE t(a int[])").unwrap();
+    e.execute("INSERT INTO t VALUES (ARRAY[7,8,9])").unwrap();
+    assert_eq!(ints(&mut e, "SELECT generate_subscripts(a, 1) FROM t"), vec![1, 2, 3]);
+    // FROM-position form is unchanged.
+    assert_eq!(ints(&mut e, "SELECT s FROM generate_subscripts(ARRAY[10,20,30], 1) s"), vec![1, 2, 3]);
 }
