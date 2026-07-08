@@ -9380,6 +9380,31 @@ fn apply_function_dispatch(
                             });
                         }
                     };
+                    // v7.38 (read01) — trunc(numeric, n) returns NUMERIC in PG
+                    // (there is no double-precision 2-arg trunc), so keep the exact
+                    // decimal rather than routing through f64 (which loses
+                    // precision past ~15 significant digits). Truncate toward zero
+                    // on the integer mantissa; i128 division already truncates.
+                    if let Value::Numeric { scaled, scale } = &args[0] {
+                        let cur = i32::from(*scale);
+                        if (0..=38).contains(&n) {
+                            #[allow(clippy::cast_sign_loss)]
+                            let out = if n >= cur {
+                                scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
+                                    Value::Numeric { scaled: m, scale: n as u8 }
+                                })
+                            } else {
+                                let factor = pow10_i128((cur - n) as u8);
+                                Some(Value::Numeric {
+                                    scaled: scaled / factor,
+                                    scale: n as u8,
+                                })
+                            };
+                            if let Some(v) = out {
+                                return Ok(v);
+                            }
+                        }
+                    }
                     let x = match &args[0] {
                         Value::SmallInt(v) => f64::from(*v),
                         Value::Int(v) => f64::from(*v),

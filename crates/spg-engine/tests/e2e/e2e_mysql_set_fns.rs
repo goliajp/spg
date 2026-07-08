@@ -75,9 +75,10 @@ fn make_set_members() {
 fn truncate_alias() {
     let mut e = Engine::new();
     // MySQL doc vectors: TRUNCATE(1.223, 1) = 1.2,
-    // TRUNCATE(122, -2) = 100.
+    // TRUNCATE(122, -2) = 100. A decimal input yields DECIMAL (like MySQL and
+    // PG's numeric trunc), not double — the exact 1.2 rides a Numeric now.
     match first(&mut e, "SELECT truncate(1.223, 1)") {
-        spg_storage::Value::Float(f) => assert!((f - 1.2).abs() < 1e-9),
+        spg_storage::Value::Numeric { scaled, scale } => assert_eq!((scaled, scale), (12, 1)),
         other => panic!("got {other:?}"),
     }
     match first(&mut e, "SELECT truncate(122, -2)") {
