@@ -1384,6 +1384,41 @@ fn hex_digit_value(b: u8) -> Option<u32> {
 fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
+    // v7.38 (read01) — PG 16+ non-decimal integer literals: `0x1F` (hex),
+    // `0o17` (octal), `0b101` (binary), with optional `_` separators. Read the
+    // radix digits, strip `_`, parse as i64 (NUMERIC on overflow).
+    if bytes.len() >= 2 && bytes[0] == b'0' {
+        let radix = match bytes[1] {
+            b'x' | b'X' => Some(16u32),
+            b'o' | b'O' => Some(8),
+            b'b' | b'B' => Some(2),
+            _ => None,
+        };
+        if let Some(radix) = radix {
+            let mut j = 2;
+            let valid = |b: u8| -> bool {
+                (b as char).to_digit(radix).is_some() || b == b'_'
+            };
+            let start = j;
+            while j < bytes.len() && valid(bytes[j]) {
+                j += 1;
+            }
+            if j > start {
+                let digits: alloc::string::String =
+                    s[2..j].chars().filter(|c| *c != '_').collect();
+                if !digits.is_empty() {
+                    return match i64::from_str_radix(&digits, radix) {
+                        Ok(v) => Ok((Token::Integer(v), j)),
+                        // Over i64 → keep as decimal NUMERIC text.
+                        Err(_) => match u128::from_str_radix(&digits, radix) {
+                            Ok(v) => Ok((Token::Numeric(alloc::format!("{v}")), j)),
+                            Err(_) => Err(LexErrorKind::BadNumber(s[..j].to_string())),
+                        },
+                    };
+                }
+            }
+        }
+    }
     // v7.38 (read01) — track the dot and exponent separately. PG: a dotted
     // literal with NO exponent is NUMERIC; an exponent (`1e5`, `1.5e3`) makes
     // it double precision; a bare integer is INTEGER unless it overflows i64,
