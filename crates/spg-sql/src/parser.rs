@@ -7758,6 +7758,20 @@ impl Parser {
                         "generate_series" if (2..=3).contains(&args.len()) => {
                             (None, Some(args.clone()))
                         }
+                        // v7.38 (read01) — generate_subscripts(arr, dim) in a
+                        // no-FROM projection yields the 1-based subscripts, i.e.
+                        // generate_series(1, array_length(arr, dim)); an invalid
+                        // dimension makes array_length NULL → 0 rows, as in PG.
+                        "generate_subscripts" if args.len() == 2 => (
+                            None,
+                            Some(alloc::vec![
+                                Expr::Literal(Literal::Integer(1)),
+                                Expr::FunctionCall {
+                                    name: "array_length".to_string(),
+                                    args: args.clone(),
+                                },
+                            ]),
+                        ),
                         // v7.38 (read01, T-srf) — string_to_table / regexp_split_to_table
                         // in a no-FROM projection unnest their *_to_array form.
                         "string_to_table" | "regexp_split_to_table" => {
