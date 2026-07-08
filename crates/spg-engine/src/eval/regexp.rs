@@ -198,6 +198,13 @@ enum ReNode {
         idx: usize,
         inner: Box<ReNode>,
     },
+    /// v7.38 (read01, T7-br) — in-pattern backreference `\1`..`\9`: matches the
+    /// literal text captured by group `idx`. `ci` is set by `fold_case` for the
+    /// `~*` case-insensitive path (the comparison folds both sides).
+    Backref {
+        idx: usize,
+        ci: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +621,23 @@ fn re_parse_atom(
                     })?;
                     Ok(ReNode::Literal(char::from_u32(code).unwrap_or('\u{fffd}')))
                 }
+                // v7.38 (read01, T7-br) — `\1`..`\9` backreference. A
+                // forward/unopened reference (`n >= *ng`, since `*ng` is the
+                // next group number to assign) errors like PG.
+                d @ '1'..='9' => {
+                    let mut n = (d as usize) - ('0' as usize);
+                    while *p < chars.len() && chars[*p].is_ascii_digit() {
+                        n = n * 10 + ((chars[*p] as usize) - ('0' as usize));
+                        *p += 1;
+                    }
+                    if n == 0 || n >= *ng {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "invalid regular expression: invalid backreference number"
+                                .into(),
+                        });
+                    }
+                    Ok(ReNode::Backref { idx: n, ci: false })
+                }
                 other => Ok(ReNode::Literal(other)),
             }
         }
@@ -1023,6 +1047,9 @@ fn re_match_at(
         // v7.38 (read01) — Stage 1: a capturing group matches transparently
         // (capture recording is threaded in a later stage).
         ReNode::Group { inner, .. } => re_match_at(inner, s, pos, d, steps),
+        // A backref never reaches the capture-free path (re_find routes any
+        // backref pattern to the caps matcher); defensively fail to match.
+        ReNode::Backref { .. } => Ok(None),
     }
 }
 
@@ -1137,9 +1164,28 @@ fn re_match_seq(
     }
 }
 
+/// v7.38 (read01, T7-br) — does the pattern contain a backreference? Such a
+/// pattern must run on the capture-aware matcher (the capture-free hot path has
+/// no `Caps` to consult).
+fn has_backref(node: &ReNode) -> bool {
+    match node {
+        ReNode::Backref { .. } => true,
+        ReNode::Group { inner, .. }
+        | ReNode::Quant { inner, .. }
+        | ReNode::Lookahead { inner, .. } => has_backref(inner),
+        ReNode::Concat(items) | ReNode::Alt(items) => items.iter().any(has_backref),
+        _ => false,
+    }
+}
+
 /// Find the first match of `node` in `s`, starting at or after
 /// `from`. Returns the (start, end) char positions of the match.
 fn re_find(node: &ReNode, s: &[char], from: usize) -> Result<Option<(usize, usize)>, EvalError> {
+    // A backref pattern has no meaning on the capture-free path — route it to
+    // the caps matcher and discard the captures.
+    if has_backref(node) {
+        return Ok(re_find_caps(node, s, from, max_group(node))?.map(|(span, _caps)| span));
+    }
     // v7.37.16 Epic Rx P0 — one monotonic step budget shared across
     // every start position of this find, so total backtracking WORK
     // (time), not just recursion depth, is bounded.
@@ -1164,6 +1210,7 @@ fn max_group(node: &ReNode) -> usize {
             items.iter().map(max_group).max().unwrap_or(0)
         }
         ReNode::Quant { inner, .. } | ReNode::Lookahead { inner, .. } => max_group(inner),
+        ReNode::Backref { idx, .. } => *idx,
         _ => 0,
     }
 }
@@ -1304,6 +1351,29 @@ fn re_match_at_caps(
                 None => Ok(None),
             }
         }
+        // v7.38 (read01, T7-br) — match the previously-captured group text at
+        // `pos`. A group that did not participate matches the empty string.
+        ReNode::Backref { idx, ci } => match caps.get(*idx).copied().flatten() {
+            Some((cs, ce)) => {
+                let need_len = ce - cs;
+                let end = pos + need_len;
+                if end <= s.len()
+                    && (0..need_len).all(|k| {
+                        let (a, b) = (s[pos + k], s[cs + k]);
+                        if *ci {
+                            a.to_ascii_lowercase() == b.to_ascii_lowercase()
+                        } else {
+                            a == b
+                        }
+                    })
+                {
+                    Ok(Some(end))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(Some(pos)),
+        },
     }
 }
 
@@ -1332,6 +1402,57 @@ fn re_match_seq_caps(
         return Ok(Some(pos));
     };
     match first {
+        // v7.38 (read01, T7-br) — a captured *quantified* group (`(a*)`) must be
+        // a backtrack point when a following backref constrains it: enumerate the
+        // inner quant's reachable ends, record caps[idx] at each rep count, and
+        // try the tail (so `^(a*)\1$` on `aaaa` gives back to group = `aa`).
+        ReNode::Group { idx, inner } if matches!(**inner, ReNode::Quant { .. }) => {
+            let ReNode::Quant { inner: qinner, min, max, greedy } = &**inner else {
+                unreachable!()
+            };
+            let mut ends = alloc::vec![pos];
+            let mut marks = alloc::vec![journal.len()];
+            let mut p = pos;
+            let mut count = 0usize;
+            loop {
+                if let Some(cap) = max {
+                    if count >= *cap {
+                        break;
+                    }
+                }
+                let mark = journal.len();
+                match re_match_at_caps(qinner, s, p, d, steps, caps, journal)? {
+                    Some(np) if np > p => {
+                        p = np;
+                        count += 1;
+                        ends.push(p);
+                        marks.push(mark);
+                    }
+                    _ => {
+                        cap_undo(caps, journal, mark);
+                        break;
+                    }
+                }
+            }
+            let n = ends.len();
+            for i in 0..n {
+                let reps = if *greedy { n - 1 - i } else { i };
+                if reps < *min {
+                    if *greedy {
+                        break;
+                    }
+                    continue;
+                }
+                cap_undo(caps, journal, marks[reps]);
+                cap_set(caps, journal, *idx, (pos, ends[reps]));
+                let tail_mark = journal.len();
+                if let Some(e) = re_match_seq_caps(rest, s, ends[reps], d, steps, caps, journal)? {
+                    return Ok(Some(e));
+                }
+                cap_undo(caps, journal, tail_mark);
+            }
+            Ok(None)
+        }
         ReNode::Quant { inner, min, max, greedy } => {
             // Enumerate reachable ends, recording a journal MARK before each
             // rep so trying the tail at `k` reps can undo the captures made by
@@ -2052,6 +2173,8 @@ fn fold_case(node: &mut ReNode) {
                 fold_case(it);
             }
         }
+        // The `~*` path folds both sides of the backref comparison at match time.
+        ReNode::Backref { ci, .. } => *ci = true,
         _ => {}
     }
 }
