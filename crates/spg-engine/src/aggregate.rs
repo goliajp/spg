@@ -4421,6 +4421,30 @@ fn range_intersect(a: &Value<'static>, b: &Value<'static>) -> Value<'static> {
 
 fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering::Equal;
+    // v7.38 (read01, T6.P3) — min()/max() over NUMERIC honor the special total
+    // order -Inf < finite < +Inf < NaN, ahead of the finite arms which would
+    // read a special's canonical 0 as the number 0.
+    {
+        use spg_storage::NumericKind as NK;
+        let kind = |v: &Value| -> Option<NK> {
+            match v {
+                Value::Numeric { kind, .. } => Some(*kind),
+                Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) => Some(NK::Finite),
+                _ => None,
+            }
+        };
+        if let (Some(lk), Some(rk)) = (kind(a), kind(b)) {
+            if lk != NK::Finite || rk != NK::Finite {
+                let rank = |k: NK| match k {
+                    NK::NegInf => -2,
+                    NK::Finite => 0,
+                    NK::PosInf => 1,
+                    NK::NaN => 2,
+                };
+                return rank(lk).cmp(&rank(rk));
+            }
+        }
+    }
     match (a, b) {
         (Value::Null, Value::Null) => Equal,
         (Value::Null, _) => core::cmp::Ordering::Greater, // NULLs last
