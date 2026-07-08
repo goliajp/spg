@@ -18,7 +18,7 @@ fn integer_two_arg_default_step() {
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
-            Value::BigInt(n) => n,
+            Value::Int(n) => i64::from(n),
             _ => unreachable!(),
         })
         .collect();
@@ -35,7 +35,7 @@ fn integer_three_arg_step() {
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
-            Value::BigInt(n) => n,
+            Value::Int(n) => i64::from(n),
             _ => unreachable!(),
         })
         .collect();
@@ -52,7 +52,7 @@ fn integer_negative_step_descending() {
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
-            Value::BigInt(n) => n,
+            Value::Int(n) => i64::from(n),
             _ => unreachable!(),
         })
         .collect();
@@ -84,7 +84,7 @@ fn integer_with_alias_and_where() {
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
-            Value::BigInt(n) => n,
+            Value::Int(n) => i64::from(n),
             _ => unreachable!(),
         })
         .collect();
@@ -271,4 +271,26 @@ fn parse_iso_to_micros(s: &str) -> i64 {
     days_since_epoch += (d as i64) - 1;
     let secs = days_since_epoch * 86_400 + h as i64 * 3600 + mi as i64 * 60 + se as i64;
     secs * 1_000_000
+}
+
+#[test]
+fn integer_series_element_type_matches_pg() {
+    // v7.38 (read01, T-gs) — generate_series types the series by the argument
+    // type: int4 args → int4 elements (PG yields int4, not int8). A bigint bound
+    // widens the whole series to int8. Oracle: live PG 18.4.
+    let mut e = Engine::new();
+    let typ = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql).unwrap() {
+            QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                v => format!("{v:?}"),
+            },
+            _ => panic!("rows"),
+        }
+    };
+    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1,3) g LIMIT 1"), "integer");
+    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1,10,2) g LIMIT 1"), "integer");
+    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1::bigint,3) g LIMIT 1"), "bigint");
+    // sum(int4) widens to bigint (matches PG), not numeric.
+    assert_eq!(typ(&mut e, "SELECT pg_typeof(sum(g)) FROM generate_series(1,3) g"), "bigint");
 }

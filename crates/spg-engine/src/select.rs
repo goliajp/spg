@@ -34,7 +34,7 @@ use crate::{
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
     try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n,
-    try_trgm_seek, value_is_integer, value_to_i64,
+    try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
 
 impl Engine {
@@ -5094,14 +5094,18 @@ pub(crate) fn generate_series_rows(
             let s = value_to_i64(start);
             let e = value_to_i64(stop);
             let st = value_to_i64(step);
-            let rows = generate_series_integers(s, e, st, cancel)?;
-            Ok((DataType::BigInt, rows))
+            // PG types the series by the argument type: int4 args → int4
+            // elements, int8 (bigint) args → int8. Any BigInt operand widens.
+            let wide = value_is_bigint(start) || value_is_bigint(stop) || value_is_bigint(step);
+            let rows = generate_series_integers(s, e, st, wide, cancel)?;
+            Ok((if wide { DataType::BigInt } else { DataType::Int }, rows))
         }
         [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
             let s = value_to_i64(start);
             let e = value_to_i64(stop);
-            let rows = generate_series_integers(s, e, 1, cancel)?;
-            Ok((DataType::BigInt, rows))
+            let wide = value_is_bigint(start) || value_is_bigint(stop);
+            let rows = generate_series_integers(s, e, 1, wide, cancel)?;
+            Ok((if wide { DataType::BigInt } else { DataType::Int }, rows))
         }
         _ => Err(EngineError::Unsupported(alloc::format!(
             "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
@@ -5123,6 +5127,7 @@ fn generate_series_integers(
     start: i64,
     stop: i64,
     step: i64,
+    wide: bool,
     cancel: &CancelToken<'_>,
 ) -> Result<alloc::vec::Vec<Row<'static>>, EngineError> {
     if step == 0 {
@@ -5144,7 +5149,11 @@ fn generate_series_integers(
         if step < 0 && cur < stop {
             break;
         }
-        out.push(Row::new(alloc::vec![Value::BigInt(cur)]));
+        out.push(Row::new(alloc::vec![if wide {
+            Value::BigInt(cur)
+        } else {
+            Value::Int(cur as i32)
+        }]));
         if out.len() > MAX_ROWS {
             return Err(EngineError::Unsupported(alloc::format!(
                 "generate_series(): exceeded {MAX_ROWS} rows; \
