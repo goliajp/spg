@@ -258,6 +258,7 @@ mod e2e_substring_similar;
 mod e2e_numeric_power;
 mod e2e_array_2d;
 mod e2e_regclass_oid;
+mod e2e_alter_drop_identity;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

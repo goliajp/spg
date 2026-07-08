@@ -106,6 +106,9 @@ impl Engine {
             T::AlterColumnDropExpression { column } => {
                 self.alter_column_drop_expression(tbl, column)
             }
+            T::AlterColumnDropIdentity { column, if_exists } => {
+                self.alter_column_drop_identity(tbl, column, if_exists)
+            }
             T::AlterColumnSetExpression { column, expr } => {
                 self.alter_column_set_expression(tbl, column, expr)
             }
@@ -195,6 +198,40 @@ impl Engine {
             )));
         }
         table.schema_mut().columns[pos].generated_stored_expr = None;
+        Ok(())
+    }
+
+    /// v7.38 (read01, T28) — `ALTER COLUMN col DROP IDENTITY [IF EXISTS]`:
+    /// de-generate an identity column into a plain column. Errors when the
+    /// column is not an identity column, unless `IF EXISTS` was given.
+    fn alter_column_drop_identity(
+        &mut self,
+        tbl: &str,
+        column: String,
+        if_exists: bool,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN DROP IDENTITY: column {column:?} not in table {tbl:?}"
+                ))
+            })?;
+        if !table.schema().columns[pos].auto_increment {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER COLUMN DROP IDENTITY: column {column:?} is not an identity column"
+            )));
+        }
+        table.schema_mut().columns[pos].auto_increment = false;
         Ok(())
     }
 
