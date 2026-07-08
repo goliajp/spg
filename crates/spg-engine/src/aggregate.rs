@@ -4253,10 +4253,18 @@ fn encode_one(out: &mut String, v: &Value) {
             out.push('|');
         }
         Value::Numeric { scaled, scale } => {
+            // v7.38 (read01) — DISTINCT keys numerically-equal decimals as one
+            // regardless of scale (1.0 = 1.00), so strip trailing fractional
+            // zeros before encoding, matching PG (and set-op / GROUP BY dedup).
+            let (mut s, mut sc) = (*scaled, *scale);
+            while sc > 0 && s % 10 == 0 {
+                s /= 10;
+                sc -= 1;
+            }
             out.push('D');
-            out.push_str(&scaled.to_string());
+            out.push_str(&s.to_string());
             out.push('@');
-            out.push_str(&scale.to_string());
+            out.push_str(&sc.to_string());
             out.push('|');
         }
         Value::Date(d) => {
