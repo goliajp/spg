@@ -37,7 +37,7 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Text(s) => s.to_string(),
         Value::Float(x) => format!("{x}"),
-        Value::Numeric { scaled, scale } => f::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale , .. } => f::format_numeric(*scaled, *scale),
         other => panic!("{sql}: unexpected {other:?}"),
     }
 }

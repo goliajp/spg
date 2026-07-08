@@ -127,7 +127,7 @@ impl UniformArrayKind {
                     .into_iter()
                     .map(|v| match v {
                         Value::Null => None,
-                        Value::Numeric { scaled, scale } => Some((scaled, scale)),
+                        Value::Numeric { scaled, scale, .. } => Some((scaled, scale)),
                         _ => unreachable!("uniform Numeric"),
                     })
                     .collect(),
@@ -966,7 +966,7 @@ pub(crate) fn parse_range_element(
                 .filter(|c| *c == '-' || c.is_ascii_digit())
                 .collect();
             let scaled: i128 = digits.parse().ok()?;
-            Some(Value::Numeric { scaled, scale })
+            Some(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
         }
         K::Ts | K::TsTz => {
             // Reuse the existing timestamp parse path. v7.17.0
@@ -1643,7 +1643,7 @@ pub(crate) fn format_range_element(v: &Value) -> alloc::string::String {
         Value::BigInt(n) => alloc::format!("{n}"),
         Value::Date(d) => crate::eval::format_date(*d),
         Value::Timestamp(t) => crate::eval::format_timestamp(*t),
-        Value::Numeric { scaled, scale } => crate::eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => crate::eval::format_numeric(*scaled, *scale),
         other => alloc::format!("{other:?}"),
     }
 }
@@ -2079,7 +2079,7 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
             Expr::Literal(Literal::Float(x)) => Ok(Value::Float(-x)),
             // v7.38 (read01) — a dotted literal is NUMERIC; negate the mantissa.
             Expr::Literal(Literal::Numeric { unscaled, scale }) => {
-                Ok(Value::Numeric { scaled: -unscaled, scale })
+                Ok(Value::Numeric { scaled: -unscaled, scale , kind: spg_storage::NumericKind::Finite })
             }
             // v7.37.5 ship triage — fold the unary minus through a
             // `Cast { Literal, target }` wrapper (`-2::smallint`,
@@ -2155,7 +2155,7 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
     match l {
         Literal::Integer(n) => int_value_for(n),
         Literal::Float(x) => Value::Float(x),
-        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: unscaled, scale },
+        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: unscaled, scale , kind: spg_storage::NumericKind::Finite },
         Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
@@ -2257,7 +2257,7 @@ fn coerce_text_array_to(
             scal.into_iter()
                 .map(|o| {
                     o.map(|v| match v {
-                        Value::Numeric { scaled, scale } => (scaled, scale),
+                        Value::Numeric { scaled, scale, .. } => (scaled, scale),
                         _ => (0, 0),
                     })
                 })
@@ -2541,7 +2541,7 @@ pub(crate) fn coerce_value(
                     Some(Value::Numeric {
                         scaled: mantissa,
                         scale: src_scale,
-                    })
+                     kind: spg_storage::NumericKind::Finite })
                 } else {
                     Some(numeric_from_float(x, precision, scale, col_name)?)
                 }
@@ -2570,7 +2570,7 @@ pub(crate) fn coerce_value(
                 Some(Value::Numeric {
                     scaled: mantissa,
                     scale: src_scale,
-                })
+                 kind: spg_storage::NumericKind::Finite })
             } else {
                 Some(numeric_rescale(
                     mantissa, src_scale, precision, scale, col_name,
@@ -2623,7 +2623,7 @@ pub(crate) fn coerce_value(
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
         (Value::BigInt(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::Float(x), DataType::Real) => Some(Value::Real(x as f32)),
-        (Value::Numeric { scaled, scale }, DataType::Real) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::Real) => {
             let mut div = 1.0f64;
             for _ in 0..scale {
                 div *= 10.0;
@@ -2807,7 +2807,7 @@ pub(crate) fn coerce_value(
             };
             Some(Value::Money(cents))
         }
-        (Value::Numeric { scaled, scale }, DataType::Money) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::Money) => {
             // Convert exact decimal to cents (scale 2). If scale > 2,
             // round half-away-from-zero. If scale < 2, multiply up.
             let cents = if scale == 2 {
@@ -2827,7 +2827,7 @@ pub(crate) fn coerce_value(
         (Value::Money(c), DataType::Text) => Some(Value::text(eval::format_money(c))),
         // MONEY → NUMERIC: integer cents become a scale-2 decimal (dollars).
         (Value::Money(c), DataType::Numeric { .. }) => {
-            Some(Value::Numeric { scaled: i128::from(c), scale: 2 })
+            Some(Value::Numeric { scaled: i128::from(c), scale: 2 , kind: spg_storage::NumericKind::Finite })
         }
         // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
         // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
@@ -3545,7 +3545,7 @@ pub(crate) fn coerce_value(
             Value::Numeric {
                 scaled,
                 scale: src_scale,
-            },
+             .. },
             DataType::Numeric { precision, scale },
         ) => {
             // v7.38 (read01) — the unconstrained `::numeric` sentinel (0, 0)
@@ -3557,13 +3557,13 @@ pub(crate) fn coerce_value(
                 Some(Value::Numeric {
                     scaled,
                     scale: src_scale,
-                })
+                 kind: spg_storage::NumericKind::Finite })
             } else {
                 Some(numeric_rescale(scaled, src_scale, precision, scale, col_name)?)
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        (Value::Numeric { scaled, scale }, DataType::Float) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::Float) => {
             let mut div = 1.0_f64;
             for _ in 0..scale {
                 div *= 10.0;
@@ -3573,15 +3573,15 @@ pub(crate) fn coerce_value(
         // v7.38 (read01) — coercing NUMERIC into an integer column rounds half
         // away from zero (PG assignment cast: `1.5 → 2`), matching the `::int`
         // cast path; it previously truncated (`1.7 → 1`).
-        (Value::Numeric { scaled, scale }, DataType::Int) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::Int) => {
             let rounded = numeric_round_to_integer(scaled, scale);
             i32::try_from(rounded).ok().map(Value::Int)
         }
-        (Value::Numeric { scaled, scale }, DataType::BigInt) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::BigInt) => {
             let rounded = numeric_round_to_integer(scaled, scale);
             i64::try_from(rounded).ok().map(Value::BigInt)
         }
-        (Value::Numeric { scaled, scale }, DataType::SmallInt) => {
+        (Value::Numeric { scaled, scale, .. }, DataType::SmallInt) => {
             let rounded = numeric_round_to_integer(scaled, scale);
             i16::try_from(rounded).ok().map(Value::SmallInt)
         }

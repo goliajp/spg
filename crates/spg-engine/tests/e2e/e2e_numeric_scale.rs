@@ -61,7 +61,7 @@ fn trim_scale_removes_trailing_zeroes() {
         panic!("expected Rows");
     };
     match &rows[0].values[0] {
-        spg_storage::Value::Numeric { scaled, scale } => {
+        spg_storage::Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled, 31);
             assert_eq!(*scale, 1);
         }

@@ -267,7 +267,7 @@ pub(crate) fn synth_information_schema_columns(
                     // canonical text formatters (PG stores the default
                     // expression text) instead of leaking Rust Debug
                     // (`Numeric { scaled: 0, scale: 2 }`).
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         crate::eval::format_numeric(*scaled, *scale)
                     }
                     Value::Date(d) => alloc::format!("'{}'::date", crate::eval::format_date(*d)),

@@ -48,19 +48,19 @@ pub(super) fn extract_field(
                 return Ok(Value::Numeric {
                     scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
                     scale: 6,
-                });
+                 kind: spg_storage::NumericKind::Finite });
             }
             F::Second => {
                 return Ok(Value::Numeric {
                     scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
                     scale: 6,
-                });
+                 kind: spg_storage::NumericKind::Finite });
             }
             F::Millisecond => {
                 return Ok(Value::Numeric {
                     scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
                     scale: 3,
-                });
+                 kind: spg_storage::NumericKind::Finite });
             }
             _ => {}
         }
@@ -135,19 +135,19 @@ pub(super) fn extract_field(
             return Ok(Value::Numeric {
                 scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
                 scale: 6,
-            });
+             kind: spg_storage::NumericKind::Finite });
         }
         F::Second => {
             return Ok(Value::Numeric {
                 scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
                 scale: 6,
-            });
+             kind: spg_storage::NumericKind::Finite });
         }
         F::Millisecond => {
             return Ok(Value::Numeric {
                 scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
                 scale: 3,
-            });
+             kind: spg_storage::NumericKind::Finite });
         }
         _ => {}
     }
@@ -290,7 +290,7 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     // it to f64 so `date_part('epoch', …)` renders like PG's double (no trailing
     // `.000000`) and pg_typeof reports double precision.
     Ok(match extract_field(field, &args[1])? {
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             #[allow(clippy::cast_precision_loss)]
             Value::Float(scaled as f64 / 10f64.powi(i32::from(scale)))
         }
@@ -606,7 +606,7 @@ pub(super) fn from_unixtime(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
         Value::Int(n) => i64::from(*n),
         Value::BigInt(n) => *n,
         Value::Float(x) => *x as i64,
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             let denom = 10_i128.pow(u32::from(*scale));
             i64::try_from(scaled.div_euclid(denom)).unwrap_or(i64::MAX)
         }

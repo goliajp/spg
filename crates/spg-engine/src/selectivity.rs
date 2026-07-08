@@ -260,7 +260,7 @@ fn value_cmp_str(value: &Value, bound: &str) -> core::cmp::Ordering {
         // text would mis-bucket), so parse the histogram bound back to a
         // numeric and compare by value; lex-compare only if it won't
         // parse.
-        Value::Numeric { scaled, scale } => match crate::numeric::parse_numeric_text(bound) {
+        Value::Numeric { scaled, scale, .. } => match crate::numeric::parse_numeric_text(bound) {
             Some((b_scaled, b_scale)) => {
                 crate::orderby::cmp_numeric(*scaled, *scale, b_scaled, b_scale)
             }
@@ -324,12 +324,12 @@ mod tests {
         // 10.5 vs 9.5: numerically 10.5 > 9.5, but a text-lex compare of
         // "10.5" < "9.5" (because '1' < '9') would mis-order — the bug
         // this guards. 105/scale1 = 10.5.
-        let ten_five = Value::Numeric { scaled: 105, scale: 1 };
+        let ten_five = Value::Numeric { scaled: 105, scale: 1 , kind: spg_storage::NumericKind::Finite };
         assert_eq!(value_cmp_str(&ten_five, "9.5"), Ordering::Greater);
         assert_eq!(value_cmp_str(&ten_five, "10.5"), Ordering::Equal);
         assert_eq!(value_cmp_str(&ten_five, "20"), Ordering::Less);
         // Different scales still compare by value (2.50 == 2.5).
-        let two_five = Value::Numeric { scaled: 250, scale: 2 };
+        let two_five = Value::Numeric { scaled: 250, scale: 2 , kind: spg_storage::NumericKind::Finite };
         assert_eq!(value_cmp_str(&two_five, "2.5"), Ordering::Equal);
     }
 

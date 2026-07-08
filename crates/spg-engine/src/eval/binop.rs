@@ -48,10 +48,10 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                     detail: "smallint overflow on unary -".into(),
                 })
         }
-        (UnOp::Neg, Value::Numeric { scaled, scale }) => {
+        (UnOp::Neg, Value::Numeric { scaled, scale, .. }) => {
             scaled
                 .checked_neg()
-                .map(|s| Value::Numeric { scaled: s, scale })
+                .map(|s| Value::Numeric { scaled: s, scale , kind: spg_storage::NumericKind::Finite })
                 .ok_or(EvalError::TypeMismatch {
                     detail: "numeric overflow on unary -".into(),
                 })
@@ -1252,7 +1252,7 @@ fn apply_binary_numeric(
             Ok(Value::Numeric {
                 scaled: r,
                 scale: target_scale,
-            })
+             kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Mod => {
             // PG `numeric % numeric`: rescale both to the shared scale, then
@@ -1271,7 +1271,7 @@ fn apply_binary_numeric(
             Ok(Value::Numeric {
                 scaled: lhs.wrapping_rem(rhs),
                 scale: target_scale,
-            })
+             kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Mul => {
             let scaled = a.checked_mul(b).ok_or(EvalError::TypeMismatch {
@@ -1280,7 +1280,7 @@ fn apply_binary_numeric(
             Ok(Value::Numeric {
                 scaled,
                 scale: sa.saturating_add(sb),
-            })
+             kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Div => {
             if b == 0 {
@@ -1295,7 +1295,7 @@ fn apply_binary_numeric(
                 crate::numeric::numeric_div(a, sa, b, sb).ok_or(EvalError::TypeMismatch {
                     detail: "NUMERIC overflow on / scaling".into(),
                 })?;
-            Ok(Value::Numeric { scaled, scale })
+            Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             let target_scale = sa.max(sb);
@@ -1319,7 +1319,7 @@ fn apply_binary_numeric(
 /// returns `None` and the caller raises a type error.
 fn numeric_or_widen(v: &Value<'static>) -> Option<(i128, u8)> {
     match v {
-        Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+        Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
         Value::Int(n) => Some((i128::from(*n), 0)),
         Value::SmallInt(n) => Some((i128::from(*n), 0)),
         Value::BigInt(n) => Some((i128::from(*n), 0)),
@@ -2017,7 +2017,7 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
         Value::Float(x) => Ok(*x),
         Value::Real(x) => Ok(f64::from(*x)),
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             let mut div = 1.0_f64;
             for _ in 0..*scale {
                 div *= 10.0;
@@ -2431,7 +2431,7 @@ fn bound_cmp(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
         (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Numeric { scaled: xs, scale: xc }, Value::Numeric { scaled: ys, scale: yc }) => {
+        (Value::Numeric { scaled: xs, scale: xc , .. }, Value::Numeric { scaled: ys, scale: yc , .. }) => {
             numeric_pair_cmp((*xs, *xc), (*ys, *yc))
         }
         // Mixed real-number bounds/elements (e.g. `numrange(1.5,3.5) @> 2.5`
@@ -2452,7 +2452,7 @@ fn num_as_f64(v: &Value<'_>) -> Option<f64> {
         Value::Int(n) => Some(f64::from(*n)),
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             Some(*scaled as f64 / 10i128.pow(u32::from(*scale)) as f64)
         }
         _ => None,
@@ -2833,7 +2833,7 @@ fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'
             Value::Int(n) => Some(f64::from(*n)),
             Value::BigInt(n) => Some(*n as f64),
             Value::Float(x) => Some(*x),
-            Value::Numeric { scaled, scale } => {
+            Value::Numeric { scaled, scale, .. } => {
                 Some(*scaled as f64 / 10i128.pow(u32::from(*scale)) as f64)
             }
             _ => None,
@@ -3206,7 +3206,7 @@ pub(super) fn compare(
             // operands are shorter-lived but only their Copy fields are read).
             let widen = |v: &Value<'_>| -> Option<(i128, u8)> {
                 match v {
-                    Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+                    Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
                     Value::Int(n) => Some((i128::from(*n), 0)),
                     Value::SmallInt(n) => Some((i128::from(*n), 0)),
                     Value::BigInt(n) => Some((i128::from(*n), 0)),

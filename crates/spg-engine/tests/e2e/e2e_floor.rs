@@ -34,7 +34,7 @@ fn floor_positive_fraction() {
     let row = one_row(e.execute("SELECT floor(1.7)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 1.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled, 10_i128.pow(u32::from(*scale)));
         }
         other => panic!("expected numeric, got {other:?}"),
@@ -48,7 +48,7 @@ fn floor_negative_fraction_rounds_toward_neg_infinity() {
     let row = one_row(e.execute("SELECT floor(-1.5)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, -2.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), -2.0);
         }
         other => panic!("expected Float, got {other:?}"),
@@ -61,7 +61,7 @@ fn floor_negative_half_step() {
     let row = one_row(e.execute("SELECT floor(-0.5)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, -1.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), -1.0);
         }
         other => panic!("expected Float, got {other:?}"),
@@ -74,7 +74,7 @@ fn floor_already_integer_float() {
     let row = one_row(e.execute("SELECT floor(5.0)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 5.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), 5.0);
         }
         other => panic!("got {other:?}"),
@@ -87,7 +87,7 @@ fn floor_zero() {
     let row = one_row(e.execute("SELECT floor(0.0)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 0.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), 0.0);
         }
         other => panic!("got {other:?}"),
@@ -105,7 +105,7 @@ fn floor_integer_passthrough() {
         Value::Int(n) => assert_eq!(*n, 42),
         Value::BigInt(n) => assert_eq!(*n, 42),
         Value::Float(x) => assert_eq!(*x, 42.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), 42.0);
         }
         other => panic!("got {other:?}"),
@@ -120,7 +120,7 @@ fn floor_negative_integer_passthrough() {
         Value::Int(n) => assert_eq!(*n, -7),
         Value::BigInt(n) => assert_eq!(*n, -7),
         Value::Float(x) => assert_eq!(*x, -7.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), -7.0);
         }
         other => panic!("got {other:?}"),
@@ -135,7 +135,7 @@ fn floor_just_below_integer_negative() {
     let row = one_row(e.execute("SELECT floor(-2.999)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, -3.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), -3.0);
         }
         other => panic!("got {other:?}"),
@@ -148,7 +148,7 @@ fn floor_just_above_integer_negative() {
     let row = one_row(e.execute("SELECT floor(-2.001)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, -3.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), -3.0);
         }
         other => panic!("got {other:?}"),
@@ -224,7 +224,7 @@ fn floor_inside_insert_values() {
     let row = one_row(e.execute("SELECT n FROM u").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 3.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), 3.0);
         }
         other => panic!("got {other:?}"),
@@ -238,7 +238,7 @@ fn floor_arithmetic_composition() {
     let row = one_row(e.execute("SELECT floor(10.0 / 3.0)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 3.0),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             assert_eq!(*scaled as f64 / 10f64.powi(i32::from(*scale)), 3.0);
         }
         other => panic!("got {other:?}"),

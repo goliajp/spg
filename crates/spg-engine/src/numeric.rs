@@ -23,7 +23,7 @@ pub(crate) fn numeric_from_integer(
         ))
     })?;
     check_precision(scaled, precision, col_name)?;
-    Ok(Value::Numeric { scaled, scale })
+    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
 }
 
 /// Float → NUMERIC. Uses round-half-away-from-zero on `x * 10^scale`,
@@ -63,7 +63,7 @@ pub(crate) fn numeric_from_float(
     }
     let scaled = biased as i128;
     check_precision(scaled, precision, col_name)?;
-    Ok(Value::Numeric { scaled, scale })
+    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
 }
 
 /// v7.17.0 Phase 3.P0-67 — parse PG-canonical decimal text into
@@ -176,7 +176,7 @@ pub(crate) fn numeric_rescale(
     Ok(Value::Numeric {
         scaled: new_scaled,
         scale: dst_scale,
-    })
+     kind: spg_storage::NumericKind::Finite })
 }
 
 /// Drop the fractional part of a scaled integer, returning the integer

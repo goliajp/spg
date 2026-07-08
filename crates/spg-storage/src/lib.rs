@@ -550,6 +550,20 @@ pub enum TsQueryAst {
 /// Array-of-Option<String> variants (TextArray etc.) also stay owned in
 /// Phase 1; their nested shape is awkward for the simple Cow lift and the
 /// SCALARSQ hot path doesn't touch them.
+/// v7.38 (read01, T6) — the IEEE-style class of a NUMERIC value. `Finite` is the
+/// ordinary fixed-point case; the specials mirror PG's `'NaN'` / `'Infinity'` /
+/// `'-Infinity'`. Derived `PartialEq` gives `NaN == NaN` — correct for NUMERIC
+/// (unlike float's NaN ≠ NaN); the total order (`-Inf < finite < +Inf < NaN`)
+/// lives in the comparison paths, not in `Ord`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum NumericKind {
+    #[default]
+    Finite,
+    NaN,
+    PosInf,
+    NegInf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Value<'arena> {
@@ -577,10 +591,14 @@ pub enum Value<'arena> {
     HalfVector(crate::halfvec::HalfVector),
     /// Exact fixed-point decimal. `scaled` holds the value as
     /// `actual * 10^scale` so the storage type is always integral —
-    /// arithmetic never falls back to floating-point.
+    /// arithmetic never falls back to floating-point. v7.38 (read01, T6) —
+    /// `kind` classifies the value as finite (the common case, using
+    /// `scaled`/`scale`) or one of PG's NUMERIC specials (NaN / ±Infinity),
+    /// which ignore `scaled`/`scale` (canonicalized to 0).
     Numeric {
         scaled: i128,
         scale: u8,
+        kind: NumericKind,
     },
     /// Days since the Unix epoch (1970-01-01). Negative for earlier dates.
     Date(i32),
@@ -974,7 +992,7 @@ impl<'arena> Value<'arena> {
             Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
             Value::Sq8Vector(q) => Value::Sq8Vector(q),
             Value::HalfVector(h) => Value::HalfVector(h),
-            Value::Numeric { scaled, scale } => Value::Numeric { scaled, scale },
+            Value::Numeric { scaled, scale, kind } => Value::Numeric { scaled, scale, kind },
             Value::Date(d) => Value::Date(d),
             Value::Timestamp(t) => Value::Timestamp(t),
             Value::Interval {
@@ -1111,6 +1129,17 @@ impl Value<'static> {
     /// `Value::text(String::from("foo"))`.
     pub fn text<S: Into<String>>(s: S) -> Self {
         Value::Text(Cow::Owned(s.into()))
+    }
+
+    /// v7.38 (read01, T6) — a finite NUMERIC from its fixed-point parts.
+    pub const fn numeric(scaled: i128, scale: u8) -> Self {
+        Value::Numeric { scaled, scale, kind: NumericKind::Finite }
+    }
+
+    /// v7.38 (read01, T6) — a special NUMERIC (NaN / ±Infinity). The fixed-point
+    /// fields are canonicalized to 0 so equal specials compare byte-identical.
+    pub const fn numeric_special(kind: NumericKind) -> Self {
+        Value::Numeric { scaled: 0, scale: 0, kind }
     }
 
     /// v7.37.42-arena Phase 1 — owned-Json constructor (mirrors `text`).

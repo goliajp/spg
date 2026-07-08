@@ -51,7 +51,7 @@ fn render(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         // v7.38 (read01, T4) — sum/avg(bigint) render as decimal text.
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             if *scale == 0 {
                 scaled.to_string()
             } else {

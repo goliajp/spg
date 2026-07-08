@@ -573,7 +573,7 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
         Value::Float(x) => format!("{x}"),
         // PG renders numeric in concat/format/text-coercion as its exact
         // decimal (`x || 2.5::numeric` → `x2.5`), not a debug dump.
-        Value::Numeric { scaled, scale } => super::format::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => super::format::format_numeric(*scaled, *scale),
         Value::Bool(b) => {
             if *b {
                 "t".into()
@@ -601,7 +601,7 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             let mut div = 1.0_f64;
             for _ in 0..*scale {
                 div *= 10.0;
@@ -1190,7 +1190,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         // v7.38 (read01 P6.01) — thread the exact (scaled, scale) for numeric
         // inputs so to_char never rounds a high-precision value through f64.
         let exact = match &args[0] {
-            Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+            Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
             _ => None,
         };
         return Ok(Value::text(to_char_numeric(n, exact, fmt)));

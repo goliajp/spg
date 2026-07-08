@@ -3046,7 +3046,7 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: 12345,
                 scale: 2,
-            },
+             kind: crate::NumericKind::Finite },
             Value::Date(20_000),
             Value::Timestamp(1_700_000_000_000_000),
         ]),
@@ -3062,7 +3062,7 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: 0,
                 scale: 2,
-            },
+             kind: crate::NumericKind::Finite },
             Value::Date(0),
             Value::Timestamp(0),
         ]),
@@ -3077,7 +3077,7 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: -999_999_999,
                 scale: 2,
-            },
+             kind: crate::NumericKind::Finite },
             Value::Date(-1),
             Value::Timestamp(-1),
         ]),
