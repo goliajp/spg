@@ -3641,7 +3641,10 @@ pub(crate) fn coerce_value(
             for _ in 0..need {
                 padded.push(' ');
             }
-            Some(Value::text(padded))
+            // v7.38 (read01, T11) — CHAR(n) is bpchar: blank-padded, and
+            // length / comparison / ::text ignore the padding (handled at those
+            // sites).
+            Some(Value::BpChar(alloc::borrow::Cow::Owned(padded)))
         }
         _ => None,
     };

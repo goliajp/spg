@@ -1401,6 +1401,17 @@ fn bit_concat(an: u32, ab: &[u8], bn: u32, bb: &[u8]) -> (u32, alloc::vec::Vec<u
 }
 
 fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
+    // v7.38 (read01, T11) — bpchar concatenates with its trailing blanks
+    // removed (`'ab'::char(4) || 'x'` = `abx`).
+    if matches!(l, Value::BpChar(_)) || matches!(r, Value::BpChar(_)) {
+        let norm = |v: &Value<'static>| -> Value<'static> {
+            match v {
+                Value::BpChar(s) => Value::text(s.trim_end_matches(' ').to_string()),
+                other => other.clone(),
+            }
+        };
+        return text_concat(&norm(l), &norm(r));
+    }
     if let (Value::TsVector(a), Value::TsVector(b)) = (l, r) {
         return tsvector_concat(a, b);
     }
@@ -3018,6 +3029,22 @@ pub(super) fn compare(
     if let (Some(dt), Value::Text(s)) = (needs_text_coerce(l), r) {
         if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
             return compare(op, l, &c);
+        }
+    }
+    // v7.38 (read01, T11) — bpchar compares blank-insensitively: when either
+    // side is bpchar, both text-like operands are compared with trailing blanks
+    // trimmed (`'ab'::char(4) = 'ab'` is true).
+    if matches!(l, Value::BpChar(_)) || matches!(r, Value::BpChar(_)) {
+        let trimmed = |v: &Value<'_>| -> Option<alloc::string::String> {
+            match v {
+                Value::BpChar(s) | Value::Text(s) => {
+                    Some(s.trim_end_matches(' ').to_string())
+                }
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(b)) = (trimmed(l), trimmed(r)) {
+            return cmp_result(op, a.cmp(&b));
         }
     }
     let ord = match (l, r) {
