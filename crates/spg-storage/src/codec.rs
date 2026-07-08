@@ -1080,6 +1080,7 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         Value::HalfVector(h) => 4 + h.bytes.len(),
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 1 + 16 + 1, // form byte + scaled + scale (T6.P4)
+        Value::NumericBig(b) => { let (_, l, _) = b.parts(); 1 + 1 + 2 + 4 * l.len() }
         // v7.10.4: BYTEA on-disk shape mirrors Text — [u16 len][bytes].
         // The 16-bit length cap is the same TEXT/JSON limit (~65 KB);
         // larger blobs need toast-style chunking which is a v7.11
@@ -2059,6 +2060,18 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
                 crate::NumericKind::NaN => out.push(1),
                 crate::NumericKind::PosInf => out.push(2),
                 crate::NumericKind::NegInf => out.push(3),
+            }
+        }
+        // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC (FILE_VERSION 57+):
+        // tag 33, then [neg u8][scale u8][nlimbs u16 LE][limb u32 LE]…
+        Value::NumericBig(b) => {
+            let (neg, limbs, scale) = b.parts();
+            out.push(33);
+            out.push(u8::from(neg));
+            out.push(scale);
+            out.extend_from_slice(&(limbs.len() as u16).to_le_bytes());
+            for &l in limbs {
+                out.extend_from_slice(&l.to_le_bytes());
             }
         }
         Value::Date(d) => {
@@ -3690,6 +3703,19 @@ impl<'a> Cursor<'a> {
             2 => Ok(Value::BigInt(self.read_i64()?)),
             3 => Ok(Value::Float(self.read_f64()?)),
             32 => Ok(Value::Real(self.read_f32()?)),
+            // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC (form 2).
+            33 => {
+                let neg = self.read_u8()? != 0;
+                let scale = self.read_u8()?;
+                let nlimbs = self.read_u16()? as usize;
+                let mut limbs = alloc::vec::Vec::with_capacity(nlimbs);
+                for _ in 0..nlimbs {
+                    limbs.push(self.read_u32()?);
+                }
+                Ok(Value::NumericBig(alloc::boxed::Box::new(
+                    crate::bignum::BigNumeric::from_parts(neg, limbs, scale),
+                )))
+            }
             4 => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             5 => Ok(Value::Bool(self.read_u8()? != 0)),
             6 => {

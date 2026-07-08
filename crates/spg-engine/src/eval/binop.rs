@@ -429,8 +429,8 @@ pub(super) fn apply_binary(
             };
         }
     }
-    if (matches!(l, Value::Numeric { .. })
-        || matches!(r, Value::Numeric { .. })
+    if (matches!(l, Value::Numeric { .. } | Value::NumericBig(_))
+        || matches!(r, Value::Numeric { .. } | Value::NumericBig(_))
         || matches!(l, Value::Real(_))
         || matches!(r, Value::Real(_)))
         && !matches!(l, Value::Interval { .. })
@@ -1236,11 +1236,55 @@ fn numeric_special_result(
     Some(Ok(res))
 }
 
+/// v7.38 (read01, T3.C3) — convert a numeric-family value to `BigNumeric` for
+/// the arbitrary-precision fallback. `None` for a non-numeric.
+fn to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumeric> {
+    use spg_storage::bignum::BigNumeric;
+    Some(match v {
+        Value::SmallInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
+        Value::Int(n) => BigNumeric::from_i128(i128::from(*n), 0),
+        Value::BigInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
+        Value::Numeric { scaled, scale, kind } if *kind == spg_storage::NumericKind::Finite => {
+            BigNumeric::from_i128(*scaled, *scale)
+        }
+        Value::NumericBig(b) => (**b).clone(),
+        _ => return None,
+    })
+}
+
+/// Collapse a `BigNumeric` back to `Value::Numeric` when its mantissa fits
+/// `i128`, else keep the big form.
+fn demote_bignum(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
+    match b.to_i128() {
+        Some(scaled) => Value::Numeric { scaled, scale: b.scale(), kind: spg_storage::NumericKind::Finite },
+        None => Value::NumericBig(alloc::boxed::Box::new(b)),
+    }
+}
+
+/// v7.38 (read01, T3.C3) — arbitrary-precision fallback for a numeric op whose
+/// i128 fast path overflowed, or where an operand is already `NumericBig`.
+fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'static>, EvalError>> {
+    let (a, b) = (to_bignum(l)?, to_bignum(r)?);
+    let res = match op {
+        BinOp::Add => a.add(&b),
+        BinOp::Sub => a.sub(&b),
+        BinOp::Mul => a.mul(&b),
+        _ => return None,
+    };
+    Some(Ok(demote_bignum(res)))
+}
+
 fn apply_binary_numeric(
     op: BinOp,
     l: Value<'static>,
     r: Value<'static>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01, T3.C3) — an already-big operand skips the i128 fast path.
+    if matches!(l, Value::NumericBig(_)) || matches!(r, Value::NumericBig(_)) {
+        if let Some(res) = numeric_big_op(op, &l, &r) {
+            return res;
+        }
+    }
     // v7.38 (read01) — an unknown-type string operand against NUMERIC coerces to
     // numeric (PG): `3.5::numeric = '3.5'`, `n <op> '2'`. Do it up front so both
     // the comparison and arithmetic paths see two numerics; a string that isn't
@@ -1282,7 +1326,7 @@ fn apply_binary_numeric(
     // f64, narrow to f32); a float8 / numeric operand widens to the float path.
     let has_real = matches!(l, Value::Real(_)) || matches!(r, Value::Real(_));
     let has_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
-    let has_numeric = matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. });
+    let has_numeric = matches!(l, Value::Numeric { .. } | Value::NumericBig(_)) || matches!(r, Value::Numeric { .. } | Value::NumericBig(_));
     let both_real = matches!(l, Value::Real(_)) && matches!(r, Value::Real(_));
     if both_real && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
     {
@@ -1383,24 +1427,23 @@ fn apply_binary_numeric(
     match op {
         BinOp::Add | BinOp::Sub => {
             let target_scale = sa.max(sb);
-            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
-                detail: "NUMERIC overflow on rescale".into(),
-            })?;
-            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
-                detail: "NUMERIC overflow on rescale".into(),
-            })?;
-            let r = match op {
-                BinOp::Add => lhs.checked_add(rhs),
-                BinOp::Sub => lhs.checked_sub(rhs),
-                _ => unreachable!(),
+            // v7.38 (read01, T3.C3) — try the exact i128 path; any overflow
+            // (rescale or the add/sub) promotes to arbitrary precision.
+            let fast = rescale(a, sa, target_scale).and_then(|lhs| {
+                rescale(b, sb, target_scale).and_then(|rhs| match op {
+                    BinOp::Add => lhs.checked_add(rhs),
+                    BinOp::Sub => lhs.checked_sub(rhs),
+                    _ => unreachable!(),
+                })
+            });
+            match fast {
+                Some(r) => Ok(Value::Numeric {
+                    scaled: r,
+                    scale: target_scale,
+                    kind: spg_storage::NumericKind::Finite,
+                }),
+                None => numeric_big_op(op, &l, &r).expect("numeric operands"),
             }
-            .ok_or(EvalError::TypeMismatch {
-                detail: "NUMERIC overflow on +/-".into(),
-            })?;
-            Ok(Value::Numeric {
-                scaled: r,
-                scale: target_scale,
-             kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Mod => {
             // PG `numeric % numeric`: rescale both to the shared scale, then
@@ -1422,13 +1465,15 @@ fn apply_binary_numeric(
              kind: spg_storage::NumericKind::Finite })
         }
         BinOp::Mul => {
-            let scaled = a.checked_mul(b).ok_or(EvalError::TypeMismatch {
-                detail: "NUMERIC overflow on *".into(),
-            })?;
-            Ok(Value::Numeric {
-                scaled,
-                scale: sa.saturating_add(sb),
-             kind: spg_storage::NumericKind::Finite })
+            // v7.38 (read01, T3.C3) — i128 product overflow promotes to bignum.
+            match a.checked_mul(b) {
+                Some(scaled) => Ok(Value::Numeric {
+                    scaled,
+                    scale: sa.saturating_add(sb),
+                    kind: spg_storage::NumericKind::Finite,
+                }),
+                None => numeric_big_op(op, &l, &r).expect("numeric operands"),
+            }
         }
         BinOp::Div => {
             if b == 0 {
@@ -3346,7 +3391,7 @@ pub(super) fn compare(
         // shared scale (bare decimal literals are numeric now, so `n = 9.99`
         // lands here). A numeric-vs-float mix still falls to the float arm.
         (a, b)
-            if (matches!(a, Value::Numeric { .. }) || matches!(b, Value::Numeric { .. }))
+            if (matches!(a, Value::Numeric { .. } | Value::NumericBig(_)) || matches!(b, Value::Numeric { .. } | Value::NumericBig(_)))
                 && !matches!(a.data_type(), Some(DataType::Float))
                 && !matches!(b.data_type(), Some(DataType::Float)) =>
         {

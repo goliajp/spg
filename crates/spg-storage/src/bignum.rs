@@ -39,6 +39,22 @@ impl BigNumeric {
         self.scale
     }
 
+    /// v7.38 (read01, T3.C3) — expose the on-disk parts (sign, base-10^9 limbs
+    /// little-endian, scale) for the codec.
+    #[must_use]
+    pub fn parts(&self) -> (bool, &[u32], u8) {
+        (self.neg, &self.limbs, self.scale)
+    }
+
+    /// Rebuild from codec parts. Normalizes (a canonical big value never has a
+    /// mantissa that fits `i128` — the caller collapses those to `Numeric`).
+    #[must_use]
+    pub fn from_parts(neg: bool, limbs: Vec<u32>, scale: u8) -> Self {
+        let mut out = BigNumeric { neg, limbs, scale };
+        out.normalize();
+        out
+    }
+
     /// Drop most-significant zero limbs and canonicalize a zero to `+0`.
     fn normalize(&mut self) {
         while self.limbs.last() == Some(&0) {
