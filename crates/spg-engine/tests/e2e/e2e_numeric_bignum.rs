@@ -37,3 +37,17 @@ fn numeric_beyond_i128() {
     // (Parsing a literal whose *mantissa* itself overflows i128 — a big literal
     // rather than a big *result* — is a follow-up C3 sub-item.)
 }
+
+
+#[test]
+fn numeric_bignum_compare() {
+    let mut e = Engine::new();
+    let b = |e: &mut Engine, sql: &str| matches!(
+        e.execute(sql).unwrap(),
+        QueryResult::Rows { ref rows, .. } if matches!(rows[0].values[0], spg_storage::Value::Bool(true))
+    );
+    // Big vs big (produced via arithmetic), and big vs a small int.
+    assert!(b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) > (99999999999999999999999999999999999999 * 1)"));
+    assert!(b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) = (99999999999999999999999999999999999999 + 99999999999999999999999999999999999999)"));
+    assert!(!b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) < 5"));
+}
