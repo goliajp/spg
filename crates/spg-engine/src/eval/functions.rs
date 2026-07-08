@@ -2138,6 +2138,83 @@ fn apply_function_dispatch(
             };
             Ok(Value::Lseg(*a, *b))
         }
+        // v7.38 (read01, T21) — slope(point, point) = (y2-y1)/(x2-x1); a
+        // vertical segment yields Infinity (matching PG's float division).
+        "slope" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Point(a), Value::Point(b)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "slope(point, point) needs two points".into(),
+                });
+            };
+            Ok(Value::Float((b.y - a.y) / (b.x - a.x)))
+        }
+        // diagonal(box) — the lseg from the upper-right to the lower-left corner.
+        "diagonal" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::PgBox(ur, ll) => Ok(Value::Lseg(*ur, *ll)),
+            v => Err(EvalError::TypeMismatch {
+                detail: alloc::format!("diagonal() not defined for {:?}", v.data_type()),
+            }),
+        },
+        // bound_box(box, box) — the smallest box enclosing both.
+        "bound_box" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::PgBox(aur, all), Value::PgBox(bur, bll)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "bound_box(box, box) needs two boxes".into(),
+                });
+            };
+            Ok(Value::PgBox(
+                spg_storage::Point2D {
+                    x: aur.x.max(bur.x),
+                    y: aur.y.max(bur.y),
+                },
+                spg_storage::Point2D {
+                    x: all.x.min(bll.x),
+                    y: all.y.min(bll.y),
+                },
+            ))
+        }
+        // box(circle) — the largest square inscribed in the circle (corners at
+        // centre ± r/√2). Narrowed to a Circle operand so `box('(0,0),(1,1)')`
+        // still resolves as a function-style typecast.
+        "box" if args.len() == 1 && matches!(&args[0], Value::Circle { .. }) => {
+            let Value::Circle { center, radius } = &args[0] else {
+                unreachable!()
+            };
+            let h = radius / core::f64::consts::SQRT_2;
+            Ok(Value::PgBox(
+                spg_storage::Point2D {
+                    x: center.x + h,
+                    y: center.y + h,
+                },
+                spg_storage::Point2D {
+                    x: center.x - h,
+                    y: center.y - h,
+                },
+            ))
+        }
+        // circle(box) — the smallest circle containing the box (centre at the
+        // box centre, radius = half the diagonal). Narrowed to a box operand so
+        // `circle('<(0,0),5>')` still resolves as a function-style typecast.
+        "circle" if args.len() == 1 && matches!(&args[0], Value::PgBox(..)) => {
+            let Value::PgBox(ur, ll) = &args[0] else {
+                unreachable!()
+            };
+            let cx = (ur.x + ll.x) / 2.0;
+            let cy = (ur.y + ll.y) / 2.0;
+            let dx = ur.x - cx;
+            let dy = ur.y - cy;
+            Ok(Value::Circle {
+                center: spg_storage::Point2D { x: cx, y: cy },
+                radius: f64_sqrt(dx * dx + dy * dy),
+            })
+        }
         // npoints(path | polygon) — the vertex count.
         "npoints" if args.len() == 1 => match &args[0] {
             Value::Null => Ok(Value::Null),
