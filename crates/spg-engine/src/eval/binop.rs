@@ -482,6 +482,17 @@ pub(super) fn apply_binary(
         }
         BinOp::BitOr => bitop(l, r, |a, b| a | b, "|"),
         BinOp::BitAnd => bitop(l, r, |a, b| a & b, "&"),
+        // v7.38 (read01) — PG `lseg # lseg`: the point where two segments cross,
+        // or NULL when they don't. Distinct from the bit/integer `#` (XOR).
+        BinOp::BitXor if matches!(l, Value::Lseg(..)) && matches!(r, Value::Lseg(..)) => {
+            let (Value::Lseg(a1, a2), Value::Lseg(b1, b2)) = (&l, &r) else {
+                unreachable!()
+            };
+            match lseg_intersection(*a1, *a2, *b1, *b2) {
+                Some(p) => Ok(Value::Point(p)),
+                None => Ok(Value::Null),
+            }
+        }
         BinOp::BitXor => bitop(l, r, |a, b| a ^ b, "#"),
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
@@ -1078,6 +1089,34 @@ pub(crate) fn add_interval_to_micros(
 /// Other-side integers / floats are promoted to a NUMERIC at a common
 /// scale; all add / sub / mul / div / compare paths stay in i128.
 #[allow(clippy::needless_pass_by_value)] // mirrors `apply_binary`'s by-value calling convention
+/// v7.38 (read01) — intersection point of two closed line segments, or `None`
+/// when they are parallel or do not overlap within both segments' extents.
+fn lseg_intersection(
+    a1: spg_storage::Point2D,
+    a2: spg_storage::Point2D,
+    b1: spg_storage::Point2D,
+    b2: spg_storage::Point2D,
+) -> Option<spg_storage::Point2D> {
+    let d1x = a2.x - a1.x;
+    let d1y = a2.y - a1.y;
+    let d2x = b2.x - b1.x;
+    let d2y = b2.y - b1.y;
+    let denom = d1x * d2y - d1y * d2x;
+    if denom == 0.0 {
+        return None; // parallel or degenerate
+    }
+    let t = ((b1.x - a1.x) * d2y - (b1.y - a1.y) * d2x) / denom;
+    let s = ((b1.x - a1.x) * d1y - (b1.y - a1.y) * d1x) / denom;
+    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&s) {
+        Some(spg_storage::Point2D {
+            x: a1.x + t * d1x,
+            y: a1.y + t * d1y,
+        })
+    } else {
+        None
+    }
+}
+
 fn apply_binary_numeric(
     op: BinOp,
     l: Value<'static>,
