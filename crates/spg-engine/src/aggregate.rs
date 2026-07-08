@@ -328,6 +328,10 @@ struct AggState {
     sum_num_scaled: i128,
     sum_num_scale: u8,
     use_numeric: bool,
+    /// v7.38 (read01, T6.P3) — the NUMERIC special class of the running sum, so a
+    /// NaN / ±Infinity input propagates to sum()/avg() (the finite mantissa keeps
+    /// accumulating but is ignored when this is non-Finite). Default = Finite.
+    sum_num_kind: spg_storage::NumericKind,
     /// v7.37 — component-wise accumulator for `sum(interval)` /
     /// `avg(interval)`. Gated by `use_interval`; the numeric/int/float
     /// paths never touch these. `micros` is i128 to avoid overflow when
@@ -1166,6 +1170,7 @@ fn accumulate_groups(
         // untouched (byte-identical), so the common int/float sum pays
         // nothing for this.
         let mut num_scaled: i128 = 0;
+        let mut num_kind = spg_storage::NumericKind::Finite;
         let mut num_scale: u8 = 0;
         let mut use_numeric = false;
         // Interval accumulator (sum/avg over an interval column).
@@ -1216,12 +1221,13 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale, .. } => {
+                    Value::Numeric { scaled, scale, kind } => {
                         let (s, sc) = crate::numeric::numeric_add(
                             num_scaled, num_scale, *scaled, *scale,
                         );
                         num_scaled = s;
                         num_scale = sc;
+                        num_kind = fold_sum_kind(num_kind, *kind);
                         use_numeric = true;
                         count += 1;
                     }
@@ -1313,12 +1319,13 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale, .. } => {
+                    Value::Numeric { scaled, scale, kind } => {
                         let (s, sc) = crate::numeric::numeric_add(
                             num_scaled, num_scale, scaled, scale,
                         );
                         num_scaled = s;
                         num_scale = sc;
+                        num_kind = fold_sum_kind(num_kind, kind);
                         use_numeric = true;
                         count += 1;
                     }
@@ -1348,6 +1355,7 @@ fn accumulate_groups(
         state.sum_float = sum_float;
         state.use_float = use_float;
         state.sum_num_scaled = num_scaled;
+        state.sum_num_kind = num_kind;
         state.sum_num_scale = num_scale;
         state.use_numeric = use_numeric;
         state.sum_iv_months = sum_iv_months;
@@ -2894,8 +2902,9 @@ fn update_state(
                 }
                 // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
                 // scales on the running max; result stays exact.
-                Value::Numeric { scaled, scale, .. } => {
+                Value::Numeric { scaled, scale, kind } => {
                     st.use_numeric = true;
+                    st.sum_num_kind = fold_sum_kind(st.sum_num_kind, *kind);
                     let (s, sc) = crate::numeric::numeric_add(
                         st.sum_num_scaled,
                         st.sum_num_scale,
@@ -3214,17 +3223,18 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             } else if st.use_money {
                 Value::Money(st.sum_money as i64)
             } else if st.use_numeric {
-                // Exact NUMERIC sum (PG18: sum(numeric) → numeric). Fold
-                // any integer contributions (scale 0) into the running
-                // numeric accumulator — normally a group is single-typed,
-                // so sum_int is 0 here.
-                let (scaled, scale) = crate::numeric::numeric_add(
-                    st.sum_num_scaled,
-                    st.sum_num_scale,
-                    i128::from(st.sum_int),
-                    0,
-                );
-                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                // v7.38 (read01, T6.P3) — a NaN / ±Infinity input propagates.
+                if st.sum_num_kind != spg_storage::NumericKind::Finite {
+                    Value::numeric_special(st.sum_num_kind)
+                } else {
+                    let (scaled, scale) = crate::numeric::numeric_add(
+                        st.sum_num_scaled,
+                        st.sum_num_scale,
+                        i128::from(st.sum_int),
+                        0,
+                    );
+                    Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                }
             } else if st.use_float {
                 Value::Float(st.sum_float + (st.sum_int as f64))
             } else {
@@ -3262,17 +3272,21 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 let q = (st.sum_money * 2 + if st.sum_money >= 0 { n } else { -n }) / (2 * n);
                 Value::Money(q as i64)
             } else if st.use_numeric {
-                // Exact NUMERIC avg = sum / count at the same display
-                // scale PG's division produces (division_display_scale).
-                let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
-                    st.sum_num_scaled,
-                    st.sum_num_scale,
-                    i128::from(st.sum_int),
-                    0,
-                );
-                let (scaled, scale) =
-                    crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
-                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                // v7.38 (read01, T6.P3) — avg of a special is that special
+                // (NaN→NaN, ±Inf→±Inf); PG matches.
+                if st.sum_num_kind != spg_storage::NumericKind::Finite {
+                    Value::numeric_special(st.sum_num_kind)
+                } else {
+                    let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
+                        st.sum_num_scaled,
+                        st.sum_num_scale,
+                        i128::from(st.sum_int),
+                        0,
+                    );
+                    let (scaled, scale) =
+                        crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
+                    Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                }
             } else if st.use_float {
                 Value::Float((st.sum_float + (st.sum_int as f64)) / (st.count as f64))
             } else {
@@ -4416,6 +4430,21 @@ fn range_intersect(a: &Value<'static>, b: &Value<'static>) -> Value<'static> {
         lower_inc,
         upper_inc,
         empty: false,
+    }
+}
+
+/// v7.38 (read01, T6.P3) — fold a NUMERIC input's kind into a running sum's kind:
+/// NaN wins; ±Inf + finite → that Inf; +Inf + -Inf → NaN; else unchanged.
+fn fold_sum_kind(
+    acc: spg_storage::NumericKind,
+    incoming: spg_storage::NumericKind,
+) -> spg_storage::NumericKind {
+    use spg_storage::NumericKind as NK;
+    match (acc, incoming) {
+        (NK::NaN, _) | (_, NK::NaN) => NK::NaN,
+        (NK::Finite, k) | (k, NK::Finite) => k,
+        (a, b) if a == b => a,
+        _ => NK::NaN,
     }
 }
 
