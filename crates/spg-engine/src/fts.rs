@@ -377,14 +377,21 @@ fn phrase_match(vec: &[TsLexeme], left: &TsQueryAst, right: &TsQueryAst, distanc
 /// normalisation flag 0.
 #[must_use]
 pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
-    let mut score = 0.0f32;
-    let mut unique_terms = 0usize;
-    collect_rank_terms(query, vec, &mut score, &mut unique_terms);
-    if unique_terms == 0 {
+    // v7.38 (read01, T12.1) — PG's calc_rank: an AND/PHRASE-rooted query uses
+    // the cover (distance-weighted) branch, everything else the OR branch.
+    // Normalization flag defaults to 0 (no length/uniqueness division).
+    let mut terms: Vec<&str> = Vec::new();
+    collect_query_terms(query, &mut terms);
+    if terms.is_empty() {
         return 0.0;
     }
-    let denom = 1.0 + ln_approx(unique_terms as f32);
-    score / denom
+    let and_rooted = matches!(query, TsQueryAst::And(..) | TsQueryAst::Phrase { .. });
+    // calc_rank_and delegates to calc_rank_or for a single distinct term.
+    if and_rooted && terms.len() >= 2 {
+        calc_rank_and(vec, &terms)
+    } else {
+        calc_rank_or(vec, &terms)
+    }
 }
 
 /// v7.12.2 — `ts_rank_cd(vec, q)` cover-density variant. Higher
@@ -450,6 +457,140 @@ fn weight_factor(w: u8) -> f32 {
         1 => 0.2,
         _ => 0.1,
     }
+}
+
+/// v7.38 (read01, T12.1) — no_std `exp`, sibling of `ln_approx`. Range-reduce
+/// `x = k·ln2 + r` and evaluate `2^k · e^r` with a Taylor series on the small
+/// remainder; saturate the far tails.
+fn exp_approx(x: f32) -> f32 {
+    if x > 88.0 {
+        return f32::INFINITY;
+    }
+    if x < -88.0 {
+        return 0.0;
+    }
+    let xd = f64::from(x);
+    let k = (xd / core::f64::consts::LN_2).round();
+    let r = xd - k * core::f64::consts::LN_2;
+    // e^r, r in [-ln2/2, ln2/2]; 7 Taylor terms.
+    let mut term = 1.0f64;
+    let mut er = 1.0f64;
+    for i in 1..8 {
+        term *= r / f64::from(i);
+        er += term;
+    }
+    (er * libm_exp2(k)) as f32
+}
+
+/// 2^k for an integer-valued `k` (built from the f64 exponent field).
+fn libm_exp2(k: f64) -> f64 {
+    let ki = k as i64;
+    f64::from_bits((((ki + 1023) as u64) & 0x7ff) << 52)
+}
+
+/// v7.38 (read01, T12.1) — PG `word_distance`: how much a lexeme gap of `d`
+/// positions dampens an AND cover's contribution. Only `calc_rank_and` uses it.
+fn word_distance(d: u32) -> f32 {
+    1.0 / (1.005 + 0.05 * exp_approx((d as f32) / 1.5 - 2.0))
+}
+
+/// A matched query-term occurrence: which query term, its position, its weight.
+struct RankEntry {
+    term: usize,
+    pos: u16,
+    w: f32,
+}
+
+/// Collect the distinct query-term words (in first-seen order).
+fn collect_query_terms<'a>(query: &'a TsQueryAst, out: &mut Vec<&'a str>) {
+    match query {
+        TsQueryAst::Term { word, .. } => {
+            if !out.iter().any(|t| *t == word.as_str()) {
+                out.push(word.as_str());
+            }
+        }
+        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
+            collect_query_terms(a, out);
+            collect_query_terms(b, out);
+        }
+        TsQueryAst::Phrase { left, right, .. } => {
+            collect_query_terms(left, out);
+            collect_query_terms(right, out);
+        }
+        TsQueryAst::Not(_) => {}
+    }
+}
+
+/// PG `calc_rank_or`: sum a per-term contribution over the term's positions,
+/// then divide by the number of distinct query terms.
+fn calc_rank_or(vec: &[TsLexeme], terms: &[&str]) -> f32 {
+    let mut res = 0.0f32;
+    for word in terms {
+        if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
+            let wpos = weight_factor(vec[idx].weight);
+            let (mut resj, mut wjm, mut jm) = (0.0f32, 0.0f32, 0usize);
+            for (j, _pos) in vec[idx].positions.iter().enumerate() {
+                let denom = ((j + 1) * (j + 1)) as f32;
+                resj += wpos / denom;
+                if wpos > wjm {
+                    wjm = wpos;
+                    jm = j;
+                }
+            }
+            let jm_denom = ((jm + 1) * (jm + 1)) as f32;
+            res += (wjm + resj - wjm / jm_denom) / 1.644_934_1;
+        }
+    }
+    res / (terms.len().max(1) as f32)
+}
+
+/// PG `calc_rank_and`: probabilistic-OR combine of every position pair from
+/// DISTINCT query terms, each weighted by the inter-position `word_distance`.
+fn calc_rank_and(vec: &[TsLexeme], terms: &[&str]) -> f32 {
+    let mut entries: Vec<RankEntry> = Vec::new();
+    for (t, word) in terms.iter().enumerate() {
+        if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
+            let w = weight_factor(vec[idx].weight);
+            for &pos in &vec[idx].positions {
+                entries.push(RankEntry { term: t, pos, w });
+            }
+        }
+    }
+    let mut res = -1.0f32;
+    for i in 1..entries.len() {
+        for k in 0..i {
+            if entries[i].term == entries[k].term {
+                continue;
+            }
+            let mut dist = u32::from(entries[i].pos.abs_diff(entries[k].pos));
+            if dist == 0 {
+                dist = 16384; // MAXENTRYPOS
+            }
+            let curw = sqrt_approx(entries[i].w * entries[k].w * word_distance(dist));
+            res = if res < 0.0 {
+                curw
+            } else {
+                1.0 - (1.0 - res) * (1.0 - curw)
+            };
+        }
+    }
+    if res < 0.0 {
+        1e-20
+    } else {
+        res
+    }
+}
+
+/// no_std `sqrt` for f32 (Newton, ample precision for ranking).
+fn sqrt_approx(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut g = f64::from(x);
+    for _ in 0..20 {
+        g = 0.5 * (g + f64::from(x) / g);
+    }
+    g as f32
 }
 
 fn collect_rank_terms(query: &TsQueryAst, vec: &[TsLexeme], score: &mut f32, n: &mut usize) {
