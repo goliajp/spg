@@ -3331,6 +3331,20 @@ pub(super) fn compare(
                 }),
             };
         }
+        // v7.38 (read01, T21) — geometric comparison is by AREA: PG's box and
+        // circle operators (=, <>, <, <=, >, >=) all compare areas, so
+        // `<(0,0),5> = <(100,100),5>` is true (same radius → same area) and
+        // `(0,0),(1,1) = (5,5),(6,6)` is true (same area, different position).
+        (Value::Circle { radius: r1, .. }, Value::Circle { radius: r2, .. }) => {
+            let area = |r: f64| core::f64::consts::PI * r * r;
+            return cmp_result(op, float_pg_cmp(area(*r1), area(*r2)));
+        }
+        (Value::PgBox(aur, all), Value::PgBox(bur, bll)) => {
+            let area = |ur: &spg_storage::Point2D, ll: &spg_storage::Point2D| {
+                (ur.x - ll.x).abs() * (ur.y - ll.y).abs()
+            };
+            return cmp_result(op, float_pg_cmp(area(aur, all), area(bur, bll)));
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
