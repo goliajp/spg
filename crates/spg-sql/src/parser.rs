@@ -190,6 +190,60 @@ fn is_json_each_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("json_each")
 }
 
+/// v7.38 (read01, T14) — resolve named function arguments (`argname => value`)
+/// to positional order for the `make_*` family (the AST stays positional).
+/// Positional args fill slots left-to-right; a named arg goes to its registered
+/// slot; unfilled slots default to integer 0 (PG's optional make_interval
+/// fields — the make_date/time arity is still checked at eval time).
+fn reorder_named_args(
+    fname: &str,
+    args: Vec<Expr>,
+    names: &[Option<String>],
+) -> Result<Vec<Expr>, String> {
+    let params: &[&str] = match fname.to_ascii_lowercase().as_str() {
+        "make_date" => &["year", "month", "day"],
+        "make_time" => &["hour", "min", "sec"],
+        "make_timestamp" | "make_timestamptz" => {
+            &["year", "month", "mday", "hour", "min", "sec"]
+        }
+        "make_interval" => &["years", "months", "weeks", "days", "hours", "mins", "secs"],
+        other => {
+            return Err(alloc::format!(
+                "function {other}(...) does not support named arguments"
+            ));
+        }
+    };
+    let mut slots: Vec<Option<Expr>> = (0..params.len()).map(|_| None).collect();
+    let mut next_positional = 0usize;
+    for (arg, name) in args.into_iter().zip(names.iter()) {
+        let idx = match name {
+            Some(n) => params
+                .iter()
+                .position(|p| p.eq_ignore_ascii_case(n))
+                .ok_or_else(|| alloc::format!("{fname}(...) has no argument named \"{n}\""))?,
+            None => {
+                let i = next_positional;
+                next_positional += 1;
+                i
+            }
+        };
+        if idx >= slots.len() {
+            return Err(alloc::format!("too many arguments for {fname}(...)"));
+        }
+        if slots[idx].is_some() {
+            return Err(alloc::format!(
+                "argument \"{}\" specified more than once",
+                params[idx]
+            ));
+        }
+        slots[idx] = Some(arg);
+    }
+    Ok(slots
+        .into_iter()
+        .map(|s| s.unwrap_or(Expr::Literal(Literal::Integer(0))))
+        .collect())
+}
+
 /// v7.38 (read01) — parse a lexer `Token::Numeric` source string (digits with
 /// an optional single `.`, no sign, no exponent) into `(unscaled, scale)` for
 /// `Literal::Numeric`. Returns `None` if the mantissa overflows i128.
@@ -16078,6 +16132,10 @@ impl Parser {
             }
             // Function call. PG-style: zero-or-more comma-separated args.
             let mut args = Vec::new();
+            // v7.38 (read01, T14) — named-argument notation `argname => value`.
+            // Names are collected in lock-step with `args` and resolved to
+            // positional order after the loop (the AST stays positional).
+            let mut arg_names: Vec<Option<String>> = Vec::new();
             let mut agg_order_by: Vec<OrderBy> = Vec::new();
             // v7.25 (round-17) — `COUNT(DISTINCT x)` and friends.
             // v7.32 (round-29) — accept the dual `ALL` quantifier too
@@ -16329,7 +16387,24 @@ impl Parser {
             }
             if !matches!(self.peek(), Token::RParen) {
                 loop {
+                    // v7.38 (read01, T14) — `argname => value` names this arg.
+                    let this_name = match (
+                        &self.tokens[self.pos],
+                        self.tokens.get(self.pos + 1),
+                    ) {
+                        (
+                            Token::Ident(n) | Token::QuotedIdent(n),
+                            Some(Token::FatArrow),
+                        ) => {
+                            let name = n.clone();
+                            self.advance(); // name
+                            self.advance(); // =>
+                            Some(name)
+                        }
+                        _ => None,
+                    };
                     args.push(self.parse_expr(0)?);
+                    arg_names.push(this_name);
                     // v7.25 (round-17) — standard `CAST(expr AS type)`.
                     // The `::` cast already worked; this lowers the
                     // function form onto the same Expr::Cast node.
@@ -16524,6 +16599,12 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
+            // v7.38 (read01, T14) — resolve any `argname => value` to positional
+            // order (the AST stays positional, so no downstream site changes).
+            if arg_names.iter().any(Option::is_some) {
+                args = reorder_named_args(&first, args, &arg_names)
+                    .map_err(|msg| self.err(msg))?;
+            }
             // v7.32 (round-29) — ordered-set aggregate tail
             // `name(direct_args) WITHIN GROUP (ORDER BY …)`
             // (percentile_cont / percentile_disc / mode). The sort spec

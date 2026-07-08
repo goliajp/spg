@@ -162,6 +162,9 @@ pub enum Token {
     /// v7.12.4 — PL/pgSQL assignment operator `:=`.
     /// Outside PL/pgSQL bodies this token has no SQL-side meaning.
     ColonEq,
+    /// v7.38 (read01, T14) — `=>` names a function argument
+    /// (`make_date(year => 2024, …)`).
+    FatArrow,
     /// v7.12.4 — bare `:` separator. Used inside `tsvector` external-form
     /// literals (`'cat:1 dog:2'::tsvector`) and as the fallback path for
     /// the PL/pgSQL assignment lexer.
@@ -575,7 +578,15 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                     single(&mut out, Token::Dot, &mut i);
                 }
             }
-            b'=' => single(&mut out, Token::Eq, &mut i),
+            b'=' => {
+                // v7.38 (read01, T14) — `=>` names a function argument.
+                if peek_eq(bytes, i + 1, b'>') {
+                    out.push(Token::FatArrow);
+                    i += 2;
+                } else {
+                    single(&mut out, Token::Eq, &mut i);
+                }
+            }
             b'<' => {
                 if peek_eq(bytes, i + 1, b'=') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::CosineDistance);
