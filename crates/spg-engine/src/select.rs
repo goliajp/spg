@@ -5383,6 +5383,13 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
                             | "jsonb_array_elements_text"
                             | "json_array_elements_text"
                     ))
+                // v7.38 (read01, T15) — jsonb/json_path_query(doc, path) expands
+                // per match in the SELECT list.
+                || (args.len() == 2
+                    && matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "jsonb_path_query" | "json_path_query"
+                    ))
         }
         _ => false,
     }
@@ -5431,6 +5438,20 @@ fn top_level_srf_output(
             .into_iter()
             .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
             .collect());
+    }
+    // v7.38 (read01, T15) — jsonb/json_path_query(doc, path): one Value per
+    // matched JSON value.
+    if matches!(lname.as_str(), "jsonb_path_query" | "json_path_query") {
+        let doc = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+        let path = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
+        return match crate::json::path_query(&doc, &path).map_err(EngineError::Eval)? {
+            Value::Null => Ok(Vec::new()),
+            Value::TextArray(items) => Ok(items
+                .into_iter()
+                .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
+                .collect()),
+            other => Ok(alloc::vec![other]),
+        };
     }
     let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
     array_value_to_elements(&arr)

@@ -128,6 +128,39 @@ fn select_list_expands_per_element() {
 }
 
 #[test]
+fn jsonb_path_query_expands_per_match() {
+    // v7.38 (read01, T15) — jsonb_path_query(doc, path) is set-returning: one
+    // row per match, in the SELECT list and as a FROM item. Oracle: PG 18.4.
+    let mut e = Engine::new();
+    // no-FROM SELECT list.
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_path_query('[1, 2, 3]'::jsonb, '$[*]')")),
+        [Some("1".into()), Some("2".into()), Some("3".into())]
+    );
+    // object member wildcard.
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_path_query('{\"a\": [10, 20]}'::jsonb, '$.a[*]')")),
+        [Some("10".into()), Some("20".into())]
+    );
+    // FROM item: PG names the column after the function; a column alias renames.
+    let r = e
+        .execute("SELECT * FROM jsonb_path_query('[1, 2, 3]'::jsonb, '$[*]')")
+        .unwrap();
+    let QueryResult::Rows { columns, rows: got_rows } = r else {
+        panic!("rows")
+    };
+    assert_eq!(columns[0].name, "jsonb_path_query");
+    assert_eq!(got_rows.len(), 3);
+    // Over a real table's rows, expanded per source row.
+    e.execute("CREATE TABLE pq(j jsonb)").unwrap();
+    e.execute("INSERT INTO pq VALUES ('[1, 2]'), ('[3]')").unwrap();
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_path_query(j, '$[*]') FROM pq")),
+        [Some("1".into()), Some("2".into()), Some("3".into())]
+    );
+}
+
+#[test]
 fn non_array_input_errors() {
     let mut e = Engine::new();
     let err = e

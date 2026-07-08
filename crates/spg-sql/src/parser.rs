@@ -7807,6 +7807,16 @@ impl Parser {
                                 None,
                             )
                         }
+                        // v7.38 (read01, T15) — jsonb/json_path_query(doc, path)
+                        // in a no-FROM projection expands per match (scalar form
+                        // returns the matches as a TEXT array → unnest).
+                        "jsonb_path_query" | "json_path_query" if args.len() == 2 => (
+                            Some(Box::new(Expr::FunctionCall {
+                                name: lname.clone(),
+                                args: args.clone(),
+                            })),
+                            None,
+                        ),
                         _ => continue,
                     };
                     found = Some((
@@ -11804,6 +11814,8 @@ impl Parser {
                     || s.eq_ignore_ascii_case("json_array_elements_text")
                     || s.eq_ignore_ascii_case("jsonb_object_keys")
                     || s.eq_ignore_ascii_case("json_object_keys")
+                    || s.eq_ignore_ascii_case("jsonb_path_query")
+                    || s.eq_ignore_ascii_case("json_path_query")
                     || s.eq_ignore_ascii_case("generate_subscripts")
                     || s.eq_ignore_ascii_case("string_to_table")
                     || s.eq_ignore_ascii_case("regexp_split_to_table"))
