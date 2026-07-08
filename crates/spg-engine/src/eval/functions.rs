@@ -142,22 +142,49 @@ fn apply_function_dispatch(
     // a non-numeric string falls through to the normal type error unchanged.
     // `trunc` is intentionally excluded: PG leaves `trunc('unknown')` ambiguous
     // ("function trunc(unknown) is not unique"), so SPG lets it error too.
-    const NUMERIC_ARG0_FNS: &[&str] = &[
-        "abs", "sqrt", "cbrt", "sign", "ceil", "ceiling", "floor", "exp", "ln",
-        "round",
-    ];
-    if NUMERIC_ARG0_FNS.contains(&name)
-        && let Some(Value::Text(s)) = args.first()
-        && let Ok(coerced) = crate::conversions::coerce_value(
-            Value::text(s.as_ref()),
-            spg_storage::DataType::Numeric { precision: 0, scale: 0 },
-            "",
-            0,
-        )
-    {
+    // v7.38 (read01, T16) — coerce an unknown-type string literal in ANY
+    // argument position to the parameter's type, per a small registry. `N`
+    // coerces a Text arg to numeric, `I` to integer, `.` leaves it. Ambiguous
+    // names (`trunc`, `mod`, `div`) are omitted so they error like PG.
+    #[derive(Clone, Copy)]
+    enum Co {
+        N,
+        I,
+        F,
+    }
+    let spec: Option<&[Option<Co>]> = match name {
+        "abs" | "sqrt" | "cbrt" | "sign" | "ceil" | "ceiling" | "floor" | "exp" | "ln" => {
+            Some(&[Some(Co::N)])
+        }
+        "round" => Some(&[Some(Co::N), Some(Co::I)]),
+        // power/log with unknown-string args resolve to double in PG (the result
+        // is `8`, not numeric `8.0000…`), so coerce to float.
+        "power" | "pow" | "log" => Some(&[Some(Co::F), Some(Co::F)]),
+        "left" | "right" | "repeat" => Some(&[None, Some(Co::I)]),
+        "lpad" | "rpad" => Some(&[None, Some(Co::I), None]),
+        _ => None,
+    };
+    if let Some(spec) = spec {
         let mut new_args: alloc::vec::Vec<Value> = args.to_vec();
-        new_args[0] = coerced;
-        return apply_function_dispatch(name, &new_args, ctx);
+        let mut changed = false;
+        for (i, arg) in args.iter().enumerate() {
+            if let (Value::Text(s), Some(co)) = (arg, spec.get(i).copied().flatten()) {
+                let target = match co {
+                    Co::N => spg_storage::DataType::Numeric { precision: 0, scale: 0 },
+                    Co::I => spg_storage::DataType::Int,
+                    Co::F => spg_storage::DataType::Float,
+                };
+                if let Ok(coerced) =
+                    crate::conversions::coerce_value(Value::text(s.as_ref()), target, "", 0)
+                {
+                    new_args[i] = coerced;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            return apply_function_dispatch(name, &new_args, ctx);
+        }
     }
     match name {
         // v7.38 P0 元机制 A — SQL-facing handles for the injection
