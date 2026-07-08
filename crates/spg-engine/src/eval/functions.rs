@@ -11045,21 +11045,24 @@ fn apply_function_dispatch(
                 }
             };
             let enc_up = enc.to_ascii_uppercase();
-            if enc_up != "UTF8"
-                && enc_up != "UTF-8"
-                && enc_up != "SQL_ASCII"
-                && enc_up != "LATIN1"
+            // v7.38 (read01, T30) — single-byte encodings (LATIN1/2/9, KOI8-R/U)
+            // transcode via a PG-sourced table; WIN125x keep their own arm;
+            // UTF8/SQL_ASCII pass through.
+            let table = super::encodings::encoding_table(&enc_up)
+                .or_else(|| super::encodings::encoding_table(&enc_up.replace('-', "")));
+            if !matches!(enc_up.as_str(), "UTF8" | "UTF-8" | "SQL_ASCII")
                 && !is_win1252(&enc_up)
+                && table.is_none()
             {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1 / WIN1252"
+                        "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; \
+                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1252"
                     ),
                 });
             }
-            let s = if enc_up == "LATIN1" {
-                // ISO-8859-1: each byte is exactly its own codepoint.
-                b.iter().map(|&byte| byte as char).collect::<alloc::string::String>()
+            let s = if let Some(t) = table {
+                super::encodings::single_byte_to_utf8(b, t, &enc_up)?
             } else if is_win1252(&enc_up) {
                 // Windows-1252: identity except the remapped 0x80–0x9F range.
                 let mut out = alloc::string::String::with_capacity(b.len());
@@ -11123,19 +11126,22 @@ fn apply_function_dispatch(
                 }
             };
             let enc_up = enc.to_ascii_uppercase();
-            if enc_up != "UTF8"
-                && enc_up != "UTF-8"
-                && enc_up != "SQL_ASCII"
-                && enc_up != "LATIN1"
+            let table = super::encodings::encoding_table(&enc_up)
+                .or_else(|| super::encodings::encoding_table(&enc_up.replace('-', "")));
+            if !matches!(enc_up.as_str(), "UTF8" | "UTF-8" | "SQL_ASCII")
                 && !is_win1252(&enc_up)
+                && table.is_none()
             {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; use UTF8 / SQL_ASCII / LATIN1 / WIN1252"
+                        "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; \
+                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1252"
                     ),
                 });
             }
-            let bytes = if is_win1252(&enc_up) {
+            let bytes = if let Some(t) = table {
+                super::encodings::utf8_to_single_byte(&s, t, &enc_up)?
+            } else if is_win1252(&enc_up) {
                 // UTF-8 text → Windows-1252 bytes.
                 let mut out = alloc::vec::Vec::with_capacity(s.len());
                 for ch in s.chars() {
@@ -11148,23 +11154,6 @@ fn apply_function_dispatch(
                                 ),
                             });
                         }
-                    }
-                }
-                out
-            } else if enc_up == "LATIN1" {
-                // UTF-8 text → ISO-8859-1 bytes. A codepoint above U+00FF
-                // has no LATIN1 equivalent, which PG reports as an error.
-                let mut out = alloc::vec::Vec::with_capacity(s.len());
-                for ch in s.chars() {
-                    let cp = ch as u32;
-                    if cp <= 0xFF {
-                        out.push(cp as u8);
-                    } else {
-                        return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "convert_to(): character {ch:?} has no equivalent in encoding LATIN1"
-                            ),
-                        });
                     }
                 }
                 out

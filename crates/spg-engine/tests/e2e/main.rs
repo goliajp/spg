@@ -267,6 +267,7 @@ mod e2e_unicode_string;
 mod e2e_tsquery_order;
 mod e2e_regex_backref;
 mod e2e_fk_match_full;
+mod e2e_encoding_matrix;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
