@@ -1,4 +1,5 @@
-//! v7.38 (read01 sweep) — INET/CIDR IPv6 addresses render in RFC 5952
+//! v7.38 (read01) — INET/CIDR IPv6 addresses render in RFC 5952 (::text cast
+//! shows the /128 host mask, like PG). Original
 //! canonical form: the longest run of consecutive zero groups (leftmost among
 //! ties, ≥2 groups) compresses to `::`. Oracle: live PG 18.4.
 
@@ -18,14 +19,14 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn ipv6_renders_rfc5952_canonical() {
     let mut e = Engine::new();
     let cases = [
-        ("2001:db8::1", "2001:db8::1"),
-        ("::1", "::1"),
-        ("::", "::"),
-        ("fe80::1:2:3", "fe80::1:2:3"),
+        ("2001:db8::1", "2001:db8::1/128"),
+        ("::1", "::1/128"),
+        ("::", "::/128"),
+        ("fe80::1:2:3", "fe80::1:2:3/128"),
         // Fully-expanded input compresses on output.
-        ("2001:0db8:0000:0000:0000:ff00:0042:8329", "2001:db8::ff00:42:8329"),
+        ("2001:0db8:0000:0000:0000:ff00:0042:8329", "2001:db8::ff00:42:8329/128"),
         // Two zero runs: the LONGER (second, 3 groups) compresses, not the first (2).
-        ("1:0:0:2:0:0:0:3", "1:0:0:2::3"),
+        ("1:0:0:2:0:0:0:3", "1:0:0:2::3/128"),
         // CIDR bits survive the compression.
         ("2001:db8::1/64", "2001:db8::1/64"),
     ];
