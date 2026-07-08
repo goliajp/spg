@@ -63,7 +63,7 @@ fn multiple_independent_filters_one_pass() {
             Value::text("t1"),
             Value::BigInt(2),
             Value::BigInt(1),
-            Value::BigInt(2),
+            Value::Numeric { scaled: 2, scale: 0 },
         ]
     );
     // t2: total 3, seen 2, sum(id where flags=1) = 4
@@ -73,7 +73,7 @@ fn multiple_independent_filters_one_pass() {
             Value::text("t2"),
             Value::BigInt(3),
             Value::BigInt(2),
-            Value::BigInt(4),
+            Value::Numeric { scaled: 4, scale: 0 },
         ]
     );
 }
@@ -180,6 +180,18 @@ fn filter_round_trips_through_display() {
 // function inventory (statistical + bitwise) an ORM/BI tool emits.
 // ---------------------------------------------------------------------
 
+// v7.38 (read01, T4) — statistical / SUM aggregates over integers now return
+// NUMERIC (matching PG); compare by value, tolerant of Float vs Numeric.
+fn num_f64(v: &Value) -> f64 {
+    match v {
+        Value::Float(x) => *x,
+        Value::Numeric { scaled, scale } => *scaled as f64 / 10f64.powi(i32::from(*scale)),
+        Value::Int(n) => f64::from(*n),
+        Value::BigInt(n) => *n as f64,
+        other => panic!("not a numeric value: {other:?}"),
+    }
+}
+
 fn seed_nums(db: &mut Database) {
     db.execute("CREATE TABLE t (g TEXT, x INT)").unwrap();
     // a = {1,2,3,4}; b = {10,10,20}
@@ -252,13 +264,10 @@ fn statistical_aggregates() {
         "SELECT g, var_pop(x), var_samp(x), variance(x) \
          FROM t GROUP BY g ORDER BY g",
     );
-    // a = {1,2,3,4}: var_pop = 1.25, var_samp = variance = 5/3.
-    assert_eq!(r[0][1], Value::Float(1.25));
+    // a = {1,2,3,4}: var_pop = 1.25, var_samp = variance = 5/3 (NUMERIC, PG type).
+    assert!((num_f64(&r[0][1]) - 1.25).abs() < 1e-9);
     assert_eq!(r[0][2], r[0][3]); // variance is var_samp
-    match r[0][2] {
-        Value::Float(v) => assert!((v - 5.0 / 3.0).abs() < 1e-9),
-        ref other => panic!("expected float, got {other:?}"),
-    }
+    assert!((num_f64(&r[0][2]) - 5.0 / 3.0).abs() < 1e-9);
     // single-row group: var_samp/stddev → NULL, var_pop → 0.
     db.execute("CREATE TABLE one (x INT)").unwrap();
     db.execute("INSERT INTO one VALUES (7)").unwrap();
@@ -266,7 +275,7 @@ fn statistical_aggregates() {
         &mut db,
         "SELECT var_pop(x), var_samp(x), stddev_samp(x) FROM one",
     );
-    assert_eq!(r[0][0], Value::Float(0.0));
+    assert!((num_f64(&r[0][0]) - 0.0).abs() < 1e-9);
     assert_eq!(r[0][1], Value::Null);
     assert_eq!(r[0][2], Value::Null);
 }
@@ -277,11 +286,8 @@ fn stddev_is_sqrt_of_variance() {
     let mut db = Database::open_in_memory();
     seed_nums(&mut db);
     let r = rows_of(&mut db, "SELECT stddev_pop(x) FROM t WHERE g = 'a'");
-    match r[0][0] {
-        // sqrt(1.25) = 1.1180339887…
-        Value::Float(v) => assert!((v - 1.118_033_988_749_895).abs() < 1e-9),
-        ref other => panic!("expected float, got {other:?}"),
-    }
+    // sqrt(1.25) = 1.1180339887… (NUMERIC over an int column, PG type).
+    assert!((num_f64(&r[0][0]) - 1.118_033_988_749_895).abs() < 1e-9);
 }
 
 /// The `ALL` quantifier (the dual of `DISTINCT`, and the default) must
@@ -309,9 +315,9 @@ fn bitwise_aggregates() {
         &mut db,
         "SELECT bit_and(x), bit_or(x), bit_xor(x) FROM t WHERE g = 'b'",
     );
-    assert_eq!(r[0][0], Value::BigInt(0));
-    assert_eq!(r[0][1], Value::BigInt(30));
-    assert_eq!(r[0][2], Value::BigInt(20));
+    assert_eq!(r[0][0], Value::Int(0));
+    assert_eq!(r[0][1], Value::Int(30));
+    assert_eq!(r[0][2], Value::Int(20));
 }
 
 /// Hypothetical-set aggregates: the rank the direct value would have if
