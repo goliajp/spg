@@ -1079,7 +1079,7 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // = 4 + 2 * dim bytes.
         Value::HalfVector(h) => 4 + h.bytes.len(),
         // [i128 scaled][u8 scale]
-        Value::Numeric { .. } => 16 + 1,
+        Value::Numeric { .. } => 1 + 16 + 1, // form byte + scaled + scale (T6.P4)
         // v7.10.4: BYTEA on-disk shape mirrors Text — [u16 len][bytes].
         // The 16-bit length cap is the same TEXT/JSON limit (~65 KB);
         // larger blobs need toast-style chunking which is a v7.11
@@ -1475,9 +1475,23 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
             out.extend_from_slice(&dim.to_le_bytes());
             out.extend_from_slice(&h.bytes);
         }
-        (Value::Numeric { scaled, .. }, DataType::Numeric { scale, .. }) => {
-            out.extend_from_slice(&scaled.to_le_bytes());
-            out.push(scale);
+        (Value::Numeric { scaled, scale, kind }, DataType::Numeric { .. }) => {
+            // v7.38 (read01, T6.P4) — a form byte prefixes the body (FILE_VERSION
+            // 56+): 0 = finite (scaled + scale follow), 1 = NaN, 2 = +Infinity,
+            // 3 = -Infinity (specials carry no body). The value's OWN scale is
+            // written (not the column's), so an unconstrained NUMERIC keeps each
+            // value's scale across persist (a constrained column coerces on
+            // insert, so the two already agree there).
+            match kind {
+                crate::NumericKind::Finite => {
+                    out.push(0);
+                    out.extend_from_slice(&scaled.to_le_bytes());
+                    out.push(*scale);
+                }
+                crate::NumericKind::NaN => out.push(1),
+                crate::NumericKind::PosInf => out.push(2),
+                crate::NumericKind::NegInf => out.push(3),
+            }
         }
         (Value::Date(d), DataType::Date) => out.extend_from_slice(&d.to_le_bytes()),
         (Value::Timestamp(t), DataType::Timestamp | DataType::Timestamptz) => {
@@ -1923,7 +1937,7 @@ fn write_value_encoded_len(v: &Value<'_>) -> usize {
         Value::Year(_) => 1 + 2,
         Value::Text(s) | Value::Json(s) => 1 + 4 + s.len(),
         Value::Bytes(b) => 1 + 4 + b.len(),
-        Value::Numeric { .. } => 1 + 16 + 1,
+        Value::Numeric { .. } => 1 + 1 + 16 + 1, // tag + form + scaled + scale (T6.P4)
         Value::Uuid(_) => 1 + 16,
         Value::TimeTz { .. } => 1 + 12,
         Value::Hstore(pairs) => {
@@ -2033,10 +2047,19 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
             out.extend_from_slice(&dim.to_le_bytes());
             out.extend_from_slice(&h.bytes);
         }
-        Value::Numeric { scaled, scale, .. } => {
+        Value::Numeric { scaled, scale, kind } => {
             out.push(8);
-            out.extend_from_slice(&scaled.to_le_bytes());
-            out.push(*scale);
+            // v7.38 (read01, T6.P4) — form byte after the tag (FILE_VERSION 56+).
+            match kind {
+                crate::NumericKind::Finite => {
+                    out.push(0);
+                    out.extend_from_slice(&scaled.to_le_bytes());
+                    out.push(*scale);
+                }
+                crate::NumericKind::NaN => out.push(1),
+                crate::NumericKind::PosInf => out.push(2),
+                crate::NumericKind::NegInf => out.push(3),
+            }
         }
         Value::Date(d) => {
             out.push(9);
@@ -2974,11 +2997,29 @@ impl<'a> Cursor<'a> {
                 Ok(Value::HalfVector(halfvec::HalfVector { bytes }))
             }
             DataType::Numeric { .. } => {
-                let s = self.take(16)?;
-                let arr: [u8; 16] = s.try_into().expect("checked");
-                let scaled = i128::from_le_bytes(arr);
-                let scale = self.read_u8()?;
-                Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                // v7.38 (read01, T6.P4) — FILE_VERSION 56+ prefixes a form byte;
+                // older catalogs stored a bare finite (scaled + scale).
+                if self.codec_version >= 56 {
+                    match self.read_u8()? {
+                        0 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let scale = self.read_u8()?;
+                            Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                        }
+                        1 => Ok(Value::numeric_special(crate::NumericKind::NaN)),
+                        2 => Ok(Value::numeric_special(crate::NumericKind::PosInf)),
+                        3 => Ok(Value::numeric_special(crate::NumericKind::NegInf)),
+                        f => Err(StorageError::Corrupt(alloc::format!(
+                            "unknown NUMERIC form byte {f}"
+                        ))),
+                    }
+                } else {
+                    let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                    let scaled = i128::from_le_bytes(arr);
+                    let scale = self.read_u8()?;
+                    Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                }
             }
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
             DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
@@ -3665,11 +3706,28 @@ impl<'a> Cursor<'a> {
                 Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))
             }
             8 => {
-                let s = self.take(16)?;
-                let arr: [u8; 16] = s.try_into().expect("checked");
-                let scaled = i128::from_le_bytes(arr);
-                let scale = self.read_u8()?;
-                Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                // v7.38 (read01, T6.P4) — form byte after the tag (FILE_VERSION 56+).
+                if self.codec_version >= 56 {
+                    match self.read_u8()? {
+                        0 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let scale = self.read_u8()?;
+                            Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                        }
+                        1 => Ok(Value::numeric_special(crate::NumericKind::NaN)),
+                        2 => Ok(Value::numeric_special(crate::NumericKind::PosInf)),
+                        3 => Ok(Value::numeric_special(crate::NumericKind::NegInf)),
+                        f => Err(StorageError::Corrupt(alloc::format!(
+                            "unknown NUMERIC form byte {f}"
+                        ))),
+                    }
+                } else {
+                    let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                    let scaled = i128::from_le_bytes(arr);
+                    let scale = self.read_u8()?;
+                    Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                }
             }
             9 => Ok(Value::Date(self.read_i32()?)),
             10 => Ok(Value::Timestamp(self.read_i64()?)),
