@@ -205,6 +205,9 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),
+        // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC renders its exact
+        // decimal string.
+        Value::NumericBig(b) => b.to_decimal_str(),
         // v7.38 (read01, T9) — PG record_out: `(f1,f2,...)`, NULL fields empty,
         // fields with special characters double-quoted (`\` and `"` escaped).
         Value::Composite(fields) => {

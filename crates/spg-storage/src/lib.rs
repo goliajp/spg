@@ -601,6 +601,10 @@ pub enum Value<'arena> {
         scale: u8,
         kind: NumericKind,
     },
+    /// v7.38 (read01, T3) — an exact NUMERIC whose mantissa overflows `i128`
+    /// (PG's NUMERIC is unbounded). Boxed so the common finite case keeps its
+    /// small footprint; specials never take this form (they stay `Numeric`).
+    NumericBig(alloc::boxed::Box<crate::bignum::BigNumeric>),
     /// Days since the Unix epoch (1970-01-01). Negative for earlier dates.
     Date(i32),
     /// Microseconds since the Unix epoch (1970-01-01T00:00:00Z).
@@ -906,6 +910,7 @@ impl<'arena> Value<'arena> {
                 precision: 0,
                 scale: *scale,
             }),
+            Self::NumericBig(b) => Some(DataType::Numeric { precision: 0, scale: b.scale() }),
             Self::Date(_) => Some(DataType::Date),
             Self::Timestamp(_) => Some(DataType::Timestamp),
             Self::Interval { .. } => Some(DataType::Interval),
@@ -994,6 +999,7 @@ impl<'arena> Value<'arena> {
             Value::Sq8Vector(q) => Value::Sq8Vector(q),
             Value::HalfVector(h) => Value::HalfVector(h),
             Value::Numeric { scaled, scale, kind } => Value::Numeric { scaled, scale, kind },
+            Value::NumericBig(b) => Value::NumericBig(b),
             Value::Date(d) => Value::Date(d),
             Value::Timestamp(t) => Value::Timestamp(t),
             Value::Interval {
@@ -1708,6 +1714,7 @@ impl IndexKey {
             // v7.17.0 Phase 3.P0-39: hstore is NOT indexable in
             // v7.17.0 — map columns need GIN with bespoke ops.
             Value::Hstore(_) => None,
+            Value::NumericBig(_) => None,
             // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
             Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => None,
             // v7.37.5 β-P4: INTERVAL[] isn't indexable (PG uses
@@ -5952,7 +5959,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 56;
+const FILE_VERSION: u8 = 57;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
