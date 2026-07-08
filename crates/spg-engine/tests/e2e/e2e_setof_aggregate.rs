@@ -44,10 +44,10 @@ fn sum_over_generate_series_with_column_alias() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    // 1 + 2 + ... + 10 = 55. v7.38 (read01, T4) — SPG's generate_series yields
-    // BIGINT (PG yields int4), and sum(bigint) is NUMERIC now, so the result is
-    // Numeric 55. (The generate_series element type vs PG is a separate residual.)
-    assert_eq!(r[0][0], Value::Numeric { scaled: 55, scale: 0 });
+    // 1 + 2 + ... + 10 = 55. v7.38 (read01, T-gs) — generate_series(int4) yields
+    // int4 elements (matching PG), and sum(int4) widens to BIGINT, so PG and SPG
+    // agree on bigint 55.
+    assert_eq!(r[0][0], Value::BigInt(55));
 }
 
 #[test]
@@ -58,8 +58,9 @@ fn min_max_over_generate_series() {
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::BigInt(5));
-    assert_eq!(r[0][1], Value::BigInt(12));
+    // generate_series(int4) → int4 elements, so MIN/MAX stay int4 (matching PG).
+    assert_eq!(r[0][0], Value::Int(5));
+    assert_eq!(r[0][1], Value::Int(12));
 }
 
 #[test]
@@ -119,9 +120,10 @@ fn projection_path_still_works_no_aggregate() {
             .unwrap(),
     );
     assert_eq!(r.len(), 3);
-    assert_eq!(r[0][0], Value::BigInt(3));
-    assert_eq!(r[1][0], Value::BigInt(2));
-    assert_eq!(r[2][0], Value::BigInt(1));
+    // generate_series(int4) → int4 elements (matching PG).
+    assert_eq!(r[0][0], Value::Int(3));
+    assert_eq!(r[1][0], Value::Int(2));
+    assert_eq!(r[2][0], Value::Int(1));
 }
 
 #[test]

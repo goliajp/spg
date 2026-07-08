@@ -180,6 +180,12 @@ pub(crate) const fn value_is_integer(v: &Value) -> bool {
     matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
 }
 
+/// True for a 64-bit integer value (the int8/bigint domain). Used by
+/// generate_series to type the series int8 when any bound is bigint.
+pub(crate) const fn value_is_bigint(v: &Value) -> bool {
+    matches!(v, Value::BigInt(_))
+}
+
 /// v7.17.0 Phase 3.10 — widen any integer-shaped Value to i64 for
 /// the generate_series iteration loop. Non-integer inputs panic;
 /// caller guards via `value_is_integer`.
