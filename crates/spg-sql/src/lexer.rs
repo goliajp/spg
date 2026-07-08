@@ -1391,7 +1391,14 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     let mut has_dot = false;
     let mut has_exp = false;
 
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    // v7.38 (read01) — accept `_` digit separators between digits (PG 16+:
+    // `1_000_000`, `1_000.5`). Stripped before parsing below.
+    let digit_or_sep = |bytes: &[u8], i: usize| -> bool {
+        bytes[i].is_ascii_digit()
+            || (bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+    };
+
+    while i < bytes.len() && digit_or_sep(bytes, i) {
         i += 1;
     }
     // v7.37.20 (20.4) — do NOT consume `.` when it's part of a `..`
@@ -1403,7 +1410,7 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     {
         has_dot = true;
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        while i < bytes.len() && digit_or_sep(bytes, i) {
             i += 1;
         }
     }
@@ -1414,7 +1421,7 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
             i += 1;
         }
         let exp_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        while i < bytes.len() && digit_or_sep(bytes, i) {
             i += 1;
         }
         if exp_start == i {
@@ -1422,7 +1429,14 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
         }
     }
 
-    let lit = &s[..i];
+    // Strip the `_` separators for parsing / storage (source span keeps `i`).
+    let owned;
+    let lit: &str = if s[..i].contains('_') {
+        owned = s[..i].replace('_', "");
+        &owned
+    } else {
+        &s[..i]
+    };
     if has_exp {
         // Exponent form → double precision.
         lit.parse::<f64>()
