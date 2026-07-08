@@ -4574,6 +4574,8 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     // matching PG's network ordering.
     match v {
         Value::Bytes(b) => return Ok(OrderKey::Bytes(b.as_ref().to_vec())),
+        // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC sorts by exact value.
+        Value::NumericBig(b) => return Ok(OrderKey::BigNum((**b).clone())),
         Value::Uuid(u) => return Ok(OrderKey::Bytes(u.to_vec())),
         Value::Macaddr(m) => return Ok(OrderKey::Bytes(m.to_vec())),
         Value::Macaddr8(m) => return Ok(OrderKey::Bytes(m.to_vec())),

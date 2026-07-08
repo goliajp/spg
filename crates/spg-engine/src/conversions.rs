@@ -2081,6 +2081,16 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
             Expr::Literal(Literal::Numeric { unscaled, scale }) => {
                 Ok(Value::Numeric { scaled: -unscaled, scale , kind: spg_storage::NumericKind::Finite })
             }
+            // v7.38 (read01, T3.C3) — a NUMERIC literal beyond i128; negate by
+            // flipping the sign of the decimal string, then re-resolve.
+            Expr::Literal(Literal::NumericBig(ref s)) => {
+                let flipped = if let Some(rest) = s.strip_prefix('-') {
+                    rest.to_string()
+                } else {
+                    alloc::format!("-{s}")
+                };
+                Ok(big_literal_to_value(&flipped))
+            }
             // v7.37.5 ship triage — fold the unary minus through a
             // `Cast { Literal, target }` wrapper (`-2::smallint`,
             // `-3.14::numeric(10,2)`). We negate the inner literal,
@@ -2100,6 +2110,16 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
                     Expr::Literal(Literal::Float(x)) => Expr::Literal(Literal::Float(-x)),
                     Expr::Literal(Literal::Numeric { unscaled, scale }) => {
                         Expr::Literal(Literal::Numeric { unscaled: -unscaled, scale })
+                    }
+                    // v7.38 (read01, T3.C3) — big NUMERIC literal: flip its sign
+                    // in the decimal string, re-wrap with the same cast.
+                    Expr::Literal(Literal::NumericBig(ref s)) => {
+                        let flipped = if let Some(rest) = s.strip_prefix('-') {
+                            rest.to_string()
+                        } else {
+                            alloc::format!("-{s}")
+                        };
+                        Expr::Literal(Literal::NumericBig(flipped))
                     }
                     other => Expr::Unary {
                         op: spg_sql::ast::UnOp::Neg,

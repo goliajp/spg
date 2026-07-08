@@ -58,3 +58,48 @@ fn numeric_bignum_compare() {
     assert!(b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) = (99999999999999999999999999999999999999 + 99999999999999999999999999999999999999)"));
     assert!(!b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) < 5"));
 }
+
+#[test]
+fn numeric_bignum_order_by() {
+    // v7.38 (read01, T3.C3) — ORDER BY / min / max over a NUMERIC column
+    // holding values beyond i128 sorts by exact value, not by text or a lossy
+    // f64. Includes a negated big literal (unary minus folds over NumericBig).
+    // Oracle: live PG 18.4 — same sorted order.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE bo(x numeric)").unwrap();
+    e.execute(
+        "INSERT INTO bo VALUES \
+         (123456789012345678901234567890123456789012345), (5), \
+         (999999999999999999999999999999999999999999999), \
+         ((-888888888888888888888888888888888888888888888))",
+    )
+    .unwrap();
+    // ASC: -888… < 5 < 123… < 999…
+    let order = match e.execute("SELECT x::text FROM bo ORDER BY x").unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                spg_storage::Value::Text(s) => s.to_string(),
+                v => format!("{v:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => panic!("rows"),
+    };
+    assert_eq!(
+        order,
+        "-888888888888888888888888888888888888888888888,\
+         5,\
+         123456789012345678901234567890123456789012345,\
+         999999999999999999999999999999999999999999999"
+    );
+    // max / min pick the exact extremes (value_cmp path).
+    assert_eq!(
+        t(&mut e, "SELECT max(x)::text FROM bo"),
+        "999999999999999999999999999999999999999999999"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT min(x)::text FROM bo"),
+        "-888888888888888888888888888888888888888888888"
+    );
+}

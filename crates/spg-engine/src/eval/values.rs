@@ -14,6 +14,10 @@ use super::*;
 /// a < b, Greater when a > b. NULL handling is upstream.
 pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
+    // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 orders via exact bignum.
+    if let Some(ord) = crate::orderby::numeric_bignum_cmp(a, b) {
+        return ord;
+    }
     // v7.38 (read01, T6.P3) — min()/max() over NUMERIC honor the special total
     // order -Inf < finite < +Inf < NaN, ahead of the f64 widen (which reads a
     // special's canonical 0 as the number 0).

@@ -58,8 +58,41 @@ pub(crate) fn order_by_value_cmp(
     }
 }
 
+/// v7.38 (read01, T3.C3) — order a pair when a NUMERIC beyond i128 is involved,
+/// via exact BigNumeric comparison; `None` when neither side is big (the finite
+/// comparators handle those). Shared by the ORDER BY / aggregate / min-max
+/// comparators.
+pub(crate) fn numeric_bignum_cmp(a: &Value, b: &Value) -> Option<core::cmp::Ordering> {
+    use spg_storage::bignum::BigNumeric;
+    if !matches!(a, Value::NumericBig(_)) && !matches!(b, Value::NumericBig(_)) {
+        return None;
+    }
+    let to_big = |v: &Value| -> Option<BigNumeric> {
+        Some(match v {
+            Value::SmallInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
+            Value::Int(n) => BigNumeric::from_i128(i128::from(*n), 0),
+            Value::BigInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
+            Value::Numeric { scaled, scale, kind }
+                if *kind == spg_storage::NumericKind::Finite =>
+            {
+                BigNumeric::from_i128(*scaled, *scale)
+            }
+            Value::NumericBig(b) => (**b).clone(),
+            _ => return None,
+        })
+    };
+    match (to_big(a), to_big(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => None,
+    }
+}
+
 pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
+    // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 orders via exact bignum.
+    if let Some(ord) = numeric_bignum_cmp(a, b) {
+        return ord;
+    }
     // v7.38 (read01, T6.P3) — a NUMERIC special orders by the total order
     // -Inf < finite < +Inf < NaN (NaN == NaN), ahead of the finite arms which
     // would read a special's canonical 0 as the number 0.
@@ -516,6 +549,10 @@ pub(crate) enum OrderKey {
     /// like PG (`{1} < {1,2} < {2} < {10}`). Elements carry their own OrderKey so
     /// integer arrays sort numerically, not by text.
     Array(alloc::vec::Vec<OrderKey>),
+    /// v7.38 (read01, T3.C3) — a NUMERIC beyond i128, sorted by exact bignum
+    /// value. A big value's magnitude always exceeds i128, so vs a finite Num/Int
+    /// key its sign alone orders it.
+    BigNum(spg_storage::bignum::BigNumeric),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -638,6 +675,38 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         }
         (OrderKey::Array(_), _) => Ordering::Greater,
         (_, OrderKey::Array(_)) => Ordering::Less,
+        // v7.38 (read01, T3.C3) — bignum keys compare exactly; vs a finite
+        // scalar key a big value's sign orders it (its magnitude always exceeds
+        // i128). The ±INF NULL sentinels still ride to the far ends.
+        (OrderKey::BigNum(x), OrderKey::BigNum(y)) => x.cmp(y),
+        (OrderKey::BigNum(x), OrderKey::Num(y)) => {
+            if *y == f64::INFINITY {
+                Ordering::Less
+            } else if *y == f64::NEG_INFINITY {
+                Ordering::Greater
+            } else if x.parts().0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (OrderKey::Num(x), OrderKey::BigNum(y)) => {
+            if *x == f64::INFINITY {
+                Ordering::Greater
+            } else if *x == f64::NEG_INFINITY {
+                Ordering::Less
+            } else if y.parts().0 {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (OrderKey::BigNum(x), _) => {
+            if x.parts().0 { Ordering::Less } else { Ordering::Greater }
+        }
+        (_, OrderKey::BigNum(y)) => {
+            if y.parts().0 { Ordering::Greater } else { Ordering::Less }
+        }
     }
 }
 
