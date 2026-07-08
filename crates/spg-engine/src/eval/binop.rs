@@ -2158,6 +2158,121 @@ fn tsvector_total_cmp(
     Equal
 }
 
+/// v7.38 (read01, R2) — the "traditional" CRC-32 (reflected poly 0xEDB88320,
+/// init/final 0xFFFFFFFF) PG's `silly_cmp_tsquery` uses to order tsquery
+/// lexemes — so ordering is CRC-based, NOT alphabetical (`'b' > 'c'`).
+fn crc32_traditional(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// v7.38 (read01, R2) — one item of a tsquery flattened to prefix order.
+enum QItem {
+    Val { crc: u32, bytes: alloc::vec::Vec<u8> },
+    Phrase(u16),
+    Or,
+    And,
+    Not,
+}
+
+fn tsquery_numnode(ast: &spg_storage::TsQueryAst) -> usize {
+    use spg_storage::TsQueryAst as Q;
+    match ast {
+        Q::Term { .. } => 1,
+        Q::Not(x) => 1 + tsquery_numnode(x),
+        Q::And(l, r) | Q::Or(l, r) => 1 + tsquery_numnode(l) + tsquery_numnode(r),
+        Q::Phrase { left, right, .. } => 1 + tsquery_numnode(left) + tsquery_numnode(right),
+    }
+}
+
+fn tsquery_flatten(ast: &spg_storage::TsQueryAst, out: &mut alloc::vec::Vec<QItem>) {
+    use spg_storage::TsQueryAst as Q;
+    match ast {
+        Q::Term { word, .. } => out.push(QItem::Val {
+            crc: crc32_traditional(word.as_bytes()),
+            bytes: word.as_bytes().to_vec(),
+        }),
+        Q::Not(x) => {
+            out.push(QItem::Not);
+            tsquery_flatten(x, out);
+        }
+        Q::And(l, r) => {
+            out.push(QItem::And);
+            tsquery_flatten(l, out);
+            tsquery_flatten(r, out);
+        }
+        Q::Or(l, r) => {
+            out.push(QItem::Or);
+            tsquery_flatten(l, out);
+            tsquery_flatten(r, out);
+        }
+        Q::Phrase { left, right, distance } => {
+            out.push(QItem::Phrase(*distance));
+            tsquery_flatten(left, out);
+            tsquery_flatten(right, out);
+        }
+    }
+}
+
+/// v7.38 (read01, R2) — PG's non-recursive tsquery total order: node count
+/// first, then a prefix-item compare where an operand (VAL) sorts before any
+/// operator, VALs compare by CRC-32 then length then bytes, operators sort
+/// `PHRASE < OR < AND < NOT`, and two PHRASE nodes sort larger-distance-first.
+fn tsquery_total_cmp(
+    a: &spg_storage::TsQueryAst,
+    b: &spg_storage::TsQueryAst,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    let (na, nb) = (tsquery_numnode(a), tsquery_numnode(b));
+    if na != nb {
+        return na.cmp(&nb);
+    }
+    let opr_rank = |q: &QItem| -> u8 {
+        match q {
+            QItem::Phrase(_) => 0,
+            QItem::Or => 1,
+            QItem::And => 2,
+            QItem::Not => 3,
+            QItem::Val { .. } => unreachable!(),
+        }
+    };
+    let item_cmp = |x: &QItem, y: &QItem| -> core::cmp::Ordering {
+        match (x, y) {
+            (
+                QItem::Val { crc: cx, bytes: bx },
+                QItem::Val { crc: cy, bytes: by },
+            ) => (*cx as i32) // PG's valcrc is int32 — the compare is SIGNED
+                .cmp(&(*cy as i32))
+                .then_with(|| bx.len().cmp(&by.len()))
+                .then_with(|| bx.cmp(by)),
+            (QItem::Val { .. }, _) => Less,
+            (_, QItem::Val { .. }) => Greater,
+            (QItem::Phrase(dx), QItem::Phrase(dy)) => dy.cmp(dx), // larger distance first
+            _ => opr_rank(x).cmp(&opr_rank(y)),
+        }
+    };
+    let (mut ia, mut ib) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+    tsquery_flatten(a, &mut ia);
+    tsquery_flatten(b, &mut ib);
+    for (x, y) in ia.iter().zip(ib.iter()) {
+        let c = item_cmp(x, y);
+        if c != Equal {
+            return c;
+        }
+    }
+    Equal
+}
+
 /// Map a computed `Ordering` to the boolean result of a comparison op.
 fn cmp_result(op: BinOp, ord: core::cmp::Ordering) -> Result<Value<'static>, EvalError> {
     match op {
@@ -3372,18 +3487,14 @@ pub(super) fn compare(
                 _ => cmp_result(op, tsvector_total_cmp(a, b)),
             };
         }
-        // v7.38 (read01 P6.31) — TSQUERY equality (=/<>). PG does NOT normalise
-        // operand order (`'a & b' <> 'b & a'`), so a structural compare of the
-        // ASTs matches PG exactly. Ordering (< etc.) needs PG's node total-order
-        // and is deferred.
+        // v7.38 (read01, T12.4/R2) — TSQUERY total order. Equality stays
+        // structural (PG does not normalise operand order: `'a & b' <> 'b & a'`);
+        // ordering follows PG's non-recursive silly_cmp_tsquery.
         (Value::TsQuery(a), Value::TsQuery(b)) => {
-            let eq = a == b;
             return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: "tsquery ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
-                }),
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                _ => cmp_result(op, tsquery_total_cmp(a, b)),
             };
         }
         // v7.38 (read01, T21) — geometric comparison is by AREA: PG's box and

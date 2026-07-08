@@ -264,6 +264,7 @@ mod e2e_tsvector_order;
 mod e2e_named_args;
 mod e2e_func_arg_coerce;
 mod e2e_unicode_string;
+mod e2e_tsquery_order;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
