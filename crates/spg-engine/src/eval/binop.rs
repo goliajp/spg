@@ -1272,6 +1272,30 @@ fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'stati
     ) {
         return Some(Ok(Value::Bool(cmp_to_bool(op, a.cmp(&b)))));
     }
+    // Division carries PG's display scale (~16 significant digits, floored by
+    // the dividend's scale); a zero divisor errors like the i128 path.
+    if matches!(op, BinOp::Div) {
+        if b.is_zero() {
+            return Some(Err(EvalError::DivisionByZero));
+        }
+        let rscale = crate::numeric::division_display_scale_big(&a, &b);
+        return Some(Ok(match a.div(&b, rscale) {
+            Some(q) => demote_bignum(q),
+            None => return None,
+        }));
+    }
+    // Modulo of two big integers (scale 0) via truncating integer div_rem;
+    // a scaled big remainder is rare enough to leave to the type error.
+    if matches!(op, BinOp::Mod) {
+        if b.is_zero() {
+            return Some(Err(EvalError::DivisionByZero));
+        }
+        if a.scale() == 0 && b.scale() == 0 {
+            let (_, rem) = a.div_rem_int(&b);
+            return Some(Ok(demote_bignum(rem)));
+        }
+        return None;
+    }
     let res = match op {
         BinOp::Add => a.add(&b),
         BinOp::Sub => a.sub(&b),
@@ -1491,11 +1515,15 @@ fn apply_binary_numeric(
             // (matching PG's observable division scale), so `10::numeric / 3`
             // yields 16 fractional digits (3.3333333333333333) rather than
             // truncating to the operands' scale-0 (which silently gave `3`).
-            let (scaled, scale) =
-                crate::numeric::numeric_div(a, sa, b, sb).ok_or(EvalError::TypeMismatch {
-                    detail: "NUMERIC overflow on / scaling".into(),
-                })?;
-            Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+            // v7.38 (read01, T3.C3) — when the scaled division overflows i128
+            // (large dividend × 10^rscale), promote to the arbitrary-precision
+            // path rather than erroring.
+            match crate::numeric::numeric_div(a, sa, b, sb) {
+                Some((scaled, scale)) => {
+                    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+                }
+                None => numeric_big_op(op, &l, &r).expect("numeric operands"),
+            }
         }
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             let target_scale = sa.max(sb);

@@ -60,6 +60,38 @@ fn numeric_bignum_compare() {
 }
 
 #[test]
+fn numeric_bignum_divide() {
+    // v7.38 (read01, T3.C3) — division where an operand (or the scaled
+    // quotient) exceeds i128 carries PG's display scale and half-away rounding.
+    // Oracle: live PG 18.4 — byte-identical results.
+    let mut e = Engine::new();
+    // 76-digit product / 3 (exact).
+    assert_eq!(
+        t(&mut e, "SELECT (99999999999999999999999999999999999999 * 99999999999999999999999999999999999999 / 3)::text"),
+        "3333333333333333333333333333333333333266666666666666666666666666666666666667"
+    );
+    // 45-digit / 7 — scale 0, rounds half away from zero (…620.71 → …621).
+    assert_eq!(
+        t(&mut e, "SELECT (123456789012345678901234567890123456789012345 / 7)::text"),
+        "17636684144620811271604938270017636684144621"
+    );
+    // Big / big that lands back inside i128 demotes to a normal Numeric.
+    assert_eq!(
+        t(&mut e, "SELECT (99999999999999999999999999999999999999999 / 100000000000000000000)::text"),
+        "1000000000000000000000"
+    );
+    // Modulo of a big integer.
+    assert_eq!(
+        t(&mut e, "SELECT (123456789012345678901234567890123456789012345 % 7)::text"),
+        "5"
+    );
+    // Division by zero errors (matches PG).
+    assert!(e
+        .execute("SELECT 99999999999999999999999999999999999999 / 0")
+        .is_err());
+}
+
+#[test]
 fn numeric_bignum_order_by() {
     // v7.38 (read01, T3.C3) — ORDER BY / min / max over a NUMERIC column
     // holding values beyond i128 sorts by exact value, not by text or a lossy

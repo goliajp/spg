@@ -323,8 +323,35 @@ fn pow10_checked(p: u32) -> Option<i128> {
 /// each operand's leading-group index and digit. The 1000 cap is PG's
 /// display-scale ceiling; SPG then clamps to its `u8` scale field.
 fn division_display_scale(dividend: i128, dividend_scale: u8, divisor: i128, divisor_scale: u8) -> u8 {
-    let (dividend_group, dividend_lead) = base10000_weight_firstdigit(dividend, dividend_scale);
-    let (divisor_group, divisor_lead) = base10000_weight_firstdigit(divisor, divisor_scale);
+    let dwf = base10000_weight_firstdigit(dividend, dividend_scale);
+    let vwf = base10000_weight_firstdigit(divisor, divisor_scale);
+    division_display_scale_from_wf(dwf, dividend_scale, vwf)
+}
+
+/// v7.38 (read01, T3.C3) — the same display scale for a division whose
+/// operands exceed i128. Works off each operand's unscaled mantissa digit
+/// string (from `BigNumeric::to_decimal_str`) so the base-10000 weight logic
+/// is shared with the i128 path.
+pub(crate) fn division_display_scale_big(
+    dividend: &spg_storage::bignum::BigNumeric,
+    divisor: &spg_storage::bignum::BigNumeric,
+) -> u8 {
+    let (dm, ds) = mantissa_and_scale_big(dividend);
+    let (vm, vs) = mantissa_and_scale_big(divisor);
+    let dwf = weight_firstdigit_core(&dm, ds);
+    let vwf = weight_firstdigit_core(&vm, vs);
+    division_display_scale_from_wf(dwf, ds, vwf)
+}
+
+/// Shared tail of `division_display_scale[_big]`: given each operand's
+/// base-10000 `(weight, firstdigit)` and the dividend's scale, produce the
+/// display scale PG's `/` yields (~16 significant digits, floored by the
+/// dividend's own scale, capped at PG's 1000-digit ceiling then SPG's `u8`).
+fn division_display_scale_from_wf(
+    (dividend_group, dividend_lead): (i32, i32),
+    dividend_scale: u8,
+    (divisor_group, divisor_lead): (i32, i32),
+) -> u8 {
     // Quotient magnitude ≈ dividend's leading group minus divisor's. When
     // the leading digits tie, the quotient can land a group lower, so drop
     // one group rather than risk under-scaling the result.
@@ -343,6 +370,23 @@ fn division_display_scale(dividend: i128, dividend_scale: u8, divisor: i128, div
     scale.min(255) as u8
 }
 
+/// The unsigned unscaled mantissa (decimal digits, no leading zeros except
+/// "0") and scale of a `BigNumeric`, for the weight logic. Derived from the
+/// rendered decimal so it works regardless of limb layout.
+fn mantissa_and_scale_big(b: &spg_storage::bignum::BigNumeric) -> (alloc::string::String, u8) {
+    use alloc::string::{String, ToString};
+    let s = b.to_decimal_str();
+    let s = s.strip_prefix('-').unwrap_or(&s);
+    let digits: String = s.chars().filter(|c| *c != '.').collect();
+    let trimmed = digits.trim_start_matches('0');
+    let m = if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    (m, b.scale())
+}
+
 /// Base-10000 weight + leading digit of `|scaled / 10^scale|`, matching
 /// how PG normalizes a `NumericVar` (digits grouped in 4s anchored on
 /// the decimal point). Returns `(weight, first_digit)` where `weight`
@@ -353,7 +397,16 @@ fn base10000_weight_firstdigit(scaled: i128, scale: u8) -> (i32, i32) {
     if a == 0 {
         return (0, 0);
     }
-    let s = alloc::string::ToString::to_string(&a);
+    weight_firstdigit_core(&alloc::string::ToString::to_string(&a), scale)
+}
+
+/// Base-10000 weight + leading digit computed from an unscaled unsigned
+/// mantissa digit string (no leading zeros except "0") and its scale. Shared
+/// by the i128 and BigNumeric division-scale paths.
+fn weight_firstdigit_core(s: &str, scale: u8) -> (i32, i32) {
+    if s == "0" {
+        return (0, 0);
+    }
     let ndigits = s.len() as i32;
     let scale = i32::from(scale);
     let int_digits = ndigits - scale;
