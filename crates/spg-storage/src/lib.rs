@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod bignum;
 pub mod bloom;
 mod codec;
 pub mod fts_simple;
