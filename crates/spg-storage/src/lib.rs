@@ -1540,6 +1540,33 @@ pub struct ForeignKeyConstraint {
     /// Referential action when a parent row's referenced columns
     /// are updated.
     pub on_update: FkAction,
+    /// v7.38 (read01, T29) — `MATCH SIMPLE | FULL`. Defaults to `Simple`.
+    pub match_type: MatchType,
+}
+
+/// v7.38 (read01, T29) — FK MATCH type. Mirrors `spg_sql::ast::MatchType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchType {
+    #[default]
+    Simple,
+    Full,
+}
+
+impl MatchType {
+    /// On-disk tag byte (catalog appendix, `FILE_VERSION` 55+).
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Simple => 0,
+            Self::Full => 1,
+        }
+    }
+    pub const fn from_tag(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Simple,
+            1 => Self::Full,
+            _ => return None,
+        })
+    }
 }
 
 /// v7.6.1 — referential action tag. Mirrors `spg_sql::ast::FkAction`.
@@ -5895,7 +5922,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 54;
+const FILE_VERSION: u8 = 55;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -6214,6 +6241,8 @@ impl Catalog {
                 }
                 out.push(fk.on_delete.tag());
                 out.push(fk.on_update.tag());
+                // v7.38 (read01, T29) — MATCH type tag (FILE_VERSION 55+).
+                out.push(fk.match_type.tag());
             }
             // v7.9.19 — UniquenessConstraint appendix (catalog
             // FILE_VERSION 15+). Layout per table after the FK

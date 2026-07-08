@@ -9135,7 +9135,7 @@ impl Parser {
         if columns.is_empty() {
             return Err(self.err("FOREIGN KEY requires at least one column".into()));
         }
-        let (parent_table, parent_columns, on_delete, on_update) =
+        let (parent_table, parent_columns, on_delete, on_update, match_type) =
             self.parse_references_tail(columns.len())?;
         Ok(ForeignKeyConstraint {
             name,
@@ -9144,6 +9144,7 @@ impl Parser {
             parent_columns,
             on_delete,
             on_update,
+            match_type,
         })
     }
 
@@ -9154,7 +9155,7 @@ impl Parser {
     fn parse_references_tail(
         &mut self,
         expected_arity: usize,
-    ) -> Result<(String, Vec<String>, FkAction, FkAction), ParseError> {
+    ) -> Result<(String, Vec<String>, FkAction, FkAction, crate::ast::MatchType), ParseError> {
         match self.advance() {
             Token::Ident(s) if s.eq_ignore_ascii_case("references") => {}
             other => return Err(self.err(format!("expected REFERENCES, got {other:?}"))),
@@ -9197,6 +9198,7 @@ impl Parser {
         // mixed-NULL rule, which is not wired yet; reject them honestly
         // rather than silently applying SIMPLE (PG itself errors on
         // MATCH PARTIAL as "not yet implemented").
+        let mut match_type = crate::ast::MatchType::Simple;
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("match")) {
             self.advance();
             // `FULL` is a reserved keyword token (FULL OUTER JOIN);
@@ -9211,22 +9213,13 @@ impl Parser {
                 }
             };
             match kind.as_str() {
-                "SIMPLE" => {} // Default semantics — nothing to record.
-                // v7.38 (read01 P6.44) — MATCH FULL differs from MATCH SIMPLE
-                // only in the mixed-NULL rule across MULTIPLE referencing
-                // columns (all-or-none NULL). For a single-column FK the two
-                // are identical, so accept MATCH FULL there (PG does too);
-                // multi-column MATCH FULL still needs the unwired rule.
-                "FULL" if expected_arity <= 1 => {}
-                "FULL" => {
-                    return Err(self.err(
-                        "MATCH FULL on a multi-column foreign key is not yet implemented".to_string(),
-                    ));
-                }
+                "SIMPLE" => {} // Default — match_type stays Simple.
+                // v7.38 (read01, T29) — MATCH FULL: the check is skipped only
+                // when ALL referencing columns are NULL; a mixed-NULL key errors.
+                "FULL" => match_type = crate::ast::MatchType::Full,
                 "PARTIAL" => {
                     return Err(self.err(
-                        "MATCH PARTIAL is not implemented (PostgreSQL does not implement it either)"
-                            .to_string(),
+                        "MATCH PARTIAL not yet implemented".to_string(),
                     ));
                 }
                 _ => {
@@ -9293,7 +9286,7 @@ impl Parser {
                 }
             }
         }
-        Ok((parent_table, parent_columns, on_delete, on_update))
+        Ok((parent_table, parent_columns, on_delete, on_update, match_type))
     }
 
     /// v7.6.0 — parse `CASCADE | RESTRICT | SET NULL | SET DEFAULT |
@@ -9737,7 +9730,8 @@ impl Parser {
         if !inline_references {
             return Ok((col, None));
         }
-        let (parent_table, parent_columns, on_delete, on_update) = self.parse_references_tail(1)?;
+        let (parent_table, parent_columns, on_delete, on_update, match_type) =
+            self.parse_references_tail(1)?;
         let fk = ForeignKeyConstraint {
             name: None,
             columns: vec![col.name.clone()],
@@ -9745,6 +9739,7 @@ impl Parser {
             parent_columns,
             on_delete,
             on_update,
+            match_type,
         };
         Ok((col, Some(fk)))
     }

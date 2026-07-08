@@ -148,6 +148,10 @@ pub(crate) fn resolve_foreign_key(
     }
     let on_delete = fk_action_sql_to_storage(fk.on_delete);
     let on_update = fk_action_sql_to_storage(fk.on_update);
+    let match_type = match fk.match_type {
+        spg_sql::ast::MatchType::Simple => spg_storage::MatchType::Simple,
+        spg_sql::ast::MatchType::Full => spg_storage::MatchType::Full,
+    };
     Ok(spg_storage::ForeignKeyConstraint {
         name: fk.name,
         local_columns,
@@ -155,6 +159,7 @@ pub(crate) fn resolve_foreign_key(
         parent_columns,
         on_delete,
         on_update,
+        match_type,
     })
 }
 
@@ -1485,12 +1490,32 @@ pub(crate) fn enforce_fk_inserts(
                 // Composite FK: scan parent rows. v7.6.7 also
                 // accepts a match against earlier rows in the same
                 // batch (self-ref bulk-loading of hierarchies).
-                if fk
+                // v7.38 (read01, T29) — MATCH SIMPLE skips the check when ANY
+                // referencing column is NULL; MATCH FULL skips only when they
+                // are ALL NULL, and a mixed-NULL key is an error.
+                let null_cnt = fk
                     .local_columns
                     .iter()
-                    .all(|&i| matches!(row_values.get(i), Some(Value::Null)))
-                {
-                    continue;
+                    .filter(|&&i| matches!(row_values.get(i), Some(Value::Null)))
+                    .count();
+                match fk.match_type {
+                    spg_storage::MatchType::Simple => {
+                        if null_cnt > 0 {
+                            continue;
+                        }
+                    }
+                    spg_storage::MatchType::Full => {
+                        if null_cnt == fk.local_columns.len() {
+                            continue;
+                        }
+                        if null_cnt > 0 {
+                            return Err(EngineError::Unsupported(
+                                "insert or update violates foreign key constraint: MATCH FULL \
+                                 does not allow mixing of null and nonnull key values"
+                                    .into(),
+                            ));
+                        }
+                    }
                 }
                 let local: Vec<&Value> = fk.local_columns.iter().map(|&i| &row_values[i]).collect();
                 let matches_parent_row = |prow: &Row<'static>| {
