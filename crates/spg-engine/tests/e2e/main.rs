@@ -248,6 +248,7 @@ mod e2e_real_float4;
 mod e2e_bit_agg_integer;
 mod e2e_lseg_intersection;
 mod e2e_lateral_correlated_srf;
+mod e2e_string_to_table_srf;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

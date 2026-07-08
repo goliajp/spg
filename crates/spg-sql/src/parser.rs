@@ -11375,7 +11375,11 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
             && matches!(self.tokens.get(self.pos + 1),
                 Some(Token::Ident(s) | Token::QuotedIdent(s))
-                    if s.eq_ignore_ascii_case("generate_series") || s.eq_ignore_ascii_case("unnest"))
+                    if s.eq_ignore_ascii_case("generate_series") || s.eq_ignore_ascii_case("unnest")
+                        // v7.38 (read01, T-srf) — string_to_table / regexp_split_to_table
+                        // rewrite to the unnest channel below; absorb their LATERAL too.
+                        || s.eq_ignore_ascii_case("string_to_table")
+                        || s.eq_ignore_ascii_case("regexp_split_to_table"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
         {
             self.advance(); // LATERAL
@@ -11856,6 +11860,64 @@ impl Parser {
                     args: entries,
                 }
             };
+            let tref = TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: Some(Box::new(expr)),
+                unnest_column_aliases,
+                with_ordinality,
+                generate_series_args: None,
+                lateral_subquery: None,
+                jsonb_each_text_arg: None,
+            };
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
+            });
+        }
+        // v7.38 (read01, T-srf) — `FROM string_to_table(s, d)` /
+        // `regexp_split_to_table(s, p)` are set-returning; rewrite each to
+        // `unnest(string_to_array(...))` / `unnest(regexp_split_to_array(...))`
+        // so the working unnest SRF channel handles them uniformly (FROM,
+        // projection, lateral, correlated).
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("string_to_table")
+                    || s.eq_ignore_ascii_case("regexp_split_to_table"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            let fn_name = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => unreachable!(),
+            };
+            let array_fn = if fn_name == "string_to_table" {
+                "string_to_array"
+            } else {
+                "regexp_split_to_array"
+            };
+            self.advance(); // fn name
+            self.advance(); // (
+            let mut args = alloc::vec![self.parse_expr(0)?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                args.push(self.parse_expr(0)?);
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after {fn_name}() arguments, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance(); // )
+            let with_ordinality = self.absorb_with_ordinality();
+            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
+            let expr = crate::ast::Expr::FunctionCall {
+                name: array_fn.to_string(),
+                args,
+            };
+            let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
                 name,
                 alias: alias_ident,
