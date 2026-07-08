@@ -1360,6 +1360,7 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
         }
         Literal::Float(x) => Value::Float(*x),
         Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale , kind: spg_storage::NumericKind::Finite },
+        Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Vector(v) => Value::vector(v.clone()),
         Literal::TextArray(items) => Value::TextArray(items.clone()),

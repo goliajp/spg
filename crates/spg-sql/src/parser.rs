@@ -13414,6 +13414,12 @@ impl Parser {
                 Some((unscaled, scale)) => {
                     Ok(Expr::Literal(Literal::Numeric { unscaled, scale }))
                 }
+                // v7.38 (read01, T3.C3) — a plain decimal too wide for i128 keeps
+                // its exact value as a NumericBig (only scientific `e`-notation
+                // still widens to double).
+                None if !s.contains(['e', 'E']) => {
+                    Ok(Expr::Literal(Literal::NumericBig(s)))
+                }
                 None => s
                     .parse::<f64>()
                     .map(|x| Expr::Literal(Literal::Float(x)))
