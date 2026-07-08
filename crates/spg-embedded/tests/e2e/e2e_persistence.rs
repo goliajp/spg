@@ -130,3 +130,31 @@ fn multiple_snapshot_writes_overwrite_cleanly() {
     }
     let _ = std::fs::remove_file(&db_path);
 }
+
+// v7.38 (read01, T6.P4) — NUMERIC specials (NaN / ±Infinity) survive the
+// snapshot → restore round-trip (FILE_VERSION 56 form byte). Before P4 they
+// persisted as the finite 0.
+#[test]
+fn snapshot_round_trips_numeric_specials() {
+    let db_path = unique_tmpfile("numspecial");
+    {
+        let mut db = Database::open_in_memory();
+        db.execute("CREATE TABLE n (id INT NOT NULL, v NUMERIC)").unwrap();
+        db.execute("INSERT INTO n VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 3.14)")
+            .unwrap();
+        let bytes = db.snapshot();
+        std::fs::write(&db_path, &bytes).unwrap();
+    }
+    let bytes = std::fs::read(&db_path).unwrap();
+    let mut db = Database::restore(&bytes).unwrap();
+    let rows = db.query("SELECT v::text FROM n ORDER BY id").unwrap();
+    let got: Vec<String> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.to_string(),
+            o => format!("{o:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec!["NaN", "Infinity", "-Infinity", "3.14"]);
+    let _ = std::fs::remove_file(&db_path);
+}
