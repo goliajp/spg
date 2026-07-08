@@ -38,4 +38,11 @@ fn ts_rank_matches_pg() {
     // Two covers: 0.1 + 0.1/3.
     near(&mut e, "SELECT ts_rank_cd('cat:1,5 rat:2'::tsvector, 'cat & rat'::tsquery)", 0.133_333_34);
     near(&mut e, "SELECT ts_rank_cd('cat:1'::tsvector, 'dog'::tsquery)", 0.0);
+
+    // Custom weight array [D, C, B, A] (float8[]); B-weight drives a B/B pair.
+    near(&mut e, "SELECT ts_rank(ARRAY[0.5,0.6,0.7,0.8]::float8[], 'cat:1B rat:2B'::tsvector, 'cat & rat'::tsquery)", 0.693_722_5);
+    near(&mut e, "SELECT ts_rank_cd(ARRAY[0.5,0.6,0.7,0.8]::float8[], 'cat:1B rat:2B'::tsvector, 'cat & rat'::tsquery)", 0.7);
+    // Explicit norm 0 is accepted; a non-zero flag errors honestly.
+    near(&mut e, "SELECT ts_rank('cat:1,2,3'::tsvector, 'cat'::tsquery, 0)", 0.082_745_634);
+    assert!(e.execute("SELECT ts_rank('cat:1'::tsvector, 'cat'::tsquery, 1)").is_err());
 }

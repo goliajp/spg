@@ -19,64 +19,129 @@ use super::{EvalContext, EvalError};
 /// optional weight-array / normalisation arguments error with an
 /// "unsupported" message rather than silently changing semantics.
 pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (vec, query) = parse_rank_args("ts_rank", args)?;
+    let (weights, vec, query) = parse_rank_args("ts_rank", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
-        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank(&v, &q)))),
+        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank(&weights, &v, &q)))),
     }
 }
 
 pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (vec, query) = parse_rank_args("ts_rank_cd", args)?;
+    let (weights, vec, query) = parse_rank_args("ts_rank_cd", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
-        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank_cd(&v, &q)))),
+        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank_cd(&weights, &v, &q)))),
     }
 }
 
+/// v7.38 (read01, T12.1) — parse `ts_rank[_cd]([weights,] vec, query [, norm])`.
+/// A leading `float4[]` weight array (PG order `[D, C, B, A]`) and a trailing
+/// integer normalization flag are both optional. Custom weights are honored;
+/// the only supported normalization flag is 0 (the default) — a non-zero flag
+/// errors honestly rather than silently returning an un-normalized rank.
 fn parse_rank_args(
     name: &str,
     args: &[Value<'_>],
 ) -> Result<
     (
+        crate::fts::RankWeights,
         Option<Vec<spg_storage::TsLexeme>>,
         Option<spg_storage::TsQueryAst>,
     ),
     EvalError,
 > {
-    if args.len() != 2 {
+    // Split off an optional leading weight array and an optional trailing norm.
+    let mut rest = args;
+    let mut weights = crate::fts::DEFAULT_RANK_WEIGHTS;
+    if matches!(
+        rest.first(),
+        Some(
+            Value::FloatArray(_)
+                | Value::NumericArray(_)
+                | Value::IntArray(_)
+                | Value::SmallIntArray(_)
+        )
+    ) {
+        weights = parse_weight_array(name, &rest[0])?;
+        rest = &rest[1..];
+    }
+    // A trailing integer is the normalization flag.
+    let norm = match rest.last() {
+        Some(Value::Int(n)) => Some(i64::from(*n)),
+        Some(Value::BigInt(n)) => Some(*n),
+        _ => None,
+    };
+    if norm.is_some() {
+        rest = &rest[..rest.len() - 1];
+    }
+    if let Some(flag) = norm {
+        if flag != 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "{name}(): normalization flag {flag} is not yet supported (only 0)"
+                ),
+            });
+        }
+    }
+    if rest.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "{name}() takes 2 args in v7.12.2 (weights array + normalisation flag are v7.12.x carve-out), got {}",
-                args.len()
+                "{name}() takes (vec, query) optionally wrapped by a weight array and a norm flag"
             ),
         });
     }
-    let vec = match &args[0] {
+    let vec = match &rest[0] {
         Value::Null => None,
         Value::TsVector(v) => Some(v.clone()),
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() first arg must be tsvector, got {:?}",
+                    "{name}() vector arg must be tsvector, got {:?}",
                     other.data_type()
                 ),
             });
         }
     };
-    let query = match &args[1] {
+    let query = match &rest[1] {
         Value::Null => None,
         Value::TsQuery(q) => Some(q.clone()),
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() second arg must be tsquery, got {:?}",
+                    "{name}() query arg must be tsquery, got {:?}",
                     other.data_type()
                 ),
             });
         }
     };
-    Ok((vec, query))
+    Ok((weights, vec, query))
+}
+
+/// Read a 4-element weight array in PG order `[D, C, B, A]`.
+fn parse_weight_array(name: &str, v: &Value<'_>) -> Result<crate::fts::RankWeights, EvalError> {
+    let vals: Vec<f32> = match v {
+        Value::FloatArray(a) => a.iter().map(|o| o.unwrap_or(0.0) as f32).collect(),
+        Value::IntArray(a) => a.iter().map(|o| o.unwrap_or(0) as f32).collect(),
+        Value::SmallIntArray(a) => a.iter().map(|o| f32::from(o.unwrap_or(0))).collect(),
+        Value::NumericArray(a) => a
+            .iter()
+            .map(|o| o.map_or(0.0, |(m, s)| (m as f64 / 10f64.powi(i32::from(s))) as f32))
+            .collect(),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("{name}() weight argument must be a numeric array"),
+            });
+        }
+    };
+    if vals.len() != 4 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{name}() weight array must have 4 elements [D, C, B, A], got {}",
+                vals.len()
+            ),
+        });
+    }
+    Ok([vals[0], vals[1], vals[2], vals[3]])
 }
 
 /// v7.12.2 — `tsvector @@ tsquery` match operator. Either
