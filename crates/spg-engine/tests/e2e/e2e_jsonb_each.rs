@@ -118,3 +118,35 @@ fn jsonb_to_recordset_and_record() {
     );
     assert!(matches!(&got[0][0], Value::Text(s) if s == "10,20"));
 }
+
+#[test]
+fn jsonb_each_in_select_list_is_composite_srf() {
+    // v7.38 (read01, T15) — jsonb/json_each[_text] in the SELECT list (not FROM)
+    // emit one composite `(key, value)` row per object member, like PG (which
+    // renders each row as `(a,1)`). Covers no-FROM, _text (JSON null → SQL
+    // NULL), over a real table, and NULL input. Oracle: live PG 18.4.
+    use spg_storage::Value;
+    let mut e = Engine::new();
+    // no-FROM plain: value keeps jsonb rendering.
+    let got = rows(&mut e, "SELECT jsonb_each('{\"a\": 1, \"b\": 2}'::jsonb)");
+    assert_eq!(got.len(), 2);
+    let comp = |v: &Value| match v {
+        Value::Composite(f) => (render(&f[0].1), render(&f[1].1)),
+        other => panic!("expected Composite, got {other:?}"),
+    };
+    assert_eq!(comp(&got[0][0]), (Some("a".into()), Some("1".into())));
+    assert_eq!(comp(&got[1][0]), (Some("b".into()), Some("2".into())));
+    // _text: string values unwrap, JSON null → SQL NULL.
+    let got = rows(&mut e, "SELECT jsonb_each_text('{\"a\": \"x\", \"b\": null}'::jsonb)");
+    assert_eq!(comp(&got[0][0]), (Some("a".into()), Some("x".into())));
+    assert_eq!(comp(&got[1][0]), (Some("b".into()), None));
+    // Over a real table: one composite row per member per source row.
+    e.execute("CREATE TABLE je(j jsonb)").unwrap();
+    e.execute("INSERT INTO je VALUES ('{\"k\": 10}'), ('{\"m\": 20}')").unwrap();
+    let got = rows(&mut e, "SELECT jsonb_each(j) FROM je");
+    assert_eq!(got.len(), 2);
+    assert_eq!(comp(&got[0][0]), (Some("k".into()), Some("10".into())));
+    assert_eq!(comp(&got[1][0]), (Some("m".into()), Some("20".into())));
+    // NULL input → no rows.
+    assert_eq!(rows(&mut e, "SELECT jsonb_each(NULL::jsonb)").len(), 0);
+}
