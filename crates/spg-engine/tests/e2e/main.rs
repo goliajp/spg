@@ -252,6 +252,7 @@ mod e2e_string_to_table_srf;
 mod e2e_tz_abbreviations;
 mod e2e_numeric_underscore_sep;
 mod e2e_infinity_datetime;
+mod e2e_ipv4_mapped_ipv6;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
