@@ -30,4 +30,12 @@ fn ts_rank_matches_pg() {
     near(&mut e, "SELECT ts_rank('cat:1 rat:10'::tsvector, 'cat & rat'::tsquery)", 0.051_744_01);
     // No match → 0.
     near(&mut e, "SELECT ts_rank('cat:1'::tsvector, 'dog'::tsquery)", 0.0);
+
+    // ts_rank_cd cover density: (#entries / Σ 1/weight) / (noise + 1) per cover.
+    near(&mut e, "SELECT ts_rank_cd('cat:1 rat:2'::tsvector, 'cat & rat'::tsquery)", 0.1);
+    near(&mut e, "SELECT ts_rank_cd('cat:1 rat:3'::tsvector, 'cat & rat'::tsquery)", 0.05);
+    near(&mut e, "SELECT ts_rank_cd('cat:1 rat:10'::tsvector, 'cat & rat'::tsquery)", 0.011_111_111);
+    // Two covers: 0.1 + 0.1/3.
+    near(&mut e, "SELECT ts_rank_cd('cat:1,5 rat:2'::tsvector, 'cat & rat'::tsquery)", 0.133_333_34);
+    near(&mut e, "SELECT ts_rank_cd('cat:1'::tsvector, 'dog'::tsquery)", 0.0);
 }
