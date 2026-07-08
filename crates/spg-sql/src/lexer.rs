@@ -411,6 +411,14 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 out.push(tok);
                 i += 1 + consumed;
             }
+            // v7.38 (read01, T18) — PG `U&'...'` Unicode string literal.
+            b'U' | b'u'
+                if peek_eq(bytes, i + 1, b'&') && peek_eq(bytes, i + 2, b'\'') =>
+            {
+                let (tok, consumed) = lex_unicode_string(input, i + 2)?;
+                out.push(tok);
+                i += 2 + consumed;
+            }
             b'"' => {
                 let (tok, consumed) = lex_quoted(input, i, b'"', true)?;
                 out.push(tok);
@@ -1369,6 +1377,70 @@ fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexErr
             s.push(ch);
             i += ch.len_utf8();
         }
+    }
+    Ok((Token::String(s), i - start))
+}
+
+/// v7.38 (read01, T18) — lex a PG `U&'...'` Unicode string literal. `start`
+/// points at the opening quote. Decodes `\XXXX` (4 hex), `\+XXXXXX` (6 hex),
+/// `\\` → backslash, `''` → quote; the default escape is `\`. (A trailing
+/// `UESCAPE 'c'` clause and the `U&"..."` identifier form are separate
+/// follow-ups.)
+fn lex_unicode_string(input: &str, start: usize) -> Result<(Token, usize), LexError> {
+    let bytes = input.as_bytes();
+    debug_assert_eq!(bytes[start], b'\'');
+    let hex_char = |hex: &str, pos: usize| -> Result<char, LexError> {
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .ok_or(LexError {
+                kind: LexErrorKind::InvalidUnicodeEscape,
+                pos,
+            })
+    };
+    let mut i = start + 1;
+    let mut s = String::new();
+    loop {
+        if i >= bytes.len() {
+            return Err(LexError {
+                kind: LexErrorKind::UnterminatedString,
+                pos: start,
+            });
+        }
+        let b = bytes[i];
+        if b == b'\'' {
+            if peek_eq(bytes, i + 1, b'\'') {
+                s.push('\'');
+                i += 2;
+                continue;
+            }
+            i += 1;
+            break;
+        }
+        if b == b'\\' {
+            if peek_eq(bytes, i + 1, b'\\') {
+                s.push('\\');
+                i += 2;
+                continue;
+            }
+            let (lo, hi) = if peek_eq(bytes, i + 1, b'+') {
+                (i + 2, i + 8) // \+XXXXXX
+            } else {
+                (i + 1, i + 5) // \XXXX
+            };
+            if hi > bytes.len() || !input.is_char_boundary(lo) || !input.is_char_boundary(hi) {
+                return Err(LexError {
+                    kind: LexErrorKind::InvalidUnicodeEscape,
+                    pos: i,
+                });
+            }
+            s.push(hex_char(&input[lo..hi], i)?);
+            i = hi;
+            continue;
+        }
+        let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+        s.push(ch);
+        i += ch.len_utf8();
     }
     Ok((Token::String(s), i - start))
 }
