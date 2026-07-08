@@ -92,6 +92,36 @@ fn numeric_bignum_divide() {
 }
 
 #[test]
+fn numeric_sqrt_stays_numeric() {
+    // v7.38 (read01, C4) — sqrt(numeric) returns NUMERIC (not double) with
+    // PG's ~16-significant-digit display scale, exact via integer sqrt.
+    // Oracle: live PG 18.4 — byte-identical text + numeric type.
+    let mut e = Engine::new();
+    // scale-0 args get 15 fractional digits; rounds like PG.
+    assert_eq!(t(&mut e, "SELECT sqrt(2::numeric)::text"), "1.414213562373095");
+    assert_eq!(t(&mut e, "SELECT sqrt(10::numeric)::text"), "3.162277660168379");
+    // Perfect square renders with the scale, all zeros after the point.
+    assert_eq!(t(&mut e, "SELECT sqrt(9::numeric)::text"), "3.000000000000000");
+    assert_eq!(t(&mut e, "SELECT sqrt(1000000::numeric)::text"), "1000.0000000000000");
+    // A fractional arg floors the scale by its own; 2.25 = 1.5 exactly.
+    assert_eq!(t(&mut e, "SELECT sqrt(2.25)::text"), "1.500000000000000");
+    assert_eq!(t(&mut e, "SELECT sqrt(0.01)::text"), "0.10000000000000000");
+    // Beyond i128: a 38-digit arg and an exact big perfect square.
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(99999999999999999999999999999999999999::numeric)::text"),
+        "10000000000000000000"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(152415787532388367501905199875019052100::numeric)::text"),
+        "12345678901234567890"
+    );
+    // Type is numeric, not double precision.
+    assert_eq!(t(&mut e, "SELECT pg_typeof(sqrt(2::numeric))::text"), "numeric");
+    // Negative arg errors (matches PG's domain error).
+    assert!(e.execute("SELECT sqrt((-4)::numeric)").is_err());
+}
+
+#[test]
 fn numeric_bignum_order_by() {
     // v7.38 (read01, T3.C3) — ORDER BY / min / max over a NUMERIC column
     // holding values beyond i128 sorts by exact value, not by text or a lossy

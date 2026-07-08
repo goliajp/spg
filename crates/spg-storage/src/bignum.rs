@@ -463,6 +463,85 @@ impl BigNumeric {
         Some(out)
     }
 
+    /// v7.38 (read01, C4) — floor of the integer square root of this value's
+    /// magnitude taken as an integer (scale ignored). Newton's method on the
+    /// base-10^9 limbs, starting from a decimal-digit overestimate and
+    /// descending to the floor. Zero → zero.
+    fn isqrt_mag(&self) -> Self {
+        use core::cmp::Ordering;
+        let n = BigNumeric { neg: false, limbs: self.limbs.clone(), scale: 0 };
+        if n.is_zero() {
+            return BigNumeric { neg: false, limbs: Vec::new(), scale: 0 };
+        }
+        // Decimal digit count of the magnitude.
+        let top = *n.limbs.last().unwrap();
+        let ndigits = (n.limbs.len() - 1) * BASE_DIGITS + top.to_string().len();
+        // Overestimate x0 = 10^ceil(ndigits/2) >= sqrt(n).
+        let half = ndigits.div_ceil(2);
+        let one = BigNumeric::from_i128(1, 0);
+        let two = BigNumeric::from_i128(2, 0);
+        let mut x = BigNumeric {
+            neg: false,
+            limbs: Self::mul_pow10(&one.limbs, half as u32),
+            scale: 0,
+        };
+        // Newton: x_{k+1} = (x + n/x) / 2, monotonically descending to the floor.
+        loop {
+            let (div, _) = n.div_rem_int(&x);
+            let sum = x.add(&div);
+            let (next, _) = sum.div_rem_int(&two);
+            if next.cmp(&x) != Ordering::Less {
+                break;
+            }
+            x = next;
+        }
+        // Descend any residual overshoot so x*x <= n exactly.
+        while x.mul(&x).cmp(&n) == Ordering::Greater {
+            x = x.sub(&one);
+        }
+        x
+    }
+
+    /// v7.38 (read01, C4) — square root at a target display scale, rounded
+    /// half-away-from-zero, the shape PG's numeric `sqrt` uses. `None` for a
+    /// negative value (the caller raises the domain error). The caller picks
+    /// `result_scale` (PG's ~16-significant-digit rule) and guarantees it is at
+    /// least the argument's own scale.
+    #[must_use]
+    pub fn sqrt(&self, result_scale: u8) -> Option<Self> {
+        use core::cmp::Ordering;
+        if self.neg && !self.is_zero() {
+            return None;
+        }
+        if self.is_zero() {
+            return Some(BigNumeric { neg: false, limbs: Vec::new(), scale: result_scale });
+        }
+        // Compute one guard digit past result_scale, then round it off.
+        // radicand = mantissa * 10^(2*(result_scale+1) - scale); isqrt of it is
+        // floor(sqrt(value) * 10^(result_scale+1)).
+        let shift = 2 * (i32::from(result_scale) + 1) - i32::from(self.scale);
+        let mant = BigNumeric { neg: false, limbs: self.limbs.clone(), scale: 0 };
+        let radicand = if shift >= 0 {
+            BigNumeric { neg: false, limbs: Self::mul_pow10(&mant.limbs, shift as u32), scale: 0 }
+        } else {
+            let (q, _) = Self::div_rem_mag(&mant.limbs, &Self::mul_pow10(&[1], (-shift) as u32));
+            BigNumeric { neg: false, limbs: q, scale: 0 }
+        };
+        let root = radicand.isqrt_mag();
+        // Round the guard digit half-away-from-zero, drop it.
+        let ten = BigNumeric::from_i128(10, 0);
+        let (q, r) = root.div_rem_int(&ten);
+        let five = BigNumeric::from_i128(5, 0);
+        let mut rounded = if r.cmp(&five) != Ordering::Less {
+            q.add(&BigNumeric::from_i128(1, 0))
+        } else {
+            q
+        };
+        rounded.scale = result_scale;
+        rounded.normalize();
+        Some(rounded)
+    }
+
     /// Render as a decimal string (`-123.4500` style), inserting the scale point.
     #[must_use]
     pub fn to_decimal_str(&self) -> String {
@@ -654,5 +733,56 @@ mod tests {
         assert_eq!(one.div(&eight, 2).unwrap().to_decimal_str(), "0.13");
         // division by zero → None.
         assert!(one.div(&BigNumeric::from_decimal_str("0").unwrap(), 4).is_none());
+    }
+
+    #[test]
+    fn isqrt_exact_and_floor() {
+        // Perfect square far beyond i128: (12345678901234567890)^2.
+        let n = BigNumeric::from_decimal_str("152415787532388367501905199875019052100").unwrap();
+        assert_eq!(n.isqrt_mag().to_decimal_str(), "12345678901234567890");
+        // Floor for a non-square: isqrt(10) = 3, isqrt(15) = 3, isqrt(16) = 4.
+        for (v, want) in [("0", "0"), ("1", "1"), ("2", "1"), ("10", "3"), ("15", "3"), ("16", "4"), ("99", "9"), ("100", "10")] {
+            let b = BigNumeric::from_decimal_str(v).unwrap();
+            assert_eq!(b.isqrt_mag().to_decimal_str(), want, "isqrt({v})");
+        }
+    }
+
+    #[test]
+    fn sqrt_scale_and_rounding() {
+        // sqrt(2) at scale 15 rounds to PG's value.
+        let two = BigNumeric::from_decimal_str("2").unwrap();
+        assert_eq!(two.sqrt(15).unwrap().to_decimal_str(), "1.414213562373095");
+        // sqrt(10) rounds down (16th digit 3).
+        let ten = BigNumeric::from_decimal_str("10").unwrap();
+        assert_eq!(ten.sqrt(15).unwrap().to_decimal_str(), "3.162277660168379");
+        // Perfect squares are exact at any scale.
+        let nine = BigNumeric::from_decimal_str("9").unwrap();
+        assert_eq!(nine.sqrt(15).unwrap().to_decimal_str(), "3.000000000000000");
+        // A big perfect square, scale 0.
+        let big = BigNumeric::from_decimal_str("152415787532388367501905199875019052100").unwrap();
+        assert_eq!(big.sqrt(0).unwrap().to_decimal_str(), "12345678901234567890");
+        // Negative → None (caller raises the domain error); zero is fine.
+        assert!(BigNumeric::from_decimal_str("-4").unwrap().sqrt(2).is_none());
+        assert_eq!(BigNumeric::from_decimal_str("0").unwrap().sqrt(3).unwrap().to_decimal_str(), "0.000");
+    }
+
+    #[test]
+    fn fuzz_isqrt_vs_i128() {
+        // Deterministic LCG: isqrt of fit-i128 values matches the property
+        // x^2 <= n < (x+1)^2.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+        for _ in 0..20_000 {
+            let n = u128::from(next()) | (u128::from(next()) << 64);
+            let n = n % (1u128 << 100); // keep products in range
+            let b = BigNumeric::from_i128(n as i128, 0);
+            let root = b.isqrt_mag();
+            let rl = root.to_i128().unwrap() as u128;
+            assert!(rl * rl <= n, "root^2 > n for n={n}");
+            assert!((rl + 1) * (rl + 1) > n, "(root+1)^2 <= n for n={n}");
+        }
     }
 }

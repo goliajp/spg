@@ -79,19 +79,21 @@ fn cbrt_of_27_is_3() {
 }
 
 #[test]
-fn sqrt_matches_pg_to_the_ulp() {
+fn sqrt_matches_pg() {
     let mut e = Engine::new();
-    // libm::sqrt is correctly rounded (IEEE-754) — the same square
-    // root PG calls via C libm. Perfect squares are exact and
-    // non-squares match PG's double bit-for-bit (the old Newton
-    // iteration returned 1.414213562373095, a ULP shy of PG's
-    // 1.4142135623730951).
-    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(16.0)")), 4.0);
-    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(2.0)")), 1.414_213_562_373_095_1);
-    assert_eq!(
-        as_f64(&first(&mut e, "SELECT sqrt(130.0)")),
-        11.401_754_250_991_38
-    );
+    // v7.38 (read01, C4) — a dotted literal (`2.0`, `16.0`, `130.0`) is NUMERIC
+    // in PG, so sqrt returns NUMERIC at PG's ~16-significant-digit display scale
+    // (byte-identical text), not a double. An integer / float8 arg stays double.
+    let txt = |e: &mut Engine, sql: &str| match first(e, sql) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        other => panic!("expected Text, got {other:?}"),
+    };
+    assert_eq!(txt(&mut e, "SELECT sqrt(16.0)::text"), "4.000000000000000");
+    assert_eq!(txt(&mut e, "SELECT sqrt(2.0)::text"), "1.414213562373095");
+    assert_eq!(txt(&mut e, "SELECT sqrt(130.0)::text"), "11.401754250991380");
+    // An integer arg resolves to the double overload (PG returns double `4`).
+    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(16)")), 4.0);
+    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(2.0::float8)")), 1.414_213_562_373_095_1);
 }
 
 #[test]

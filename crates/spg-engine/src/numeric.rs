@@ -343,6 +343,19 @@ pub(crate) fn division_display_scale_big(
     division_display_scale_from_wf(dwf, ds, vwf)
 }
 
+/// v7.38 (read01, C4) — the display scale PG's numeric `sqrt` gives its
+/// result: ~16 significant digits keyed off the argument's base-10000 weight
+/// (`sweight = (weight+1)*2 - 1`, then `16 - sweight`), floored by the
+/// argument's own scale, capped at PG's 1000-digit ceiling then SPG's `u8`.
+/// Differential-verified: `sqrt(2)` → 15 fractional digits, `sqrt(1e38)` → 0.
+pub(crate) fn sqrt_display_scale_big(arg: &spg_storage::bignum::BigNumeric) -> u8 {
+    let (m, s) = mantissa_and_scale_big(arg);
+    let (weight, _lead) = weight_firstdigit_core(&m, s);
+    let sweight = (weight + 1) * 2 - 1;
+    let scale = (16 - sweight).max(i32::from(s)).max(0).min(1000);
+    scale.min(255) as u8
+}
+
 /// Shared tail of `division_display_scale[_big]`: given each operand's
 /// base-10000 `(weight, firstdigit)` and the dividend's scale, produce the
 /// display scale PG's `/` yields (~16 significant digits, floored by the
