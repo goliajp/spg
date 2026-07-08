@@ -10,6 +10,7 @@ fn one(e: &mut Engine, sql: &str) -> String {
             spg_storage::Value::Text(s) | spg_storage::Value::BpChar(s) => s.to_string(),
             spg_storage::Value::Bool(b) => b.to_string(),
             spg_storage::Value::Int(n) => n.to_string(),
+            spg_storage::Value::BigInt(n) => n.to_string(),
             v => format!("{v:?}"),
         },
         _ => panic!("rows"),
@@ -37,6 +38,14 @@ fn bpchar_semantics() {
     assert_eq!(one(&mut e, "SELECT length('abc'::char(2))"), "2");
     // ORDER BY / equality ignore trailing blanks.
     assert_eq!(one(&mut e, "SELECT 'ab'::char(4) = 'ab'::char(2)"), "true");
-    // (COUNT(DISTINCT bpchar) across *different* declared widths still keys on
-    // the padded form — a small residual in the aggregate dedup path.)
+    // DISTINCT / GROUP BY dedup blank-insensitively, even across declared widths
+    // and against plain text (R3).
+    assert_eq!(
+        one(&mut e, "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::char(6)),('ab'::char(2))) v(x)"),
+        "1"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::text)) v(x)"),
+        "1"
+    );
 }
