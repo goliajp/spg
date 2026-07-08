@@ -276,6 +276,7 @@ mod e2e_date_part_double;
 mod e2e_numeric_dedup;
 mod e2e_distinct_derived;
 mod e2e_numeric_scale_union;
+mod e2e_trunc_numeric;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
