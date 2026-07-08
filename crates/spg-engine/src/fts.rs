@@ -376,7 +376,7 @@ fn phrase_match(vec: &[TsLexeme], left: &TsQueryAst, right: &TsQueryAst, distanc
 /// terms in query)`. Matches PG's `ts_rank` with default
 /// normalisation flag 0.
 #[must_use]
-pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
+pub fn ts_rank(weights: &RankWeights, vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
     // v7.38 (read01, T12.1) — PG's calc_rank: an AND/PHRASE-rooted query uses
     // the cover (distance-weighted) branch, everything else the OR branch.
     // Normalization flag defaults to 0 (no length/uniqueness division).
@@ -388,9 +388,9 @@ pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
     let and_rooted = matches!(query, TsQueryAst::And(..) | TsQueryAst::Phrase { .. });
     // calc_rank_and delegates to calc_rank_or for a single distinct term.
     if and_rooted && terms.len() >= 2 {
-        calc_rank_and(vec, &terms)
+        calc_rank_and(vec, &terms, weights)
     } else {
-        calc_rank_or(vec, &terms)
+        calc_rank_or(vec, &terms, weights)
     }
 }
 
@@ -399,7 +399,7 @@ pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
 /// to a per-lexeme contribution divided by the average gap
 /// between matched positions. Returns 0 when no terms match.
 #[must_use]
-pub fn ts_rank_cd(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
+pub fn ts_rank_cd(weights: &RankWeights, vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
     // v7.38 (read01, T12.1) — PG's calc_rank_cd cover density. Sum, over each
     // minimal cover (window containing every distinct query term), a
     // per-cover weight `Cpos = (#entries / Σ 1/weight) / (noise + 1)`, where
@@ -453,7 +453,7 @@ pub fn ts_rank_cd(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
         }
         let p = doc[begin].0;
         let q = doc[end].0;
-        let inv_sum: f32 = doc[begin..=end].iter().map(|d| 1.0 / weight_factor(d.2)).sum();
+        let inv_sum: f32 = doc[begin..=end].iter().map(|d| 1.0 / weight_factor(d.2, weights)).sum();
         let mut cpos = ((end - begin + 1) as f32) / inv_sum;
         let nnoise = (i32::from(q) - i32::from(p)) - (end as i32 - begin as i32);
         if nnoise > 0 {
@@ -485,14 +485,14 @@ fn ln_approx(x: f32) -> f32 {
     ln as f32
 }
 
-fn weight_factor(w: u8) -> f32 {
-    // PG default: A=1.0, B=0.4, C=0.2, D=0.1.
-    match w {
-        3 => 1.0,
-        2 => 0.4,
-        1 => 0.2,
-        _ => 0.1,
-    }
+/// v7.38 (read01, T12.1) — a ts_rank weight array in PG order `[D, C, B, A]`.
+pub type RankWeights = [f32; 4];
+/// PG default weights: D=0.1, C=0.2, B=0.4, A=1.0.
+pub const DEFAULT_RANK_WEIGHTS: RankWeights = [0.1, 0.2, 0.4, 1.0];
+
+fn weight_factor(w: u8, weights: &RankWeights) -> f32 {
+    // Weight byte: D=0, C=1, B=2, A=3 — a direct index into the PG-order array.
+    weights[(w as usize).min(3)]
 }
 
 /// v7.38 (read01, T12.1) — no_std `exp`, sibling of `ln_approx`. Range-reduce
@@ -559,11 +559,11 @@ fn collect_query_terms<'a>(query: &'a TsQueryAst, out: &mut Vec<&'a str>) {
 
 /// PG `calc_rank_or`: sum a per-term contribution over the term's positions,
 /// then divide by the number of distinct query terms.
-fn calc_rank_or(vec: &[TsLexeme], terms: &[&str]) -> f32 {
+fn calc_rank_or(vec: &[TsLexeme], terms: &[&str], weights: &RankWeights) -> f32 {
     let mut res = 0.0f32;
     for word in terms {
         if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
-            let wpos = weight_factor(vec[idx].weight);
+            let wpos = weight_factor(vec[idx].weight, weights);
             let (mut resj, mut wjm, mut jm) = (0.0f32, 0.0f32, 0usize);
             for (j, _pos) in vec[idx].positions.iter().enumerate() {
                 let denom = ((j + 1) * (j + 1)) as f32;
@@ -582,11 +582,11 @@ fn calc_rank_or(vec: &[TsLexeme], terms: &[&str]) -> f32 {
 
 /// PG `calc_rank_and`: probabilistic-OR combine of every position pair from
 /// DISTINCT query terms, each weighted by the inter-position `word_distance`.
-fn calc_rank_and(vec: &[TsLexeme], terms: &[&str]) -> f32 {
+fn calc_rank_and(vec: &[TsLexeme], terms: &[&str], weights: &RankWeights) -> f32 {
     let mut entries: Vec<RankEntry> = Vec::new();
     for (t, word) in terms.iter().enumerate() {
         if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
-            let w = weight_factor(vec[idx].weight);
+            let w = weight_factor(vec[idx].weight, weights);
             for &pos in &vec[idx].positions {
                 entries.push(RankEntry { term: t, pos, w });
             }
