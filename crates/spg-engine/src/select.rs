@@ -4983,23 +4983,39 @@ fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) 
         let Some(target) = resolve_union_common_type(&seen) else {
             continue;
         };
+        // v7.38 (read01) — an unconstrained NUMERIC result column keeps each
+        // value's own scale in PG (`VALUES (1.0),(1.00)` renders `1.0` / `1.00`,
+        // not `1.00` / `1.00`). So when the common type is NUMERIC, leave an
+        // existing numeric cell untouched and only promote integers (to scale 0)
+        // rather than rescaling everything to the widest scale.
+        let scale_preserving_numeric = matches!(target, DataType::Numeric { .. });
         // Dry-run the coercion; abandon the whole column if any fails.
         let mut coerced: Vec<Option<Value<'static>>> = Vec::with_capacity(rows.len());
         let mut ok = true;
         for row in rows.iter() {
             match row.values.get(col_idx) {
-                Some(v) => match crate::conversions::coerce_value(
-                    v.clone(),
-                    target.clone(),
-                    &columns[col_idx].name,
-                    col_idx,
-                ) {
-                    Ok(cv) => coerced.push(Some(cv)),
-                    Err(_) => {
-                        ok = false;
-                        break;
+                Some(Value::Numeric { .. }) if scale_preserving_numeric => {
+                    coerced.push(Some(row.values[col_idx].clone()));
+                }
+                Some(v) => {
+                    let cell_target = if scale_preserving_numeric {
+                        DataType::Numeric { precision: 0, scale: 0 }
+                    } else {
+                        target.clone()
+                    };
+                    match crate::conversions::coerce_value(
+                        v.clone(),
+                        cell_target,
+                        &columns[col_idx].name,
+                        col_idx,
+                    ) {
+                        Ok(cv) => coerced.push(Some(cv)),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
                     }
-                },
+                }
                 None => coerced.push(None),
             }
         }
