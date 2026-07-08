@@ -11796,6 +11796,17 @@ fn apply_function_dispatch(
                     if missing_ok {
                         return Ok(Value::Null);
                     }
+                    // v7.38 (read01, T26) — a namespaced custom GUC (`myapp.x`)
+                    // that was never SET does not exist; PG errors rather than
+                    // returning empty. (A non-dotted name we don't model falls
+                    // back to empty so unlisted built-in GUCs don't hard-fail.)
+                    if name.contains('.') {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "unrecognized configuration parameter \"{name}\""
+                            ),
+                        });
+                    }
                     ""
                 }
             };

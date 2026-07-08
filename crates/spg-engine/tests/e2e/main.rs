@@ -270,6 +270,7 @@ mod e2e_fk_match_full;
 mod e2e_encoding_matrix;
 mod e2e_ts_rank;
 mod e2e_int_to_bit;
+mod e2e_current_setting_missing;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
