@@ -3256,6 +3256,11 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01, T10) — cardinality is the TOTAL element count
+            // across all dimensions (2-D → rows × cols).
+            if let Some((r, c)) = array_2d_dims(&args[0]) {
+                return Ok(Value::Int(i32::try_from(r.saturating_mul(c)).unwrap_or(i32::MAX)));
+            }
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -3323,14 +3328,6 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_len(&args[0]) else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_length() first arg must be an array, got {:?}",
-                        args[0].data_type()
-                    ),
-                });
-            };
             let dim: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
                 Value::BigInt(n) => n,
@@ -3343,6 +3340,22 @@ fn apply_function_dispatch(
                         ),
                     });
                 }
+            };
+            // v7.38 (read01, T10) — 2-D: dim 1 → rows, dim 2 → cols.
+            if let Some((r, c)) = array_2d_dims(&args[0]) {
+                return Ok(match dim {
+                    1 => Value::Int(i32::try_from(r).unwrap_or(i32::MAX)),
+                    2 => Value::Int(i32::try_from(c).unwrap_or(i32::MAX)),
+                    _ => Value::Null,
+                });
+            }
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_length() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             // PG: an empty array has *no* dimensions, so
             // `array_length('{}'::int[], 1)` is NULL — not 0.
@@ -3369,14 +3382,6 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Some(len) = array_len(&args[0]) else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "{name}() first arg must be an array, got {:?}",
-                        args[0].data_type()
-                    ),
-                });
-            };
             let dim: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
                 Value::BigInt(n) => n,
@@ -3389,6 +3394,24 @@ fn apply_function_dispatch(
                         ),
                     });
                 }
+            };
+            // v7.38 (read01, T10) — 2-D: lower is 1 for dims 1 and 2; upper is
+            // rows (dim 1) / cols (dim 2).
+            if let Some((r, c)) = array_2d_dims(&args[0]) {
+                return Ok(match (name, dim) {
+                    ("array_lower", 1 | 2) => Value::Int(1),
+                    ("array_upper", 1) => Value::Int(i32::try_from(r).unwrap_or(i32::MAX)),
+                    ("array_upper", 2) => Value::Int(i32::try_from(c).unwrap_or(i32::MAX)),
+                    _ => Value::Null,
+                });
+            }
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{name}() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
             if dim != 1 || len == 0 {
                 return Ok(Value::Null);
@@ -3406,11 +3429,14 @@ fn apply_function_dispatch(
                     detail: format!("array_ndims() takes 1 arg, got {}", args.len()),
                 });
             }
+            if array_2d_dims(&args[0]).is_some() {
+                return Ok(Value::Int(2));
+            }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 other => match array_len(other) {
                     // PG: an empty array has no dimensions → NULL; a 1-D
-                    // array → 1 (SPG only models 1-D arrays).
+                    // array → 1.
                     Some(0) => Ok(Value::Null),
                     Some(_) => Ok(Value::Int(1)),
                     None => Err(EvalError::TypeMismatch {
@@ -3430,6 +3456,10 @@ fn apply_function_dispatch(
             }
             if matches!(&args[0], Value::Null) {
                 return Ok(Value::Null);
+            }
+            // v7.38 (read01, T10) — 2-D → `[1:R][1:C]`.
+            if let Some((r, c)) = array_2d_dims(&args[0]) {
+                return Ok(Value::text(alloc::format!("[1:{r}][1:{c}]")));
             }
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
