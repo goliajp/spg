@@ -265,6 +265,14 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // sub-second field to that many digits, like PG. Resolve against the
             // base type (`type_name_to_data_type` does not know the `(N)` form)
             // and round the coerced result below.
+            // v7.38 (read01, T20) — an integer casts to `bit(n)` as the low n
+            // bits of its two's-complement representation (PG; int→varbit is
+            // rejected there, so only fixed-length `bit` is handled here).
+            if matches!(v, Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)) {
+                if let Some(width) = bit_cast_width(&name) {
+                    return int_to_bit_string(v, width);
+                }
+            }
             let temporal_prec = temporal_typmod(&name);
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
                 alloc::borrow::Cow::Owned(
@@ -326,6 +334,50 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             })
         }
     }
+}
+
+/// v7.38 (read01, T20) — width of a `bit` cast target: bare `bit` is `bit(1)`,
+/// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
+/// any non-bit name.
+fn bit_cast_width(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed == "bit" {
+        return Some(1);
+    }
+    let rest = trimmed.strip_prefix("bit")?.trim_start();
+    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
+    inner.trim().parse::<u32>().ok()
+}
+
+/// v7.38 (read01, T20) — build a `bit(width)` value from an integer: the low
+/// `width` bits of the two's-complement, packed MSB-first / left-aligned (the
+/// on-wire bit layout). Widths past 64 sign-extend.
+fn int_to_bit_string(v: Value<'static>, width: u32) -> Result<Value<'static>, EvalError> {
+    let n: i64 = match v {
+        Value::Int(x) => i64::from(x),
+        Value::BigInt(x) => x,
+        Value::SmallInt(x) => i64::from(x),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "int_to_bit_string: non-integer source".into(),
+            })
+        }
+    };
+    let w = width as usize;
+    let mut bytes = alloc::vec![0u8; w.div_ceil(8)];
+    for i in 0..w {
+        let p = w - 1 - i; // bit position counted from the LSB
+        let bit = if p >= 64 {
+            u8::from(n < 0) // sign-extend beyond the integer's width
+        } else {
+            ((n >> p) & 1) as u8
+        };
+        if bit != 0 {
+            bytes[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    Ok(Value::bit_string(width, bytes))
 }
 
 /// Extract the fractional-seconds precision from a temporal cast name like
