@@ -235,7 +235,7 @@ pub(crate) fn value_to_text(v: &Value) -> String {
             let cells: Vec<String> = h.to_f32_vec().iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))
         }
-        Value::Numeric { scaled, scale, .. } => format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, kind } => format_numeric_kind(*kind, *scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Interval {

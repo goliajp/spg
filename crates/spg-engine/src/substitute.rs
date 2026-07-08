@@ -114,7 +114,7 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
             Literal::String(format_timestamp_micros_as_date(micros))
         }
         Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),
-        Value::Numeric { scaled, scale, .. } => Literal::String(format_numeric(scaled, scale)),
+        Value::Numeric { scaled, scale, kind } => Literal::String(crate::eval::format_numeric_kind(kind, scaled, scale)),
         // v7.37.43-T4 — UUID round-trips through its canonical
         // 8-4-4-4-12 hex text form. `coerce_value` against a UUID
         // target column re-parses the literal back to `Value::Uuid`.

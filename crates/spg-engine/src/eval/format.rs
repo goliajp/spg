@@ -797,6 +797,18 @@ pub fn format_bytea_hex(b: &[u8]) -> String {
 /// Negative `scaled` prepends `-` to the absolute value's digits; the
 /// integer / fractional split is by character count, padding the
 /// fractional side with leading zeros to exactly `scale` chars.
+/// v7.38 (read01, T6) — render a NUMERIC honoring its special kind. Finite uses
+/// `format_numeric`; the specials render PG's full-word spellings.
+pub fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u8) -> String {
+    use spg_storage::NumericKind;
+    match kind {
+        NumericKind::Finite => format_numeric(scaled, scale),
+        NumericKind::NaN => String::from("NaN"),
+        NumericKind::PosInf => String::from("Infinity"),
+        NumericKind::NegInf => String::from("-Infinity"),
+    }
+}
+
 pub fn format_numeric(scaled: i128, scale: u8) -> String {
     if scale == 0 {
         return format!("{scaled}");

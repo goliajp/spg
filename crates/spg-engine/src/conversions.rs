@@ -1643,7 +1643,7 @@ pub(crate) fn format_range_element(v: &Value) -> alloc::string::String {
         Value::BigInt(n) => alloc::format!("{n}"),
         Value::Date(d) => crate::eval::format_date(*d),
         Value::Timestamp(t) => crate::eval::format_timestamp(*t),
-        Value::Numeric { scaled, scale, .. } => crate::eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, kind } => crate::eval::format_numeric_kind(*kind, *scaled, *scale),
         other => alloc::format!("{other:?}"),
     }
 }
@@ -2560,6 +2560,11 @@ pub(crate) fn coerce_value(
         // arm the round-trip surfaces a TypeMismatch even though
         // the cell already left the engine as a valid Numeric.
         (Value::Text(s), DataType::Numeric { precision, scale }) => {
+            // v7.38 (read01, T6) — PG's NUMERIC specials (`'NaN'`, `'Infinity'`,
+            // `'-Infinity'`) parse before the ordinary decimal path.
+            if let Some(kind) = crate::numeric::parse_numeric_special(&s) {
+                return Ok(Value::numeric_special(kind));
+            }
             let Some((mantissa, src_scale)) = parse_numeric_text(&s) else {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!("cannot parse {s:?} as NUMERIC for column `{col_name}`"),

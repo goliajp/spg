@@ -72,6 +72,21 @@ pub(crate) fn numeric_from_float(
 /// scientific notation, embedded spaces, locale-specific
 /// thousand separators. Returns None on bad input — coerce_value
 /// turns that into a TypeMismatch error.
+/// v7.38 (read01, T6) — recognise PG's NUMERIC special-value spellings.
+/// Case-insensitive: `NaN`; `Infinity` / `Inf` / `+Infinity` / `+Inf`;
+/// `-Infinity` / `-Inf`. Returns `None` for an ordinary number.
+pub(crate) fn parse_numeric_special(s: &str) -> Option<spg_storage::NumericKind> {
+    use spg_storage::NumericKind;
+    let t = s.trim();
+    let lower = t.to_ascii_lowercase();
+    match lower.as_str() {
+        "nan" => Some(NumericKind::NaN),
+        "infinity" | "inf" | "+infinity" | "+inf" => Some(NumericKind::PosInf),
+        "-infinity" | "-inf" => Some(NumericKind::NegInf),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
     let s = s.trim();
     if s.is_empty() {
