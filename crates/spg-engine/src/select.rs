@@ -5422,6 +5422,13 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
                 // returning: one row (a text[] of capture groups) per match.
                 || ((2..=3).contains(&args.len())
                     && name.eq_ignore_ascii_case("regexp_matches"))
+                // v7.38 (read01, T15) — jsonb/json_each[_text] in the SELECT list
+                // emit one composite `(key, value)` row per object member.
+                || (args.len() == 1
+                    && matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text"
+                    ))
         }
         _ => false,
     }
@@ -5479,6 +5486,33 @@ fn top_level_srf_output(
             .map(|a| eval::eval_expr(a, row, ctx).map_err(EngineError::Eval))
             .collect::<Result<_, _>>()?;
         return crate::eval::regexp_matches_rows(&vals).map_err(EngineError::Eval);
+    }
+    // v7.38 (read01, T15) — jsonb/json_each[_text]: one composite `(key, value)`
+    // row per object member (plain → jsonb value, `_text` → text / SQL NULL).
+    if matches!(
+        lname.as_str(),
+        "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text"
+    ) {
+        let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+        if matches!(arg, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let as_text = lname.ends_with("_text");
+        let pairs = crate::json::each_rows(&arg, as_text, &lname).map_err(EngineError::Eval)?;
+        return Ok(pairs
+            .into_iter()
+            .map(|(k, v)| {
+                let val = if as_text {
+                    v.map(Value::text).unwrap_or(Value::Null)
+                } else {
+                    v.map(Value::json).unwrap_or(Value::Null)
+                };
+                Value::Composite(alloc::vec![
+                    ("key".to_string(), Value::text(k)),
+                    ("value".to_string(), val),
+                ])
+            })
+            .collect());
     }
     // v7.38 (read01, T15) — jsonb/json_path_query(doc, path): one Value per
     // matched JSON value.
