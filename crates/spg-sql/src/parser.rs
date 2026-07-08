@@ -13450,7 +13450,14 @@ impl Parser {
                 let mut items: Vec<Expr> = Vec::new();
                 if !matches!(self.peek(), Token::RBracket) {
                     loop {
-                        items.push(self.parse_expr(0)?);
+                        // v7.38 (read01, T10) — inside `ARRAY[...]`, a nested
+                        // `[...]` is a sub-array (`ARRAY[[1,2],[3,4]]`), not a
+                        // pgvector literal.
+                        if matches!(self.peek(), Token::LBracket) {
+                            items.push(self.parse_array_bracket_body()?);
+                        } else {
+                            items.push(self.parse_expr(0)?);
+                        }
                         match self.peek() {
                             Token::Comma => {
                                 self.advance();
@@ -15475,6 +15482,37 @@ impl Parser {
             micros,
             text,
         }))
+    }
+
+    /// v7.38 (read01, T10) — parse a bracketed sub-array `[e, e, …]` inside an
+    /// `ARRAY[...]` constructor, recursing on further nested `[...]` so
+    /// `ARRAY[[1,2],[3,4]]` (and deeper) becomes nested `Expr::Array` rather
+    /// than a pgvector literal.
+    fn parse_array_bracket_body(&mut self) -> Result<Expr, ParseError> {
+        self.advance(); // consume `[`
+        let mut items: Vec<Expr> = Vec::new();
+        if !matches!(self.peek(), Token::RBracket) {
+            loop {
+                if matches!(self.peek(), Token::LBracket) {
+                    items.push(self.parse_array_bracket_body()?);
+                } else {
+                    items.push(self.parse_expr(0)?);
+                }
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RBracket => break,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ']' in array literal, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        self.advance(); // consume `]`
+        Ok(Expr::Array(items))
     }
 
     fn parse_vector_literal_body(&mut self) -> Result<Expr, ParseError> {

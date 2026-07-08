@@ -84,8 +84,8 @@ use textsearch::{
 };
 pub use values::gen_random_uuid_bytes;
 use values::{
-    array_element_at, array_len, value_cmp_for_min_max, value_to_f64, value_to_text,
-    values_equal_for_nullif,
+    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64,
+    value_to_text, values_equal_for_nullif,
 };
 
 /// Resolution context for evaluating a single row. `table_alias` is the alias
@@ -697,6 +697,81 @@ pub fn eval_expr(
             let mut materialised: Vec<Value<'static>> = Vec::with_capacity(items.len());
             for elem in items {
                 materialised.push(eval_expr(elem, row, ctx)?);
+            }
+            // v7.38 (read01, T10) — a constructor whose elements are all 1-D
+            // arrays builds a 2-D array (`ARRAY[[1,2],[3,4]]`). All rows must
+            // share a length (PG: "multidimensional arrays must have array
+            // expressions with matching dimensions"). Int rows promote to
+            // bigint if any row is bigint; a text row makes the whole thing text.
+            let all_arrays = !materialised.is_empty()
+                && materialised.iter().all(|v| {
+                    matches!(
+                        v,
+                        Value::IntArray(_) | Value::BigIntArray(_) | Value::TextArray(_)
+                    )
+                });
+            if all_arrays {
+                let row_len = match &materialised[0] {
+                    Value::IntArray(r) => r.len(),
+                    Value::BigIntArray(r) => r.len(),
+                    Value::TextArray(r) => r.len(),
+                    _ => unreachable!(),
+                };
+                let same_len = materialised.iter().all(|v| {
+                    let l = match v {
+                        Value::IntArray(r) => r.len(),
+                        Value::BigIntArray(r) => r.len(),
+                        Value::TextArray(r) => r.len(),
+                        _ => 0,
+                    };
+                    l == row_len
+                });
+                if !same_len {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "multidimensional arrays must have array expressions \
+                                 with matching dimensions"
+                            .into(),
+                    });
+                }
+                let any_text = materialised.iter().any(|v| matches!(v, Value::TextArray(_)));
+                let any_big = materialised.iter().any(|v| matches!(v, Value::BigIntArray(_)));
+                if any_text {
+                    let rows: Vec<Vec<Option<String>>> = materialised
+                        .into_iter()
+                        .map(|v| match v {
+                            Value::TextArray(r) => r,
+                            Value::IntArray(r) => {
+                                r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
+                            }
+                            Value::BigIntArray(r) => {
+                                r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    return Ok(Value::TextArray2D(rows));
+                }
+                if any_big {
+                    let rows: Vec<Vec<Option<i64>>> = materialised
+                        .into_iter()
+                        .map(|v| match v {
+                            Value::BigIntArray(r) => r,
+                            Value::IntArray(r) => {
+                                r.into_iter().map(|c| c.map(i64::from)).collect()
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    return Ok(Value::BigIntArray2D(rows));
+                }
+                let rows: Vec<Vec<Option<i32>>> = materialised
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::IntArray(r) => r,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                return Ok(Value::IntArray2D(rows));
             }
             let mut has_text = false;
             let mut has_bigint = false;

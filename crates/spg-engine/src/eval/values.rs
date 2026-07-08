@@ -336,6 +336,17 @@ pub(super) fn array_len(v: &Value) -> Option<usize> {
     }
 }
 
+/// v7.38 (read01, T10) — the (rows, cols) dimensions of a 2-D array, or None
+/// for anything that is not a 2-D matrix.
+pub(super) fn array_2d_dims(v: &Value) -> Option<(usize, usize)> {
+    match v {
+        Value::IntArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
+        Value::BigIntArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
+        Value::TextArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
+        _ => None,
+    }
+}
+
 /// The `pos`-th (0-based) element of a 1-D array as an owned scalar
 /// `Value` (a NULL hole becomes `Value::Null`), or `None` when `pos` is
 /// out of range or `v` is not a 1-D array. O(1) per element. This is the
