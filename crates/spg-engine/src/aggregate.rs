@@ -3398,11 +3398,21 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             let numerator = (nf * st.sum_sq - st.sum_float * st.sum_float).max(0.0);
             let divisor = if pop { nf * nf } else { nf * (nf - 1.0) };
             let var = numerator / divisor;
-            if name.starts_with("stddev") {
-                Value::Float(crate::eval::f64_sqrt(var))
+            let result = if name.starts_with("stddev") {
+                crate::eval::f64_sqrt(var)
             } else {
-                Value::Float(var)
-            }
+                var
+            };
+            // v7.38 (read01, T4.3) — PG stddev/variance return NUMERIC. Route the
+            // f64 result through its shortest decimal text into an exact numeric
+            // (matches PG's rendering for the common cases).
+            crate::conversions::coerce_value(
+                Value::Float(result),
+                DataType::Numeric { precision: 0, scale: 0 },
+                "stddev",
+                0,
+            )
+            .unwrap_or(Value::Float(result))
         }
         // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
         // → SQL NULL.
@@ -3802,8 +3812,11 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // v7.32 (round-29) — variance / stddev are floating point;
         // percentile_cont interpolates to float; the regression family
         // (except regr_count) is floating point.
-        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop"
-        | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy"
+        // v7.38 (read01, T4.3) — PG stddev / variance return NUMERIC.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+            DataType::Numeric { precision: 0, scale: 0 }
+        }
+        "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy"
         | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
             DataType::Float
         }

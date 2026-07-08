@@ -674,13 +674,12 @@ fn stat_agg_on_numeric() {
             _ => "<x>".into(),
         }
     };
-    // The core fix: these now COMPUTE on a NUMERIC column instead of erroring
-    // (stddev/variance) or returning NULL (percentile_cont/corr). Values are
-    // numerically PG-correct; the trailing-zero padding on round(float,4)
-    // (2.5 vs PG's 2.5000) is the separate numeric-scale deferral.
+    // v7.38 (read01, T4.3) — stddev / variance return NUMERIC (PG), so
+    // round(numeric, 4) keeps the 4-decimal scale (`2.5000`, `2.0000`), matching
+    // PG exactly (was SPG's float `2.5` / `2` divergence).
     assert_eq!(q(&mut e, "SELECT round(stddev(v),4)::text FROM s"), "1.5811");
-    assert_eq!(q(&mut e, "SELECT round(variance(v),4)::text FROM s"), "2.5");
-    assert_eq!(q(&mut e, "SELECT round(var_pop(v),4)::text FROM s"), "2");
+    assert_eq!(q(&mut e, "SELECT round(variance(v),4)::text FROM s"), "2.5000");
+    assert_eq!(q(&mut e, "SELECT round(var_pop(v),4)::text FROM s"), "2.0000");
     assert_eq!(q(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::text FROM s"), "3");
     assert_eq!(q(&mut e, "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v)::text FROM s"), "2");
     assert_eq!(q(&mut e, "SELECT corr(v, v)::text FROM s"), "1");
