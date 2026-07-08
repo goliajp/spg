@@ -1238,7 +1238,7 @@ fn numeric_special_result(
 
 /// v7.38 (read01, T3.C3) — convert a numeric-family value to `BigNumeric` for
 /// the arbitrary-precision fallback. `None` for a non-numeric.
-fn to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumeric> {
+pub(crate) fn value_to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumeric> {
     use spg_storage::bignum::BigNumeric;
     Some(match v {
         Value::SmallInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
@@ -1254,7 +1254,7 @@ fn to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumeric> {
 
 /// Collapse a `BigNumeric` back to `Value::Numeric` when its mantissa fits
 /// `i128`, else keep the big form.
-fn demote_bignum(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
+pub(crate) fn bignum_to_value(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
     match b.to_i128() {
         Some(scaled) => Value::Numeric { scaled, scale: b.scale(), kind: spg_storage::NumericKind::Finite },
         None => Value::NumericBig(alloc::boxed::Box::new(b)),
@@ -1264,7 +1264,7 @@ fn demote_bignum(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
 /// v7.38 (read01, T3.C3) — arbitrary-precision fallback for a numeric op whose
 /// i128 fast path overflowed, or where an operand is already `NumericBig`.
 fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'static>, EvalError>> {
-    let (a, b) = (to_bignum(l)?, to_bignum(r)?);
+    let (a, b) = (value_to_bignum(l)?, value_to_bignum(r)?);
     // Comparison honors the exact big values (sign + scale-aligned magnitude).
     if matches!(
         op,
@@ -1280,7 +1280,7 @@ fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'stati
         }
         let rscale = crate::numeric::division_display_scale_big(&a, &b);
         return Some(Ok(match a.div(&b, rscale) {
-            Some(q) => demote_bignum(q),
+            Some(q) => bignum_to_value(q),
             None => return None,
         }));
     }
@@ -1292,7 +1292,7 @@ fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'stati
         }
         if a.scale() == 0 && b.scale() == 0 {
             let (_, rem) = a.div_rem_int(&b);
-            return Some(Ok(demote_bignum(rem)));
+            return Some(Ok(bignum_to_value(rem)));
         }
         return None;
     }
@@ -1302,7 +1302,7 @@ fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'stati
         BinOp::Mul => a.mul(&b),
         _ => return None,
     };
-    Some(Ok(demote_bignum(res)))
+    Some(Ok(bignum_to_value(res)))
 }
 
 fn apply_binary_numeric(
@@ -3404,7 +3404,7 @@ pub(super) fn compare(
     // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 compares via bignum (the
     // finite path below would mis-read its canonical form).
     if matches!(l, Value::NumericBig(_)) || matches!(r, Value::NumericBig(_)) {
-        if let (Some(a), Some(b)) = (to_bignum(l), to_bignum(r)) {
+        if let (Some(a), Some(b)) = (value_to_bignum(l), value_to_bignum(r)) {
             return Ok(Value::Bool(cmp_to_bool(op, a.cmp(&b))));
         }
     }

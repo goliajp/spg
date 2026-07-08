@@ -153,9 +153,12 @@ fn apply_function_dispatch(
         F,
     }
     let spec: Option<&[Option<Co>]> = match name {
-        "abs" | "sqrt" | "cbrt" | "sign" | "ceil" | "ceiling" | "floor" | "exp" | "ln" => {
-            Some(&[Some(Co::N)])
-        }
+        "abs" | "sign" | "ceil" | "ceiling" | "floor" | "exp" | "ln" => Some(&[Some(Co::N)]),
+        // v7.38 (read01, C4) — sqrt/cbrt over an unknown-string arg resolve to
+        // the double overload in PG (`sqrt('16')` → double `4`, not numeric
+        // `4.0000…`), so coerce to float; a genuinely numeric-typed arg still
+        // reaches sqrt's numeric path.
+        "sqrt" | "cbrt" => Some(&[Some(Co::F)]),
         "round" => Some(&[Some(Co::N), Some(Co::I)]),
         // power/log with unknown-string args resolve to double in PG (the result
         // is `8`, not numeric `8.0000…`), so coerce to float.
@@ -8603,6 +8606,27 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.38 (read01, C4) — sqrt(numeric) stays NUMERIC (PG types it
+                // numeric, not double), exact to PG's ~16-significant-digit
+                // display scale. Integer sqrt on the arbitrary-precision value.
+                v @ (Value::Numeric { kind: spg_storage::NumericKind::Finite, .. }
+                | Value::NumericBig(_)) => {
+                    let big = crate::eval::binop::value_to_bignum(v).ok_or_else(|| {
+                        EvalError::TypeMismatch {
+                            detail: "sqrt(): numeric conversion".into(),
+                        }
+                    })?;
+                    if big.parts().0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "sqrt(): negative input outside real domain".into(),
+                        });
+                    }
+                    let rscale = crate::numeric::sqrt_display_scale_big(&big);
+                    let root = big.sqrt(rscale).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "sqrt(): negative input outside real domain".into(),
+                    })?;
+                    Ok(crate::eval::binop::bignum_to_value(root))
+                }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!("sqrt() needs numeric, got {:?}", v.data_type()),
