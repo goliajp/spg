@@ -83,7 +83,7 @@ pub(super) fn value_to_f64(v: &Value) -> Option<f64> {
         Value::SmallInt(x) => Some(f64::from(*x)),
         Value::Int(x) => Some(f64::from(*x)),
         Value::BigInt(x) => Some(*x as f64),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
         }
         _ => None,
@@ -121,7 +121,7 @@ pub(super) fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
         Value::SmallInt(x) => Some(f64::from(*x)),
         Value::Int(x) => Some(f64::from(*x)),
         Value::BigInt(x) => Some(*x as f64),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
         }
         _ => None,
@@ -131,7 +131,7 @@ pub(super) fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
         Value::SmallInt(x) => Some(f64::from(*x)),
         Value::Int(x) => Some(f64::from(*x)),
         Value::BigInt(x) => Some(*x as f64),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
         }
         _ => None,
@@ -235,7 +235,7 @@ pub(crate) fn value_to_text(v: &Value) -> String {
             let cells: Vec<String> = h.to_f32_vec().iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))
         }
-        Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => format_numeric(*scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Interval {
@@ -376,7 +376,7 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         Value::BoolArray(items) => nth!(items, |b| Value::Bool(*b)),
         Value::FloatArray(items) => nth!(items, |f| Value::Float(*f)),
         Value::NumericArray(items) => {
-            nth!(items, |t: &(i128, u8)| Value::Numeric { scaled: t.0, scale: t.1 })
+            nth!(items, |t: &(i128, u8)| Value::Numeric { scaled: t.0, scale: t.1 , kind: spg_storage::NumericKind::Finite })
         }
         Value::DateArray(items) => nth!(items, |d| Value::Date(*d)),
         Value::TimestampArray(items) | Value::TimestamptzArray(items) => {

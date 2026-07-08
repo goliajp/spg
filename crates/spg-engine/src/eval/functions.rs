@@ -4177,22 +4177,22 @@ fn apply_function_dispatch(
                     (K::Int8, Value::Int(n)) => Some(Value::BigInt(i64::from(*n))),
                     (K::Int8, Value::SmallInt(n)) => Some(Value::BigInt(i64::from(*n))),
                     (K::Int8, Value::BigInt(n)) => Some(Value::BigInt(*n)),
-                    (K::Num, Value::Numeric { scaled, scale }) => Some(Value::Numeric {
+                    (K::Num, Value::Numeric { scaled, scale, .. }) => Some(Value::Numeric {
                         scaled: *scaled,
                         scale: *scale,
-                    }),
+                     kind: spg_storage::NumericKind::Finite }),
                     (K::Num, Value::Int(n)) => Some(Value::Numeric {
                         scaled: i128::from(*n),
                         scale: 0,
-                    }),
+                     kind: spg_storage::NumericKind::Finite }),
                     (K::Num, Value::SmallInt(n)) => Some(Value::Numeric {
                         scaled: i128::from(*n),
                         scale: 0,
-                    }),
+                     kind: spg_storage::NumericKind::Finite }),
                     (K::Num, Value::BigInt(n)) => Some(Value::Numeric {
                         scaled: i128::from(*n),
                         scale: 0,
-                    }),
+                     kind: spg_storage::NumericKind::Finite }),
                     // Float literals (numrange(1.1, 2.2)) route
                     // through the range-element text parse so the
                     // Numeric scale matches the lexeme.
@@ -4971,10 +4971,10 @@ fn apply_function_dispatch(
                 Value::Float(x) => Ok(Value::Float(x.abs())),
                 // PG `abs(numeric)` returns numeric — preserve the type
                 // and scale, negating only the sign of the mantissa.
-                Value::Numeric { scaled, scale } => Ok(Value::Numeric {
+                Value::Numeric { scaled, scale, .. } => Ok(Value::Numeric {
                     scaled: scaled.abs(),
                     scale: *scale,
-                }),
+                 kind: spg_storage::NumericKind::Finite }),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("abs() needs numeric, got {:?}", other.data_type()),
                 }),
@@ -5924,7 +5924,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 _ => {
@@ -5982,7 +5982,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 _ => {
@@ -6046,7 +6046,7 @@ fn apply_function_dispatch(
                     Some(Value::SmallInt(n)) => Ok(f64::from(*n)),
                     Some(Value::BigInt(n)) => Ok(*n as f64),
                     Some(Value::Float(f)) => Ok(*f),
-                    Some(Value::Numeric { scaled, scale }) => {
+                    Some(Value::Numeric { scaled, scale, .. }) => {
                         Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
                     }
                     Some(other) => Err(EvalError::TypeMismatch {
@@ -6268,7 +6268,7 @@ fn apply_function_dispatch(
             // float; parse into the exact (scaled, scale) representation so
             // long / high-precision inputs don't lose digits to f64.
             match crate::numeric::parse_numeric_text(&cleaned) {
-                Some((scaled, scale)) => Ok(Value::Numeric { scaled, scale }),
+                Some((scaled, scale)) => Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }),
                 None => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("to_number(): could not parse {cleaned:?}"),
                 }),
@@ -7467,7 +7467,7 @@ fn apply_function_dispatch(
                     let us = (*f * 1_000_000.0).round() as i64;
                     Ok(Value::Timestamp(us))
                 }
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     // scaled / 10^scale = seconds. Multiply by 1e6.
                     let ten_pow = 10i128.pow(*scale as u32);
                     let us_i128 = *scaled as i128 * 1_000_000 / ten_pow;
@@ -7528,7 +7528,7 @@ fn apply_function_dispatch(
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
                 Value::Float(f) => *f,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / libm::pow(10.0, f64::from(*scale))
                 }
                 _ => unreachable!(),
@@ -7945,7 +7945,7 @@ fn apply_function_dispatch(
                 Value::BigInt(n) => *n as f64,
                 // PG accepts numeric via the implicit numeric→float8 cast
                 // (all these take double precision).
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 other => {
@@ -7988,7 +7988,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 other => {
@@ -8050,7 +8050,7 @@ fn apply_function_dispatch(
                     Value::Int(n) => Ok(f64::from(*n)),
                     Value::SmallInt(n) => Ok(f64::from(*n)),
                     Value::BigInt(n) => Ok(*n as f64),
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
                     }
                     other => Err(EvalError::TypeMismatch {
@@ -8085,7 +8085,7 @@ fn apply_function_dispatch(
                         Value::Int(n) => Ok(f64::from(*n)),
                         Value::SmallInt(n) => Ok(f64::from(*n)),
                         Value::BigInt(n) => Ok(*n as f64),
-                        Value::Numeric { scaled, scale } => {
+                        Value::Numeric { scaled, scale, .. } => {
                             Ok((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
                         }
                         other => Err(EvalError::TypeMismatch {
@@ -8111,7 +8111,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 other => {
@@ -8231,7 +8231,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 other => {
@@ -8281,7 +8281,7 @@ fn apply_function_dispatch(
                     Value::Int(n) => f64::from(*n),
                     Value::SmallInt(n) => f64::from(*n),
                     Value::BigInt(n) => *n as f64,
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                     }
                     other => {
@@ -8303,7 +8303,7 @@ fn apply_function_dispatch(
                     Value::Int(n) => f64::from(*n),
                     Value::SmallInt(n) => f64::from(*n),
                     Value::BigInt(n) => *n as f64,
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                     }
                     other => {
@@ -8583,12 +8583,12 @@ fn apply_function_dispatch(
                     };
                     Ok(Value::Float(s))
                 }
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let s = scaled.signum();
                     Ok(Value::Numeric {
                         scaled: s * pow10_i128(*scale),
                         scale: *scale,
-                    })
+                     kind: spg_storage::NumericKind::Finite })
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("sign() needs numeric, got {:?}", other.data_type()),
@@ -8638,13 +8638,13 @@ fn apply_function_dispatch(
             if let Value::Numeric {
                 scaled: base_scaled,
                 scale: base_scale,
-            } = &args[0]
+             .. } = &args[0]
             {
                 let exp_int: Option<u32> = match &args[1] {
                     Value::SmallInt(n) if *n >= 0 => Some(u32::from(*n as u16)),
                     Value::Int(n) if *n >= 0 => Some(*n as u32),
                     Value::BigInt(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Some(*n as u32),
-                    Value::Numeric { scaled, scale: 0 }
+                    Value::Numeric { scaled, scale: 0 , .. }
                         if *scaled >= 0 && *scaled <= i128::from(u32::MAX) =>
                     {
                         Some(*scaled as u32)
@@ -8702,7 +8702,7 @@ fn apply_function_dispatch(
                             return Ok(Value::Numeric {
                                 scaled,
                                 scale: display_rscale,
-                            });
+                             kind: spg_storage::NumericKind::Finite });
                         }
                         // Overflow (result exceeds i128 / >38 digits) — fall to
                         // the float path until bignum lands (S1.1b).
@@ -8800,7 +8800,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => f64::from(*n),
                 Value::SmallInt(n) => f64::from(*n),
                 Value::BigInt(n) => *n as f64,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                 }
                 other => {
@@ -8834,7 +8834,7 @@ fn apply_function_dispatch(
                         Value::SmallInt(n) => Some((i128::from(*n), 0)),
                         Value::Int(n) => Some((i128::from(*n), 0)),
                         Value::BigInt(n) => Some((i128::from(*n), 0)),
-                        Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+                        Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
                         _ => None,
                     }
                 };
@@ -8851,7 +8851,7 @@ fn apply_function_dispatch(
                         return Ok(Value::Numeric {
                             scaled: ya.wrapping_rem(xa),
                             scale: common,
-                        });
+                         kind: spg_storage::NumericKind::Finite });
                     }
                 }
             }
@@ -8864,7 +8864,7 @@ fn apply_function_dispatch(
                         Value::Int(n) => Some(f64::from(*n)),
                         Value::BigInt(n) => Some(*n as f64),
                         Value::Float(x) => Some(*x),
-                        Value::Numeric { scaled, scale } => {
+                        Value::Numeric { scaled, scale, .. } => {
                             Some((*scaled as f64) / (10i128.pow(u32::from(*scale)) as f64))
                         }
                         _ => None,
@@ -9333,7 +9333,7 @@ fn apply_function_dispatch(
                         Ok(args[0].clone().into_owned())
                     }
                     Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         let factor = pow10_i128(*scale);
                         // Truncate toward zero — sign-preserving division.
                         // PG `trunc(numeric)` (1-arg) yields scale 0.
@@ -9341,7 +9341,7 @@ fn apply_function_dispatch(
                         Ok(Value::Numeric {
                             scaled: q,
                             scale: 0,
-                        })
+                         kind: spg_storage::NumericKind::Finite })
                     }
                     // PG `trunc(macaddr)` zeros the last 3 bytes (clears the
                     // device-specific part, keeping the manufacturer prefix).
@@ -9385,20 +9385,20 @@ fn apply_function_dispatch(
                     // decimal rather than routing through f64 (which loses
                     // precision past ~15 significant digits). Truncate toward zero
                     // on the integer mantissa; i128 division already truncates.
-                    if let Value::Numeric { scaled, scale } = &args[0] {
+                    if let Value::Numeric { scaled, scale, .. } = &args[0] {
                         let cur = i32::from(*scale);
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_sign_loss)]
                             let out = if n >= cur {
                                 scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
-                                    Value::Numeric { scaled: m, scale: n as u8 }
+                                    Value::Numeric { scaled: m, scale: n as u8 , kind: spg_storage::NumericKind::Finite }
                                 })
                             } else {
                                 let factor = pow10_i128((cur - n) as u8);
                                 Some(Value::Numeric {
                                     scaled: scaled / factor,
                                     scale: n as u8,
-                                })
+                                 kind: spg_storage::NumericKind::Finite })
                             };
                             if let Some(v) = out {
                                 return Ok(v);
@@ -9410,7 +9410,7 @@ fn apply_function_dispatch(
                         Value::Int(v) => f64::from(*v),
                         Value::BigInt(v) => *v as f64,
                         Value::Float(v) => *v,
-                        Value::Numeric { scaled, scale } => {
+                        Value::Numeric { scaled, scale, .. } => {
                             (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                         }
                         other => {
@@ -9449,7 +9449,7 @@ fn apply_function_dispatch(
                     // genuine Float here is an explicit double, so banker's rounding
                     // is correct and no longer clashes with `round(2.5)=3`.
                     Value::Float(x) => Ok(Value::Float(super::math::f64_round_half_even(*x))),
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         let factor = pow10_i128(*scale);
                         // Half-away-from-zero on the magnitude, then
                         // restore the sign — div_euclid alone rounds
@@ -9464,7 +9464,7 @@ fn apply_function_dispatch(
                         Ok(Value::Numeric {
                             scaled: if neg { -mag } else { mag },
                             scale: 0,
-                        })
+                         kind: spg_storage::NumericKind::Finite })
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -9500,13 +9500,13 @@ fn apply_function_dispatch(
                     // lands at 1.25 instead of PG's 1.26). Do half-away-from-zero
                     // on the integer mantissa. Negative target scales fall
                     // through to the f64 path below (existing behaviour).
-                    if let Value::Numeric { scaled, scale } = &args[0] {
+                    if let Value::Numeric { scaled, scale, .. } = &args[0] {
                         let cur = i32::from(*scale);
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let out = if n >= cur {
                                 scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
-                                    Value::Numeric { scaled: m, scale: n as u8 }
+                                    Value::Numeric { scaled: m, scale: n as u8 , kind: spg_storage::NumericKind::Finite }
                                 })
                             } else {
                                 let factor = pow10_i128((cur - n) as u8);
@@ -9518,7 +9518,7 @@ fn apply_function_dispatch(
                                 Some(Value::Numeric {
                                     scaled: if neg { -mag } else { mag },
                                     scale: n as u8,
-                                })
+                                 kind: spg_storage::NumericKind::Finite })
                             };
                             if let Some(v) = out {
                                 return Ok(v);
@@ -9535,7 +9535,7 @@ fn apply_function_dispatch(
                         Value::Int(v) => f64::from(*v),
                         Value::BigInt(v) => *v as f64,
                         Value::Float(v) => *v,
-                        Value::Numeric { scaled, scale } => {
+                        Value::Numeric { scaled, scale, .. } => {
                             (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
                         }
                         other => {
@@ -9577,7 +9577,7 @@ fn apply_function_dispatch(
                     Ok(args[0].clone().into_owned())
                 }
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let factor = pow10_i128(*scale);
                     let q = scaled.div_euclid(factor);
                     let r = scaled.rem_euclid(factor);
@@ -9586,7 +9586,7 @@ fn apply_function_dispatch(
                     Ok(Value::Numeric {
                         scaled: result,
                         scale: 0,
-                    })
+                     kind: spg_storage::NumericKind::Finite })
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("ceil() needs numeric, got {:?}", other.data_type()),
@@ -9605,7 +9605,7 @@ fn apply_function_dispatch(
                     Ok(args[0].clone().into_owned())
                 }
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let factor = pow10_i128(*scale);
                     let q = scaled.div_euclid(factor);
                     // div_euclid rounds toward -infinity which is
@@ -9614,7 +9614,7 @@ fn apply_function_dispatch(
                     Ok(Value::Numeric {
                         scaled: q,
                         scale: 0,
-                    })
+                     kind: spg_storage::NumericKind::Finite })
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("floor() needs numeric, got {:?}", other.data_type()),
@@ -12214,7 +12214,7 @@ fn apply_function_dispatch(
                 Value::SmallInt(x) => i64::from(*x),
                 Value::Int(x) => i64::from(*x),
                 Value::BigInt(x) => *x,
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let ten_pow = 10i128.pow(*scale as u32);
                     (*scaled as i128 / ten_pow) as i64
                 }
@@ -13123,7 +13123,7 @@ fn apply_function_dispatch(
                     let total_cents = (abs * 100.0 + 0.5) as i64;
                     (total_cents / 100, total_cents % 100, neg)
                 }
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let neg = *scaled < 0;
                     let abs = scaled.unsigned_abs();
                     let pow = 10u128.pow(u32::from(*scale));
@@ -13277,7 +13277,7 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     // Strip trailing zeroes off the scaled integer to
                     // find the minimal scale.
                     let mut s = *scale as i32;
@@ -13307,14 +13307,14 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     let mut s = *scale;
                     let mut v = *scaled;
                     while s > 0 && v % 10 == 0 {
                         v /= 10;
                         s -= 1;
                     }
-                    Ok(Value::Numeric { scaled: v, scale: s })
+                    Ok(Value::Numeric { scaled: v, scale: s , kind: spg_storage::NumericKind::Finite })
                 }
                 v @ (Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)) => {
                     Ok(v.clone().into_owned())

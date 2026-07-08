@@ -1852,7 +1852,7 @@ fn encode_value_into(v: &Value, out: &mut String) {
         Value::Int(n) => out.push_str(&alloc::format!("{n}")),
         Value::BigInt(n) => out.push_str(&alloc::format!("{n}")),
         Value::Float(x) => out.push_str(&alloc::format!("{x}")),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             // Render the exact decimal text — same shape display uses.
             out.push_str(&render_numeric(*scaled, *scale));
         }

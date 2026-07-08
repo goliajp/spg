@@ -9,7 +9,7 @@ fn numeric(e: &mut Engine, sql: &str) -> (i128, u8) {
         panic!("expected Rows");
     };
     match rows[0].values[0] {
-        spg_storage::Value::Numeric { scaled, scale } => (scaled, scale),
+        spg_storage::Value::Numeric { scaled, scale , .. } => (scaled, scale),
         ref other => panic!("{sql}: expected Numeric, got {other:?}"),
     }
 }

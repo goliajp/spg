@@ -2567,7 +2567,7 @@ fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value<'static>, St
     Ok(spg_storage::Value::Numeric {
         scaled: final_value,
         scale,
-    })
+     kind: spg_storage::NumericKind::Finite })
 }
 
 /// Parse `[f1,f2,...,fn]` into `Vec<f32>`. Returns None on any
@@ -3794,7 +3794,7 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
-        Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         Value::Interval {
@@ -4845,7 +4845,7 @@ fn value_to_pg_text<'a>(
             let _ = write!(&mut buf, "P{months}M{days}D{micros}U");
             buf.into_bump_str()
         }
-        Value::Numeric { scaled, scale } => into_arena(&format_numeric(*scaled, *scale)),
+        Value::Numeric { scaled, scale, .. } => into_arena(&format_numeric(*scaled, *scale)),
         Value::Vector(vec) => {
             // Inline join into the arena buffer — avoids
             // intermediate `Vec<String> + parts.join(", ")` heap

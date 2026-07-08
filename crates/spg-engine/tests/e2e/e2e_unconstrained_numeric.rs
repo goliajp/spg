@@ -27,7 +27,7 @@ fn unconstrained_numeric_accepts_any_scale() {
     }
     // UPDATE to a differently-scaled numeric also works.
     e.execute("UPDATE sn SET n = 9.99 WHERE n = 7").unwrap();
-    assert_eq!(one(&mut e, "SELECT n FROM sn WHERE n = 9.99"), Value::Numeric { scaled: 999, scale: 2 });
+    assert_eq!(one(&mut e, "SELECT n FROM sn WHERE n = 9.99"), Value::Numeric { scaled: 999, scale: 2 , kind: spg_storage::NumericKind::Finite });
 }
 
 #[test]
@@ -36,5 +36,5 @@ fn declared_numeric_still_rescales() {
     e.execute("CREATE TABLE sp (n NUMERIC(10,2))").unwrap();
     // Rounds to the declared scale (PG: 3.14159 → 3.14).
     e.execute("INSERT INTO sp VALUES (3.14159)").unwrap();
-    assert_eq!(one(&mut e, "SELECT n FROM sp"), Value::Numeric { scaled: 314, scale: 2 });
+    assert_eq!(one(&mut e, "SELECT n FROM sp"), Value::Numeric { scaled: 314, scale: 2 , kind: spg_storage::NumericKind::Finite });
 }

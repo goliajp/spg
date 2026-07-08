@@ -1216,7 +1216,7 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         let (s, sc) = crate::numeric::numeric_add(
                             num_scaled, num_scale, *scaled, *scale,
                         );
@@ -1313,7 +1313,7 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale } => {
+                    Value::Numeric { scaled, scale, .. } => {
                         let (s, sc) = crate::numeric::numeric_add(
                             num_scaled, num_scale, scaled, scale,
                         );
@@ -2894,7 +2894,7 @@ fn update_state(
                 }
                 // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
                 // scales on the running max; result stays exact.
-                Value::Numeric { scaled, scale } => {
+                Value::Numeric { scaled, scale, .. } => {
                     st.use_numeric = true;
                     let (s, sc) = crate::numeric::numeric_add(
                         st.sum_num_scaled,
@@ -3224,7 +3224,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     i128::from(st.sum_int),
                     0,
                 );
-                Value::Numeric { scaled, scale }
+                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
             } else if st.use_float {
                 Value::Float(st.sum_float + (st.sum_int as f64))
             } else {
@@ -3272,7 +3272,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 );
                 let (scaled, scale) =
                     crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
-                Value::Numeric { scaled, scale }
+                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
             } else if st.use_float {
                 Value::Float((st.sum_float + (st.sum_int as f64)) / (st.count as f64))
             } else {
@@ -3281,7 +3281,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 // scale. sum(int) is unaffected (it reads sum_int as BigInt).
                 let (scaled, scale) =
                     crate::numeric::numeric_avg(i128::from(st.sum_int), 0, i128::from(st.count));
-                Value::Numeric { scaled, scale }
+                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
             }
         }
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
@@ -3559,7 +3559,7 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
         Value::Real(x) => Some(f64::from(*x)),
-        Value::Numeric { scaled, scale } => Some(numeric_to_f64(*scaled, *scale)),
+        Value::Numeric { scaled, scale, .. } => Some(numeric_to_f64(*scaled, *scale)),
         _ => None,
     }
 }
@@ -4252,7 +4252,7 @@ fn encode_one(out: &mut String, v: &Value) {
             }
             out.push('|');
         }
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             // v7.38 (read01) — DISTINCT keys numerically-equal decimals as one
             // regardless of scale (1.0 = 1.00), so strip trailing fractional
             // zeros before encoding, matching PG (and set-op / GROUP BY dedup).
@@ -4480,38 +4480,38 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // representations so 12.50 vs 5.25 orders correctly (the old
         // `_ => Equal` fallback made min/max(numeric) keep the first row).
         (
-            Value::Numeric { scaled: xs, scale: xsc },
-            Value::Numeric { scaled: ys, scale: ysc },
+            Value::Numeric { scaled: xs, scale: xsc , .. },
+            Value::Numeric { scaled: ys, scale: ysc , .. },
         ) => crate::orderby::cmp_numeric(*xs, *xsc, *ys, *ysc),
         // Mixed exact-decimal ↔ integer — promote the integer to a
         // NUMERIC at scale 0 and compare exactly (mirrors binop.rs
         // `numeric_or_widen`), so min/max over a mixed NUMERIC/int column
         // matches arithmetic + WHERE. The old `_ => Equal` fallback made
         // min/max keep whichever row happened to arrive first.
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::SmallInt(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::SmallInt(y)) => {
             crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::Int(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Int(y)) => {
             crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::BigInt(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::BigInt(y)) => {
             crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
         // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
         // `numeric op double precision`, so compare as f64.
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::Float(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Float(y)) => {
             crate::orderby::numeric_to_f64(*xs, *xsc).partial_cmp(y).unwrap_or(Equal)
         }
-        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             x.partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc)).unwrap_or(Equal)
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
@@ -4568,7 +4568,7 @@ mod value_cmp_mixed_numeric_tests {
     use spg_storage::Value;
 
     fn num(scaled: i128, scale: u8) -> Value<'static> {
-        Value::Numeric { scaled, scale }
+        Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
     }
 
     #[test]

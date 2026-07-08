@@ -2033,7 +2033,7 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
             out.extend_from_slice(&dim.to_le_bytes());
             out.extend_from_slice(&h.bytes);
         }
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             out.push(8);
             out.extend_from_slice(&scaled.to_le_bytes());
             out.push(*scale);
@@ -2978,7 +2978,7 @@ impl<'a> Cursor<'a> {
                 let arr: [u8; 16] = s.try_into().expect("checked");
                 let scaled = i128::from_le_bytes(arr);
                 let scale = self.read_u8()?;
-                Ok(Value::Numeric { scaled, scale })
+                Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
             }
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
             DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
@@ -3669,7 +3669,7 @@ impl<'a> Cursor<'a> {
                 let arr: [u8; 16] = s.try_into().expect("checked");
                 let scaled = i128::from_le_bytes(arr);
                 let scale = self.read_u8()?;
-                Ok(Value::Numeric { scaled, scale })
+                Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
             }
             9 => Ok(Value::Date(self.read_i32()?)),
             10 => Ok(Value::Timestamp(self.read_i64()?)),

@@ -114,40 +114,40 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // .. }`), corrupting `ORDER BY numeric_col` and every
         // aggregate-internal `ORDER BY` over a NUMERIC key.
         (
-            Value::Numeric { scaled: xs, scale: xsc },
-            Value::Numeric { scaled: ys, scale: ysc },
+            Value::Numeric { scaled: xs, scale: xsc , .. },
+            Value::Numeric { scaled: ys, scale: ysc , .. },
         ) => cmp_numeric(*xs, *xsc, *ys, *ysc),
         // Mixed exact-decimal ↔ integer — promote the integer to a
         // NUMERIC at scale 0 and compare exactly. Mirrors the int→numeric
         // promotion `apply_binary_numeric` (binop.rs `numeric_or_widen`)
         // uses for arithmetic + WHERE comparison, so ORDER BY / min / max
         // over a mixed NUMERIC/int key orders consistently with them.
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::SmallInt(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::SmallInt(y)) => {
             cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::Int(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Int(y)) => {
             cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::BigInt(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::BigInt(y)) => {
             cmp_numeric(*xs, *xsc, i128::from(*y), 0)
         }
-        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             cmp_numeric(i128::from(*x), 0, *ys, *ysc)
         }
         // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
         // `numeric op double precision` (the float_path in
         // `apply_binary_numeric`), so compare as f64 with the same
         // NaN-as-Equal fallback the Float arms above use.
-        (Value::Numeric { scaled: xs, scale: xsc }, Value::Float(y)) => {
+        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Float(y)) => {
             numeric_to_f64(*xs, *xsc).partial_cmp(y).unwrap_or(Ordering::Equal)
         }
-        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc }) => {
+        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
             x.partial_cmp(&numeric_to_f64(*ys, *ysc)).unwrap_or(Ordering::Equal)
         }
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
@@ -338,7 +338,7 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
             days,
             micros,
         } => eval::format_interval(*months, *days, *micros),
-        Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
             // Unreachable in practice (vector columns are filtered
             // out before this). Defensive fallback so a future
@@ -813,7 +813,7 @@ mod value_cmp_mixed_numeric_tests {
     use spg_storage::Value;
 
     fn num(scaled: i128, scale: u8) -> Value<'static> {
-        Value::Numeric { scaled, scale }
+        Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
     }
 
     #[test]

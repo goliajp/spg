@@ -1115,7 +1115,7 @@ fn value_to_text_for_array(v: &Value) -> String {
         Value::Real(x) => format::format_real(*x),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
-        Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => format_numeric(*scaled, *scale),
         _ => format!("{v:?}"),
     }
 }
@@ -1359,7 +1359,7 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
             }
         }
         Literal::Float(x) => Value::Float(*x),
-        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale },
+        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale , kind: spg_storage::NumericKind::Finite },
         Literal::String(s) => Value::text(s.clone()),
         Literal::Vector(v) => Value::vector(v.clone()),
         Literal::TextArray(items) => Value::TextArray(items.clone()),
@@ -1422,7 +1422,7 @@ mod tests {
             Value::Numeric {
                 scaled: 30,
                 scale: 1,
-            },
+             kind: spg_storage::NumericKind::Finite },
             Value::Interval {
                 months: 0,
                 days: 0,

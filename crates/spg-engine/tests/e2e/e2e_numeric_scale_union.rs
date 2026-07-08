@@ -10,7 +10,7 @@ fn render(e: &mut Engine, sql: &str) -> Vec<String> {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r.values[0] {
-                spg_storage::Value::Numeric { scaled, scale } => {
+                spg_storage::Value::Numeric { scaled, scale , .. } => {
                     if *scale == 0 {
                         scaled.to_string()
                     } else {

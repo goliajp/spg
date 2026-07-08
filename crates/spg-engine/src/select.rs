@@ -4676,7 +4676,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             ));
         }
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             // Scaled integer / 10^scale, computed via f64 for sort
             // ordering only. Precision losses here only matter for
             // ORDER BY tie-breaks well past 15 significant digits.
@@ -5040,7 +5040,7 @@ fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
             Value::SmallInt(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
             Value::Int(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
             Value::BigInt(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
-            Value::Numeric { scaled, scale } => encode_numeric_key(&mut out, *scaled, *scale),
+            Value::Numeric { scaled, scale, .. } => encode_numeric_key(&mut out, *scaled, *scale),
             other => {
                 let s = alloc::format!("{other:?}|");
                 out.extend_from_slice(s.as_bytes());

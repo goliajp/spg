@@ -747,7 +747,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             }
             Ok(Value::Int(r as i32))
         }
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i32::try_from(rounded)
                 .map(Value::Int)
@@ -790,7 +790,7 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
             }
             Ok(Value::BigInt(r as i64))
         }
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i64::try_from(rounded)
                 .map(Value::BigInt)
@@ -824,7 +824,7 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
         // `Value::Numeric` (from `::numeric`, a numeric column, or
         // numeric arithmetic) must convert to f64, not error.
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             Ok(Value::Float((scaled as f64) / f64_powi(10.0, i32::from(scale))))
         }
         Value::Text(s) => {

@@ -19,7 +19,7 @@ fn window_sum_result_types() {
     e.execute("INSERT INTO wt VALUES (10, 1.5, 2.5), (20, 2.5, 3.5)").unwrap();
     assert_eq!(one(&mut e, "SELECT sum(v) OVER () FROM wt LIMIT 1"), Value::BigInt(30));
     assert_eq!(one(&mut e, "SELECT sum(f) OVER () FROM wt LIMIT 1"), Value::Float(4.0));
-    assert_eq!(one(&mut e, "SELECT sum(n) OVER () FROM wt LIMIT 1"), Value::Numeric { scaled: 60, scale: 1 });
+    assert_eq!(one(&mut e, "SELECT sum(n) OVER () FROM wt LIMIT 1"), Value::Numeric { scaled: 60, scale: 1 , kind: spg_storage::NumericKind::Finite });
     // Running frame sums are also BIGINT.
     match e.execute("SELECT sum(v) OVER (ORDER BY v) FROM wt ORDER BY v").unwrap() {
         QueryResult::Rows { rows, .. } => {

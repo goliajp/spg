@@ -26,7 +26,7 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
         Value::Vector(v) => Literal::Vector(v.into_owned()),
-        Value::Numeric { scaled, scale } => Literal::String(eval::format_numeric(scaled, scale)),
+        Value::Numeric { scaled, scale, .. } => Literal::String(eval::format_numeric(scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
         // v7.17.0 Phase 3.P0-69 — UUID round-trips via canonical

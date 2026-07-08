@@ -32,7 +32,7 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         Value::Float(x) => Literal::Float(x),
         // v7.38 (read01) — a scalar subquery returning NUMERIC (common now that
         // decimal literals are numeric) materialises back through Literal::Numeric.
-        Value::Numeric { scaled, scale } => Literal::Numeric {
+        Value::Numeric { scaled, scale, .. } => Literal::Numeric {
             unscaled: scaled,
             scale,
         },
@@ -114,7 +114,7 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
             Literal::String(format_timestamp_micros_as_date(micros))
         }
         Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),
-        Value::Numeric { scaled, scale } => Literal::String(format_numeric(scaled, scale)),
+        Value::Numeric { scaled, scale, .. } => Literal::String(format_numeric(scaled, scale)),
         // v7.37.43-T4 — UUID round-trips through its canonical
         // 8-4-4-4-12 hex text form. `coerce_value` against a UUID
         // target column re-parses the literal back to `Value::Uuid`.

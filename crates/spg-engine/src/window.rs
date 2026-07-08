@@ -350,7 +350,7 @@ pub(crate) fn compute_window_partition(
                                 // sum/avg: exact NUMERIC accumulation for
                                 // Numeric cells (aligns scales, no f64);
                                 // int/float continue through the f64 path.
-                                if let Value::Numeric { scaled, scale } = v {
+                                if let Value::Numeric { scaled, scale, .. } = v {
                                     let (s, sc) = crate::numeric::numeric_add(
                                         num_scaled, num_scale, *scaled, *scale,
                                     );
@@ -396,7 +396,7 @@ pub(crate) fn compute_window_partition(
                         if count == 0 {
                             Value::Null
                         } else if use_numeric {
-                            Value::Numeric { scaled: num_scaled, scale: num_scale }
+                            Value::Numeric { scaled: num_scaled, scale: num_scale , kind: spg_storage::NumericKind::Finite }
                         } else if all_int && i64::try_from(int_sum).is_ok() {
                             // Integer inputs → BIGINT, matching PG and the
                             // GROUP BY sum() path.
@@ -414,7 +414,7 @@ pub(crate) fn compute_window_partition(
                                 num_scale,
                                 i128::from(count),
                             );
-                            Value::Numeric { scaled, scale }
+                            Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
                         } else {
                             Value::Float(sum / count as f64)
                         }
@@ -885,7 +885,7 @@ fn range_order_key_f64(key: &[(Value, bool, Option<bool>)]) -> Option<(f64, bool
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
         Value::Float(x) => *x,
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale, .. } => {
             (*scaled as f64) / (10i128.pow(u32::from(*scale)) as f64)
         }
         _ => return None,

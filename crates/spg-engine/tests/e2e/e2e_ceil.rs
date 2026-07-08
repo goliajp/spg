@@ -22,7 +22,7 @@ fn float_result(e: &mut Engine, sql: &str) -> f64 {
         Value::Float(x) => *x,
         // v7.38 (read01) — a dotted literal is now NUMERIC, so ceil/floor over a
         // bare-literal input returns NUMERIC; accept it and read the f64 value.
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             *scaled as f64 / 10f64.powi(i32::from(*scale))
         }
         other => panic!("expected numeric, got {other:?}"),

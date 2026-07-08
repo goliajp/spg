@@ -15,7 +15,7 @@ fn n(e: &mut Engine, sql: &str) -> i64 {
         // v7.38 (read01 sweep) — fraction-bearing fields (epoch/second/
         // milliseconds) now return NUMERIC to keep sub-second precision;
         // truncate to the integer part for these whole-number assertions.
-        spg_storage::Value::Numeric { scaled, scale } => {
+        spg_storage::Value::Numeric { scaled, scale , .. } => {
             (scaled / 10i128.pow(u32::from(scale))) as i64
         }
         ref other => panic!("{sql}: expected integer, got {other:?}"),

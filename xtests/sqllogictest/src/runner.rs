@@ -215,7 +215,7 @@ fn render_cell(v: &Value, ty: char) -> String {
                 .collect();
             format!("[{}]", cells.join(", "))
         }
-        Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale , .. } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.

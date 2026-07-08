@@ -46,7 +46,7 @@ fn render(v: &Value) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => x.to_string(),
         Value::Text(s) => s.to_string(),
-        Value::Numeric { scaled, scale } => {
+        Value::Numeric { scaled, scale , .. } => {
             let neg = *scaled < 0;
             let mut digits = scaled.unsigned_abs().to_string();
             let sc = *scale as usize;
