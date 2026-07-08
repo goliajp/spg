@@ -1380,8 +1380,9 @@ fn apply_function_dispatch(
                     })?;
                     fn pretty(v: &crate::json::JsonValue, indent: usize) -> alloc::string::String {
                         use alloc::string::String;
-                        let pad = "  ".repeat(indent);
-                        let pad_next = "  ".repeat(indent + 1);
+                        // v7.38 (read01) — PG jsonb_pretty indents with 4 spaces.
+                        let pad = "    ".repeat(indent);
+                        let pad_next = "    ".repeat(indent + 1);
                         match v {
                             crate::json::JsonValue::Null => "null".into(),
                             crate::json::JsonValue::Bool(b) => {
