@@ -8566,6 +8566,87 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01, T5) — a NUMERIC base raised to a non-negative
+            // integer exponent is exact and returns NUMERIC (PG types
+            // `numeric ^` / power(numeric, …) as numeric). The display scale
+            // follows PG: rscale = 17 − (integer digits) for |result| ≥ 1, else
+            // 16. Fractional / negative exponents need numeric ln/exp and stay
+            // on the float path below. (An integer base like `2 ^ 10` is double
+            // in PG, so this only fires for a Numeric base.)
+            if let Value::Numeric {
+                scaled: base_scaled,
+                scale: base_scale,
+            } = &args[0]
+            {
+                let exp_int: Option<u32> = match &args[1] {
+                    Value::SmallInt(n) if *n >= 0 => Some(u32::from(*n as u16)),
+                    Value::Int(n) if *n >= 0 => Some(*n as u32),
+                    Value::BigInt(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Some(*n as u32),
+                    Value::Numeric { scaled, scale: 0 }
+                        if *scaled >= 0 && *scaled <= i128::from(u32::MAX) =>
+                    {
+                        Some(*scaled as u32)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = exp_int {
+                    let result_scale = u32::from(*base_scale) * n;
+                    // Keep the exact scale in a range where 10^scale fits i128.
+                    if result_scale <= 38 {
+                        let mut acc: i128 = 1;
+                        let mut ok = true;
+                        for _ in 0..n {
+                            match acc.checked_mul(*base_scaled) {
+                                Some(v) => acc = v,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let exact_scale = result_scale as u8;
+                        let int_part = if exact_scale == 0 {
+                            acc.abs()
+                        } else {
+                            acc.abs() / 10i128.pow(result_scale)
+                        };
+                        let display_rscale: u8 = if int_part == 0 {
+                            16
+                        } else {
+                            let mut d = 0u32;
+                            let mut t = int_part;
+                            while t > 0 {
+                                d += 1;
+                                t /= 10;
+                            }
+                            17u32.saturating_sub(d).min(16) as u8
+                        };
+                        let final_scaled = if !ok {
+                            None
+                        } else if display_rscale >= exact_scale {
+                            10i128
+                                .checked_pow(u32::from(display_rscale - exact_scale))
+                                .and_then(|bump| acc.checked_mul(bump))
+                        } else {
+                            let drop = 10i128.pow(u32::from(exact_scale - display_rscale));
+                            let half = drop / 2;
+                            Some(if acc >= 0 {
+                                (acc + half) / drop
+                            } else {
+                                (acc - half) / drop
+                            })
+                        };
+                        if let Some(scaled) = final_scaled {
+                            return Ok(Value::Numeric {
+                                scaled,
+                                scale: display_rscale,
+                            });
+                        }
+                        // Overflow (result exceeds i128 / >38 digits) — fall to
+                        // the float path until bignum lands (S1.1b).
+                    }
+                }
+            }
             let x = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "power() needs numeric x".into(),
             })?;
