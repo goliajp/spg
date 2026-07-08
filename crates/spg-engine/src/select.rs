@@ -1819,7 +1819,7 @@ impl Engine {
                 UnionKind::Intersect => {
                     rows = dedup_rows(rows)
                         .into_iter()
-                        .filter(|r| peer_rows.iter().any(|p| p == r))
+                        .filter(|r| peer_rows.iter().any(|p| row_eq_norm(p, r)))
                         .collect();
                 }
                 // INTERSECT ALL: multiset intersection — each row
@@ -1828,7 +1828,7 @@ impl Engine {
                     let mut peer_pool = peer_rows;
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| p == &r) {
+                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r)) {
                             peer_pool.swap_remove(pos);
                             kept.push(r);
                         }
@@ -1839,7 +1839,7 @@ impl Engine {
                 UnionKind::Except => {
                     rows = dedup_rows(rows)
                         .into_iter()
-                        .filter(|r| !peer_rows.iter().any(|p| p == r))
+                        .filter(|r| !peer_rows.iter().any(|p| row_eq_norm(p, r)))
                         .collect();
                 }
                 // EXCEPT ALL: multiset subtraction — each right
@@ -1848,7 +1848,7 @@ impl Engine {
                     let mut peer_pool = peer_rows;
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| p == &r) {
+                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r)) {
                             peer_pool.swap_remove(pos);
                         } else {
                             kept.push(r);
@@ -4515,11 +4515,24 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
 fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
     let mut out: Vec<Row<'static>> = Vec::with_capacity(rows.len());
     for r in rows {
-        if !out.iter().any(|seen| seen == &r) {
+        if !out.iter().any(|seen| row_eq_norm(seen, &r)) {
             out.push(r);
         }
     }
     out
+}
+
+/// v7.38 (read01) — row equality for DISTINCT / UNION / INTERSECT / EXCEPT that
+/// treats numerically-equal exact values as one regardless of type or scale
+/// (`1 = 1.0 = 1.00`), matching PG (and GROUP BY). Uses the scale-aware
+/// `orderby::value_cmp`, so `Int(1)` and `Numeric{10,1}` compare Equal; plain
+/// `Row` `==` would keep them distinct.
+pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>) -> bool {
+    a.values.len() == b.values.len()
+        && a.values
+            .iter()
+            .zip(&b.values)
+            .all(|(x, y)| crate::orderby::value_cmp(x, y) == core::cmp::Ordering::Equal)
 }
 
 /// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;
@@ -4992,10 +5005,35 @@ fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) 
 fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
     let mut out = Vec::new();
     for v in &row.values {
-        let s = alloc::format!("{v:?}|");
-        out.extend_from_slice(s.as_bytes());
+        // v7.38 (read01) — UNION / DISTINCT dedup must treat numerically-equal
+        // exact values as one, regardless of type or scale (`1 = 1.0 = 1.00`),
+        // like PG (and like GROUP BY, which already normalizes). The old
+        // `{v:?}` key made `Numeric{10,1}` differ from `Numeric{100,2}`. Encode
+        // the exact-decimal family through one scale-stripped canonical form.
+        match v {
+            Value::SmallInt(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
+            Value::Int(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
+            Value::BigInt(n) => encode_numeric_key(&mut out, i128::from(*n), 0),
+            Value::Numeric { scaled, scale } => encode_numeric_key(&mut out, *scaled, *scale),
+            other => {
+                let s = alloc::format!("{other:?}|");
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
     }
     out
+}
+
+/// Append a scale-independent canonical key for an exact-decimal value: strip
+/// trailing fractional zeros so `1`, `1.0`, `1.00` all key the same. The `\x01`
+/// tag keeps a numeric key from colliding with a text value's `{v:?}` form.
+fn encode_numeric_key(out: &mut Vec<u8>, mut scaled: i128, mut scale: u8) {
+    while scale > 0 && scaled % 10 == 0 {
+        scaled /= 10;
+        scale -= 1;
+    }
+    let s = alloc::format!("\u{1}{scaled}e-{scale}|");
+    out.extend_from_slice(s.as_bytes());
 }
 
 /// Multi-arg `unnest(a, b, …)` — evaluate each array argument
