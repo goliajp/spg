@@ -2812,9 +2812,9 @@ mod pg18_differential_tests {
         //  implemented — see the lazy span cases in
         //  `pg18_differential_corpus`. No longer deferred.)
 
-        // Backreferences — architectural (ReNode has no capture state).
-        // PG18: 'abab' ~ '(ab)\1' = true
-        // SPG : \1 is a literal '1' → false
-        assert!(!like("abab", r"(ab)\1", false));
+        // (In-pattern backreferences `\1`..`\9` are now implemented — see
+        //  `e2e_regex_backref.rs` (T7-br). `'abab' ~ '(ab)\1'` is now true,
+        //  matching PG. No longer deferred.)
+        assert!(like("abab", r"(ab)\1", false));
     }
 }
