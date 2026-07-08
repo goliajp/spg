@@ -4209,6 +4209,13 @@ fn encode_one(out: &mut String, v: &Value) {
             out.push_str(s);
             out.push('|');
         }
+        // v7.38 (read01, T11/R3) — bpchar groups / dedups blank-insensitively,
+        // and shares the text key so `'ab'::char(4)` and `'ab'` co-group.
+        Value::BpChar(s) => {
+            out.push('S');
+            out.push_str(s.trim_end_matches(' '));
+            out.push('|');
+        }
         Value::Vector(v) => {
             out.push('V');
             for x in v.iter() {
