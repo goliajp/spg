@@ -1265,6 +1265,13 @@ fn demote_bignum(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
 /// i128 fast path overflowed, or where an operand is already `NumericBig`.
 fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'static>, EvalError>> {
     let (a, b) = (to_bignum(l)?, to_bignum(r)?);
+    // Comparison honors the exact big values (sign + scale-aligned magnitude).
+    if matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return Some(Ok(Value::Bool(cmp_to_bool(op, a.cmp(&b)))));
+    }
     let res = match op {
         BinOp::Add => a.add(&b),
         BinOp::Sub => a.sub(&b),
@@ -3364,6 +3371,13 @@ pub(super) fn compare(
     if let (Some(dt), Value::Text(s)) = (needs_text_coerce(l), r) {
         if let Ok(c) = crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0) {
             return compare(op, l, &c);
+        }
+    }
+    // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 compares via bignum (the
+    // finite path below would mis-read its canonical form).
+    if matches!(l, Value::NumericBig(_)) || matches!(r, Value::NumericBig(_)) {
+        if let (Some(a), Some(b)) = (to_bignum(l), to_bignum(r)) {
+            return Ok(Value::Bool(cmp_to_bool(op, a.cmp(&b))));
         }
     }
     // v7.38 (read01, T11) — bpchar compares blank-insensitively: when either
