@@ -40,7 +40,14 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
     }
     match target {
         CastTarget::Vector => cast_to_vector(v),
-        CastTarget::Text => Ok(Value::text(value_to_text(&v))),
+        // v7.38 (read01) — the inet/cidr ::text cast shows the mask even for
+        // /32 and /128 (PG's cast-path form, unlike the display default).
+        CastTarget::Text => Ok(Value::text(match &v {
+            Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                crate::conversions::format_inet_full(*family, *bits, addr)
+            }
+            _ => value_to_text(&v),
+        })),
         CastTarget::Int => cast_numeric_to_int(v),
         CastTarget::BigInt => cast_numeric_to_bigint(v),
         CastTarget::Float => cast_numeric_to_float(v),

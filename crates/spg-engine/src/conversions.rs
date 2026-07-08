@@ -1292,6 +1292,15 @@ pub fn parse_polygon_text(s: &str) -> Option<Vec<spg_storage::Point2D>> {
 /// IPv4: `a.b.c.d/bits`; IPv6: `xxxx:xxxx:.../bits`. The mask is
 /// elided when it equals the family default (32 for IPv4, 128 for
 /// IPv6), per PG convention.
+/// v7.38 (read01) — inet text with the mask ALWAYS shown (`192.168.1.0/32`),
+/// as PG's `inet::text` / `::varchar` cast renders it (the default display and
+/// concat omit `/32` and `/128`; this is the cast-path form).
+pub fn format_inet_full(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::String {
+    let max = if family == 4 { 32 } else { 128 };
+    let base = format_inet(family, max, addr);
+    alloc::format!("{base}/{bits}")
+}
+
 pub fn format_inet(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::String {
     match family {
         4 => {
