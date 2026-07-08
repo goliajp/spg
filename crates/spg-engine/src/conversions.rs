@@ -1319,6 +1319,18 @@ pub fn format_inet(family: u8, bits: u8, addr: &[u8; 16]) -> alloc::string::Stri
             for (i, g) in groups.iter_mut().enumerate() {
                 *g = (u16::from(addr[i * 2]) << 8) | u16::from(addr[i * 2 + 1]);
             }
+            // v7.38 (read01, T19) — IPv4-mapped IPv6 (`::ffff:0:0/96` range:
+            // first five groups zero, sixth 0xffff) renders with a dotted-quad
+            // tail, matching PG (independent of the input spelling).
+            if groups[..5].iter().all(|&g| g == 0) && groups[5] == 0xffff {
+                let s =
+                    alloc::format!("::ffff:{}.{}.{}.{}", addr[12], addr[13], addr[14], addr[15]);
+                return if bits == 128 {
+                    s
+                } else {
+                    alloc::format!("{s}/{bits}")
+                };
+            }
             let (mut best_start, mut best_len) = (usize::MAX, 0usize);
             let mut i = 0;
             while i < 8 {
@@ -1458,31 +1470,63 @@ pub fn parse_inet_text(s: &str) -> Option<(u8, u8, [u8; 16])> {
             Some(idx) => (&addr_s[..idx], Some(&addr_s[idx + 2..])),
             None => (addr_s, None),
         };
-        let head_groups: alloc::vec::Vec<&str> = if head.is_empty() {
+        let mut head_groups: alloc::vec::Vec<&str> = if head.is_empty() {
             alloc::vec::Vec::new()
         } else {
             head.split(':').collect()
         };
-        let tail_groups: alloc::vec::Vec<&str> = match tail {
+        let mut tail_groups: alloc::vec::Vec<&str> = match tail {
             Some(t) if !t.is_empty() => t.split(':').collect(),
             _ => alloc::vec::Vec::new(),
         };
+        // v7.38 (read01, T19) — a trailing dotted-quad (IPv4-in-IPv6, e.g.
+        // `::ffff:192.168.1.1`, `64:ff9b::192.0.2.1`) fills the last two 16-bit
+        // words. It is always the final group overall.
+        let mut dotted_words: Option<[u16; 2]> = None;
+        if let Some(g) = tail_groups.last().or_else(|| head_groups.last()) {
+            if g.contains('.') {
+                let oct: alloc::vec::Vec<&str> = g.split('.').collect();
+                if oct.len() != 4 {
+                    return None;
+                }
+                let mut b = [0u8; 4];
+                for (i, o) in oct.iter().enumerate() {
+                    b[i] = o.parse::<u8>().ok()?;
+                }
+                dotted_words = Some([
+                    (u16::from(b[0]) << 8) | u16::from(b[1]),
+                    (u16::from(b[2]) << 8) | u16::from(b[3]),
+                ]);
+                if !tail_groups.is_empty() {
+                    tail_groups.pop();
+                } else {
+                    head_groups.pop();
+                }
+            }
+        }
+        let dq = if dotted_words.is_some() { 2 } else { 0 };
         let head_len = head_groups.len();
         let tail_len = tail_groups.len();
         if tail.is_none() {
-            if head_len != 8 {
+            if head_len + dq != 8 {
                 return None;
             }
-        } else if head_len + tail_len > 7 {
+        } else if head_len + tail_len + dq > 7 {
             return None;
         }
         let mut words = [0u16; 8];
         for (i, g) in head_groups.iter().enumerate() {
             words[i] = u16::from_str_radix(g, 16).ok()?;
         }
-        let tail_start = 8 - tail_len;
+        // The dotted-quad (if any) occupies the final two words; hex tail groups
+        // sit just before it.
+        let trailing_start = 8 - dq - tail_len;
         for (i, g) in tail_groups.iter().enumerate() {
-            words[tail_start + i] = u16::from_str_radix(g, 16).ok()?;
+            words[trailing_start + i] = u16::from_str_radix(g, 16).ok()?;
+        }
+        if let Some(dw) = dotted_words {
+            words[6] = dw[0];
+            words[7] = dw[1];
         }
         let mut addr = [0u8; 16];
         for (i, w) in words.iter().enumerate() {
