@@ -2131,6 +2131,33 @@ fn interval_span_cmp(
     span(a).cmp(&span(b))
 }
 
+/// v7.38 (read01, T12.4) — PG's tsvector B-tree total order: lexeme count
+/// first, then per-lexeme by word (length, then bytes), then positions, then
+/// weight. (The position tiebreak direction for identical words is a niche
+/// detail; the count + word ordering matches PG.)
+fn tsvector_total_cmp(
+    a: &[spg_storage::TsLexeme],
+    b: &[spg_storage::TsLexeme],
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering::Equal;
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    for (la, lb) in a.iter().zip(b.iter()) {
+        let c = la
+            .word
+            .len()
+            .cmp(&lb.word.len())
+            .then_with(|| la.word.cmp(&lb.word))
+            .then_with(|| la.positions.cmp(&lb.positions))
+            .then_with(|| la.weight.cmp(&lb.weight));
+        if c != Equal {
+            return c;
+        }
+    }
+    Equal
+}
+
 /// Map a computed `Ordering` to the boolean result of a comparison op.
 fn cmp_result(op: BinOp, ord: core::cmp::Ordering) -> Result<Value<'static>, EvalError> {
     match op {
@@ -3334,14 +3361,15 @@ pub(super) fn compare(
         // word + deduped with their (ascending) positions and weight, so a
         // structural compare matches PG (`'bar foo' = 'foo bar'`, position-
         // sensitive, deduped). Ordering (< etc.) is deferred.
+        // v7.38 (read01, T12.4) — TSVECTOR total order. Equality stays
+        // structural (position/weight sensitive); ordering follows PG: lexeme
+        // count first, then per-lexeme by word (length, then bytes), then
+        // positions, then weight.
         (Value::TsVector(a), Value::TsVector(b)) => {
-            let eq = a == b;
             return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: "tsvector ordering (<, <=, >, >=) not yet supported; only = / <>".into(),
-                }),
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::NotEq => Ok(Value::Bool(a != b)),
+                _ => cmp_result(op, tsvector_total_cmp(a, b)),
             };
         }
         // v7.38 (read01 P6.31) — TSQUERY equality (=/<>). PG does NOT normalise
