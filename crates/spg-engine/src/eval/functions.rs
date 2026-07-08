@@ -41,6 +41,51 @@ pub(super) fn apply_function(
 /// v7.38 (read01 P6.31) — count the nodes of a tsquery AST the way PG's
 /// numnode() does: every lexeme term and every operator (AND / OR / NOT /
 /// PHRASE) counts as one node.
+/// v7.38 (read01, T17) — convert a SQL-standard SIMILAR substring pattern to an
+/// anchored POSIX regex. `%`→`.*`, `_`→`.`, `<esc>"` markers become a capturing
+/// group boundary (`(` then `)`) so the group-extracting POSIX substring returns
+/// the delimited portion; other `<esc>c` sequences are literal escapes.
+fn similar_substring_to_posix(pat: &str, esc: Option<char>) -> alloc::string::String {
+    let mut out = alloc::string::String::from("^");
+    let mut opened = false;
+    let mut iter = pat.chars();
+    while let Some(c) = iter.next() {
+        if Some(c) == esc {
+            match iter.next() {
+                Some('"') => {
+                    // `<esc>"` toggles the capture group boundary.
+                    if opened {
+                        out.push(')');
+                    } else {
+                        out.push('(');
+                        opened = true;
+                    }
+                }
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        match c {
+            // Lazy so the surrounding `%` yields to the captured portion, e.g.
+            // `%#"[0-9]+#"%` over `abc123def` captures the full `123`.
+            '%' => out.push_str(".*?"),
+            '_' => out.push('.'),
+            '[' | ']' | '(' | ')' | '|' | '+' | '*' | '?' | '{' | '}' => out.push(c),
+            '.' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('$');
+    out
+}
+
 fn count_tsquery_nodes(ast: &spg_storage::TsQueryAst) -> i32 {
     use spg_storage::TsQueryAst as Q;
     match ast {
@@ -4371,6 +4416,26 @@ fn apply_function_dispatch(
                     return Ok(Value::Null);
                 };
                 return super::regexp::substring_pattern(src, pat);
+            }
+            // v7.38 (read01, T17) — SQL-standard `substring(text FROM sql_regex
+            // FOR escape)`: SIMILAR-TO pattern with `<esc>"..."<esc>"` (`#"..#"`)
+            // delimiting the returned portion. Convert to a POSIX regex where the
+            // markers become a capturing group, then reuse the group-extracting
+            // POSIX substring. Only fires when both arg1 and arg2 are TEXT so a
+            // real numeric `FOR len` still takes the positional path below.
+            if name != "mid"
+                && args.len() == 3
+                && matches!(&args[1], Value::Text(_))
+                && matches!(&args[2], Value::Text(_))
+            {
+                let (Value::Text(src), Value::Text(pat), Value::Text(esc)) =
+                    (&args[0], &args[1], &args[2])
+                else {
+                    return Ok(Value::Null);
+                };
+                let esc_ch = esc.chars().next();
+                let posix = similar_substring_to_posix(pat, esc_ch);
+                return super::regexp::substring_pattern(src, &posix);
             }
             let start: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
