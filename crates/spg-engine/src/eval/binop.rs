@@ -48,13 +48,20 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                     detail: "smallint overflow on unary -".into(),
                 })
         }
-        (UnOp::Neg, Value::Numeric { scaled, scale, .. }) => {
-            scaled
-                .checked_neg()
-                .map(|s| Value::Numeric { scaled: s, scale , kind: spg_storage::NumericKind::Finite })
-                .ok_or(EvalError::TypeMismatch {
-                    detail: "numeric overflow on unary -".into(),
-                })
+        (UnOp::Neg, Value::Numeric { scaled, scale, kind }) => {
+            use spg_storage::NumericKind as NK;
+            match kind {
+                NK::Finite => scaled
+                    .checked_neg()
+                    .map(|s| Value::Numeric { scaled: s, scale, kind: NK::Finite })
+                    .ok_or(EvalError::TypeMismatch {
+                        detail: "numeric overflow on unary -".into(),
+                    }),
+                // v7.38 (read01, T6.P3) — -(NaN)=NaN, -(±Inf)=∓Inf.
+                NK::NaN => Ok(Value::numeric_special(NK::NaN)),
+                NK::PosInf => Ok(Value::numeric_special(NK::NegInf)),
+                NK::NegInf => Ok(Value::numeric_special(NK::PosInf)),
+            }
         }
         // NOTE: PG has no `- money` operator (unary minus on money is an
         // error there), so money is intentionally NOT handled here.
@@ -1117,6 +1124,118 @@ fn lseg_intersection(
     }
 }
 
+/// v7.38 (read01, T6.P3) — the NUMERIC kind of a numeric-family operand, or None
+/// for a non-numeric value (which falls through to the ordinary type path).
+fn numeric_kind_of(v: &Value) -> Option<spg_storage::NumericKind> {
+    use spg_storage::NumericKind::Finite;
+    match v {
+        Value::Numeric { kind, .. } => Some(*kind),
+        Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) => Some(Finite),
+        _ => None,
+    }
+}
+
+fn finite_sign_of(v: &Value) -> i32 {
+    match v {
+        Value::Numeric { scaled, .. } => (*scaled).signum() as i32,
+        Value::Int(n) => n.signum(),
+        Value::BigInt(n) => (*n).signum() as i32,
+        Value::SmallInt(n) => i32::from(*n).signum(),
+        _ => 0,
+    }
+}
+
+/// v7.38 (read01, T6.P3) — PG's NUMERIC special-value arithmetic. Returns
+/// `Some` when a NaN/±Infinity operand determines the result (verified vs PG:
+/// NaN wins over everything incl. div-by-zero; `Inf/0` still errors; `Inf-Inf` /
+/// `Inf*0` / `Inf/Inf` → NaN; `finite/Inf` → 0; `finite%Inf` → the dividend;
+/// `Inf%x` → NaN; sign multiplies). `None` falls through to the finite path.
+fn numeric_special_result(
+    op: BinOp,
+    l: &Value<'static>,
+    r: &Value<'static>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    use spg_storage::NumericKind as NK;
+    let (lk, rk) = (numeric_kind_of(l)?, numeric_kind_of(r)?);
+    if lk == NK::Finite && rk == NK::Finite {
+        return None;
+    }
+    if !matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    ) {
+        return None;
+    }
+    let nan = || Ok(Value::numeric_special(NK::NaN));
+    // NaN wins over everything, including division by zero.
+    if lk == NK::NaN || rk == NK::NaN {
+        return Some(nan());
+    }
+    // After NaN: a zero divisor still errors (PG: `Infinity / 0` errors too).
+    let r_is_zero = rk == NK::Finite && finite_sign_of(r) == 0;
+    if matches!(op, BinOp::Div | BinOp::Mod) && r_is_zero {
+        return Some(Err(EvalError::DivisionByZero));
+    }
+    let sign = |k: NK, v: &Value<'static>| -> i32 {
+        match k {
+            NK::PosInf => 1,
+            NK::NegInf => -1,
+            _ => finite_sign_of(v),
+        }
+    };
+    let (ls, rs) = (sign(lk, l), sign(rk, r));
+    let (l_inf, r_inf) = (
+        matches!(lk, NK::PosInf | NK::NegInf),
+        matches!(rk, NK::PosInf | NK::NegInf),
+    );
+    let inf = |s: i32| Value::numeric_special(if s < 0 { NK::NegInf } else { NK::PosInf });
+    let l_zero = lk == NK::Finite && ls == 0;
+    let res = match op {
+        BinOp::Add => {
+            if l_inf && r_inf {
+                if ls == rs { inf(ls) } else { return Some(nan()); }
+            } else if l_inf {
+                inf(ls)
+            } else {
+                inf(rs)
+            }
+        }
+        BinOp::Sub => {
+            let rs2 = -rs;
+            if l_inf && r_inf {
+                if ls == rs2 { inf(ls) } else { return Some(nan()); }
+            } else if l_inf {
+                inf(ls)
+            } else {
+                inf(rs2)
+            }
+        }
+        BinOp::Mul => {
+            if (l_inf && r_is_zero) || (r_inf && l_zero) {
+                return Some(nan());
+            }
+            inf(ls * rs)
+        }
+        BinOp::Div => {
+            if l_inf && r_inf {
+                return Some(nan());
+            } else if l_inf {
+                inf(ls * rs)
+            } else {
+                Value::numeric(0, 0) // finite / Inf → 0
+            }
+        }
+        BinOp::Mod => {
+            if l_inf {
+                return Some(nan()); // Inf % x → NaN
+            }
+            l.clone().into_owned() // finite % Inf → the dividend
+        }
+        _ => unreachable!(),
+    };
+    Some(Ok(res))
+}
+
 fn apply_binary_numeric(
     op: BinOp,
     l: Value<'static>,
@@ -1149,6 +1268,12 @@ fn apply_binary_numeric(
         if let Some(nr) = to_num(&r) {
             return apply_binary_numeric(op, l, nr);
         }
+    }
+    // v7.38 (read01, T6.P3) — a NaN / ±Infinity operand determines the result
+    // before the finite fixed-point path (arithmetic ops only; comparison of
+    // specials is handled in the compare arm / cmp_numeric).
+    if let Some(res) = numeric_special_result(op, &l, &r) {
+        return res;
     }
     // Float still wins — Numeric + Float coerces both to f64 and runs
     // through the float path. PG demotes Numeric to float in this mix
@@ -1224,6 +1349,29 @@ fn apply_binary_numeric(
     // the text side. (The float path already special-cases Concat this way.)
     if matches!(op, BinOp::Concat) {
         return Ok(text_concat(&l, &r));
+    }
+    // v7.38 (read01, T6.P3) — comparison involving a NUMERIC special uses the
+    // total order -Inf < finite < +Inf < NaN (NaN == NaN). Handled before the
+    // finite widen, which would read a special's canonical 0 as the number 0.
+    if matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        use spg_storage::NumericKind as NK;
+        if let (Some(lk), Some(rk)) = (numeric_kind_of(&l), numeric_kind_of(&r)) {
+            if lk != NK::Finite || rk != NK::Finite {
+                let rank = |k: NK| match k {
+                    NK::NegInf => -2,
+                    NK::Finite => 0,
+                    NK::PosInf => 1,
+                    NK::NaN => 2,
+                };
+                // At least one side is special, so the ranks alone order the pair
+                // (two finites never reach here).
+                let ord = rank(lk).cmp(&rank(rk));
+                return Ok(Value::Bool(cmp_to_bool(op, ord)));
+            }
+        }
     }
     // Promote integer ↔ numeric to a shared scale (max of both sides).
     let (a, sa) = numeric_or_widen(&l).ok_or_else(|| EvalError::TypeMismatch {
