@@ -11847,7 +11847,7 @@ impl Parser {
             let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "rows".to_string());
-            let correlated = entries.iter().any(Self::expr_has_qualified_column);
+            let correlated = entries.iter().any(Self::expr_has_any_column);
             let expr = if entries.len() == 1 {
                 entries.pop().expect("len checked")
             } else {
@@ -11908,7 +11908,7 @@ impl Parser {
             let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
-            let correlated = Self::expr_has_qualified_column(&expr);
+            let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
                 name,
                 alias: alias_ident,
@@ -11967,7 +11967,7 @@ impl Parser {
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "generate_series".to_string());
-            let correlated = args.iter().any(Self::expr_has_qualified_column);
+            let correlated = args.iter().any(Self::expr_has_any_column);
             let tref = TableRef {
                 name,
                 alias: alias_ident,
@@ -12167,6 +12167,30 @@ impl Parser {
                     || else_branch
                         .as_deref()
                         .is_some_and(Self::expr_has_qualified_column)
+            }
+            _ => false,
+        }
+    }
+
+    /// v7.38 (read01, T-lateral) — like `expr_has_qualified_column` but also
+    /// counts a bare (unqualified) column. A set-returning function has no
+    /// input columns of its own, so ANY column in its arguments is an outer
+    /// (correlated) reference — `generate_series(1, n)` correlates on `n`.
+    fn expr_has_any_column(e: &Expr) -> bool {
+        match e {
+            Expr::Column(_) => true,
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::expr_has_any_column(lhs) || Self::expr_has_any_column(rhs)
+            }
+            Expr::Unary { expr, .. } => Self::expr_has_any_column(expr),
+            Expr::Cast { expr, .. } => Self::expr_has_any_column(expr),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_any_column),
+            Expr::Case { operand, branches, else_branch } => {
+                operand.as_deref().is_some_and(Self::expr_has_any_column)
+                    || branches.iter().any(|(w, t)| {
+                        Self::expr_has_any_column(w) || Self::expr_has_any_column(t)
+                    })
+                    || else_branch.as_deref().is_some_and(Self::expr_has_any_column)
             }
             _ => false,
         }
