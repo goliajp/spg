@@ -18,6 +18,12 @@ use super::civil_from_days;
 /// Render a `Date` (days since epoch) as `YYYY-MM-DD`. Negative values
 /// for pre-1970 dates render with a leading `-` on the year.
 pub fn format_date(days: i32) -> String {
+    if days == i32::MAX {
+        return "infinity".into();
+    }
+    if days == i32::MIN {
+        return "-infinity".into();
+    }
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
@@ -164,6 +170,13 @@ pub fn format_time(us: i64) -> String {
 }
 
 pub fn format_timestamp(micros: i64) -> String {
+    // PG infinity sentinels.
+    if micros == i64::MAX {
+        return "infinity".into();
+    }
+    if micros == i64::MIN {
+        return "-infinity".into();
+    }
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     // Split into day + intra-day part with proper floor division so
     // negative timestamps render right too.
@@ -208,9 +221,15 @@ pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
 /// `TypeMismatch` with the original text included.
 pub fn parse_date_literal(s: &str) -> Option<i32> {
     let s = s.trim();
-    // PG special date value.
+    // PG special date values.
     if s.eq_ignore_ascii_case("epoch") {
         return Some(days_from_civil(1970, 1, 1));
+    }
+    if s.eq_ignore_ascii_case("infinity") || s.eq_ignore_ascii_case("+infinity") {
+        return Some(i32::MAX);
+    }
+    if s.eq_ignore_ascii_case("-infinity") {
+        return Some(i32::MIN);
     }
     let bytes = s.as_bytes();
     // ISO 8601 basic (compact) form `YYYYMMDD` — no separators.
@@ -246,9 +265,16 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
 /// pads with zeros to microseconds.
 pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
     let trimmed = s.trim();
-    // PG special timestamp value.
+    // PG special timestamp values. `infinity` / `-infinity` use the i64
+    // sentinels (they compare greater/less than every finite timestamp).
     if trimmed.eq_ignore_ascii_case("epoch") {
         return Some(0);
+    }
+    if trimmed.eq_ignore_ascii_case("infinity") || trimmed.eq_ignore_ascii_case("+infinity") {
+        return Some(i64::MAX);
+    }
+    if trimmed.eq_ignore_ascii_case("-infinity") {
+        return Some(i64::MIN);
     }
     let (date_part, time_part) = match trimmed.find([' ', 'T']) {
         Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
