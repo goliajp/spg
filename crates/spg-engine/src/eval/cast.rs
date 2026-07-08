@@ -46,6 +46,9 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
                 crate::conversions::format_inet_full(*family, *bits, addr)
             }
+            // v7.38 (read01, T11) — bpchar → text strips the trailing blanks
+            // (unlike the padded wire display).
+            Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
             _ => value_to_text(&v),
         })),
         CastTarget::Int => cast_numeric_to_int(v),

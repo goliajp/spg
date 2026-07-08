@@ -724,6 +724,11 @@ pub enum Value<'arena> {
     /// v7.37.5 ζ-A — PG `"char"` (internal single-byte type,
     /// distinct from CHAR(n)).
     Char1(u8),
+    /// v7.38 (read01, T11) — PG `bpchar` / CHAR(n): blank-padded fixed-length
+    /// string. Stored space-padded to the declared width (as PG does + for wire
+    /// display); length / comparison / ::text / concat all ignore the trailing
+    /// blanks (handled at those sites).
+    BpChar(Cow<'arena, str>),
     /// v7.37.5 ζ-A — PG `money[]`.
     MoneyArray(Vec<Option<i64>>),
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
@@ -923,6 +928,8 @@ impl<'arena> Value<'arena> {
             Self::BitString { .. } => Some(DataType::BitVarying),
             Self::Xml(_) => Some(DataType::Xml),
             Self::Char1(_) => Some(DataType::Char1),
+            // BpChar reports its declared width from the padded length.
+            Self::BpChar(s) => Some(DataType::Char(u32::try_from(s.chars().count()).unwrap_or(0))),
             Self::MoneyArray(_) => Some(DataType::MoneyArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
@@ -1018,6 +1025,7 @@ impl<'arena> Value<'arena> {
             },
             Value::Xml(s) => Value::Xml(Cow::Owned(s.into_owned())),
             Value::Char1(c) => Value::Char1(c),
+            Value::BpChar(s) => Value::BpChar(Cow::Owned(s.into_owned())),
             Value::MoneyArray(v) => Value::MoneyArray(v),
             Value::TsVector(v) => Value::TsVector(v),
             Value::TsQuery(q) => Value::TsQuery(q),
@@ -1068,6 +1076,7 @@ impl<'arena> Value<'arena> {
             Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(s))),
             Value::Json(s) => Value::Json(Cow::Borrowed(arena.alloc_str(s))),
             Value::Xml(s) => Value::Xml(Cow::Borrowed(arena.alloc_str(s))),
+            Value::BpChar(s) => Value::BpChar(Cow::Borrowed(arena.alloc_str(&s))),
             Value::Bytes(b) => {
                 let slot = arena.alloc_slice_copy::<u8>(b);
                 Value::Bytes(Cow::Borrowed(slot))
@@ -1606,6 +1615,8 @@ impl IndexKey {
             Value::SmallInt(n) => Some(Self::Int(i64::from(*n))),
             Value::Int(n) => Some(Self::Int(i64::from(*n))),
             Value::Text(s) => Some(Self::Text(s.clone().into_owned())),
+            // v7.38 (read01, T11) — bpchar keys compare blank-insensitively.
+            Value::BpChar(s) => Some(Self::Text(s.trim_end_matches(' ').to_string())),
             Value::Bool(b) => Some(Self::Bool(*b)),
             // Date/Timestamp use their integer storage repr as the
             // index key — same order semantics, same comparison.

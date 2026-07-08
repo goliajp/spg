@@ -1233,6 +1233,13 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
                 2 + s.len()
             }
         }
+        Value::BpChar(s) => {
+            if s.len() >= STR_LEN_ESCAPE as usize {
+                6 + s.len()
+            } else {
+                2 + s.len()
+            }
+        }
         Value::Char1(_) => 1,
         Value::MoneyArray(items) => {
             2 + items
@@ -1407,7 +1414,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::Float(x), DataType::Float) => out.extend_from_slice(&x.to_le_bytes()),
         (Value::Real(x), DataType::Real) => out.extend_from_slice(&x.to_le_bytes()),
         (Value::Bool(b), DataType::Bool) => out.push(u8::from(*b)),
-        (Value::Text(s), DataType::Text | DataType::Varchar(_) | DataType::Char(_)) => {
+        (
+            Value::Text(s) | Value::BpChar(s),
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_),
+        ) => {
             write_str(out, s);
         }
         (
@@ -1975,7 +1985,7 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // schema decides which variant comes back on read. The
         // bodies are byte-identical so collapsing the match keeps
         // clippy::match_same_arms quiet.
-        Value::Text(s) | Value::Json(s) => {
+        Value::Text(s) | Value::Json(s) | Value::BpChar(s) => {
             out.push(4);
             write_str(out, s);
         }
@@ -2918,9 +2928,11 @@ impl<'a> Cursor<'a> {
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
-            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
+            DataType::Text | DataType::Varchar(_) => {
                 Ok(Value::Text(Cow::Owned(self.read_str()?)))
             }
+            // v7.38 (read01, T11) — a CHAR(n) column reads back as bpchar.
+            DataType::Char(_) => Ok(Value::BpChar(Cow::Owned(self.read_str()?))),
             DataType::Vector {
                 encoding: VecEncoding::F32,
                 ..

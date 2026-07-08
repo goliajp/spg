@@ -2347,7 +2347,8 @@ fn date_column_coerces_timestamp_string() {
 fn value_to_charn_cast() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        // v7.38 (read01, T11) — CHAR(n) casts now yield bpchar values.
+        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)|Value::BpChar(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
     };
     assert_eq!(q(&mut e, "SELECT (99::char(2))"), "99");
     assert_eq!(q(&mut e, "SELECT (99::varchar(2))"), "99");

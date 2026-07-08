@@ -78,6 +78,12 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
         (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v7.38 (read01, T11) — bpchar orders blank-insensitively (either side).
+        (Value::BpChar(x), Value::BpChar(y)) => {
+            x.trim_end_matches(' ').cmp(y.trim_end_matches(' '))
+        }
+        (Value::BpChar(x), Value::Text(y)) => x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')),
+        (Value::Text(x), Value::BpChar(y)) => x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')),
         // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order
         // (Null<String<Number<Boolean<Array<Object, recursive), not by its
         // text spelling. Fall back to text only if either side fails to parse.
@@ -306,6 +312,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::BigInt(n) => alloc::format!("{n}"),
         Value::Float(x) => alloc::format!("{x:?}"),
         Value::Text(s) | Value::Json(s) => s.to_string(),
+        // v7.38 (read01, T11) — bpchar dedups/orders blank-insensitively.
+        Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         Value::Date(d) => eval::format_date(*d),
         Value::Timestamp(t) => eval::format_timestamp(*t),

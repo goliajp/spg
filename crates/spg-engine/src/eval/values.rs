@@ -175,6 +175,9 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         Value::Float(x) => crate::eval::format_float(*x),
         // v7.38 (read01, T-float4) — PG float4out (f32 shortest round-trip).
         Value::Real(x) => crate::eval::format_real(*x),
+        // v7.38 (read01, T11) — bpchar renders blank-padded (the stored form,
+        // as PG's wire display). The ::text CAST strips (handled in cast.rs).
+        Value::BpChar(s) => s.to_string(),
         // v4.9: JSON renders identically to Text — both are raw UTF-8.
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),

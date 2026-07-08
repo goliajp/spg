@@ -314,6 +314,11 @@ fn apply_function_dispatch(
                     }
                     Ok(Value::Float(total))
                 }
+                // v7.38 (read01, T11) — bpchar length ignores trailing blanks.
+                Value::BpChar(s) => {
+                    let t = s.trim_end_matches(' ');
+                    Ok(Value::Int(i32::try_from(t.chars().count()).unwrap_or(i32::MAX)))
+                }
                 Value::Text(s) => {
                     // v7.36 (perf — mailrs Ask 1) — ASCII fast path.
                     // `s.is_ascii()` is SIMD-vectorised; for the 1 KB
