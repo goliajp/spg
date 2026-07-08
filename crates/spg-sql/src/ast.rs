@@ -1726,6 +1726,18 @@ pub struct ForeignKeyConstraint {
     pub on_delete: FkAction,
     /// `ON UPDATE` action. Defaults to `Restrict` if absent.
     pub on_update: FkAction,
+    /// v7.38 (read01, T29) — `MATCH {SIMPLE | FULL}`. Defaults to `Simple`.
+    pub match_type: MatchType,
+}
+
+/// v7.38 (read01, T29) — FK `MATCH` type. SIMPLE (default) skips the check when
+/// ANY referencing column is NULL; FULL requires all-or-none NULL (a mixed-NULL
+/// key errors). PARTIAL is parse-rejected (PG does not implement it either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchType {
+    #[default]
+    Simple,
+    Full,
 }
 
 /// v7.6.0 — Referential action for `ON DELETE` / `ON UPDATE`.

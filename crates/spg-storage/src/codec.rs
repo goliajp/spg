@@ -120,6 +120,15 @@ pub(crate) fn deserialize_table(
             let on_update = FkAction::from_tag(cur.read_u8()?).ok_or_else(|| {
                 StorageError::Corrupt("FK appendix: unknown on_update tag".into())
             })?;
+            // v7.38 (read01, T29) — MATCH type appendix (FILE_VERSION 55+); older
+            // catalogs default to Simple.
+            let match_type = if version >= 55 {
+                crate::MatchType::from_tag(cur.read_u8()?).ok_or_else(|| {
+                    StorageError::Corrupt("FK appendix: unknown match_type tag".into())
+                })?
+            } else {
+                crate::MatchType::Simple
+            };
             fks.push(ForeignKeyConstraint {
                 name,
                 local_columns,
@@ -127,6 +136,7 @@ pub(crate) fn deserialize_table(
                 parent_columns,
                 on_delete,
                 on_update,
+                match_type,
             });
         }
         t.schema_mut().foreign_keys = fks;
