@@ -4563,6 +4563,50 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         }
         _ => {}
     }
+    // v7.38 (read01, U16) — one-dimensional arrays sort element-wise, then
+    // shorter-first (PG: `{1} < {1,2} < {2} < {10}`). Each element carries its
+    // own OrderKey so integer arrays sort numerically; a NULL element rides to
+    // the end via the +INF sentinel.
+    let inf = || OrderKey::Num(f64::INFINITY);
+    let arr = match v {
+        Value::IntArray(a) => Some(
+            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+        ),
+        Value::SmallIntArray(a) => Some(
+            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+        ),
+        Value::BigIntArray(a) => {
+            Some(a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect())
+        }
+        Value::BoolArray(a) => Some(
+            a.iter().map(|o| o.map_or_else(inf, |b| OrderKey::Int(i128::from(b)))).collect(),
+        ),
+        Value::TextArray(a) => Some(
+            a.iter()
+                .map(|o| o.as_ref().map_or_else(inf, |s| OrderKey::Text(s.clone())))
+                .collect(),
+        ),
+        #[allow(clippy::cast_precision_loss)]
+        Value::FloatArray(a) => {
+            Some(a.iter().map(|o| OrderKey::Num(o.unwrap_or(f64::INFINITY))).collect())
+        }
+        Value::NumericArray(a) => Some(
+            a.iter()
+                .map(|o| {
+                    o.map_or_else(inf, |(m, s)| {
+                        OrderKey::Num(crate::orderby::numeric_to_f64(m, s))
+                    })
+                })
+                .collect(),
+        ),
+        Value::DateArray(a) => Some(
+            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+        ),
+        _ => None,
+    };
+    if let Some(elements) = arr {
+        return Ok(OrderKey::Array(elements));
+    }
     // v7.38 (read01 U31) — the integer-valued types carry an EXACT i128 key.
     // Projecting these to f64 (the historic path) silently collapses BigInt /
     // Timestamp / Time / TimeTz / Money values past 2^53, so `ORDER BY` gave

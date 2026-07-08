@@ -488,6 +488,10 @@ pub(crate) enum OrderKey {
     /// v7.38 (read01 P6.24) — jsonb sorted by PG's type-aware total order
     /// (`crate::json::jsonb_compare`), not its text spelling.
     Json(crate::json::JsonValue),
+    /// v7.38 (read01, U16) — array key sorted element-wise, then shorter-first,
+    /// like PG (`{1} < {1,2} < {2} < {10}`). Elements carry their own OrderKey so
+    /// integer arrays sort numerically, not by text.
+    Array(alloc::vec::Vec<OrderKey>),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -504,6 +508,16 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         // Exact same-type integer comparison — the load-bearing path that
         // U31 fixes (no f64 rounding).
         (OrderKey::Int(x), OrderKey::Int(y)) => x.cmp(y),
+        // v7.38 (read01, U16) — array key: element-wise, then shorter-first.
+        (OrderKey::Array(x), OrderKey::Array(y)) => {
+            for (ex, ey) in x.iter().zip(y.iter()) {
+                let c = order_key_elem_cmp(ex, ey);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         (OrderKey::Text(x), OrderKey::Text(y)) => x.cmp(y),
         (OrderKey::Bytes(x), OrderKey::Bytes(y)) => x.cmp(y),
         // v7.38 (read01 P6.24) — jsonb total order. Same-type is the
@@ -577,6 +591,29 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         // Text sorts before Bytes in the rare heterogeneous case.
         (OrderKey::Text(_), OrderKey::Bytes(_)) => Ordering::Less,
         (OrderKey::Bytes(_), OrderKey::Text(_)) => Ordering::Greater,
+        // v7.38 (read01, U16) — an Array key meets a foreign key only via the
+        // ±INF NULL sentinel (NULLs ride to the ends) or a degenerate
+        // heterogeneous ORDER BY (Array placed after every scalar key).
+        (OrderKey::Array(_), OrderKey::Num(y)) => {
+            if *y == f64::NEG_INFINITY {
+                Ordering::Greater
+            } else if *y == f64::INFINITY {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (OrderKey::Num(x), OrderKey::Array(_)) => {
+            if *x == f64::NEG_INFINITY {
+                Ordering::Less
+            } else if *x == f64::INFINITY {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (OrderKey::Array(_), _) => Ordering::Greater,
+        (_, OrderKey::Array(_)) => Ordering::Less,
     }
 }
 
