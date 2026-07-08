@@ -272,6 +272,7 @@ mod e2e_ts_rank;
 mod e2e_int_to_bit;
 mod e2e_current_setting_missing;
 mod e2e_array_orderby;
+mod e2e_date_part_double;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
