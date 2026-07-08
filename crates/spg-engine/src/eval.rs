@@ -28,6 +28,7 @@ mod cast;
 pub mod compiled;
 mod datetime;
 mod encoding;
+mod encodings;
 mod format;
 mod functions;
 mod inet;
