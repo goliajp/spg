@@ -44,5 +44,16 @@ fn ts_rank_matches_pg() {
     near(&mut e, "SELECT ts_rank_cd(ARRAY[0.5,0.6,0.7,0.8]::float8[], 'cat:1B rat:2B'::tsvector, 'cat & rat'::tsquery)", 0.7);
     // Explicit norm 0 is accepted; a non-zero flag errors honestly.
     near(&mut e, "SELECT ts_rank('cat:1,2,3'::tsvector, 'cat'::tsquery, 0)", 0.082_745_634);
-    assert!(e.execute("SELECT ts_rank('cat:1'::tsvector, 'cat'::tsquery, 1)").is_err());
+    // Normalization bitmask (verified vs PG): 1 → /log2(len+1), 2 → /len,
+    // 8 → /uniq, 16 → /log2(uniq+1), 32 → r/(r+1); combos apply in sequence.
+    near(&mut e, "SELECT ts_rank('a:1,2,3'::tsvector, 'a'::tsquery, 1)", 0.041_372_817);
+    near(&mut e, "SELECT ts_rank('a:1,2,3'::tsvector, 'a'::tsquery, 2)", 0.027_581_878);
+    near(&mut e, "SELECT ts_rank('a:1,2,3'::tsvector, 'a'::tsquery, 32)", 0.076_422_04);
+    near(&mut e, "SELECT ts_rank('a:1 b:2 c:4'::tsvector, 'a & b & c'::tsquery, 8)", 0.088_970_9);
+    near(&mut e, "SELECT ts_rank('a:1 b:2 c:4'::tsvector, 'a & b & c'::tsquery, 16)", 0.133_456_38);
+    near(&mut e, "SELECT ts_rank('a:1 b:2 c:4'::tsvector, 'a & b & c'::tsquery, 3)", 0.044_485_46);
+    // Cover-extent flag 4 is not yet supported for ts_rank_cd (honest error).
+    assert!(e.execute("SELECT ts_rank_cd('a:1 b:2'::tsvector, 'a & b'::tsquery, 4)").is_err());
+    // Unknown flag bits error.
+    assert!(e.execute("SELECT ts_rank('a:1'::tsvector, 'a'::tsquery, 64)").is_err());
 }
