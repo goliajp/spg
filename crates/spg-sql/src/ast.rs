@@ -3047,6 +3047,10 @@ pub enum Literal {
         unscaled: i128,
         scale: u8,
     },
+    /// v7.38 (read01, T3.C3) — an exact decimal literal whose mantissa overflows
+    /// i128 (kept as its source digit string, `[-]digits[.digits]`). Becomes a
+    /// `Value::NumericBig` at eval; previously such literals fell back to double.
+    NumericBig(String),
     String(String),
     Bool(bool),
     Null,
@@ -5394,6 +5398,7 @@ impl fmt::Display for Literal {
                 // scale (trailing zeros) — round-trips to the same literal.
                 f.write_str(&render_exact_decimal(*unscaled, *scale))
             }
+            Self::NumericBig(s) => f.write_str(s),
             Self::String(s) => {
                 f.write_str("'")?;
                 for c in s.chars() {

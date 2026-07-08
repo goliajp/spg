@@ -34,8 +34,15 @@ fn numeric_beyond_i128() {
     );
     // A result that fits i128 again stays a normal Numeric.
     assert_eq!(t(&mut e, "SELECT (10000000000000000000 * 2)::text"), "20000000000000000000");
-    // (Parsing a literal whose *mantissa* itself overflows i128 — a big literal
-    // rather than a big *result* — is a follow-up C3 sub-item.)
+    // A literal whose mantissa itself overflows i128 is now an exact NumericBig.
+    assert_eq!(
+        t(&mut e, "SELECT (123456789012345678901234567890123456789012345)::text"),
+        "123456789012345678901234567890123456789012345"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT (99999999999999999999999999999999999999.5 + 0.5)::text"),
+        "100000000000000000000000000000000000000.0"
+    );
 }
 
 

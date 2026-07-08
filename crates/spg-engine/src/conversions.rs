@@ -2156,6 +2156,7 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
         Literal::Integer(n) => int_value_for(n),
         Literal::Float(x) => Value::Float(x),
         Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: unscaled, scale , kind: spg_storage::NumericKind::Finite },
+        Literal::NumericBig(s) => big_literal_to_value(&s),
         Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
@@ -3659,4 +3660,15 @@ pub(crate) fn coerce_value(
         actual,
         position,
     }))
+}
+
+/// v7.38 (read01, T3.C3) — a lexer-validated big decimal literal → NumericBig,
+/// demoted to a plain Numeric if its mantissa happens to fit i128.
+pub(crate) fn big_literal_to_value(s: &str) -> Value<'static> {
+    let b = spg_storage::bignum::BigNumeric::from_decimal_str(s)
+        .expect("lexer-validated decimal");
+    match b.to_i128() {
+        Some(scaled) => Value::Numeric { scaled, scale: b.scale(), kind: spg_storage::NumericKind::Finite },
+        None => Value::NumericBig(alloc::boxed::Box::new(b)),
+    }
 }

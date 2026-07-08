@@ -1080,6 +1080,7 @@ pub(crate) fn resolve_col_literal_pair(
         }
         Literal::Float(x) => Value::Float(*x),
         Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale , kind: spg_storage::NumericKind::Finite },
+        Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
