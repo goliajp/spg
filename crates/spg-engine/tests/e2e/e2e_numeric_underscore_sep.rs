@@ -27,3 +27,18 @@ fn underscore_digit_separators() {
     assert_eq!(text(&mut e, "SELECT 1000"), "1000");
     assert_eq!(text(&mut e, "SELECT ((ARRAY[10,20,30])[1])::text"), "10");
 }
+
+#[test]
+fn non_decimal_integer_literals() {
+    let mut e = Engine::new();
+    // PG 16+ hex / octal / binary integer literals (with optional _ separators).
+    assert_eq!(text(&mut e, "SELECT 0x10"), "16");
+    assert_eq!(text(&mut e, "SELECT 0xFF"), "255");
+    assert_eq!(text(&mut e, "SELECT 0o17"), "15");
+    assert_eq!(text(&mut e, "SELECT 0b101"), "5");
+    assert_eq!(text(&mut e, "SELECT 0x_FF"), "255");
+    assert_eq!(text(&mut e, "SELECT 0xFFFFFFFFFF"), "1099511627775");
+    // Plain decimal / zero unaffected.
+    assert_eq!(text(&mut e, "SELECT 0"), "0");
+    assert_eq!(text(&mut e, "SELECT (0.5)::text"), "0.5");
+}
