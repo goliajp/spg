@@ -50,3 +50,20 @@ fn numeric_special_compare_and_order() {
     assert_eq!(t(&mut e, "SELECT min(x)::text FROM (VALUES ('Infinity'::numeric),(1),('-Infinity'::numeric)) v(x)"), "-Infinity");
     assert_eq!(t(&mut e, "SELECT max(x)::text FROM (VALUES ('NaN'::numeric),(1),(2)) v(x)"), "NaN");
 }
+
+
+#[test]
+fn numeric_special_sum_avg() {
+    let mut e = Engine::new();
+    // sum/avg propagate a special input (NaN wins; ±Inf accumulate; +Inf+-Inf → NaN).
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (\'NaN\'::numeric),(1),(2)) v(x)"), "NaN");
+    assert_eq!(t(&mut e, "SELECT avg(x)::text FROM (VALUES (\'NaN\'::numeric),(1),(2)) v(x)"), "NaN");
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (\'Infinity\'::numeric),(1),(2)) v(x)"), "Infinity");
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (\'Infinity\'::numeric),(\'-Infinity\'::numeric)) v(x)"), "NaN");
+    assert_eq!(t(&mut e, "SELECT avg(x)::text FROM (VALUES (\'Infinity\'::numeric),(1)) v(x)"), "Infinity");
+    // Finite sums are unaffected.
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (1.5::numeric),(2.5)) v(x)"), "4.0");
+    // GROUP BY: only the group with the special is affected.
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (1,\'NaN\'::numeric),(1,5),(2,3)) v(g,x) WHERE g=2 GROUP BY g"), "3");
+    assert_eq!(t(&mut e, "SELECT sum(x)::text FROM (VALUES (1,\'NaN\'::numeric),(1,5),(2,3)) v(g,x) WHERE g=1 GROUP BY g"), "NaN");
+}
