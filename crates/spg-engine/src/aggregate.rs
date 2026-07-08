@@ -386,6 +386,9 @@ struct AggState {
     /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
     /// bit_xor. `None` until the first non-NULL input → SQL NULL.
     bit_acc: Option<i64>,
+    /// v7.38 (read01, T4.4) — true once a BIGINT input is seen, so
+    /// bit_and/or/xor finalize as bigint vs integer (PG input-typed).
+    bit_wide: bool,
     /// v7.32 (round-29) — two-argument regression family
     /// (`covar_*` / `corr` / `regr_*`), PG arg order `f(Y, X)`. Only
     /// rows where BOTH inputs are non-NULL contribute (`count` is the
@@ -3129,6 +3132,9 @@ fn update_state(
                     });
                 }
             };
+            if matches!(v, Value::BigInt(_)) {
+                st.bit_wide = true;
+            }
             st.bit_acc = Some(match (st.bit_acc, kind) {
                 (None, _) => n,
                 (Some(acc), AggKind::BitAnd) => acc & n,
@@ -3416,7 +3422,13 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
         // → SQL NULL.
-        "bit_and" | "bit_or" | "bit_xor" => st.bit_acc.map_or(Value::Null, Value::BigInt),
+        "bit_and" | "bit_or" | "bit_xor" => st.bit_acc.map_or(Value::Null, |acc| {
+            if st.bit_wide {
+                Value::BigInt(acc)
+            } else {
+                Value::Int(acc as i32)
+            }
+        }),
         // v7.32 (round-29) — regression family. `regr_count` is the
         // paired n; everything else is NULL over an empty set. Terms
         // are the mean-centred sums of squares / cross-products.
@@ -3822,7 +3834,14 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         }
         // v7.32 (round-29) — bitwise aggregates, regr_count, and the
         // integer hypothetical-set ranks return an integer.
-        "bit_and" | "bit_or" | "bit_xor" | "regr_count" | "rank" | "dense_rank" => DataType::BigInt,
+        // v7.38 (read01, T4.4) — bit_and/or/xor return the INPUT integer type
+        // (PG: bit_and(int) → integer, bit_and(bigint) → bigint).
+        "bit_and" | "bit_or" | "bit_xor" => match arg_ty {
+            Some(DataType::SmallInt) => DataType::SmallInt,
+            Some(DataType::BigInt) => DataType::BigInt,
+            _ => DataType::Int,
+        },
+        "regr_count" | "rank" | "dense_rank" => DataType::BigInt,
         // v7.32 (round-29) — hypothetical-set distribution functions.
         "percent_rank" | "cume_dist" => DataType::Float,
         // v7.32 (round-29) — JSON aggregates return JSON.
