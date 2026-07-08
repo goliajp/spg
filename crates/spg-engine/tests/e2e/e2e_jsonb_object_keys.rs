@@ -1,70 +1,69 @@
-//! v7.37.17 (17.6 siblings) — jsonb_object_keys returns TextArray
-//! of top-level keys (SPG scalar surface; PG has this as SRF).
+//! v7.38 (read01, T15) — jsonb/json_object_keys is set-returning: one row per
+//! top-level key (SPG previously returned a scalar TextArray; PG emits rows).
+//! Oracle: live PG 18.4.
 
 use spg_engine::{Engine, QueryResult};
 
-fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
+fn key_rows(e: &mut Engine, sql: &str) -> Vec<String> {
     let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
-    rows[0].values[0].clone()
+    rows.iter()
+        .map(|row| match &row.values[0] {
+            spg_storage::Value::Text(s) => s.to_string(),
+            other => panic!("expected Text, got {other:?}"),
+        })
+        .collect()
 }
 
 #[test]
 fn jsonb_object_keys_returns_keys_in_order() {
     let mut e = Engine::new();
-    let v = first(
-        &mut e,
-        "SELECT jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)",
+    assert_eq!(
+        key_rows(&mut e, "SELECT jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)"),
+        ["a", "b", "c"]
     );
-    match &v {
-        spg_storage::Value::TextArray(items) => {
-            let s: Vec<_> = items.iter().map(|o| o.clone().unwrap()).collect();
-            assert_eq!(s, ["a", "b", "c"]);
-        }
-        other => panic!("got {other:?}"),
-    }
 }
 
 #[test]
-fn jsonb_object_keys_empty_object_empty_array() {
+fn jsonb_object_keys_empty_object_no_rows() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT jsonb_object_keys('{}'::jsonb)");
-    match &v {
-        spg_storage::Value::TextArray(items) => assert!(items.is_empty()),
-        other => panic!("got {other:?}"),
-    }
+    assert!(key_rows(&mut e, "SELECT jsonb_object_keys('{}'::jsonb)").is_empty());
 }
 
 #[test]
 fn jsonb_object_keys_errors_on_non_object() {
     let mut e = Engine::new();
-    assert!(
-        e.execute("SELECT jsonb_object_keys('[1,2,3]'::jsonb)")
-            .is_err()
-    );
+    assert!(e.execute("SELECT jsonb_object_keys('[1,2,3]'::jsonb)").is_err());
     assert!(e.execute("SELECT jsonb_object_keys('42'::jsonb)").is_err());
 }
 
 #[test]
-fn jsonb_object_keys_null_returns_null() {
+fn jsonb_object_keys_null_returns_no_rows() {
+    // A NULL argument yields zero rows (PG), not one NULL row.
     let mut e = Engine::new();
-    assert!(matches!(
-        first(&mut e, "SELECT jsonb_object_keys(NULL::jsonb)"),
-        spg_storage::Value::Null
-    ));
+    assert!(key_rows(&mut e, "SELECT jsonb_object_keys(NULL::jsonb)").is_empty());
 }
 
 #[test]
 fn json_object_keys_synonym_works() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT json_object_keys('{\"x\":1}'::jsonb)");
-    match &v {
-        spg_storage::Value::TextArray(items) => {
-            let s: Vec<_> = items.iter().map(|o| o.clone().unwrap()).collect();
-            assert_eq!(s, ["x"]);
-        }
-        other => panic!("got {other:?}"),
-    }
+    assert_eq!(
+        key_rows(&mut e, "SELECT json_object_keys('{\"x\":1}'::jsonb)"),
+        ["x"]
+    );
+}
+
+#[test]
+fn jsonb_object_keys_over_table_expands_per_row() {
+    // Over a real table's rows, keys expand per source row (SELECT-list SRF).
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ok(j jsonb)").unwrap();
+    e.execute("INSERT INTO ok VALUES ('{\"a\":1}'), ('{\"b\":2,\"c\":3}')")
+        .unwrap();
+    assert_eq!(
+        key_rows(&mut e, "SELECT jsonb_object_keys(j) FROM ok"),
+        ["a", "b", "c"]
+    );
 }

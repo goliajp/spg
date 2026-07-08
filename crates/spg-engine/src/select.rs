@@ -5429,6 +5429,13 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
                         name.to_ascii_lowercase().as_str(),
                         "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text"
                     ))
+                // v7.38 (read01, T15) — jsonb/json_object_keys expands one row
+                // per top-level key in the SELECT list.
+                || (args.len() == 1
+                    && matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "jsonb_object_keys" | "json_object_keys"
+                    ))
         }
         _ => false,
     }
@@ -5477,6 +5484,13 @@ fn top_level_srf_output(
             .into_iter()
             .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
             .collect());
+    }
+    // v7.38 (read01, T15) — jsonb/json_object_keys: one row per top-level key.
+    // The scalar form already yields a TextArray of the keys (or errors on a
+    // non-object, like PG); expand it into rows.
+    if matches!(lname.as_str(), "jsonb_object_keys" | "json_object_keys") {
+        let v = eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval)?;
+        return array_value_to_elements(&v);
     }
     // v7.38 (read01, T15) — regexp_matches(s, pat[, flags]): one row per match,
     // each a text[] of the pattern's capture groups.
