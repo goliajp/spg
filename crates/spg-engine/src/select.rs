@@ -2180,6 +2180,10 @@ impl Engine {
                 .map(|(i, _)| projected_rows[i].clone())
                 .collect();
         }
+        // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
+        if stmt.distinct {
+            projected_rows = dedup_rows(projected_rows);
+        }
         // LIMIT / OFFSET — apply at the tail.
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -2351,6 +2355,10 @@ impl Engine {
                 .into_iter()
                 .map(|(i, _)| projected_rows[i].clone())
                 .collect();
+        }
+        // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
+        if stmt.distinct {
+            projected_rows = dedup_rows(projected_rows);
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -2738,6 +2746,10 @@ impl Engine {
                 .map(|(i, _)| projected_rows[i].clone())
                 .collect();
         }
+        // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
+        if stmt.distinct {
+            projected_rows = dedup_rows(projected_rows);
+        }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
             projected_rows.drain(..off);
@@ -2894,6 +2906,10 @@ impl Engine {
                 .into_iter()
                 .map(|(i, _)| projected_rows[i].clone())
                 .collect();
+        }
+        // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
+        if stmt.distinct {
+            projected_rows = dedup_rows(projected_rows);
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
