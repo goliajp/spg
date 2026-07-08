@@ -465,6 +465,38 @@ pub fn ts_rank_cd(weights: &RankWeights, vec: &[TsLexeme], query: &TsQueryAst) -
     wdoc
 }
 
+/// v7.38 (read01, T12.1) — apply PG's ranking normalization bitmask to a raw
+/// rank. Flags are applied in PG's order over the tsvector's total position
+/// count (`len`) and distinct-lexeme count (`uniq`):
+///   1 → /log2(len+1) · 2 → /len · 8 → /uniq · 16 → /log2(uniq+1) · 32 → r/(r+1)
+/// (flag 4, the cover-extent distance, is cover-density only and handled by the
+/// caller.) Verified against live PG 18.4.
+#[must_use]
+pub fn apply_rank_norm(mut rank: f32, norm: i64, vec: &[TsLexeme]) -> f32 {
+    let len: usize = vec.iter().map(|l| l.positions.len()).sum();
+    let uniq = vec.len();
+    if norm & 1 != 0 && len > 0 {
+        rank /= log2_approx((len + 1) as f32);
+    }
+    if norm & 2 != 0 && len > 0 {
+        rank /= len as f32;
+    }
+    if norm & 8 != 0 && uniq > 0 {
+        rank /= uniq as f32;
+    }
+    if norm & 16 != 0 {
+        rank /= log2_approx((uniq + 1) as f32);
+    }
+    if norm & 32 != 0 {
+        rank /= rank + 1.0;
+    }
+    rank
+}
+
+fn log2_approx(x: f32) -> f32 {
+    ln_approx(x) / core::f32::consts::LN_2
+}
+
 /// `f32::ln` is std-only; spg-engine is no_std. Reuse the bit-
 /// trick decomposition the spg-storage bloom filter uses
 /// (precision ≈ 1e-7, ample for ranking).

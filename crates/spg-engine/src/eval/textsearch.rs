@@ -19,26 +19,40 @@ use super::{EvalContext, EvalError};
 /// optional weight-array / normalisation arguments error with an
 /// "unsupported" message rather than silently changing semantics.
 pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (weights, vec, query) = parse_rank_args("ts_rank", args)?;
+    let (weights, vec, query, norm) = parse_rank_args("ts_rank", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
-        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank(&weights, &v, &q)))),
+        (Some(v), Some(q)) => {
+            // Flag 4 (cover-extent distance) is cover-density only — a no-op for
+            // ts_rank, matching PG.
+            let r = crate::fts::apply_rank_norm(crate::fts::ts_rank(&weights, &v, &q), norm, &v);
+            Ok(Value::Float(f64::from(r)))
+        }
     }
 }
 
 pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (weights, vec, query) = parse_rank_args("ts_rank_cd", args)?;
+    let (weights, vec, query, norm) = parse_rank_args("ts_rank_cd", args)?;
+    if norm & 4 != 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: "ts_rank_cd(): normalization flag 4 (cover-extent distance) is not yet supported"
+                .into(),
+        });
+    }
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
-        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank_cd(&weights, &v, &q)))),
+        (Some(v), Some(q)) => {
+            let r = crate::fts::apply_rank_norm(crate::fts::ts_rank_cd(&weights, &v, &q), norm, &v);
+            Ok(Value::Float(f64::from(r)))
+        }
     }
 }
 
 /// v7.38 (read01, T12.1) — parse `ts_rank[_cd]([weights,] vec, query [, norm])`.
-/// A leading `float4[]` weight array (PG order `[D, C, B, A]`) and a trailing
-/// integer normalization flag are both optional. Custom weights are honored;
-/// the only supported normalization flag is 0 (the default) — a non-zero flag
-/// errors honestly rather than silently returning an un-normalized rank.
+/// A leading weight array (PG order `[D, C, B, A]`) and a trailing integer
+/// normalization flag are both optional. Custom weights are honored; the norm
+/// flag bits 1/2/8/16/32 are applied by `apply_rank_norm` (bit 4 is cover-density
+/// only, handled by the ts_rank_cd wrapper). Unknown bits error.
 fn parse_rank_args(
     name: &str,
     args: &[Value<'_>],
@@ -47,6 +61,7 @@ fn parse_rank_args(
         crate::fts::RankWeights,
         Option<Vec<spg_storage::TsLexeme>>,
         Option<spg_storage::TsQueryAst>,
+        i64,
     ),
     EvalError,
 > {
@@ -74,14 +89,11 @@ fn parse_rank_args(
     if norm.is_some() {
         rest = &rest[..rest.len() - 1];
     }
-    if let Some(flag) = norm {
-        if flag != 0 {
-            return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "{name}(): normalization flag {flag} is not yet supported (only 0)"
-                ),
-            });
-        }
+    let norm = norm.unwrap_or(0);
+    if norm & !0x3F != 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("{name}(): unknown normalization flag bits in {norm}"),
+        });
     }
     if rest.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -114,7 +126,7 @@ fn parse_rank_args(
             });
         }
     };
-    Ok((weights, vec, query))
+    Ok((weights, vec, query, norm))
 }
 
 /// Read a 4-element weight array in PG order `[D, C, B, A]`.
