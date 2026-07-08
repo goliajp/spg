@@ -96,6 +96,38 @@ fn count_and_where_compose() {
 }
 
 #[test]
+fn select_list_expands_per_element() {
+    // v7.38 (read01, T15) — jsonb/json_array_elements[_text] in the SELECT list
+    // (not FROM) expand to one row per element, matching PG (they collapsed to a
+    // single TextArray row before). Covers no-FROM, no-FROM with a sibling
+    // scalar column, and over a real table's rows. Oracle: live PG 18.4.
+    let mut e = Engine::new();
+    // no-FROM, plain and _text.
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_array_elements('[1, 2, 3]'::jsonb)")),
+        [Some("1".into()), Some("2".into()), Some("3".into())]
+    );
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_array_elements_text('[\"a\", null]'::jsonb)")),
+        [Some("a".into()), None]
+    );
+    // no-FROM with a sibling scalar column repeated per element.
+    let got = rows(&mut e, "SELECT 'x', jsonb_array_elements('[7, 8]'::jsonb)");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0][0], spg_storage::Value::Text("x".into()));
+    assert_eq!(got[1][1], spg_storage::Value::Text("8".into()));
+    // Over a real table: one element-row per source row, in order.
+    e.execute("CREATE TABLE jt(j jsonb)").unwrap();
+    e.execute("INSERT INTO jt VALUES ('[10, 20]'), ('[30]')").unwrap();
+    assert_eq!(
+        texts(&rows(&mut e, "SELECT jsonb_array_elements(j) FROM jt")),
+        [Some("10".into()), Some("20".into()), Some("30".into())]
+    );
+    // NULL input → no rows.
+    assert_eq!(rows(&mut e, "SELECT jsonb_array_elements(NULL::jsonb)").len(), 0);
+}
+
+#[test]
 fn non_array_input_errors() {
     let mut e = Engine::new();
     let err = e
