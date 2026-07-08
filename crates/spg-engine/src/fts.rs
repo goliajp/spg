@@ -400,33 +400,69 @@ pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
 /// between matched positions. Returns 0 when no terms match.
 #[must_use]
 pub fn ts_rank_cd(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
-    let mut matched_positions: Vec<u16> = Vec::new();
-    let mut score = 0.0f32;
-    let mut unique_terms = 0usize;
-    collect_cd_positions(
-        query,
-        vec,
-        &mut matched_positions,
-        &mut score,
-        &mut unique_terms,
-    );
-    if matched_positions.is_empty() || unique_terms == 0 {
+    // v7.38 (read01, T12.1) — PG's calc_rank_cd cover density. Sum, over each
+    // minimal cover (window containing every distinct query term), a
+    // per-cover weight `Cpos = (#entries / Σ 1/weight) / (noise + 1)`, where
+    // noise is the extra positional span beyond the matched entries. Default
+    // normalization flag 0 (no division).
+    let mut terms: Vec<&str> = Vec::new();
+    collect_query_terms(query, &mut terms);
+    if terms.is_empty() {
         return 0.0;
     }
-    matched_positions.sort_unstable();
-    matched_positions.dedup();
-    // Cover density: invert the average distance between
-    // consecutive matched positions.
-    if matched_positions.len() == 1 {
-        return score / (1.0 + ln_approx(unique_terms as f32));
+    // doc = (position, term-index, weight), sorted by position.
+    let mut doc: Vec<(u16, usize, u8)> = Vec::new();
+    for (t, word) in terms.iter().enumerate() {
+        if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
+            for &pos in &vec[idx].positions {
+                doc.push((pos, t, vec[idx].weight));
+            }
+        }
     }
-    let gaps: u32 = matched_positions
-        .windows(2)
-        .map(|w| u32::from(w[1] - w[0]))
-        .sum();
-    let avg_gap = (gaps as f32) / ((matched_positions.len() - 1) as f32);
-    let density = 1.0 / avg_gap.max(1.0);
-    score * density / (1.0 + ln_approx(unique_terms as f32))
+    doc.sort_unstable();
+    let nterms = terms.len();
+    let mut wdoc = 0.0f32;
+    let mut start = 0usize;
+    while start < doc.len() {
+        // Grow a window from `start` until every distinct term is present.
+        let mut seen = alloc::vec![false; nterms];
+        let mut cnt = 0usize;
+        let mut end = start;
+        while end < doc.len() {
+            if !seen[doc[end].1] {
+                seen[doc[end].1] = true;
+                cnt += 1;
+            }
+            if cnt == nterms {
+                break;
+            }
+            end += 1;
+        }
+        if cnt < nterms {
+            break; // no further cover
+        }
+        // Shrink from the left to the minimal cover.
+        let mut begin = start;
+        while begin < end {
+            let bt = doc[begin].1;
+            if doc[begin + 1..=end].iter().any(|d| d.1 == bt) {
+                begin += 1;
+            } else {
+                break;
+            }
+        }
+        let p = doc[begin].0;
+        let q = doc[end].0;
+        let inv_sum: f32 = doc[begin..=end].iter().map(|d| 1.0 / weight_factor(d.2)).sum();
+        let mut cpos = ((end - begin + 1) as f32) / inv_sum;
+        let nnoise = (i32::from(q) - i32::from(p)) - (end as i32 - begin as i32);
+        if nnoise > 0 {
+            cpos /= (nnoise + 1) as f32;
+        }
+        wdoc += cpos;
+        start = begin + 1;
+    }
+    wdoc
 }
 
 /// `f32::ln` is std-only; spg-engine is no_std. Reuse the bit-
@@ -593,58 +629,7 @@ fn sqrt_approx(x: f32) -> f32 {
     g as f32
 }
 
-fn collect_rank_terms(query: &TsQueryAst, vec: &[TsLexeme], score: &mut f32, n: &mut usize) {
-    match query {
-        TsQueryAst::Term { word, .. } => {
-            *n += 1;
-            if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word.as_str())) {
-                let w = vec[idx].weight;
-                let occurrences = vec[idx].positions.len().max(1) as f32;
-                *score += weight_factor(w) * occurrences;
-            }
-        }
-        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
-            collect_rank_terms(a, vec, score, n);
-            collect_rank_terms(b, vec, score, n);
-        }
-        TsQueryAst::Not(_) => {
-            // NOT-side terms don't contribute to ts_rank.
-        }
-        TsQueryAst::Phrase { left, right, .. } => {
-            collect_rank_terms(left, vec, score, n);
-            collect_rank_terms(right, vec, score, n);
-        }
-    }
-}
 
-fn collect_cd_positions(
-    query: &TsQueryAst,
-    vec: &[TsLexeme],
-    positions: &mut Vec<u16>,
-    score: &mut f32,
-    n: &mut usize,
-) {
-    match query {
-        TsQueryAst::Term { word, .. } => {
-            *n += 1;
-            if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word.as_str())) {
-                positions.extend_from_slice(&vec[idx].positions);
-                let w = vec[idx].weight;
-                let occurrences = vec[idx].positions.len().max(1) as f32;
-                *score += weight_factor(w) * occurrences;
-            }
-        }
-        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
-            collect_cd_positions(a, vec, positions, score, n);
-            collect_cd_positions(b, vec, positions, score, n);
-        }
-        TsQueryAst::Not(_) => {}
-        TsQueryAst::Phrase { left, right, .. } => {
-            collect_cd_positions(left, vec, positions, score, n);
-            collect_cd_positions(right, vec, positions, score, n);
-        }
-    }
-}
 
 /// Tokenise on Unicode word boundaries — anything that is not an
 /// alphanumeric scalar value (or `_`) splits the token. Lowercases
