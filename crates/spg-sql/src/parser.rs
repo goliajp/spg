@@ -6606,6 +6606,25 @@ impl Parser {
                     crate::ast::AlterTableTarget::AlterColumnDropExpression { column: col_name }
                 ])
             }
+            // v7.38 (read01, T28) — `DROP IDENTITY [IF EXISTS]` — de-generate an
+            // identity column into a plain column.
+            Token::Ident(s) if s.eq_ignore_ascii_case("identity") => {
+                self.advance();
+                let mut if_exists = false;
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                    self.advance();
+                    if matches!(self.peek(), Token::Ident(e) if e.eq_ignore_ascii_case("exists")) {
+                        self.advance();
+                        if_exists = true;
+                    }
+                }
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::AlterColumnDropIdentity {
+                        column: col_name,
+                        if_exists,
+                    }
+                ])
+            }
             _ => {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
