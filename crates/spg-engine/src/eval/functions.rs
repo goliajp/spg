@@ -8729,6 +8729,46 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.38 (read01) — PG's `^` / power() are numeric whenever either
+            // operand is numeric and neither is float (`2 ^ 0.5` → numeric),
+            // and double when both are integers (`2 ^ 10` → double). Promote an
+            // integer operand to numeric here so the exact / pow_numeric paths
+            // below fire for an integer base as well as a numeric one.
+            let promoted: Option<[Value<'static>; 2]> = {
+                let is_float = |v: &Value| matches!(v, Value::Float(_) | Value::Real(_));
+                let is_num = |v: &Value| {
+                    matches!(v, Value::Numeric { .. } | Value::NumericBig(_))
+                };
+                if !is_float(&args[0])
+                    && !is_float(&args[1])
+                    && (is_num(&args[0]) || is_num(&args[1]))
+                {
+                    let as_num = |v: &Value| -> Value<'static> {
+                        match v {
+                            Value::SmallInt(n) => Value::Numeric {
+                                scaled: i128::from(*n),
+                                scale: 0,
+                                kind: spg_storage::NumericKind::Finite,
+                            },
+                            Value::Int(n) => Value::Numeric {
+                                scaled: i128::from(*n),
+                                scale: 0,
+                                kind: spg_storage::NumericKind::Finite,
+                            },
+                            Value::BigInt(n) => Value::Numeric {
+                                scaled: i128::from(*n),
+                                scale: 0,
+                                kind: spg_storage::NumericKind::Finite,
+                            },
+                            other => other.clone().into_owned(),
+                        }
+                    };
+                    Some([as_num(&args[0]), as_num(&args[1])])
+                } else {
+                    None
+                }
+            };
+            let args: &[Value] = promoted.as_ref().map_or(args, <[Value; 2]>::as_slice);
             // v7.38 (read01, T5) — a NUMERIC base raised to a non-negative
             // integer exponent is exact and returns NUMERIC (PG types
             // `numeric ^` / power(numeric, …) as numeric). The display scale

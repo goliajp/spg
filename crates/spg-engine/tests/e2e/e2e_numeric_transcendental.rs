@@ -66,3 +66,25 @@ fn float_arguments_keep_the_double_overload() {
     assert_eq!(text(&mut e, "SELECT pg_typeof(ln(2.0::float8))::text"), "double precision");
     assert_eq!(text(&mut e, "SELECT pg_typeof(exp(1.0::float8))::text"), "double precision");
 }
+
+// v7.38 (read01) — PG's `^` / power() are numeric whenever either operand is
+// numeric and neither is float; only both-integer is double. So an integer
+// base with a fractional/numeric exponent is exact numeric, not double.
+// Oracle: live PG18.4.
+#[test]
+fn int_base_with_numeric_exponent_is_numeric() {
+    let mut e = Engine::new();
+    assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 0.5)::text"), "numeric");
+    assert_eq!(text(&mut e, "SELECT (2 ^ 0.5)::text"), "1.4142135623730950");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 3.0)::text"), "numeric");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(power(2, 0.5))::text"), "numeric");
+    assert_eq!(text(&mut e, "SELECT (power(2, 0.5))::text"), "1.4142135623730950");
+    // A numeric base keeps the exact numeric scale even for a negative exp.
+    assert_eq!(text(&mut e, "SELECT (2.0 ^ (-1))::text"), "0.5000000000000000");
+    // Both-integer stays double precision (PG `2 ^ 10` → double, `2 ^ (-1)` → 0.5).
+    assert_eq!(text(&mut e, "SELECT (2 ^ (-1))::text"), "0.5");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 10)::text"), "double precision");
+    assert_eq!(text(&mut e, "SELECT (2 ^ 10)::text"), "1024");
+    // power() of two integers is double.
+    assert_eq!(text(&mut e, "SELECT pg_typeof(power(2, 3))::text"), "double precision");
+}
