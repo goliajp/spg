@@ -828,12 +828,21 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
             Ok(Value::Float((scaled as f64) / f64_powi(10.0, i32::from(scale))))
         }
         Value::Text(s) => {
-            s.trim()
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| EvalError::TypeMismatch {
+            let t = s.trim();
+            // Unparseable → invalid syntax; parseable-but-out-of-range (overflow
+            // to ±∞ / nonzero underflow to 0) → out of range, the way PG's
+            // float8in does, rather than silently yielding Infinity/0. Shared
+            // with the Named-cast coerce path so `::float` and `::float8` agree.
+            if t.parse::<f64>().is_err() {
+                return Err(EvalError::TypeMismatch {
                     detail: format!("cannot parse {s:?} as float"),
-                })
+                });
+            }
+            crate::conversions::parse_float8(t).map(Value::Float).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: format!("\"{t}\" is out of range for type double precision"),
+                }
+            })
         }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to float", other.data_type()),

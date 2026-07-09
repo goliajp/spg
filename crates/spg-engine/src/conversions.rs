@@ -2507,6 +2507,31 @@ fn xml_content_is_well_formed(s: &str) -> bool {
     stack.is_empty()
 }
 
+/// v7.38 (read01) — parse a float8 the way PG's `float8in` does: a
+/// numeric literal that overflows to ±∞, or a nonzero magnitude that
+/// underflows to 0, is "out of range" (returns None → the caller errors),
+/// not a silent Infinity/0. The `inf`/`infinity`/`nan` spellings (a letter
+/// after the optional sign) are the legitimate special values and pass.
+pub(crate) fn parse_float8(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let parsed = t.parse::<f64>().ok()?;
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let numeric_looking = body.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'.');
+    if numeric_looking {
+        if parsed.is_infinite() {
+            return None; // overflow
+        }
+        if parsed == 0.0 {
+            // A mantissa with a nonzero digit that resolves to 0 underflowed.
+            let mantissa = body.split(['e', 'E']).next().unwrap_or(body);
+            if mantissa.bytes().any(|c| c.is_ascii_digit() && c != b'0') {
+                return None;
+            }
+        }
+    }
+    Some(parsed)
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -2643,7 +2668,7 @@ pub(crate) fn coerce_value(
             parse_pg_int(&s).and_then(|n| i32::try_from(n).ok()).map(Value::Int)
         }
         (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
-        (Value::Text(s), DataType::Float) => s.trim().parse::<f64>().ok().map(Value::Float),
+        (Value::Text(s), DataType::Float) => parse_float8(&s).map(Value::Float),
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
         (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
