@@ -56,7 +56,8 @@ pub use format::{
     format_interval,
     format_interval_array, format_money, format_numeric, format_numeric_array, format_numeric_kind,
     format_smallint_array, format_text_array, format_time, format_timestamp,
-    format_timestamp_array, format_timestamptz, format_timetz, format_uuid_array,
+    format_timestamp_array, format_timestamptz, format_timestamptz_at, format_timetz,
+    format_uuid_array,
     parse_date_literal, parse_timestamp_literal,
 };
 use functions::apply_function;
@@ -267,6 +268,19 @@ impl<'a> EvalContext<'a> {
     pub const fn with_catalog(mut self, catalog: &'a spg_storage::Catalog) -> Self {
         self.catalog = Some(catalog);
         self
+    }
+
+    /// v7.38 (T-tstz Phase 2) — the micro-offset of the session `TimeZone` GUC
+    /// (`SET TimeZone = '+09'` → +9h). A fixed offset / abbreviation resolves;
+    /// UTC and an unset GUC give 0; a named IANA zone (no tzdata) also gives 0
+    /// so a timestamptz still renders — as `+00` — rather than erroring on
+    /// every display. Timestamptz rendering / cast is the only consumer.
+    #[must_use]
+    pub fn session_tz_offset(&self) -> i64 {
+        self.session_gucs
+            .and_then(|g| g.get("timezone"))
+            .and_then(|z| datetime::resolve_zone_offset(z))
+            .unwrap_or(0)
     }
 
     /// v7.38 (T24) — attach the transaction-version view the `txid_*` builtins
@@ -571,7 +585,10 @@ pub fn eval_expr(
                 && crate::describe::describe_expr(expr, ctx.columns)
                     .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
             {
-                return Ok(Value::text(crate::eval::format_timestamptz(*t)));
+                return Ok(Value::text(crate::eval::format_timestamptz_at(
+                    *t,
+                    ctx.session_tz_offset(),
+                )));
             }
             cast_value(v, target.clone())
         }

@@ -39,10 +39,28 @@ pub fn format_date(days: i32) -> String {
 /// round-trip to a literal that re-INSERTs without semantic
 /// drift.
 pub fn format_timestamptz(micros: i64) -> String {
-    let base = format_timestamp(micros);
-    let mut s = String::with_capacity(base.len() + 3);
+    format_timestamptz_at(micros, 0)
+}
+
+/// v7.38 (T-tstz Phase 2) — render a UTC instant in a fixed-offset zone: shift
+/// the wall clock by `offset_micros`, then append PG's offset suffix (`+09`,
+/// `-05`, `+05:30`, `+00`). Minutes are shown only when non-zero, matching PG.
+/// UTC (`offset_micros == 0`) reproduces the old `+00` output byte-for-byte.
+pub fn format_timestamptz_at(micros: i64, offset_micros: i64) -> String {
+    if micros == i64::MAX || micros == i64::MIN {
+        return format_timestamp(micros);
+    }
+    let base = format_timestamp(micros + offset_micros);
+    let mut s = String::with_capacity(base.len() + 6);
     s.push_str(&base);
-    s.push_str("+00");
+    let total_min = (offset_micros / 60_000_000).abs();
+    let (h, m) = (total_min / 60, total_min % 60);
+    s.push(if offset_micros < 0 { '-' } else { '+' });
+    s.push_str(&alloc::format!("{h:02}"));
+    if m != 0 {
+        s.push(':');
+        s.push_str(&alloc::format!("{m:02}"));
+    }
     s
 }
 
