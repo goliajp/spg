@@ -542,6 +542,184 @@ impl BigNumeric {
         Some(rounded)
     }
 
+    /// v7.38 (S1.1b) — round to `target_scale`, half-away-from-zero (PG numeric
+    /// `round_var`). Widening pads with zeros; narrowing drops digits with
+    /// rounding.
+    #[must_use]
+    pub fn round_to(&self, target_scale: u8) -> Self {
+        use core::cmp::Ordering;
+        match self.scale.cmp(&target_scale) {
+            Ordering::Equal => self.clone(),
+            Ordering::Less => {
+                let k = u32::from(target_scale - self.scale);
+                let mut out = BigNumeric {
+                    neg: self.neg,
+                    limbs: Self::mul_pow10(&self.limbs, k),
+                    scale: target_scale,
+                };
+                out.normalize();
+                out
+            }
+            Ordering::Greater => {
+                let k = u32::from(self.scale - target_scale);
+                let divisor = Self::mul_pow10(&[1], k);
+                let (mut q, r) = Self::div_rem_mag(&self.limbs, &divisor);
+                // half-away: bump when 2*rem >= divisor.
+                let two_r = Self::mul_scalar(&r, 2);
+                if Self::cmp_mag(&two_r, &divisor) != Ordering::Less {
+                    q = Self::add_mag(&q, &[1]);
+                }
+                let mut out = BigNumeric { neg: self.neg, limbs: q, scale: target_scale };
+                out.normalize();
+                out
+            }
+        }
+    }
+
+    /// v7.38 (S1.1b) — the display scale PG gives a numeric transcendental
+    /// result (`exp` / `ln` / fractional `^`): ~16 significant digits, i.e.
+    /// `17 - int_digits` fractional digits (16 for `|v| < 10`), floored at 0.
+    fn transcendental_scale(&self) -> u8 {
+        let (_, digits, scale) = self.parts();
+        // Decimal digit count of the mantissa.
+        let ndigits = if digits.is_empty() {
+            1
+        } else {
+            let top = *digits.last().unwrap();
+            (digits.len() - 1) * BASE_DIGITS + top.to_string().len()
+        };
+        let int_digits = ndigits as i64 - i64::from(scale);
+        if int_digits <= 1 {
+            16
+        } else {
+            (17 - int_digits).max(0) as u8
+        }
+    }
+
+    /// v7.38 (S1.1b) — e^self at PG's numeric display scale (~16 significant
+    /// digits), rounded half-away. Range-reduces by halving until the operand is
+    /// small (fast Taylor convergence), sums the series with guard digits, then
+    /// squares back. The final scale keys off the RESULT magnitude, so it is
+    /// computed at high precision first, then rounded. Matches PG18.4 to the
+    /// last digit across the differential set.
+    #[must_use]
+    pub fn exp(&self) -> Self {
+        const WS: u8 = 28;
+        let raw = if self.neg && !self.is_zero() {
+            // e^-x = 1 / e^x.
+            let pos = self.neg().exp_core(WS);
+            BigNumeric::from_i128(1, 0).div(&pos, WS).unwrap()
+        } else {
+            self.exp_core(WS)
+        };
+        raw.round_to(raw.transcendental_scale())
+    }
+
+    /// exp on a non-negative value computed at `ws` (working scale, includes the
+    /// guard digits); the caller rounds down to the display scale. Integer
+    /// constants are built at scale 0 (`from_i128(k, 0)` is the value `k`, not
+    /// `k * 10^-scale`) and gain scale through the arithmetic.
+    fn exp_core(&self, ws: u8) -> Self {
+        let one = BigNumeric::from_i128(1, 0);
+        if self.is_zero() {
+            return one.round_to(ws);
+        }
+        // Range reduction: halve until t <= 1/16 so the series converges in a
+        // handful of terms. `halvings` squarings undo it afterwards.
+        let sixteenth = BigNumeric::from_decimal_str("0.0625").unwrap();
+        let two = BigNumeric::from_i128(2, 0);
+        let mut halvings = 0u32;
+        let mut t = self.clone();
+        while t.cmp(&sixteenth) == core::cmp::Ordering::Greater {
+            t = t.div(&two, ws).unwrap();
+            halvings += 1;
+        }
+        // Taylor: 1 + t + t^2/2! + t^3/3! + …  term_k = term_{k-1} * t / k.
+        let mut sum = one.round_to(ws);
+        let mut term = one.round_to(ws);
+        let mut k: i128 = 1;
+        loop {
+            term = term.mul(&t).round_to(ws);
+            term = term.div(&BigNumeric::from_i128(k, 0), ws).unwrap();
+            if term.is_zero() {
+                break;
+            }
+            sum = sum.add(&term);
+            k += 1;
+        }
+        // Undo the halvings: square once per halving.
+        for _ in 0..halvings {
+            sum = sum.mul(&sum).round_to(ws);
+        }
+        sum
+    }
+
+    /// v7.38 (S1.1b) — `self^exp` for a positive base and any exponent, exact
+    /// to PG's numeric display scale, via `exp(exp · ln(self))`. `ln` is taken
+    /// at high internal precision (not its display scale) so the composition
+    /// keeps ~16 correct significant digits. `None` for a non-positive base.
+    #[must_use]
+    pub fn pow_numeric(&self, exp: &Self) -> Option<Self> {
+        if self.neg || self.is_zero() {
+            return None;
+        }
+        const WS: u8 = 30;
+        let ln_hi = self.ln_at(WS)?;
+        let prod = exp.mul(&ln_hi).round_to(WS);
+        Some(prod.exp())
+    }
+
+    /// natural log computed to a fixed working scale `ws` (no display-scale
+    /// rounding); shared by `ln` (rounds to display scale) and `pow_numeric`
+    /// (needs full precision for the exponent multiply). `None` for `self <= 0`.
+    fn ln_at(&self, ws: u8) -> Option<Self> {
+        if self.neg || self.is_zero() {
+            return None;
+        }
+        let two = BigNumeric::from_i128(2, 0);
+        let ln2 = BigNumeric::from_decimal_str("0.6931471805599453094172321214581765680755").unwrap();
+        let four_thirds = BigNumeric::from_decimal_str("1.3333333333333333").unwrap();
+        let two_thirds = BigNumeric::from_decimal_str("0.6666666666666667").unwrap();
+        let mut m = self.round_to(ws);
+        let mut e: i128 = 0;
+        while m.cmp(&four_thirds) != core::cmp::Ordering::Less {
+            m = m.div(&two, ws).unwrap();
+            e += 1;
+        }
+        while m.cmp(&two_thirds) == core::cmp::Ordering::Less {
+            m = m.mul(&two).round_to(ws);
+            e -= 1;
+        }
+        let one = BigNumeric::from_i128(1, 0);
+        let t = m.sub(&one).div(&m.add(&one), ws).unwrap();
+        let t2 = t.mul(&t).round_to(ws);
+        let mut sum = t.clone();
+        let mut power = t.clone();
+        let mut k: i128 = 3;
+        loop {
+            power = power.mul(&t2).round_to(ws);
+            let term = power.div(&BigNumeric::from_i128(k, 0), ws).unwrap();
+            if term.is_zero() {
+                break;
+            }
+            sum = sum.add(&term);
+            k += 2;
+        }
+        let ln_m = sum.mul(&two).round_to(ws);
+        let e_ln2 = ln2.mul(&BigNumeric::from_i128(e, 0)).round_to(ws);
+        Some(ln_m.add(&e_ln2))
+    }
+
+    /// v7.38 (S1.1b) — natural log at a target display scale, rounded half-away.
+    /// `None` for a non-positive value (the caller raises the domain error).
+    /// Range-reduces `x = m · 2^e` to `m ∈ [2/3, 4/3)` where the atanh series
+    /// converges fast, then adds `e · ln2`. Matches PG18.4 to the last digit.
+    #[must_use]
+    pub fn ln(&self) -> Option<Self> {
+        let raw = self.ln_at(30)?;
+        Some(raw.round_to(raw.transcendental_scale()))
+    }
+
     /// Render as a decimal string (`-123.4500` style), inserting the scale point.
     #[must_use]
     pub fn to_decimal_str(&self) -> String {
