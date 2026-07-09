@@ -212,25 +212,29 @@ fn range_peer_semantics_with_ties() {
 }
 
 #[test]
-fn range_with_offset_is_rejected() {
+fn range_with_offset_sums_the_value_window() {
+    // v7.38 — PG supports an offset RANGE frame, and so does SPG now; the test
+    // predates that and asserted a rejection. Over `n = 1..5, v = 10..50`, each
+    // row sums the values whose `n` lies in `[n-1, n]`, i.e. itself plus its
+    // predecessor. Oracle: live PG 18.4 returns 10 / 30 / 50 / 70 / 90 (bigint).
     let (raw, addrs) = ServerBuilder::new().spawn();
     let _child = ChildGuard(raw);
     let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed_series(&mut s);
 
-    send(
+    let rows = select_rows(
         &mut s,
-        &build_query(
-            "SELECT n, SUM(v) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ts",
-        ),
+        "SELECT n, SUM(v) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ts",
     );
-    let f = read_frame(&mut s);
-    assert_eq!(f.op, Op::ErrorResponse, "expected error for RANGE offset");
-    let msg = spg_wire::parse_error_response(&f).unwrap_or("");
-    assert!(
-        msg.contains("RANGE") || msg.contains("offset"),
-        "unexpected error message: {msg}"
+    let mut got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|r| (as_i64(&r[0]), as_f64(&r[1])))
+        .collect();
+    got.sort_by_key(|(n, _)| *n);
+    assert_eq!(
+        got,
+        vec![(1, 10.0), (2, 30.0), (3, 50.0), (4, 70.0), (5, 90.0)]
     );
 }
 
