@@ -85,7 +85,8 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         (UnOp::Neg, other) => Err(EvalError::TypeMismatch {
             detail: format!("unary - applied to {:?}", other.data_type()),
         }),
-        (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::Int(!i32::from(n))),
+        // v7.38 (read01) — PG `~ int2` is int2, not int4.
+        (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::SmallInt(!n)),
         (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
         (UnOp::BitNot, Value::BigInt(n)) => Ok(Value::BigInt(!n)),
         // v7.38 (read01) — PG `~ inet` flips every host-address bit, keeping the
@@ -694,6 +695,9 @@ pub(super) fn apply_binary(
             };
             if matches!(l, Value::BigInt(_)) {
                 Ok(Value::BigInt(shifted))
+            } else if matches!(l, Value::SmallInt(_)) {
+                // v7.38 (read01) — PG `int2 << / >> k` stays int2.
+                small_int_result(shifted)
             } else {
                 #[allow(clippy::cast_possible_truncation)]
                 Ok(Value::Int(shifted as i32))
@@ -1948,6 +1952,11 @@ fn bitop(
         }
         return Ok(Value::Macaddr8(out));
     }
+    // v7.38 (read01) — PG `int2 & | # int2` stays int2 (a bitwise result of
+    // two int2 always fits int2). Mixed widths widen as before.
+    if let (Value::SmallInt(a), Value::SmallInt(b)) = (&l, &r) {
+        return small_int_result(f(i64::from(*a), i64::from(*b)));
+    }
     let widen = |v: Value<'static>| -> Value<'static> {
         match v {
             Value::SmallInt(n) => Value::Int(i32::from(n)),
@@ -2046,6 +2055,15 @@ fn check_float8_range(result: f64, a: f64, b: f64, op_name: &str) -> Result<f64,
     Ok(result)
 }
 
+/// v7.38 (read01) — narrow an i64 result of two int2 operands back to int2,
+/// erroring "smallint out of range" on overflow. PG keeps int2 arithmetic and
+/// bitwise ops in int2; this is the shared narrowing all those sites use.
+fn small_int_result(res: i64) -> Result<Value<'static>, EvalError> {
+    i16::try_from(res)
+        .map(Value::SmallInt)
+        .map_err(|_| EvalError::TypeMismatch { detail: "smallint out of range".into() })
+}
+
 fn arith(
     l: Value<'static>,
     r: Value<'static>,
@@ -2053,6 +2071,15 @@ fn arith(
     float_op: impl Fn(f64, f64) -> f64,
     op_name: &str,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01) — PG keeps int2 <op> int2 in int2 (widening only when
+    // mixed with int4/int8), and a result outside int2 is "smallint out of
+    // range", not a silent widen. Handle the both-small case before widening.
+    if let (Value::SmallInt(a), Value::SmallInt(b)) = (&l, &r) {
+        let res = int_op(i64::from(*a), i64::from(*b)).ok_or(EvalError::TypeMismatch {
+            detail: format!("smallint overflow on {op_name}"),
+        })?;
+        return small_int_result(res);
+    }
     // Widen SmallInt to Int up front so the rest of the arithmetic
     // table only deals with Int / BigInt / Float pairs.
     let widen = |v: Value<'static>| -> Value<'static> {
