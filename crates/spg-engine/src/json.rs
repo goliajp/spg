@@ -183,6 +183,177 @@ fn accessor_result(v: &JsonValue, as_text: bool) -> Value<'static> {
     }
 }
 
+// ---- v7.38 (read01) — verbatim source extraction for the json accessors ----
+//
+// PG's `->` / `->>` / `#>` / `#>>` return the EXACT source text of the located
+// value, never a re-serialization: `('{"a":{ "b" : 1 }}'::json) -> 'a'` yields
+// `{ "b" : 1 }`, `2e2` stays `2e2`, and `{"k":1,"k":2}` keeps both members.
+// `jsonb` needs no special case — its stored text is already canonical, so
+// slicing that text yields canonical text, exactly as before.
+//
+// Only containers were wrong: SPG already passed scalars through verbatim.
+
+/// First index at or after `i` that is not JSON whitespace.
+fn skip_ws_at(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// `i` sits on the opening quote; returns the index just past the closing
+/// quote. Escapes are skipped as a unit so `\"` does not end the string.
+fn scan_string(b: &[u8], i: usize) -> Option<usize> {
+    debug_assert_eq!(b.get(i), Some(&b'"'));
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// `i` sits on the first byte of a JSON value; returns the index just past its
+/// last byte. Containers are matched by depth, ignoring braces inside strings;
+/// scalars run to the next structural byte. Multi-byte UTF-8 is safe: its
+/// continuation bytes are all >= 0x80 and never collide with the ASCII
+/// delimiters tested here.
+fn scan_value(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => scan_string(b, i),
+        open @ (b'{' | b'[') => {
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => j = scan_string(b, j)?,
+                    c if c == open => {
+                        depth += 1;
+                        j += 1;
+                    }
+                    c if c == close => {
+                        depth -= 1;
+                        j += 1;
+                        if depth == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut j = i;
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
+/// Decode a JSON string token (including its quotes) into its text value.
+fn decode_string_token(tok: &str) -> Option<String> {
+    match parse(tok).ok()? {
+        JsonValue::String(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Verbatim source slice of `key`'s value in the object encoded at `src`.
+/// PG resolves a duplicate key to the LAST occurrence, so the scan does not
+/// stop early. Keys are compared after unescaping (`{"A":1}` has key `A`).
+fn locate_member<'a>(src: &'a str, key: &str) -> Option<&'a str> {
+    let b = src.as_bytes();
+    let mut i = skip_ws_at(b, 0);
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut found: Option<&'a str> = None;
+    loop {
+        i = skip_ws_at(b, i);
+        match b.get(i)? {
+            b'}' => return found,
+            b'"' => {}
+            _ => return None,
+        }
+        let key_end = scan_string(b, i)?;
+        let this_key = decode_string_token(src.get(i..key_end)?)?;
+        i = skip_ws_at(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws_at(b, i + 1);
+        let val_end = scan_value(b, i)?;
+        if this_key == key {
+            found = Some(src.get(i..val_end)?);
+        }
+        i = skip_ws_at(b, val_end);
+        match b.get(i)? {
+            b',' => i += 1,
+            b'}' => return found,
+            _ => return None,
+        }
+    }
+}
+
+/// Verbatim source slice of element `idx` in the array encoded at `src`.
+/// A negative index counts from the end, as in PG.
+fn locate_index<'a>(src: &'a str, idx: i64) -> Option<&'a str> {
+    let b = src.as_bytes();
+    let mut i = skip_ws_at(b, 0);
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    i += 1;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    loop {
+        i = skip_ws_at(b, i);
+        if b.get(i)? == &b']' {
+            break;
+        }
+        let end = scan_value(b, i)?;
+        spans.push((i, end));
+        i = skip_ws_at(b, end);
+        match b.get(i)? {
+            b',' => i += 1,
+            b']' => break,
+            _ => return None,
+        }
+    }
+    let n = if idx >= 0 {
+        usize::try_from(idx).ok()?
+    } else {
+        usize::try_from(i64::try_from(spans.len()).ok()? + idx).ok()?
+    };
+    let (s, e) = *spans.get(n)?;
+    src.get(s..e)
+}
+
+/// Turn a located verbatim slice into the accessor's result. Containers and
+/// scalars alike keep their source text; only `->>` unwraps a string token and
+/// maps a JSON `null` to SQL NULL (`->` yields the JSON `null` itself).
+fn verbatim_accessor_result(slice: &str, as_text: bool) -> Value<'static> {
+    match slice.as_bytes().first() {
+        Some(b'n') if slice == "null" => {
+            if as_text {
+                Value::Null
+            } else {
+                Value::json("null")
+            }
+        }
+        Some(b'"') if as_text => decode_string_token(slice).map_or(Value::Null, Value::text),
+        _ if as_text => Value::text(slice.to_string()),
+        _ => Value::json(slice.to_string()),
+    }
+}
+
 /// Serialise a `JsonValue` in PG's canonical jsonb text form.
 fn json_canonical_string(v: &JsonValue) -> String {
     let mut s = String::new();
@@ -446,41 +617,28 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
         }
     };
     let path = parse_text_array(path_text)?;
-    let mut cur = parse(src).map_err(|e| EvalError::TypeMismatch {
+    // Validate once, then narrow a VERBATIM source slice per step — PG's `#>` /
+    // `#>>` return the located value's original text, not a re-serialization.
+    parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON for path walk: {e}"),
     })?;
+    let mut cur: &str = src;
     for step in &path {
-        let next = match (&cur, step.as_str()) {
-            (JsonValue::Object(entries), key) => entries
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone()),
-            (JsonValue::Array(items), key) => {
-                let Ok(idx) = key.parse::<i64>() else {
-                    return Ok(Value::Null);
-                };
-                if idx >= 0 {
-                    items.get(idx as usize).cloned()
-                } else {
-                    let from_end = items.len() as i64 + idx;
-                    if from_end >= 0 {
-                        items.get(from_end as usize).cloned()
-                    } else {
-                        None
-                    }
-                }
-            }
+        let at = skip_ws_at(cur.as_bytes(), 0);
+        let next = match cur.as_bytes().get(at) {
+            Some(b'{') => locate_member(cur, step),
+            Some(b'[') => match step.parse::<i64>() {
+                Ok(idx) => locate_index(cur, idx),
+                Err(_) => return Ok(Value::Null),
+            },
             _ => return Ok(Value::Null),
         };
         cur = match next {
             None => return Ok(Value::Null),
-            Some(v) => v,
+            Some(slice) => slice,
         };
     }
-    if matches!(cur, JsonValue::Null) {
-        return Ok(Value::Null);
-    }
-    Ok(accessor_result(&cur, as_text))
+    Ok(verbatim_accessor_result(cur, as_text))
 }
 
 /// v6.4.5 — PG `json @> sub_json` containment. Returns BOOL.
@@ -806,47 +964,19 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
             });
         }
     };
-    let doc = parse(src).map_err(|e| EvalError::TypeMismatch {
+    // Validate the document (an invalid one still errors), then extract the
+    // located value's VERBATIM source text — PG never re-serializes here.
+    parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON for path access: {e}"),
     })?;
-    let inner = match (&doc, rhs) {
-        (JsonValue::Object(entries), Value::Text(k)) => entries
-            .iter()
-            .find(|(name, _)| name == k)
-            .map(|(_, v)| v.clone()),
-        (JsonValue::Array(items), Value::Int(idx)) => {
-            let n = *idx;
-            if n >= 0 {
-                items.get(n as usize).cloned()
-            } else {
-                let from_end = items.len() as i64 + i64::from(n);
-                if from_end >= 0 {
-                    items.get(from_end as usize).cloned()
-                } else {
-                    None
-                }
-            }
-        }
-        (JsonValue::Array(items), Value::BigInt(idx)) => {
-            let n = *idx;
-            if n >= 0 {
-                items.get(n as usize).cloned()
-            } else {
-                let from_end = items.len() as i64 + n;
-                if from_end >= 0 {
-                    items.get(from_end as usize).cloned()
-                } else {
-                    None
-                }
-            }
-        }
-        (_, Value::Null) => return Ok(Value::Null),
+    let located = match rhs {
+        Value::Text(k) => locate_member(src, k),
+        Value::Int(idx) => locate_index(src, i64::from(*idx)),
+        Value::BigInt(idx) => locate_index(src, *idx),
+        Value::Null => return Ok(Value::Null),
         _ => None,
     };
-    match inner {
-        None | Some(JsonValue::Null) => Ok(Value::Null),
-        Some(v) => Ok(accessor_result(&v, as_text)),
-    }
+    Ok(located.map_or(Value::Null, |slice| verbatim_accessor_result(slice, as_text)))
 }
 
 // ---- Tiny recursive-descent JSON parser ----
@@ -2574,11 +2704,40 @@ mod tests {
     }
 
     #[test]
-    fn path_get_nested_subtree_renders_back() {
+    fn path_get_nested_subtree_is_verbatim() {
+        // v7.38 (read01) — PG returns the located value's EXACT source text, so
+        // a compact source stays compact (verified against PG18.4: `->` on this
+        // doc yields `{"x":[1,2]}`, not the canonical `{"x": [1, 2]}`). A jsonb
+        // column reaches here already canonicalized, so slicing it still yields
+        // canonical text.
         let doc = Value::json::<String>(r#"{"k":{"x":[1,2]}}"#.into());
         let v = path_get(&doc, &Value::text("k"), false).unwrap();
-        // The extracted jsonb subtree is re-emitted canonically (PG form).
-        assert_eq!(v, Value::json::<String>("{\"x\": [1, 2]}".into()));
+        assert_eq!(v, Value::json::<String>(r#"{"x":[1,2]}"#.into()));
+
+        // A canonical (jsonb-shaped) source slices back to canonical text.
+        let canon = Value::json::<String>(r#"{"k": {"x": [1, 2]}}"#.into());
+        let v = path_get(&canon, &Value::text("k"), false).unwrap();
+        assert_eq!(v, Value::json::<String>(r#"{"x": [1, 2]}"#.into()));
+
+        // Whitespace, number lexemes and duplicate keys all survive; a
+        // duplicate key resolves to the LAST occurrence, as in PG.
+        let raw = Value::json::<String>(r#"{"a":{ "y" : 2e2 },"k":1,"k":2}"#.into());
+        assert_eq!(
+            path_get(&raw, &Value::text("a"), false).unwrap(),
+            Value::json::<String>(r#"{ "y" : 2e2 }"#.into())
+        );
+        assert_eq!(
+            path_get(&raw, &Value::text("k"), false).unwrap(),
+            Value::json::<String>("2".into())
+        );
+
+        // `->` on a JSON null yields the JSON null; `->>` yields SQL NULL.
+        let n = Value::json::<String>(r#"{"a":null}"#.into());
+        assert_eq!(
+            path_get(&n, &Value::text("a"), false).unwrap(),
+            Value::json::<String>("null".into())
+        );
+        assert_eq!(path_get(&n, &Value::text("a"), true).unwrap(), Value::Null);
     }
 }
 
