@@ -286,6 +286,7 @@ mod e2e_cte_search;
 mod e2e_win125x_encoding;
 mod e2e_numeric_transcendental;
 mod e2e_common_type_unification;
+mod e2e_array_numeric_unification;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
