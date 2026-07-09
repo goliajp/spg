@@ -187,6 +187,28 @@ pub fn current_version() -> u64 {
     GLOBAL_VERSION.load(Ordering::Acquire)
 }
 
+/// v7.38 — recover the version cursor past a version read off a durable
+/// image. `GLOBAL_VERSION` lives in process memory and restarts at
+/// `XMIN_FROZEN + 1`, but rows persisted by an earlier process carry the
+/// versions *that* process allocated. A fresh process must not hand out a
+/// version any restored row already uses, and — because `Snapshot::visible`
+/// rejects `xmin > version` as "written by a future transaction" — must take
+/// snapshots at a version above every restored `xmin`, or committed rows
+/// silently vanish from reads. The same applies to `xmax`: a delete that
+/// looks like the future would resurrect the deleted row.
+///
+/// This is the version-cursor twin of the `next_rowid` recovery in
+/// `codec::read_mvcc_header_appendix`, and mirrors PG recovering `nextXid`
+/// from `pg_control` rather than restarting the counter at zero.
+///
+/// `XMAX_ALIVE` (0) carries no version and is ignored.
+pub fn observe_persisted_version(v: u64) {
+    if v == XMAX_ALIVE {
+        return;
+    }
+    GLOBAL_VERSION.fetch_max(v.saturating_add(1), Ordering::AcqRel);
+}
+
 /// v7.37.15 (Phase C.1) — stable per-relation row identity.
 ///
 /// ## Why a stable id, separate from the physical index
@@ -322,5 +344,26 @@ mod tests {
         assert!(!h.is_deleted());
         h.xmax = 13;
         assert!(h.is_deleted());
+    }
+
+    #[test]
+    fn observe_persisted_version_advances_cursor_past_restored_rows() {
+        // v7.38 — a restored row's version must never look like the future to a
+        // snapshot this process takes, or `Snapshot::visible` drops it. The
+        // cursor is process-global and monotonic, so observing a large restored
+        // version must leave `current_version()` strictly above it.
+        let restored_xmin = 1_000_000_007u64;
+        observe_persisted_version(restored_xmin);
+        assert!(
+            current_version() > restored_xmin,
+            "cursor must sit above every restored version"
+        );
+        // Idempotent: observing an older version never rewinds the cursor.
+        let after = current_version();
+        observe_persisted_version(42);
+        assert_eq!(current_version(), after);
+        // XMAX_ALIVE is the "not deleted" sentinel, not a version.
+        observe_persisted_version(XMAX_ALIVE);
+        assert_eq!(current_version(), after);
     }
 }
