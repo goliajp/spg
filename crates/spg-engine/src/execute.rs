@@ -1294,17 +1294,27 @@ impl Engine {
         // COPY renders each value with its type's output function, the
         // same as the wire — notably bool as `t` / `f`, not the engine's
         // debug-ish `true` / `false`.
-        let cell_text = |v: &Value| -> Option<alloc::string::String> {
+        // v7.38 (T-tstz Phase 1) — `ty` is the column's declared type, needed
+        // only to tell timestamptz from timestamp: PG's COPY renders the former
+        // with its offset. Everything else renders identically either way.
+        let cell_text = |v: &Value, ty: spg_storage::DataType| -> Option<alloc::string::String> {
             match v {
                 Value::Null => None,
                 Value::Bool(b) => Some(alloc::string::String::from(if *b { "t" } else { "f" })),
+                Value::Timestamp(t) if matches!(ty, spg_storage::DataType::Timestamptz) => {
+                    Some(crate::eval::format_timestamptz(*t))
+                }
                 other => Some(crate::eval::values::value_to_text(other)),
             }
         };
         let encode = |row: &spg_storage::Row<'static>| {
             let cells: alloc::vec::Vec<Option<alloc::string::String>> = positions
                 .iter()
-                .map(|&p| row.values.get(p).and_then(cell_text))
+                .map(|&p| {
+                    row.values
+                        .get(p)
+                        .and_then(|v| cell_text(v, schema_cols[p].ty))
+                })
                 .collect();
             encode_cells(&cells)
         };

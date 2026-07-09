@@ -3770,7 +3770,7 @@ fn handle_copy_to_stdout(
             if i > 0 {
                 line.push('\t');
             }
-            line.push_str(&encode_copy_cell(v));
+            line.push_str(&encode_copy_cell(v, columns.get(i).map(|c| c.ty)));
         }
         line.push('\n');
         send_msg(stream, b'd', line.as_bytes())?;
@@ -3784,7 +3784,11 @@ fn handle_copy_to_stdout(
 
 /// Inverse of decode_copy_text_row's cell decode: render a Value
 /// as a tab-safe text cell with `\N` for NULL.
-fn encode_copy_cell(v: &spg_storage::Value) -> String {
+/// v7.38 (T-tstz Phase 1) — `ty` is the column's declared type. It exists only
+/// to tell `timestamptz` from `timestamp`: PG's COPY renders the former with
+/// its offset (`2024-01-15 10:30:00+00`), the latter without. Every other
+/// value renders identically either way.
+fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -> String {
     use spg_storage::Value;
     match v {
         Value::Null => "\\N".to_string(),
@@ -3796,7 +3800,13 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
         Value::Numeric { scaled, scale, kind } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
-        Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
+        Value::Timestamp(t) => {
+            if matches!(ty, Some(DataType::Timestamptz)) {
+                spg_engine::eval::format_timestamptz(*t)
+            } else {
+                spg_engine::eval::format_timestamp(*t)
+            }
+        }
         Value::Interval {
             months,
             days,
@@ -4751,8 +4761,12 @@ const fn pg_type_len(ty: DataType) -> i16 {
     match ty {
         DataType::Bool => 1,
         DataType::SmallInt => 2,
-        DataType::Int | DataType::Date => 4,
-        DataType::BigInt | DataType::Float | DataType::Timestamp => 8,
+        // v7.38 (T-tstz Phase 1) — float4 is 4 bytes; it fell to the varlena
+        // catch-all while already carrying the fixed-length OID 700.
+        DataType::Int | DataType::Date | DataType::Real => 4,
+        // v7.38 (T-tstz Phase 1) — timestamptz is a fixed 8-byte type (PG
+        // typlen 8), same as timestamp; it fell to the varlena catch-all.
+        DataType::BigInt | DataType::Float | DataType::Timestamp | DataType::Timestamptz => 8,
         DataType::Interval => 16,
         // v7.17.0 — UUID is fixed 16 bytes (RFC 4122 / PG OID 2950).
         DataType::Uuid => 16,
