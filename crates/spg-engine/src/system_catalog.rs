@@ -271,8 +271,19 @@ pub(crate) fn synth_information_schema_columns(
                         crate::eval::format_numeric_kind(*kind, *scaled, *scale)
                     }
                     Value::Date(d) => alloc::format!("'{}'::date", crate::eval::format_date(*d)),
+                    // v7.38 (T-tstz Phase 1) — a timestamptz column's default
+                    // renders with the offset and the full type name, like PG.
+                    Value::Timestamp(t) if matches!(col.ty, DataType::Timestamptz) => {
+                        alloc::format!(
+                            "'{}'::timestamp with time zone",
+                            crate::eval::format_timestamptz(*t)
+                        )
+                    }
                     Value::Timestamp(t) => {
-                        alloc::format!("'{}'::timestamp", crate::eval::format_timestamp(*t))
+                        alloc::format!(
+                            "'{}'::timestamp without time zone",
+                            crate::eval::format_timestamp(*t)
+                        )
                     }
                     Value::Uuid(b) => alloc::format!("'{}'::uuid", spg_storage::format_uuid(b)),
                     other => alloc::format!("{other:?}"),
