@@ -354,6 +354,14 @@ fn read_mvcc_header_appendix(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), 
         let xmax = cur.read_u64()?;
         let flags = cur.read_u8()?;
         let rowid = cur.read_u64()?;
+        // v7.38 — recover the process-global version cursor past every
+        // persisted version, exactly as `next_rowid` is recovered past every
+        // persisted RowId below. Without this a fresh process takes snapshots
+        // at a version below the restored rows' `xmin`, so `Snapshot::visible`
+        // reads them as "written by a future transaction" and every row a
+        // previous process committed after the first one silently disappears.
+        crate::row_header::observe_persisted_version(xmin);
+        crate::row_header::observe_persisted_version(xmax);
         headers.push_mut(crate::row_header::RowHeader { xmin, xmax, flags });
         rowids.push_mut(crate::row_header::RowId(rowid));
         if rowid > max_id {
