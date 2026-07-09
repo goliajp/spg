@@ -275,6 +275,13 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
     // clock dependency.
     enum ClockShape {
         Timestamp,
+        /// v7.38 (T-tstz Phase 1) — `now()` / `current_timestamp` /
+        /// `clock_timestamp` / `statement_timestamp` / `transaction_timestamp`
+        /// are `timestamp with time zone` in PG. Same instant as `Timestamp`,
+        /// but the folded literal must carry the tz type so the projected
+        /// column type and `pg_typeof` report it. `localtimestamp` stays
+        /// `Timestamp` (PG types it without time zone).
+        TimestampTz,
         Date,
         UnixSeconds,
         /// v7.37.17 (17.6 siblings) — curtime / utc_time /
@@ -285,7 +292,7 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
     }
     let shape = match name.len() {
         3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => {
-            Some(ClockShape::Timestamp)
+            Some(ClockShape::TimestampTz)
         }
         12 if name.eq_ignore_ascii_case("current_date") => Some(ClockShape::Date),
         // v7.37.17 (17.6 siblings) — MySQL clock spellings. SPG's
@@ -328,19 +335,19 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
             Some(ClockShape::UnixSeconds)
         }
         15 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("clock_timestamp") => {
-            Some(ClockShape::Timestamp)
+            Some(ClockShape::TimestampTz)
         }
-        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::Timestamp),
+        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::TimestampTz),
         14 if name.eq_ignore_ascii_case("localtimestamp") => Some(ClockShape::Timestamp),
         19 if kind == ClockSite::Fn
             && name.eq_ignore_ascii_case("statement_timestamp") =>
         {
-            Some(ClockShape::Timestamp)
+            Some(ClockShape::TimestampTz)
         }
         21 if kind == ClockSite::Fn
             && name.eq_ignore_ascii_case("transaction_timestamp") =>
         {
-            Some(ClockShape::Timestamp)
+            Some(ClockShape::TimestampTz)
         }
         _ => None,
     };
@@ -356,13 +363,14 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         return Some(Expr::Literal(spg_sql::ast::Literal::String(text)));
     }
     let payload = match shape {
-        ClockShape::Timestamp => now,
+        ClockShape::Timestamp | ClockShape::TimestampTz => now,
         ClockShape::Date => now.div_euclid(86_400_000_000),
         ClockShape::UnixSeconds => now.div_euclid(1_000_000),
         ClockShape::TimeText => unreachable!("handled above"),
     };
     let target = match shape {
         ClockShape::Timestamp => spg_sql::ast::CastTarget::Timestamp,
+        ClockShape::TimestampTz => spg_sql::ast::CastTarget::Timestamptz,
         ClockShape::Date => spg_sql::ast::CastTarget::Date,
         ClockShape::UnixSeconds => spg_sql::ast::CastTarget::BigInt,
         ClockShape::TimeText => unreachable!("handled above"),
