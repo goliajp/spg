@@ -312,6 +312,13 @@ pub(crate) fn synth_information_schema_columns(
                 DataType::Uuid => "uuid",
                 DataType::Date => "date",
                 DataType::Timestamp => "timestamp",
+                // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
+                // and mis-reported themselves. PG18.4 udt_name, verified:
+                // timestamptz / time / interval / numeric.
+                DataType::Timestamptz => "timestamptz",
+                DataType::Time => "time",
+                DataType::Interval => "interval",
+                DataType::Numeric { .. } => "numeric",
                 _ => "text",
             };
             rows.push(Row::new(alloc::vec![
