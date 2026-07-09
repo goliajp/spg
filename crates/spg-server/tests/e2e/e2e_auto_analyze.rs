@@ -140,7 +140,7 @@ fn wait_for_spg_statistic_rows(addr: &str, target: usize, deadline: Instant) -> 
 }
 
 #[test]
-fn sweep_fires_after_10pct_threshold() {
+fn sweep_fires_after_analyze_threshold() {
     let dir = unique_tmpdir();
     let (raw, addrs) = spawn_with_interval(&dir.join("s.db"), 200);
     let _g = common::ChildGuard(raw);
@@ -148,11 +148,13 @@ fn sweep_fires_after_10pct_threshold() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL)");
-    // 10+ INSERTs on a fresh table → threshold = 0.1 × max(N, 100) = 10
-    // (after 10 inserts, row_count=10 → threshold = 10). The worker
-    // sweep should pick this up within ~400 ms (sweep interval 200 ms
-    // + ANALYZE cycle).
-    for i in 0..10 {
+    // v7.38 (read01 P5.29) — the sweep uses PG's autovacuum analyze threshold,
+    // `autovacuum_analyze_threshold (50) + autovacuum_analyze_scale_factor
+    // (0.1) × reltuples`, so a table needs `modified >= 50 + ceil(rows/10)`.
+    // 60 inserts clears it (60 >= 50 + 6); the older 10-insert figure came
+    // from the pre-P5.29 formula `0.1 × max(N, 100)`. The worker sweep should
+    // pick this up within ~400 ms (sweep interval 200 ms + ANALYZE cycle).
+    for i in 0..60 {
         exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i})"));
     }
 
