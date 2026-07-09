@@ -11801,6 +11801,74 @@ impl Parser {
         {
             return self.parse_json_to_record_from();
         }
+        // v7.38 (T15) — `regexp_matches(s, pat[, flags])` as a FROM item. Each
+        // row is a text[] of capture groups, so it cannot desugar to unnest
+        // (that would flatten the array). Wrap it as a derived table
+        // `(SELECT regexp_matches(args)) AS <alias>(<col>)` — the SELECT-list
+        // SRF path already emits one text[] row per match. PG names the column
+        // `regexp_matches`; an `AS a(col)` alias overrides it.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("regexp_matches"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // fn name
+            self.advance(); // (
+            let mut fn_args: Vec<Expr> = Vec::new();
+            loop {
+                fn_args.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after regexp_matches() arguments, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let table_alias = alias_ident.clone().unwrap_or_else(|| "regexp_matches".to_string());
+            let col_name = column_aliases
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "regexp_matches".to_string());
+            let inner = crate::ast::SelectStatement {
+                ctes: Vec::new(),
+                distinct: false,
+                distinct_on: Vec::new(),
+                items: alloc::vec![SelectItem::Expr {
+                    expr: Expr::FunctionCall {
+                        name: "regexp_matches".to_string(),
+                        args: fn_args,
+                    },
+                    alias: Some(col_name),
+                }],
+                from: None,
+                where_: None,
+                group_by: None,
+                group_by_all: false,
+                having: None,
+                unions: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                limit_with_ties: false,
+            };
+            return Ok(TableRef {
+                name: table_alias.clone(),
+                alias: Some(table_alias),
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(inner)),
+                jsonb_each_text_arg: None,
+            });
+        }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
         // / json_ variants as a FROM item. Rewritten into
         // `unnest(<same fn>(<expr>))`: the scalar form returns the

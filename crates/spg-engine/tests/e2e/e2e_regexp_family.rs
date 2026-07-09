@@ -220,3 +220,44 @@ fn invalid_pattern_errors_cleanly() {
     let r = e.execute(r"SELECT regexp_matches('x', '[unterminated')");
     assert!(r.is_err());
 }
+
+#[test]
+fn from_regexp_matches_is_a_row_source() {
+    // v7.38 (T15) — `FROM regexp_matches(...)` yields one text[] row per match
+    // (it can't desugar to unnest, which would flatten the group array). The
+    // column is named `regexp_matches`, overridable by an alias, and the array
+    // is usable downstream via subscript. Oracle: live PG 18.4.
+    use spg_storage::Value;
+    let mut e = Engine::new();
+
+    // Row count + values.
+    let r = e
+        .execute(r"SELECT * FROM regexp_matches('a1b2', '(\w)(\d)', 'g')")
+        .unwrap();
+    let QueryResult::Rows { columns, rows: got_rows } = r else {
+        panic!("rows")
+    };
+    assert_eq!(columns[0].name, "regexp_matches");
+    assert_eq!(got_rows.len(), 2);
+    assert_eq!(unwrap_text_array(&got_rows[0].values[0]), vec![Some("a".into()), Some("1".into())]);
+    assert_eq!(unwrap_text_array(&got_rows[1].values[0]), vec![Some("b".into()), Some("2".into())]);
+
+    // No `g` flag → the single first match.
+    let r = rows(e.execute(r"SELECT * FROM regexp_matches('abc', '(a)(b)')").unwrap());
+    assert_eq!(r.len(), 1);
+    assert_eq!(unwrap_text_array(&r[0][0]), vec![Some("a".into()), Some("b".into())]);
+
+    // Column alias + subscript access to the groups.
+    let r = rows(
+        e.execute(r"SELECT g[1], g[2] FROM regexp_matches('a1b2', '(\w)(\d)', 'g') AS t(g)")
+            .unwrap(),
+    );
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Text("a".into()));
+    assert_eq!(r[0][1], Value::Text("1".into()));
+    assert_eq!(r[1][0], Value::Text("b".into()));
+
+    // count(*) composes.
+    let r = rows(e.execute(r"SELECT count(*) FROM regexp_matches('a1b2', '(\w)(\d)', 'g')").unwrap());
+    assert!(matches!(r[0][0], Value::Int(2) | Value::BigInt(2)));
+}
