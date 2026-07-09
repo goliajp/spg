@@ -59,17 +59,27 @@ fn cycle_no_cycle_terminates_normally() {
 }
 
 #[test]
-fn search_errors_honestly() {
-    // Parsed, but the SET column can't be faithfully ORDER BY'd yet.
+fn search_by_a_single_column_works() {
+    // v7.38 (T31) — a single-column SEARCH BY now desugars to a typed array
+    // key that ORDER BY sorts correctly, so this no longer errors. The graph
+    // has one edge 1→2, so the recursion yields the single root row. PG18.4:
+    // `1 | 2 | {(1)}`.
     let mut e = Engine::new();
     e.execute("CREATE TABLE g(a int, b int)").unwrap();
     e.execute("INSERT INTO g VALUES(1,2)").unwrap();
-    let r = e.execute(
-        "WITH RECURSIVE t(a,b) AS (\
-           SELECT a,b FROM g WHERE a=1 \
-           UNION ALL \
-           SELECT g.a,g.b FROM g JOIN t ON g.a=t.b\
-         ) SEARCH DEPTH FIRST BY a SET ord SELECT * FROM t",
-    );
-    assert!(r.is_err(), "SEARCH should error honestly, not mis-order");
+    let r = e
+        .execute(
+            "WITH RECURSIVE t(a,b) AS (\
+               SELECT a,b FROM g WHERE a=1 \
+               UNION ALL \
+               SELECT g.a,g.b FROM g JOIN t ON g.a=t.b\
+             ) SEARCH DEPTH FIRST BY a SET ord SELECT a, b FROM t ORDER BY ord",
+        )
+        .unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], spg_storage::Value::Int(1));
+    assert_eq!(rows[0].values[1], spg_storage::Value::Int(2));
 }
