@@ -962,6 +962,70 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
     );
 }
 
+/// v7.38 — a row restored from a durable image must be visible to a snapshot
+/// this process takes. The version cursor is process-global and restarts at
+/// `XMIN_FROZEN + 1`, so without recovering it past the restored `xmin` the
+/// row reads as "written by a future transaction" and silently disappears —
+/// which is exactly how a daemon restart used to drop every committed row but
+/// the first. Regression test for the load-side cursor recovery.
+#[test]
+fn restored_rows_are_visible_to_a_fresh_snapshot() {
+    use crate::row_header::{self, RowHeader, XMAX_ALIVE};
+    use crate::snapshot::{InProgressSet, Snapshot};
+
+    // Well above whatever the process cursor has reached in this test binary.
+    const RESTORED_XMIN: u64 = 9_000_000_001;
+    const RESTORED_XMAX: u64 = 9_000_000_500;
+
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("id", DataType::Int, false)],
+    ))
+    .unwrap();
+    {
+        let t = c.get_mut("t").unwrap();
+        t.insert(Row::new(vec![Value::Int(1)])).unwrap();
+        t.insert(Row::new(vec![Value::Int(2)])).unwrap();
+        let headers = t.headers_mut_for_test();
+        // Row 0: committed by a long-gone process at a high version.
+        *headers.get_mut(0).unwrap() = RowHeader {
+            xmin: RESTORED_XMIN,
+            xmax: XMAX_ALIVE,
+            flags: 0,
+        };
+        // Row 1: deleted by that process at an even higher version.
+        *headers.get_mut(1).unwrap() = RowHeader {
+            xmin: RESTORED_XMIN,
+            xmax: RESTORED_XMAX,
+            flags: 0,
+        };
+    }
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("image loads");
+
+    // The cursor must now sit above every restored version, so the snapshot a
+    // reader takes is not "behind" the data it just loaded.
+    let version = row_header::current_version();
+    assert!(
+        version > RESTORED_XMAX,
+        "cursor {version} must exceed every restored version ({RESTORED_XMAX})"
+    );
+
+    let snap = Snapshot::new(version, InProgressSet::empty(), version, 0);
+    let headers: Vec<RowHeader> = restored.get("t").unwrap().headers().iter().copied().collect();
+    assert!(
+        snap.visible(&headers[0]),
+        "a committed restored row must not read as a future write"
+    );
+    // Symmetric: recovering `xmax` keeps the delete in the past, so the
+    // deleted row stays deleted rather than being resurrected.
+    assert!(
+        !snap.visible(&headers[1]),
+        "a restored tombstone must stay deleted, not resurrect"
+    );
+}
+
 /// (c) CROSS-CHECKPOINT DURABILITY. A tombstone naming a row inserted
 /// BEFORE the last checkpoint must survive the base-snapshot boundary:
 /// after serialize→deserialize the tombstone-redo resolves by RowId and
