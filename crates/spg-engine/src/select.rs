@@ -5393,52 +5393,74 @@ fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), Engin
 /// function" mismatch downstream, which is what we want
 /// (multi-SRF / nested SRF is documented carve-out for v7.19).
 fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
-    match expr {
-        spg_sql::ast::Expr::FunctionCall { name, args } => {
-            (name.eq_ignore_ascii_case("unnest") && args.len() == 1)
-                // v7.38 (read01) — generate_subscripts(arr, dim) is also a
-                // set-returning function in the SELECT list (it returned an array
-                // there before); it shares the unnest expansion machinery.
-                || (name.eq_ignore_ascii_case("generate_subscripts") && args.len() == 2)
-                // v7.38 (read01, T15) — jsonb/json_array_elements[_text] over a
-                // real FROM's rows expand per element in the SELECT list too
-                // (they collapsed to a single TextArray row before).
-                || (args.len() == 1
-                    && matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "jsonb_array_elements"
-                            | "json_array_elements"
-                            | "jsonb_array_elements_text"
-                            | "json_array_elements_text"
-                    ))
-                // v7.38 (read01, T15) — jsonb/json_path_query(doc, path) expands
-                // per match in the SELECT list.
-                || (args.len() == 2
-                    && matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "jsonb_path_query" | "json_path_query"
-                    ))
-                // v7.38 (read01, T15) — regexp_matches(s, pat[, flags]) is set-
-                // returning: one row (a text[] of capture groups) per match.
-                || ((2..=3).contains(&args.len())
-                    && name.eq_ignore_ascii_case("regexp_matches"))
-                // v7.38 (read01, T15) — jsonb/json_each[_text] in the SELECT list
-                // emit one composite `(key, value)` row per object member.
-                || (args.len() == 1
-                    && matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text"
-                    ))
-                // v7.38 (read01, T15) — jsonb/json_object_keys expands one row
-                // per top-level key in the SELECT list.
-                || (args.len() == 1
-                    && matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "jsonb_object_keys" | "json_object_keys"
-                    ))
-        }
-        _ => false,
+    top_level_srf_kind(expr).is_some()
+}
+
+/// v7.38 (read01, T15) — which set-returning function a top-level SELECT-list
+/// call is, if any. Matching is allocation-free (`eq_ignore_ascii_case`, no
+/// `to_ascii_lowercase`) because `top_level_srf_output` classifies once per
+/// source row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SrfKind {
+    Unnest,
+    GenerateSubscripts,
+    /// `_text` variants unwrap scalars to their lexeme; the plain forms render
+    /// every value as compact JSON text.
+    ArrayElements {
+        as_text: bool,
+    },
+    PathQuery,
+    RegexpMatches,
+    Each {
+        as_text: bool,
+    },
+    ObjectKeys,
+}
+
+/// Case-insensitive match against any of `names`.
+fn name_is(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
+fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
+    let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    let n = args.len();
+    // v7.38 (read01) — generate_subscripts(arr, dim) is set-returning in the
+    // SELECT list (it returned an array there before) and shares the unnest
+    // expansion machinery.
+    if n == 1 && name.eq_ignore_ascii_case("unnest") {
+        return Some(SrfKind::Unnest);
     }
+    if n == 2 && name.eq_ignore_ascii_case("generate_subscripts") {
+        return Some(SrfKind::GenerateSubscripts);
+    }
+    // v7.38 (read01, T15) — the jsonb/json SRF family and regexp_matches expand
+    // per element / match in the SELECT list; they collapsed to a single row
+    // (a TextArray, or an "unknown function" error for `each`) before.
+    if n == 1 && name_is(name, &["jsonb_array_elements", "json_array_elements"]) {
+        return Some(SrfKind::ArrayElements { as_text: false });
+    }
+    if n == 1 && name_is(name, &["jsonb_array_elements_text", "json_array_elements_text"]) {
+        return Some(SrfKind::ArrayElements { as_text: true });
+    }
+    if n == 2 && name_is(name, &["jsonb_path_query", "json_path_query"]) {
+        return Some(SrfKind::PathQuery);
+    }
+    if (2..=3).contains(&n) && name.eq_ignore_ascii_case("regexp_matches") {
+        return Some(SrfKind::RegexpMatches);
+    }
+    if n == 1 && name_is(name, &["jsonb_each", "json_each"]) {
+        return Some(SrfKind::Each { as_text: false });
+    }
+    if n == 1 && name_is(name, &["jsonb_each_text", "json_each_text"]) {
+        return Some(SrfKind::Each { as_text: true });
+    }
+    if n == 1 && name_is(name, &["jsonb_object_keys", "json_object_keys"]) {
+        return Some(SrfKind::ObjectKeys);
+    }
+    None
 }
 
 /// v7.38 (read01) — the row-set a top-level SELECT-list SRF emits: the elements
@@ -5450,100 +5472,91 @@ fn top_level_srf_output(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Vec<Value<'static>>, EngineError> {
-    let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+    let (Some(kind), spg_sql::ast::Expr::FunctionCall { name, args }) =
+        (top_level_srf_kind(expr), expr)
+    else {
         return Err(EngineError::Unsupported("expected a SELECT-list SRF call".into()));
     };
-    if name.eq_ignore_ascii_case("generate_subscripts") {
-        let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-        let dim = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
-        if !matches!(dim, Value::Int(1) | Value::BigInt(1) | Value::SmallInt(1)) {
-            return Ok(Vec::new());
+    match kind {
+        SrfKind::Unnest => {
+            let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            array_value_to_elements(&arr)
         }
-        let len = array_value_to_elements(&arr)?.len();
-        return Ok((1..=len).map(|i| Value::Int(i as i32)).collect());
-    }
-    // v7.38 (read01, T15) — jsonb/json_array_elements[_text]: one Value per
-    // array element (`_text` → text / SQL NULL, plain → the element's compact
-    // JSON text), the same element list the FROM-clause form materialises.
-    let lname = name.to_ascii_lowercase();
-    if matches!(
-        lname.as_str(),
-        "jsonb_array_elements"
-            | "json_array_elements"
-            | "jsonb_array_elements_text"
-            | "json_array_elements_text"
-    ) {
-        let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-        if matches!(arg, Value::Null) {
-            return Ok(Vec::new());
+        SrfKind::GenerateSubscripts => {
+            let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            let dim = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
+            if !matches!(dim, Value::Int(1) | Value::BigInt(1) | Value::SmallInt(1)) {
+                return Ok(Vec::new());
+            }
+            let len = array_value_to_elements(&arr)?.len();
+            Ok((1..=len).map(|i| Value::Int(i as i32)).collect())
         }
-        let as_text = lname.ends_with("_text");
-        let items =
-            crate::json::array_element_rows(&arg, as_text, &lname).map_err(EngineError::Eval)?;
-        return Ok(items
-            .into_iter()
-            .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
-            .collect());
-    }
-    // v7.38 (read01, T15) — jsonb/json_object_keys: one row per top-level key.
-    // The scalar form already yields a TextArray of the keys (or errors on a
-    // non-object, like PG); expand it into rows.
-    if matches!(lname.as_str(), "jsonb_object_keys" | "json_object_keys") {
-        let v = eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval)?;
-        return array_value_to_elements(&v);
-    }
-    // v7.38 (read01, T15) — regexp_matches(s, pat[, flags]): one row per match,
-    // each a text[] of the pattern's capture groups.
-    if lname == "regexp_matches" {
-        let vals: Vec<Value<'static>> = args
-            .iter()
-            .map(|a| eval::eval_expr(a, row, ctx).map_err(EngineError::Eval))
-            .collect::<Result<_, _>>()?;
-        return crate::eval::regexp_matches_rows(&vals).map_err(EngineError::Eval);
-    }
-    // v7.38 (read01, T15) — jsonb/json_each[_text]: one composite `(key, value)`
-    // row per object member (plain → jsonb value, `_text` → text / SQL NULL).
-    if matches!(
-        lname.as_str(),
-        "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text"
-    ) {
-        let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-        if matches!(arg, Value::Null) {
-            return Ok(Vec::new());
-        }
-        let as_text = lname.ends_with("_text");
-        let pairs = crate::json::each_rows(&arg, as_text, &lname).map_err(EngineError::Eval)?;
-        return Ok(pairs
-            .into_iter()
-            .map(|(k, v)| {
-                let val = if as_text {
-                    v.map(Value::text).unwrap_or(Value::Null)
-                } else {
-                    v.map(Value::json).unwrap_or(Value::Null)
-                };
-                Value::Composite(alloc::vec![
-                    ("key".to_string(), Value::text(k)),
-                    ("value".to_string(), val),
-                ])
-            })
-            .collect());
-    }
-    // v7.38 (read01, T15) — jsonb/json_path_query(doc, path): one Value per
-    // matched JSON value.
-    if matches!(lname.as_str(), "jsonb_path_query" | "json_path_query") {
-        let doc = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-        let path = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
-        return match crate::json::path_query(&doc, &path).map_err(EngineError::Eval)? {
-            Value::Null => Ok(Vec::new()),
-            Value::TextArray(items) => Ok(items
+        // One Value per array element (`_text` → text / SQL NULL, plain → the
+        // element's compact JSON text) — the element list the FROM-clause form
+        // materialises.
+        SrfKind::ArrayElements { as_text } => {
+            let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            if matches!(arg, Value::Null) {
+                return Ok(Vec::new());
+            }
+            let items =
+                crate::json::array_element_rows(&arg, as_text, name).map_err(EngineError::Eval)?;
+            Ok(items
                 .into_iter()
                 .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
-                .collect()),
-            other => Ok(alloc::vec![other]),
-        };
+                .collect())
+        }
+        // The scalar form already yields a TextArray of the keys (or errors on
+        // a non-object, like PG); expand it into rows.
+        SrfKind::ObjectKeys => {
+            let v = eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval)?;
+            array_value_to_elements(&v)
+        }
+        // One row per match, each a text[] of the pattern's capture groups.
+        SrfKind::RegexpMatches => {
+            let vals: Vec<Value<'static>> = args
+                .iter()
+                .map(|a| eval::eval_expr(a, row, ctx).map_err(EngineError::Eval))
+                .collect::<Result<_, _>>()?;
+            crate::eval::regexp_matches_rows(&vals).map_err(EngineError::Eval)
+        }
+        // One composite `(key, value)` row per object member (plain → jsonb
+        // value, `_text` → text / SQL NULL).
+        SrfKind::Each { as_text } => {
+            let arg = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            if matches!(arg, Value::Null) {
+                return Ok(Vec::new());
+            }
+            let pairs = crate::json::each_rows(&arg, as_text, name).map_err(EngineError::Eval)?;
+            Ok(pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = if as_text {
+                        v.map(Value::text).unwrap_or(Value::Null)
+                    } else {
+                        v.map(Value::json).unwrap_or(Value::Null)
+                    };
+                    Value::Composite(alloc::vec![
+                        ("key".to_string(), Value::text(k)),
+                        ("value".to_string(), val),
+                    ])
+                })
+                .collect())
+        }
+        // One Value per matched JSON value.
+        SrfKind::PathQuery => {
+            let doc = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            let path = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
+            match crate::json::path_query(&doc, &path).map_err(EngineError::Eval)? {
+                Value::Null => Ok(Vec::new()),
+                Value::TextArray(items) => Ok(items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::text).unwrap_or(Value::Null))
+                    .collect()),
+                other => Ok(alloc::vec![other]),
+            }
+        }
     }
-    let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-    array_value_to_elements(&arr)
 }
 
 /// v7.19 P5 — turn an array-typed `Value` into the element list
