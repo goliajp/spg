@@ -548,6 +548,12 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::TextArray(_) => "text[]",
         Value::IntArray(_) => "integer[]",
         Value::BigIntArray(_) => "bigint[]",
+        // v7.38 (read01) — the constructor now unifies numeric-ladder element
+        // types (`ARRAY[1, 2.5]` → numeric[], `ARRAY[1, 2.5::float8]` →
+        // double precision[]); report them instead of falling to "unknown".
+        Value::SmallIntArray(_) => "smallint[]",
+        Value::NumericArray(_) => "numeric[]",
+        Value::FloatArray(_) => "double precision[]",
         Value::TsVector(_) => "tsvector",
         Value::TsQuery(_) => "tsquery",
         Value::Uuid(_) => "uuid",

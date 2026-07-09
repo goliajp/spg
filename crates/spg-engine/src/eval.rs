@@ -885,18 +885,37 @@ pub fn eval_expr(
                 return Ok(Value::IntArray2D(rows));
             }
             let mut has_text = false;
+            let mut has_float = false;
+            let mut has_numeric = false;
             let mut has_bigint = false;
             let mut has_int = false;
+            // A NumericBig or non-finite (NaN/Inf) numeric can't be held in
+            // NumericArray's `(i128, scale)` cells, so it forces the text[]
+            // fallback rather than a lossy/panicking conversion.
+            let mut numeric_representable = true;
             for v in &materialised {
                 match v {
                     Value::Null => {}
                     Value::Int(_) | Value::SmallInt(_) => has_int = true,
                     Value::BigInt(_) => has_bigint = true,
+                    Value::Numeric { kind: spg_storage::NumericKind::Finite, .. } => {
+                        has_numeric = true;
+                    }
+                    Value::Numeric { .. } => {
+                        has_numeric = true;
+                        numeric_representable = false;
+                    }
+                    Value::NumericBig(_) => {
+                        has_numeric = true;
+                        numeric_representable = false;
+                    }
+                    Value::Float(_) => has_float = true,
                     Value::Text(_) | Value::Json(_) => has_text = true,
                     _ => has_text = true,
                 }
             }
-            if has_text || (!has_int && !has_bigint) {
+            let any_numlike = has_int || has_bigint || has_numeric || has_float;
+            if has_text || !any_numlike || (has_numeric && !numeric_representable) {
                 let out: Vec<Option<String>> = materialised
                     .into_iter()
                     .map(|v| match v {
@@ -906,6 +925,44 @@ pub fn eval_expr(
                     })
                     .collect();
                 return Ok(Value::TextArray(out));
+            }
+            // v7.38 (read01) — PG array-element unification across the numeric
+            // ladder: any float → double precision[]; else any numeric →
+            // numeric[] (each element keeps its own scale, PG's behaviour);
+            // else the integer widths. Matches `pg_typeof(ARRAY[1, 2.5])` =
+            // numeric[] and keeps downstream `[i]` arithmetic numeric.
+            if has_float {
+                let out: Vec<Option<f64>> = materialised
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Float(f) => Some(f),
+                        Value::Int(n) => Some(f64::from(n)),
+                        Value::SmallInt(n) => Some(f64::from(n)),
+                        #[allow(clippy::cast_precision_loss)]
+                        Value::BigInt(n) => Some(n as f64),
+                        #[allow(clippy::cast_precision_loss)]
+                        Value::Numeric { scaled, scale, .. } => {
+                            Some(scaled as f64 / libm::pow(10.0, f64::from(scale)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(Value::FloatArray(out));
+            }
+            if has_numeric {
+                let out: Vec<Option<(i128, u8)>> = materialised
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::SmallInt(n) => Some((i128::from(n), 0)),
+                        Value::Int(n) => Some((i128::from(n), 0)),
+                        Value::BigInt(n) => Some((i128::from(n), 0)),
+                        Value::Numeric { scaled, scale, .. } => Some((scaled, scale)),
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(Value::NumericArray(out));
             }
             if has_bigint {
                 let out: Vec<Option<i64>> = materialised
