@@ -85,7 +85,10 @@ fn jsonb_alias_accepted() {
     let dr = read_frame(&mut s);
     let cells = parse_data_row(&dr).unwrap();
     match &cells[0] {
-        WireValue::Text(s) => assert!(s.contains("\"a\":1")),
+        // v7.38 — a JSONB value renders canonically (`{"a": 1}`, space after the
+        // colon), matching PG; the pre-canonicalization spelling `{"a":1}` is
+        // what a JSON (non-b) column would keep.
+        WireValue::Text(s) => assert!(s.contains("\"a\": 1"), "got {s}"),
         other => panic!("got {other:?}"),
     }
     let _cc = read_frame(&mut s);

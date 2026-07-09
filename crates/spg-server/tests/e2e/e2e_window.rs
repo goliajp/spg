@@ -137,8 +137,13 @@ fn sum_over_partition_running_total() {
                 WireValue::Text(t) => t.clone(),
                 other => panic!("got {other:?}"),
             };
+            // v7.38 — SUM(int) is bigint in PG (and now in SPG), so the running
+            // total arrives as an integer wire value, not a float.
+            #[allow(clippy::cast_precision_loss)]
             let f = match &r[2] {
                 WireValue::Float(f) => *f,
+                WireValue::BigInt(n) => *n as f64,
+                WireValue::Int(n) => f64::from(*n),
                 WireValue::Text(t) => t.parse().unwrap(),
                 other => panic!("got {other:?}"),
             };
