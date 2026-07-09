@@ -59,11 +59,14 @@ fn trigger_depth_and_jit() {
 }
 
 #[test]
-fn txid_current_if_assigned_returns_bigint() {
+fn txid_current_if_assigned_is_null_without_an_id() {
+    // v7.38 (T24) — PG returns NULL when the current transaction has not been
+    // assigned an id, which is the case for a read-only autocommit statement.
+    // This used to return the constant-1 stub.
     let mut e = Engine::new();
     assert!(matches!(
         first(&mut e, "SELECT txid_current_if_assigned()"),
-        spg_storage::Value::BigInt(_)
+        spg_storage::Value::Null
     ));
 }
 

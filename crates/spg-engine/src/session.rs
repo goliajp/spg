@@ -146,6 +146,25 @@ impl Engine {
             // v7.38 (read01 P6.08) — thread the host wall clock so uuidv7 gets
             // a real time-ordered prefix.
             .with_clock(self.clock)
+            // v7.38 (T24) — thread the transaction-version state so the txid_*
+            // builtins report real ids instead of a constant stub.
+            .with_xact(self.xact_view())
+    }
+
+    /// v7.38 (T24) — read-only snapshot of the transaction-version state the
+    /// `txid_*` / `pg_xact_status` builtins read. A transaction's id is
+    /// allocated at BEGIN (`transaction.rs`), so it is stable across the
+    /// statements of that transaction, as in PG. In autocommit the id exists
+    /// only once the statement has written.
+    pub(crate) fn xact_view(&self) -> crate::eval::XactView<'_> {
+        crate::eval::XactView {
+            current: self
+                .current_tx
+                .and_then(|t| self.tx_writer_versions.get(&t).copied())
+                .or(self.stmt_writer_version),
+            active: &self.active_writer_versions,
+            aborted: &self.aborted_versions,
+        }
     }
 }
 

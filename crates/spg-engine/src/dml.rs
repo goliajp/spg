@@ -2467,6 +2467,8 @@ pub(crate) fn apply_generated_stored_columns(
                 // DEFAULT, so the deterministic fallbacks are acceptable here.
                 salt_fn: None,
                 clock: None,
+                xact: None,
+                assigned_xid: core::cell::Cell::new(None),
             };
             let value = crate::eval::eval_expr(&pe.expr, &row, &ctx).map_err(EngineError::Eval)?;
             let coerced = crate::coerce_value(value, pe.ty, &pe.col_name, idx)?;

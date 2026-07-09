@@ -280,6 +280,7 @@ mod e2e_trunc_numeric;
 mod e2e_numeric_special_render;
 mod e2e_numeric_special_arith;
 mod e2e_numeric_bignum;
+mod e2e_txid;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
