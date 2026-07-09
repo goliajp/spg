@@ -14823,19 +14823,84 @@ impl Parser {
         }
         let rec = body.unions.len() - 1; // recursive term = last UNION peer
 
-        if search.is_some() {
-            // SEARCH's SET column is meant to be ORDER BY'd, which needs a
-            // typed composite / array comparison (PG's `record[]`). SPG
-            // renders a row as text, so ordering it compares
-            // lexicographically and diverges from PG for multi-digit or
-            // multi-value keys (`(10)` sorts before `(2)`). Rather than
-            // return a silently-wrong order, error honestly. CYCLE below is
-            // equality-based and unaffected.
-            return Err(self.err(
-                "SEARCH DEPTH/BREADTH FIRST needs typed row ordering SPG doesn't have yet \
-                 (rows render as text, which mis-orders multi-digit keys); CYCLE is supported"
-                    .into(),
-            ));
+        if let Some(srch) = search {
+            // v7.38 (T31) — SEARCH's SET column is ORDER BY'd, and PG's key is a
+            // `record[]` (DEPTH) or `(depth, keys…)` record (BREADTH). SPG has
+            // no typed `record[]`, but element-wise array ORDER BY is correct
+            // (`[1,2] < [1,10] < [2]`), so a SINGLE scalar BY column maps
+            // exactly onto a typed array: DEPTH is the root→node path
+            // `array_append(parent, key)`, BREADTH is `[depth, key]`. This
+            // orders numerically (multi-digit keys included), matching PG.
+            //
+            // A multi-column BY would need a record[] to keep the per-node key
+            // tuple orderable, which SPG can't express — error honestly there
+            // rather than mis-order.
+            if srch.by_columns.len() != 1 {
+                return Err(self.err(
+                    "SEARCH … BY with multiple columns needs typed record[] ordering \
+                     SPG doesn't have yet; a single BY column is supported"
+                        .into(),
+                ));
+            }
+            let key_pos = pos_of(&srch.by_columns[0])?;
+            let base_key = match body.items.get(key_pos) {
+                Some(SelectItem::Expr { expr, .. }) => expr.clone(),
+                _ => {
+                    return Err(self.err(
+                        "SEARCH BY column maps to a non-expression select item".into(),
+                    ));
+                }
+            };
+            let rec_key = match body.unions[rec].1.items.get(key_pos) {
+                Some(SelectItem::Expr { expr, .. }) => expr.clone(),
+                _ => {
+                    return Err(self.err(
+                        "SEARCH BY column maps to a non-expression select item".into(),
+                    ));
+                }
+            };
+            if srch.depth_first {
+                // base: ARRAY[key]; rec: array_append(cte.set, key).
+                body.items.push(SelectItem::Expr {
+                    expr: Expr::Array(alloc::vec![base_key]),
+                    alias: Some(srch.set_column.clone()),
+                });
+                body.unions[rec].1.items.push(SelectItem::Expr {
+                    expr: Expr::FunctionCall {
+                        name: "array_append".into(),
+                        args: alloc::vec![col_ref(&srch.set_column), rec_key],
+                    },
+                    alias: Some(srch.set_column.clone()),
+                });
+            } else {
+                // BREADTH: [depth, key]; depth starts at 0 and increments. The
+                // leading depth element dominates the element-wise comparison,
+                // so shallower rows sort first, then by key — PG's (depth, key).
+                body.items.push(SelectItem::Expr {
+                    expr: Expr::Array(alloc::vec![
+                        Expr::Literal(Literal::Integer(0)),
+                        base_key,
+                    ]),
+                    alias: Some(srch.set_column.clone()),
+                });
+                // rec depth = cte.set[1] + 1.
+                let parent_depth = Expr::ArraySubscript {
+                    target: Box::new(col_ref(&srch.set_column)),
+                    index: Box::new(Expr::Literal(Literal::Integer(1))),
+                };
+                body.unions[rec].1.items.push(SelectItem::Expr {
+                    expr: Expr::Array(alloc::vec![
+                        Expr::Binary {
+                            lhs: Box::new(parent_depth),
+                            op: BinOp::Add,
+                            rhs: Box::new(Expr::Literal(Literal::Integer(1))),
+                        },
+                        rec_key,
+                    ]),
+                    alias: Some(srch.set_column.clone()),
+                });
+            }
+            extra_cols.push(srch.set_column);
         }
 
         if let Some(cyc) = cycle {
