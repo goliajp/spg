@@ -144,7 +144,14 @@ fn values_not_distinct(l: &Value<'_>, r: &Value<'_>) -> bool {
     match (l, r) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
-        _ => l == r,
+        // v7.38 (read01) — "not distinct" is the type's `=` semantics, not a
+        // representation-exact match, so `1 IS NOT DISTINCT FROM 1.0` is true
+        // (int and numeric compare equal) like PG. Fall back to structural
+        // equality only for types `compare` cannot order.
+        _ => match compare(BinOp::Eq, l, r) {
+            Ok(Value::Bool(b)) => b,
+            _ => l == r,
+        },
     }
 }
 
@@ -779,7 +786,13 @@ fn apply_binary_calendar(
     // former with an `int_value(Date) = None` no-op fall-through.
     match (l, r) {
         (Value::Date(a), Value::Date(b)) if op == BinOp::Sub => {
-            return Ok(Some(Value::BigInt(i64::from(*a) - i64::from(*b))));
+            // PG: date - date → integer (int4) day count, not bigint.
+            let days = i64::from(*a) - i64::from(*b);
+            return i32::try_from(days).map(Value::Int).map(Some).map_err(|_| {
+                EvalError::TypeMismatch {
+                    detail: "DATE - DATE day count out of integer range".into(),
+                }
+            });
         }
         (Value::Timestamp(a), Value::Timestamp(b)) if op == BinOp::Sub => {
             // PG: timestamp - timestamp -> interval, justified to hours (every
