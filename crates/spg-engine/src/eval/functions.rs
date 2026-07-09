@@ -2097,6 +2097,19 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.38 (S1.1b) — ln(numeric) is exact NUMERIC in PG (~16
+                // significant digits), computed via BigNumeric. int / float8
+                // args stay on the double path below.
+                v @ (Value::Numeric { kind: spg_storage::NumericKind::Finite, .. }
+                | Value::NumericBig(_)) => {
+                    let big = crate::eval::binop::value_to_bignum(v)
+                        .ok_or_else(|| EvalError::TypeMismatch { detail: "ln(): numeric".into() })?;
+                    big.ln()
+                        .map(crate::eval::binop::bignum_to_value)
+                        .ok_or_else(|| EvalError::TypeMismatch {
+                            detail: "ln(): input must be > 0".into(),
+                        })
+                }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!("ln() needs numeric, got {:?}", v.data_type()),
@@ -2162,6 +2175,14 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.38 (S1.1b) — exp(numeric) is exact NUMERIC in PG.
+                v @ (Value::Numeric { kind: spg_storage::NumericKind::Finite, .. }
+                | Value::NumericBig(_)) => {
+                    let big = crate::eval::binop::value_to_bignum(v).ok_or_else(|| {
+                        EvalError::TypeMismatch { detail: "exp(): numeric".into() }
+                    })?;
+                    Ok(crate::eval::binop::bignum_to_value(big.exp()))
+                }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!("exp() needs numeric, got {:?}", v.data_type()),
@@ -8789,6 +8810,39 @@ fn apply_function_dispatch(
             let y = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "power() needs numeric y".into(),
             })?;
+            // v7.38 (S1.1b) — a NUMERIC base with a fractional or negative
+            // exponent is exact NUMERIC in PG: x^y = exp(y · ln(x)). (The
+            // non-negative integer exponent is handled exactly above; an
+            // integer base like `2 ^ 0.5` is double in PG, so this only fires
+            // for a Numeric base.) x must be positive; x=0 with y<=0 is
+            // undefined; a negative base with a fractional exponent is complex.
+            if matches!(
+                args[0],
+                Value::Numeric { kind: spg_storage::NumericKind::Finite, .. } | Value::NumericBig(_)
+            ) {
+                let base = crate::eval::binop::value_to_bignum(&args[0]);
+                let exp_b = crate::eval::binop::value_to_bignum(&args[1]);
+                if let (Some(base), Some(exp_b)) = (base, exp_b) {
+                    if base.is_zero() {
+                        if !exp_b.parts().0 && !exp_b.is_zero() {
+                            return Ok(crate::eval::binop::bignum_to_value(
+                                spg_storage::bignum::BigNumeric::from_i128(0, 0),
+                            ));
+                        }
+                        return Err(EvalError::TypeMismatch {
+                            detail: "power(): 0 raised to a non-positive power is undefined".into(),
+                        });
+                    }
+                    if base.parts().0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "power(): negative base with fractional exponent yields complex result".into(),
+                        });
+                    }
+                    if let Some(ln_base) = base.pow_numeric(&exp_b) {
+                        return Ok(crate::eval::binop::bignum_to_value(ln_base));
+                    }
+                }
+            }
             // Integer-exponent fast path.
             let y_int = y as i32;
             if (y_int as f64) == y && y.abs() < 1024.0 {
