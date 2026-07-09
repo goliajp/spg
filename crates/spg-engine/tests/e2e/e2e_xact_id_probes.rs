@@ -26,8 +26,11 @@ fn pg_current_xact_id_returns_bigint() {
         spg_storage::Value::BigInt(_) => {}
         other => panic!("got {other:?}"),
     }
+    // v7.38 (T24) — `_if_assigned` is NULL until the transaction has an id; a
+    // read-only autocommit statement has none, as in PG. It used to return the
+    // constant-1 stub.
     match first(&mut e, "SELECT pg_current_xact_id_if_assigned()") {
-        spg_storage::Value::BigInt(_) => {}
+        spg_storage::Value::Null => {}
         other => panic!("got {other:?}"),
     }
 }

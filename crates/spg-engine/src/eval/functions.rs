@@ -1255,17 +1255,22 @@ fn apply_function_dispatch(
         // uses u64 tx IDs that never wrap; these return the current
         // tx ID as BigInt. txid_ names are pre-PG 13 aliases for
         // the pg_ names.
-        "txid_current"
-        | "txid_current_if_assigned"
-        | "pg_current_xact_id"
-        | "pg_current_xact_id_if_assigned" => {
-            // Use next_tx_id as a best-effort scalar surface.
-            let id = ctx
-                .catalog
-                .and_then(|_| Some(1i64))
-                .unwrap_or(0i64);
-            Ok(Value::BigInt(id))
+        // v7.38 (T24) — SPG's writer versions ARE its transaction ids, so these
+        // report the real id. A transaction's id is allocated at BEGIN, hence
+        // stable across its statements (as in PG); in autocommit an id exists
+        // only once the statement has written.
+        "txid_current" | "pg_current_xact_id" => {
+            let id = current_or_assign_xid(ctx);
+            Ok(Value::BigInt(i64::try_from(id).unwrap_or(i64::MAX)))
         }
+        // NULL until this transaction has been assigned an id, as in PG.
+        "txid_current_if_assigned" | "pg_current_xact_id_if_assigned" => Ok(ctx
+            .xact
+            .and_then(|x| x.current)
+            .or_else(|| ctx.assigned_xid.get())
+            .map_or(Value::Null, |v| {
+                Value::BigInt(i64::try_from(v).unwrap_or(i64::MAX))
+            })),
         // txid_current_snapshot / pg_current_snapshot — full snapshot
         // structure with xmin/xmax/xip_list. Return NULL for the
         // scalar surface until we have a snapshot text type.
@@ -1277,10 +1282,55 @@ fn apply_function_dispatch(
         | "txid_snapshot_xmin"
         | "txid_snapshot_xmax"
         | "txid_snapshot_xip" => Ok(Value::Null),
-        // txid_status / pg_xact_status — SPG commits synchronously,
-        // so any non-null tx ID we know about is committed.
+        // v7.38 (T24 / U22) — txid_status / pg_xact_status report the real
+        // three-state answer off the engine's version sets. Previously this
+        // always said "committed", which is wrong for an in-flight or
+        // rolled-back transaction. An id above the allocation cursor was never
+        // handed out; PG errors on it rather than guessing.
         "txid_status" | "pg_xact_status" => {
-            Ok(Value::text::<String>("committed".into()))
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let id = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}(): argument must be a transaction id, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let Ok(v) = u64::try_from(id) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("transaction ID {id} is in the future"),
+                });
+            };
+            if v >= spg_storage::row_header::current_version() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("transaction ID {v} is in the future"),
+                });
+            }
+            // The caller's own transaction is in flight by definition — this is
+            // what `txid_status(txid_current())` probes.
+            let is_own = ctx.xact.and_then(|x| x.current) == Some(v)
+                || ctx.assigned_xid.get() == Some(v);
+            let status = if is_own {
+                "in progress"
+            } else {
+                match ctx.xact {
+                    Some(x) if x.active.contains(&v) => "in progress",
+                    Some(x) if x.aborted.contains(&v) => "aborted",
+                    _ => "committed",
+                }
+            };
+            Ok(Value::text::<String>(status.into()))
         }
         // pg_notification_queue_usage — % of notification queue in
         // use. Return 0.0 (SPG has no notification queue yet).
@@ -14850,4 +14900,21 @@ fn spg_injection_detach(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     Err(EvalError::TypeMismatch {
         detail: "spg_injection_detach: injection-points feature not enabled in this build".into(),
     })
+}
+
+/// v7.38 (T24) — the current transaction's id, allocating one if none exists.
+/// PG's `txid_current()` assigns an id to a transaction that lacks one; SPG's
+/// autocommit read-only statements have no writer version, so the first call
+/// takes one from the same cursor the writers use and memoizes it for the rest
+/// of the statement (`SELECT txid_current(), txid_current()` must agree).
+fn current_or_assign_xid(ctx: &EvalContext<'_>) -> u64 {
+    if let Some(v) = ctx.xact.and_then(|x| x.current) {
+        return v;
+    }
+    if let Some(v) = ctx.assigned_xid.get() {
+        return v;
+    }
+    let v = spg_storage::row_header::next_version();
+    ctx.assigned_xid.set(Some(v));
+    v
 }

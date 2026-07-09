@@ -158,6 +158,32 @@ pub struct EvalContext<'a> {
     /// uses it for the real time-ordered 48-bit millisecond prefix; `None`
     /// (no host clock) falls back to the deterministic anchor.
     pub clock: Option<crate::ClockFn>,
+    /// v7.38 (T24) — read-only view of the engine's transaction-version state,
+    /// so the `txid_*` / `pg_*_xact_id` / `pg_xact_status` builtins report the
+    /// real transaction ids instead of a constant stub. `None` on the scan /
+    /// join / aggregate contexts that never evaluate them.
+    pub xact: Option<XactView<'a>>,
+    /// v7.38 (T24) — PG's `txid_current()` ASSIGNS an id to a transaction that
+    /// has none. In autocommit a read-only statement has no writer version, so
+    /// the first call allocates one here and later calls in the same statement
+    /// reuse it — `SELECT txid_current(), txid_current()` must agree, as in PG.
+    pub assigned_xid: core::cell::Cell<Option<u64>>,
+}
+
+/// v7.38 (T24) — the transaction-id surface PG's `txid_*` family exposes.
+/// SPG's writer versions ARE its transaction ids (`row_header::next_version`),
+/// so no separate xid counter is needed — this is the bridge U22 was waiting
+/// on.
+#[derive(Clone, Copy, Debug)]
+pub struct XactView<'a> {
+    /// The id assigned to the current transaction (allocated at BEGIN) or, in
+    /// autocommit, to the current statement once it has written. `None` when
+    /// nothing has been assigned — `*_if_assigned` returns NULL there, as PG does.
+    pub current: Option<u64>,
+    /// Ids allocated by transactions that have neither committed nor aborted.
+    pub active: &'a alloc::collections::BTreeSet<u64>,
+    /// Ids of rolled-back transactions.
+    pub aborted: &'a alloc::collections::BTreeSet<u64>,
 }
 
 /// v7.17.0 — sequence-mutating callback used by `apply_function`
@@ -192,6 +218,8 @@ impl<'a> EvalContext<'a> {
             recursion_base: core::cell::Cell::new(0),
             salt_fn: None,
             clock: None,
+            xact: None,
+            assigned_xid: core::cell::Cell::new(None),
         }
     }
 
@@ -238,6 +266,14 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_catalog(mut self, catalog: &'a spg_storage::Catalog) -> Self {
         self.catalog = Some(catalog);
+        self
+    }
+
+    /// v7.38 (T24) — attach the transaction-version view the `txid_*` builtins
+    /// read. Defaults to None, where they fall back to the process-wide cursor.
+    #[must_use]
+    pub const fn with_xact(mut self, xact: XactView<'a>) -> Self {
+        self.xact = Some(xact);
         self
     }
 
