@@ -227,8 +227,9 @@ impl Engine {
             if if_exists {
                 return Ok(());
             }
+            // PG18.4: `column "a" of relation "t3" is not an identity column`.
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER COLUMN DROP IDENTITY: column {column:?} is not an identity column"
+                "column {column:?} of relation {tbl:?} is not an identity column"
             )));
         }
         table.schema_mut().columns[pos].auto_increment = false;
