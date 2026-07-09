@@ -1255,21 +1255,23 @@ pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         });
     };
     let z = zone.trim();
+    // PG's AT TIME ZONE has a sign quirk that a uniform offset can't capture: a
+    // NUMERIC offset (`+09`) is added to the naive time, but a NAMED zone (`JST`)
+    // subtracts its UTC offset. `tz_abbrev_offset` already stores the applied
+    // (naive→UTC) offset, so the two spellings keep their own branches here.
     let offset = if z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("gmt") {
         0
     } else if let Some(off) = parse_tz_offset(z) {
         off
     } else if let Ok(h) = z.parse::<i64>() {
-        // Bare numeric hours ('+5' parses above; '5' lands here).
         if h.abs() > 14 {
             return Err(EvalError::TypeMismatch {
                 detail: format!("timezone(): offset {h} out of range"),
             });
         }
         h * 3_600_000_000
-    } else if let Some(off) = tz_abbrev_offset(z) {
-        // v7.38 (read01, T-timezone) — common fixed-offset zone abbreviations.
-        off
+    } else if let Some(applied) = tz_abbrev_offset(z) {
+        applied
     } else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1281,6 +1283,30 @@ pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     };
     let ts = text_or_temporal_micros(&args[1], "timezone")?;
     Ok(Value::Timestamp(ts + offset))
+}
+
+/// v7.38 (T-tstz Phase 2) — the micro-offset a fixed time-zone spelling adds to
+/// a UTC instant to reach zone-local wall-clock (JST → +9h, EST → -5h). Accepts
+/// `UTC` / `GMT`, an explicit `±HH[:MM]` / bare-hour offset, and the fixed
+/// abbreviations in `tz_abbrev_offset`. Returns `None` for a named IANA zone
+/// (no tzdata) — the caller decides whether that errors or falls back to UTC.
+///
+/// Note the sign: `tz_abbrev_offset` stores the *applied* offset (`-utc_offset`,
+/// the `AT TIME ZONE` naive→UTC direction), so it is negated here to give the
+/// UTC→local rendering direction this function promises.
+pub(crate) fn resolve_zone_offset(z: &str) -> Option<i64> {
+    let z = z.trim();
+    if z.is_empty() || z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("gmt") {
+        return Some(0);
+    }
+    if let Some(off) = parse_tz_offset(z) {
+        return Some(off);
+    }
+    // Bare numeric hours: `+5`, `5`, `-9`.
+    if let Ok(h) = z.parse::<i64>() {
+        return (h.abs() <= 14).then_some(h * 3_600_000_000);
+    }
+    tz_abbrev_offset(z).map(|applied| -applied)
 }
 
 /// v7.38 (read01, T-timezone) — the applied micro-offset for a fixed

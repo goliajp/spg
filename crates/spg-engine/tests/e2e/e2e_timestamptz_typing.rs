@@ -147,3 +147,53 @@ fn union_of_timestamptz_and_timestamp_is_timestamptz() {
     };
     assert_eq!(columns[0].ty, spg_storage::DataType::Timestamptz);
 }
+
+#[test]
+fn timestamptz_text_honours_session_timezone() {
+    // v7.38 (T-tstz Phase 2) — `<timestamptz>::text` renders in the session
+    // TimeZone. A fixed offset / abbreviation shifts the wall clock and shows
+    // the matching suffix; a named IANA zone (no tzdata) falls back to +00
+    // rather than erroring. AT TIME ZONE keeps its own (PG-quirky) sign
+    // convention and is checked here too so the shared parser can't drift it.
+    // Oracle: live PG 18.4.
+    let mut e = Engine::new();
+    let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
+
+    e.execute("SET TimeZone='JST'").unwrap();
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+00'::timestamptz::text"),
+        "2024-01-15 19:30:00+09"
+    );
+    e.execute("SET TimeZone='EST'").unwrap();
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+00'::timestamptz::text"),
+        "2024-01-15 05:30:00-05"
+    );
+    e.execute("SET TimeZone='+05:30'").unwrap();
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+00'::timestamptz::text"),
+        "2024-01-15 16:00:00+05:30"
+    );
+    // Named IANA zone → fallback to +00 (no tzdata), never an error.
+    e.execute("SET TimeZone='America/New_York'").unwrap();
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+00'::timestamptz::text"),
+        "2024-01-15 10:30:00+00"
+    );
+    // Back to UTC restores the plain +00 form.
+    e.execute("SET TimeZone='UTC'").unwrap();
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+00'::timestamptz::text"),
+        "2024-01-15 10:30:00+00"
+    );
+
+    // AT TIME ZONE unchanged: numeric adds, named subtracts (PG's quirk).
+    assert_eq!(
+        t(&mut e, "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE '+09')::text"),
+        "2024-01-15 19:30:00"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE 'JST')::text"),
+        "2024-01-15 01:30:00"
+    );
+}
