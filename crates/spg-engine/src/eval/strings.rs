@@ -840,6 +840,63 @@ fn to_char_roman(n: f64, fill_mode: bool) -> String {
     }
 }
 
+/// v7.38 (read01, T23) — the numeric `EEEE` scientific marker has two PG
+/// placement rules, both rejected at parse time (before any output):
+///   * combining `EEEE` with a sign/fill/scale/roman flag
+///     (`FM`,`S`,`MI`,`PL`,`SG`,`PR`,`RN`,`V`,`B`) → "incompatible with
+///     other formats";
+///   * any further *format token* after `EEEE` (a digit `9`/`0`, a
+///     decimal/group `.`/`,`/`D`/`G`, a currency `L`, a scale `V`, a sign
+///     flag, or a second `EEEE`) → "EEEE must be the last pattern used".
+/// Plain literals after it — spaces, `$`, or `"…"`-quoted text — are fine.
+/// Quoted spans and `\`-escaped characters are literals, so we scan a
+/// de-quoted copy of the mask; the incompatible check wins when a flag
+/// precedes `EEEE` and a token also follows it (PG's left-to-right pass).
+fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
+    // Build the significant (non-literal) characters, uppercased, dropping
+    // `"…"` quoted spans and `\`-escaped characters the way PG's lexer does.
+    let mut sig = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => {
+                for q in chars.by_ref() {
+                    if q == '"' {
+                        break;
+                    }
+                }
+            }
+            _ => sig.push(c.to_ascii_uppercase()),
+        }
+    }
+    let Some(epos) = sig.find("EEEE") else {
+        return Ok(());
+    };
+    let before = &sig[..epos];
+    if ["FM", "MI", "PL", "SG", "PR", "RN"].iter().any(|f| before.contains(f))
+        || before.contains(['S', 'V', 'B'])
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: String::from(
+                "\"EEEE\" is incompatible with other formats: \"EEEE\" may \
+                 only be used together with digit and decimal point patterns",
+            ),
+        });
+    }
+    let after = &sig[epos + 4..];
+    if after.contains([
+        '9', '0', '.', ',', 'D', 'G', 'L', 'V', 'S', 'M', 'I', 'P', 'R', 'N', 'B', 'F', 'H', 'E',
+    ]) {
+        return Err(EvalError::TypeMismatch {
+            detail: String::from("\"EEEE\" must be the last pattern used"),
+        });
+    }
+    Ok(())
+}
+
 // v7.38 (read01 P6.01) — `exact` carries the input's exact (scaled, scale)
 // when it came in as `numeric`, so the digit-slot path can build the value
 // from integer arithmetic instead of the lossy f64 `n`. `n` is still used by
@@ -1187,6 +1244,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     }
     // Numeric form: to_char(number, 'FM9999.00' / '999,990.9' / …).
     if let Some(n) = numeric_value_for_to_char(&args[0]) {
+        check_eeee_format(fmt)?;
         // v7.38 (read01 P6.01) — thread the exact (scaled, scale) for numeric
         // inputs so to_char never rounds a high-precision value through f64.
         let exact = match &args[0] {

@@ -53,3 +53,50 @@ fn date_form_unaffected() {
         "2024-03-05"
     );
 }
+
+// v7.38 (read01, T23) — `EEEE` scientific-notation placement rules. Valid
+// masks keep working; malformed ones error the way PG18.4 does instead of
+// silently mis-rendering. Every expected string / error is from live PG18.4.
+#[test]
+fn eeee_scientific_valid_forms() {
+    let mut e = Engine::new();
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, '9.999EEEE')"), " 1.235e+04");
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, '9EEEE')"), " 1e+04");
+    assert_eq!(text(&mut e, "SELECT to_char(0.00012345, '9.99EEEE')"), " 1.23e-04");
+    assert_eq!(text(&mut e, "SELECT to_char(-12345.678, '9.999EEEE')"), "-1.235e+04");
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, 'EEEE')"), " 1e+04");
+    // Group/decimal coexist with EEEE; a trailing quoted literal is accepted
+    // but (like PG) contributes nothing to the scientific output.
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, '9G999EEEE')"), " 1e+04");
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, '9.9EEEE\"z\"')"), " 1.2e+04");
+}
+
+#[test]
+fn eeee_incompatible_flags_error() {
+    // A sign/fill/scale/roman flag anywhere before EEEE is rejected.
+    let mut e = Engine::new();
+    for m in [
+        "FM9.999EEEE", "FMEEEE", "S9.9EEEE", "MI9.9EEEE", "PL9.9EEEE",
+        "SG9.9EEEE", "B9.9EEEE", "RN EEEE", "V9EEEE", "S9.9EEEE9",
+    ] {
+        assert!(
+            e.execute(&format!("SELECT to_char(12345.678, '{m}')")).is_err(),
+            "mask {m:?} must be rejected as EEEE-incompatible",
+        );
+    }
+}
+
+#[test]
+fn eeee_must_be_last_error() {
+    // Any format token after EEEE is rejected; literals are fine.
+    let mut e = Engine::new();
+    for m in ["9.9EEEE9", "EEEE9", "9.9EEEE.", "9.9EEEE,", "9.9EEEED", "9.9EEEEL", "9.9EEEEMI"] {
+        assert!(
+            e.execute(&format!("SELECT to_char(12345.678, '{m}')")).is_err(),
+            "mask {m:?} must be rejected: EEEE not last",
+        );
+    }
+    // A trailing literal (space / $ / quoted) is NOT an error; like PG it
+    // contributes nothing to the scientific output.
+    assert_eq!(text(&mut e, "SELECT to_char(12345.678, '9.9EEEE$')"), " 1.2e+04");
+}
