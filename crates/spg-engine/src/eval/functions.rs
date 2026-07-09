@@ -11156,7 +11156,7 @@ fn apply_function_dispatch(
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "convert_from(): unsupported encoding {enc:?} — SPG stores UTF-8 only; \
-                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1252"
+                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1250-1254"
                     ),
                 });
             }
@@ -11234,7 +11234,7 @@ fn apply_function_dispatch(
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "convert_to(): unsupported encoding {enc:?} — SPG stores UTF-8 only; \
-                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1252"
+                         use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1250-1254"
                     ),
                 });
             }
