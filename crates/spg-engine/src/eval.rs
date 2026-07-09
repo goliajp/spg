@@ -560,6 +560,19 @@ pub fn eval_expr(
                     }
                 }
             }
+            // v7.38 (T-tstz Phase 1) — `<timestamptz>::text` renders the offset
+            // (`2024-01-15 10:30:00+00`); plain timestamp does not. The runtime
+            // value is the same tz-less `Value::Timestamp`, so consult the
+            // inner expression's static type. Falls through to the ordinary
+            // cast on any shape the static typer can't resolve — worst case is
+            // today's no-offset rendering, never a wrong instant.
+            if matches!(target, CastTarget::Text)
+                && let Value::Timestamp(t) = &v
+                && crate::describe::describe_expr(expr, ctx.columns)
+                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+            {
+                return Ok(Value::text(crate::eval::format_timestamptz(*t)));
+            }
             cast_value(v, target.clone())
         }
         Expr::IsNull { expr, negated } => {
@@ -618,6 +631,23 @@ pub fn eval_expr(
                         _ => {}
                     }
                 }
+            }
+            // v7.38 (T-tstz Phase 1) — the ONE case where pg_typeof needs the
+            // static type: timestamptz. The runtime value is a tz-less
+            // Value::Timestamp, so the value-driven answer below can only ever
+            // say "without time zone". For every other type the value-driven
+            // path is strictly better (it distinguishes json vs jsonb, keeps
+            // NULL as "unknown", and is not fooled by describe_expr's lossy
+            // heuristics), so we consult the static typer ONLY when it says
+            // Timestamptz and otherwise fall through untouched.
+            if args.len() == 1
+                && name.eq_ignore_ascii_case("pg_typeof")
+                && crate::describe::describe_expr(&args[0], ctx.columns)
+                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+            {
+                return Ok(Value::text::<alloc::string::String>(
+                    "timestamp with time zone".into(),
+                ));
             }
             // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
             // common type of its branches, so a typed sibling (`NULL::time`,

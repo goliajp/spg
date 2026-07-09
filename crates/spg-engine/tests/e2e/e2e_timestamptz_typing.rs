@@ -79,3 +79,71 @@ fn timestamptz_input_is_normalized_to_utc() {
     let got = rows(&mut e, "COPY cz2 TO STDOUT");
     assert_eq!(got[0][0], "2024-01-15 01:30:00+00");
 }
+
+#[test]
+fn pg_typeof_uses_the_static_type_not_the_runtime_value() {
+    // The runtime value is a tz-less Value::Timestamp, so pg_typeof must read
+    // the static expression type. Oracle: PG18.4.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE tzt(a timestamptz, b timestamp)").unwrap();
+    e.execute("INSERT INTO tzt VALUES ('2024-01-15 10:30:00+00', '2024-01-15 10:30:00')")
+        .unwrap();
+    let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
+    assert_eq!(t(&mut e, "SELECT pg_typeof(a) FROM tzt"), "timestamp with time zone");
+    assert_eq!(t(&mut e, "SELECT pg_typeof(b) FROM tzt"), "timestamp without time zone");
+}
+
+#[test]
+fn clock_functions_carry_the_right_tz_type() {
+    // now()/current_timestamp/clock_timestamp are timestamptz; localtimestamp
+    // is not. Oracle: PG18.4.
+    let mut e = Engine::new().with_clock(|| 1_705_314_600_000_000);
+    let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
+    assert_eq!(t(&mut e, "SELECT pg_typeof(now())"), "timestamp with time zone");
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(current_timestamp)"),
+        "timestamp with time zone"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(clock_timestamp())"),
+        "timestamp with time zone"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(localtimestamp)"),
+        "timestamp without time zone"
+    );
+}
+
+#[test]
+fn cast_to_text_renders_offset_for_timestamptz() {
+    // `<timestamptz>::text` carries the +00 offset; `<timestamp>::text` does not.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE tzc(a timestamptz, b timestamp)").unwrap();
+    e.execute("INSERT INTO tzc VALUES ('2024-01-15 10:30:00+00', '2024-01-15 10:30:00')")
+        .unwrap();
+    let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
+    assert_eq!(t(&mut e, "SELECT a::text FROM tzc"), "2024-01-15 10:30:00+00");
+    assert_eq!(t(&mut e, "SELECT b::text FROM tzc"), "2024-01-15 10:30:00");
+    // A non-UTC literal folds to UTC then renders +00.
+    assert_eq!(
+        t(&mut e, "SELECT '2024-01-15 10:30:00+09'::timestamptz::text"),
+        "2024-01-15 01:30:00+00"
+    );
+}
+
+#[test]
+fn union_of_timestamptz_and_timestamp_is_timestamptz() {
+    // PG18.4: any timestamptz branch makes the common type timestamptz, and the
+    // column then renders with offsets.
+    let mut e = Engine::new();
+    let r = e
+        .execute(
+            "SELECT '2024-01-01 00:00:00+00'::timestamptz AS x \
+             UNION ALL SELECT '2024-01-02 00:00:00'::timestamp",
+        )
+        .unwrap();
+    let QueryResult::Rows { columns, .. } = r else {
+        panic!("rows")
+    };
+    assert_eq!(columns[0].ty, spg_storage::DataType::Timestamptz);
+}

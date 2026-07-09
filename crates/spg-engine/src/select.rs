@@ -4977,9 +4977,20 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
         .iter()
         .filter(|t| !matches!(t, DataType::Text))
         .collect();
-    if non_text.iter().all(|t| matches!(t, DataType::Date | DataType::Timestamp))
-        && non_text.iter().any(|t| matches!(t, DataType::Timestamp))
+    // v7.38 (T-tstz Phase 1) — temporal common type, per PG18.4: if any branch
+    // is timestamptz the result is timestamptz (tstz ∪ ts, tstz ∪ date), else
+    // if any is timestamp the result is timestamp (ts ∪ date). All values are
+    // the same UTC-micros instant, so widening date/ts to tstz is lossless.
+    if non_text
+        .iter()
+        .all(|t| matches!(t, DataType::Date | DataType::Timestamp | DataType::Timestamptz))
+        && non_text
+            .iter()
+            .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
     {
+        if non_text.iter().any(|t| matches!(t, DataType::Timestamptz)) {
+            return Some(DataType::Timestamptz);
+        }
         return Some(DataType::Timestamp);
     }
     // A single concrete non-TEXT type mixed with TEXT literals.
