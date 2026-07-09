@@ -114,6 +114,13 @@ pub(crate) enum Step {
         branches: alloc::vec::Vec<(CompiledExpr, CompiledExpr)>,
         else_branch: Option<CompiledExpr>,
     },
+    /// v7.38 (read01) — widen the top-of-stack value to a statically
+    /// resolved PG common type (e.g. a `CASE` whose branches mix integer and
+    /// numeric resolves to numeric). Resolved once at compile time from the
+    /// branch expressions' types, so the per-row cost is a single
+    /// scale-preserving coercion, not a describe. See
+    /// [`crate::eval::widen_value_to`].
+    CoerceCommon(spg_storage::DataType),
     /// Fallback: interpret this subtree with eval_expr.
     Subtree(Expr),
 }
@@ -347,6 +354,20 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 branches: branches_c,
                 else_branch: else_c,
             });
+            // v7.38 (read01) — resolve the CASE result to PG's common type of
+            // every THEN/ELSE branch once, here, and append a scale-preserving
+            // coercion so a taken integer branch is widened to numeric (and
+            // `pg_typeof` / downstream division match PG). Costs nothing when
+            // the branches already share a type (common_type → None).
+            let branch_types: Vec<spg_storage::DataType> = branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_branch.iter().map(|b| b.as_ref()))
+                .filter_map(|e| crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty))
+                .collect();
+            if let Some(common) = crate::describe::common_type(&branch_types) {
+                steps.push(Step::CoerceCommon(common));
+            }
         }
         other => steps.push(Step::Subtree(other.clone())),
     }
@@ -905,6 +926,10 @@ where
                     },
                 };
                 stack.push(v);
+            }
+            Step::CoerceCommon(target) => {
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
+                stack.push(super::widen_value_to(v, target));
             }
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }

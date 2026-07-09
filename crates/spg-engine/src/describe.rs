@@ -101,6 +101,69 @@ pub(crate) struct ExprShape {
     pub(crate) nullable: bool,
 }
 
+/// v7.38 (read01) — PG numeric-category width rank for common-type
+/// resolution: smallint < int < bigint < numeric < double precision.
+/// `real` (float4) is deliberately omitted: PG's preferred-type rules make
+/// some real mixes resolve to `real` and others to `double precision`, so a
+/// real-involving mix is left uncoerced rather than risk the wrong widening.
+pub(crate) fn numeric_rank(t: &DataType) -> Option<u8> {
+    match t {
+        DataType::SmallInt => Some(1),
+        DataType::Int => Some(2),
+        DataType::BigInt => Some(3),
+        DataType::Numeric { .. } => Some(4),
+        DataType::Float => Some(6),
+        _ => None,
+    }
+}
+
+/// v7.38 (read01) — the PG common type for a set of sibling branch/argument
+/// types (`CASE`, `COALESCE`, `GREATEST`/`LEAST`, `NULLIF`). A safe subset of
+/// PG's type resolution; returns `None` for anything ambiguous so the caller
+/// leaves the value untouched (never turns a working expression into one that
+/// coerces wrongly or errors):
+///   * all numeric-category → the widest (int ∪ numeric → numeric,
+///     … ∪ float8 → float8);
+///   * DATE/TIMESTAMP/TIMESTAMPTZ with at least one timestamp[tz] →
+///     timestamptz if any is tz, else timestamp (all are the same UTC
+///     instant, so widening is lossless);
+///   * exactly one concrete non-TEXT type mixed with TEXT → that type.
+pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
+    let mut distinct: Vec<&DataType> = Vec::new();
+    for t in types {
+        if !distinct.iter().any(|d| *d == t) {
+            distinct.push(t);
+        }
+    }
+    if distinct.len() < 2 {
+        return None;
+    }
+    if distinct.iter().all(|t| numeric_rank(t).is_some()) {
+        return distinct
+            .iter()
+            .max_by_key(|t| numeric_rank(t).unwrap_or(0))
+            .map(|t| (*t).clone());
+    }
+    let non_text: Vec<&DataType> =
+        distinct.iter().copied().filter(|t| !matches!(t, DataType::Text)).collect();
+    if non_text
+        .iter()
+        .all(|t| matches!(t, DataType::Date | DataType::Timestamp | DataType::Timestamptz))
+        && non_text
+            .iter()
+            .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
+    {
+        if non_text.iter().any(|t| matches!(t, DataType::Timestamptz)) {
+            return Some(DataType::Timestamptz);
+        }
+        return Some(DataType::Timestamp);
+    }
+    if non_text.len() == 1 {
+        return Some(non_text[0].clone());
+    }
+    None
+}
+
 pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
     match e {
         Expr::Column(c) => {

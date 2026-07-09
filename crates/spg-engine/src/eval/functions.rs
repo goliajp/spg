@@ -5055,12 +5055,18 @@ fn apply_function_dispatch(
             }
         }
         "coalesce" => {
-            for a in args {
-                if !matches!(a, Value::Null) {
-                    return Ok(a.clone().into_owned());
-                }
-            }
-            Ok(Value::Null)
+            let result = args
+                .iter()
+                .find(|a| !matches!(a, Value::Null))
+                .map(|a| a.clone().into_owned())
+                .unwrap_or(Value::Null);
+            // v7.38 (read01) — widen to the PG common type of all branches so
+            // `COALESCE(1, 2.5)` is numeric, not integer. (A typed NULL branch
+            // — `COALESCE(1, NULL::bigint)` — carries no runtime type here, so
+            // that widening is handled statically elsewhere, not from values.)
+            let types: alloc::vec::Vec<spg_storage::DataType> =
+                args.iter().filter_map(Value::data_type).collect();
+            Ok(super::widen_to_common(result, &types))
         }
         "date_trunc" => date_trunc(args),
         // v7.37.17 (17.6 siblings) — PG 14+ date_bin(stride, ts, origin)
@@ -9122,7 +9128,12 @@ fn apply_function_dispatch(
                     best = v.clone();
                 }
             }
-            Ok(best)
+            // v7.38 (read01) — widen the winner to the PG common type of all
+            // args so `GREATEST(3, 2.5)` is numeric 3, not integer 3 (matching
+            // `pg_typeof` and downstream numeric division).
+            let types: alloc::vec::Vec<spg_storage::DataType> =
+                non_null.iter().filter_map(Value::data_type).collect();
+            Ok(super::widen_to_common(best, &types))
         }
         // MySQL `ifnull(a, b)` — alias for coalesce(a, b).
         // Used by every ORM with a MySQL target (Hibernate /
@@ -9447,7 +9458,11 @@ fn apply_function_dispatch(
                     if values_equal_for_nullif(a, b) {
                         Ok(Value::Null)
                     } else {
-                        Ok(a.clone().into_owned())
+                        // v7.38 (read01) — the NULLIF result is PG's common
+                        // type of both args (`NULLIF(1, 2.5)` → numeric 1).
+                        let types: alloc::vec::Vec<spg_storage::DataType> =
+                            [a, b].iter().filter_map(|v| v.data_type()).collect();
+                        Ok(super::widen_to_common(a.clone().into_owned(), &types))
                     }
                 }
             }

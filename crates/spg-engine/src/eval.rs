@@ -678,15 +678,20 @@ pub fn eval_expr(
                     args.iter().map(|a| eval_expr(a, row, ctx)).collect();
                 let evaluated = evaluated?;
                 let result = evaluated
-                    .into_iter()
+                    .iter()
                     .find(|v| !matches!(v, Value::Null))
+                    .cloned()
                     .unwrap_or(Value::Null);
                 if matches!(result, Value::Text(_)) {
                     if let Some(target) = args.iter().find_map(coalesce_type_hint) {
                         return crate::eval::cast::cast_value(result, target);
                     }
                 }
-                return Ok(result);
+                // v7.38 (read01) — otherwise widen the picked value to the PG
+                // common type of all branches (COALESCE(1, 2.5) → numeric).
+                let types: Vec<spg_storage::DataType> =
+                    evaluated.iter().filter_map(Value::data_type).collect();
+                return Ok(widen_to_common(result, &types));
             }
             let evaluated: Result<Vec<Value<'static>>, _> =
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
@@ -1136,11 +1141,23 @@ pub fn eval_expr(
                 .map(|(_, t)| t)
                 .chain(else_branch.iter().map(|b| b.as_ref()))
                 .find_map(coalesce_type_hint);
+            // v7.38 (read01) — the CASE result is PG's common type of every
+            // THEN/ELSE branch, so a taken integer branch is widened to
+            // numeric when a sibling branch is numeric (and `pg_typeof` /
+            // downstream division match PG). Only one branch is evaluated, so
+            // the type must come from the branch expressions statically.
+            let branch_types: Vec<spg_storage::DataType> = branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_branch.iter().map(|b| b.as_ref()))
+                .filter_map(|e| crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty))
+                .collect();
             let coerce = |v: Value<'static>| -> Result<Value<'static>, EvalError> {
-                match (&v, &case_hint) {
-                    (Value::Text(_), Some(target)) => cast::cast_value(v, target.clone()),
-                    _ => Ok(v),
-                }
+                let v = match (&v, &case_hint) {
+                    (Value::Text(_), Some(target)) => cast::cast_value(v, target.clone())?,
+                    _ => v,
+                };
+                Ok(widen_to_common(v, &branch_types))
             };
             for (when_expr, then_expr) in branches {
                 let when_value = eval_expr(when_expr, row, ctx)?;
@@ -1177,6 +1194,68 @@ fn coalesce_type_hint(e: &Expr) -> Option<CastTarget> {
     match e {
         Expr::Cast { target, .. } if !matches!(target, CastTarget::Text) => Some(target.clone()),
         _ => None,
+    }
+}
+
+/// v7.38 (read01) — widen `v` to the already-resolved common type `common`
+/// of a `CASE`/`COALESCE`/`GREATEST`/`LEAST`/`NULLIF` result, so the value's
+/// type matches the one PG reports and downstream operators (e.g. `/`) see
+/// the widened type (integer division vs numeric division). Only widens;
+/// anything already at the common type, or that fails to coerce, is returned
+/// untouched (this must never turn a working expression into an error).
+/// NUMERIC is scale-preserving: an existing exact-numeric keeps its own scale
+/// (PG renders `COALESCE(1.50, 2)` as `1.50`); only integers promote, to
+/// scale 0.
+pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) -> Value<'static> {
+    use spg_storage::DataType as DT;
+    // Only widen numeric- and temporal-category results: these are the ones
+    // whose type actually changes a downstream value (integer vs numeric
+    // division, date vs timestamp). Widening a string result (varchar ∪ text)
+    // would only relabel the type while risking a spurious length-limit error
+    // when coercing into a modelled-length varchar/char, so leave it as-is.
+    if !matches!(
+        common,
+        DT::SmallInt
+            | DT::Int
+            | DT::BigInt
+            | DT::Numeric { .. }
+            | DT::Float
+            | DT::Date
+            | DT::Time
+            | DT::Timestamp
+            | DT::Timestamptz
+    ) {
+        return v;
+    }
+    if matches!(v, Value::Null) {
+        return v;
+    }
+    if v.data_type().as_ref() == Some(common) {
+        return v;
+    }
+    if matches!(common, spg_storage::DataType::Numeric { .. })
+        && matches!(v, Value::Numeric { .. } | Value::NumericBig(_))
+    {
+        return v;
+    }
+    let target = if matches!(common, spg_storage::DataType::Numeric { .. }) {
+        spg_storage::DataType::Numeric { precision: 0, scale: 0 }
+    } else {
+        common.clone()
+    };
+    match crate::conversions::coerce_value(v.clone(), target, "", 0) {
+        Ok(cv) => cv,
+        Err(_) => v,
+    }
+}
+
+/// Widen `v` to the PG common type of the sibling `types`, or leave it as-is
+/// when the types don't resolve to a single widening type. See
+/// [`widen_value_to`] and [`crate::describe::common_type`].
+pub(crate) fn widen_to_common(v: Value<'static>, types: &[spg_storage::DataType]) -> Value<'static> {
+    match crate::describe::common_type(types) {
+        Some(common) => widen_value_to(v, &common),
+        None => v,
     }
 }
 
