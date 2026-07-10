@@ -1464,6 +1464,11 @@ impl Parser {
                         }
                         Ok(Statement::DropSequence { names, if_exists })
                     }
+                    // v7.39 (RLS) — DROP POLICY [IF EXISTS] name ON table.
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("policy") => {
+                        self.advance();
+                        self.parse_drop_policy_after_keyword()
+                    }
                     // v7.37.17 (17.6 siblings) — DROP <target> for
                     // targets SPG doesn't natively track. pg_dump
                     // emits DROP EXTENSION / DROP TYPE / DROP DOMAIN
@@ -1498,7 +1503,6 @@ impl Parser {
                                 | "event"
                                 | "tablespace"
                                 | "rule"
-                                | "policy"
                                 | "large"
                                 | "role"
                                 | "access"
@@ -2050,6 +2054,11 @@ impl Parser {
                 self.advance();
                 self.parse_create_user_after_keyword()
             }
+            // v7.39 (RLS) — `CREATE POLICY name ON table …`.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("policy") => {
+                self.advance();
+                self.parse_create_policy_after_keyword()
+            }
             // v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
             // [WITH SCHEMA …] [VERSION '…'] [CASCADE]` as a
             // no-op. mailrs follow-up F3.
@@ -2237,7 +2246,6 @@ impl Parser {
                     s.to_ascii_lowercase().as_str(),
                     "database"
                         | "role"
-                        | "policy"
                         | "operator"
                         | "cast"
                         | "rule"
@@ -4935,6 +4943,251 @@ impl Parser {
         }))
     }
 
+    /// v7.39 (RLS) — parenthesised policy qualifier `( <expr> )`; caller has
+    /// consumed the USING / WITH CHECK keyword.
+    fn parse_paren_expr(&mut self, clause: &str) -> Result<Expr, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after {clause}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let e = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close {clause}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(e)
+    }
+
+    /// v7.39 (RLS) — `TO role [, role]*`; caller has consumed `TO`.
+    fn parse_policy_roles(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut roles = Vec::new();
+        loop {
+            roles.push(self.expect_ident_like()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(roles)
+    }
+
+    /// v7.39 (RLS) — `CREATE POLICY name ON table [AS {PERMISSIVE|RESTRICTIVE}]
+    /// [FOR cmd] [TO roles] [USING (expr)] [WITH CHECK (expr)]`. Caller consumed
+    /// `CREATE POLICY`.
+    fn parse_create_policy_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        use crate::ast::PolicyCmd;
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(alloc::format!(
+                "expected ON after CREATE POLICY name, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+
+        let mut permissive = true;
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+            let w = self.expect_ident_like()?;
+            permissive = if w.eq_ignore_ascii_case("permissive") {
+                true
+            } else if w.eq_ignore_ascii_case("restrictive") {
+                false
+            } else {
+                return Err(self.err(alloc::format!(
+                    "expected PERMISSIVE or RESTRICTIVE after AS, got {w:?}"
+                )));
+            };
+        }
+
+        let mut cmd = PolicyCmd::All;
+        if matches!(self.peek(), Token::For) {
+            self.advance();
+            cmd = self.parse_policy_cmd()?;
+        }
+
+        let mut roles = Vec::new();
+        if matches!(self.peek(), Token::To) {
+            self.advance();
+            roles = self.parse_policy_roles()?;
+        }
+
+        let mut using = None;
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using"))
+        {
+            self.advance();
+            using = Some(self.parse_paren_expr("USING")?);
+        }
+
+        let mut with_check = None;
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with"))
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check"))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected CHECK after WITH, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            with_check = Some(self.parse_paren_expr("WITH CHECK")?);
+        }
+
+        // Clause-per-command matrix (PG wording).
+        match cmd {
+            PolicyCmd::Insert => {
+                if using.is_some() {
+                    return Err(self.err("only WITH CHECK expression allowed for INSERT".into()));
+                }
+            }
+            PolicyCmd::Select | PolicyCmd::Delete => {
+                if with_check.is_some() {
+                    return Err(self.err("WITH CHECK cannot be applied to SELECT or DELETE".into()));
+                }
+            }
+            PolicyCmd::Update | PolicyCmd::All => {}
+        }
+
+        Ok(Statement::CreatePolicy(crate::ast::CreatePolicyStatement {
+            name,
+            table,
+            permissive,
+            cmd,
+            roles,
+            using,
+            with_check,
+        }))
+    }
+
+    /// v7.39 (RLS) — the command word after `FOR`.
+    fn parse_policy_cmd(&mut self) -> Result<crate::ast::PolicyCmd, ParseError> {
+        use crate::ast::PolicyCmd;
+        match self.peek().clone() {
+            Token::All => {
+                self.advance();
+                Ok(PolicyCmd::All)
+            }
+            Token::Select => {
+                self.advance();
+                Ok(PolicyCmd::Select)
+            }
+            Token::Insert => {
+                self.advance();
+                Ok(PolicyCmd::Insert)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("update") => {
+                self.advance();
+                Ok(PolicyCmd::Update)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("delete") => {
+                self.advance();
+                Ok(PolicyCmd::Delete)
+            }
+            other => Err(self.err(alloc::format!(
+                "expected ALL/SELECT/INSERT/UPDATE/DELETE after FOR, got {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.39 (RLS) — `ALTER POLICY name ON table { RENAME TO new | [TO roles]
+    /// [USING (expr)] [WITH CHECK (expr)] }`. Caller consumed `ALTER POLICY`.
+    fn parse_alter_policy_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(alloc::format!(
+                "expected ON after ALTER POLICY name, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+
+        // RENAME TO new
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("rename"))
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::To) {
+                return Err(self.err(alloc::format!(
+                    "expected TO after RENAME, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let new = self.expect_ident_like()?;
+            return Ok(Statement::AlterPolicy(crate::ast::AlterPolicyStatement {
+                name,
+                table,
+                rename_to: Some(new),
+                roles: None,
+                using: None,
+                with_check: None,
+            }));
+        }
+
+        let mut roles = None;
+        if matches!(self.peek(), Token::To) {
+            self.advance();
+            roles = Some(self.parse_policy_roles()?);
+        }
+        let mut using = None;
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using"))
+        {
+            self.advance();
+            using = Some(self.parse_paren_expr("USING")?);
+        }
+        let mut with_check = None;
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with"))
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check"))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected CHECK after WITH, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            with_check = Some(self.parse_paren_expr("WITH CHECK")?);
+        }
+        Ok(Statement::AlterPolicy(crate::ast::AlterPolicyStatement {
+            name,
+            table,
+            rename_to: None,
+            roles,
+            using,
+            with_check,
+        }))
+    }
+
+    /// v7.39 (RLS) — `DROP POLICY [IF EXISTS] name ON table`. Caller consumed
+    /// `DROP POLICY`.
+    fn parse_drop_policy_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let if_exists = self.consume_if_exists();
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(alloc::format!(
+                "expected ON after DROP POLICY name, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        Ok(Statement::DropPolicy(crate::ast::DropPolicyStatement {
+            name,
+            table,
+            if_exists,
+        }))
+    }
+
     /// v4.4 `UPDATE <table> SET col = expr [, col = expr]* [WHERE cond]`.
     /// Caller already consumed the leading `UPDATE` ident.
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
@@ -5687,6 +5940,9 @@ impl Parser {
                 }
                 return self.parse_alter_table_after_keyword();
             }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("policy") => {
+                return self.parse_alter_policy_after_keyword();
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table") => {
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("only")) {
                     self.advance();
@@ -5768,7 +6024,6 @@ impl Parser {
                         | "default"
                         | "extension"
                         | "materialized"
-                        | "policy"
                         | "publication"
                         | "subscription"
                         // v7.37.17 (17.6 siblings) — additional ALTER
@@ -5989,8 +6244,16 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
-            Token::Ident(s) if s.eq_ignore_ascii_case("no") => {
-                // `NO INHERIT <parent>`
+            // `NO INHERIT <parent>` — accept-and-no-op. Guarded to NOT match
+            // `NO FORCE ROW LEVEL SECURITY`, which has its own RLS arm below
+            // (v7.39). Without the guard this swallowed NO FORCE as a no-op.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("no")
+                    && !matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(t)) if t.eq_ignore_ascii_case("force")
+                    ) =>
+            {
                 self.advance();
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
@@ -6049,19 +6312,34 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
-            // v7.37.18 (18.18) — FORCE / NO FORCE ROW LEVEL SECURITY
-            // (PG 9.5+). SPG doesn't enforce RLS at the engine layer
-            // yet (v7.41 roadmap); accept-and-no-op so RLS-aware
-            // dumps load straight through.
+            // v7.39 (RLS) — FORCE ROW LEVEL SECURITY (sets relforcerowsecurity).
             Token::Ident(s) if s.eq_ignore_ascii_case("force") => {
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                self.expect_row_level_security()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetRowSecurity {
+                    enabled: None,
+                    force: Some(true),
+                }])
             }
-            // v7.37.18 (18.18) — ENABLE/DISABLE ROW LEVEL SECURITY
-            // (PG 9.5+). The guard requires the next token to be
-            // `ROW` so the v7.37.18.12 ENABLE/DISABLE TRIGGER arm
-            // (further down) still matches its case unchanged.
+            // v7.39 (RLS) — NO FORCE ROW LEVEL SECURITY.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("no")
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(t)) if t.eq_ignore_ascii_case("force")
+                    ) =>
+            {
+                self.advance(); // NO
+                self.advance(); // FORCE
+                self.expect_row_level_security()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetRowSecurity {
+                    enabled: None,
+                    force: Some(false),
+                }])
+            }
+            // v7.39 (RLS) — ENABLE/DISABLE ROW LEVEL SECURITY
+            // (sets relrowsecurity). The guard requires the next token to be
+            // `ROW` so the ENABLE/DISABLE TRIGGER arm still matches its case.
             Token::Ident(s)
                 if (s.eq_ignore_ascii_case("enable") || s.eq_ignore_ascii_case("disable"))
                     && matches!(
@@ -6069,9 +6347,13 @@ impl Parser {
                         Some(Token::Ident(t)) if t.eq_ignore_ascii_case("row")
                     ) =>
             {
+                let enabled = s.eq_ignore_ascii_case("enable");
                 self.advance(); // ENABLE/DISABLE
-                self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                self.expect_row_level_security()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetRowSecurity {
+                    enabled: Some(enabled),
+                    force: None,
+                }])
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
@@ -7053,6 +7335,8 @@ impl Parser {
             "pg_inherits",
             "pg_matviews",
             "pg_namespace",
+            "pg_policies",
+            "pg_policy",
             "pg_proc",
             "pg_publication",
             "pg_replication_slots",
@@ -9437,6 +9721,23 @@ impl Parser {
     /// v7.12.4 — `IF EXISTS` modifier for DROP statements.
     /// Consumes IF EXISTS as a pair; returns false otherwise
     /// without consuming any tokens.
+    /// v7.39 (RLS) — consume the `ROW LEVEL SECURITY` keyword triple after
+    /// ENABLE/DISABLE/FORCE/NO FORCE.
+    fn expect_row_level_security(&mut self) -> Result<(), ParseError> {
+        for kw in ["row", "level", "security"] {
+            if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected {} in ROW LEVEL SECURITY, got {:?}",
+                    kw.to_ascii_uppercase(),
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        Ok(())
+    }
+
     fn consume_if_exists(&mut self) -> bool {
         let looks_like_if = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"));
         if !looks_like_if {

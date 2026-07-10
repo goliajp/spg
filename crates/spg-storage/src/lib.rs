@@ -1430,6 +1430,84 @@ impl Collation {
     pub const TAG_CASE_INSENSITIVE: u8 = 1;
 }
 
+/// v7.39 (RLS) — the command a policy applies to. `ALL` is the default and
+/// covers every command; the others scope the policy to one statement kind.
+/// Persisted as a single byte in the policy appendix (FILE_VERSION 59+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCmd {
+    /// PG `pg_policy.polcmd` single-char encoding.
+    #[must_use]
+    pub const fn as_pg_char(self) -> char {
+        match self {
+            Self::All => '*',
+            Self::Select => 'r',
+            Self::Insert => 'a',
+            Self::Update => 'w',
+            Self::Delete => 'd',
+        }
+    }
+
+    /// PG `pg_policies.cmd` word form.
+    #[must_use]
+    pub const fn as_pg_word(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    #[must_use]
+    pub const fn to_wire_byte(self) -> u8 {
+        match self {
+            Self::All => 0,
+            Self::Select => 1,
+            Self::Insert => 2,
+            Self::Update => 3,
+            Self::Delete => 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_wire_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::All),
+            1 => Some(Self::Select),
+            2 => Some(Self::Insert),
+            3 => Some(Self::Update),
+            4 => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// v7.39 (RLS) — one `CREATE POLICY` object, stored per table. The `using_expr`
+/// / `with_check_expr` hold the qualifying expression's `Display` form
+/// (re-parsed and evaluated per row at enforcement time, exactly like
+/// `TableSchema.checks`); `None` means the clause was absent. `roles` empty =
+/// PUBLIC. Persisted in the policy appendix (FILE_VERSION 59+).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyDef {
+    pub name: String,
+    pub cmd: PolicyCmd,
+    /// `true` = PERMISSIVE (default, OR-combined), `false` = RESTRICTIVE
+    /// (AND-combined).
+    pub permissive: bool,
+    pub roles: Vec<String>,
+    pub using_expr: Option<String>,
+    pub with_check_expr: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     pub name: String,
@@ -1471,6 +1549,18 @@ pub struct TableSchema {
     /// `Some(Default { … })` = `CREATE TABLE c PARTITION OF p DEFAULT` 兜底子表。
     /// 持久化于 FILE_VERSION 49+。
     pub partition_role: Option<PartitionRole>,
+    /// v7.39 (RLS) — `CREATE POLICY` objects on this table, independent of the
+    /// `row_security` flag (PG stores policies even on non-RLS tables; they
+    /// only take effect once RLS is enabled). Persisted in the policy appendix
+    /// (FILE_VERSION 59+). Older catalogs deserialise with an empty vec.
+    pub policies: Vec<PolicyDef>,
+    /// v7.39 (RLS) — `ALTER TABLE … ENABLE ROW LEVEL SECURITY`
+    /// (PG `pg_class.relrowsecurity`). Fresh table = `false`.
+    pub row_security: bool,
+    /// v7.39 (RLS) — `ALTER TABLE … FORCE ROW LEVEL SECURITY`
+    /// (PG `pg_class.relforcerowsecurity`); subjects the table owner to RLS
+    /// too. Fresh table = `false`.
+    pub force_row_security: bool,
 }
 
 /// v7.37.6-B — partition 三态(parent / range child / default child)。
@@ -5719,6 +5809,9 @@ impl TableSchema {
             uniqueness_constraints: Vec::new(),
             checks: Vec::new(),
             partition_role: None,
+            policies: Vec::new(),
+            row_security: false,
+            force_row_security: false,
         }
     }
 }
@@ -6012,7 +6105,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 58;
+const FILE_VERSION: u8 = 59;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -6565,6 +6658,44 @@ impl Catalog {
             for (pos, src) in default_texts {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, src);
+            }
+            // v7.39 (RLS) — per-table policy appendix + the two RLS flags
+            // (FILE_VERSION 59+). Written after the default_text block and
+            // before the MVCC row appendix, so a v58 reader stops before it.
+            // Layout: [u8 row_security][u8 force] [u16 policy_count] then per
+            // policy: [str name][u8 cmd][u8 permissive][u16 role_count]
+            // (role_count × str) [u8 has_using](+str)[u8 has_check](+str).
+            out.push(u8::from(t.schema.row_security));
+            out.push(u8::from(t.schema.force_row_security));
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.policies.len()).expect("≤ 65k policies/table"),
+            );
+            for p in &t.schema.policies {
+                write_str(&mut out, &p.name);
+                out.push(p.cmd.to_wire_byte());
+                out.push(u8::from(p.permissive));
+                write_u16(
+                    &mut out,
+                    u16::try_from(p.roles.len()).expect("≤ 65k roles/policy"),
+                );
+                for r in &p.roles {
+                    write_str(&mut out, r);
+                }
+                match &p.using_expr {
+                    Some(s) => {
+                        out.push(1);
+                        write_str(&mut out, s);
+                    }
+                    None => out.push(0),
+                }
+                match &p.with_check_expr {
+                    Some(s) => {
+                        out.push(1);
+                        write_str(&mut out, s);
+                    }
+                    None => out.push(0),
+                }
             }
             // v7.37.16 (Epic W) — per-row MVCC header + stable RowId
             // appendix (FILE_VERSION 53+). Persists xmin/xmax/flags +

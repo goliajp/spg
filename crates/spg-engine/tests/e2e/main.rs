@@ -604,6 +604,7 @@ mod e2e_regexp_family;
 mod e2e_repeat;
 mod e2e_replace;
 mod e2e_returning;
+mod e2e_rls_catalog;
 mod e2e_round;
 mod e2e_round5_alter_and_trigger;
 mod e2e_round5_misc;

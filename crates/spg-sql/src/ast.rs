@@ -146,6 +146,12 @@ pub enum Statement {
     CreateUser(CreateUserStatement),
     /// `DROP USER 'name'` (v4.1).
     DropUser(String),
+    /// v7.39 (RLS) — `CREATE POLICY name ON table …`.
+    CreatePolicy(CreatePolicyStatement),
+    /// v7.39 (RLS) — `ALTER POLICY name ON table …`.
+    AlterPolicy(AlterPolicyStatement),
+    /// v7.39 (RLS) — `DROP POLICY [IF EXISTS] name ON table`.
+    DropPolicy(DropPolicyStatement),
     /// `SHOW USERS` (v4.1) — admin-only listing of (name, role).
     ShowUsers,
     /// v4.26 — `EXPLAIN [ANALYZE] <select>`. The engine returns a
@@ -805,6 +811,14 @@ pub enum AlterTableTarget {
         which: TriggerSelector,
         enabled: bool,
     },
+    /// v7.39 (RLS) — `ALTER TABLE t { ENABLE | DISABLE | FORCE | NO FORCE }
+    /// ROW LEVEL SECURITY`. `enabled` = Some for ENABLE/DISABLE (sets
+    /// `relrowsecurity`); `force` = Some for FORCE/NO FORCE (sets
+    /// `relforcerowsecurity`). Exactly one is `Some` per statement.
+    SetRowSecurity {
+        enabled: Option<bool>,
+        force: Option<bool>,
+    },
     /// v7.37.16 (16.3) — `ALTER TABLE parent ATTACH PARTITION child
     /// <bounds>`. Promotes an existing table `child` to a partition
     /// of `parent` using PG-style `FOR VALUES …` / `DEFAULT` bounds.
@@ -928,6 +942,52 @@ pub enum ExplainFormat {
     Json,
     Xml,
     Yaml,
+}
+
+/// v7.39 (RLS) — the command a `CREATE POLICY` scopes to. `All` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+/// v7.39 (RLS) — `CREATE POLICY name ON table [AS {PERMISSIVE|RESTRICTIVE}]
+/// [FOR cmd] [TO roles] [USING (expr)] [WITH CHECK (expr)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePolicyStatement {
+    pub name: String,
+    pub table: String,
+    /// `true` = PERMISSIVE (default), `false` = RESTRICTIVE.
+    pub permissive: bool,
+    pub cmd: PolicyCmd,
+    /// Empty = PUBLIC.
+    pub roles: Vec<String>,
+    pub using: Option<Expr>,
+    pub with_check: Option<Expr>,
+}
+
+/// v7.39 (RLS) — `ALTER POLICY name ON table { RENAME TO new | [TO roles]
+/// [USING (expr)] [WITH CHECK (expr)] }`. Cannot change PERMISSIVE/RESTRICTIVE
+/// or the command (matches PG).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterPolicyStatement {
+    pub name: String,
+    pub table: String,
+    pub rename_to: Option<String>,
+    pub roles: Option<Vec<String>>,
+    pub using: Option<Expr>,
+    pub with_check: Option<Expr>,
+}
+
+/// v7.39 (RLS) — `DROP POLICY [IF EXISTS] name ON table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropPolicyStatement {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3307,6 +3367,9 @@ impl Statement {
             | Statement::ReleaseSavepoint(_)
             | Statement::CreateUser(_)
             | Statement::DropUser(_)
+            | Statement::CreatePolicy(_)
+            | Statement::AlterPolicy(_)
+            | Statement::DropPolicy(_)
             | Statement::AlterIndex(_)
             | Statement::AlterTable(_)
             | Statement::CreatePublication(_)
@@ -3508,6 +3571,65 @@ impl fmt::Display for Statement {
                 s.role
             ),
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
+            Self::CreatePolicy(s) => {
+                write!(
+                    f,
+                    "CREATE POLICY {} ON {}",
+                    quote_ident(&s.name),
+                    quote_ident(&s.table)
+                )?;
+                if !s.permissive {
+                    f.write_str(" AS RESTRICTIVE")?;
+                }
+                if !matches!(s.cmd, PolicyCmd::All) {
+                    let w = match s.cmd {
+                        PolicyCmd::Select => "SELECT",
+                        PolicyCmd::Insert => "INSERT",
+                        PolicyCmd::Update => "UPDATE",
+                        PolicyCmd::Delete => "DELETE",
+                        PolicyCmd::All => unreachable!(),
+                    };
+                    write!(f, " FOR {w}")?;
+                }
+                if !s.roles.is_empty() {
+                    write!(f, " TO {}", s.roles.join(", "))?;
+                }
+                if let Some(u) = &s.using {
+                    write!(f, " USING ({u})")?;
+                }
+                if let Some(c) = &s.with_check {
+                    write!(f, " WITH CHECK ({c})")?;
+                }
+                Ok(())
+            }
+            Self::AlterPolicy(s) => {
+                write!(
+                    f,
+                    "ALTER POLICY {} ON {}",
+                    quote_ident(&s.name),
+                    quote_ident(&s.table)
+                )?;
+                if let Some(nn) = &s.rename_to {
+                    return write!(f, " RENAME TO {}", quote_ident(nn));
+                }
+                if let Some(roles) = &s.roles {
+                    write!(f, " TO {}", roles.join(", "))?;
+                }
+                if let Some(u) = &s.using {
+                    write!(f, " USING ({u})")?;
+                }
+                if let Some(c) = &s.with_check {
+                    write!(f, " WITH CHECK ({c})")?;
+                }
+                Ok(())
+            }
+            Self::DropPolicy(s) => {
+                f.write_str("DROP POLICY ")?;
+                if s.if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{} ON {}", quote_ident(&s.name), quote_ident(&s.table))
+            }
             Self::ShowUsers => f.write_str("SHOW USERS"),
             Self::ShowPublications => f.write_str("SHOW PUBLICATIONS"),
             Self::ShowSubscriptions => f.write_str("SHOW SUBSCRIPTIONS"),
@@ -4474,6 +4596,13 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 TriggerSelector::Named(n) => f.write_str(&quote_ident(n)),
             }
         }
+        AlterTableTarget::SetRowSecurity { enabled, force } => match (enabled, force) {
+            (Some(true), _) => f.write_str("ENABLE ROW LEVEL SECURITY"),
+            (Some(false), _) => f.write_str("DISABLE ROW LEVEL SECURITY"),
+            (_, Some(true)) => f.write_str("FORCE ROW LEVEL SECURITY"),
+            (_, Some(false)) => f.write_str("NO FORCE ROW LEVEL SECURITY"),
+            (None, None) => Ok(()),
+        },
         AlterTableTarget::AttachPartition { child, bounds } => {
             write!(f, "ATTACH PARTITION {} ", quote_ident(child))?;
             match bounds {
