@@ -186,6 +186,100 @@ fn query_over_tls_returns_a_row() {
     assert_eq!(&row[6..7], b"1");
 }
 
+/// Records the leaf cert the server presents, then accepts it.
+#[derive(Debug)]
+struct CapturingVerifier(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+
+impl rustls::client::danger::ServerCertVerifier for CapturingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _i: &[rustls::pki_types::CertificateDer<'_>],
+        _n: &rustls::pki_types::ServerName<'_>,
+        _o: &[u8],
+        _t: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.0.lock().unwrap() = Some(end_entity.as_ref().to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _m: &[u8],
+        _c: &rustls::pki_types::CertificateDer<'_>,
+        _d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _m: &[u8],
+        _c: &rustls::pki_types::CertificateDer<'_>,
+        _d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+#[test]
+fn operator_supplied_cert_is_served() {
+    // Generate an operator cert + key, write PEM, and start the server with
+    // SPG_TLS_CERT / SPG_TLS_KEY pointing at them. The TLS handshake must
+    // present exactly that cert (not the self-signed default).
+    let dir = unique_tmpdir("opcert");
+    let db = dir.join("spg.db");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["spg-operator.example".to_string()]).unwrap();
+    let cert_der = cert.cert.der().to_vec();
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let (child, addrs) = common::ServerBuilder::new()
+        .arg_path(&db)
+        .with_pgwire()
+        .env("SPG_TLS_CERT", cert_path.to_str().unwrap())
+        .env("SPG_TLS_KEY", key_path.to_str().unwrap())
+        .spawn();
+    let _guard = common::ChildGuard(child);
+    let addr = addrs.pgwire.expect("pgwire addr");
+
+    let mut s = common::connect_to(&addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    s.write_all(&ssl_request()).unwrap();
+    let mut reply = [0u8; 1];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[0], b'S');
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(CapturingVerifier(seen.clone())))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("spg-operator.example").unwrap();
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+    drive_to_ready(&mut tls);
+
+    let presented = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server presented a cert");
+    assert_eq!(
+        presented, cert_der,
+        "server must serve the operator-supplied cert"
+    );
+}
+
 #[test]
 fn plaintext_still_works_without_ssl() {
     // Regression: a client that connects without SSLRequest reaches
