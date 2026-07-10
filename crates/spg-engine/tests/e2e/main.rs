@@ -294,6 +294,7 @@ mod e2e_pg_typeof_coverage;
 mod e2e_extract_from_time;
 mod e2e_date_parse_relaxed;
 mod e2e_numeric_underscore_input;
+mod e2e_any_all_unknown_array;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
