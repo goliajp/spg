@@ -867,6 +867,11 @@ pub enum TriggerSelector {
     Named(String),
 }
 
+/// Each bool mirrors one independent PG `EXPLAIN (…)` option (ANALYZE,
+/// SUGGEST, COSTS OFF, BUFFERS, TIMING OFF, …); they compose freely, so a
+/// bitflags word or a nested options struct would only relocate the lint
+/// while making the option each caller sets harder to read.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     pub analyze: bool,

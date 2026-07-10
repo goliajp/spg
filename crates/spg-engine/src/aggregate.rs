@@ -310,6 +310,13 @@ fn classify_agg_name(name: &str) -> AggKind {
 }
 
 /// Per-aggregate running state.
+///
+/// The four `use_*` flags are independent observations about which value
+/// shapes have flowed through this accumulator (a single `sum()` can see both
+/// numeric and float inputs), not a discriminant — collapsing them into one
+/// enum would change accumulation semantics, and a bitflags word would hide
+/// which gate each fast path reads.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 struct AggState {
     count: i64,

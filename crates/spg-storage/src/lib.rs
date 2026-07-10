@@ -1261,6 +1261,12 @@ impl Row<'static> {
     }
 }
 
+/// Each bool is an independent, separately-persisted column attribute
+/// (`nullable`, `auto_increment`, `is_unsigned`, `identity_always`) that the
+/// catalog appendix reads and writes by name. Packing them into a bitflags
+/// word would buy nothing and would put a decoding step between the on-disk
+/// format and every reader of the schema.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSchema {
     pub name: String,
