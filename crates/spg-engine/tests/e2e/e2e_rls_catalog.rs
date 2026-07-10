@@ -188,6 +188,22 @@ fn drop_policy_and_if_exists() {
 }
 
 #[test]
+fn qual_deparse_normalises_current_user() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE d(id int, owner text)").unwrap();
+    e.execute("ALTER TABLE d ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    e.execute("CREATE POLICY p ON d USING (owner = current_user)")
+        .unwrap();
+    // pg_policies.qual renders CURRENT_USER (not current_user()), matching PG.
+    let got = rows(
+        &mut e,
+        "SELECT qual FROM pg_policies WHERE tablename='d' AND policyname='p'",
+    );
+    assert_eq!(got, vec![vec!["(owner = CURRENT_USER)"]]);
+}
+
+#[test]
 fn alter_policy_rename_and_replace() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE d(id int)").unwrap();

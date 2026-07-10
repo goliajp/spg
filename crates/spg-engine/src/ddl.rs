@@ -2606,8 +2606,8 @@ impl Engine {
         s: spg_sql::ast::CreatePolicyStatement,
     ) -> Result<QueryResult, EngineError> {
         let cmd = policy_cmd_to_storage(s.cmd);
-        let using_expr = s.using.as_ref().map(|e| alloc::format!("{e}"));
-        let with_check_expr = s.with_check.as_ref().map(|e| alloc::format!("{e}"));
+        let using_expr = s.using.as_ref().map(deparse_policy_qual);
+        let with_check_expr = s.with_check.as_ref().map(deparse_policy_qual);
         let table = self.active_catalog_mut().get_mut(&s.table).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound {
                 name: s.table.clone(),
@@ -2640,8 +2640,8 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::AlterPolicyStatement,
     ) -> Result<QueryResult, EngineError> {
-        let new_using = s.using.as_ref().map(|e| alloc::format!("{e}"));
-        let new_check = s.with_check.as_ref().map(|e| alloc::format!("{e}"));
+        let new_using = s.using.as_ref().map(deparse_policy_qual);
+        let new_check = s.with_check.as_ref().map(deparse_policy_qual);
         let table = self.active_catalog_mut().get_mut(&s.table).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound {
                 name: s.table.clone(),
@@ -3704,6 +3704,69 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
             }
         }
         _ => alloc::format!("{expr}"),
+    }
+}
+
+/// v7.39 (RLS) — deparse a policy `USING` / `WITH CHECK` qual to PG-compatible
+/// text for pg_policy / pg_policies / pg_dump. SPG's `Expr` Display already
+/// matches PG for column comparisons and operators; this recursively rewrites
+/// the niladic SQL-standard keyword functions a policy qual commonly uses
+/// (`current_user` → `CURRENT_USER`, &c) which Display would render as
+/// `current_user()`. The stored form re-parses identically, so enforcement is
+/// unaffected. (String-literal `::text` typing is the shared default_text
+/// Phase-2 residual and is left to Display.)
+pub(crate) fn deparse_policy_qual(e: &Expr) -> alloc::string::String {
+    match e {
+        Expr::FunctionCall { name, args } if args.is_empty() => pg_parenless_keyword(name)
+            .map_or_else(|| alloc::format!("{e}"), alloc::string::String::from),
+        Expr::Binary { lhs, op, rhs } => alloc::format!(
+            "({} {op} {})",
+            deparse_policy_qual(lhs),
+            deparse_policy_qual(rhs)
+        ),
+        Expr::Unary { op, expr } => {
+            use spg_sql::ast::UnOp;
+            let inner = deparse_policy_qual(expr);
+            match op {
+                UnOp::Not => alloc::format!("(NOT {inner})"),
+                UnOp::Neg => alloc::format!("(-{inner})"),
+                UnOp::BitNot => alloc::format!("(~{inner})"),
+            }
+        }
+        Expr::Cast { expr, target } => {
+            alloc::format!("({}::{target})", deparse_policy_qual(expr))
+        }
+        Expr::IsNull { expr, negated } => {
+            let inner = deparse_policy_qual(expr);
+            if *negated {
+                alloc::format!("({inner} IS NOT NULL)")
+            } else {
+                alloc::format!("({inner} IS NULL)")
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let op = match (negated, case_insensitive) {
+                (false, false) => "LIKE",
+                (true, false) => "NOT LIKE",
+                (false, true) => "ILIKE",
+                (true, true) => "NOT ILIKE",
+            };
+            alloc::format!(
+                "({} {op} {})",
+                deparse_policy_qual(expr),
+                deparse_policy_qual(pattern)
+            )
+        }
+        Expr::FunctionCall { name, args } => {
+            let rendered: alloc::vec::Vec<_> = args.iter().map(deparse_policy_qual).collect();
+            alloc::format!("{name}({})", rendered.join(", "))
+        }
+        _ => alloc::format!("{e}"),
     }
 }
 
