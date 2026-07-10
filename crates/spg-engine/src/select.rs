@@ -2567,6 +2567,19 @@ impl Engine {
         {
             return Ok(out);
         }
+        // v7.38 (perf) — `count(*) WHERE <indexed BETWEEN>`: count the in-range
+        // locators directly, skipping row materialisation + WHERE re-eval.
+        if aggregate::uses_aggregate(stmt)
+            && let Some(out) = self.try_count_star_indexed_range_fast(
+                stmt,
+                table,
+                schema_cols,
+                alias,
+                &seek_snapshot,
+            )
+        {
+            return Ok(out);
+        }
         // full scan over the hot tier (cold-tier rows are only reached
         // via index seek in v5.1 — full table scans against cold-tier
         // data ship in v5.2 with the freezer's per-segment scan API).
@@ -3339,6 +3352,54 @@ impl Engine {
             qualifier: None,
             name: String::new(),
         };
+        Some(QueryResult::Rows { columns, rows })
+    }
+
+    /// v7.38 (perf, exact-range count) — `SELECT count(*) FROM t WHERE <col>
+    /// BETWEEN a AND b` on an indexed column. The index range walk yields
+    /// exactly the matching (visible) rows, so we count locators directly —
+    /// skipping the row materialisation, the aggregate state machine, and the
+    /// per-row WHERE re-eval the general path pays. Turns the `range_count`
+    /// endpoint from tied-with-PG (superset re-eval) into a clear win. None
+    /// when the shape doesn't match.
+    fn try_count_star_indexed_range_fast(
+        &self,
+        stmt: &SelectStatement,
+        table: &spg_storage::Table,
+        schema_cols: &[ColumnSchema],
+        alias: &str,
+        snapshot: &spg_storage::snapshot::Snapshot,
+    ) -> Option<QueryResult> {
+        use spg_sql::ast::SelectItem;
+        if stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || !stmt.unions.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.items.len() != 1
+        {
+            return None;
+        }
+        let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+            return None;
+        };
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("count_star") && args.is_empty());
+        if !is_count_star {
+            return None;
+        }
+        let where_expr = stmt.where_.as_ref()?;
+        let count =
+            crate::index_access::try_range_count(where_expr, schema_cols, table, alias, snapshot)?;
+        let columns = alloc::vec![ColumnSchema::new(
+            "count".to_string(),
+            spg_storage::DataType::BigInt,
+            false,
+        )];
+        let rows = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
         Some(QueryResult::Rows { columns, rows })
     }
 
