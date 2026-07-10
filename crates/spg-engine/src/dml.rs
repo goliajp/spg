@@ -141,6 +141,7 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
@@ -994,6 +995,7 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body (DELETE).
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
@@ -1495,6 +1497,7 @@ impl Engine {
         &mut self,
         mut stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
+        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
         // leading WITH clause first (running any modifying CTE
         // bodies against the active catalog so their writes land

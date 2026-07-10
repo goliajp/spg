@@ -70,6 +70,30 @@ impl Engine {
             self.current_role(),
         )))
     }
+
+    /// v7.39 (RLS) Phase 1 — fail closed on writes. Write-side enforcement
+    /// (INSERT/UPDATE `WITH CHECK`, UPDATE/DELETE `USING`) is Phase 2; until
+    /// then a policy-subject (non-superuser) session must not be able to write
+    /// an RLS-enabled table unchecked, so such a write errors rather than
+    /// bypassing RLS. Superuser sessions and non-RLS tables pass through.
+    pub(crate) fn rls_write_guard(&self, table: &str) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        if self
+            .active_catalog()
+            .get(table)
+            .is_some_and(|t| t.schema().row_security)
+        {
+            return Err(EngineError::Unsupported(
+                "row-level security write enforcement (WITH CHECK / USING on \
+                 INSERT/UPDATE/DELETE) is not yet implemented; a policy-subject \
+                 session cannot write an RLS-enabled table in this build"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Combine the applicable SELECT policies into one predicate:
