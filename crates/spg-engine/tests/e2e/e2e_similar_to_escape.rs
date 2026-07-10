@@ -1,3 +1,6 @@
+//! v7.38 (read01) — expectations match PG's actual similar_to_escape output
+//! (`^(?:...)$`, groups turned non-capturing). The prior `^...$` forms never
+//! matched PG.
 //! v7.37.17 (17.6 siblings) — similar_to_escape(pattern [, escape]).
 
 use spg_engine::{Engine, QueryResult};
@@ -22,15 +25,15 @@ fn similar_to_escape_basic_wildcards() {
     let mut e = Engine::new();
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('abc%')")),
-        "^abc.*$"
+        "^(?:abc.*)$"
     );
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('a_c')")),
-        "^a.c$"
+        "^(?:a.c)$"
     );
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('a%b_c')")),
-        "^a.*b.c$"
+        "^(?:a.*b.c)$"
     );
 }
 
@@ -40,17 +43,17 @@ fn similar_to_escape_regex_meta_escaped() {
     // Dot in SIMILAR TO is a literal, must escape for regex.
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('a.b')")),
-        "^a\\.b$"
+        "^(?:a\\.b)$"
     );
     // Character-class-like brackets pass through.
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('[abc]')")),
-        "^[abc]$"
+        "^(?:[abc])$"
     );
     // Alternation passes through.
     assert_eq!(
         text(&first(&mut e, "SELECT similar_to_escape('(a|b)')")),
-        "^(a|b)$"
+        "^(?:(?:a|b))$"
     );
 }
 

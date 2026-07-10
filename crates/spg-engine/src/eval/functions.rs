@@ -14062,8 +14062,11 @@ fn apply_function_dispatch(
         //   |       → |
         //   +*?{}() → same (already regex metachar)
         //   any other char → escaped literal
-        // Result is wrapped in ^...$ so it matches the whole
-        // string, matching PG's SIMILAR TO whole-string semantics.
+        // Result is wrapped in ^(?:...)$ so it matches the whole
+        // string, matching PG's SIMILAR TO whole-string semantics. The
+        // non-capturing group is essential: without it a top-level
+        // alternation like `a|b` would anchor as `^a|b$` = `(^a)|(b$)`
+        // and wrongly match `abc`.
         "similar_to_escape" | "similar_escape" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::TypeMismatch {
@@ -14101,7 +14104,7 @@ fn apply_function_dispatch(
             } else {
                 Some('\\')
             };
-            let mut out = alloc::string::String::from("^");
+            let mut out = alloc::string::String::from("^(?:");
             let mut iter = pat.chars();
             while let Some(c) = iter.next() {
                 if Some(c) == esc {
@@ -14117,7 +14120,10 @@ fn apply_function_dispatch(
                 match c {
                     '%' => out.push_str(".*"),
                     '_' => out.push('.'),
-                    '[' | ']' | '(' | ')' | '|' | '+' | '*' | '?' | '{' | '}' => {
+                    // PG turns a SIMILAR group `(` into a non-capturing
+                    // `(?:` so groups never capture (mirrors its own output).
+                    '(' => out.push_str("(?:"),
+                    ']' | '[' | ')' | '|' | '+' | '*' | '?' | '{' | '}' => {
                         out.push(c);
                     }
                     // POSIX regex metachars that SIMILAR TO doesn't
@@ -14129,7 +14135,7 @@ fn apply_function_dispatch(
                     _ => out.push(c),
                 }
             }
-            out.push('$');
+            out.push_str(")$");
             Ok(Value::text(out))
         }
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
