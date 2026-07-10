@@ -714,6 +714,55 @@ impl Engine {
 mod tests {
     use super::*;
 
+    /// v7.39 (TLS/SCRAM) — SPG's SCRAM-SHA-256 verifier derivation is
+    /// byte-identical to PostgreSQL. Vector captured from live PG18.4:
+    /// `CREATE ROLE scr PASSWORD 'secret'` with password_encryption=scram-sha-256
+    /// stored `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`.
+    #[test]
+    fn scram_secrets_match_live_pg_vector() {
+        let salt: [u8; SCRAM_SALT_LEN] = [
+            0xbb, 0x70, 0xc5, 0x3e, 0x8d, 0x2b, 0x56, 0x64, 0x12, 0xc0, 0xae, 0xd1, 0x4e, 0x19,
+            0x8b, 0xfe,
+        ];
+        let want_stored: [u8; HASH_LEN] = [
+            0xbb, 0x80, 0x16, 0x91, 0x1b, 0xc4, 0x49, 0x6f, 0x9d, 0x95, 0x79, 0xcd, 0xb8, 0x57,
+            0x12, 0x01, 0x58, 0x2b, 0x52, 0x9a, 0x9e, 0x80, 0xe8, 0x06, 0x32, 0x3e, 0x76, 0x5f,
+            0x38, 0xd1, 0x51, 0xa9,
+        ];
+        let want_server: [u8; HASH_LEN] = [
+            0x21, 0xe4, 0x04, 0x40, 0x68, 0x5f, 0x80, 0x5c, 0x6d, 0x52, 0xc0, 0x47, 0x4d, 0xa3,
+            0x5b, 0x96, 0xc0, 0x61, 0x10, 0x25, 0x2c, 0xf3, 0x31, 0x30, 0x00, 0x88, 0x5b, 0x08,
+            0x8c, 0xe3, 0x0b, 0x84,
+        ];
+        let secrets = compute_scram_secrets("secret", salt, 4096);
+        assert_eq!(secrets.iters, 4096);
+        assert_eq!(secrets.salt, salt);
+        assert_eq!(
+            secrets.stored_key, want_stored,
+            "StoredKey diverges from PG"
+        );
+        assert_eq!(
+            secrets.server_key, want_server,
+            "ServerKey diverges from PG"
+        );
+    }
+
+    /// v7.39 (TLS/SCRAM) Gap A — a user made via SQL `CREATE USER … PASSWORD`
+    /// must get a SCRAM verifier (else pgwire silently downgrades it to
+    /// cleartext auth). Before the fix, `exec_create_user` called
+    /// `users.create` directly (scram = None).
+    #[test]
+    fn sql_create_user_derives_scram() {
+        let mut e = crate::Engine::new();
+        e.execute("CREATE USER app WITH PASSWORD 'pw' ROLE 'readwrite'")
+            .expect("CREATE USER");
+        let rec = e.users.get("app").expect("user created");
+        assert!(
+            rec.scram().is_some(),
+            "SQL CREATE USER must derive a SCRAM-SHA-256 verifier"
+        );
+    }
+
     #[test]
     fn create_then_verify_succeeds_with_right_password_only() {
         let mut s = UserStore::new();

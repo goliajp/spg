@@ -2745,8 +2745,11 @@ impl Engine {
             },
             |f| f(),
         );
-        self.users
-            .create(&s.name, &s.password, role, salt)
+        // v7.39 (TLS/SCRAM) — route through `create_user`, not `users.create`,
+        // so the SQL path also derives the SCRAM-SHA-256 verifier. Without
+        // this, a `CREATE USER … PASSWORD` user had `scram = None` and silently
+        // fell back to cleartext pgwire auth.
+        self.create_user(&s.name, &s.password, role, salt)
             .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE USER: {e}")))?;
         Ok(QueryResult::CommandOk {
             affected: 1,
