@@ -48,6 +48,7 @@ use spg_engine::{CancelToken, EngineError, MonotonicNowFn, QueryResult, Role};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::ServerState;
+use crate::mysqlwire::ReadWrite;
 
 // v7.37.x (docker-fair SCALARSQ wire-overhead attack) — per-thread
 // parse cache for the simple-query streaming path. The wire-probe
@@ -286,7 +287,7 @@ pub(crate) fn split_top_level_statements(body: &[u8]) -> Vec<&[u8]> {
 /// the multi-stmt branch.
 #[allow(clippy::too_many_arguments)]
 fn handle_pg_simple_query(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     body: &[u8],
     state: &Arc<ServerState>,
     conn_state: &Arc<crate::ConnState>,
@@ -1001,7 +1002,7 @@ fn handle_pg_simple_query_one_into_wbuf(
 /// went to 'E'), stop dispatching the remainder.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_pg_simple_query_multi(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     stmts: &[&[u8]],
     state: &Arc<ServerState>,
     conn_state: &Arc<crate::ConnState>,
@@ -1040,11 +1041,55 @@ fn dispatch_pg_simple_query_multi(
     Ok(())
 }
 
+/// New pgwire connection: negotiate optional TLS (SSLRequest), then run the
+/// session over the plain or TLS-wrapped stream.
 fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // v7.39 (TLS) — SSLRequest negotiation. Peek the 8-byte header without
+    // consuming it, so a plain-TCP client's StartupMessage is left intact for
+    // read_startup; only a real SSLRequest (proto 80877103) is consumed and
+    // upgraded. GSSENCRequest (80877104) is declined, then we re-peek.
+    loop {
+        match peek_startup_proto(&stream)? {
+            Some(80877103) => {
+                let mut hdr = [0u8; 8];
+                stream.read_exact(&mut hdr)?;
+                stream.write_all(b"S")?;
+                let mut tls_conn =
+                    crate::mysqlwire::build_server_connection().map_err(std::io::Error::other)?;
+                let mut tls = rustls::Stream::new(&mut tls_conn, &mut stream);
+                return run_pg_session(&mut tls, state);
+            }
+            Some(80877104) => {
+                let mut hdr = [0u8; 8];
+                stream.read_exact(&mut hdr)?;
+                stream.write_all(b"N")?;
+            }
+            _ => return run_pg_session(&mut stream, state),
+        }
+    }
+}
 
+/// v7.39 (TLS) — peek the first 8 bytes (length + request code) WITHOUT
+/// consuming them via the safe `TcpStream::peek` (MSG_PEEK under the hood), so
+/// a plain StartupMessage stays buffered for `read_startup`. Returns the
+/// request code, or `None` when fewer than 8 bytes are visible (short read /
+/// EOF), which the caller treats as "not an SSL/GSS request". Clients send the
+/// fixed 8-byte SSLRequest as one segment, so a full peek is reliable.
+fn peek_startup_proto(stream: &TcpStream) -> std::io::Result<Option<u32>> {
+    let mut buf = [0u8; 8];
+    let n = stream.peek(&mut buf)?;
+    if n < 8 {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])))
+}
+
+/// Run the pgwire session (startup, auth, query loop) over a plain or
+/// TLS-wrapped stream.
+fn run_pg_session(stream: &mut dyn ReadWrite, state: &Arc<ServerState>) -> std::io::Result<()> {
     // ---- Startup phase ----
-    let (user, params) = read_startup(&mut stream)?;
+    let (user, params) = read_startup(stream)?;
     // v7.17 Phase 2.4 — surface `application_name` from the startup
     // params on the per-connection ConnState (read back via
     // `spg_stat_activity.application_name`). Other params
@@ -1115,9 +1160,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             })
             .unwrap_or(false);
         let outcome = if user_has_scram {
-            scram_auth(&mut stream, state, &user)?
+            scram_auth(stream, state, &user)?
         } else {
-            cleartext_auth(&mut stream, state, &user)?
+            cleartext_auth(stream, state, &user)?
         };
         match outcome {
             Some(r) => r,
@@ -1128,21 +1173,21 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     };
 
     // AuthenticationOk
-    send_msg(&mut stream, b'R', &0u32.to_be_bytes())?;
+    send_msg(stream, b'R', &0u32.to_be_bytes())?;
     // ParameterStatus pairs — keep the set minimal but include the
     // ones psql / driver libraries check first.
-    send_parameter_status(&mut stream, "server_version", "18.4 (spg-4.3)")?;
-    send_parameter_status(&mut stream, "client_encoding", "UTF8")?;
-    send_parameter_status(&mut stream, "DateStyle", "ISO, MDY")?;
-    send_parameter_status(&mut stream, "integer_datetimes", "on")?;
-    send_parameter_status(&mut stream, "standard_conforming_strings", "on")?;
+    send_parameter_status(stream, "server_version", "18.4 (spg-4.3)")?;
+    send_parameter_status(stream, "client_encoding", "UTF8")?;
+    send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
+    send_parameter_status(stream, "integer_datetimes", "on")?;
+    send_parameter_status(stream, "standard_conforming_strings", "on")?;
     // BackendKeyData — required by spec but we don't support cancel,
     // so the keys are bogus. Most clients ignore.
     let mut bkd = Vec::with_capacity(8);
     bkd.extend_from_slice(&std::process::id().to_be_bytes());
     bkd.extend_from_slice(&0u32.to_be_bytes());
-    send_msg(&mut stream, b'K', &bkd)?;
-    send_ready_for_query(&mut stream, b'I')?;
+    send_msg(stream, b'K', &bkd)?;
+    send_ready_for_query(stream, b'I')?;
 
     // ---- Query loop ----
     let mut tx_state = b'I'; // 'I' idle / 'T' in transaction / 'E' failed
@@ -1250,7 +1295,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
 
         match msg_type {
             b'Q' => handle_pg_simple_query(
-                &mut stream,
+                stream,
                 body,
                 state,
                 &conn_state,
@@ -3327,7 +3372,7 @@ fn unquote_copy_char(val: &str) -> Option<char> {
 /// inserts via engine.execute("INSERT ..."). CopyDone commits;
 /// CopyFail aborts.
 fn handle_copy_from_stdin(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
     table: &str,
@@ -3741,7 +3786,7 @@ fn build_copy_insert(table: &str, values: &[Option<String>]) -> String {
 /// CopyOutResponse, streams each row as one CopyData frame (text
 /// format), then CopyDone + CommandComplete.
 fn handle_copy_to_stdout(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
     table: &str,
@@ -3885,7 +3930,7 @@ fn escape_copy_cell(s: &str) -> String {
 // ---- Auth helpers (cleartext + SCRAM) ----
 
 fn cleartext_auth(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     user: &str,
 ) -> std::io::Result<Option<Role>> {
@@ -3908,7 +3953,7 @@ fn cleartext_auth(
 /// successful proof verification, `None` if anything goes wrong
 /// (caller closes the connection — error frame already written).
 fn scram_auth(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     user: &str,
 ) -> std::io::Result<Option<Role>> {
@@ -4072,7 +4117,7 @@ fn random_nonce_b64(byte_len: usize) -> std::io::Result<String> {
 
 // ---- Startup message ----
 
-fn read_startup(stream: &mut TcpStream) -> std::io::Result<(String, Vec<(String, String)>)> {
+fn read_startup(stream: &mut dyn ReadWrite) -> std::io::Result<(String, Vec<(String, String)>)> {
     // First u32 (BE) is total length. Read it, then the rest.
     loop {
         let mut len_bytes = [0u8; 4];
@@ -4134,7 +4179,7 @@ fn read_startup(stream: &mut TcpStream) -> std::io::Result<(String, Vec<(String,
     }
 }
 
-fn read_password_message(stream: &mut TcpStream) -> std::io::Result<String> {
+fn read_password_message(stream: &mut dyn ReadWrite) -> std::io::Result<String> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header)?;
     if header[0] != b'p' {
