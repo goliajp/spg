@@ -654,7 +654,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(rhs, f);
         }
         Expr::Unary { expr, .. } => walk_expr(expr, f),
-        Expr::Cast { expr, .. } => walk_expr(expr, f),
+        Expr::Cast { expr, .. } | Expr::FieldAccess { base: expr, .. } => walk_expr(expr, f),
         Expr::IsNull { expr, .. } => walk_expr(expr, f),
         Expr::Like { expr, pattern, .. } => {
             walk_expr(expr, f);

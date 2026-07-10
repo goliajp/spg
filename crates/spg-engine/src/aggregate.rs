@@ -65,7 +65,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         }
         Expr::AggregateOrdered { .. } => true,
         Expr::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             contains_aggregate(expr)
         }
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
@@ -2765,7 +2765,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(lhs, out);
             collect_aggregates(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             collect_aggregates(expr, out);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -4091,6 +4091,10 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         Expr::Cast { expr, target } => Expr::Cast {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
             target: target.clone(),
+        },
+        Expr::FieldAccess { base, field } => Expr::FieldAccess {
+            base: Box::new(rewrite_expr(base, group_exprs, aggs)),
+            field: field.clone(),
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),

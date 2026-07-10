@@ -13979,6 +13979,32 @@ impl Parser {
 
     fn finish_postfix_casts(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         loop {
+            // v7.38 (read01, T9) — composite field access `(expr).field`.
+            // A bare `a.b` is consumed as a qualified column inside the ident
+            // atom, so a Dot only survives to this postfix position when the
+            // base was a parenthesised expression (`(e).id`, `(row(1,2)).f1`).
+            // `.*` whole-row expansion is not handled here (projection-level).
+            if matches!(self.peek(), Token::Dot)
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_))
+                )
+            {
+                self.advance(); // .
+                let field = match self.advance() {
+                    Token::Ident(s) | Token::QuotedIdent(s) => s,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected a field name after '.', got {other:?}"
+                        )));
+                    }
+                };
+                expr = Expr::FieldAccess {
+                    base: Box::new(expr),
+                    field,
+                };
+                continue;
+            }
             if matches!(self.peek(), Token::DoubleColon) {
                 self.advance();
                 // v7.9.25 / v7.9.26 — broaden the postfix `::` cast

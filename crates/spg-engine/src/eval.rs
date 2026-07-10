@@ -592,6 +592,28 @@ pub fn eval_expr(
             }
             cast_value(v, target.clone())
         }
+        Expr::FieldAccess { base, field } => {
+            // v7.38 (read01, T9) — composite field access `(expr).field`.
+            // The base evaluates to a record; look the member up by name
+            // (`f1`..`fN` for an anonymous ROW, base column names for a
+            // whole-row). A NULL record yields NULL (PG semantics).
+            let v = eval_expr(base, row, ctx)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Composite(fields) => fields
+                    .into_iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, val)| val)
+                    .ok_or_else(|| EvalError::ColumnNotFound {
+                        name: field.clone(),
+                    }),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "field access `.{field}` requires a composite (record) value"
+                    ),
+                }),
+            }
+        }
         Expr::IsNull { expr, negated } => {
             // v7.38 (read01 P4.11) — `ROW(...) IS [NOT] NULL` is evaluated
             // field-wise, not as a whole-value null test: a row IS NULL when
