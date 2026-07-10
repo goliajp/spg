@@ -720,6 +720,29 @@ impl BigNumeric {
         Some(raw.round_to(raw.transcendental_scale()))
     }
 
+    /// v7.38 (read01) — PG numeric `log(base, x)` = ln(x) / ln(base), computed
+    /// at a wide working scale and then rounded to PG's display scale. `None`
+    /// when either operand is non-positive (`ln_at` rejects it) or when
+    /// `ln(base)` is zero (base = 1) — the caller raises PG's specific
+    /// "logarithm of zero / of a negative number" / "division by zero" error.
+    #[must_use]
+    pub fn log_base(&self, base: &Self) -> Option<Self> {
+        const WS: u8 = 32;
+        let ln_x = self.ln_at(WS)?;
+        let ln_b = base.ln_at(WS)?;
+        if ln_b.is_zero() {
+            return None;
+        }
+        let raw = ln_x.div(&ln_b, WS)?;
+        Some(raw.round_to(raw.transcendental_scale()))
+    }
+
+    /// PG numeric `log(x)` / `log10(x)` — the base-10 logarithm.
+    #[must_use]
+    pub fn log10(&self) -> Option<Self> {
+        self.log_base(&Self::from_i128(10, 0))
+    }
+
     /// Render as a decimal string (`-123.4500` style), inserting the scale point.
     #[must_use]
     pub fn to_decimal_str(&self) -> String {

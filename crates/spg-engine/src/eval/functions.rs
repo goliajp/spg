@@ -30,6 +30,22 @@ pub(super) fn apply_function_lower(
     apply_function_dispatch(name_lower, args, ctx)
 }
 
+/// v7.38 (read01) — reject a logarithm operand outside its domain with PG's
+/// own wording, so `log(0)` and `log(-1)` are distinguishable.
+fn check_log_domain(v: &spg_storage::bignum::BigNumeric) -> Result<(), EvalError> {
+    if v.is_zero() {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot take logarithm of zero".into(),
+        });
+    }
+    if v.parts().0 {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot take logarithm of a negative number".into(),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -2128,6 +2144,21 @@ fn apply_function_dispatch(
             if arg_count == 1 {
                 match &args[0] {
                     Value::Null => Ok(Value::Null),
+                    // v7.38 (read01) — log(numeric) / log10(numeric) is exact
+                    // NUMERIC in PG (an integer argument keeps the double
+                    // overload: `log(100)` → 2, `log(100.0)` → 2.0000000000000000).
+                    v @ (Value::Numeric { kind: spg_storage::NumericKind::Finite, .. }
+                    | Value::NumericBig(_)) => {
+                        let big = crate::eval::binop::value_to_bignum(v).ok_or_else(|| {
+                            EvalError::TypeMismatch { detail: "log(): numeric".into() }
+                        })?;
+                        check_log_domain(&big)?;
+                        big.log10().map(crate::eval::binop::bignum_to_value).ok_or(
+                            EvalError::TypeMismatch {
+                                detail: "log(): cannot take logarithm".into(),
+                            },
+                        )
+                    }
                     v => {
                         let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                             detail: alloc::format!("{name}() needs numeric, got {:?}", v.data_type()),
@@ -2148,6 +2179,25 @@ fn apply_function_dispatch(
             } else if arg_count == 2 {
                 if args.iter().any(|v| matches!(v, Value::Null)) {
                     return Ok(Value::Null);
+                }
+                // v7.38 (read01) — PG's two-argument `log(base, x)` has only a
+                // NUMERIC overload, so integer arguments are numeric too
+                // (`log(2, 8)` → 3.0000000000000000). A float operand keeps the
+                // double path below (PG rejects it; SPG stays permissive).
+                let is_float = |v: &Value| matches!(v, Value::Float(_) | Value::Real(_));
+                if !is_float(&args[0]) && !is_float(&args[1]) {
+                    if let (Some(base), Some(x)) = (
+                        crate::eval::binop::value_to_bignum(&args[0]),
+                        crate::eval::binop::value_to_bignum(&args[1]),
+                    ) {
+                        check_log_domain(&base)?;
+                        check_log_domain(&x)?;
+                        // A base of 1 makes ln(base) zero → PG "division by zero".
+                        return x
+                            .log_base(&base)
+                            .map(crate::eval::binop::bignum_to_value)
+                            .ok_or(EvalError::DivisionByZero);
+                    }
                 }
                 let b = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
                     detail: "log(base, x) needs numeric base".into(),
