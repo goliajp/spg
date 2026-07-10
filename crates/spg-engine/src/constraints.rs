@@ -21,6 +21,10 @@ use crate::aggregate;
 use crate::eval::{self, EvalError};
 use crate::{Engine, EngineError, check_unsigned_range, coerce_value, value_to_literal_expr};
 
+/// v7.38 — builds an index key string for a row, or `None` when the row is
+/// absent from the index (NULL key, or a false partial predicate).
+type KeyStrFn<'a> = dyn Fn(&[Value<'static>]) -> Result<Option<String>, EngineError> + 'a;
+
 /// v7.6.1 — resolve a parser-level `ForeignKeyConstraint` (column
 /// names + parent table name) into the storage-layer shape (column
 /// indices + same parent table). Validates everything the engine
@@ -950,7 +954,7 @@ pub(crate) fn enforce_unique_updates(
     // remove-old + insert-new; `key_str` returns None for a row that isn't
     // in the index (NULL key, or partial-predicate false) so it neither
     // seeds nor conflicts.
-    let replay = |key_str: &dyn Fn(&[Value<'static>]) -> Result<Option<String>, EngineError>,
+    let replay = |key_str: &KeyStrFn<'_>,
                   on_conflict: &dyn Fn(usize) -> EngineError|
      -> Result<(), EngineError> {
         let mut index: hashbrown::HashSet<String> =

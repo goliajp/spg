@@ -4940,7 +4940,7 @@ pub(crate) fn infer_column_types(
 }
 
 /// Numeric widening rank for UNION type resolution (higher = wider).
-fn numeric_rank(t: &DataType) -> Option<u8> {
+fn numeric_rank(t: DataType) -> Option<u8> {
     match t {
         DataType::SmallInt => Some(1),
         DataType::Int => Some(2),
@@ -4965,10 +4965,10 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
     if types.len() < 2 {
         return None;
     }
-    if types.iter().all(|t| numeric_rank(t).is_some()) {
+    if types.iter().all(|t| numeric_rank(*t).is_some()) {
         return types
             .iter()
-            .max_by_key(|t| numeric_rank(t).unwrap_or(0))
+            .max_by_key(|t| numeric_rank(**t).unwrap_or(0))
             .copied();
     }
     let non_text: Vec<&DataType> = types
