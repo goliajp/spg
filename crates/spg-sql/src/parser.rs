@@ -1841,16 +1841,27 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("role"))
                 {
                     self.advance(); // ROLE
-                    match self.peek().clone() {
-                        Token::Default
-                        | Token::String(_)
-                        | Token::Ident(_)
-                        | Token::QuotedIdent(_) => {
+                    // v7.39 (RLS) — real session-role switch. NONE / DEFAULT
+                    // reset to the login identity; a name / string sets the
+                    // effective role that drives current_user + RLS.
+                    let role = match self.peek().clone() {
+                        Token::Default => {
                             self.advance();
+                            None
                         }
-                        _ => {}
-                    }
-                    return Ok(Statement::Empty);
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("none") =>
+                        {
+                            self.advance();
+                            None
+                        }
+                        Token::String(s) | Token::Ident(s) | Token::QuotedIdent(s) => {
+                            self.advance();
+                            Some(s)
+                        }
+                        _ => None,
+                    };
+                    return Ok(Statement::SetRole(role));
                 }
                 // v7.37.17 (17.6 sibling) — PG `SET SESSION
                 // CHARACTERISTICS AS TRANSACTION <mode>` (per PG
@@ -2003,6 +2014,11 @@ impl Parser {
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("all") => {
                         self.advance();
                         Ok(Statement::ResetParameter(None))
+                    }
+                    // v7.39 (RLS) — `RESET ROLE` clears the session role.
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("role") => {
+                        self.advance();
+                        Ok(Statement::SetRole(None))
                     }
                     _ => {
                         let name = self.parse_set_param_name()?;

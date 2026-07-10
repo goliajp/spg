@@ -14,7 +14,35 @@ use spg_storage::ColumnSchema;
 use crate::Engine;
 use crate::eval::EvalContext;
 
+/// v7.39 (RLS) — reserved `session_params` key holding the effective session
+/// role set by `SET ROLE` (absent = the default Admin superuser login).
+/// `current_user` / RLS enforcement read it via `EvalContext.session_gucs`.
+/// The `__spg_` prefix keeps it out of the user-visible GUC namespace.
+pub(crate) const CURRENT_ROLE_KEY: &str = "__spg_current_role";
+
+/// v7.39 (RLS) — the login identity (superuser). SPG's embedded engine and
+/// its default server session both authenticate as this.
+pub(crate) const LOGIN_ROLE: &str = "admin";
+
 impl Engine {
+    /// v7.39 (RLS) — the effective session role: the `SET ROLE` override, or
+    /// the Admin login identity. Drives `current_user` and RLS role matching.
+    #[must_use]
+    pub(crate) fn current_role(&self) -> &str {
+        self.session_params
+            .get(CURRENT_ROLE_KEY)
+            .map_or(LOGIN_ROLE, String::as_str)
+    }
+
+    /// v7.39 (RLS) — whether the session bypasses RLS. PG: superusers always
+    /// bypass. SPG maps this to "no non-Admin `SET ROLE` is in effect": the
+    /// default login and an explicit `SET ROLE admin` are superuser; any other
+    /// role is policy-subject.
+    #[must_use]
+    pub(crate) fn is_superuser(&self) -> bool {
+        self.current_role().eq_ignore_ascii_case(LOGIN_ROLE)
+    }
+
     /// v7.12.1 — record a `SET <name> = <value>` parameter. Names
     /// are case-folded to lowercase to match PG; values keep their
     /// caller-supplied form so observability paths see what was
