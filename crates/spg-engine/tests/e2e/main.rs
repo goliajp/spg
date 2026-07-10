@@ -689,5 +689,6 @@ mod e2e_cast_pg_differential;
 mod e2e_identity_always;
 mod e2e_default_expr_text;
 mod e2e_whole_row_ref;
+mod e2e_composite_field;
 mod e2e_query_clause_pg_differential;
 mod mvcc_pg_differential;

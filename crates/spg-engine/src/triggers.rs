@@ -1219,7 +1219,7 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             substitute_locals(lhs, locals);
             substitute_locals(rhs, locals);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             substitute_locals(expr, locals);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -1356,7 +1356,7 @@ fn substitute_new_old(
             substitute_new_old(lhs, new_row, old_row, columns)?;
             substitute_new_old(rhs, new_row, old_row, columns)?;
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;
         }
         Expr::Like { expr, pattern, .. } => {

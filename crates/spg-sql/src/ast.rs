@@ -2634,6 +2634,16 @@ pub enum Expr {
         expr: Box<Expr>,
         target: CastTarget,
     },
+    /// v7.38 (read01, T9) — composite field access `(expr).field`. `base`
+    /// evaluates to a composite/record value (an explicit `ROW(...)`, a
+    /// whole-row reference, or a composite-returning function); `field` names
+    /// the member (`f1`..`fN` positional for an anonymous ROW, or the base
+    /// column names for a whole-row). Only the parenthesised form reaches
+    /// here — a bare `a.b` is parsed as a qualified column reference.
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
+    },
     /// Postfix `IS NULL` / `IS NOT NULL`. Returns BOOL.
     IsNull {
         expr: Box<Expr>,
@@ -5112,6 +5122,7 @@ impl fmt::Display for Expr {
                 UnOp::BitNot => write!(f, "(~{expr})"),
             },
             Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
+            Self::FieldAccess { base, field } => write!(f, "({base}).{field}"),
             Self::AggregateOrdered {
                 call,
                 order_by,

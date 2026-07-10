@@ -470,7 +470,7 @@ where
             walk_expr(lhs, f);
             walk_expr(rhs, f);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             walk_expr(expr, f)
         }
         Expr::FunctionCall { args, .. } => {

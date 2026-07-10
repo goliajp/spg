@@ -264,7 +264,7 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
             rewrite_column_in_expr(lhs, old, new);
             rewrite_column_in_expr(rhs, old, new);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             rewrite_column_in_expr(expr, old, new);
         }
         Expr::FunctionCall { args, .. } => {
@@ -698,7 +698,7 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
             substitute_expr(lhs, params)?;
             substitute_expr(rhs, params)?;
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             substitute_expr(expr, params)?;
         }
         Expr::FunctionCall { args, .. } => {

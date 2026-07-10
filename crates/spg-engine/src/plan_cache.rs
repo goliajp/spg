@@ -291,7 +291,7 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             collect_expr(rhs, out);
         }
         Expr::Unary { expr, .. } => collect_expr(expr, out),
-        Expr::Cast { expr, .. } => collect_expr(expr, out),
+        Expr::Cast { expr, .. } | Expr::FieldAccess { base: expr, .. } => collect_expr(expr, out),
         Expr::IsNull { expr, .. } => collect_expr(expr, out),
         Expr::Like { expr, pattern, .. } => {
             collect_expr(expr, out);

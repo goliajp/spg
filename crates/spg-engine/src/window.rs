@@ -37,7 +37,7 @@ fn expr_has_window(e: &Expr) -> bool {
             expr_has_window(call) || order_by.iter().any(|o| expr_has_window(&o.expr))
         }
         Expr::Binary { lhs, rhs, .. } => expr_has_window(lhs) || expr_has_window(rhs),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             expr_has_window(expr)
         }
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_window),
@@ -94,7 +94,7 @@ pub(crate) fn collect_window_nodes(e: &Expr, out: &mut Vec<Expr>) {
             collect_window_nodes(lhs, out);
             collect_window_nodes(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             collect_window_nodes(expr, out);
         }
         Expr::FunctionCall { args, .. } => {
@@ -126,7 +126,7 @@ pub(crate) fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
             rewrite_window_to_columns(lhs, window_nodes);
             rewrite_window_to_columns(rhs, window_nodes);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             rewrite_window_to_columns(expr, window_nodes);
         }
         Expr::FunctionCall { args, .. } => {

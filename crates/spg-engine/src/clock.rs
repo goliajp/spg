@@ -154,7 +154,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(lhs, now);
             rewrite_expr_clock(rhs, now);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
             rewrite_expr_clock(expr, now);
         }
         Expr::FunctionCall { args, .. } => {
