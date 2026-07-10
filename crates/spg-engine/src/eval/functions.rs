@@ -10451,11 +10451,11 @@ fn apply_function_dispatch(
                         });
                     };
                     if !first {
-                        out.push(',');
+                        out.push_str(", ");
                     }
                     first = false;
                     escape_into(key, &mut out);
-                    out.push(':');
+                    out.push_str(" : ");
                     match &pair[1] {
                         Some(v) => escape_into(v, &mut out),
                         None => out.push_str("null"),
@@ -10492,11 +10492,11 @@ fn apply_function_dispatch(
                         });
                     };
                     if !first {
-                        out.push(',');
+                        out.push_str(", ");
                     }
                     first = false;
                     escape_into(key, &mut out);
-                    out.push(':');
+                    out.push_str(" : ");
                     match v {
                         Some(val) => escape_into(val, &mut out),
                         None => out.push_str("null"),
@@ -10504,6 +10504,11 @@ fn apply_function_dispatch(
                 }
             }
             out.push('}');
+            // v7.38 (read01, T-json-ws) — json_object emits ` : ` (built
+            // above); jsonb_object canonicalises to the `: ` jsonb form.
+            if name == "jsonb_object" {
+                return Ok(crate::json::canonicalize_value(Value::json(out)));
+            }
             Ok(Value::json(out))
         }
         // "json_array" is MySQL's spelling of json_build_array.

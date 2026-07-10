@@ -2205,7 +2205,10 @@ pub fn build_object(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let mut first = true;
     for pair in args.chunks_exact(2) {
         if !first {
-            out.push(',');
+            // v7.38 (read01, T-json-ws) — PG's json_build_object uses `, `
+            // between pairs and ` : ` (spaces both sides) around the colon;
+            // jsonb_build_object canonicalises this to `: `.
+            out.push_str(", ");
         }
         first = false;
         let key = match &pair[0] {
@@ -2218,7 +2221,7 @@ pub fn build_object(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             other => format_value_as_text(other),
         };
         write_json(&JsonValue::String(key), &mut out);
-        out.push(':');
+        out.push_str(" : ");
         encode_value_into(&pair[1], &mut out);
     }
     out.push('}');
@@ -2231,7 +2234,10 @@ pub fn build_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let mut out = String::from("[");
     for (i, v) in args.iter().enumerate() {
         if i > 0 {
-            out.push(',');
+            // v7.38 (read01, T-json-ws) — PG's json_build_array separates
+            // elements with `, ` (the jsonb variant canonicalises to the same
+            // spacing). to_json / array_to_json stay compact via other paths.
+            out.push_str(", ");
         }
         encode_value_into(v, &mut out);
     }

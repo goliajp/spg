@@ -128,7 +128,7 @@ fn json_build_object_basic_keys_and_values() {
         &mut e,
         "SELECT json_build_object('a', 1, 'b', 'two', 'c', true)",
     ));
-    assert_eq!(s, r#"{"a":1,"b":"two","c":true}"#);
+    assert_eq!(s, r#"{"a" : 1, "b" : "two", "c" : true}"#);
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn json_build_object_value_null_serialises_null() {
         &mut e,
         "SELECT json_build_object('a', NULL, 'b', 1)",
     ));
-    assert_eq!(s, r#"{"a":null,"b":1}"#);
+    assert_eq!(s, r#"{"a" : null, "b" : 1}"#);
 }
 
 #[test]
@@ -173,7 +173,7 @@ fn json_build_array_mixed_types() {
         &mut e,
         "SELECT json_build_array(1, 'x', true, NULL)",
     ));
-    assert_eq!(s, r#"[1,"x",true,null]"#);
+    assert_eq!(s, r#"[1, "x", true, null]"#);
 }
 
 #[test]
