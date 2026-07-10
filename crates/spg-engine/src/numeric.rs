@@ -87,11 +87,34 @@ pub(crate) fn parse_numeric_special(s: &str) -> Option<spg_storage::NumericKind>
     }
 }
 
+/// v7.38 (read01) — PG 16+ accepts `_` as a digit-group separator in numeric /
+/// integer *input* (`'1_000'::numeric`), but only between two digits — not
+/// leading, trailing, doubled, or adjacent to a sign / point / exponent.
+/// Returns the underscore-free string, or `None` if any `_` is misplaced.
+pub(crate) fn strip_digit_underscores(s: &str) -> Option<alloc::borrow::Cow<'_, str>> {
+    if !s.contains('_') {
+        return Some(alloc::borrow::Cow::Borrowed(s));
+    }
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'_'
+            && !(i > 0
+                && i + 1 < b.len()
+                && b[i - 1].is_ascii_digit()
+                && b[i + 1].is_ascii_digit())
+        {
+            return None;
+        }
+    }
+    Some(alloc::borrow::Cow::Owned(s.replace('_', "")))
+}
+
 pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
+    let s: &str = &strip_digit_underscores(s)?;
     // Scientific notation (`1e3`, `1.5e2`, `3E-4`): split off the exponent
     // and fold it into the decimal scale. PG accepts this in numeric input.
     if let Some(idx) = s.find(['e', 'E']) {
