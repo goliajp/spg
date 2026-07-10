@@ -7532,6 +7532,15 @@ impl Parser {
     /// is dropped in this grouping set). Runs during the ROLLUP /
     /// CUBE / GROUPING SETS expansion, where the set is known.
     fn substitute_grouping_calls(expr: &mut Expr, dropped: &[Expr]) {
+        // v7.38 (read01) — a reference to a key that is dropped in this grouping
+        // set evaluates to NULL, at any depth. Previously only a *top-level*
+        // select item equal to a dropped key was nullified, so a key nested in
+        // an expression (`COALESCE(g,'TOTAL')`, `g || sum(v)`) survived as a raw
+        // column and failed to resolve against the set's synthetic schema.
+        if dropped.iter().any(|d| d == expr) {
+            *expr = Expr::Literal(Literal::Null);
+            return;
+        }
         if let Expr::FunctionCall { name, args } = expr
             && name.eq_ignore_ascii_case("grouping")
         {
@@ -7579,6 +7588,44 @@ impl Parser {
                 if let Some(e) = else_branch {
                     Self::substitute_grouping_calls(e, dropped);
                 }
+            }
+            // v7.38 (read01) — recurse into the remaining child-bearing shapes
+            // so a dropped key nested in `IS NULL` / `LIKE` / `IN (…)` / `EXTRACT`
+            // / a subscript / `ANY`/`ALL` is nullified too (`CASE WHEN g IS NULL
+            // …` is the canonical rollup-total label idiom).
+            Expr::IsNull { expr: inner, .. } => Self::substitute_grouping_calls(inner, dropped),
+            Expr::Like { expr, pattern, .. } => {
+                Self::substitute_grouping_calls(expr, dropped);
+                Self::substitute_grouping_calls(pattern, dropped);
+            }
+            Expr::InList { expr, list, .. } => {
+                Self::substitute_grouping_calls(expr, dropped);
+                for item in list {
+                    Self::substitute_grouping_calls(item, dropped);
+                }
+            }
+            Expr::Extract { source, .. } => Self::substitute_grouping_calls(source, dropped),
+            Expr::Array(items) => {
+                for item in items {
+                    Self::substitute_grouping_calls(item, dropped);
+                }
+            }
+            Expr::ArraySubscript { target, index } => {
+                Self::substitute_grouping_calls(target, dropped);
+                Self::substitute_grouping_calls(index, dropped);
+            }
+            Expr::ArraySlice { target, lo, hi } => {
+                Self::substitute_grouping_calls(target, dropped);
+                if let Some(lo) = lo {
+                    Self::substitute_grouping_calls(lo, dropped);
+                }
+                if let Some(hi) = hi {
+                    Self::substitute_grouping_calls(hi, dropped);
+                }
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                Self::substitute_grouping_calls(expr, dropped);
+                Self::substitute_grouping_calls(array, dropped);
             }
             _ => {}
         }
