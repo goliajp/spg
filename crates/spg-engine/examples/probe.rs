@@ -10,6 +10,13 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Text(s) => s.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        // psql renders booleans as t / f.
+        Value::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+        // Non-scalar / float / numeric values keep the Debug form; wrap the
+        // column in ::text in the probe SQL when an exact value diff is needed.
         other => format!("{other:?}"),
     }
 }
@@ -25,10 +32,13 @@ fn main() {
         }
         match e.execute(stmt) {
             Ok(QueryResult::Rows { rows, .. }) => {
-                for row in &rows {
-                    let cells: Vec<String> = row.values.iter().map(render).collect();
-                    println!("{}", cells.join("|"));
-                }
+                // One line per statement: columns joined by `|`, rows by `;`
+                // (matches `psql -tA` with rows collapsed onto a line).
+                let line: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.values.iter().map(render).collect::<Vec<_>>().join("|"))
+                    .collect();
+                println!("{}", line.join(";"));
             }
             Ok(_) => println!("(ok)"),
             Err(err) => println!("ERROR: {err}"),
