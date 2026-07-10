@@ -7,6 +7,7 @@
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 use spg_sql::ast::{BinOp, Expr, Literal, SelectStatement};
 use spg_storage::{Catalog, ColumnSchema, IndexKey, Row, Table, Value};
@@ -387,6 +388,143 @@ pub(crate) fn try_index_seek_positions(
     Some(out)
 }
 
+/// v7.38 (perf, index range scan) — flip a comparison operator for the
+/// `literal <op> column` orientation (`5 < v` ≡ `v > 5`).
+fn flip_comparison(op: BinOp) -> Option<BinOp> {
+    match op {
+        BinOp::Gt => Some(BinOp::Lt),
+        BinOp::GtEq => Some(BinOp::LtEq),
+        BinOp::Lt => Some(BinOp::Gt),
+        BinOp::LtEq => Some(BinOp::GtEq),
+        _ => None,
+    }
+}
+
+/// Parse a single `col <op> lit` / `lit <op> col` range comparison into
+/// `(col_pos, lo, hi)` where exactly one of `lo` / `hi` is bounded. Returns
+/// None for anything that isn't a `> >= < <=` comparison of an indexable
+/// column against a literal.
+fn parse_one_sided_range(
+    e: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
+    let Expr::Binary { lhs, op, rhs } = e else {
+        return None;
+    };
+    // `col <op> lit` keeps `op`; `lit <op> col` flips it.
+    let (col_pos, value, op) =
+        if let Some((p, v)) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias) {
+            (p, v, *op)
+        } else if let Some((p, v)) = resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias) {
+            (p, v, flip_comparison(*op)?)
+        } else {
+            return None;
+        };
+    let key = IndexKey::from_value(&value)?;
+    let bounds = match op {
+        BinOp::Gt => (Bound::Excluded(key), Bound::Unbounded),
+        BinOp::GtEq => (Bound::Included(key), Bound::Unbounded),
+        BinOp::Lt => (Bound::Unbounded, Bound::Excluded(key)),
+        BinOp::LtEq => (Bound::Unbounded, Bound::Included(key)),
+        _ => return None,
+    };
+    Some((col_pos, bounds.0, bounds.1))
+}
+
+/// Parse a two-sided range predicate — `(col >=/> a) AND (col <=/< b)` on the
+/// SAME column (the BETWEEN shape) — into `(col_pos, lo, hi)` with both ends
+/// bounded. Deliberately TWO-sided only: a one-sided `col > x` is usually
+/// non-selective (matches a large fraction), where an index range scan +
+/// per-candidate re-eval loses to a tight seq scan; those stay on the seq
+/// path. A two-sided BETWEEN is typically selective enough to win, and the
+/// cap in `try_range_seek` catches the rare wide one.
+fn parse_range_bounds(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
+    let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    let (c1, lo1, hi1) = parse_one_sided_range(lhs, schema_cols, table_alias)?;
+    let (c2, lo2, hi2) = parse_one_sided_range(rhs, schema_cols, table_alias)?;
+    if c1 != c2 {
+        return None;
+    }
+    // One side must supply the lower bound, the other the upper.
+    let lo = match (lo1, lo2) {
+        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
+        _ => return None, // two lower bounds — not a clean [lo, hi]
+    };
+    let hi = match (hi1, hi2) {
+        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
+        _ => return None,
+    };
+    // Both ends must be bounded (a real BETWEEN), else fall back to seq scan.
+    if matches!(lo, Bound::Unbounded) || matches!(hi, Bound::Unbounded) {
+        return None;
+    }
+    Some((c1, lo, hi))
+}
+
+fn bound_as_ref(b: &Bound<IndexKey>) -> Bound<&IndexKey> {
+    match b {
+        Bound::Included(k) => Bound::Included(k),
+        Bound::Excluded(k) => Bound::Excluded(k),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+/// v7.38 (perf, index range scan) — plan `col <op> lit` / `col BETWEEN a AND b`
+/// as an index range walk. Returns the candidate rows in the key range, or None
+/// (→ caller seq-scans) when there's no usable index, the shape isn't a range,
+/// the range isn't selective (> half the table — the cap), or the range touches
+/// a cold-tier locator (whose key we'd need to resolve the segment row and the
+/// flattened walk doesn't carry). The caller re-applies the full WHERE per row,
+/// so returning a superset is correct.
+fn try_range_seek<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &'a Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    let idx = table.index_on(col_pos)?;
+    // Selectivity cap: the caller still materialises + re-evals every candidate
+    // this returns, so the index range scan only pays off when the range is a
+    // small fraction of the table. Empirically ~50%-selective ranges regress
+    // (index-walk + per-candidate materialise > a tight seq scan); a quarter is
+    // a safe margin that keeps the clear wins and falls back (→ None → seq scan)
+    // otherwise, so no endpoint regresses.
+    let cap = table.rows().len() / 4;
+    let locators = idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), cap)?;
+    let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
+    for loc in &locators {
+        match *loc {
+            spg_storage::RowLocator::Hot(i) => {
+                if !table.is_row_visible(i, snapshot) {
+                    continue;
+                }
+                if let Some(row) = table.rows().get(i) {
+                    out.push(Cow::Borrowed(row));
+                }
+            }
+            // A range walk flattens locators without their per-key handle, so a
+            // cold-tier row can't be resolved the way the Eq seek does. Bail to
+            // a seq scan (correct — the caller re-applies the WHERE to all rows).
+            spg_storage::RowLocator::Cold { .. } => return None,
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn try_index_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
@@ -395,6 +533,14 @@ pub(crate) fn try_index_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    // v7.38 (perf) — a range predicate (`col BETWEEN a AND b`, `col > x`) walks
+    // the index range instead of full-scanning. Tried before the `AND` recurse
+    // so a two-sided BETWEEN is caught as one range; a mixed predicate like
+    // `id = 1 AND created > $1` isn't a pure range, so this returns None and the
+    // Eq path below still seeks on `id`.
+    if let Some(rows) = try_range_seek(where_expr, schema_cols, table, table_alias, snapshot) {
+        return Some(rows);
+    }
     // v7.11.3 — recurse through top-level `AND` so a PG-style
     // composite predicate like `WHERE id = 1 AND created_at > $1`
     // still hits the index on `id`. The caller re-applies the

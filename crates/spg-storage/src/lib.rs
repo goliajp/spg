@@ -2489,6 +2489,38 @@ impl Index {
         }
     }
 
+    /// v7.38 (perf, index range scan) — flatten the row locators for every key
+    /// in `[lo, hi]` (bounds per `core::ops::Bound`) via the BTree's `O(log N +
+    /// k)` range walk. Returns `None` once more than `cap` locators accumulate
+    /// — a "this range isn't selective enough, seq-scan instead" signal that
+    /// stops a wide range from materialising a near-full table's worth of rows
+    /// through the index. BTree only (other kinds → None).
+    pub fn lookup_range_capped(
+        &self,
+        lo: core::ops::Bound<&IndexKey>,
+        hi: core::ops::Bound<&IndexKey>,
+        cap: usize,
+    ) -> Option<Vec<RowLocator>> {
+        match &self.kind {
+            IndexKind::BTree(m) => {
+                let mut out: Vec<RowLocator> = Vec::new();
+                for (_, locs) in m.range(lo, hi) {
+                    out.extend(locs.iter().copied());
+                    if out.len() > cap {
+                        return None;
+                    }
+                }
+                Some(out)
+            }
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => None,
+        }
+    }
+
     /// v7.12.3 — GIN posting-list lookup. Returns the row locators
     /// whose `tsvector` cell contains `word`. Empty when the word is
     /// absent from the index or this isn't a GIN index.
