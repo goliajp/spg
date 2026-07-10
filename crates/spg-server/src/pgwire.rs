@@ -1191,7 +1191,7 @@ fn run_pg_session(
             })
             .unwrap_or(false);
         let outcome = if user_has_scram {
-            scram_auth(stream, state, &user)?
+            scram_auth(stream, state, &user, secure)?
         } else {
             cleartext_auth(stream, state, &user)?
         };
@@ -3987,13 +3987,27 @@ fn scram_auth(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     user: &str,
+    secure: bool,
 ) -> std::io::Result<Option<Role>> {
     // ---- Step 1: AuthenticationSASL ----
     // Mechanism list is null-terminated mechanism strings, ended by
-    // an empty string (= double null).
+    // an empty string (= double null). Over TLS with a SHA-256 cert we
+    // additionally advertise SCRAM-SHA-256-PLUS and bind to
+    // `tls-server-end-point` (RFC 5929).
+    let cbind_hash = if secure {
+        crate::mysqlwire::tls_channel_binding_hash()
+    } else {
+        None
+    };
+    let advertise_plus = cbind_hash.is_some();
     let mut sasl_body = Vec::new();
     sasl_body.extend_from_slice(&10u32.to_be_bytes());
-    sasl_body.extend_from_slice(b"SCRAM-SHA-256\0\0");
+    if advertise_plus {
+        // PLUS listed first — clients pick the strongest offered.
+        sasl_body.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
+    } else {
+        sasl_body.extend_from_slice(b"SCRAM-SHA-256\0\0");
+    }
     send_msg(stream, b'R', &sasl_body)?;
 
     // ---- Step 2: read SASLInitialResponse ('p') ----
@@ -4016,14 +4030,28 @@ fn scram_auth(
         return Ok(None);
     };
     let mech = std::str::from_utf8(&body[..mech_end]).unwrap_or("");
-    if mech != "SCRAM-SHA-256" {
-        send_error(
-            stream,
-            "28000",
-            &format!("only SCRAM-SHA-256 is supported, got {mech:?}"),
-        )?;
-        return Ok(None);
-    }
+    let using_plus = match mech {
+        "SCRAM-SHA-256-PLUS" => {
+            if !advertise_plus {
+                send_error(
+                    stream,
+                    "28000",
+                    "SCRAM-SHA-256-PLUS not available on this connection",
+                )?;
+                return Ok(None);
+            }
+            true
+        }
+        "SCRAM-SHA-256" => false,
+        _ => {
+            send_error(
+                stream,
+                "28000",
+                &format!("only SCRAM-SHA-256[-PLUS] is supported, got {mech:?}"),
+            )?;
+            return Ok(None);
+        }
+    };
     let mut cur = mech_end + 1;
     if cur + 4 > body.len() {
         send_error(stream, "28000", "SASLInitial: missing client-first length")?;
@@ -4047,6 +4075,45 @@ fn scram_auth(
             send_error(stream, "28000", &e.to_string())?;
             return Ok(None);
         }
+    };
+
+    // ---- Step 2b: GS2 flag / mechanism consistency + downgrade guard ----
+    // The gs2-cbind-flag must agree with the chosen mechanism, and a client
+    // that flags `y` (channel-binding-capable but "server didn't offer it")
+    // while we *did* advertise -PLUS signals a stripped-advertisement MITM.
+    use crate::scram::Gs2CbindFlag;
+    match (&client_first.cbind_flag, using_plus) {
+        (Gs2CbindFlag::Required, true) => {}
+        (Gs2CbindFlag::Required, false) => {
+            send_error(
+                stream,
+                "28000",
+                "SCRAM: channel-binding flag set on a non-PLUS mechanism",
+            )?;
+            return Ok(None);
+        }
+        (Gs2CbindFlag::NotSupported | Gs2CbindFlag::SupportedNotUsed, true) => {
+            send_error(
+                stream,
+                "28000",
+                "SCRAM-SHA-256-PLUS requires the p=tls-server-end-point flag",
+            )?;
+            return Ok(None);
+        }
+        (Gs2CbindFlag::SupportedNotUsed, false) => {
+            if advertise_plus {
+                send_error(stream, "28000", "SCRAM: channel-binding downgrade detected")?;
+                return Ok(None);
+            }
+        }
+        (Gs2CbindFlag::NotSupported, false) => {}
+    }
+    // The cbind-data bound into the client-final `c=` value: the cert hash for
+    // a -PLUS exchange, empty otherwise.
+    let cbind_data: &[u8] = if using_plus {
+        cbind_hash.as_ref().map(|h| h.as_slice()).unwrap_or(&[])
+    } else {
+        &[]
     };
 
     // ---- Step 3: pull this user's SCRAM secrets ----
@@ -4102,6 +4169,15 @@ fn scram_auth(
             return Ok(None);
         }
     };
+    // Validate the channel binding the client echoed in `c=`: it must equal
+    // base64(gs2-header || cbind-data). For -PLUS this is what actually binds
+    // the auth to *this* TLS cert — a MITM presenting a different cert makes
+    // the client's cbind-data (and hence c=) mismatch what we compute here.
+    let expected_c = crate::scram::channel_binding_c_value(&client_first.gs2_header, cbind_data);
+    if client_final.channel_binding != expected_c {
+        send_error(stream, "28000", "SCRAM: channel binding mismatch")?;
+        return Ok(None);
+    }
     if client_final.combined_nonce != combined_nonce {
         send_error(stream, "28000", "SCRAM: nonce mismatch")?;
         return Ok(None);

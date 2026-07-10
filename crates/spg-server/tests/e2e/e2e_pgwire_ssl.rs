@@ -329,3 +329,230 @@ fn plaintext_still_works_without_ssl() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     drive_to_ready(&mut s);
 }
+
+// ---- v7.39 (TLS/SCRAM Phase 3) — SCRAM-SHA-256-PLUS channel binding ----
+
+/// StartupMessage for an arbitrary `user`.
+fn startup_message_for(user: &str) -> Vec<u8> {
+    let mut params = Vec::new();
+    params.extend_from_slice(b"user\0");
+    params.extend_from_slice(user.as_bytes());
+    params.push(0);
+    params.push(0); // terminating empty key
+    let total = 4 + 4 + params.len();
+    let mut v = Vec::with_capacity(total);
+    v.extend_from_slice(&(total as u32).to_be_bytes());
+    v.extend_from_slice(&PROTOCOL_V3.to_be_bytes());
+    v.extend_from_slice(&params);
+    v
+}
+
+/// Send a Simple Query and drain to ReadyForQuery.
+fn simple_query<S: Read + Write>(s: &mut S, sql: &str) {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    let mut q = Vec::new();
+    q.push(b'Q');
+    q.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+    q.extend_from_slice(&body);
+    s.write_all(&q).unwrap();
+    loop {
+        let (ty, _) = read_msg(s);
+        if ty == b'Z' {
+            break;
+        }
+    }
+}
+
+/// True if `buf` (NUL-delimited mechanism list) contains `needle`.
+fn advertises(buf: &[u8], needle: &str) -> bool {
+    buf.split(|&b| b == 0).any(|m| m == needle.as_bytes())
+}
+
+/// SASLInitialResponse ('p'): mech name (NUL) + Int32 len + client-first.
+fn send_sasl_initial<S: Write>(s: &mut S, mech: &str, client_first: &str) {
+    let mut body = Vec::new();
+    body.extend_from_slice(mech.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&(client_first.len() as u32).to_be_bytes());
+    body.extend_from_slice(client_first.as_bytes());
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+    msg.extend_from_slice(&body);
+    s.write_all(&msg).unwrap();
+}
+
+/// SASLResponse ('p'): just the client-final bytes.
+fn send_sasl_response<S: Write>(s: &mut S, client_final: &str) {
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&((4 + client_final.len()) as u32).to_be_bytes());
+    msg.extend_from_slice(client_final.as_bytes());
+    s.write_all(&msg).unwrap();
+}
+
+/// Parse server-first `r=<combined>,s=<salt_b64>,i=<iters>`.
+fn parse_server_first(sf: &str) -> (String, String, u32) {
+    let mut combined = None;
+    let mut salt = None;
+    let mut iters = None;
+    for attr in sf.split(',') {
+        if let Some(r) = attr.strip_prefix("r=") {
+            combined = Some(r.to_string());
+        } else if let Some(sv) = attr.strip_prefix("s=") {
+            salt = Some(sv.to_string());
+        } else if let Some(i) = attr.strip_prefix("i=") {
+            iters = Some(i.parse().unwrap());
+        }
+    }
+    (combined.unwrap(), salt.unwrap(), iters.unwrap())
+}
+
+/// Create a `readonly` SCRAM user over TLS (server is in open mode until the
+/// first user exists, so this connection authenticates as admin).
+fn create_scram_user(addr: &str, user: &str, password: &str) {
+    let mut s = common::connect_to(addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    s.write_all(&ssl_request()).unwrap();
+    let mut reply = [0u8; 1];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[0], b'S');
+    let cfg = client_config();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut conn = rustls::ClientConnection::new(cfg, name).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+    drive_to_ready(&mut tls);
+    simple_query(
+        &mut tls,
+        &format!("CREATE USER '{user}' WITH PASSWORD '{password}'"),
+    );
+}
+
+#[test]
+fn scram_sha256_plus_authenticates_over_tls() {
+    use spg_crypto::{base64, hmac, pbkdf2, sha256};
+    let (_guard, addr) = spawn();
+    create_scram_user(&addr, "scramuser", "secret");
+
+    // Reconnect as scramuser over TLS; capture the cert for channel binding.
+    let mut s = common::connect_to(&addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    s.write_all(&ssl_request()).unwrap();
+    let mut reply = [0u8; 1];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[0], b'S');
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(CapturingVerifier(seen.clone())))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+
+    tls.write_all(&startup_message_for("scramuser")).unwrap();
+    let cert_der = seen.lock().unwrap().clone().expect("cert captured");
+    let cert_hash = sha256::hash(&cert_der);
+
+    // AuthenticationSASL advertising -PLUS.
+    let (ty, body) = read_msg(&mut tls);
+    assert_eq!(ty, b'R');
+    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 10);
+    assert!(
+        advertises(&body[4..], "SCRAM-SHA-256-PLUS"),
+        "server must advertise -PLUS over TLS"
+    );
+
+    // client-first with tls-server-end-point binding.
+    let client_nonce = "clientnonce_abcdef0123456789";
+    let gs2 = "p=tls-server-end-point,,";
+    let client_first_bare = format!("n=,r={client_nonce}");
+    send_sasl_initial(
+        &mut tls,
+        "SCRAM-SHA-256-PLUS",
+        &format!("{gs2}{client_first_bare}"),
+    );
+
+    // server-first.
+    let (ty, body) = read_msg(&mut tls);
+    assert_eq!(ty, b'R');
+    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 11);
+    let server_first = std::str::from_utf8(&body[4..]).unwrap().to_string();
+    let (combined, salt_b64, iters) = parse_server_first(&server_first);
+    let salt = base64::decode(&salt_b64).unwrap();
+
+    // client-final: compute the proof, bind c= to the cert hash.
+    let salted = pbkdf2::pbkdf2_sha256_32(b"secret", &salt, iters);
+    let client_key = hmac::hmac_sha256(&salted, b"Client Key");
+    let stored_key = sha256::hash(&client_key);
+    let mut cbind_input = gs2.as_bytes().to_vec();
+    cbind_input.extend_from_slice(&cert_hash);
+    let c_b64 = base64::encode(&cbind_input);
+    let without_proof = format!("c={c_b64},r={combined}");
+    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+    let client_sig = hmac::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut proof = [0u8; 32];
+    for i in 0..32 {
+        proof[i] = client_key[i] ^ client_sig[i];
+    }
+    let client_final = format!("{without_proof},p={}", base64::encode(&proof));
+    send_sasl_response(&mut tls, &client_final);
+
+    // SASLFinal (12) → AuthenticationOk (0) → ReadyForQuery.
+    let (ty, body) = read_msg(&mut tls);
+    assert_eq!(ty, b'R');
+    assert_eq!(
+        u32::from_be_bytes(body[..4].try_into().unwrap()),
+        12,
+        "SASLFinal"
+    );
+    let (ty, body) = read_msg(&mut tls);
+    assert_eq!(ty, b'R');
+    assert_eq!(
+        u32::from_be_bytes(body[..4].try_into().unwrap()),
+        0,
+        "AuthenticationOk after valid channel-bound proof"
+    );
+    loop {
+        let (t, _) = read_msg(&mut tls);
+        if t == b'Z' {
+            break;
+        }
+    }
+}
+
+#[test]
+fn scram_plus_downgrade_y_flag_is_rejected() {
+    let (_guard, addr) = spawn();
+    create_scram_user(&addr, "scramuser2", "secret");
+
+    let mut s = common::connect_to(&addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    s.write_all(&ssl_request()).unwrap();
+    let mut reply = [0u8; 1];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[0], b'S');
+    let cfg = client_config();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut conn = rustls::ClientConnection::new(cfg, name).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+
+    tls.write_all(&startup_message_for("scramuser2")).unwrap();
+    // Consume AuthenticationSASL (server advertises -PLUS over TLS).
+    let (ty, body) = read_msg(&mut tls);
+    assert_eq!(ty, b'R');
+    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 10);
+    assert!(advertises(&body[4..], "SCRAM-SHA-256-PLUS"));
+
+    // A channel-binding-capable client that picks plain SCRAM-SHA-256 with a
+    // `y` flag is claiming "the server didn't offer -PLUS" — but it did, so
+    // this is a stripped-advertisement MITM and must be refused.
+    send_sasl_initial(&mut tls, "SCRAM-SHA-256", "y,,n=,r=noncenoncenonce123");
+    let (ty, _) = read_msg(&mut tls);
+    assert_eq!(
+        ty, b'E',
+        "y-flag against a -PLUS-capable server must be rejected as a downgrade"
+    );
+}
