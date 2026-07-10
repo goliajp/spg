@@ -36,28 +36,44 @@ fn ln_of_e_is_one() {
     assert!(approx(as_f64(&v), 1.0, 1e-9), "got {}", as_f64(&v));
 }
 
+fn text(e: &mut Engine, sql: &str) -> String {
+    match first(e, sql) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        other => panic!("{sql}: expected Text, got {other:?}"),
+    }
+}
+
 #[test]
 fn log10_of_100_is_2() {
+    // v7.38 (read01) — log(x) / log10(x) of a NUMERIC argument is exact
+    // NUMERIC in PG (an integer argument keeps the double overload). PG's
+    // log(x) is base-10. Oracle: live PG18.4.
     let mut e = Engine::new();
-    // libm::log10 lands exact powers of ten on whole numbers (live
-    // PG18.4: log10(1000) = 3, not the 2.9999999999999996 that
-    // ln(x)/ln(10) produced). PG's log(x) is base-10 too.
-    assert_eq!(as_f64(&first(&mut e, "SELECT log10(100.0)")), 2.0);
-    assert_eq!(as_f64(&first(&mut e, "SELECT log(100.0)")), 2.0);
-    assert_eq!(as_f64(&first(&mut e, "SELECT log10(1000.0)")), 3.0);
-    assert_eq!(as_f64(&first(&mut e, "SELECT log10(0.001)")), -3.0);
-    // Non-power argument matches PG's exact double.
-    assert_eq!(
-        as_f64(&first(&mut e, "SELECT log10(2.0)")),
-        0.301_029_995_663_981_2
-    );
+    assert_eq!(text(&mut e, "SELECT (log10(100.0))::text"), "2.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log(100.0))::text"), "2.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log10(1000.0))::text"), "3.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log10(0.001))::text"), "-3.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log10(2.0))::text"), "0.3010299956639812");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(log10(100.0))::text"), "numeric");
+    // An integer argument stays double precision.
+    assert_eq!(as_f64(&first(&mut e, "SELECT log10(100)")), 2.0);
+    assert_eq!(text(&mut e, "SELECT pg_typeof(log(100))::text"), "double precision");
 }
 
 #[test]
 fn log_base_2_of_8_is_3() {
+    // PG's two-argument `log(base, x)` has only a numeric overload, so even
+    // integer arguments give an exact numeric. Oracle: live PG18.4.
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT log(2.0, 8.0)");
-    assert!(approx(as_f64(&v), 3.0, 1e-9), "got {}", as_f64(&v));
+    assert_eq!(text(&mut e, "SELECT (log(2.0, 8.0))::text"), "3.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log(2, 8))::text"), "3.0000000000000000");
+    assert_eq!(text(&mut e, "SELECT (log(2, 10))::text"), "3.3219280948873623");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(log(2, 8))::text"), "numeric");
+    // Domain errors: base 1 divides by zero; a zero / negative operand.
+    assert!(e.execute("SELECT log(1, 5)").is_err());
+    assert!(e.execute("SELECT log(0, 5)").is_err());
+    assert!(e.execute("SELECT log(2, -3)").is_err());
+    assert!(e.execute("SELECT log(-1.0)").is_err());
 }
 
 #[test]
