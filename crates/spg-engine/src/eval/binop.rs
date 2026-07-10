@@ -256,6 +256,18 @@ pub(super) fn apply_binary(
     if let BinOp::IsDistinctFrom = op {
         return Ok(Value::Bool(!values_not_distinct(&l, &r)));
     }
+    // v7.38 (read01) — PG's array `||` treats a NULL array operand as an empty
+    // array (array_cat semantics), so `arr || NULL` and `NULL || arr` yield the
+    // array itself, not NULL. (A scalar `text || NULL` still propagates NULL;
+    // this only fires when the non-NULL side is an array.)
+    if let BinOp::Concat = op {
+        if l.is_null() && super::values::array_len(&r).is_some() {
+            return Ok(r);
+        }
+        if r.is_null() && super::values::array_len(&l).is_some() {
+            return Ok(l);
+        }
+    }
     // Everything else: any NULL operand → NULL.
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
