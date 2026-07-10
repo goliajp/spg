@@ -563,6 +563,45 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         // A `bit` literal reads as "bit varying" here vs PG's "bit"; that
         // needs a bit-vs-varbit value tag SPG doesn't yet keep.
         Value::BitString { .. } => "bit varying",
+        // v7.38 (read01) — the rest of SPG's scalar value types. These all
+        // reported "unknown" before, which drivers and ORMs read as "no type".
+        Value::Money(_) => "money",
+        Value::Inet { .. } => "inet",
+        Value::Cidr { .. } => "cidr",
+        Value::Macaddr(_) => "macaddr",
+        Value::Macaddr8(_) => "macaddr8",
+        Value::Xml(_) => "xml",
+        Value::Hstore(_) => "hstore",
+        Value::BpChar(_) => "character",
+        // An anonymous `row(...)` / whole-row reference is PG's `record`.
+        Value::Composite(_) => "record",
+        Value::Point(_) => "point",
+        Value::Lseg(..) => "lseg",
+        Value::Path { .. } => "path",
+        Value::PgBox(..) => "box",
+        Value::Polygon(_) => "polygon",
+        Value::Line { .. } => "line",
+        Value::Circle { .. } => "circle",
+        Value::Range { kind, .. } => match kind {
+            spg_storage::RangeKind::Int4 => "int4range",
+            spg_storage::RangeKind::Int8 => "int8range",
+            spg_storage::RangeKind::Num => "numrange",
+            spg_storage::RangeKind::Ts => "tsrange",
+            spg_storage::RangeKind::TsTz => "tstzrange",
+            spg_storage::RangeKind::Date => "daterange",
+        },
+        Value::BoolArray(_) => "boolean[]",
+        Value::DateArray(_) => "date[]",
+        Value::TimestampArray(_) => "timestamp without time zone[]",
+        Value::TimestamptzArray(_) => "timestamp with time zone[]",
+        Value::IntervalArray(_) => "interval[]",
+        Value::UuidArray(_) => "uuid[]",
+        Value::JsonArray(_) => "json[]",
+        Value::JsonbArray(_) => "jsonb[]",
+        Value::BytesArray(_) => "bytea[]",
+        Value::VarcharArray(_) => "character varying[]",
+        Value::CharArray(_) => "character[]",
+        Value::MoneyArray(_) => "money[]",
         Value::Null => "unknown",
         // Value is #[non_exhaustive]; future variants land here
         // until the table is updated.

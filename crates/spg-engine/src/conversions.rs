@@ -3636,9 +3636,11 @@ pub(crate) fn coerce_value(
             let rounded = numeric_round_to_integer(scaled, scale);
             i16::try_from(rounded).ok().map(Value::SmallInt)
         }
-        // VARCHAR(n) enforces an upper bound on character count.
+        // VARCHAR(n) enforces an upper bound on character count. A bare
+        // `varchar` (no typmod) is modelled as `Varchar(0)` and, like PG, holds
+        // a string of any length — `'a'::varchar` must not read as VARCHAR(0).
         (Value::Text(s), DataType::Varchar(max)) => {
-            if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
+            if max == 0 || u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
                 Some(Value::text(s))
             } else {
                 return Err(EngineError::Unsupported(alloc::format!(

@@ -290,6 +290,7 @@ mod e2e_array_numeric_unification;
 mod e2e_distinct_from_date_diff;
 mod e2e_int2_arithmetic_type;
 mod e2e_float8_range;
+mod e2e_pg_typeof_coverage;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;
