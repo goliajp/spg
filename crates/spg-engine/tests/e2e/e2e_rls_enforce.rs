@@ -148,3 +148,21 @@ fn join_on_rls_table_fails_closed() {
             .is_err()
     );
 }
+
+#[test]
+fn writes_fail_closed_under_non_superuser() {
+    let mut e = Engine::new();
+    owned_docs(&mut e);
+    e.execute("SET ROLE alice").unwrap();
+    // Phase-1 write-side is fail-closed (WITH CHECK / USING enforcement is
+    // Phase 2): a policy-subject session cannot write an RLS table yet.
+    assert!(e.execute("INSERT INTO doc VALUES (9,'alice')").is_err());
+    assert!(
+        e.execute("UPDATE doc SET owner='alice' WHERE id=1")
+            .is_err()
+    );
+    assert!(e.execute("DELETE FROM doc WHERE id=1").is_err());
+    // The superuser session still writes freely (bypass).
+    e.execute("RESET ROLE").unwrap();
+    e.execute("INSERT INTO doc VALUES (9,'x')").unwrap();
+}
