@@ -2532,6 +2532,30 @@ pub(crate) fn parse_float8(s: &str) -> Option<f64> {
     Some(parsed)
 }
 
+/// v7.38 (read01) — decode PG's external array form (`{a,b,NULL}`) and coerce
+/// each element to `elem` through `coerce_value`, so element semantics (bool
+/// spellings, date formats, numeric parsing, float8 range) live in one place.
+fn decode_array_elems(
+    s: &str,
+    elem: DataType,
+    col_name: &str,
+    position: usize,
+) -> Result<Vec<Option<Value<'static>>>, EngineError> {
+    let raw = decode_text_array_literal(s).map_err(|e| {
+        EngineError::Eval(EvalError::TypeMismatch {
+            detail: alloc::format!("cannot parse {s:?} as an array for column `{col_name}`: {e}"),
+        })
+    })?;
+    let mut out = Vec::with_capacity(raw.len());
+    for e in raw {
+        match e {
+            None => out.push(None),
+            Some(t) => out.push(Some(coerce_value(Value::text(t), elem, col_name, position)?)),
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -3214,6 +3238,68 @@ pub(crate) fn coerce_value(
             }
             Some(Value::IntArray(out))
         }
+        // v7.38 (read01) — the remaining Text → typed-array casts
+        // (`'{1.5}'::numeric[]`, `'{t}'::bool[]`, `'{2020-01-01}'::date[]`, …),
+        // which previously errored while `::int[]` / `::text[]` worked.
+        (Value::Text(s), DataType::SmallIntArray) => Some(Value::SmallIntArray(
+            decode_array_elems(&s, DataType::SmallInt, col_name, position)?
+                .into_iter()
+                .map(|o| match o {
+                    Some(Value::SmallInt(n)) => Some(n),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        (Value::Text(s), DataType::BoolArray) => Some(Value::BoolArray(
+            decode_array_elems(&s, DataType::Bool, col_name, position)?
+                .into_iter()
+                .map(|o| match o {
+                    Some(Value::Bool(b)) => Some(b),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        (Value::Text(s), DataType::FloatArray) => Some(Value::FloatArray(
+            decode_array_elems(&s, DataType::Float, col_name, position)?
+                .into_iter()
+                .map(|o| match o {
+                    Some(Value::Float(f)) => Some(f),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        (Value::Text(s), DataType::NumericArray) => Some(Value::NumericArray(
+            decode_array_elems(
+                &s,
+                DataType::Numeric { precision: 0, scale: 0 },
+                col_name,
+                position,
+            )?
+            .into_iter()
+            .map(|o| match o {
+                Some(Value::Numeric { scaled, scale, .. }) => Some((scaled, scale)),
+                _ => None,
+            })
+            .collect(),
+        )),
+        (Value::Text(s), DataType::DateArray) => Some(Value::DateArray(
+            decode_array_elems(&s, DataType::Date, col_name, position)?
+                .into_iter()
+                .map(|o| match o {
+                    Some(Value::Date(d)) => Some(d),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        (Value::Text(s), DataType::UuidArray) => Some(Value::UuidArray(
+            decode_array_elems(&s, DataType::Uuid, col_name, position)?
+                .into_iter()
+                .map(|o| match o {
+                    Some(Value::Uuid(u)) => Some(u),
+                    _ => None,
+                })
+                .collect(),
+        )),
         (Value::Text(s), DataType::BigIntArray) => {
             let arr = decode_text_array_literal(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
