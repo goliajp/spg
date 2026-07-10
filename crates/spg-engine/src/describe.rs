@@ -88,6 +88,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     inline_enum_variants: None,
                     inline_set_variants: None,
                     generated_stored_expr: None,
+                    identity_always: false,
                 });
             }
         }

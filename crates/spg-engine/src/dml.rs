@@ -1569,6 +1569,7 @@ impl Engine {
                 select_source: None,
                 on_conflict: stmt.on_conflict,
                 returning: stmt.returning,
+                overriding: stmt.overriding,
             };
             return self.exec_insert(recurse);
         }
@@ -1609,6 +1610,7 @@ impl Engine {
         let fks = table.schema().foreign_keys.clone();
         // Stage 1 — parse + AUTO_INC + coerce all rows under the
         // (immutable) table borrow.
+        let overriding = stmt.overriding;
         let mut all_values = parse_insert_rows(
             table,
             stmt.rows,
@@ -1619,6 +1621,7 @@ impl Engine {
             &seq_floors,
             &enum_label_lookup,
             &set_variant_lookup,
+            overriding,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -2093,6 +2096,7 @@ impl Engine {
                 select_source: None,
                 on_conflict: None,
                 returning: None,
+                overriding: stmt.overriding,
             };
             let result = self.exec_insert(child_stmt)?;
             if let QueryResult::CommandOk { affected, .. } = result {
@@ -2371,6 +2375,12 @@ fn is_column_default_marker(e: &Expr) -> bool {
     matches!(e, Expr::FunctionCall { name, args } if name == "__column_default" && args.is_empty())
 }
 
+/// The `DEFAULT`-slot marker expression (`__column_default()`), used to
+/// force a column to its declared default / sequence value.
+fn column_default_marker() -> Expr {
+    Expr::FunctionCall { name: String::from("__column_default"), args: Vec::new() }
+}
+
 fn build_tuple_pos(
     columns: &Option<Vec<String>>,
     column_meta: &[ColumnSchema],
@@ -2509,7 +2519,7 @@ mod spg_engine_no_alias {
 #[allow(clippy::too_many_arguments)]
 fn parse_insert_rows(
     table: &spg_storage::Table,
-    rows: Vec<Vec<Expr>>,
+    mut rows: Vec<Vec<Expr>>,
     column_meta: &[ColumnSchema],
     tuple_pos: &Option<Vec<Option<usize>>>,
     expected_tuple_len: usize,
@@ -2517,7 +2527,9 @@ fn parse_insert_rows(
     seq_floors: &alloc::collections::BTreeMap<usize, i64>,
     enum_label_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    overriding: spg_sql::ast::Overriding,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
+    use spg_sql::ast::Overriding;
     let schema_cols_len = column_meta.len();
     let mut all_values: Vec<Vec<Value<'static>>> = Vec::with_capacity(rows.len());
     // v7.24 (round-16 collateral) — statement-scoped serial
@@ -2553,6 +2565,59 @@ fn parse_insert_rows(
                 "cannot insert a non-DEFAULT value into column {:?} — it is a generated column",
                 col.name
             )));
+        }
+    }
+    // v7.38 (read01) — OVERRIDING USER VALUE: ignore any explicit value on an
+    // identity column and generate from the sequence. We flatten a supplied
+    // value to the DEFAULT marker at the affected slots so the existing
+    // auto-increment path fills them. Done before the ALWAYS-reject check so a
+    // USER override on an ALWAYS column generates rather than erroring.
+    if overriding == Overriding::User {
+        for (i, col) in column_meta.iter().enumerate() {
+            if !col.auto_increment {
+                continue;
+            }
+            let slot: Option<usize> = match tuple_pos {
+                Some(map) => map.get(i).copied().flatten(),
+                None => Some(i),
+            };
+            let Some(j) = slot else { continue };
+            for row in rows.iter_mut() {
+                if let Some(e) = row.get_mut(j) {
+                    if !is_column_default_marker(e) {
+                        *e = column_default_marker();
+                    }
+                }
+            }
+        }
+    }
+    // v7.38 (read01) — GENERATED ALWAYS AS IDENTITY. PG rejects an
+    // explicit non-DEFAULT value for such a column unless the statement
+    // carries OVERRIDING SYSTEM VALUE. A DEFAULT marker is always allowed
+    // (the sequence fills it). OVERRIDING USER VALUE already flattened any
+    // explicit value above, so it too passes here and generates. BY DEFAULT
+    // identity columns (auto_increment && !identity_always) accept an
+    // explicit value unmodified — no check here.
+    if overriding != Overriding::System {
+        for (i, col) in column_meta.iter().enumerate() {
+            if !col.identity_always {
+                continue;
+            }
+            let slot: Option<usize> = match tuple_pos {
+                Some(map) => map.get(i).copied().flatten(),
+                None => Some(i),
+            };
+            let Some(j) = slot else { continue };
+            let has_explicit_value = rows
+                .iter()
+                .any(|row| row.get(j).is_some_and(|e| !is_column_default_marker(e)));
+            if has_explicit_value {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot insert a non-DEFAULT value into column {:?} — column is an identity \
+                     column defined as GENERATED ALWAYS; use OVERRIDING SYSTEM VALUE to override",
+                    col.name
+                )));
+            }
         }
     }
     for tuple in rows {

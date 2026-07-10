@@ -24,7 +24,7 @@ use crate::ast::{
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
-    IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare,
+    IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare,
     PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem,
     SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp,
     UnionKind, VecEncoding, WindowFrame,
@@ -10517,6 +10517,7 @@ impl Parser {
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
         let mut generated_stored_expr: Option<Box<Expr>> = None;
+        let mut identity_always = false;
         loop {
             // v7.22 (mailrs round-13 gap 3) — PG 18 catalogs
             // not-null constraints by name and pg_dump emits them
@@ -10539,9 +10540,11 @@ impl Parser {
             // instead of silently storing NULLs.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("generated")) {
                 self.advance();
+                let mut saw_generated_always = false;
                 match self.peek().clone() {
                     Token::Ident(s) if s.eq_ignore_ascii_case("always") => {
                         self.advance();
+                        saw_generated_always = true;
                     }
                     // `BY` is a reserved keyword token (GROUP BY).
                     Token::By => {
@@ -10640,6 +10643,10 @@ impl Parser {
                     }
                 }
                 auto_increment = true;
+                // v7.38 (read01) — remember the ALWAYS flavour so the engine
+                // can reject explicit non-DEFAULT INSERT values (unless
+                // OVERRIDING SYSTEM VALUE) the way PG does.
+                identity_always = saw_generated_always;
                 // PG identity columns are implicitly NOT NULL.
                 nullable = false;
                 continue;
@@ -10856,6 +10863,7 @@ impl Parser {
             inline_enum_variants,
             inline_set_variants,
             generated_stored_expr,
+            identity_always,
         })
     }
 
@@ -11060,18 +11068,22 @@ impl Parser {
             None
         };
         // PG 10+ `OVERRIDING {SYSTEM | USER} VALUE` — pg_dump emits
-        // it for identity columns. SPG always uses the values the
-        // statement supplies (identity defaults only fill omitted
-        // columns), which is exactly OVERRIDING SYSTEM VALUE
-        // semantics; accept and absorb both spellings.
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("overriding")) {
+        // OVERRIDING SYSTEM VALUE for its identity columns. The clause
+        // is captured on the statement so the engine can apply PG's
+        // GENERATED ALWAYS / BY DEFAULT interaction (v7.38, read01).
+        let overriding = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("overriding"))
+        {
             self.advance();
             let which = self.expect_ident_like()?;
-            if !which.eq_ignore_ascii_case("system") && !which.eq_ignore_ascii_case("user") {
+            let ov = if which.eq_ignore_ascii_case("system") {
+                Overriding::System
+            } else if which.eq_ignore_ascii_case("user") {
+                Overriding::User
+            } else {
                 return Err(self.err(format!(
                     "expected SYSTEM or USER after OVERRIDING, got {which:?}"
                 )));
-            }
+            };
             if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("value")) {
                 return Err(self.err(format!(
                     "expected VALUE after OVERRIDING {}, got {:?}",
@@ -11080,7 +11092,10 @@ impl Parser {
                 )));
             }
             self.advance();
-        }
+            ov
+        } else {
+            Overriding::None
+        };
         // `INSERT INTO t DEFAULT VALUES` — a single row made
         // entirely of column defaults. Lower to the permuted
         // column-list path with an empty list: every schema column
@@ -11110,6 +11125,7 @@ impl Parser {
                 select_source: None,
                 on_conflict,
                 returning,
+                overriding,
             }));
         }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
@@ -11133,6 +11149,7 @@ impl Parser {
                 select_source: Some(Box::new(select_stmt)),
                 on_conflict,
                 returning,
+                overriding,
             }));
         }
         if !matches!(self.peek(), Token::Values) {
@@ -11275,6 +11292,7 @@ impl Parser {
             select_source: None,
             on_conflict,
             returning,
+            overriding,
         }))
     }
 
