@@ -341,21 +341,74 @@ fn tls_server_config() -> Result<Arc<rustls::ServerConfig>, String> {
         // pick; ring is what we depend on.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .map_err(|e| format!("rcgen: {e}"))?;
-        let cert_der_bytes = cert.cert.der().to_vec();
-        let key_der_bytes = cert.key_pair.serialize_der();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert_der_bytes);
-        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der_bytes),
-        );
+        // v7.39 (TLS Phase 2) — an operator can supply a real cert chain +
+        // private key (PEM) via SPG_TLS_CERT / SPG_TLS_KEY; production clients
+        // reject the self-signed default. Both must be set to opt in; otherwise
+        // fall back to the lazily-minted self-signed `localhost` cert.
+        let cert_env = std::env::var("SPG_TLS_CERT").ok().filter(|s| !s.is_empty());
+        let key_env = std::env::var("SPG_TLS_KEY").ok().filter(|s| !s.is_empty());
+        let (cert_chain, key_der) = match (cert_env, key_env) {
+            (Some(cert_path), Some(key_path)) => load_operator_pem(&cert_path, &key_path)?,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "TLS: SPG_TLS_CERT and SPG_TLS_KEY must both be set (or neither)".into(),
+                );
+            }
+            (None, None) => self_signed_cert()?,
+        };
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
+            .with_single_cert(cert_chain, key_der)
             .map_err(|e| format!("rustls cert: {e}"))?;
         Ok(Arc::new(cfg))
     })
     .clone()
+}
+
+/// v7.39 (TLS Phase 2) — the lazily-minted self-signed `localhost` cert used
+/// when no operator cert is configured (dev / e2e default).
+fn self_signed_cert() -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| format!("rcgen: {e}"))?;
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+    );
+    Ok((vec![cert_der], key_der))
+}
+
+/// v7.39 (TLS Phase 2) — load an operator-supplied PEM cert chain + private key
+/// from the SPG_TLS_CERT / SPG_TLS_KEY paths.
+fn load_operator_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| format!("SPG_TLS_CERT {cert_path:?}: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("SPG_TLS_CERT {cert_path:?}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "SPG_TLS_CERT {cert_path:?}: no certificates in file"
+        ));
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| format!("SPG_TLS_KEY {key_path:?}: {e}"))?;
+    Ok((certs, key))
 }
 
 /// v7.17.0 Phase 3.P0-74 — per-session prepared-statement
