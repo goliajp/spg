@@ -43,6 +43,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 /// B-tree order (max children per internal node). Picked at the small end of
 /// the conventional 8–16 range to keep per-CoW node-clone cost low — the
@@ -228,6 +229,60 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
         let mut stack: Vec<(&Arc<BNode<K, V>>, usize)> = Vec::with_capacity(8);
         stack.push((&self.root, 1));
         IterRev { stack }
+    }
+
+    /// v7.38 (perf, index range scan) — in-order iterator over the entries
+    /// whose keys fall in `(lo, hi)` (each end honoured per `core::ops::Bound`).
+    /// Descends to `lo` in `O(log₈ N)` (skipping the subtrees entirely below
+    /// it) by building the same `(node, child_index)` cursor stack `iter()`
+    /// uses, positioned at the first key ≥/> `lo`; then walks forward and stops
+    /// at the first key past `hi`. `O(log N + k)` for `k` hits — the building
+    /// block for `Index::lookup_range` (BETWEEN / `>` / `<` seeks).
+    pub fn range<'a>(&'a self, lo: Bound<&K>, hi: Bound<&K>) -> RangeIter<'a, K, V>
+    where
+        K: Clone,
+    {
+        let mut stack: Vec<(&'a Arc<BNode<K, V>>, usize)> = Vec::with_capacity(8);
+        let mut node = &self.root;
+        loop {
+            match &**node {
+                BNode::Leaf { entries } => {
+                    // Leaf frame: begin emitting at the first in-range entry.
+                    stack.push((node, lower_index(entries, lo)));
+                    break;
+                }
+                BNode::Internal { entries, children } => {
+                    let i = lower_index(entries, lo);
+                    // children[i] may hold keys ≥ lo and < entries[i]; descend
+                    // into it, and set this frame to resume by emitting
+                    // entries[i] once that subtree is exhausted (phase-1 slot i
+                    // → idx = 2*i + 1, matching `Iter::next`'s frame encoding).
+                    stack.push((node, 2 * i + 1));
+                    node = &children[i];
+                }
+            }
+        }
+        let (hi_key, hi_incl) = match hi {
+            Bound::Unbounded => (None, false),
+            Bound::Included(k) => (Some(k.clone()), true),
+            Bound::Excluded(k) => (Some(k.clone()), false),
+        };
+        RangeIter {
+            inner: Iter { stack },
+            hi_key,
+            hi_incl,
+            done: false,
+        }
+    }
+}
+
+/// First entry index whose key is ≥ (Included) / > (Excluded) `lo`; 0 for
+/// Unbounded. Linear — a node holds ≤ `MAX_ENTRIES` = 7 entries.
+fn lower_index<K: Ord, V>(entries: &[(K, V)], lo: Bound<&K>) -> usize {
+    match lo {
+        Bound::Unbounded => 0,
+        Bound::Included(k) => entries.partition_point(|e| &e.0 < k),
+        Bound::Excluded(k) => entries.partition_point(|e| &e.0 <= k),
     }
 }
 
@@ -512,6 +567,35 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     }
 }
 
+/// v7.38 — bounded-above wrapper over [`Iter`], produced by
+/// [`PersistentBTreeMap::range`]. `Iter` already starts at `lo` (the seek
+/// stack); this stops emission at the first key past `hi`.
+#[derive(Debug)]
+pub struct RangeIter<'a, K, V> {
+    inner: Iter<'a, K, V>,
+    hi_key: Option<K>,
+    hi_incl: bool,
+    done: bool,
+}
+
+impl<'a, K: Ord, V> Iterator for RangeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        if self.done {
+            return None;
+        }
+        let (k, v) = self.inner.next()?;
+        if let Some(h) = &self.hi_key {
+            let past = if self.hi_incl { k > h } else { k >= h };
+            if past {
+                self.done = true;
+                return None;
+            }
+        }
+        Some((k, v))
+    }
+}
+
 /// v7.34.4 — descending-order `(K, V)` iterator. Mirrors `Iter` but each
 /// node's child-then-entry walk runs right-to-left so the first yielded
 /// pair is the maximum key in the map. Used by the ORDER BY `<indexed
@@ -686,6 +770,100 @@ mod tests {
         let collected: Vec<i64> = pb.iter().map(|(k, _)| *k).collect();
         let expected: Vec<i64> = (0..500).collect();
         assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn range_basic_bounds() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..100_i64 {
+            pb = pb.insert(i, i * 10).0;
+        }
+        let keys = |lo: Bound<&i64>, hi: Bound<&i64>| -> Vec<i64> {
+            pb.range(lo, hi).map(|(k, _)| *k).collect()
+        };
+        assert_eq!(
+            keys(Bound::Included(&20), Bound::Included(&24)),
+            vec![20, 21, 22, 23, 24]
+        );
+        assert_eq!(
+            keys(Bound::Excluded(&20), Bound::Excluded(&24)),
+            vec![21, 22, 23]
+        );
+        assert_eq!(keys(Bound::Unbounded, Bound::Excluded(&3)), vec![0, 1, 2]);
+        assert_eq!(
+            keys(Bound::Included(&97), Bound::Unbounded),
+            vec![97, 98, 99]
+        );
+        assert!(keys(Bound::Included(&50), Bound::Included(&49)).is_empty());
+        // Out-of-range bounds clamp to the data.
+        assert_eq!(
+            keys(Bound::Included(&-5), Bound::Included(&2)),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            keys(Bound::Included(&200), Bound::Unbounded),
+            Vec::<i64>::new()
+        );
+    }
+
+    /// Fuzz `range` against `BTreeMap::range` across random data + random
+    /// bounds (inclusive / exclusive / unbounded on each end) — the perf
+    /// index range scan rides on this, and it's a stone (max blast radius),
+    /// so the range walk must match the std oracle exactly.
+    #[test]
+    fn fuzz_range_against_btreemap() {
+        let mut rng = Splitmix::new(0x5EED_1234_u64);
+        const KEY_RANGE: i64 = 512;
+        // A few tree sizes so we exercise leaf-only, shallow, and deep trees.
+        for &n_inserts in &[0usize, 5, 40, 300, 2000] {
+            let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+            let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+            for _ in 0..n_inserts {
+                let key = (rng.next() as i64).rem_euclid(KEY_RANGE);
+                let val = rng.next() as i64;
+                pb = pb.insert(key, val).0;
+                oracle.insert(key, val);
+            }
+            for _ in 0..2000 {
+                let a = (rng.next() as i64).rem_euclid(KEY_RANGE + 40) - 20;
+                let b = (rng.next() as i64).rem_euclid(KEY_RANGE + 40) - 20;
+                let (lo_raw, hi_raw) = if a <= b { (a, b) } else { (b, a) };
+                let mk = |raw: i64, sel: u64| -> Bound<i64> {
+                    match sel % 3 {
+                        0 => Bound::Included(raw),
+                        1 => Bound::Excluded(raw),
+                        _ => Bound::Unbounded,
+                    }
+                };
+                let lo = mk(lo_raw, rng.next());
+                let hi = mk(hi_raw, rng.next());
+                // `BTreeMap::range` panics on `Excluded(x)..Excluded(x)`; our
+                // `range` yields empty there. Skip that one case for the oracle.
+                if lo_raw == hi_raw
+                    && matches!(lo, Bound::Excluded(_))
+                    && matches!(hi, Bound::Excluded(_))
+                {
+                    continue;
+                }
+                let lo_ref = match &lo {
+                    Bound::Included(k) => Bound::Included(k),
+                    Bound::Excluded(k) => Bound::Excluded(k),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+                let hi_ref = match &hi {
+                    Bound::Included(k) => Bound::Included(k),
+                    Bound::Excluded(k) => Bound::Excluded(k),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+                let got: Vec<(i64, i64)> =
+                    pb.range(lo_ref, hi_ref).map(|(k, v)| (*k, *v)).collect();
+                let want: Vec<(i64, i64)> = oracle.range((lo, hi)).map(|(k, v)| (*k, *v)).collect();
+                assert_eq!(
+                    got, want,
+                    "range drift n={n_inserts} lo={lo_raw:?} hi={hi_raw:?}"
+                );
+            }
+        }
     }
 
     #[test]
