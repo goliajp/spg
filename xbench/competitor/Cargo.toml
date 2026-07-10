@@ -48,6 +48,11 @@ path = "src/bin/latency.rs"
 test = false
 
 [[bin]]
+name = "heavy"
+path = "src/bin/heavy.rs"
+test = false
+
+[[bin]]
 name = "throughput"
 path = "src/bin/throughput.rs"
 test = false
