@@ -7,16 +7,18 @@
 //! and bypasses RLS entirely — byte-identical to a customer on real PG
 //! connected as a superuser, so every existing path is unaffected.
 //!
-//! Scope: single-target-table statements. A non-superuser SELECT that JOINs an
-//! RLS-enabled table fails closed (cross-table enforcement is a later phase);
-//! subqueries are covered by recursion.
+//! Joins (Phase 3): each RLS-enabled operand of a multi-table FROM is wrapped
+//! in a security-barrier subquery `(SELECT * FROM t) alias`, whose single-table
+//! body is filtered by the same pass on re-entry — correct for every join type
+//! (the barrier filters before the join), matching PG's RLS-as-subquery
+//! rewrite. Subqueries elsewhere are covered by the same recursion.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{BinOp, Expr, Literal, SelectStatement};
-use spg_storage::{ColumnSchema, PolicyCmd, Row, TableSchema, Value};
+use spg_sql::ast::{BinOp, Expr, FromClause, Literal, SelectItem, SelectStatement, TableRef};
+use spg_storage::{Catalog, ColumnSchema, PolicyCmd, Row, TableSchema, Value};
 
 use crate::eval;
 use crate::{Engine, EngineError};
@@ -33,8 +35,8 @@ enum QualKind {
 
 impl Engine {
     /// v7.39 (RLS) Phase 1 — the SELECT `USING` predicate to AND into a
-    /// single-table SELECT's WHERE, or `None` when RLS does not apply. Errors
-    /// (fail-closed) when a non-superuser query joins an RLS-enabled table.
+    /// single-table SELECT's WHERE, or `None` when RLS does not apply.
+    /// Multi-table FROMs are handled earlier by `rls_rewrite_joins`.
     pub(crate) fn rls_select_predicate(
         &self,
         stmt: &SelectStatement,
@@ -46,21 +48,10 @@ impl Engine {
             return Ok(None);
         };
         let cat = self.active_catalog();
+        // Joins are handled by `rls_rewrite_joins` (each RLS operand is wrapped
+        // in a security-barrier subquery filtered via this same pass), so the
+        // single-table predicate does not apply to a multi-table FROM.
         if !from.joins.is_empty() {
-            let rls_join = cat
-                .get(&from.primary.name)
-                .is_some_and(|t| t.schema().row_security)
-                || from.joins.iter().any(|j| {
-                    cat.get(&j.table.name)
-                        .is_some_and(|t| t.schema().row_security)
-                });
-            if rls_join {
-                return Err(EngineError::Unsupported(
-                    "row-level security is enforced only on single-table queries in this build; \
-                     a join references an RLS-enabled table"
-                        .into(),
-                ));
-            }
             return Ok(None);
         }
         if from.primary.lateral_subquery.is_some() {
@@ -78,6 +69,37 @@ impl Engine {
             PolicyCmd::Select,
             QualKind::Using,
         )))
+    }
+
+    /// v7.39 (RLS) Phase 3 — cross-table joins. For a policy-subject session,
+    /// wrap each RLS-enabled base table in a multi-table FROM into a
+    /// security-barrier subquery `(SELECT * FROM t) alias`. The inner SELECT is
+    /// single-table, so re-entering the executor applies this module's
+    /// single-table USING filter to it — correct for every join type (the
+    /// subquery filters before the join sees the rows), matching PG's
+    /// RLS-as-subquery rewrite. Returns the rewritten statement to re-enter, or
+    /// `None` when nothing needs wrapping.
+    pub(crate) fn rls_rewrite_joins(&self, stmt: &SelectStatement) -> Option<SelectStatement> {
+        if self.is_superuser() {
+            return None;
+        }
+        let from = stmt.from.as_ref()?;
+        if from.joins.is_empty() {
+            return None;
+        }
+        let cat = self.active_catalog();
+        let needs = is_rls_base(&from.primary, cat)
+            || from.joins.iter().any(|j| is_rls_base(&j.table, cat));
+        if !needs {
+            return None;
+        }
+        let mut s = stmt.clone();
+        let from = s.from.as_mut().expect("checked above");
+        wrap_rls_table(&mut from.primary, cat);
+        for j in &mut from.joins {
+            wrap_rls_table(&mut j.table, cat);
+        }
+        Some(s)
     }
 
     /// v7.39 (RLS) Phase 2 — the `USING` visibility predicate to AND into an
@@ -236,6 +258,51 @@ fn fold_session_identity(e: &mut Expr, role: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// A FROM operand that is a bare RLS-enabled base table (not already a
+/// subquery / SRF).
+fn is_rls_base(tref: &TableRef, cat: &Catalog) -> bool {
+    tref.lateral_subquery.is_none()
+        && tref.unnest_expr.is_none()
+        && tref.generate_series_args.is_none()
+        && cat.get(&tref.name).is_some_and(|t| t.schema().row_security)
+}
+
+/// Rewrite a bare RLS base-table operand into `(SELECT * FROM base) alias`,
+/// preserving its alias. Non-RLS / already-derived operands are untouched.
+fn wrap_rls_table(tref: &mut TableRef, cat: &Catalog) {
+    if !is_rls_base(tref, cat) {
+        return;
+    }
+    let base = tref.name.clone();
+    let alias = tref.alias.clone().unwrap_or_else(|| base.clone());
+    let inner = SelectStatement {
+        items: alloc::vec![SelectItem::Wildcard],
+        from: Some(FromClause {
+            primary: bare_table_ref(base),
+            joins: Vec::new(),
+        }),
+        ..SelectStatement::default()
+    };
+    tref.name = alias.clone();
+    tref.alias = Some(alias);
+    tref.lateral_subquery = Some(Box::new(inner));
+}
+
+/// A minimal `TableRef` naming a base table with no alias / modifiers.
+fn bare_table_ref(name: String) -> TableRef {
+    TableRef {
+        name,
+        alias: None,
+        as_of_segment: None,
+        unnest_expr: None,
+        unnest_column_aliases: Vec::new(),
+        with_ordinality: false,
+        generate_series_args: None,
+        lateral_subquery: None,
+        jsonb_each_text_arg: None,
     }
 }
 

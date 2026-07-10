@@ -126,26 +126,71 @@ fn role_scoped_policy() {
     assert_eq!(scalar(&mut e, "SELECT count(*)::text FROM t"), "3");
 }
 
+/// Two columns as "a|b" per row (NULL → empty).
+fn pair(e: &mut Engine, sql: &str) -> Vec<String> {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| match v {
+                        spg_storage::Value::Text(s) => s.to_string(),
+                        spg_storage::Value::Int(n) => n.to_string(),
+                        spg_storage::Value::BigInt(n) => n.to_string(),
+                        spg_storage::Value::Null => String::new(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect(),
+        other => panic!("{sql}: expected Rows, got {other:?}"),
+    }
+}
+
 #[test]
-fn join_on_rls_table_fails_closed() {
+fn join_filters_rls_table_via_security_barrier() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
-    e.execute("INSERT INTO doc VALUES (1,'alice')").unwrap();
+    e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob'),(3,'alice')")
+        .unwrap();
     e.execute("CREATE TABLE tag(doc_id int, label text)")
         .unwrap();
-    e.execute("INSERT INTO tag VALUES (1,'x')").unwrap();
+    e.execute("INSERT INTO tag VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
         .unwrap();
-    e.execute("CREATE POLICY p ON doc USING (owner = current_user)")
+    e.execute("CREATE POLICY p ON doc FOR SELECT USING (owner = current_user)")
         .unwrap();
-    // Superuser join is fine (bypass).
-    e.execute("SELECT d.id FROM doc d JOIN tag t ON d.id = t.doc_id")
-        .unwrap();
-    // Non-superuser join touching an RLS table fails closed (no silent leak).
+    // Superuser join sees everything.
+    assert_eq!(
+        pair(
+            &mut e,
+            "SELECT d.id, t.label FROM doc d JOIN tag t ON d.id=t.doc_id ORDER BY d.id"
+        ),
+        vec!["1|a", "2|b", "3|c"]
+    );
     e.execute("SET ROLE alice").unwrap();
-    assert!(
-        e.execute("SELECT d.id FROM doc d JOIN tag t ON d.id = t.doc_id")
-            .is_err()
+    // INNER JOIN: doc filtered to alice (rows 1,3) before the join.
+    assert_eq!(
+        pair(
+            &mut e,
+            "SELECT d.id, t.label FROM doc d JOIN tag t ON d.id=t.doc_id ORDER BY d.id"
+        ),
+        vec!["1|a", "3|c"]
+    );
+    // LEFT JOIN with the RLS table on the nullable side: bob's doc (id=2) is
+    // hidden, so tag row 2 gets a NULL owner (the barrier filters pre-join).
+    assert_eq!(
+        pair(
+            &mut e,
+            "SELECT t.doc_id, d.owner FROM tag t LEFT JOIN doc d ON d.id=t.doc_id ORDER BY t.doc_id"
+        ),
+        vec!["1|alice", "2|", "3|alice"]
     );
 }
 
