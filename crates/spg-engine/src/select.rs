@@ -2376,6 +2376,13 @@ impl Engine {
         if let Some(rewritten) = self.desugar_using_natural(stmt)? {
             return self.exec_bare_select_cancel(&rewritten, cancel);
         }
+        // v7.39 (RLS) Phase 3 — cross-table joins: wrap each RLS-enabled join
+        // operand in a security-barrier subquery, then re-enter (the wrapped
+        // operands are no longer bare RLS tables, so this is a no-op on the
+        // second pass).
+        if let Some(rewritten) = self.rls_rewrite_joins(stmt) {
+            return self.exec_bare_select_cancel(&rewritten, cancel);
+        }
         // v7.39 (RLS) Phase 1 — for a policy-subject (non-superuser) session,
         // AND the RLS USING predicate into a single-table SELECT's WHERE.
         // Superuser sessions and non-RLS tables get `None` (no clone, no
