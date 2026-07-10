@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -28,10 +30,7 @@ fn json_arrayagg_matches_json_agg() {
     e.execute("INSERT INTO ja VALUES (1), (2), (3)").unwrap();
     let std_form = rows(&mut e, "SELECT json_arrayagg(v) FROM ja");
     let pg_form = rows(&mut e, "SELECT json_agg(v) FROM ja");
-    assert_eq!(
-        text_or_json(&std_form[0][0]),
-        text_or_json(&pg_form[0][0]),
-    );
+    assert_eq!(text_or_json(&std_form[0][0]), text_or_json(&pg_form[0][0]),);
 }
 
 #[test]
@@ -42,10 +41,7 @@ fn json_objectagg_matches_json_object_agg() {
         .unwrap();
     let std_form = rows(&mut e, "SELECT json_objectagg(k, v) FROM jo");
     let pg_form = rows(&mut e, "SELECT json_object_agg(k, v) FROM jo");
-    assert_eq!(
-        text_or_json(&std_form[0][0]),
-        text_or_json(&pg_form[0][0]),
-    );
+    assert_eq!(text_or_json(&std_form[0][0]), text_or_json(&pg_form[0][0]),);
 }
 
 #[test]
@@ -56,7 +52,8 @@ fn json_agg_honours_order_by() {
     // never recorded the sort keys.
     let mut e = Engine::new();
     e.execute("CREATE TABLE ja (v INT, k TEXT)").unwrap();
-    e.execute("INSERT INTO ja VALUES (2,'b'),(1,'a'),(3,'c')").unwrap();
+    e.execute("INSERT INTO ja VALUES (2,'b'),(1,'a'),(3,'c')")
+        .unwrap();
     assert_eq!(
         text_or_json(&rows(&mut e, "SELECT json_agg(v ORDER BY v DESC) FROM ja")[0][0]),
         "[3, 2, 1]"

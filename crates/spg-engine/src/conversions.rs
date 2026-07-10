@@ -799,7 +799,13 @@ pub(crate) fn canonicalize_range_bounds(
     upper: Option<Value<'static>>,
     lower_inc: bool,
     upper_inc: bool,
-) -> Option<(Option<Value<'static>>, Option<Value<'static>>, bool, bool, bool)> {
+) -> Option<(
+    Option<Value<'static>>,
+    Option<Value<'static>>,
+    bool,
+    bool,
+    bool,
+)> {
     use spg_storage::RangeKind as K;
     // An infinite bound is always exclusive.
     let mut lower_inc = lower.is_some() && lower_inc;
@@ -966,7 +972,11 @@ pub(crate) fn parse_range_element(
                 .filter(|c| *c == '-' || c.is_ascii_digit())
                 .collect();
             let scaled: i128 = digits.parse().ok()?;
-            Some(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+            Some(Value::Numeric {
+                scaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            })
         }
         K::Ts | K::TsTz => {
             // Reuse the existing timestamp parse path. v7.17.0
@@ -1022,9 +1032,8 @@ pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
 /// spaces) pass through unquoted, matching PG.
 fn quote_range_bound(s: &str) -> alloc::string::String {
     let needs_quote = s.is_empty()
-        || s.chars().any(|c| {
-            matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || c.is_whitespace()
-        });
+        || s.chars()
+            .any(|c| matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || c.is_whitespace());
     if !needs_quote {
         return s.into();
     }
@@ -1149,8 +1158,7 @@ pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Po
         .strip_prefix('[')
         .and_then(|x| x.strip_suffix(']'))
         .unwrap_or(s);
-    let two_points =
-        |v: Option<alloc::vec::Vec<spg_storage::Point2D>>| v.filter(|p| p.len() == 2);
+    let two_points = |v: Option<alloc::vec::Vec<spg_storage::Point2D>>| v.filter(|p| p.len() == 2);
     let pts = if let Some(p) = two_points(parse_point_list(inner)) {
         p
     } else if let Some(p) = inner
@@ -1190,8 +1198,14 @@ pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Poi
             return None;
         }
         alloc::vec![
-            spg_storage::Point2D { x: nums[0], y: nums[1] },
-            spg_storage::Point2D { x: nums[2], y: nums[3] },
+            spg_storage::Point2D {
+                x: nums[0],
+                y: nums[1]
+            },
+            spg_storage::Point2D {
+                x: nums[2],
+                y: nums[3]
+            },
         ]
     };
     if pts.len() != 2 {
@@ -1643,7 +1657,11 @@ pub(crate) fn format_range_element(v: &Value) -> alloc::string::String {
         Value::BigInt(n) => alloc::format!("{n}"),
         Value::Date(d) => crate::eval::format_date(*d),
         Value::Timestamp(t) => crate::eval::format_timestamp(*t),
-        Value::Numeric { scaled, scale, kind } => crate::eval::format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => crate::eval::format_numeric_kind(*kind, *scaled, *scale),
         other => alloc::format!("{other:?}"),
     }
 }
@@ -2078,9 +2096,11 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
             }
             Expr::Literal(Literal::Float(x)) => Ok(Value::Float(-x)),
             // v7.38 (read01) — a dotted literal is NUMERIC; negate the mantissa.
-            Expr::Literal(Literal::Numeric { unscaled, scale }) => {
-                Ok(Value::Numeric { scaled: -unscaled, scale , kind: spg_storage::NumericKind::Finite })
-            }
+            Expr::Literal(Literal::Numeric { unscaled, scale }) => Ok(Value::Numeric {
+                scaled: -unscaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            }),
             // v7.38 (read01, T3.C3) — a NUMERIC literal beyond i128; negate by
             // flipping the sign of the decimal string, then re-resolve.
             Expr::Literal(Literal::NumericBig(ref s)) => {
@@ -2109,7 +2129,10 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
                     }
                     Expr::Literal(Literal::Float(x)) => Expr::Literal(Literal::Float(-x)),
                     Expr::Literal(Literal::Numeric { unscaled, scale }) => {
-                        Expr::Literal(Literal::Numeric { unscaled: -unscaled, scale })
+                        Expr::Literal(Literal::Numeric {
+                            unscaled: -unscaled,
+                            scale,
+                        })
                     }
                     // v7.38 (read01, T3.C3) — big NUMERIC literal: flip its sign
                     // in the decimal string, re-wrap with the same cast.
@@ -2175,7 +2198,11 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
     match l {
         Literal::Integer(n) => int_value_for(n),
         Literal::Float(x) => Value::Float(x),
-        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: unscaled, scale , kind: spg_storage::NumericKind::Finite },
+        Literal::Numeric { unscaled, scale } => Value::Numeric {
+            scaled: unscaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        },
         Literal::NumericBig(s) => big_literal_to_value(&s),
         Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
@@ -2253,7 +2280,10 @@ fn coerce_text_array_to(
 ) -> Result<Option<Value<'static>>, EngineError> {
     let elem_dt = match target {
         DataType::BoolArray => DataType::Bool,
-        DataType::NumericArray => DataType::Numeric { precision: 0, scale: 0 },
+        DataType::NumericArray => DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
         DataType::DateArray => DataType::Date,
         DataType::TimestampArray => DataType::Timestamp,
         DataType::TimestamptzArray => DataType::Timestamptz,
@@ -2430,7 +2460,8 @@ pub(crate) fn parse_pg_int(s: &str) -> Option<i64> {
 /// attributes, char legality) are a documented follow-up.
 fn xml_content_is_well_formed(s: &str) -> bool {
     let b = s.as_bytes();
-    let is_name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':') || c >= 0x80;
+    let is_name =
+        |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':') || c >= 0x80;
     let mut stack: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
     let mut i = 0;
     while i < b.len() {
@@ -2516,7 +2547,10 @@ pub(crate) fn parse_float8(s: &str) -> Option<f64> {
     let t = s.trim();
     let parsed = t.parse::<f64>().ok()?;
     let body = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let numeric_looking = body.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'.');
+    let numeric_looking = body
+        .bytes()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == b'.');
     if numeric_looking {
         if parsed.is_infinite() {
             return None; // overflow
@@ -2550,7 +2584,12 @@ fn decode_array_elems(
     for e in raw {
         match e {
             None => out.push(None),
-            Some(t) => out.push(Some(coerce_value(Value::text(t), elem, col_name, position)?)),
+            Some(t) => out.push(Some(coerce_value(
+                Value::text(t),
+                elem,
+                col_name,
+                position,
+            )?)),
         }
     }
     Ok(out)
@@ -2605,13 +2644,12 @@ pub(crate) fn coerce_value(
             // Route the float through its shortest round-trip decimal
             // text so `3.14::numeric` stays 3.14, not 3.
             if precision == 0 && scale == 0 && x.is_finite() {
-                if let Some((mantissa, src_scale)) =
-                    parse_numeric_text(&alloc::format!("{x}"))
-                {
+                if let Some((mantissa, src_scale)) = parse_numeric_text(&alloc::format!("{x}")) {
                     Some(Value::Numeric {
                         scaled: mantissa,
                         scale: src_scale,
-                     kind: spg_storage::NumericKind::Finite })
+                        kind: spg_storage::NumericKind::Finite,
+                    })
                 } else {
                     Some(numeric_from_float(x, precision, scale, col_name)?)
                 }
@@ -2645,7 +2683,8 @@ pub(crate) fn coerce_value(
                 Some(Value::Numeric {
                     scaled: mantissa,
                     scale: src_scale,
-                 kind: spg_storage::NumericKind::Finite })
+                    kind: spg_storage::NumericKind::Finite,
+                })
             } else {
                 Some(numeric_rescale(
                     mantissa, src_scale, precision, scale, col_name,
@@ -2662,9 +2701,8 @@ pub(crate) fn coerce_value(
             // to the day — mirroring the ::date cast path.
             let d = eval::parse_date_literal(&s)
                 .or_else(|| {
-                    eval::parse_timestamp_literal(&s).and_then(|t| {
-                        i32::try_from(t.div_euclid(86_400_000_000)).ok()
-                    })
+                    eval::parse_timestamp_literal(&s)
+                        .and_then(|t| i32::try_from(t.div_euclid(86_400_000_000)).ok())
                 })
                 .ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
@@ -2685,12 +2723,12 @@ pub(crate) fn coerce_value(
         // `'  256  '::int2` / `'  3.14  '::float8` (both of which route
         // through this generic coerce path, unlike `::int` / `::float`
         // that trim in the CAST helper) parse rather than error.
-        (Value::Text(s), DataType::SmallInt) => {
-            parse_pg_int(&s).and_then(|n| i16::try_from(n).ok()).map(Value::SmallInt)
-        }
-        (Value::Text(s), DataType::Int) => {
-            parse_pg_int(&s).and_then(|n| i32::try_from(n).ok()).map(Value::Int)
-        }
+        (Value::Text(s), DataType::SmallInt) => parse_pg_int(&s)
+            .and_then(|n| i16::try_from(n).ok())
+            .map(Value::SmallInt),
+        (Value::Text(s), DataType::Int) => parse_pg_int(&s)
+            .and_then(|n| i32::try_from(n).ok())
+            .map(Value::Int),
         (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
         (Value::Text(s), DataType::Float) => parse_float8(&s).map(Value::Float),
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
@@ -2901,9 +2939,11 @@ pub(crate) fn coerce_value(
         // MONEY → Text canonical `$N,NNN.CC`.
         (Value::Money(c), DataType::Text) => Some(Value::text(eval::format_money(c))),
         // MONEY → NUMERIC: integer cents become a scale-2 decimal (dollars).
-        (Value::Money(c), DataType::Numeric { .. }) => {
-            Some(Value::Numeric { scaled: i128::from(c), scale: 2 , kind: spg_storage::NumericKind::Finite })
-        }
+        (Value::Money(c), DataType::Numeric { .. }) => Some(Value::Numeric {
+            scaled: i128::from(c),
+            scale: 2,
+            kind: spg_storage::NumericKind::Finite,
+        }),
         // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
         // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
         // `'(a,b)'`, with empty lower or upper for unbounded.
@@ -2942,18 +2982,20 @@ pub(crate) fn coerce_value(
         },
         // INSERT / assignment of a text literal into an INTERVAL column
         // parses it, matching the `::interval` cast (mirrors macaddr/inet).
-        (Value::Text(s), DataType::Interval) => {
-            match spg_sql::parser::parse_interval_text(&s) {
-                Some((months, days, micros)) => Some(Value::Interval { months, days, micros }),
-                None => {
-                    return Err(EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "invalid input syntax for INTERVAL: {s:?} (column `{col_name}`)"
-                        ),
-                    }));
-                }
+        (Value::Text(s), DataType::Interval) => match spg_sql::parser::parse_interval_text(&s) {
+            Some((months, days, micros)) => Some(Value::Interval {
+                months,
+                days,
+                micros,
+            }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for INTERVAL: {s:?} (column `{col_name}`)"
+                    ),
+                }));
             }
-        }
+        },
         (Value::Text(s), DataType::Macaddr) => match parse_macaddr_text(&s) {
             Some(m) => Some(Value::Macaddr(m)),
             None => {
@@ -3271,7 +3313,10 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::NumericArray) => Some(Value::NumericArray(
             decode_array_elems(
                 &s,
-                DataType::Numeric { precision: 0, scale: 0 },
+                DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
                 col_name,
                 position,
             )?
@@ -3369,7 +3414,11 @@ pub(crate) fn coerce_value(
                     },
                 }
             }
-            if ok { Some(Value::FloatArray(out)) } else { None }
+            if ok {
+                Some(Value::FloatArray(out))
+            } else {
+                None
+            }
         }
         // Identity for an already-float array, and widen integer arrays
         // element-wise (PG accepts `ARRAY[1,2]::float8[]`).
@@ -3451,7 +3500,11 @@ pub(crate) fn coerce_value(
                     },
                 }
             }
-            if ok { Some(Value::NumericArray(out)) } else { None }
+            if ok {
+                Some(Value::NumericArray(out))
+            } else {
+                None
+            }
         }
         // v7.38 (read01) — narrow a NUMERIC[] into int[] / bigint[] element-wise,
         // rounding half away from zero (PG) like the scalar Numeric→Int coercion.
@@ -3492,7 +3545,11 @@ pub(crate) fn coerce_value(
                     }
                 }
             }
-            if ok { Some(Value::BigIntArray(out)) } else { None }
+            if ok {
+                Some(Value::BigIntArray(out))
+            } else {
+                None
+            }
         }
         // v7.38 (read01, T2) — float8[] → int[] / bigint[], rounding each element
         // half-to-even (PG's float→int rule, distinct from numeric's half-away).
@@ -3537,7 +3594,11 @@ pub(crate) fn coerce_value(
                     }
                 }
             }
-            if ok { Some(Value::BigIntArray(out)) } else { None }
+            if ok {
+                Some(Value::BigIntArray(out))
+            } else {
+                None
+            }
         }
         (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
             Some(Value::NumericArray(alloc::vec::Vec::new()))
@@ -3682,7 +3743,8 @@ pub(crate) fn coerce_value(
             Value::Numeric {
                 scaled,
                 scale: src_scale,
-             .. },
+                ..
+            },
             DataType::Numeric { precision, scale },
         ) => {
             // v7.38 (read01) — the unconstrained `::numeric` sentinel (0, 0)
@@ -3694,9 +3756,12 @@ pub(crate) fn coerce_value(
                 Some(Value::Numeric {
                     scaled,
                     scale: src_scale,
-                 kind: spg_storage::NumericKind::Finite })
+                    kind: spg_storage::NumericKind::Finite,
+                })
             } else {
-                Some(numeric_rescale(scaled, src_scale, precision, scale, col_name)?)
+                Some(numeric_rescale(
+                    scaled, src_scale, precision, scale, col_name,
+                )?)
             }
         }
         #[allow(clippy::cast_precision_loss)]
@@ -3798,10 +3863,13 @@ pub(crate) fn coerce_value(
 /// v7.38 (read01, T3.C3) — a lexer-validated big decimal literal → NumericBig,
 /// demoted to a plain Numeric if its mantissa happens to fit i128.
 pub(crate) fn big_literal_to_value(s: &str) -> Value<'static> {
-    let b = spg_storage::bignum::BigNumeric::from_decimal_str(s)
-        .expect("lexer-validated decimal");
+    let b = spg_storage::bignum::BigNumeric::from_decimal_str(s).expect("lexer-validated decimal");
     match b.to_i128() {
-        Some(scaled) => Value::Numeric { scaled, scale: b.scale(), kind: spg_storage::NumericKind::Finite },
+        Some(scaled) => Value::Numeric {
+            scaled,
+            scale: b.scale(),
+            kind: spg_storage::NumericKind::Finite,
+        },
         None => Value::NumericBig(alloc::boxed::Box::new(b)),
     }
 }

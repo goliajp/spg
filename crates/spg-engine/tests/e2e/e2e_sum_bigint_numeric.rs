@@ -34,5 +34,8 @@ fn sum_avg_bigint_widen_to_numeric() {
     e.execute("CREATE TABLE big (v bigint)").unwrap();
     e.execute("INSERT INTO big VALUES (9000000000000000000), (9000000000000000000)")
         .unwrap();
-    assert_eq!(text(&mut e, "SELECT sum(v)::text FROM big"), "18000000000000000000");
+    assert_eq!(
+        text(&mut e, "SELECT sum(v)::text FROM big"),
+        "18000000000000000000"
+    );
 }

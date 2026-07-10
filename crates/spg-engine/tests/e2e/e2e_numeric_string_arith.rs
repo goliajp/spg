@@ -20,7 +20,14 @@ fn arithmetic_with_string_literal_coerces() {
     assert_eq!(scalar(&mut e, "SELECT 2 * '4'"), Value::Int(8));
     assert_eq!(scalar(&mut e, "SELECT '10' / 4"), Value::Int(2));
     assert_eq!(scalar(&mut e, "SELECT 10 % '3'"), Value::Int(1));
-    assert_eq!(scalar(&mut e, "SELECT 1.5 + '2'"), Value::Numeric { scaled: 35, scale: 1 , kind: spg_storage::NumericKind::Finite });
+    assert_eq!(
+        scalar(&mut e, "SELECT 1.5 + '2'"),
+        Value::Numeric {
+            scaled: 35,
+            scale: 1,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
 }
 
 #[test]

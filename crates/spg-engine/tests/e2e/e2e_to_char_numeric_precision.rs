@@ -43,16 +43,31 @@ fn to_char_numeric_keeps_full_precision() {
 #[test]
 fn to_char_numeric_rounds_half_away_from_zero() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT to_char(1.678::numeric, 'FM9.99')"), "1.68");
+    assert_eq!(
+        text(&mut e, "SELECT to_char(1.678::numeric, 'FM9.99')"),
+        "1.68"
+    );
     assert_eq!(text(&mut e, "SELECT to_char(2.5::numeric, 'FM9')"), "3");
-    assert_eq!(text(&mut e, "SELECT to_char((-3.145)::numeric, 'FM9.99')"), "-3.15");
+    assert_eq!(
+        text(&mut e, "SELECT to_char((-3.145)::numeric, 'FM9.99')"),
+        "-3.15"
+    );
 }
 
 #[test]
 fn to_char_numeric_grouping_and_zero_pad_intact() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT to_char(1234567.89::numeric, 'FM9,999,999.99')"), "1,234,567.89");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT to_char(1234567.89::numeric, 'FM9,999,999.99')"
+        ),
+        "1,234,567.89"
+    );
     assert_eq!(text(&mut e, "SELECT to_char(0.1::numeric, 'FM0.9')"), "0.1");
     // Float inputs still format through the f64 path unchanged.
-    assert_eq!(text(&mut e, "SELECT to_char(3.14::float8, 'FM9.99')"), "3.14");
+    assert_eq!(
+        text(&mut e, "SELECT to_char(3.14::float8, 'FM9.99')"),
+        "3.14"
+    );
 }

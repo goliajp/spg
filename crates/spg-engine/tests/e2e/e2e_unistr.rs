@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -28,20 +30,14 @@ fn unistr_no_escapes() {
 fn unistr_hex_4digit() {
     let mut e = Engine::new();
     // U+00E9 = é
-    assert_eq!(
-        text(&first(&mut e, r"SELECT unistr('caf\00e9')")),
-        "café"
-    );
+    assert_eq!(text(&first(&mut e, r"SELECT unistr('caf\00e9')")), "café");
 }
 
 #[test]
 fn unistr_hex_u_syntax() {
     let mut e = Engine::new();
     // é → é
-    assert_eq!(
-        text(&first(&mut e, r"SELECT unistr('café')")),
-        "café"
-    );
+    assert_eq!(text(&first(&mut e, r"SELECT unistr('café')")), "café");
 }
 
 #[test]
@@ -67,10 +63,7 @@ fn unistr_hex_uppercase_u_syntax() {
 #[test]
 fn unistr_backslash_backslash() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&first(&mut e, r"SELECT unistr('a\\b')")),
-        r"a\b"
-    );
+    assert_eq!(text(&first(&mut e, r"SELECT unistr('a\\b')")), r"a\b");
 }
 
 #[test]

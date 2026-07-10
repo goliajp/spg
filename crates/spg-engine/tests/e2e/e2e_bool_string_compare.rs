@@ -19,10 +19,16 @@ fn b(e: &mut Engine, sql: &str) -> bool {
 fn bool_compared_to_string_literal_coerces() {
     let mut e = Engine::new();
     for lit in ["t", "true", "yes", "on", "1"] {
-        assert!(b(&mut e, &format!("SELECT true = '{lit}'")), "true = '{lit}'");
+        assert!(
+            b(&mut e, &format!("SELECT true = '{lit}'")),
+            "true = '{lit}'"
+        );
     }
     for lit in ["f", "no", "0"] {
-        assert!(b(&mut e, &format!("SELECT false = '{lit}'")), "false = '{lit}'");
+        assert!(
+            b(&mut e, &format!("SELECT false = '{lit}'")),
+            "false = '{lit}'"
+        );
     }
     // A non-bool string still errors, matching PG.
     assert!(e.execute("SELECT true = 'maybe'").is_err());
@@ -32,7 +38,8 @@ fn bool_compared_to_string_literal_coerces() {
 fn where_bool_column_equals_string_literal() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE bt (id INT, flag BOOL)").unwrap();
-    e.execute("INSERT INTO bt VALUES (1, true), (2, false)").unwrap();
+    e.execute("INSERT INTO bt VALUES (1, true), (2, false)")
+        .unwrap();
     match e.execute("SELECT id FROM bt WHERE flag = 't'").unwrap() {
         QueryResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], Value::Int(1)),
         _ => panic!(),

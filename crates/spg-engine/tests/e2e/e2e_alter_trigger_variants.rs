@@ -18,10 +18,8 @@ fn engine_with_trigger() -> Engine {
         "CREATE FUNCTION noop_fn() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
     )
     .unwrap();
-    e.execute(
-        "CREATE TRIGGER ix_trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION noop_fn()",
-    )
-    .unwrap();
+    e.execute("CREATE TRIGGER ix_trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION noop_fn()")
+        .unwrap();
     e
 }
 

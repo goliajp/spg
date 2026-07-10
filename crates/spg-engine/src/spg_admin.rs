@@ -423,26 +423,34 @@ impl Engine {
                 };
                 let started = Value::Timestamp(r.started_at_us);
                 Row::new(alloc::vec![
-                    Value::Null,           // datid
-                    datname.clone(),       // datname
+                    Value::Null,     // datid
+                    datname.clone(), // datname
                     Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
-                    Value::Null,           // leader_pid
-                    Value::Null,           // usesysid
-                    Value::text(r.user),   // usename
+                    Value::Null,         // leader_pid
+                    Value::Null,         // usesysid
+                    Value::text(r.user), // usename
                     Value::text(r.application_name),
-                    Value::Null,           // client_addr
-                    Value::Null,           // client_hostname
-                    Value::Null,           // client_port
-                    started.clone(),       // backend_start
-                    if r.in_transaction { started.clone() } else { Value::Null }, // xact_start
-                    if r.current_sql.is_empty() { Value::Null } else { started }, // query_start
-                    Value::Null,           // state_change
+                    Value::Null,     // client_addr
+                    Value::Null,     // client_hostname
+                    Value::Null,     // client_port
+                    started.clone(), // backend_start
+                    if r.in_transaction {
+                        started.clone()
+                    } else {
+                        Value::Null
+                    }, // xact_start
+                    if r.current_sql.is_empty() {
+                        Value::Null
+                    } else {
+                        started
+                    }, // query_start
+                    Value::Null,     // state_change
                     Value::text(r.wait_event_type),
                     Value::text(r.wait_event),
                     Value::text(alloc::string::String::from(state)),
-                    Value::Null,           // backend_xid
-                    Value::Null,           // backend_xmin
-                    Value::Null,           // query_id
+                    Value::Null,                // backend_xid
+                    Value::Null,                // backend_xmin
+                    Value::Null,                // query_id
                     Value::text(r.current_sql), // query
                     Value::text(alloc::string::String::from("client backend")),
                 ])
@@ -471,8 +479,12 @@ impl Engine {
         ];
         let cv = spg_storage::row_header::current_version() as i64;
         let active = self.active_writer_versions.len() as i32;
-        let oldest =
-            self.active_writer_versions.iter().next().copied().unwrap_or(cv as u64) as i64;
+        let oldest = self
+            .active_writer_versions
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(cv as u64) as i64;
         let rows = alloc::vec![Row::new(alloc::vec![
             Value::BigInt(cv),
             Value::Int(active),
@@ -560,7 +572,11 @@ impl Engine {
                         diag.push_str(&partition_bound_diag(v));
                     }
                     diag.push(')');
-                    (parent_name.clone(), alloc::string::String::from("List"), diag)
+                    (
+                        parent_name.clone(),
+                        alloc::string::String::from("List"),
+                        diag,
+                    )
                 }
                 PartitionRole::Hash {
                     parent_name,
@@ -676,28 +692,27 @@ impl Engine {
                 // (matches what pg_compatible_hash uses for HASH
                 // partitions). Stable across runs as long as the
                 // sql text is byte-identical.
-                let queryid =
-                    crate::partition::pg_compatible_hash(&spg_storage::Value::Text(
-                        alloc::borrow::Cow::Borrowed(&sql),
-                    )) as i64;
+                let queryid = crate::partition::pg_compatible_hash(&spg_storage::Value::Text(
+                    alloc::borrow::Cow::Borrowed(&sql),
+                )) as i64;
                 Row::new(alloc::vec![
-                    Value::BigInt(10),     // userid (PG superuser)
-                    Value::BigInt(16384),  // dbid
-                    Value::Bool(true),     // toplevel
+                    Value::BigInt(10),    // userid (PG superuser)
+                    Value::BigInt(16384), // dbid
+                    Value::Bool(true),    // toplevel
                     Value::BigInt(queryid),
                     Value::Text(alloc::borrow::Cow::Owned(sql)),
-                    Value::BigInt(calls),  // plans
-                    Value::Float(0.0),     // total_plan_time
-                    Value::Float(0.0),     // min_plan_time
-                    Value::Float(0.0),     // max_plan_time
-                    Value::Float(0.0),     // mean_plan_time
-                    Value::Float(0.0),     // stddev_plan_time
-                    Value::BigInt(calls),  // calls
+                    Value::BigInt(calls), // plans
+                    Value::Float(0.0),    // total_plan_time
+                    Value::Float(0.0),    // min_plan_time
+                    Value::Float(0.0),    // max_plan_time
+                    Value::Float(0.0),    // mean_plan_time
+                    Value::Float(0.0),    // stddev_plan_time
+                    Value::BigInt(calls), // calls
                     Value::Float(total_ms),
-                    Value::Float(0.0),     // min_exec_time
+                    Value::Float(0.0), // min_exec_time
                     Value::Float(max_ms),
                     Value::Float(mean_ms),
-                    Value::Float(0.0),     // stddev_exec_time
+                    Value::Float(0.0), // stddev_exec_time
                     // v7.37.22 (22.9) — total rows produced /
                     // affected, mapped from query_stats.total_rows.
                     Value::BigInt(i64::try_from(s.total_rows).unwrap_or(i64::MAX)),
@@ -712,16 +727,16 @@ impl Engine {
                     Value::BigInt(0),
                     Value::BigInt(0),
                     Value::BigInt(0),
-                    Value::Float(0.0),     // blk_read_time
-                    Value::Float(0.0),     // blk_write_time
-                    Value::BigInt(0),      // wal_records
-                    Value::BigInt(0),      // wal_fpi
-                    Value::BigInt(0),      // wal_bytes
-                    Value::BigInt(0),      // jit_functions
-                    Value::Float(0.0),     // jit_generation_time
-                    Value::BigInt(0),      // jit_inlining_count
-                    Value::Float(0.0),     // jit_inlining_time
-                    Value::BigInt(0),      // jit_emission_count
+                    Value::Float(0.0), // blk_read_time
+                    Value::Float(0.0), // blk_write_time
+                    Value::BigInt(0),  // wal_records
+                    Value::BigInt(0),  // wal_fpi
+                    Value::BigInt(0),  // wal_bytes
+                    Value::BigInt(0),  // jit_functions
+                    Value::Float(0.0), // jit_generation_time
+                    Value::BigInt(0),  // jit_inlining_count
+                    Value::Float(0.0), // jit_inlining_time
+                    Value::BigInt(0),  // jit_emission_count
                 ])
             })
             .collect();

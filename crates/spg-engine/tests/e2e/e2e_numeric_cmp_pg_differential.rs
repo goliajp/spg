@@ -59,7 +59,10 @@ fn cell(eng: &mut Engine, sql: &str) -> String {
 
 fn ck(eng: &mut Engine, sql: &str, want: &str) {
     let got = cell(eng, sql);
-    assert_eq!(got, want, "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}");
+    assert_eq!(
+        got, want,
+        "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}"
+    );
 }
 
 /// `mix (id, k)`; the sort/aggregate key is
@@ -69,7 +72,8 @@ fn seed() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE mix (id int, k int)").unwrap();
     for row in ["(1,4)", "(2,1)", "(3,5)", "(4,2)", "(5,3)", "(6,6)"] {
-        e.execute(&format!("INSERT INTO mix (id,k) VALUES {row}")).unwrap();
+        e.execute(&format!("INSERT INTO mix (id,k) VALUES {row}"))
+            .unwrap();
     }
     e
 }
@@ -84,8 +88,16 @@ fn order_by_mixed_numeric_int() {
     let mut e = seed();
     // ORDER BY the mixed key: numeric value order (1.5,2,3.5,4,5.5,6),
     // not debug-string order. PG: 2|4|5|1|3|6.
-    ck(&mut e, &format!("SELECT id FROM mix ORDER BY {VX} ASC, id"), "2|4|5|1|3|6");
-    ck(&mut e, &format!("SELECT id FROM mix ORDER BY {VX} DESC, id"), "6|3|1|5|4|2");
+    ck(
+        &mut e,
+        &format!("SELECT id FROM mix ORDER BY {VX} ASC, id"),
+        "2|4|5|1|3|6",
+    );
+    ck(
+        &mut e,
+        &format!("SELECT id FROM mix ORDER BY {VX} DESC, id"),
+        "6|3|1|5|4|2",
+    );
 }
 
 #[test]
@@ -113,8 +125,16 @@ fn min_max_mixed_numeric_int() {
 fn window_min_max_mixed_numeric_int() {
     let mut e = seed();
     // Window min/max over the whole partition (orderby::value_cmp path).
-    ck(&mut e, &format!("SELECT (min({VX}) OVER ())::text FROM mix ORDER BY id LIMIT 1"), "1.5");
-    ck(&mut e, &format!("SELECT (max({VX}) OVER ())::text FROM mix ORDER BY id LIMIT 1"), "6");
+    ck(
+        &mut e,
+        &format!("SELECT (min({VX}) OVER ())::text FROM mix ORDER BY id LIMIT 1"),
+        "1.5",
+    );
+    ck(
+        &mut e,
+        &format!("SELECT (max({VX}) OVER ())::text FROM mix ORDER BY id LIMIT 1"),
+        "6",
+    );
 }
 
 #[test]
@@ -122,7 +142,11 @@ fn order_by_and_minmax_mixed_numeric_float() {
     let mut e = seed();
     // NUMERIC vs float: PG demotes to float8; SPG demotes NUMERIC to f64.
     // Order and extremes are the same as the int mix.
-    ck(&mut e, &format!("SELECT id FROM mix ORDER BY {VF} ASC, id"), "2|4|5|1|3|6");
+    ck(
+        &mut e,
+        &format!("SELECT id FROM mix ORDER BY {VF} ASC, id"),
+        "2|4|5|1|3|6",
+    );
     ck(
         &mut e,
         &format!("SELECT id FROM mix WHERE {VF} = (SELECT min({VF}) FROM mix) ORDER BY id"),
@@ -143,7 +167,12 @@ fn mode_mixed_numeric_int() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE mm (id int, k int)").unwrap();
     for row in ["(1,2)", "(2,4)", "(3,3)", "(4,3)", "(5,2)"] {
-        e.execute(&format!("INSERT INTO mm (id,k) VALUES {row}")).unwrap();
+        e.execute(&format!("INSERT INTO mm (id,k) VALUES {row}"))
+            .unwrap();
     }
-    ck(&mut e, &format!("SELECT (mode() WITHIN GROUP (ORDER BY {VX}))::text FROM mm"), "2");
+    ck(
+        &mut e,
+        &format!("SELECT (mode() WITHIN GROUP (ORDER BY {VX}))::text FROM mm"),
+        "2",
+    );
 }

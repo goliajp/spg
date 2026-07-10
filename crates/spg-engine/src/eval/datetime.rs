@@ -48,19 +48,22 @@ pub(super) fn extract_field(
                 return Ok(Value::Numeric {
                     scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
                     scale: 6,
-                 kind: spg_storage::NumericKind::Finite });
+                    kind: spg_storage::NumericKind::Finite,
+                });
             }
             F::Second => {
                 return Ok(Value::Numeric {
                     scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
                     scale: 6,
-                 kind: spg_storage::NumericKind::Finite });
+                    kind: spg_storage::NumericKind::Finite,
+                });
             }
             F::Millisecond => {
                 return Ok(Value::Numeric {
                     scaled: i128::from(secs_total % 60) * 1_000_000 + i128::from(frac),
                     scale: 3,
-                 kind: spg_storage::NumericKind::Finite });
+                    kind: spg_storage::NumericKind::Finite,
+                });
             }
             _ => {}
         }
@@ -112,7 +115,11 @@ pub(super) fn extract_field(
         let secs = micros / 1_000_000;
         let frac = micros % 1_000_000;
         let num = |scaled: i128, scale: u8| {
-            Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+            Ok(Value::Numeric {
+                scaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            })
         };
         return match field {
             F::Hour => num(i128::from(secs / 3600), 0),
@@ -159,19 +166,22 @@ pub(super) fn extract_field(
             return Ok(Value::Numeric {
                 scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
                 scale: 6,
-             kind: spg_storage::NumericKind::Finite });
+                kind: spg_storage::NumericKind::Finite,
+            });
         }
         F::Second => {
             return Ok(Value::Numeric {
                 scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
                 scale: 6,
-             kind: spg_storage::NumericKind::Finite });
+                kind: spg_storage::NumericKind::Finite,
+            });
         }
         F::Millisecond => {
             return Ok(Value::Numeric {
                 scaled: i128::from(ss) * 1_000_000 + i128::from(frac),
                 scale: 3,
-             kind: spg_storage::NumericKind::Finite });
+                kind: spg_storage::NumericKind::Finite,
+            });
         }
         _ => {}
     }
@@ -314,7 +324,8 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     // it to f64 so `date_part('epoch', …)` renders like PG's double (no trailing
     // `.000000`) and pg_typeof reports double precision.
     Ok(match extract_field(field, &args[1])? {
-        Value::Numeric { scaled, scale, .. } => {
+        Value::Numeric { scaled, scale, .. } =>
+        {
             #[allow(clippy::cast_precision_loss)]
             Value::Float(scaled as f64 / 10f64.powi(i32::from(scale)))
         }
@@ -695,11 +706,19 @@ pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     let truncated = match unit_lc.as_str() {
         "millennium" => {
             // Millennia run 2001-3000; truncate to the first year.
-            let my = if y > 0 { (y - 1) / 1000 * 1000 + 1 } else { y / 1000 * 1000 - 999 };
+            let my = if y > 0 {
+                (y - 1) / 1000 * 1000 + 1
+            } else {
+                y / 1000 * 1000 - 999
+            };
             i64::from(days_from_civil(my, 1, 1)) * DAY
         }
         "century" => {
-            let cy = if y > 0 { (y - 1) / 100 * 100 + 1 } else { y / 100 * 100 - 99 };
+            let cy = if y > 0 {
+                (y - 1) / 100 * 100 + 1
+            } else {
+                y / 100 * 100 - 99
+            };
             i64::from(days_from_civil(cy, 1, 1)) * DAY
         }
         "decade" => i64::from(days_from_civil(y.div_euclid(10) * 10, 1, 1)) * DAY,
@@ -757,8 +776,18 @@ pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         });
     };
     const MONTH_FULL_UP: [&str; 12] = [
-        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
-        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+        "JANUARY",
+        "FEBRUARY",
+        "MARCH",
+        "APRIL",
+        "MAY",
+        "JUNE",
+        "JULY",
+        "AUGUST",
+        "SEPTEMBER",
+        "OCTOBER",
+        "NOVEMBER",
+        "DECEMBER",
     ];
     let inp: alloc::vec::Vec<char> = input.chars().collect();
     let f: alloc::vec::Vec<char> = fmt.chars().collect();
@@ -818,7 +847,13 @@ pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
             },
             'y' => match read_num(&mut ip, 2, &inp) {
                 // MySQL 2-digit year: 70..=99 → 19xx, else 20xx.
-                Some(v) => year = if v >= 70 { 1900 + v as i32 } else { 2000 + v as i32 },
+                Some(v) => {
+                    year = if v >= 70 {
+                        1900 + v as i32
+                    } else {
+                        2000 + v as i32
+                    }
+                }
                 None => return Ok(Value::Null),
             },
             'm' | 'c' => match read_num(&mut ip, 2, &inp) {
@@ -875,8 +910,10 @@ pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
             }
             'p' => {
                 if ip + 2 <= inp.len() {
-                    let tag: alloc::string::String =
-                        inp[ip..ip + 2].iter().collect::<alloc::string::String>().to_ascii_uppercase();
+                    let tag: alloc::string::String = inp[ip..ip + 2]
+                        .iter()
+                        .collect::<alloc::string::String>()
+                        .to_ascii_uppercase();
                     match tag.as_str() {
                         "AM" => pm = Some(false),
                         "PM" => pm = Some(true),
@@ -891,7 +928,10 @@ pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
             'M' | 'b' => {
                 // Month name (full or abbreviated) — match the
                 // longest month prefix.
-                let rest: alloc::string::String = inp[ip..].iter().collect::<alloc::string::String>().to_ascii_uppercase();
+                let rest: alloc::string::String = inp[ip..]
+                    .iter()
+                    .collect::<alloc::string::String>()
+                    .to_ascii_uppercase();
                 let mut matched = None;
                 for (idx, name) in MONTH_FULL_UP.iter().enumerate() {
                     if rest.starts_with(name) {
@@ -958,12 +998,11 @@ pub(super) fn time_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         Value::Timestamp(t) => t.rem_euclid(86_400_000_000),
         Value::Text(s) => {
             let mut parts = s.trim().splitn(3, ':');
-            let h: i64 = parts
-                .next()
-                .and_then(|x| x.parse().ok())
-                .ok_or_else(|| EvalError::TypeMismatch {
+            let h: i64 = parts.next().and_then(|x| x.parse().ok()).ok_or_else(|| {
+                EvalError::TypeMismatch {
                     detail: format!("time_format(): cannot parse time {s:?}"),
-                })?;
+                }
+            })?;
             let m: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
             let (sec, us) = match parts.next() {
                 None => (0_i64, 0_i64),
@@ -1182,12 +1221,10 @@ pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, 
             // shifted point stays ≤ `to` (mirrored for negatives).
             let sign = if to >= from { 1 } else { -1 };
             let (lo, hi) = if sign > 0 { (from, to) } else { (to, from) };
-            let (ly, lm, _) = civil_from_days(
-                i32::try_from(lo.div_euclid(86_400_000_000)).unwrap_or(0),
-            );
-            let (hy, hm, _) = civil_from_days(
-                i32::try_from(hi.div_euclid(86_400_000_000)).unwrap_or(0),
-            );
+            let (ly, lm, _) =
+                civil_from_days(i32::try_from(lo.div_euclid(86_400_000_000)).unwrap_or(0));
+            let (hy, hm, _) =
+                civil_from_days(i32::try_from(hi.div_euclid(86_400_000_000)).unwrap_or(0));
             let mut approx =
                 (i64::from(hy) * 12 + i64::from(hm)) - (i64::from(ly) * 12 + i64::from(lm));
             // Adjust down while the full-month shift overshoots.

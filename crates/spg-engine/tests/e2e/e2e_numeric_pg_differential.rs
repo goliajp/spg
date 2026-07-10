@@ -25,7 +25,9 @@ use spg_storage::Value;
 /// Render the first scalar of the first row as PG-comparable text.
 fn scalar(e: &mut Engine, sql: &str) -> String {
     use spg_engine::eval as f;
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -37,7 +39,7 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Text(s) => s.to_string(),
         Value::Float(x) => format!("{x}"),
-        Value::Numeric { scaled, scale , .. } => f::format_numeric(*scaled, *scale),
+        Value::Numeric { scaled, scale, .. } => f::format_numeric(*scaled, *scale),
         other => panic!("{sql}: unexpected {other:?}"),
     }
 }

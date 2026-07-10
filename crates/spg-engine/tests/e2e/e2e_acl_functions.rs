@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -64,10 +66,7 @@ fn makeaclitem_builds_text_form() {
     );
     // Grantable appends '*' per privilege.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT makeaclitem(10, 10, 'INSERT', true)"
-        )),
+        text(&first(&mut e, "SELECT makeaclitem(10, 10, 'INSERT', true)")),
         "admin=a*/admin"
     );
     // Grantee 0 = PUBLIC (empty name).
@@ -76,9 +75,10 @@ fn makeaclitem_builds_text_form() {
         "=r/admin"
     );
     // Unknown privilege errors.
-    assert!(e
-        .execute("SELECT makeaclitem(10, 10, 'FLY', false)")
-        .is_err());
+    assert!(
+        e.execute("SELECT makeaclitem(10, 10, 'FLY', false)")
+            .is_err()
+    );
 }
 
 #[test]

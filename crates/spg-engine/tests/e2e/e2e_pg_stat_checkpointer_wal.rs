@@ -3,7 +3,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn col_names(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { columns, .. } => columns.iter().map(|c| c.name.clone()).collect(),
         _ => panic!("expected rows"),
     }
@@ -15,18 +18,35 @@ fn checkpointer_and_wal_shell_views_have_pg_columns() {
     assert_eq!(
         col_names(&mut e, "SELECT * FROM pg_catalog.pg_stat_checkpointer"),
         vec![
-            "num_timed", "num_requested", "num_done", "restartpoints_timed",
-            "restartpoints_req", "restartpoints_done", "write_time", "sync_time",
-            "buffers_written", "slru_written", "stats_reset",
+            "num_timed",
+            "num_requested",
+            "num_done",
+            "restartpoints_timed",
+            "restartpoints_req",
+            "restartpoints_done",
+            "write_time",
+            "sync_time",
+            "buffers_written",
+            "slru_written",
+            "stats_reset",
         ]
     );
     assert_eq!(
         col_names(&mut e, "SELECT * FROM pg_catalog.pg_stat_wal"),
-        vec!["wal_records", "wal_fpi", "wal_bytes", "wal_buffers_full", "stats_reset"]
+        vec![
+            "wal_records",
+            "wal_fpi",
+            "wal_bytes",
+            "wal_buffers_full",
+            "stats_reset"
+        ]
     );
     // Projection works too (via the meta-view pipeline).
     assert_eq!(
-        col_names(&mut e, "SELECT wal_records, wal_bytes FROM pg_catalog.pg_stat_wal"),
+        col_names(
+            &mut e,
+            "SELECT wal_records, wal_bytes FROM pg_catalog.pg_stat_wal"
+        ),
         vec!["wal_records", "wal_bytes"]
     );
 }
@@ -40,17 +60,35 @@ fn slru_and_subscription_stats_shell_views() {
     assert_eq!(
         col_names(&mut e, "SELECT * FROM pg_catalog.pg_stat_slru"),
         vec![
-            "name", "blks_zeroed", "blks_hit", "blks_read", "blks_written",
-            "blks_exists", "flushes", "truncates", "stats_reset",
+            "name",
+            "blks_zeroed",
+            "blks_hit",
+            "blks_read",
+            "blks_written",
+            "blks_exists",
+            "flushes",
+            "truncates",
+            "stats_reset",
         ]
     );
     assert_eq!(
-        col_names(&mut e, "SELECT * FROM pg_catalog.pg_stat_subscription_stats"),
+        col_names(
+            &mut e,
+            "SELECT * FROM pg_catalog.pg_stat_subscription_stats"
+        ),
         vec![
-            "subid", "subname", "apply_error_count", "sync_error_count",
-            "confl_insert_exists", "confl_update_origin_differs", "confl_update_exists",
-            "confl_update_missing", "confl_delete_origin_differs", "confl_delete_missing",
-            "confl_multiple_unique_conflicts", "stats_reset",
+            "subid",
+            "subname",
+            "apply_error_count",
+            "sync_error_count",
+            "confl_insert_exists",
+            "confl_update_origin_differs",
+            "confl_update_exists",
+            "confl_update_missing",
+            "confl_delete_origin_differs",
+            "confl_delete_missing",
+            "confl_multiple_unique_conflicts",
+            "stats_reset",
         ]
     );
 }

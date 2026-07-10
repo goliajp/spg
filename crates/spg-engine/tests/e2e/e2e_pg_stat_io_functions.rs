@@ -6,9 +6,7 @@ use spg_engine::{Engine, QueryResult};
 #[test]
 fn pg_stat_io_returns_single_aggregate_row_with_pg_columns() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_stat_io")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_stat_io").unwrap();
     let QueryResult::Rows { columns, rows } = r else {
         panic!("Rows");
     };

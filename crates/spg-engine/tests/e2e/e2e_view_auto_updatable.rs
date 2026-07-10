@@ -5,11 +5,14 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };
@@ -60,12 +63,17 @@ fn view_with_where_is_auto_updatable() {
     // to the base (no WITH CHECK OPTION, so it need not satisfy the WHERE).
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE base (id INT, name TEXT)");
-    e.execute("INSERT INTO base VALUES (5, 'lo'), (20, 'hi')").unwrap();
-    ddl(&mut e, "CREATE VIEW v AS SELECT id, name FROM base WHERE id > 10");
+    e.execute("INSERT INTO base VALUES (5, 'lo'), (20, 'hi')")
+        .unwrap();
+    ddl(
+        &mut e,
+        "CREATE VIEW v AS SELECT id, name FROM base WHERE id > 10",
+    );
 
     // UPDATE only touches rows visible through the view (id > 10).
     e.execute("UPDATE v SET name = 'HI' WHERE id = 20").unwrap();
-    e.execute("UPDATE v SET name = 'nope' WHERE id = 5").unwrap(); // filtered out
+    e.execute("UPDATE v SET name = 'nope' WHERE id = 5")
+        .unwrap(); // filtered out
     let names = |e: &mut Engine, sql: &str| match e.execute(sql).unwrap() {
         spg_engine::QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
@@ -77,7 +85,8 @@ fn view_with_where_is_auto_updatable() {
     assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 5"), "lo"); // untouched
 
     // INSERT succeeds (no CHECK OPTION), landing in the base table.
-    e.execute("INSERT INTO v (id, name) VALUES (30, 'new')").unwrap();
+    e.execute("INSERT INTO v (id, name) VALUES (30, 'new')")
+        .unwrap();
     assert_eq!(names(&mut e, "SELECT name FROM base WHERE id = 30"), "new");
 
     // DELETE only removes view-visible rows.

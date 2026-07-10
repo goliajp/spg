@@ -193,7 +193,8 @@ fn drop_expression_converts_to_plain_column() {
     e.execute("CREATE TABLE t(id int, g int GENERATED ALWAYS AS (id*2) STORED)")
         .unwrap();
     e.execute("INSERT INTO t(id) VALUES(5)").unwrap();
-    e.execute("ALTER TABLE t ALTER COLUMN g DROP EXPRESSION").unwrap();
+    e.execute("ALTER TABLE t ALTER COLUMN g DROP EXPRESSION")
+        .unwrap();
     // Now g is a plain column — a direct value is stored as given.
     e.execute("INSERT INTO t(id,g) VALUES(10, 999)").unwrap();
     let out = rows(&mut e, "SELECT id,g FROM t ORDER BY id");

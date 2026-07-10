@@ -48,8 +48,12 @@ fn meta_views_support_projection_where_orderby() {
     // now projection / WHERE / ORDER BY / aggregates run over them.
     let mut e = Engine::new();
     // Projection to a subset of columns.
-    let r = e.execute("SELECT pid, state, query FROM pg_stat_activity").unwrap();
-    let QueryResult::Rows { columns, .. } = r else { panic!() };
+    let r = e
+        .execute("SELECT pid, state, query FROM pg_stat_activity")
+        .unwrap();
+    let QueryResult::Rows { columns, .. } = r else {
+        panic!()
+    };
     assert_eq!(
         columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
         vec!["pid", "state", "query"]
@@ -61,6 +65,7 @@ fn meta_views_support_projection_where_orderby() {
         "SELECT count(*)::int FROM spg_statistic",
         "SELECT pid FROM spg_stat_activity",
     ] {
-        e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     }
 }

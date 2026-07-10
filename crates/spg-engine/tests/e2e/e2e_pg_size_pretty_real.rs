@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,19 +24,49 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn pg_size_pretty_boundaries() {
     let mut e = Engine::new();
     // Under 10240 (10 kB) — reports bytes.
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(0::bigint)")), "0 bytes");
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(1024::bigint)")), "1024 bytes");
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(10239::bigint)")), "10239 bytes");
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(0::bigint)")),
+        "0 bytes"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(1024::bigint)")),
+        "1024 bytes"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(10239::bigint)")),
+        "10239 bytes"
+    );
     // ≥ 10 kB — reports kB.
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(10240::bigint)")), "10 kB");
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(102400::bigint)")), "100 kB");
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(10240::bigint)")),
+        "10 kB"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(102400::bigint)")),
+        "100 kB"
+    );
     // ≥ 10 MB — reports MB. 10 MB = 10485760 bytes.
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(10485760::bigint)")), "10 MB");
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(1073741824::bigint)")), "1024 MB");
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(10485760::bigint)")),
+        "10 MB"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(1073741824::bigint)")),
+        "1024 MB"
+    );
     // ≥ 10 GB.
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(10737418240::bigint)")), "10 GB");
+    assert_eq!(
+        text(&first(&mut e, "SELECT pg_size_pretty(10737418240::bigint)")),
+        "10 GB"
+    );
     // ≥ 10 TB.
-    assert_eq!(text(&first(&mut e, "SELECT pg_size_pretty(10995116277760::bigint)")), "10 TB");
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT pg_size_pretty(10995116277760::bigint)"
+        )),
+        "10 TB"
+    );
 }
 
 #[test]

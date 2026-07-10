@@ -310,7 +310,10 @@ fn redo_log_old_format_decodes_and_replays_identically() {
                     write_values(&mut out, &row.values);
                 }
                 RowChange::Update {
-                    table, pos, new_row, ..
+                    table,
+                    pos,
+                    new_row,
+                    ..
                 } => {
                     out.push(1);
                     codec::write_str(&mut out, table);
@@ -490,8 +493,15 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
             _ => None,
         })
         .collect();
-    assert_eq!(tomb_ids.len(), 1, "one in-place delete → one Tombstone redo");
-    assert_eq!(tomb_ids[0].1, TOMB_XMAX, "tombstone carries the writer version");
+    assert_eq!(
+        tomb_ids.len(),
+        1,
+        "one in-place delete → one Tombstone redo"
+    );
+    assert_eq!(
+        tomb_ids[0].1, TOMB_XMAX,
+        "tombstone carries the writer version"
+    );
     assert_eq!(tomb_ids[0].0.len(), 1, "one row tombstoned");
 
     // --- Round-trip through the WAL codec (the real durability path). ---
@@ -511,7 +521,11 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
 
     // Physically present: 3 rows survive (tombstone keeps the slot).
     let t = rep.get("t").unwrap();
-    assert_eq!(t.rows().len(), 3, "tombstone must NOT physically remove the row");
+    assert_eq!(
+        t.rows().len(),
+        3,
+        "tombstone must NOT physically remove the row"
+    );
     // The visible set (per the MVCC snapshot gate) is {1, 3}; id=2 is a
     // tombstone hidden from a fresh snapshot — exactly the live gate-on
     // result, now reproduced from the WAL.
@@ -522,7 +536,11 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
             _ => None,
         })
         .collect();
-    assert_eq!(visible, alloc::vec![1, 3], "tombstoned row must be hidden after replay");
+    assert_eq!(
+        visible,
+        alloc::vec![1, 3],
+        "tombstoned row must be hidden after replay"
+    );
     // And the hidden row's header carries the exact xmax we stamped.
     let hidden_idx = t
         .rows()
@@ -530,7 +548,10 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
         .position(|r| r.values.first() == Some(&Value::Int(2)))
         .expect("id=2 physically present");
     let h = t.headers().get(hidden_idx).expect("header lock-step");
-    assert_eq!(h.xmax, TOMB_XMAX, "recovered row must carry the tombstone xmax");
+    assert_eq!(
+        h.xmax, TOMB_XMAX,
+        "recovered row must carry the tombstone xmax"
+    );
     assert!(h.is_deleted(), "recovered row must read as deleted");
     // Survivors stay alive (not accidentally tombstoned).
     for (i, r) in t.rows().iter().enumerate() {
@@ -555,14 +576,19 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
     }
     let logc = capc.drain_redo();
     assert!(
-        logc.iter().all(|c| !matches!(c, RowChange::Tombstone { .. })),
+        logc.iter()
+            .all(|c| !matches!(c, RowChange::Tombstone { .. })),
         "gate-off DELETE must NOT emit a Tombstone redo"
     );
     let mut repc = fresh();
     repc.apply_redo(&decode_redo_log(&encode_redo_log(&logc)).unwrap())
         .unwrap();
     let tc = repc.get("t").unwrap();
-    assert_eq!(tc.rows().len(), 2, "gate-off replay physically removes the row");
+    assert_eq!(
+        tc.rows().len(),
+        2,
+        "gate-off replay physically removes the row"
+    );
     let ids: Vec<i32> = tc
         .rows()
         .iter()
@@ -571,7 +597,11 @@ fn redo_tombstone_survives_replay_hidden_from_snapshot() {
             _ => None,
         })
         .collect();
-    assert_eq!(ids, alloc::vec![1, 3], "gate-off replay keeps only survivors");
+    assert_eq!(
+        ids,
+        alloc::vec![1, 3],
+        "gate-off replay keeps only survivors"
+    );
 }
 
 /// v7.37.16 (Epic W) — durability proof for the gate-on
@@ -641,11 +671,20 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
         RowChange::Tombstone { rowids, xmax, .. } => (rowids.clone(), *xmax),
         _ => unreachable!(),
     };
-    assert_eq!(tomb_rowids.len(), 1, "one row superseded → one tombstone target");
-    assert_eq!(tomb_xmax, STMT_V, "tombstone carries the statement writer version");
+    assert_eq!(
+        tomb_rowids.len(),
+        1,
+        "one row superseded → one tombstone target"
+    );
+    assert_eq!(
+        tomb_xmax, STMT_V,
+        "tombstone carries the statement writer version"
+    );
     // Exactly one tombstone total (no double-tombstone).
     assert_eq!(
-        log.iter().filter(|c| matches!(c, RowChange::Tombstone { .. })).count(),
+        log.iter()
+            .filter(|c| matches!(c, RowChange::Tombstone { .. }))
+            .count(),
         1,
         "an in-place UPDATE tombstones the old version exactly once"
     );
@@ -653,10 +692,12 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
     // new row values.
     let new_ins_pos = log
         .iter()
-        .position(|c| matches!(
-            c,
-            RowChange::Insert { row, .. } if row.values.first() == Some(&Value::Int(NEW_VAL))
-        ))
+        .position(|c| {
+            matches!(
+                c,
+                RowChange::Insert { row, .. } if row.values.first() == Some(&Value::Int(NEW_VAL))
+            )
+        })
         .expect("in-place UPDATE emits an Insert carrying the new values");
     assert!(
         tomb_pos < new_ins_pos,
@@ -666,7 +707,10 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
     // --- Round-trip through the WAL codec (the real durability path). ---
     let bytes = encode_redo_log(&log);
     let decoded = decode_redo_log(&bytes).unwrap();
-    assert_eq!(decoded, log, "UPDATE tombstone+insert redo must round-trip the codec");
+    assert_eq!(
+        decoded, log,
+        "UPDATE tombstone+insert redo must round-trip the codec"
+    );
 
     // --- Replay into a FRESH catalog (crash-recovery simulation). ---
     let unresolved_before = crate::unresolved_tombstone_count();
@@ -681,7 +725,11 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
     let t = rep.get("t").unwrap();
     // 4 rows physically present: 3 originals (one now tombstoned) + the
     // appended new version.
-    assert_eq!(t.rows().len(), 4, "in-place UPDATE keeps the old row + appends the new");
+    assert_eq!(
+        t.rows().len(),
+        4,
+        "in-place UPDATE keeps the old row + appends the new"
+    );
     // Visible set (per the MVCC snapshot gate): survivors {1,3} + new {20};
     // the OLD value {2} is hidden — exactly the live gate-on UPDATE result,
     // reproduced from the WAL.
@@ -711,7 +759,10 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
         .position(|r| r.values.first() == Some(&Value::Int(OLD_VAL)))
         .expect("old version physically present (tombstone keeps the slot)");
     let old_h = t.headers().get(old_idx).expect("header lock-step");
-    assert_eq!(old_h.xmax, STMT_V, "superseded row must carry the tombstone xmax");
+    assert_eq!(
+        old_h.xmax, STMT_V,
+        "superseded row must carry the tombstone xmax"
+    );
     assert!(old_h.is_deleted(), "superseded row must read as deleted");
     // The new version is a live, undeleted row.
     let new_idx = t
@@ -746,7 +797,8 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
     }
     let logc = capc.drain_redo();
     assert!(
-        logc.iter().all(|c| !matches!(c, RowChange::Tombstone { .. })),
+        logc.iter()
+            .all(|c| !matches!(c, RowChange::Tombstone { .. })),
         "gate-off UPDATE must NOT emit a Tombstone redo"
     );
     assert!(
@@ -757,7 +809,11 @@ fn redo_update_tombstone_plus_insert_survives_replay() {
     repc.apply_redo(&decode_redo_log(&encode_redo_log(&logc)).unwrap())
         .unwrap();
     let tc = repc.get("t").unwrap();
-    assert_eq!(tc.rows().len(), 3, "gate-off UPDATE replays in place (no extra row)");
+    assert_eq!(
+        tc.rows().len(),
+        3,
+        "gate-off UPDATE replays in place (no extra row)"
+    );
     let mut ids: Vec<i32> = tc
         .rows()
         .iter()
@@ -841,9 +897,19 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     let hits: Vec<usize> = v53
         .windows(appendix.len())
         .enumerate()
-        .filter_map(|(i, w)| if w == appendix.as_slice() { Some(i) } else { None })
+        .filter_map(|(i, w)| {
+            if w == appendix.as_slice() {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
-    assert_eq!(hits.len(), 1, "MVCC appendix must appear exactly once in the image");
+    assert_eq!(
+        hits.len(),
+        1,
+        "MVCC appendix must appear exactly once in the image"
+    );
     let start = hits[0];
     // v7.38 — strip the empty (2-byte zero-count) default_text appendix (v58)
     // that the current writer emits immediately before the MVCC appendix, so
@@ -869,7 +935,11 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     }
     // Dense 1..=N rowids + next_rowid = N + 1.
     let ids: Vec<RowId> = t.rowids().iter().copied().collect();
-    assert_eq!(ids, alloc::vec![RowId(1), RowId(2), RowId(3)], "v52 dense rowids");
+    assert_eq!(
+        ids,
+        alloc::vec![RowId(1), RowId(2), RowId(3)],
+        "v52 dense rowids"
+    );
     assert_eq!(t.next_rowid_for_test(), 4, "v52 next_rowid = N + 1");
 }
 
@@ -903,7 +973,7 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// (strictly above every loaded id).
 #[test]
 fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
-    use crate::row_header::{RowHeader, RowId, HEAP_XMIN_FROZEN, XMAX_ALIVE};
+    use crate::row_header::{HEAP_XMIN_FROZEN, RowHeader, RowId, XMAX_ALIVE};
 
     let mut c = Catalog::new();
     c.create_table(TableSchema::new(
@@ -917,7 +987,8 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
         // delete slots 1,3,5 (rowids 2,4,6). Survivors keep their real
         // ids [1,3,5]; next_rowid stays 7 — a non-dense id set.
         for v in 0..6 {
-            t.insert(Row::new(alloc::vec![Value::Int(100 + v)])).unwrap();
+            t.insert(Row::new(alloc::vec![Value::Int(100 + v)]))
+                .unwrap();
         }
         t.delete_rows(&[1, 3, 5]);
         assert_eq!(t.rows().len(), 3);
@@ -926,7 +997,11 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
             alloc::vec![RowId(1), RowId(3), RowId(5)],
             "survivors keep their real (non-dense) rowids"
         );
-        assert_eq!(t.next_rowid_for_test(), 7, "next_rowid unaffected by delete");
+        assert_eq!(
+            t.next_rowid_for_test(),
+            7,
+            "next_rowid unaffected by delete"
+        );
         // Stamp mixed headers: slot 0 alive-frozen, slot 1 tombstoned
         // (xmax = 99), slot 2 alive with a non-frozen xmin.
         let headers = t.headers_mut_for_test();
@@ -942,8 +1017,7 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
             flags: HEAP_XMIN_FROZEN,
         };
     }
-    let want_headers: Vec<RowHeader> =
-        c.get("t").unwrap().headers().iter().copied().collect();
+    let want_headers: Vec<RowHeader> = c.get("t").unwrap().headers().iter().copied().collect();
 
     let bytes = c.serialize();
     let restored = Catalog::deserialize(&bytes).expect("v53 image loads");
@@ -957,8 +1031,14 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
     );
     // Headers identical field-for-field.
     let got_headers: Vec<RowHeader> = t.headers().iter().copied().collect();
-    assert_eq!(got_headers, want_headers, "headers must round-trip verbatim");
-    assert!(got_headers[1].is_deleted(), "the tombstoned row stays tombstoned");
+    assert_eq!(
+        got_headers, want_headers,
+        "headers must round-trip verbatim"
+    );
+    assert!(
+        got_headers[1].is_deleted(),
+        "the tombstoned row stays tombstoned"
+    );
     assert_eq!(got_headers[1].xmax, 99, "tombstone xmax preserved");
     // next_rowid restored above the max loaded id (5) — a fresh alloc
     // (7) cannot collide with any restored row.
@@ -1020,7 +1100,13 @@ fn restored_rows_are_visible_to_a_fresh_snapshot() {
     );
 
     let snap = Snapshot::new(version, InProgressSet::empty(), version, 0);
-    let headers: Vec<RowHeader> = restored.get("t").unwrap().headers().iter().copied().collect();
+    let headers: Vec<RowHeader> = restored
+        .get("t")
+        .unwrap()
+        .headers()
+        .iter()
+        .copied()
+        .collect();
     assert!(
         snap.visible(&headers[0]),
         "a committed restored row must not read as a future write"
@@ -1092,7 +1178,11 @@ fn cross_checkpoint_tombstone_resolves_after_snapshot_restore() {
         })
         .collect();
     assert_eq!(tomb_targets.len(), 1, "one in-place tombstone captured");
-    assert_eq!(tomb_targets[0].0, alloc::vec![RowId(4)], "tombstone names the pre-checkpoint id");
+    assert_eq!(
+        tomb_targets[0].0,
+        alloc::vec![RowId(4)],
+        "tombstone names the pre-checkpoint id"
+    );
     // Round-trip through the real WAL codec.
     let decoded = decode_redo_log(&encode_redo_log(&log)).unwrap();
 
@@ -1100,7 +1190,13 @@ fn cross_checkpoint_tombstone_resolves_after_snapshot_restore() {
     let mut restored = Catalog::deserialize(&base).expect("base snapshot loads");
     // The crux: the id persisted as 4 (NOT dense-reassigned to 1).
     assert_eq!(
-        restored.get("t").unwrap().rowids().iter().copied().collect::<Vec<_>>(),
+        restored
+            .get("t")
+            .unwrap()
+            .rowids()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
         alloc::vec![RowId(4)],
         "v53 restore preserves RowId(4); pre-v53 would have dense-assigned RowId(1)"
     );
@@ -1117,7 +1213,10 @@ fn cross_checkpoint_tombstone_resolves_after_snapshot_restore() {
     let t = restored.get("t").unwrap();
     assert_eq!(t.rows().len(), 1, "tombstone keeps the physical row");
     let h = *t.headers().get(0).unwrap();
-    assert_eq!(h.xmax, TOMB_XMAX, "recovered row carries the tombstone xmax");
+    assert_eq!(
+        h.xmax, TOMB_XMAX,
+        "recovered row carries the tombstone xmax"
+    );
     assert!(h.is_deleted(), "recovered row reads as deleted");
     let visible: Vec<i32> = t
         .scan_visible(&snap)
@@ -1126,7 +1225,10 @@ fn cross_checkpoint_tombstone_resolves_after_snapshot_restore() {
             _ => None,
         })
         .collect();
-    assert!(visible.is_empty(), "the tombstoned survivor must be hidden after restore");
+    assert!(
+        visible.is_empty(),
+        "the tombstoned survivor must be hidden after restore"
+    );
 }
 
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the
@@ -1533,8 +1635,12 @@ fn rowid_monotonic_survives_delete_and_never_reused() {
         alloc::vec![RowId(1), RowId(3)]
     );
     // A new insert never reuses the freed id 2 — it takes 4.
-    t.insert(Row::new(vec![Value::Int(9), Value::text("y"), Value::Float(0.0)]))
-        .unwrap();
+    t.insert(Row::new(vec![
+        Value::Int(9),
+        Value::text("y"),
+        Value::Float(0.0),
+    ]))
+    .unwrap();
     assert_eq!(
         t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
         alloc::vec![RowId(1), RowId(3), RowId(4)]
@@ -1543,8 +1649,12 @@ fn rowid_monotonic_survives_delete_and_never_reused() {
     // next insert never collides with a pre-truncate id.
     t.truncate();
     assert_eq!(t.rowids().len(), 0);
-    t.insert(Row::new(vec![Value::Int(0), Value::text("z"), Value::Float(0.0)]))
-        .unwrap();
+    t.insert(Row::new(vec![
+        Value::Int(0),
+        Value::text("z"),
+        Value::Float(0.0),
+    ]))
+    .unwrap();
     assert_eq!(
         t.rowids().iter().copied().collect::<alloc::vec::Vec<_>>(),
         alloc::vec![RowId(5)]
@@ -3117,7 +3227,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: 12345,
                 scale: 2,
-             kind: crate::NumericKind::Finite },
+                kind: crate::NumericKind::Finite,
+            },
             Value::Date(20_000),
             Value::Timestamp(1_700_000_000_000_000),
         ]),
@@ -3133,7 +3244,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: 0,
                 scale: 2,
-             kind: crate::NumericKind::Finite },
+                kind: crate::NumericKind::Finite,
+            },
             Value::Date(0),
             Value::Timestamp(0),
         ]),
@@ -3148,7 +3260,8 @@ fn row_body_encoded_len_matches_actual_encode_for_all_types() {
             Value::Numeric {
                 scaled: -999_999_999,
                 scale: 2,
-             kind: crate::NumericKind::Finite },
+                kind: crate::NumericKind::Finite,
+            },
             Value::Date(-1),
             Value::Timestamp(-1),
         ]),
@@ -3404,11 +3517,7 @@ fn v7_37_15_phase_b_scan_visible_filters_correctly() {
     // Phase A: every header is frozen, so unbounded sees all 5.
     let unbounded = Snapshot::unbounded();
     let all: Vec<_> = t.scan_visible(&unbounded).collect();
-    assert_eq!(
-        all.len(),
-        5,
-        "unbounded snapshot must see every frozen row"
-    );
+    assert_eq!(all.len(), 5, "unbounded snapshot must see every frozen row");
     for i in 0..5 {
         assert!(t.is_row_visible(i, &unbounded), "row {i} visible");
     }
@@ -3419,18 +3528,15 @@ fn v7_37_15_phase_b_scan_visible_filters_correctly() {
     // (Reach through the test cfg into the underlying PersistentVec —
     // Phase C will land the proper writer-side stamping API.)
     let snap = Snapshot::new(
-        100,                       // version
+        100,                                         // version
         InProgressSet::from_sorted(alloc::vec![50]), // tx 50 in flight
-        50,                        // oldest_active
-        0,                         // anonymous reader
+        50,                                          // oldest_active
+        0,                                           // anonymous reader
     );
     // Direct-write a row header to xmin=50 (an in-flight tx); it
     // becomes invisible to `snap`.
     {
-        let header = t
-            .headers()
-            .get(0)
-            .expect("row 0 header exists");
+        let header = t.headers().get(0).expect("row 0 header exists");
         // The PersistentVec set yields a fresh vec; reassign back
         // via Table's existing test-friendly path (Phase C will
         // add a writer-aware path; here we splice manually).
@@ -3483,21 +3589,22 @@ fn v7_37_15_phase_c_insert_with_xmin_stamps_header() {
 
     // Snapshot taken WHILE tx 17 is still in-flight: row hidden.
     let before = Snapshot::new(
-        20,                                                     // version
-        InProgressSet::from_sorted(alloc::vec![17]),            // tx 17 in flight
-        10,                                                     // oldest_active
-        0,                                                       // reader
+        20,                                          // version
+        InProgressSet::from_sorted(alloc::vec![17]), // tx 17 in flight
+        10,                                          // oldest_active
+        0,                                           // reader
     );
-    assert!(!t.is_row_visible(0, &before), "row hidden while writer in-flight");
+    assert!(
+        !t.is_row_visible(0, &before),
+        "row hidden while writer in-flight"
+    );
 
     // Snapshot taken AFTER tx 17 commits: row visible.
-    let after = Snapshot::new(
-        20,
-        InProgressSet::empty(),
-        20,
-        0,
+    let after = Snapshot::new(20, InProgressSet::empty(), 20, 0);
+    assert!(
+        t.is_row_visible(0, &after),
+        "row visible after writer commits"
     );
-    assert!(t.is_row_visible(0, &after), "row visible after writer commits");
 }
 
 /// v7.37.15 (Phase C TDD) — `mark_row_deleted` stamps `xmax`
@@ -3520,22 +3627,18 @@ fn v7_37_15_phase_c_mark_row_deleted_writes_xmax() {
     assert_eq!(t.row_count(), 1);
 
     // Snapshot taken BEFORE tx 25 commits sees the row.
-    let before = Snapshot::new(
-        30,
-        InProgressSet::from_sorted(alloc::vec![25]),
-        17,
-        0,
+    let before = Snapshot::new(30, InProgressSet::from_sorted(alloc::vec![25]), 17, 0);
+    assert!(
+        t.is_row_visible(0, &before),
+        "row visible while deleter in-flight"
     );
-    assert!(t.is_row_visible(0, &before), "row visible while deleter in-flight");
 
     // Snapshot taken AFTER tx 25 commits doesn't see it.
-    let after = Snapshot::new(
-        30,
-        InProgressSet::empty(),
-        30,
-        0,
+    let after = Snapshot::new(30, InProgressSet::empty(), 30, 0);
+    assert!(
+        !t.is_row_visible(0, &after),
+        "row hidden after deleter commits"
     );
-    assert!(!t.is_row_visible(0, &after), "row hidden after deleter commits");
 }
 
 /// v7.37.15 (Phase C TDD) — re-deleting an already-tombstoned
@@ -3614,7 +3717,11 @@ fn v7_37_15_phase_d_vacuum_reclaims_only_safe_rows() {
         survivor_rowids, expected_survivor_rowids,
         "survivors keep their stable RowIds across vacuum compaction"
     );
-    assert_eq!(t.rowids().len(), t.rows().len(), "rowids lock-step with rows");
+    assert_eq!(
+        t.rowids().len(),
+        t.rows().len(),
+        "rowids lock-step with rows"
+    );
 }
 
 /// v7.37.15 (Phase D TDD) — `Catalog::vacuum_all` aggregates per-
@@ -3637,15 +3744,15 @@ fn v7_37_15_phase_d_vacuum_all_aggregates_per_table() {
     u.mark_row_deleted(0, 50).unwrap();
 
     let l = cat.get_mut("logs").unwrap();
-    l.insert_with_xmin(
-        Row::new(vec![Value::BigInt(1), Value::text("hello")]),
-        20,
-    )
-    .unwrap();
+    l.insert_with_xmin(Row::new(vec![Value::BigInt(1), Value::text("hello")]), 20)
+        .unwrap();
     // logs row stays alive — vacuum reclaims nothing here.
 
     let report = cat.vacuum_all(100, false);
-    assert_eq!(report.rows_reclaimed, 1, "one row reclaimed across both tables");
+    assert_eq!(
+        report.rows_reclaimed, 1,
+        "one row reclaimed across both tables"
+    );
     assert_eq!(
         report.per_table.len(),
         1,
@@ -3717,25 +3824,40 @@ fn v7_37_15_end_to_end_mvcc_lifecycle() {
     // 15 with V in_progress hides the row.
     t.insert_with_xmin(make_user_row(42, "alice"), 10).unwrap();
     let mid_insert = Snapshot::new(15, InProgressSet::from_sorted(alloc::vec![10]), 10, 0);
-    assert!(!t.is_row_visible(0, &mid_insert), "writer in flight ⇒ hidden");
+    assert!(
+        !t.is_row_visible(0, &mid_insert),
+        "writer in flight ⇒ hidden"
+    );
 
     // Step 2: V committed (in_progress empty) → row visible.
     let post_insert = Snapshot::new(20, InProgressSet::empty(), 20, 0);
-    assert!(t.is_row_visible(0, &post_insert), "committed insert ⇒ visible");
+    assert!(
+        t.is_row_visible(0, &post_insert),
+        "committed insert ⇒ visible"
+    );
 
     // Step 3: deleter W=30 stamps xmax. Snapshot at version 25 (pre-
     // delete) still sees row.
     t.mark_row_deleted(0, 30).unwrap();
     let pre_delete = Snapshot::new(25, InProgressSet::empty(), 25, 0);
-    assert!(t.is_row_visible(0, &pre_delete), "pre-delete snapshot sees row");
+    assert!(
+        t.is_row_visible(0, &pre_delete),
+        "pre-delete snapshot sees row"
+    );
     let post_delete = Snapshot::new(50, InProgressSet::empty(), 30, 0);
-    assert!(!t.is_row_visible(0, &post_delete), "post-delete snapshot hides row");
+    assert!(
+        !t.is_row_visible(0, &post_delete),
+        "post-delete snapshot hides row"
+    );
 
     // Step 4: vacuum reclaim. Only safe when oldest_active > xmax.
     // oldest_active=25 → still possibly observable, do NOT reclaim.
     assert!(!is_reclaimable(30, 25));
     let dry_at_25 = t.vacuum(25, true);
-    assert_eq!(dry_at_25.rows_reclaimed, 0, "vacuum waits for oldest_active > xmax");
+    assert_eq!(
+        dry_at_25.rows_reclaimed, 0,
+        "vacuum waits for oldest_active > xmax"
+    );
     // oldest_active=40 → safe (every live snapshot is past 30).
     assert!(is_reclaimable(30, 40));
     let real_at_40 = t.vacuum(40, false);

@@ -339,10 +339,7 @@ pub(crate) fn lookup_row_position_by_keys(
     // header check reuses the same index. `is_deleted()` is never true
     // under the default gate → gate-off path byte-for-byte unchanged.
     table.rows().iter().enumerate().position(|(row_idx, r)| {
-        !table
-            .headers()
-            .get(row_idx)
-            .is_some_and(|h| h.is_deleted())
+        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted())
             && column_positions
                 .iter()
                 .enumerate()
@@ -378,11 +375,7 @@ pub(crate) fn on_conflict_keys_exist(
     // tombstoned in place. `is_deleted()` is never true under the
     // default gate → gate-off path byte-for-byte unchanged.
     let hot_hit = table.rows().iter().enumerate().any(|(row_idx, r)| {
-        !table
-            .headers()
-            .get(row_idx)
-            .is_some_and(|h| h.is_deleted())
-            && matches(r)
+        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
     });
     if hot_hit {
         return true;
@@ -639,11 +632,7 @@ pub(crate) fn enforce_uniqueness_inserts(
             // the default gate (physical delete) no header is ever
             // tombstoned, so this skip is never taken and the gate-off
             // path is byte-for-byte unchanged.
-            if table
-                .headers()
-                .get(row_idx)
-                .is_some_and(|h| h.is_deleted())
-            {
+            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
                 continue;
             }
             let key = fold_key(&prow.values);
@@ -878,11 +867,7 @@ pub(crate) fn enforce_unique_index_inserts(
             // `enforce_uniqueness_inserts`; `is_deleted()` is never true
             // under the default gate (physical delete), so the gate-off
             // path is byte-for-byte unchanged.
-            if table
-                .headers()
-                .get(row_idx)
-                .is_some_and(|h| h.is_deleted())
-            {
+            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
                 continue;
             }
             if !participates(&prow.values)? {
@@ -1019,7 +1004,11 @@ pub(crate) fn enforce_unique_updates(
             Ok(Some(aggregate::encode_key(&key)))
         };
         let on_conflict = |pos: usize| -> EngineError {
-            let kind = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+            let kind = if uc.is_primary_key {
+                "PRIMARY KEY"
+            } else {
+                "UNIQUE"
+            };
             let col_names: Vec<String> = uc
                 .columns
                 .iter()
@@ -1067,7 +1056,9 @@ pub(crate) fn enforce_unique_updates(
         let key_str = |values: &[Value<'static>]| -> Result<Option<String>, EngineError> {
             // Partial index: rows failing the predicate are not indexed.
             if let Some(pred) = &predicate_expr {
-                let tmp_row = spg_storage::Row { values: values.to_vec() };
+                let tmp_row = spg_storage::Row {
+                    values: values.to_vec(),
+                };
                 let v = eval::eval_expr(pred, &tmp_row, &ctx).map_err(|e| {
                     EngineError::Unsupported(alloc::format!(
                         "UNIQUE INDEX {:?} predicate eval: {e:?}",
@@ -1079,7 +1070,9 @@ pub(crate) fn enforce_unique_updates(
                 }
             }
             let key: Vec<Value<'static>> = if let Some(expr) = &expr_key {
-                let tmp_row = spg_storage::Row { values: values.to_vec() };
+                let tmp_row = spg_storage::Row {
+                    values: values.to_vec(),
+                };
                 let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
                     EngineError::Unsupported(alloc::format!(
                         "UNIQUE INDEX {:?} expression eval: {e:?}",

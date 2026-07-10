@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -49,7 +51,8 @@ fn describe_routes_to_show_columns() {
 fn mysql_limit_offset_count() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ml (v INT)").unwrap();
-    e.execute("INSERT INTO ml VALUES (1), (2), (3), (4)").unwrap();
+    e.execute("INSERT INTO ml VALUES (1), (2), (3), (4)")
+        .unwrap();
     // LIMIT 1, 2 — skip 1, take 2.
     let got = rows(&mut e, "SELECT v FROM ml ORDER BY v LIMIT 1, 2");
     assert_eq!(got.len(), 2);

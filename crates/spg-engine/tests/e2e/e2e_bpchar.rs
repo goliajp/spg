@@ -32,7 +32,10 @@ fn bpchar_semantics() {
     assert_eq!(one(&mut e, "SELECT ('ab'::char(4))::text"), "ab");
     assert_eq!(one(&mut e, "SELECT length(('ab'::char(4))::text)"), "2");
     assert_eq!(one(&mut e, "SELECT 'ab'::char(4) || 'x'"), "abx");
-    assert_eq!(one(&mut e, "SELECT '[' || ('ab'::char(4))::text || ']'"), "[ab]");
+    assert_eq!(
+        one(&mut e, "SELECT '[' || ('ab'::char(4))::text || ']'"),
+        "[ab]"
+    );
     // Over-long cast truncates.
     assert_eq!(one(&mut e, "SELECT 'abc'::char(2)"), "ab");
     assert_eq!(one(&mut e, "SELECT length('abc'::char(2))"), "2");
@@ -41,11 +44,17 @@ fn bpchar_semantics() {
     // DISTINCT / GROUP BY dedup blank-insensitively, even across declared widths
     // and against plain text (R3).
     assert_eq!(
-        one(&mut e, "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::char(6)),('ab'::char(2))) v(x)"),
+        one(
+            &mut e,
+            "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::char(6)),('ab'::char(2))) v(x)"
+        ),
         "1"
     );
     assert_eq!(
-        one(&mut e, "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::text)) v(x)"),
+        one(
+            &mut e,
+            "SELECT count(DISTINCT x) FROM (VALUES('ab'::char(4)),('ab'::text)) v(x)"
+        ),
         "1"
     );
 }

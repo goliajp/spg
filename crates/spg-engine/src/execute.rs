@@ -63,15 +63,26 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
     let is_duration = num.parse::<i64>().is_ok()
         && matches!(unit.as_str(), "" | "us" | "ms" | "s" | "min" | "h" | "d");
     match key.as_str() {
-        "enable_seqscan" | "enable_indexscan" | "enable_bitmapscan" | "enable_indexonlyscan"
-        | "enable_hashjoin" | "enable_mergejoin" | "enable_nestloop" | "autovacuum" | "fsync"
+        "enable_seqscan"
+        | "enable_indexscan"
+        | "enable_bitmapscan"
+        | "enable_indexonlyscan"
+        | "enable_hashjoin"
+        | "enable_mergejoin"
+        | "enable_nestloop"
+        | "autovacuum"
+        | "fsync"
         | "full_page_writes" => {
             if !is_bool {
                 return Err(bad());
             }
         }
-        "work_mem" | "maintenance_work_mem" | "shared_buffers" | "temp_buffers"
-        | "effective_cache_size" | "wal_buffers" => {
+        "work_mem"
+        | "maintenance_work_mem"
+        | "shared_buffers"
+        | "temp_buffers"
+        | "effective_cache_size"
+        | "wal_buffers" => {
             if !is_size {
                 return Err(bad());
             }
@@ -977,11 +988,7 @@ impl Engine {
             // tracks the value in `session_params`; FTS dispatcher
             // reads `default_text_search_config`. Everything else
             // is a recorded no-op (PG dump compat).
-            Statement::SetParameter {
-                name,
-                value,
-                local,
-            } => {
+            Statement::SetParameter { name, value, local } => {
                 // v7.38 (read01) — SPG serves the wire as UTF8, so a
                 // non-UTF8 client_encoding can't be honoured (the bytes
                 // stay UTF8). Reject it rather than silently store a value
@@ -1114,7 +1121,10 @@ impl Engine {
                             Value::text(alloc::string::String::from(*cat)),
                         ]));
                     }
-                    return Ok(QueryResult::Rows { columns: cols, rows });
+                    return Ok(QueryResult::Rows {
+                        columns: cols,
+                        rows,
+                    });
                 }
                 let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
                     "transaction_isolation" => {
@@ -1324,7 +1334,9 @@ impl Engine {
         }
         for row in self.iter_cold_rows_of_table(table) {
             cancel.check()?;
-            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(encode(&row))]));
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(encode(
+                &row
+            ))]));
         }
         Ok(QueryResult::Rows {
             columns: alloc::vec![spg_storage::ColumnSchema::new(

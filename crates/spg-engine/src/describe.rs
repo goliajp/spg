@@ -146,14 +146,19 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
             .max_by_key(|t| numeric_rank(t).unwrap_or(0))
             .map(|t| (*t).clone());
     }
-    let non_text: Vec<&DataType> =
-        distinct.iter().copied().filter(|t| !matches!(t, DataType::Text)).collect();
-    if non_text
+    let non_text: Vec<&DataType> = distinct
         .iter()
-        .all(|t| matches!(t, DataType::Date | DataType::Timestamp | DataType::Timestamptz))
-        && non_text
-            .iter()
-            .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
+        .copied()
+        .filter(|t| !matches!(t, DataType::Text))
+        .collect();
+    if non_text.iter().all(|t| {
+        matches!(
+            t,
+            DataType::Date | DataType::Timestamp | DataType::Timestamptz
+        )
+    }) && non_text
+        .iter()
+        .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
     {
         if non_text.iter().any(|t| matches!(t, DataType::Timestamptz)) {
             return Some(DataType::Timestamptz);
@@ -219,8 +224,20 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                     }
                 }
                 L::Float(_) => (DataType::Float, false),
-                L::Numeric { .. } => (DataType::Numeric { precision: 0, scale: 0 }, false),
-                L::NumericBig(_) => (DataType::Numeric { precision: 0, scale: 0 }, false),
+                L::Numeric { .. } => (
+                    DataType::Numeric {
+                        precision: 0,
+                        scale: 0,
+                    },
+                    false,
+                ),
+                L::NumericBig(_) => (
+                    DataType::Numeric {
+                        precision: 0,
+                        scale: 0,
+                    },
+                    false,
+                ),
                 L::String(_) => (DataType::Text, false),
                 L::Bool(_) => (DataType::Bool, false),
                 L::Vector(_) | L::Interval { .. } => return None,

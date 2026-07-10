@@ -18,15 +18,26 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn make_time_is_time_typed() {
     let mut e = Engine::new();
     // Renders as a time, not "1970-01-01 12:30:00".
-    assert_eq!(text(&mut e, "SELECT make_time(12, 30, 0)::text"), "12:30:00");
-    assert_eq!(text(&mut e, "SELECT make_time(8, 15, 30.5)::text"), "08:15:30.5");
+    assert_eq!(
+        text(&mut e, "SELECT make_time(12, 30, 0)::text"),
+        "12:30:00"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT make_time(8, 15, 30.5)::text"),
+        "08:15:30.5"
+    );
     assert_eq!(
         text(&mut e, "SELECT pg_typeof(make_time(12,30,0))"),
         "time without time zone"
     );
     // Compares as a TIME.
-    match e.execute("SELECT make_time(12,0,0) > '11:00:00'::time").unwrap() {
-        QueryResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], spg_storage::Value::Bool(true)),
+    match e
+        .execute("SELECT make_time(12,0,0) > '11:00:00'::time")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_storage::Value::Bool(true))
+        }
         _ => panic!(),
     }
 }
@@ -34,5 +45,8 @@ fn make_time_is_time_typed() {
 #[test]
 fn pg_typeof_reports_time() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT pg_typeof('12:30:00'::time)"), "time without time zone");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof('12:30:00'::time)"),
+        "time without time zone"
+    );
 }

@@ -82,9 +82,7 @@ impl Engine {
             }
             T::RenameTable { new } => self.alter_rename_table(tbl, new),
             T::RenameColumn { old, new } => self.alter_rename_column(tbl, old, new),
-            T::AttachPartition { child, bounds } => {
-                self.alter_attach_partition(tbl, child, bounds)
-            }
+            T::AttachPartition { child, bounds } => self.alter_attach_partition(tbl, child, bounds),
             T::DetachPartition {
                 child,
                 concurrently,
@@ -94,15 +92,9 @@ impl Engine {
                 column,
                 default_expr,
             } => self.alter_column_set_default(tbl, column, default_expr),
-            T::AlterColumnDropDefault { column } => {
-                self.alter_column_drop_default(tbl, column)
-            }
-            T::AlterColumnSetNotNull { column } => {
-                self.alter_column_set_not_null(tbl, column)
-            }
-            T::AlterColumnDropNotNull { column } => {
-                self.alter_column_drop_not_null(tbl, column)
-            }
+            T::AlterColumnDropDefault { column } => self.alter_column_drop_default(tbl, column),
+            T::AlterColumnSetNotNull { column } => self.alter_column_set_not_null(tbl, column),
+            T::AlterColumnDropNotNull { column } => self.alter_column_drop_not_null(tbl, column),
             T::AlterColumnDropExpression { column } => {
                 self.alter_column_drop_expression(tbl, column)
             }
@@ -283,11 +275,7 @@ impl Engine {
         Ok(())
     }
 
-    fn alter_column_drop_default(
-        &mut self,
-        tbl: &str,
-        column: String,
-    ) -> Result<(), EngineError> {
+    fn alter_column_drop_default(&mut self, tbl: &str, column: String) -> Result<(), EngineError> {
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -308,11 +296,7 @@ impl Engine {
     }
 
     /// v7.37.18 (18.2) — set / drop column NOT NULL flag.
-    fn alter_column_set_not_null(
-        &mut self,
-        tbl: &str,
-        column: String,
-    ) -> Result<(), EngineError> {
+    fn alter_column_set_not_null(&mut self, tbl: &str, column: String) -> Result<(), EngineError> {
         // Validate no existing row holds NULL in this column
         // before flipping the flag. PG raises on first NULL hit.
         let table = self.active_catalog().get(tbl).ok_or_else(|| {
@@ -336,16 +320,15 @@ impl Engine {
                 )));
             }
         }
-        let table = self.active_catalog_mut().get_mut(tbl).expect("checked above");
+        let table = self
+            .active_catalog_mut()
+            .get_mut(tbl)
+            .expect("checked above");
         table.schema_mut().columns[pos].nullable = false;
         Ok(())
     }
 
-    fn alter_column_drop_not_null(
-        &mut self,
-        tbl: &str,
-        column: String,
-    ) -> Result<(), EngineError> {
+    fn alter_column_drop_not_null(&mut self, tbl: &str, column: String) -> Result<(), EngineError> {
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -433,7 +416,10 @@ impl Engine {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "ALTER TABLE … ATTACH PARTITION: column {:?} of {child_name:?} \
                          (type {:?}) doesn't match column {:?} of {parent_name:?} (type {:?})",
-                        c.name, c.ty, p.name, p.ty
+                        c.name,
+                        c.ty,
+                        p.name,
+                        p.ty
                     )));
                 }
             }
@@ -459,8 +445,7 @@ impl Engine {
                         crate::partition::bound_to_diag(&upper_b),
                     )));
                 }
-                for sib in
-                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                for sib in crate::partition::children_of_parent(self.active_catalog(), parent_name)
                 {
                     let Some(t) = self.active_catalog().get(&sib) else {
                         continue;
@@ -500,8 +485,7 @@ impl Engine {
                 for v in values {
                     bounds_v.push(crate::partition::evaluate_partition_bound(v)?);
                 }
-                for sib in
-                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                for sib in crate::partition::children_of_parent(self.active_catalog(), parent_name)
                 {
                     let Some(t) = self.active_catalog().get(&sib) else {
                         continue;
@@ -539,8 +523,7 @@ impl Engine {
                          must satisfy modulus > 0 and remainder < modulus"
                     )));
                 }
-                for sib in
-                    crate::partition::children_of_parent(self.active_catalog(), parent_name)
+                for sib in crate::partition::children_of_parent(self.active_catalog(), parent_name)
                 {
                     let Some(t) = self.active_catalog().get(&sib) else {
                         continue;
@@ -2087,9 +2070,10 @@ impl Engine {
                     .and_then(|p| Some(p.schema().partition_role.clone()))
                     .flatten()
                 {
-                    Some(PartitionRole::Parent { key_column_positions, .. }) => {
-                        key_column_positions.first().copied().unwrap_or(0)
-                    }
+                    Some(PartitionRole::Parent {
+                        key_column_positions,
+                        ..
+                    }) => key_column_positions.first().copied().unwrap_or(0),
                     _ => 0,
                 };
                 for sib in &siblings {
@@ -3542,11 +3526,14 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
         // Negative numeric constant: PG folds `- <lit>` into a typed Const.
         // The cast type is the *literal's* natural type (integer / numeric),
         // not the column type.
-        Expr::Unary { op: spg_sql::ast::UnOp::Neg, expr: inner } => match inner.as_ref() {
+        Expr::Unary {
+            op: spg_sql::ast::UnOp::Neg,
+            expr: inner,
+        } => match inner.as_ref() {
             Expr::Literal(Literal::Integer(n)) => alloc::format!("'-{n}'::integer"),
-            Expr::Literal(
-                Literal::Float(_) | Literal::NumericBig(_) | Literal::Numeric { .. },
-            ) => alloc::format!("'-{inner}'::numeric"),
+            Expr::Literal(Literal::Float(_) | Literal::NumericBig(_) | Literal::Numeric { .. }) => {
+                alloc::format!("'-{inner}'::numeric")
+            }
             _ => alloc::format!("{expr}"),
         },
         // Parenless SQL-standard keyword functions → bare uppercase keyword.

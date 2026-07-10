@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn col1(e: &mut Engine, sql: &str) -> Vec<i64> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,7 +24,8 @@ fn col1(e: &mut Engine, sql: &str) -> Vec<i64> {
 fn setup() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE fx (id INT, v INT)").unwrap();
-    e.execute("INSERT INTO fx VALUES (1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO fx VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     e
 }
 
@@ -62,9 +65,10 @@ fn exclude_current_row_count() {
     );
     assert_eq!(got, vec![2, 2, 2]);
     // GROUP / TIES honestly error.
-    assert!(e
-        .execute(
+    assert!(
+        e.execute(
             "SELECT sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) FROM fx"
         )
-        .is_err());
+        .is_err()
+    );
 }

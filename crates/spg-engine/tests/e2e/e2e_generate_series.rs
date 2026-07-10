@@ -288,9 +288,33 @@ fn integer_series_element_type_matches_pg() {
             _ => panic!("rows"),
         }
     };
-    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1,3) g LIMIT 1"), "integer");
-    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1,10,2) g LIMIT 1"), "integer");
-    assert_eq!(typ(&mut e, "SELECT pg_typeof(g) FROM generate_series(1::bigint,3) g LIMIT 1"), "bigint");
+    assert_eq!(
+        typ(
+            &mut e,
+            "SELECT pg_typeof(g) FROM generate_series(1,3) g LIMIT 1"
+        ),
+        "integer"
+    );
+    assert_eq!(
+        typ(
+            &mut e,
+            "SELECT pg_typeof(g) FROM generate_series(1,10,2) g LIMIT 1"
+        ),
+        "integer"
+    );
+    assert_eq!(
+        typ(
+            &mut e,
+            "SELECT pg_typeof(g) FROM generate_series(1::bigint,3) g LIMIT 1"
+        ),
+        "bigint"
+    );
     // sum(int4) widens to bigint (matches PG), not numeric.
-    assert_eq!(typ(&mut e, "SELECT pg_typeof(sum(g)) FROM generate_series(1,3) g"), "bigint");
+    assert_eq!(
+        typ(
+            &mut e,
+            "SELECT pg_typeof(sum(g)) FROM generate_series(1,3) g"
+        ),
+        "bigint"
+    );
 }

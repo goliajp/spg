@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn key_rows(e: &mut Engine, sql: &str) -> Vec<String> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,7 +23,10 @@ fn key_rows(e: &mut Engine, sql: &str) -> Vec<String> {
 fn jsonb_object_keys_returns_keys_in_order() {
     let mut e = Engine::new();
     assert_eq!(
-        key_rows(&mut e, "SELECT jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)"),
+        key_rows(
+            &mut e,
+            "SELECT jsonb_object_keys('{\"a\":1,\"b\":2,\"c\":3}'::jsonb)"
+        ),
         ["a", "b", "c"]
     );
 }
@@ -35,7 +40,10 @@ fn jsonb_object_keys_empty_object_no_rows() {
 #[test]
 fn jsonb_object_keys_errors_on_non_object() {
     let mut e = Engine::new();
-    assert!(e.execute("SELECT jsonb_object_keys('[1,2,3]'::jsonb)").is_err());
+    assert!(
+        e.execute("SELECT jsonb_object_keys('[1,2,3]'::jsonb)")
+            .is_err()
+    );
     assert!(e.execute("SELECT jsonb_object_keys('42'::jsonb)").is_err());
 }
 

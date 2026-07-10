@@ -10,7 +10,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -64,7 +66,10 @@ fn typed_cols() -> Engine {
 fn array_position_numeric() {
     let mut e = Engine::new();
     assert_eq!(
-        int(&mut e, "SELECT array_position(ARRAY[1.5,2.5,3.5]::numeric[], 2.5)"),
+        int(
+            &mut e,
+            "SELECT array_position(ARRAY[1.5,2.5,3.5]::numeric[], 2.5)"
+        ),
         2
     );
 }
@@ -73,7 +78,10 @@ fn array_position_numeric() {
 fn array_position_float8() {
     let mut e = Engine::new();
     assert_eq!(
-        int(&mut e, "SELECT array_position(ARRAY[3.5,2.5]::float8[], 2.5)"),
+        int(
+            &mut e,
+            "SELECT array_position(ARRAY[3.5,2.5]::float8[], 2.5)"
+        ),
         2
     );
 }
@@ -94,7 +102,10 @@ fn array_position_date() {
 fn array_position_not_found_is_null() {
     let mut e = Engine::new();
     assert!(matches!(
-        first(&mut e, "SELECT array_position(ARRAY[1.5,2.5]::numeric[], 9.9)"),
+        first(
+            &mut e,
+            "SELECT array_position(ARRAY[1.5,2.5]::numeric[], 9.9)"
+        ),
         spg_storage::Value::Null
     ));
 }
@@ -104,7 +115,10 @@ fn array_position_not_found_is_null() {
 #[test]
 fn array_position_money() {
     let mut e = typed_cols();
-    assert_eq!(int(&mut e, "SELECT array_position(m, '3'::money) FROM t"), 2);
+    assert_eq!(
+        int(&mut e, "SELECT array_position(m, '3'::money) FROM t"),
+        2
+    );
 }
 
 #[test]
@@ -132,7 +146,10 @@ fn array_position_bytea() {
 fn array_position_interval() {
     let mut e = typed_cols();
     assert_eq!(
-        int(&mut e, "SELECT array_position(iv, INTERVAL '2 hours') FROM t"),
+        int(
+            &mut e,
+            "SELECT array_position(iv, INTERVAL '2 hours') FROM t"
+        ),
         2
     );
 }
@@ -159,7 +176,10 @@ fn array_positions_numeric_multiple() {
     let mut e = Engine::new();
     // PG18.4: array_positions(ARRAY[1.5,2.5,2.5]::numeric[], 2.5) = {2,3}.
     assert_eq!(
-        int_array(&mut e, "SELECT array_positions(ARRAY[1.5,2.5,2.5]::numeric[], 2.5)"),
+        int_array(
+            &mut e,
+            "SELECT array_positions(ARRAY[1.5,2.5,2.5]::numeric[], 2.5)"
+        ),
         [2, 3]
     );
 }
@@ -182,7 +202,10 @@ fn array_positions_date_null_needle() {
 #[test]
 fn subscript_numeric() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT ((ARRAY[1.5,2.5,3.5]::numeric[])[3])::text"), "3.5");
+    assert_eq!(
+        text(&mut e, "SELECT ((ARRAY[1.5,2.5,3.5]::numeric[])[3])::text"),
+        "3.5"
+    );
 }
 
 #[test]

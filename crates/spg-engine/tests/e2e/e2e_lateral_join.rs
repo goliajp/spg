@@ -59,8 +59,10 @@ fn lateral_fromless_projects_outer_column() {
 
     // CROSS JOIN LATERAL, bare outer ref.
     let r = rows(
-        e.execute("SELECT t.id, x FROM t CROSS JOIN LATERAL (SELECT v + 1 AS x) sub WHERE t.id = 2")
-            .unwrap(),
+        e.execute(
+            "SELECT t.id, x FROM t CROSS JOIN LATERAL (SELECT v + 1 AS x) sub WHERE t.id = 2",
+        )
+        .unwrap(),
     );
     assert_eq!(r, vec![vec![Value::Int(2), Value::Int(21)]]);
 
@@ -71,7 +73,10 @@ fn lateral_fromless_projects_outer_column() {
         )
         .unwrap(),
     );
-    assert_eq!(r, vec![vec![Value::Int(3), Value::Int(300), Value::Int(32)]]);
+    assert_eq!(
+        r,
+        vec![vec![Value::Int(3), Value::Int(300), Value::Int(32)]]
+    );
 
     // JOIN LATERAL … ON true (the ON-clause mixed form).
     let r = rows(

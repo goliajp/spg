@@ -112,7 +112,8 @@ fn refresh_materialized_view_concurrently_parses() {
     e.execute("INSERT INTO t VALUES (1), (2)").unwrap();
     e.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t")
         .unwrap();
-    e.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+        .unwrap();
     e.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA")
         .unwrap();
 }

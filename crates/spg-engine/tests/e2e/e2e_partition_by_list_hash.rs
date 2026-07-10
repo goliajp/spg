@@ -50,10 +50,8 @@ fn list_parent_with_children() -> Engine {
          FOR VALUES IN ('de', 'fr', 'uk')",
     )
     .expect("CREATE TABLE child emea");
-    e.execute(
-        "CREATE TABLE customers_other PARTITION OF customers_listed DEFAULT",
-    )
-    .expect("CREATE TABLE DEFAULT child");
+    e.execute("CREATE TABLE customers_other PARTITION OF customers_listed DEFAULT")
+        .expect("CREATE TABLE DEFAULT child");
     e
 }
 
@@ -65,19 +63,10 @@ fn list_insert_routes_to_named_child() {
     e.execute("INSERT INTO customers_listed VALUES (2, 'de', 200)")
         .unwrap();
     // Routing landed each row in the correct child.
-    assert_eq!(
-        one_i64(&mut e, "SELECT COUNT(*) FROM customers_apac"),
-        1
-    );
-    assert_eq!(
-        one_i64(&mut e, "SELECT COUNT(*) FROM customers_emea"),
-        1
-    );
+    assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM customers_apac"), 1);
+    assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM customers_emea"), 1);
     // Parent reads via UNION over the children (round-trip view).
-    assert_eq!(
-        one_i64(&mut e, "SELECT COUNT(*) FROM customers_listed"),
-        2
-    );
+    assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM customers_listed"), 2);
 }
 
 #[test]
@@ -85,19 +74,14 @@ fn list_insert_falls_back_to_default() {
     let mut e = list_parent_with_children();
     e.execute("INSERT INTO customers_listed VALUES (3, 'us', 300)")
         .unwrap();
-    assert_eq!(
-        one_i64(&mut e, "SELECT COUNT(*) FROM customers_other"),
-        1
-    );
+    assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM customers_other"), 1);
 }
 
 #[test]
 fn list_duplicate_value_across_siblings_rejected() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE c_l_a PARTITION OF c_l FOR VALUES IN ('jp')")
         .unwrap();
     // Same 'jp' on a second sibling — must fail.
@@ -114,16 +98,12 @@ fn list_duplicate_value_across_siblings_rejected() {
 #[test]
 fn list_unknown_value_without_default_rejects_insert() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE c_l_a PARTITION OF c_l FOR VALUES IN ('jp')")
         .unwrap();
     // No DEFAULT, value 'us' not in any LIST child — rejected.
-    let err = e
-        .execute("INSERT INTO c_l VALUES (1, 'us')")
-        .unwrap_err();
+    let err = e.execute("INSERT INTO c_l VALUES (1, 'us')").unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("no partition") || msg.contains("LIST"),
@@ -229,10 +209,8 @@ fn hash_duplicate_remainder_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE oh (id BIGINT) PARTITION BY HASH (id)")
         .unwrap();
-    e.execute(
-        "CREATE TABLE oh_0 PARTITION OF oh FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE oh_0 PARTITION OF oh FOR VALUES WITH (MODULUS 4, REMAINDER 0)")
+        .unwrap();
     let err = e
         .execute(
             "CREATE TABLE oh_0_dup PARTITION OF oh \
@@ -251,10 +229,8 @@ fn hash_mixed_modulus_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE oh (id BIGINT) PARTITION BY HASH (id)")
         .unwrap();
-    e.execute(
-        "CREATE TABLE oh_0 PARTITION OF oh FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE oh_0 PARTITION OF oh FOR VALUES WITH (MODULUS 4, REMAINDER 0)")
+        .unwrap();
     let err = e
         .execute(
             "CREATE TABLE oh_2 PARTITION OF oh \

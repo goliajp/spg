@@ -53,9 +53,7 @@ fn pg_am_carries_pg_canonical_oids() {
 #[test]
 fn pg_collation_lists_default_c_posix() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_collation")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_collation").unwrap();
     let QueryResult::Rows { columns, rows } = r else {
         panic!("Rows");
     };
@@ -98,9 +96,7 @@ fn pg_collation_lists_default_c_posix() {
 fn pg_collation_carries_pg_canonical_oids() {
     // PG hard-codes oid 100 = default, 950 = C, 951 = POSIX.
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_collation")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_collation").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };

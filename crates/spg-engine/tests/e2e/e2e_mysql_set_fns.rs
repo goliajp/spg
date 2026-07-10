@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -36,18 +38,12 @@ fn export_set_bits() {
     let mut e = Engine::new();
     // MySQL doc vector: EXPORT_SET(5, 'Y', 'N', ',', 4) = 'Y,N,Y,N'.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT export_set(5, 'Y', 'N', ',', 4)"
-        )),
+        text(&first(&mut e, "SELECT export_set(5, 'Y', 'N', ',', 4)")),
         "Y,N,Y,N"
     );
     // MySQL doc vector: EXPORT_SET(6, '1', '0', ',', 10).
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT export_set(6, '1', '0', ',', 10)"
-        )),
+        text(&first(&mut e, "SELECT export_set(6, '1', '0', ',', 10)")),
         "0,1,1,0,0,0,0,0,0,0"
     );
 }
@@ -64,10 +60,7 @@ fn make_set_members() {
         )),
         "hello,world"
     );
-    assert_eq!(
-        text(&first(&mut e, "SELECT make_set(1, 'a', 'b')")),
-        "a"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT make_set(1, 'a', 'b')")), "a");
     assert_eq!(text(&first(&mut e, "SELECT make_set(0, 'a', 'b')")), "");
 }
 
@@ -78,7 +71,7 @@ fn truncate_alias() {
     // TRUNCATE(122, -2) = 100. A decimal input yields DECIMAL (like MySQL and
     // PG's numeric trunc), not double — the exact 1.2 rides a Numeric now.
     match first(&mut e, "SELECT truncate(1.223, 1)") {
-        spg_storage::Value::Numeric { scaled, scale , .. } => assert_eq!((scaled, scale), (12, 1)),
+        spg_storage::Value::Numeric { scaled, scale, .. } => assert_eq!((scaled, scale), (12, 1)),
         other => panic!("got {other:?}"),
     }
     match first(&mut e, "SELECT truncate(122, -2)") {

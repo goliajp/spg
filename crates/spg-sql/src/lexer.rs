@@ -412,9 +412,7 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 i += 1 + consumed;
             }
             // v7.38 (read01, T18) — PG `U&'...'` Unicode string literal.
-            b'U' | b'u'
-                if peek_eq(bytes, i + 1, b'&') && peek_eq(bytes, i + 2, b'\'') =>
-            {
+            b'U' | b'u' if peek_eq(bytes, i + 1, b'&') && peek_eq(bytes, i + 2, b'\'') => {
                 let (tok, consumed) = lex_unicode_string(input, i + 2)?;
                 out.push(tok);
                 i += 2 + consumed;
@@ -1479,16 +1477,13 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
         };
         if let Some(radix) = radix {
             let mut j = 2;
-            let valid = |b: u8| -> bool {
-                (b as char).to_digit(radix).is_some() || b == b'_'
-            };
+            let valid = |b: u8| -> bool { (b as char).to_digit(radix).is_some() || b == b'_' };
             let start = j;
             while j < bytes.len() && valid(bytes[j]) {
                 j += 1;
             }
             if j > start {
-                let digits: alloc::string::String =
-                    s[2..j].chars().filter(|c| *c != '_').collect();
+                let digits: alloc::string::String = s[2..j].chars().filter(|c| *c != '_').collect();
                 if !digits.is_empty() {
                     return match i64::from_str_radix(&digits, radix) {
                         Ok(v) => Ok((Token::Integer(v), j)),
@@ -1522,10 +1517,7 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     // v7.37.20 (20.4) — do NOT consume `.` when it's part of a `..`
     // range operator; leave both dots for the top-level dispatcher
     // which will emit a single Token::DotDot.
-    if i < bytes.len()
-        && bytes[i] == b'.'
-        && !(i + 1 < bytes.len() && bytes[i + 1] == b'.')
-    {
+    if i < bytes.len() && bytes[i] == b'.' && !(i + 1 < bytes.len() && bytes[i + 1] == b'.') {
         has_dot = true;
         i += 1;
         while i < bytes.len() && digit_or_sep(bytes, i) {

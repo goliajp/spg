@@ -34,10 +34,9 @@ fn pg_statistic_ext_returns_empty_with_pg_columns() {
 #[test]
 fn pg_statistic_lists_one_row_per_column() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (a INT, b TEXT, c BIGINT)").unwrap();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_statistic")
+    e.execute("CREATE TABLE t (a INT, b TEXT, c BIGINT)")
         .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_statistic").unwrap();
     let QueryResult::Rows { columns, rows } = r else {
         panic!("Rows");
     };
@@ -75,9 +74,7 @@ fn pg_statistic_lists_one_row_per_column() {
 #[test]
 fn pg_statistic_empty_when_no_user_tables() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_statistic")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_statistic").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };

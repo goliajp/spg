@@ -19,10 +19,25 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn jsonb_subscript_object_and_array() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (('{\"a\":{\"b\":1}}'::jsonb)['a']['b'])::text"), "1");
-    assert_eq!(text(&mut e, "SELECT (('[10,20,30]'::jsonb)[1])::text"), "20"); // 0-based
-    assert_eq!(text(&mut e, "SELECT (('{\"a\":[5,6,7]}'::jsonb)['a'][2])::text"), "7");
-    assert_eq!(text(&mut e, "SELECT (('{\"a\":1}'::jsonb)['x'])::text"), "<NULL>");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (('{\"a\":{\"b\":1}}'::jsonb)['a']['b'])::text"
+        ),
+        "1"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (('[10,20,30]'::jsonb)[1])::text"),
+        "20"
+    ); // 0-based
+    assert_eq!(
+        text(&mut e, "SELECT (('{\"a\":[5,6,7]}'::jsonb)['a'][2])::text"),
+        "7"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (('{\"a\":1}'::jsonb)['x'])::text"),
+        "<NULL>"
+    );
 }
 
 #[test]

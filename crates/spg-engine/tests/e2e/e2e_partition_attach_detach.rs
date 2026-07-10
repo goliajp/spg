@@ -35,10 +35,8 @@ fn attach_range_partition_round_trips() {
     )
     .unwrap();
     // Standalone child with parent-matching layout.
-    e.execute(
-        "CREATE TABLE events_2026_06 (id BIGINT NOT NULL, received_at TIMESTAMPTZ NOT NULL)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE events_2026_06 (id BIGINT NOT NULL, received_at TIMESTAMPTZ NOT NULL)")
+        .unwrap();
     // Attach it.
     e.execute(
         "ALTER TABLE events_p ATTACH PARTITION events_2026_06 \
@@ -46,30 +44,21 @@ fn attach_range_partition_round_trips() {
     )
     .unwrap();
     // Parent INSERT now routes through.
-    e.execute(
-        "INSERT INTO events_p VALUES (1, '2026-06-15 12:00:00+00')",
-    )
-    .unwrap();
-    assert_eq!(
-        one_i64(&mut e, "SELECT COUNT(*) FROM events_2026_06"),
-        1
-    );
+    e.execute("INSERT INTO events_p VALUES (1, '2026-06-15 12:00:00+00')")
+        .unwrap();
+    assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM events_2026_06"), 1);
     assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM events_p"), 1);
 }
 
 #[test]
 fn attach_list_partition_routes_existing_inserts() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE c_apac (id BIGINT, region TEXT)")
         .unwrap();
-    e.execute(
-        "ALTER TABLE c_l ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')",
-    )
-    .unwrap();
+    e.execute("ALTER TABLE c_l ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')")
+        .unwrap();
     e.execute("INSERT INTO c_l VALUES (1, 'jp')").unwrap();
     assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM c_apac"), 1);
 }
@@ -81,14 +70,10 @@ fn attach_hash_partition_routes_existing_inserts() {
         .unwrap();
     e.execute("CREATE TABLE oh_0 (id BIGINT)").unwrap();
     e.execute("CREATE TABLE oh_1 (id BIGINT)").unwrap();
-    e.execute(
-        "ALTER TABLE oh ATTACH PARTITION oh_0 FOR VALUES WITH (MODULUS 2, REMAINDER 0)",
-    )
-    .unwrap();
-    e.execute(
-        "ALTER TABLE oh ATTACH PARTITION oh_1 FOR VALUES WITH (MODULUS 2, REMAINDER 1)",
-    )
-    .unwrap();
+    e.execute("ALTER TABLE oh ATTACH PARTITION oh_0 FOR VALUES WITH (MODULUS 2, REMAINDER 0)")
+        .unwrap();
+    e.execute("ALTER TABLE oh ATTACH PARTITION oh_1 FOR VALUES WITH (MODULUS 2, REMAINDER 1)")
+        .unwrap();
     for i in 0..10 {
         let sql = format!("INSERT INTO oh VALUES ({i})");
         e.execute(&sql).unwrap();
@@ -124,11 +109,10 @@ fn attach_rejects_layout_mismatch() {
 #[test]
 fn attach_rejects_non_empty_child() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE p (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
-    e.execute("CREATE TABLE c (id BIGINT, region TEXT)").unwrap();
+    e.execute("CREATE TABLE p (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
+    e.execute("CREATE TABLE c (id BIGINT, region TEXT)")
+        .unwrap();
     e.execute("INSERT INTO c VALUES (1, 'jp')").unwrap();
     let err = e
         .execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
@@ -152,7 +136,8 @@ fn attach_rejects_overlap_with_existing_sibling() {
          FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00')",
     )
     .unwrap();
-    e.execute("CREATE TABLE c2 (id BIGINT, received_at TIMESTAMPTZ)").unwrap();
+    e.execute("CREATE TABLE c2 (id BIGINT, received_at TIMESTAMPTZ)")
+        .unwrap();
     let err = e
         .execute(
             "ALTER TABLE p ATTACH PARTITION c2 \
@@ -169,17 +154,16 @@ fn attach_rejects_overlap_with_existing_sibling() {
 #[test]
 fn detach_partition_makes_child_standalone() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE c_apac PARTITION OF c_l FOR VALUES IN ('jp')")
         .unwrap();
     e.execute("INSERT INTO c_l VALUES (1, 'jp')").unwrap();
     assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM c_apac"), 1);
 
     // Detach.
-    e.execute("ALTER TABLE c_l DETACH PARTITION c_apac").unwrap();
+    e.execute("ALTER TABLE c_l DETACH PARTITION c_apac")
+        .unwrap();
 
     // c_apac retains its rows but is no longer in the parent UNION.
     assert_eq!(one_i64(&mut e, "SELECT COUNT(*) FROM c_apac"), 1);
@@ -197,10 +181,8 @@ fn detach_concurrently_accepted_at_parser() {
     // performs the same atomic detach (PG's two-phase split exists
     // to address replication lag, which doesn't apply here).
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE c_l (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE c_apac PARTITION OF c_l FOR VALUES IN ('jp')")
         .unwrap();
     e.execute("ALTER TABLE c_l DETACH PARTITION c_apac CONCURRENTLY")
@@ -231,11 +213,10 @@ fn detach_rejects_non_child() {
 #[test]
 fn attach_then_detach_round_trip_preserves_standalone_inserts() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE p (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
-    e.execute("CREATE TABLE c (id BIGINT, region TEXT)").unwrap();
+    e.execute("CREATE TABLE p (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
+    e.execute("CREATE TABLE c (id BIGINT, region TEXT)")
+        .unwrap();
     e.execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
         .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'jp')").unwrap();

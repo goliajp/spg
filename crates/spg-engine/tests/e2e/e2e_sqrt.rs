@@ -22,7 +22,7 @@ fn float_result(e: &mut Engine, sql: &str) -> f64 {
         Value::Float(x) => *x,
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
-        Value::Numeric { scaled, scale , .. } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
+        Value::Numeric { scaled, scale, .. } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
         other => panic!("got {other:?}"),
     }
 }

@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -11,7 +13,9 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
 }
 
 fn cols(e: &mut Engine, sql: &str) -> Vec<String> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { columns, .. } = r else {
         panic!("expected Rows");
     };
@@ -41,7 +45,10 @@ fn ordinality_tracks_series_order() {
     assert_eq!(as_i64(&got[2][1]), 3);
     // PG's default column names.
     assert_eq!(
-        cols(&mut e, "SELECT * FROM generate_series(1, 2) WITH ORDINALITY"),
+        cols(
+            &mut e,
+            "SELECT * FROM generate_series(1, 2) WITH ORDINALITY"
+        ),
         ["generate_series", "ordinality"]
     );
 }

@@ -7,7 +7,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -17,9 +19,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
 #[test]
 fn pg_class_columns_match_pg_canonical() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_class")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_class").unwrap();
     let QueryResult::Rows { columns, .. } = r else {
         panic!("expected Rows");
     };
@@ -47,10 +47,8 @@ fn pg_class_columns_match_pg_canonical() {
 #[test]
 fn pg_class_relkind_p_for_partition_parent() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
         .unwrap();
     e.execute("CREATE TABLE plain (id INT)").unwrap();
@@ -62,13 +60,25 @@ fn pg_class_relkind_p_for_partition_parent() {
             .unwrap_or_else(|| panic!("missing pg_class row for {needle}"))
     };
     let cust = by_name("cust");
-    assert!(matches!(&cust[16], Value::Text(s) if s.as_ref() == "p"), "parent relkind");
-    assert!(matches!(cust[26], Value::Bool(false)), "parent is not a partition");
+    assert!(
+        matches!(&cust[16], Value::Text(s) if s.as_ref() == "p"),
+        "parent relkind"
+    );
+    assert!(
+        matches!(cust[26], Value::Bool(false)),
+        "parent is not a partition"
+    );
     let apac = by_name("cust_apac");
     assert!(matches!(apac[26], Value::Bool(true)), "apac is a partition");
     let plain = by_name("plain");
-    assert!(matches!(&plain[16], Value::Text(s) if s.as_ref() == "r"), "plain table relkind");
-    assert!(matches!(plain[26], Value::Bool(false)), "plain not a partition");
+    assert!(
+        matches!(&plain[16], Value::Text(s) if s.as_ref() == "r"),
+        "plain table relkind"
+    );
+    assert!(
+        matches!(plain[26], Value::Bool(false)),
+        "plain not a partition"
+    );
 }
 
 #[test]

@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -24,10 +26,7 @@ fn crypt_md5_known_vector() {
     // Vector verified against `openssl passwd -1 -salt saltsalt
     // password` on this machine.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT crypt('password', '$1$saltsalt$')"
-        )),
+        text(&first(&mut e, "SELECT crypt('password', '$1$saltsalt$')")),
         "$1$saltsalt$qjXMvbEw8oaL.CzflDtaK/"
     );
 }
@@ -36,10 +35,7 @@ fn crypt_md5_known_vector() {
 fn crypt_verify_roundtrip() {
     let mut e = Engine::new();
     // PG idiom: crypt(pw, stored_hash) == stored_hash verifies.
-    let hashed = text(&first(
-        &mut e,
-        "SELECT crypt('s3cret', gen_salt('md5'))",
-    ));
+    let hashed = text(&first(&mut e, "SELECT crypt('s3cret', gen_salt('md5'))"));
     assert!(hashed.starts_with("$1$"), "hash shape: {hashed}");
     let verify_sql = format!("SELECT crypt('s3cret', '{hashed}')");
     assert_eq!(text(&first(&mut e, &verify_sql)), hashed);
@@ -64,9 +60,10 @@ fn unsupported_schemes_error() {
     assert!(e.execute("SELECT gen_salt('des')").is_err());
     assert!(e.execute("SELECT gen_salt('bogus')").is_err());
     // bcrypt-format salt errors in crypt too.
-    assert!(e
-        .execute("SELECT crypt('pw', '$2a$06$abcdefghijklmnopqrstuv')")
-        .is_err());
+    assert!(
+        e.execute("SELECT crypt('pw', '$2a$06$abcdefghijklmnopqrstuv')")
+            .is_err()
+    );
 }
 
 #[test]

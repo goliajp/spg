@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn count(e: &mut Engine, sql: &str) -> i64 {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -49,7 +51,8 @@ fn fifty_percent_is_a_real_sample() {
 fn combines_with_where_and_alias() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE tw (v INT)").unwrap();
-    e.execute("INSERT INTO tw VALUES (1), (2), (3), (4)").unwrap();
+    e.execute("INSERT INTO tw VALUES (1), (2), (3), (4)")
+        .unwrap();
     // Sampling ANDs with the user WHERE; alias still qualifies.
     assert_eq!(
         count(
@@ -72,11 +75,20 @@ fn repeatable_is_deterministic() {
     for i in 0..1000 {
         e.execute(&format!("INSERT INTO tr VALUES({i})")).unwrap();
     }
-    let c1 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)");
-    let c2 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)");
+    let c1 = count(
+        &mut e,
+        "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)",
+    );
+    let c2 = count(
+        &mut e,
+        "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(42)",
+    );
     assert_eq!(c1, c2, "same seed must reproduce the same sample");
     // A different seed generally selects a different subset.
-    let c3 = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(7)");
+    let c3 = count(
+        &mut e,
+        "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30) REPEATABLE(7)",
+    );
     assert_ne!(c1, c3, "different seed should give a different sample");
     // Non-REPEATABLE still parses and samples.
     let _ = count(&mut e, "SELECT count(*) FROM tr TABLESAMPLE BERNOULLI(30)");

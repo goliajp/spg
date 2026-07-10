@@ -3813,47 +3813,47 @@ impl Database {
                 // checkpoint instead of waiting a full interval.
                 let accepted = self.trigger_checkpoint()?;
                 if accepted {
-                // v7.37.13 (A1.8) — feed the EWMA + recompute the
-                // adaptive byte threshold from observed WAL growth
-                // rate. Read the prior markers BEFORE we overwrite
-                // them so dt_secs / bytes_in_window are correct.
-                let p = self.persistence.as_mut().expect("checked above");
-                let new_at = std::time::Instant::now();
-                let now_len = p.wal.written_len();
-                if p.adaptive_threshold_enabled {
-                    let prev_at = *p
-                        .last_checkpoint_at
+                    // v7.37.13 (A1.8) — feed the EWMA + recompute the
+                    // adaptive byte threshold from observed WAL growth
+                    // rate. Read the prior markers BEFORE we overwrite
+                    // them so dt_secs / bytes_in_window are correct.
+                    let p = self.persistence.as_mut().expect("checked above");
+                    let new_at = std::time::Instant::now();
+                    let now_len = p.wal.written_len();
+                    if p.adaptive_threshold_enabled {
+                        let prev_at = *p
+                            .last_checkpoint_at
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let prev_len = *p
+                            .last_checkpoint_wal_len
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let dt_secs = new_at.duration_since(prev_at).as_secs_f64().max(0.001);
+                        let bytes_in_window = now_len.saturating_sub(prev_len);
+                        let rate = (bytes_in_window as f64 / dt_secs) as u64;
+                        let mut ewma = p
+                            .ewma_wal_rate_bytes_per_sec
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        *ewma = if *ewma == 0 {
+                            rate
+                        } else {
+                            // α = 0.3 (current rate weight); 0.7 history.
+                            (rate.saturating_mul(30) + ewma.saturating_mul(70)) / 100
+                        };
+                        let target = ewma.saturating_mul(30); // ~30 s of writes
+                        drop(ewma);
+                        // Bound: [1 MiB, 64 MiB] so we never go absurd.
+                        let bounded = target.max(1024 * 1024).min(64 * 1024 * 1024);
+                        p.checkpoint_threshold_bytes = bounded;
+                    }
+                    *p.last_checkpoint_at
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let prev_len = *p
-                        .last_checkpoint_wal_len
+                        .unwrap_or_else(|e| e.into_inner()) = new_at;
+                    *p.last_checkpoint_wal_len
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let dt_secs = new_at.duration_since(prev_at).as_secs_f64().max(0.001);
-                    let bytes_in_window = now_len.saturating_sub(prev_len);
-                    let rate = (bytes_in_window as f64 / dt_secs) as u64;
-                    let mut ewma = p
-                        .ewma_wal_rate_bytes_per_sec
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    *ewma = if *ewma == 0 {
-                        rate
-                    } else {
-                        // α = 0.3 (current rate weight); 0.7 history.
-                        (rate.saturating_mul(30) + ewma.saturating_mul(70)) / 100
-                    };
-                    let target = ewma.saturating_mul(30); // ~30 s of writes
-                    drop(ewma);
-                    // Bound: [1 MiB, 64 MiB] so we never go absurd.
-                    let bounded = target.max(1024 * 1024).min(64 * 1024 * 1024);
-                    p.checkpoint_threshold_bytes = bounded;
-                }
-                *p.last_checkpoint_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = new_at;
-                *p.last_checkpoint_wal_len
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = now_len;
+                        .unwrap_or_else(|e| e.into_inner()) = now_len;
                 }
             }
         }

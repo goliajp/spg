@@ -122,7 +122,9 @@ pub fn is_scalarsq_streaming_shape(stmt: &SelectStatement) -> bool {
 fn expr_has_scalar_subquery(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) => true,
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => false,
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_scalar_subquery(call)
@@ -131,9 +133,10 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => {
             expr_has_scalar_subquery(lhs) || expr_has_scalar_subquery(rhs)
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            expr_has_scalar_subquery(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => expr_has_scalar_subquery(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_scalar_subquery),
         Expr::Like { expr, pattern, .. } => {
             expr_has_scalar_subquery(expr) || expr_has_scalar_subquery(pattern)
@@ -193,7 +196,9 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
 fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
     match e {
         Expr::WindowFunction { .. } => true,
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => true,
         // Top-level SRF. `is_top_level_unnest` (in select.rs) is the
         // authority on SRF detection at the SELECT level; for the
@@ -213,9 +218,10 @@ fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => {
             expr_has_streaming_disqualifier(lhs) || expr_has_streaming_disqualifier(rhs)
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            expr_has_streaming_disqualifier(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => expr_has_streaming_disqualifier(expr),
         Expr::Like { expr, pattern, .. } => {
             expr_has_streaming_disqualifier(expr) || expr_has_streaming_disqualifier(pattern)
         }
@@ -367,7 +373,9 @@ impl Engine {
         let seek_snapshot = self.current_snapshot();
         let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
             try_index_seek(w, schema_cols, catalog, table, alias, &seek_snapshot)
-                .or_else(|| try_gin_seek(w, schema_cols, catalog, table, alias, &ctx, &seek_snapshot))
+                .or_else(|| {
+                    try_gin_seek(w, schema_cols, catalog, table, alias, &ctx, &seek_snapshot)
+                })
                 .or_else(|| try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot))
                 .or_else(|| try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot))
         });

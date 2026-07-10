@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -20,15 +22,15 @@ fn as_bool(v: &spg_storage::Value<'_>) -> bool {
 #[test]
 fn isfinite_date_timestamp_interval() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT isfinite('2020-01-01'::date)")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT isfinite('2020-01-01'::date)"
+    )));
     assert!(as_bool(&first(
         &mut e,
         "SELECT isfinite('2020-01-01 12:00:00'::timestamp)"
     )));
-    assert!(as_bool(&first(
-        &mut e,
-        "SELECT isfinite(INTERVAL '1 day')"
-    )));
+    assert!(as_bool(&first(&mut e, "SELECT isfinite(INTERVAL '1 day')")));
 }
 
 #[test]

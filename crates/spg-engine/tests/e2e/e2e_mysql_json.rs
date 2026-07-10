@@ -6,7 +6,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -50,7 +52,10 @@ fn json_length_and_depth() {
         spg_storage::Value::Int(3)
     ));
     assert!(matches!(
-        first(&mut e, "SELECT json_length('{\"a\": 1, \"b\": {\"c\": 30}}')"),
+        first(
+            &mut e,
+            "SELECT json_length('{\"a\": 1, \"b\": {\"c\": 30}}')"
+        ),
         spg_storage::Value::Int(2)
     ));
     assert!(matches!(
@@ -91,7 +96,10 @@ fn json_keys_quote_unquote() {
         spg_storage::Value::Null
     ));
     // MySQL doc vector: JSON_QUOTE('null') → '"null"'.
-    assert_eq!(text(&first(&mut e, "SELECT json_quote('null')")), "\"null\"");
+    assert_eq!(
+        text(&first(&mut e, "SELECT json_quote('null')")),
+        "\"null\""
+    );
     // MySQL doc vector: JSON_UNQUOTE('"abc"') → 'abc'.
     assert_eq!(
         text(&first(&mut e, "SELECT json_unquote('\"abc\"')")),

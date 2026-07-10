@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -26,10 +28,7 @@ fn array_positions_int_multiple_matches() {
 #[test]
 fn array_positions_text_single_match() {
     let mut e = Engine::new();
-    let v = first(
-        &mut e,
-        "SELECT array_positions(ARRAY['a', 'b', 'a'], 'b')",
-    );
+    let v = first(&mut e, "SELECT array_positions(ARRAY['a', 'b', 'a'], 'b')");
     match &v {
         spg_storage::Value::IntArray(items) => {
             let s: Vec<_> = items.iter().map(|o| o.unwrap()).collect();

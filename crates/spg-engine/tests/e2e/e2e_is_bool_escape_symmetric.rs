@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -26,13 +28,25 @@ fn is_true_false_unknown_three_valued() {
     // NULL IS TRUE is false (not NULL) — the count proves the
     // three-valued lowering never yields NULL.
     let n = one(&mut e, "SELECT count(*) FROM ib WHERE v IS TRUE");
-    assert!(matches!(n, spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)));
+    assert!(matches!(
+        n,
+        spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)
+    ));
     let n = one(&mut e, "SELECT count(*) FROM ib WHERE v IS NOT TRUE");
-    assert!(matches!(n, spg_storage::Value::BigInt(2) | spg_storage::Value::Int(2)));
+    assert!(matches!(
+        n,
+        spg_storage::Value::BigInt(2) | spg_storage::Value::Int(2)
+    ));
     let n = one(&mut e, "SELECT count(*) FROM ib WHERE v IS FALSE");
-    assert!(matches!(n, spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)));
+    assert!(matches!(
+        n,
+        spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)
+    ));
     let n = one(&mut e, "SELECT count(*) FROM ib WHERE v IS UNKNOWN");
-    assert!(matches!(n, spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)));
+    assert!(matches!(
+        n,
+        spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)
+    ));
     assert!(b(one(&mut e, "SELECT (1 > 2) IS NOT TRUE")));
 }
 
@@ -47,7 +61,10 @@ fn like_escape_rewrites_pattern() {
         &mut e,
         "SELECT count(*) FROM le WHERE t LIKE '50!% off' ESCAPE '!'",
     );
-    assert!(matches!(n, spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)));
+    assert!(matches!(
+        n,
+        spg_storage::Value::BigInt(1) | spg_storage::Value::Int(1)
+    ));
     // Doubled escape char is the literal char.
     assert!(b(one(&mut e, "SELECT 'a!b' LIKE 'a!!b' ESCAPE '!'")));
 }

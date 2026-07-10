@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -70,10 +72,7 @@ fn merge_preserve_vectors() {
         "{\"name\":[\"x\",\"y\"]}"
     );
     // Scalars combine into an array; deprecated json_merge alias.
-    assert_eq!(
-        text(&first(&mut e, "SELECT json_merge('1', '2')")),
-        "[1,2]"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT json_merge('1', '2')")), "[1,2]");
 }
 
 #[test]

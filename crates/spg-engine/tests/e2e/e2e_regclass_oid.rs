@@ -23,11 +23,17 @@ fn oid_to_regclass_reverse_lookup() {
     e.execute("CREATE TABLE reg_b(b int)").unwrap();
     // The pg_class.oid → regclass idiom renders the relation name.
     assert_eq!(
-        text(&mut e, "SELECT (oid::regclass)::text FROM pg_class WHERE relname='reg_a'"),
+        text(
+            &mut e,
+            "SELECT (oid::regclass)::text FROM pg_class WHERE relname='reg_a'"
+        ),
         "reg_a"
     );
     assert_eq!(
-        text(&mut e, "SELECT (oid::regclass)::text FROM pg_class WHERE relname='reg_b'"),
+        text(
+            &mut e,
+            "SELECT (oid::regclass)::text FROM pg_class WHERE relname='reg_b'"
+        ),
         "reg_b"
     );
     // An OID with no matching relation renders as the integer (fallback).

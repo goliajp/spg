@@ -19,7 +19,10 @@ fn trunc_numeric_stays_numeric() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT trunc(3.14159, 2)::text"), "3.14");
     // Exact past f64 precision (float would drift).
-    assert_eq!(text(&mut e, "SELECT trunc(1234567.891234567891, 8)::text"), "1234567.89123456");
+    assert_eq!(
+        text(&mut e, "SELECT trunc(1234567.891234567891, 8)::text"),
+        "1234567.89123456"
+    );
     // Truncation is toward zero.
     assert_eq!(text(&mut e, "SELECT trunc(-3.14159, 2)::text"), "-3.14");
     // Negative target scale.

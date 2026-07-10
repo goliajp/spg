@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -71,10 +73,7 @@ fn column_alias_list_overrides_value() {
         &mut e,
         "SELECT el FROM json_array_elements('[5, 6]') AS t(el)",
     );
-    assert_eq!(
-        texts(&got),
-        [Some("5".to_string()), Some("6".to_string())]
-    );
+    assert_eq!(texts(&got), [Some("5".to_string()), Some("6".to_string())]);
 }
 
 #[test]
@@ -104,11 +103,17 @@ fn select_list_expands_per_element() {
     let mut e = Engine::new();
     // no-FROM, plain and _text.
     assert_eq!(
-        texts(&rows(&mut e, "SELECT jsonb_array_elements('[1, 2, 3]'::jsonb)")),
+        texts(&rows(
+            &mut e,
+            "SELECT jsonb_array_elements('[1, 2, 3]'::jsonb)"
+        )),
         [Some("1".into()), Some("2".into()), Some("3".into())]
     );
     assert_eq!(
-        texts(&rows(&mut e, "SELECT jsonb_array_elements_text('[\"a\", null]'::jsonb)")),
+        texts(&rows(
+            &mut e,
+            "SELECT jsonb_array_elements_text('[\"a\", null]'::jsonb)"
+        )),
         [Some("a".into()), None]
     );
     // no-FROM with a sibling scalar column repeated per element.
@@ -118,13 +123,17 @@ fn select_list_expands_per_element() {
     assert_eq!(got[1][1], spg_storage::Value::Text("8".into()));
     // Over a real table: one element-row per source row, in order.
     e.execute("CREATE TABLE jt(j jsonb)").unwrap();
-    e.execute("INSERT INTO jt VALUES ('[10, 20]'), ('[30]')").unwrap();
+    e.execute("INSERT INTO jt VALUES ('[10, 20]'), ('[30]')")
+        .unwrap();
     assert_eq!(
         texts(&rows(&mut e, "SELECT jsonb_array_elements(j) FROM jt")),
         [Some("10".into()), Some("20".into()), Some("30".into())]
     );
     // NULL input → no rows.
-    assert_eq!(rows(&mut e, "SELECT jsonb_array_elements(NULL::jsonb)").len(), 0);
+    assert_eq!(
+        rows(&mut e, "SELECT jsonb_array_elements(NULL::jsonb)").len(),
+        0
+    );
 }
 
 #[test]
@@ -134,26 +143,37 @@ fn jsonb_path_query_expands_per_match() {
     let mut e = Engine::new();
     // no-FROM SELECT list.
     assert_eq!(
-        texts(&rows(&mut e, "SELECT jsonb_path_query('[1, 2, 3]'::jsonb, '$[*]')")),
+        texts(&rows(
+            &mut e,
+            "SELECT jsonb_path_query('[1, 2, 3]'::jsonb, '$[*]')"
+        )),
         [Some("1".into()), Some("2".into()), Some("3".into())]
     );
     // object member wildcard.
     assert_eq!(
-        texts(&rows(&mut e, "SELECT jsonb_path_query('{\"a\": [10, 20]}'::jsonb, '$.a[*]')")),
+        texts(&rows(
+            &mut e,
+            "SELECT jsonb_path_query('{\"a\": [10, 20]}'::jsonb, '$.a[*]')"
+        )),
         [Some("10".into()), Some("20".into())]
     );
     // FROM item: PG names the column after the function; a column alias renames.
     let r = e
         .execute("SELECT * FROM jsonb_path_query('[1, 2, 3]'::jsonb, '$[*]')")
         .unwrap();
-    let QueryResult::Rows { columns, rows: got_rows } = r else {
+    let QueryResult::Rows {
+        columns,
+        rows: got_rows,
+    } = r
+    else {
         panic!("rows")
     };
     assert_eq!(columns[0].name, "jsonb_path_query");
     assert_eq!(got_rows.len(), 3);
     // Over a real table's rows, expanded per source row.
     e.execute("CREATE TABLE pq(j jsonb)").unwrap();
-    e.execute("INSERT INTO pq VALUES ('[1, 2]'), ('[3]')").unwrap();
+    e.execute("INSERT INTO pq VALUES ('[1, 2]'), ('[3]')")
+        .unwrap();
     assert_eq!(
         texts(&rows(&mut e, "SELECT jsonb_path_query(j, '$[*]') FROM pq")),
         [Some("1".into()), Some("2".into()), Some("3".into())]
@@ -167,8 +187,5 @@ fn non_array_input_errors() {
         .execute("SELECT value FROM jsonb_array_elements('{\"a\": 1}')")
         .unwrap_err();
     let msg = format!("{err:?}");
-    assert!(
-        msg.contains("non-array"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("non-array"), "unexpected error: {msg}");
 }

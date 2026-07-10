@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -53,7 +55,10 @@ fn regexp_instr_endoption_returns_end_pos() {
 #[test]
 fn regexp_substr_first_match() {
     let mut e = Engine::new();
-    match first(&mut e, "SELECT regexp_substr('abc def ghi', '[a-z][a-z][a-z]')") {
+    match first(
+        &mut e,
+        "SELECT regexp_substr('abc def ghi', '[a-z][a-z][a-z]')",
+    ) {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "abc"),
         other => panic!("got {other:?}"),
     }

@@ -3,7 +3,8 @@
 use spg_engine::Engine;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -21,5 +22,8 @@ fn set_constraints_all_immediate_no_op() {
 #[test]
 fn set_constraints_named_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "SET CONSTRAINTS fk_orders_customer, uq_orders_ref DEFERRED");
+    ddl(
+        &mut e,
+        "SET CONSTRAINTS fk_orders_customer, uq_orders_ref DEFERRED",
+    );
 }

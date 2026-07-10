@@ -631,7 +631,10 @@ impl Engine {
                 let mut s = (**subquery).clone();
                 substitute_outer_columns(&mut s, row, ctx);
                 let r = self.exec_select_cancel(&s, cancel)?;
-                let QueryResult::Rows { columns, mut rows, .. } = r else {
+                let QueryResult::Rows {
+                    columns, mut rows, ..
+                } = r
+                else {
                     return Err(EngineError::Unsupported(
                         "row comparison subquery: inner did not return rows".into(),
                     ));
@@ -664,7 +667,10 @@ impl Engine {
                 self.resolve_correlated_in_expr(lhs, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(rhs, row, ctx, cancel, memo.as_deref_mut())?;
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::FieldAccess { base: expr, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::Like { expr, pattern, .. } => {
@@ -932,7 +938,10 @@ impl Engine {
                     Err(e) if is_correlation_error(&e) => return Ok(None),
                     Err(e) => return Err(e),
                 };
-                let QueryResult::Rows { columns, mut rows, .. } = r else {
+                let QueryResult::Rows {
+                    columns, mut rows, ..
+                } = r
+                else {
                     return Err(EngineError::Unsupported(
                         "row comparison subquery: inner statement did not return rows".into(),
                     ));
@@ -1753,7 +1762,10 @@ impl Engine {
                     joins_out,
                 );
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::FieldAccess { base: expr, .. } => {
                 self.pull_up_walk_limit_one(
                     expr,
                     in_agg,
@@ -2066,8 +2078,8 @@ impl Engine {
             body: spg_sql::ast::CteBody::Select(body),
             recursive: false,
             column_overrides: Vec::new(),
-                    search: None,
-                    cycle: None,
+            search: None,
+            cycle: None,
         };
         // LEFT JOIN __cl1_N ON __cl1_N.jk = <outer_col>
         let join = FromJoin {
@@ -2190,7 +2202,10 @@ impl Engine {
                 self.pull_up_walk(lhs, in_agg, outer_aliases, joins_out);
                 self.pull_up_walk(rhs, in_agg, outer_aliases, joins_out);
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::FieldAccess { base: expr, .. } => {
                 self.pull_up_walk(expr, in_agg, outer_aliases, joins_out);
             }
             Expr::Like { expr, pattern, .. } => {
@@ -3019,7 +3034,10 @@ fn proj_has_disqualifying_shape(
             proj_has_disqualifying_shape(lhs, inner_alias, outer_aliases)
                 || proj_has_disqualifying_shape(rhs, inner_alias, outer_aliases)
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             proj_has_disqualifying_shape(expr, inner_alias, outer_aliases)
         }
         Expr::Like { expr, pattern, .. } => {
@@ -3108,7 +3126,10 @@ fn disambiguate_expr_unqualified_columns(
             disambiguate_expr_unqualified_columns(lhs, owner);
             disambiguate_expr_unqualified_columns(rhs, owner);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             disambiguate_expr_unqualified_columns(expr, owner);
         }
         Expr::FunctionCall { args, .. } => {
@@ -3194,7 +3215,10 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             rename_qualifier(lhs, from, to);
             rename_qualifier(rhs, from, to);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             rename_qualifier(expr, from, to);
         }
         Expr::FunctionCall { args, .. } => {
@@ -3739,13 +3763,18 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
 pub(crate) fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
     match e {
         Expr::ScalarSubquery(s) => out.push(s),
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             collect_scalar_subqueries(lhs, out);
             collect_scalar_subqueries(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             collect_scalar_subqueries(expr, out);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -3804,13 +3833,18 @@ fn hollow_scalar_subqueries(e: &mut Expr) {
             };
             **s = hollow;
         }
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             hollow_scalar_subqueries(lhs);
             hollow_scalar_subqueries(rhs);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             hollow_scalar_subqueries(expr);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -3894,11 +3928,16 @@ fn splice_planned_subqueries(
             *e = value_to_literal_expr(v)?;
             Ok(true)
         }
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => Ok(true),
         Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_subqueries(lhs, plan, idx, row, ctx)?
             && splice_planned_subqueries(rhs, plan, idx, row, ctx)?),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             splice_planned_subqueries(expr, plan, idx, row, ctx)
         }
         Expr::Like { expr, pattern, .. } => {
@@ -3976,13 +4015,18 @@ fn splice_planned_subqueries(
 pub(crate) fn collect_exists_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
     match e {
         Expr::Exists { subquery, .. } => out.push(subquery.as_ref()),
-        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             collect_exists_subqueries(lhs, out);
             collect_exists_subqueries(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             collect_exists_subqueries(expr, out);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -4066,13 +4110,16 @@ fn splice_planned_exists(
             *e = Expr::Literal(Literal::Bool(bit));
             Ok(true)
         }
-        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => Ok(true),
         Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_exists(lhs, plan, idx, row, ctx)?
             && splice_planned_exists(rhs, plan, idx, row, ctx)?),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            splice_planned_exists(expr, plan, idx, row, ctx)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => splice_planned_exists(expr, plan, idx, row, ctx),
         Expr::Like { expr, pattern, .. } => Ok(splice_planned_exists(expr, plan, idx, row, ctx)?
             && splice_planned_exists(pattern, plan, idx, row, ctx)?),
         Expr::FunctionCall { args, .. } => {
@@ -4352,7 +4399,10 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             substitute_in_expr(lhs, row, ctx, outer_alias);
             substitute_in_expr(rhs, row, ctx, outer_alias);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             substitute_in_expr(expr, row, ctx, outer_alias);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -4385,13 +4435,21 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
             substitute_in_select(subquery, row, ctx, outer_alias);
         }
-        Expr::RowInSubquery { row: row_exprs, subquery, .. } => {
+        Expr::RowInSubquery {
+            row: row_exprs,
+            subquery,
+            ..
+        } => {
             for el in row_exprs.iter_mut() {
                 substitute_in_expr(el, row, ctx, outer_alias);
             }
             substitute_in_select(subquery, row, ctx, outer_alias);
         }
-        Expr::RowCmpSubquery { row: row_exprs, subquery, .. } => {
+        Expr::RowCmpSubquery {
+            row: row_exprs,
+            subquery,
+            ..
+        } => {
             for el in row_exprs.iter_mut() {
                 substitute_in_expr(el, row, ctx, outer_alias);
             }
@@ -4472,15 +4530,19 @@ pub fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
 
 pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::RowInSubquery { .. }
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => true,
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_subquery(call) || order_by.iter().any(|o| expr_has_subquery(&o.expr))
         }
         Expr::Binary { lhs, rhs, .. } => expr_has_subquery(lhs) || expr_has_subquery(rhs),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            expr_has_subquery(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => expr_has_subquery(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_subquery),
         Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
         Expr::Extract { source, .. } => expr_has_subquery(source),

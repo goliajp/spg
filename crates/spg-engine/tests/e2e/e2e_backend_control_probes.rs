@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -23,7 +25,10 @@ fn wait_for_backend_termination_returns_true() {
 #[test]
 fn isolation_probe_returns_false() {
     let mut e = Engine::new();
-    match first(&mut e, "SELECT pg_isolation_test_session_is_blocked(1, ARRAY[1])") {
+    match first(
+        &mut e,
+        "SELECT pg_isolation_test_session_is_blocked(1, ARRAY[1])",
+    ) {
         spg_storage::Value::Bool(false) => {}
         other => panic!("got {other:?}"),
     }

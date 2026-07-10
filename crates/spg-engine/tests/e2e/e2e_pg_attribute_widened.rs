@@ -7,7 +7,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -67,7 +69,10 @@ fn pg_attribute_atttypid_matches_pg_oid_for_int_and_text() {
     let b = by_name("b");
     assert!(matches!(b[2], Value::BigInt(20)), "BIGINT atttypid=20"); // int8
     let ts = by_name("ts");
-    assert!(matches!(ts[2], Value::BigInt(1184)), "TIMESTAMPTZ atttypid=1184");
+    assert!(
+        matches!(ts[2], Value::BigInt(1184)),
+        "TIMESTAMPTZ atttypid=1184"
+    );
 }
 
 #[test]

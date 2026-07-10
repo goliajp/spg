@@ -19,15 +19,36 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn ipv4_mapped_ipv6() {
     let mut e = Engine::new();
     // Dotted-quad input, IPv4-mapped → dotted-quad render.
-    assert_eq!(text(&mut e, "SELECT ('::ffff:192.168.1.1'::inet)::text"), "::ffff:192.168.1.1/128");
+    assert_eq!(
+        text(&mut e, "SELECT ('::ffff:192.168.1.1'::inet)::text"),
+        "::ffff:192.168.1.1/128"
+    );
     // Hex input in the mapped range still renders dotted-quad.
-    assert_eq!(text(&mut e, "SELECT ('::ffff:c0a8:101'::inet)::text"), "::ffff:192.168.1.1/128");
+    assert_eq!(
+        text(&mut e, "SELECT ('::ffff:c0a8:101'::inet)::text"),
+        "::ffff:192.168.1.1/128"
+    );
     // Non-mapped embeddings parse the dotted-quad but render hex.
-    assert_eq!(text(&mut e, "SELECT ('64:ff9b::192.0.2.1'::inet)::text"), "64:ff9b::c000:201/128");
-    assert_eq!(text(&mut e, "SELECT ('2001:db8::192.168.1.1'::inet)::text"), "2001:db8::c0a8:101/128");
+    assert_eq!(
+        text(&mut e, "SELECT ('64:ff9b::192.0.2.1'::inet)::text"),
+        "64:ff9b::c000:201/128"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ('2001:db8::192.168.1.1'::inet)::text"),
+        "2001:db8::c0a8:101/128"
+    );
     // Mask preserved.
-    assert_eq!(text(&mut e, "SELECT ('::ffff:10.0.0.1/96'::inet)::text"), "::ffff:10.0.0.1/96");
+    assert_eq!(
+        text(&mut e, "SELECT ('::ffff:10.0.0.1/96'::inet)::text"),
+        "::ffff:10.0.0.1/96"
+    );
     // Plain v6 / v4 unaffected.
-    assert_eq!(text(&mut e, "SELECT ('2001:db8::1'::inet)::text"), "2001:db8::1/128");
-    assert_eq!(text(&mut e, "SELECT ('192.168.1.1'::inet)::text"), "192.168.1.1/32");
+    assert_eq!(
+        text(&mut e, "SELECT ('2001:db8::1'::inet)::text"),
+        "2001:db8::1/128"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ('192.168.1.1'::inet)::text"),
+        "192.168.1.1/32"
+    );
 }

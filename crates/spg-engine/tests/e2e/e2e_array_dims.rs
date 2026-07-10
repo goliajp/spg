@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -83,13 +85,28 @@ fn dimension_funcs_cover_all_element_types() {
     assert_eq!(i(&mut e, "SELECT array_ndims(ARRAY[true,false])"), 1);
     // date[]
     assert_eq!(
-        i(&mut e, "SELECT array_upper(ARRAY['2024-01-01'::date,'2024-01-02'], 1)"),
+        i(
+            &mut e,
+            "SELECT array_upper(ARRAY['2024-01-01'::date,'2024-01-02'], 1)"
+        ),
         2
     );
     // numeric[] / float8[]
-    assert_eq!(i(&mut e, "SELECT array_lower(ARRAY[1.5,2.5]::numeric[], 1)"), 1);
-    assert_eq!(i(&mut e, "SELECT array_upper(ARRAY[1.5,2.5,3.5]::float8[], 1)"), 3);
-    assert_eq!(i(&mut e, "SELECT array_ndims(ARRAY[1.5,2.5]::numeric[])"), 1);
+    assert_eq!(
+        i(&mut e, "SELECT array_lower(ARRAY[1.5,2.5]::numeric[], 1)"),
+        1
+    );
+    assert_eq!(
+        i(
+            &mut e,
+            "SELECT array_upper(ARRAY[1.5,2.5,3.5]::float8[], 1)"
+        ),
+        3
+    );
+    assert_eq!(
+        i(&mut e, "SELECT array_ndims(ARRAY[1.5,2.5]::numeric[])"),
+        1
+    );
     // array_dims on bool[]
     match first(&mut e, "SELECT array_dims(ARRAY[true,false,true])") {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "[1:3]"),
@@ -115,7 +132,10 @@ fn array_out_quotes_whitespace_elements() {
     };
     assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\nb'])::text"), "{\"a\nb\"}");
     assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\rb'])::text"), "{\"a\rb\"}");
-    assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\fb'])::text"), "{\"a\u{c}b\"}");
+    assert_eq!(
+        txt(&mut e, "SELECT (ARRAY[E'a\\fb'])::text"),
+        "{\"a\u{c}b\"}"
+    );
     // Tab still quotes (regression guard) and a plain element does not.
     assert_eq!(txt(&mut e, "SELECT (ARRAY[E'a\\tb'])::text"), "{\"a\tb\"}");
     assert_eq!(txt(&mut e, "SELECT (ARRAY['ab'])::text"), "{ab}");

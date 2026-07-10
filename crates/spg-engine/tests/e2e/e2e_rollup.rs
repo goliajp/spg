@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -81,7 +83,8 @@ fn single_key_rollup() {
 #[test]
 fn cube_all_subsets() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE c2 (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("CREATE TABLE c2 (a TEXT, b TEXT, v INT)")
+        .unwrap();
     e.execute("INSERT INTO c2 VALUES ('x', 'p', 1), ('x', 'q', 2), ('y', 'p', 4)")
         .unwrap();
     let got = rows(
@@ -94,20 +97,20 @@ fn cube_all_subsets() {
     // Per-b subtotal (NULL, 'p', 5) appears — the grouping ROLLUP
     // can't produce.
     assert!(got.iter().any(|r| {
-        cell(&r[0]).is_none()
-            && cell(&r[1]).as_deref() == Some("p")
-            && as_i64(&r[2]) == 5
+        cell(&r[0]).is_none() && cell(&r[1]).as_deref() == Some("p") && as_i64(&r[2]) == 5
     }));
     // Grand total (NULL, NULL, 7).
-    assert!(got.iter().any(|r| {
-        cell(&r[0]).is_none() && cell(&r[1]).is_none() && as_i64(&r[2]) == 7
-    }));
+    assert!(
+        got.iter()
+            .any(|r| { cell(&r[0]).is_none() && cell(&r[1]).is_none() && as_i64(&r[2]) == 7 })
+    );
 }
 
 #[test]
 fn grouping_sets_explicit_list() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE g2 (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("CREATE TABLE g2 (a TEXT, b TEXT, v INT)")
+        .unwrap();
     e.execute("INSERT INTO g2 VALUES ('x', 'p', 1), ('y', 'p', 2)")
         .unwrap();
     // Only per-a and per-b groupings — NO grand total (not listed).
@@ -118,12 +121,13 @@ fn grouping_sets_explicit_list() {
          ORDER BY 1 NULLS LAST, 2 NULLS LAST",
     );
     assert_eq!(got.len(), 3); // x, y per-a + p per-b.
-    assert!(got.iter().all(|r| !(cell(&r[0]).is_none() && cell(&r[1]).is_none())));
+    assert!(
+        got.iter()
+            .all(|r| !(cell(&r[0]).is_none() && cell(&r[1]).is_none()))
+    );
     // Per-b row: (NULL, p, 3).
     assert!(got.iter().any(|r| {
-        cell(&r[0]).is_none()
-            && cell(&r[1]).as_deref() == Some("p")
-            && as_i64(&r[2]) == 3
+        cell(&r[0]).is_none() && cell(&r[1]).as_deref() == Some("p") && as_i64(&r[2]) == 3
     }));
 }
 
@@ -165,7 +169,8 @@ fn grouping_sets_without_aggregate_collapses_empty_set() {
 #[test]
 fn grouping_marker_bitmask() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE gm (a TEXT, b TEXT, v INT)").unwrap();
+    e.execute("CREATE TABLE gm (a TEXT, b TEXT, v INT)")
+        .unwrap();
     e.execute("INSERT INTO gm VALUES ('x', 'p', 1), ('y', 'q', 2)")
         .unwrap();
     // grouping(a, b): detail rows 0, per-a subtotal 1 (b dropped),
@@ -187,7 +192,8 @@ fn grouping_marker_bitmask() {
 fn grouping_in_case_labels_subtotals() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE gl (k TEXT, v INT)").unwrap();
-    e.execute("INSERT INTO gl VALUES ('x', 1), ('y', 2)").unwrap();
+    e.execute("INSERT INTO gl VALUES ('x', 1), ('y', 2)")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT CASE WHEN grouping(k) = 1 THEN 'TOTAL' ELSE k END, SUM(v) \
@@ -196,7 +202,6 @@ fn grouping_in_case_labels_subtotals() {
     assert_eq!(got.len(), 3);
     // The grand-total row is labelled instead of NULL.
     assert!(got.iter().any(|r| {
-        matches!(&r[0], spg_storage::Value::Text(s) if s == "TOTAL")
-            && as_i64(&r[1]) == 3
+        matches!(&r[0], spg_storage::Value::Text(s) if s == "TOTAL") && as_i64(&r[1]) == 3
     }));
 }

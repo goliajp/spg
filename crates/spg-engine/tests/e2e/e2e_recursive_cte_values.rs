@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<i64>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -82,5 +84,6 @@ fn recursive_cte_wellformedness_guardrails() {
     }
     // Valid: plain recursion, outer ORDER BY, non-recursive CTE ORDER BY.
     e.execute("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SELECT * FROM t ORDER BY n").unwrap();
-    e.execute("WITH x AS (SELECT 1 AS n ORDER BY n) SELECT * FROM x").unwrap();
+    e.execute("WITH x AS (SELECT 1 AS n ORDER BY n) SELECT * FROM x")
+        .unwrap();
 }

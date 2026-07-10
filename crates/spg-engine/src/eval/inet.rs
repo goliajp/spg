@@ -136,7 +136,11 @@ pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         return Ok(Value::text(s));
     }
     let mask = mask.min(32);
-    let bits: u32 = if mask == 0 { 0 } else { u32::MAX << (32 - mask) };
+    let bits: u32 = if mask == 0 {
+        0
+    } else {
+        u32::MAX << (32 - mask)
+    };
     Ok(Value::text(alloc::format!(
         "{}.{}.{}.{}",
         (bits >> 24) & 0xFF,
@@ -168,7 +172,11 @@ pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
         return Ok(Value::text(s));
     }
     let mask = mask.min(32);
-    let bits: u32 = if mask == 0 { u32::MAX } else { !(u32::MAX << (32 - mask)) };
+    let bits: u32 = if mask == 0 {
+        u32::MAX
+    } else {
+        !(u32::MAX << (32 - mask))
+    };
     Ok(Value::text(alloc::format!(
         "{}.{}.{}.{}",
         (bits >> 24) & 0xFF,
@@ -189,10 +197,7 @@ pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "broadcast() takes one TEXT arg, got {} args",
-                    args.len()
-                ),
+                detail: alloc::format!("broadcast() takes one TEXT arg, got {} args", args.len()),
             });
         }
     };
@@ -202,16 +207,17 @@ pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     if host.contains(':') {
         return Ok(Value::text(s));
     }
-    let octets: Vec<u32> = host
-        .split('.')
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let octets: Vec<u32> = host.split('.').filter_map(|o| o.parse().ok()).collect();
     if octets.len() != 4 {
         return Ok(Value::text(s));
     }
     let addr = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
     let mask = mask.min(32);
-    let host_bits: u32 = if mask == 0 { u32::MAX } else { !(u32::MAX << (32 - mask)) };
+    let host_bits: u32 = if mask == 0 {
+        u32::MAX
+    } else {
+        !(u32::MAX << (32 - mask))
+    };
     let bcast = addr | host_bits;
     Ok(Value::text(alloc::format!(
         "{}.{}.{}.{}/{mask}",
@@ -237,7 +243,13 @@ pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
             });
         }
     };
-    let fam = |s: &str| if s.split('/').next().unwrap_or("").contains(':') { 6 } else { 4 };
+    let fam = |s: &str| {
+        if s.split('/').next().unwrap_or("").contains(':') {
+            6
+        } else {
+            4
+        }
+    };
     if fam(a) != fam(b) {
         return Err(EvalError::TypeMismatch {
             detail: "inet_merge(): cannot merge addresses from different families".into(),
@@ -268,7 +280,11 @@ pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     // Common prefix length, capped by both input masks.
     let diff = addr_a ^ addr_b;
     let common = diff.leading_zeros().min(mask_a).min(mask_b);
-    let net = if common == 0 { 0 } else { addr_a & (u32::MAX << (32 - common)) };
+    let net = if common == 0 {
+        0
+    } else {
+        addr_a & (u32::MAX << (32 - common))
+    };
     Ok(Value::text(alloc::format!(
         "{}.{}.{}.{}/{common}",
         (net >> 24) & 0xFF,
@@ -409,11 +425,15 @@ pub(super) fn inet_abbrev(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     // stays intact, a /32 host drops the mask); only abbrev(cidr) drops
     // the octets past the network prefix.
     if !is_cidr || family != 4 {
-        return Ok(Value::text(crate::conversions::format_inet(family, bits, &addr)));
+        return Ok(Value::text(crate::conversions::format_inet(
+            family, bits, &addr,
+        )));
     }
     let sig = ((usize::from(bits) + 7) / 8).max(1);
-    let parts: alloc::vec::Vec<alloc::string::String> =
-        addr[0..sig].iter().map(alloc::string::ToString::to_string).collect();
+    let parts: alloc::vec::Vec<alloc::string::String> = addr[0..sig]
+        .iter()
+        .map(alloc::string::ToString::to_string)
+        .collect();
     Ok(Value::text(alloc::format!("{}/{}", parts.join("."), bits)))
 }
 
@@ -627,7 +647,9 @@ pub(super) fn mysql_inet_aton(args: &[Value<'_>]) -> Result<Value<'static>, Eval
     };
     match parse_ipv4(s) {
         Some(b) => Ok(Value::BigInt(
-            (i64::from(b[0]) << 24) | (i64::from(b[1]) << 16) | (i64::from(b[2]) << 8)
+            (i64::from(b[0]) << 24)
+                | (i64::from(b[1]) << 16)
+                | (i64::from(b[2]) << 8)
                 | i64::from(b[3]),
         )),
         None => Ok(Value::Null),

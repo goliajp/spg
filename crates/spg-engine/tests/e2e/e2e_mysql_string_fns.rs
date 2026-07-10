@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -79,14 +81,8 @@ fn substring_index_both_directions() {
 fn find_in_set_comma_list() {
     let mut e = Engine::new();
     // MySQL doc vector: FIND_IN_SET('b','a,b,c,d') = 2.
-    assert_eq!(
-        int(&first(&mut e, "SELECT find_in_set('b', 'a,b,c,d')")),
-        2
-    );
-    assert_eq!(
-        int(&first(&mut e, "SELECT find_in_set('z', 'a,b,c,d')")),
-        0
-    );
+    assert_eq!(int(&first(&mut e, "SELECT find_in_set('b', 'a,b,c,d')")), 2);
+    assert_eq!(int(&first(&mut e, "SELECT find_in_set('z', 'a,b,c,d')")), 0);
 }
 
 #[test]
@@ -107,10 +103,7 @@ fn elt_and_field() {
         int(&first(&mut e, "SELECT field('Bb', 'Aa', 'Bb', 'Cc')")),
         2
     );
-    assert_eq!(
-        int(&first(&mut e, "SELECT field('Zz', 'Aa', 'Bb')")),
-        0
-    );
+    assert_eq!(int(&first(&mut e, "SELECT field('Zz', 'Aa', 'Bb')")), 0);
 }
 
 #[test]

@@ -18,7 +18,9 @@ use spg_storage::Value;
 /// Render the single scalar cell of a one-row/one-col query the way
 /// PG's `-tA` would: NULL → the literal `NULL`, booleans → `t`/`f`.
 fn text1(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -39,12 +41,18 @@ fn text1(e: &mut Engine, sql: &str) -> String {
 fn array_length_empty_is_null() {
     let mut e = Engine::new();
     // PG18: SELECT array_length('{}'::int[], 1) → NULL
-    assert_eq!(text1(&mut e, "SELECT array_length(ARRAY[]::int[], 1)"), "NULL");
+    assert_eq!(
+        text1(&mut e, "SELECT array_length(ARRAY[]::int[], 1)"),
+        "NULL"
+    );
     assert_eq!(text1(&mut e, "SELECT array_length('{}'::int[], 1)"), "NULL");
     // Non-empty still works.
     assert_eq!(text1(&mut e, "SELECT array_length(ARRAY[1,2,3], 1)"), "3");
     // array_upper/lower already matched PG (NULL on empty).
-    assert_eq!(text1(&mut e, "SELECT array_upper(ARRAY[]::int[], 1)"), "NULL");
+    assert_eq!(
+        text1(&mut e, "SELECT array_upper(ARRAY[]::int[], 1)"),
+        "NULL"
+    );
 }
 
 // ---- B2: array_position(arr, NULL) matches NULL element -----------
@@ -53,13 +61,25 @@ fn array_length_empty_is_null() {
 fn array_position_null_needle_matches_null_element() {
     let mut e = Engine::new();
     // PG18: array_position(ARRAY[1,NULL,2], NULL) → 2
-    assert_eq!(text1(&mut e, "SELECT array_position(ARRAY[1,NULL,2], NULL)"), "2");
+    assert_eq!(
+        text1(&mut e, "SELECT array_position(ARRAY[1,NULL,2], NULL)"),
+        "2"
+    );
     // PG18: no NULL element → NULL.
-    assert_eq!(text1(&mut e, "SELECT array_position(ARRAY[1,2,3], NULL::int)"), "NULL");
+    assert_eq!(
+        text1(&mut e, "SELECT array_position(ARRAY[1,2,3], NULL::int)"),
+        "NULL"
+    );
     // Text array with a NULL element.
-    assert_eq!(text1(&mut e, "SELECT array_position(ARRAY['a',NULL,'b'], NULL)"), "2");
+    assert_eq!(
+        text1(&mut e, "SELECT array_position(ARRAY['a',NULL,'b'], NULL)"),
+        "2"
+    );
     // Non-NULL needle still skips NULL elements (unchanged behaviour).
-    assert_eq!(text1(&mut e, "SELECT array_position(ARRAY[1,NULL,2], 2)"), "3");
+    assert_eq!(
+        text1(&mut e, "SELECT array_position(ARRAY[1,NULL,2], 2)"),
+        "3"
+    );
 }
 
 // ---- B3: BOOL[] external text renders t / f -----------------------
@@ -68,7 +88,10 @@ fn array_position_null_needle_matches_null_element() {
 fn bool_array_text_uses_t_f() {
     let mut e = Engine::new();
     // PG18: SELECT (ARRAY[true,false,NULL])::text → {t,f,NULL}
-    assert_eq!(text1(&mut e, "SELECT (ARRAY[true,false,NULL])::text"), "{t,f,NULL}");
+    assert_eq!(
+        text1(&mut e, "SELECT (ARRAY[true,false,NULL])::text"),
+        "{t,f,NULL}"
+    );
     assert_eq!(text1(&mut e, "SELECT (ARRAY[false,true])::text"), "{f,t}");
 }
 

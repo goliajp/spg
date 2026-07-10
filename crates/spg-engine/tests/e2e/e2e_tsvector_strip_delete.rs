@@ -17,9 +17,15 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn strip_removes_positions_from_tsvector() {
     let mut e = Engine::new();
     // PG: strip('a:1 b:2,3') → 'a' 'b'
-    assert_eq!(text(&mut e, "SELECT strip('a:1 b:2,3'::tsvector)::text"), "'a' 'b'");
     assert_eq!(
-        text(&mut e, "SELECT strip(to_tsvector('simple','hello world'))::text"),
+        text(&mut e, "SELECT strip('a:1 b:2,3'::tsvector)::text"),
+        "'a' 'b'"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT strip(to_tsvector('simple','hello world'))::text"
+        ),
         "'hello' 'world'"
     );
 }
@@ -29,12 +35,18 @@ fn ts_delete_removes_lexemes_from_tsvector() {
     let mut e = Engine::new();
     // PG: ts_delete('a:1 b:2 c:3', 'b') → 'a':1 'c':3
     assert_eq!(
-        text(&mut e, "SELECT ts_delete('a:1 b:2 c:3'::tsvector, 'b')::text"),
+        text(
+            &mut e,
+            "SELECT ts_delete('a:1 b:2 c:3'::tsvector, 'b')::text"
+        ),
         "'a':1 'c':3"
     );
     // Array form removes several lexemes at once.
     assert_eq!(
-        text(&mut e, "SELECT ts_delete('a:1 b:2 c:3'::tsvector, ARRAY['a','c'])::text"),
+        text(
+            &mut e,
+            "SELECT ts_delete('a:1 b:2 c:3'::tsvector, ARRAY['a','c'])::text"
+        ),
         "'b':2"
     );
 }

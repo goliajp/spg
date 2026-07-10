@@ -87,10 +87,12 @@ impl Engine {
         // A NATURAL join needs both sides' schemas to find the common
         // columns; a non-catalog source there is unsupported.
         for (i, j) in from.joins.iter().enumerate() {
-            if j.natural && (col_names[0..=i].iter().any(Option::is_none) || col_names[i + 1].is_none())
+            if j.natural
+                && (col_names[0..=i].iter().any(Option::is_none) || col_names[i + 1].is_none())
             {
                 return Err(EngineError::Unsupported(
-                    "NATURAL JOIN requires both inputs to be tables with a known schema".to_string(),
+                    "NATURAL JOIN requires both inputs to be tables with a known schema"
+                        .to_string(),
                 ));
             }
         }
@@ -263,10 +265,7 @@ impl Engine {
     /// present, else the table name) plus its ordered column-name list
     /// (`None` for a non-catalog source).
     fn table_qual_and_columns(&self, tref: &TableRef) -> (String, Option<Vec<String>>) {
-        let qual = tref
-            .alias
-            .clone()
-            .unwrap_or_else(|| tref.name.clone());
+        let qual = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
         let is_non_catalog = tref.unnest_expr.is_some()
             || tref.lateral_subquery.is_some()
             || tref.generate_series_args.is_some()

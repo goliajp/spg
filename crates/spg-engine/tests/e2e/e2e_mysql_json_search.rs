@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,8 +23,7 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 
 // MySQL doc corpus: '["abc", [{"k": "10"}, "def"], {"x":"abc"},
 // {"y":"bcd"}]'.
-const DOC: &str =
-    "'[\"abc\", [{\"k\": \"10\"}, \"def\"], {\"x\":\"abc\"}, {\"y\":\"bcd\"}]'";
+const DOC: &str = "'[\"abc\", [{\"k\": \"10\"}, \"def\"], {\"x\":\"abc\"}, {\"y\":\"bcd\"}]'";
 
 #[test]
 fn json_search_one_and_all() {

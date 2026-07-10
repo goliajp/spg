@@ -86,7 +86,10 @@ fn distinct_sql_strings_yield_separate_rows() {
             }
         })
         .count();
-    assert!(n_others >= 2, "expected DELETE + SELECT templates, got {n_others}");
+    assert!(
+        n_others >= 2,
+        "expected DELETE + SELECT templates, got {n_others}"
+    );
 }
 
 #[test]
@@ -127,8 +130,14 @@ fn pg_stat_statements_has_pg_compatible_columns() {
     let names: Vec<&str> = alias_cols.iter().map(|c| c.name.as_str()).collect();
     // PG-canonical column names that dashboards depend on.
     for must in [
-        "userid", "dbid", "query", "calls", "total_exec_time",
-        "max_exec_time", "mean_exec_time", "queryid",
+        "userid",
+        "dbid",
+        "query",
+        "calls",
+        "total_exec_time",
+        "max_exec_time",
+        "mean_exec_time",
+        "queryid",
     ] {
         assert!(
             names.contains(&must),

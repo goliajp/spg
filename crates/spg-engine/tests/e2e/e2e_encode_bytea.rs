@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -17,7 +19,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn encode_bytea_formats() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT encode('abc'::bytea, 'base64')"), "YWJj");
+    assert_eq!(
+        text(&mut e, "SELECT encode('abc'::bytea, 'base64')"),
+        "YWJj"
+    );
     assert_eq!(text(&mut e, "SELECT encode('abc'::bytea, 'hex')"), "616263");
     assert_eq!(
         text(&mut e, "SELECT encode('\\xDEADBEEF'::bytea, 'hex')"),

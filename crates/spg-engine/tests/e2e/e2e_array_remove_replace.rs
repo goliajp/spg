@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -34,10 +36,7 @@ fn array_remove_int() {
     );
     // No match — unchanged.
     assert_eq!(
-        as_int_array(&first(
-            &mut e,
-            "SELECT array_remove(ARRAY[1, 2, 3], 99)"
-        )),
+        as_int_array(&first(&mut e, "SELECT array_remove(ARRAY[1, 2, 3], 99)")),
         [1, 2, 3]
     );
 }

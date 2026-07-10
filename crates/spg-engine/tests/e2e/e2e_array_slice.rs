@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -56,7 +58,8 @@ fn slice_clamps_and_empties() {
 fn slice_on_column_in_where() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE asl (tags TEXT[])").unwrap();
-    e.execute("INSERT INTO asl VALUES (ARRAY['a','b','c'])").unwrap();
+    e.execute("INSERT INTO asl VALUES (ARRAY['a','b','c'])")
+        .unwrap();
     let v = one(&mut e, "SELECT tags[1:2] FROM asl");
     assert!(matches!(
         v,

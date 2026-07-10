@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn row1(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows[0]
             .values
             .iter()
@@ -24,7 +27,10 @@ fn row1(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn field_access_on_row_constructor() {
     let mut e = Engine::new();
-    assert_eq!(row1(&mut e, "SELECT (ROW(1,2)).f1, (ROW(1,2)).f2"), vec!["1", "2"]);
+    assert_eq!(
+        row1(&mut e, "SELECT (ROW(1,2)).f1, (ROW(1,2)).f2"),
+        vec!["1", "2"]
+    );
 }
 
 #[test]
@@ -32,7 +38,10 @@ fn field_access_on_whole_row_alias() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE emp(id int, name text)").unwrap();
     e.execute("INSERT INTO emp VALUES (1,'a')").unwrap();
-    assert_eq!(row1(&mut e, "SELECT (e).id, (e).name FROM emp e"), vec!["1", "a"]);
+    assert_eq!(
+        row1(&mut e, "SELECT (e).id, (e).name FROM emp e"),
+        vec!["1", "a"]
+    );
 }
 
 #[test]
@@ -50,5 +59,8 @@ fn field_access_composes_in_expressions() {
 #[test]
 fn field_access_on_subquery_alias() {
     let mut e = Engine::new();
-    assert_eq!(row1(&mut e, "SELECT (r).a, (r).b FROM (SELECT 1 a, 2 b) r"), vec!["1", "2"]);
+    assert_eq!(
+        row1(&mut e, "SELECT (r).a, (r).b FROM (SELECT 1 a, 2 b) r"),
+        vec!["1", "2"]
+    );
 }

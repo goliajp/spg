@@ -7,7 +7,10 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn one(e: &mut Engine, sql: &str) -> Value<'static> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
         other => panic!("expected rows, got {other:?}"),
     }
@@ -82,7 +85,10 @@ fn xact_status_reports_all_three_states() {
     // A transaction still in flight sees itself as in progress.
     e.execute("BEGIN").unwrap();
     let live = bigint(&mut e, "SELECT txid_current()");
-    assert_eq!(text(&mut e, "SELECT txid_status(txid_current())"), "in progress");
+    assert_eq!(
+        text(&mut e, "SELECT txid_status(txid_current())"),
+        "in progress"
+    );
     e.execute("COMMIT").unwrap();
 
     // …and as committed once it lands.

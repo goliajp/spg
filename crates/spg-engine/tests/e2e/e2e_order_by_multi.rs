@@ -155,7 +155,8 @@ fn order_by_bigint_past_2pow53_is_exact() {
         9_007_199_254_740_993,
         9_007_199_254_740_991,
     ] {
-        eng.execute(&format!("INSERT INTO big VALUES ({x})")).unwrap();
+        eng.execute(&format!("INSERT INTO big VALUES ({x})"))
+            .unwrap();
     }
     let res = eng.execute("SELECT x FROM big ORDER BY x").unwrap();
     assert_eq!(
@@ -168,7 +169,9 @@ fn order_by_bigint_past_2pow53_is_exact() {
         ]
     );
     // DESC path uses the same key.
-    let res = eng.execute("SELECT x FROM big ORDER BY x DESC LIMIT 2").unwrap();
+    let res = eng
+        .execute("SELECT x FROM big ORDER BY x DESC LIMIT 2")
+        .unwrap();
     assert_eq!(
         rows_of(res),
         vec![

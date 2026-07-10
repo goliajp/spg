@@ -146,7 +146,9 @@ fn int_text_underscore_only_between_digits() {
     let mut eng = Engine::new();
     let ok = |eng: &mut Engine, sql: &str| -> i64 {
         let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!()
+        };
         match &rows[0].values[0] {
             Value::Int(n) => i64::from(*n),
             Value::BigInt(n) => *n,
@@ -160,7 +162,12 @@ fn int_text_underscore_only_between_digits() {
     assert_eq!(ok(&mut eng, "SELECT '0xFF_FF'::int4"), 65535);
     assert_eq!(ok(&mut eng, "SELECT '0x_FF'::int4"), 255);
     // Invalid: leading / trailing / doubled underscore.
-    for bad in ["SELECT '_5'::int4", "SELECT '5_'::int4", "SELECT '123__4'::int4", "SELECT '0xFF_'::int4"] {
+    for bad in [
+        "SELECT '_5'::int4",
+        "SELECT '5_'::int4",
+        "SELECT '123__4'::int4",
+        "SELECT '0xFF_'::int4",
+    ] {
         assert!(eng.execute(bad).is_err(), "{bad} must be rejected");
     }
 }

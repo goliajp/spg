@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,7 +24,8 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn range_agg_collects_ranges() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE spans (lo INT, hi INT)").unwrap();
-    e.execute("INSERT INTO spans VALUES (1, 3), (5, 8)").unwrap();
+    e.execute("INSERT INTO spans VALUES (1, 3), (5, 8)")
+        .unwrap();
     let got = text(&first(
         &mut e,
         "SELECT range_agg(int4range(lo, hi))::text FROM spans",
@@ -33,11 +36,10 @@ fn range_agg_collects_ranges() {
 #[test]
 fn range_agg_group_by() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE g (k TEXT, lo INT, hi INT)").unwrap();
-    e.execute(
-        "INSERT INTO g VALUES ('a', 1, 2), ('a', 4, 6), ('b', 10, 20)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE g (k TEXT, lo INT, hi INT)")
+        .unwrap();
+    e.execute("INSERT INTO g VALUES ('a', 1, 2), ('a', 4, 6), ('b', 10, 20)")
+        .unwrap();
     let r = e
         .execute(
             "SELECT k, range_agg(int4range(lo, hi))::text FROM g \

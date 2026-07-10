@@ -31,7 +31,8 @@ fn import_csv(e: &mut Engine, table: &str, mut buf: Vec<u8>) -> u64 {
         let row_text = std::str::from_utf8(rec).unwrap();
         let values = decode_copy_csv_record(row_text, ',', '"', "");
         let sql = build_copy_insert(table, None, &values);
-        e.execute(&sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        e.execute(&sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
         inserted += 1;
     }
     inserted
@@ -109,8 +110,7 @@ fn csv_export_import_round_trip() {
     e.execute("CREATE TABLE rt (id INT, t TEXT)").unwrap();
     e.execute("INSERT INTO rt VALUES (1, concat('a,b\"c', chr(10), 'd'))")
         .unwrap();
-    let QueryResult::Rows { rows, .. } =
-        e.execute("COPY rt TO STDOUT WITH (FORMAT csv)").unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute("COPY rt TO STDOUT WITH (FORMAT csv)").unwrap()
     else {
         panic!("expected Rows");
     };

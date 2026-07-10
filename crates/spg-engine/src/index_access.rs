@@ -419,9 +419,14 @@ pub(crate) fn try_index_seek<'a>(
     // and unions the rows (PG's bitmap index scan) instead of a full scan
     // + per-row membership test. The single-table path otherwise tested a
     // 60-element list against every row (24k × 60 string compares ~66 ms).
-    if let Some(rows) =
-        try_inlist_seek(where_expr, schema_cols, catalog, table, table_alias, snapshot)
-    {
+    if let Some(rows) = try_inlist_seek(
+        where_expr,
+        schema_cols,
+        catalog,
+        table,
+        table_alias,
+        snapshot,
+    ) {
         return Some(rows);
     }
     let Expr::Binary {
@@ -1079,7 +1084,11 @@ pub(crate) fn resolve_col_literal_pair(
             }
         }
         Literal::Float(x) => Value::Float(*x),
-        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale , kind: spg_storage::NumericKind::Finite },
+        Literal::Numeric { unscaled, scale } => Value::Numeric {
+            scaled: *unscaled,
+            scale: *scale,
+            kind: spg_storage::NumericKind::Finite,
+        },
         Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),

@@ -7,7 +7,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -91,7 +93,8 @@ fn pg_index_indkey_carries_one_based_column_position() {
 fn pg_index_indisunique_reflects_unique_index() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
-    e.execute("CREATE UNIQUE INDEX ix_t_name ON t(name)").unwrap();
+    e.execute("CREATE UNIQUE INDEX ix_t_name ON t(name)")
+        .unwrap();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_index");
     let ix = rs.first().expect("one index row");
     // Position 4 = indisunique.

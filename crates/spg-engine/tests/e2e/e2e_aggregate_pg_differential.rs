@@ -51,18 +51,24 @@ fn render(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         // v7.38 (read01, T4) — sum/avg(bigint) render as decimal text.
-        Value::Numeric { scaled, scale , .. } => {
+        Value::Numeric { scaled, scale, .. } => {
             if *scale == 0 {
                 scaled.to_string()
             } else {
                 let digits = scaled.unsigned_abs().to_string();
                 let sc = *scale as usize;
                 let (int_part, frac_part) = if digits.len() > sc {
-                    (digits[..digits.len() - sc].to_string(), digits[digits.len() - sc..].to_string())
+                    (
+                        digits[..digits.len() - sc].to_string(),
+                        digits[digits.len() - sc..].to_string(),
+                    )
                 } else {
                     ("0".to_string(), format!("{digits:0>sc$}"))
                 };
-                format!("{}{int_part}.{frac_part}", if *scaled < 0 { "-" } else { "" })
+                format!(
+                    "{}{int_part}.{frac_part}",
+                    if *scaled < 0 { "-" } else { "" }
+                )
             }
         }
         Value::Float(x) => x.to_string(),
@@ -110,13 +116,18 @@ fn cell(eng: &mut Engine, sql: &str) -> String {
 
 fn check(eng: &mut Engine, sql: &str, expect: &str) {
     let got = cell(eng, sql);
-    assert_eq!(got, expect, "\n  SQL: {sql}\n  want: {expect}\n  got:  {got}");
+    assert_eq!(
+        got, expect,
+        "\n  SQL: {sql}\n  want: {expect}\n  got:  {got}"
+    );
 }
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id int, g text, x int, bx bigint, y float8, b bool, d date, s text)")
-        .unwrap();
+    e.execute(
+        "CREATE TABLE t (id int, g text, x int, bx bigint, y float8, b bool, d date, s text)",
+    )
+    .unwrap();
     for row in [
         "(1,'a',10, 100, 1.5,  true,  '2020-01-01','foo')",
         "(2,'a',20, 200, 2.5,  false, '2020-03-01','bar')",
@@ -140,7 +151,11 @@ fn empty_set_semantics() {
     check(&mut e, "SELECT avg(x) FROM t WHERE false", "<NULL>");
     check(&mut e, "SELECT min(x) FROM t WHERE false", "<NULL>");
     check(&mut e, "SELECT max(x) FROM t WHERE false", "<NULL>");
-    check(&mut e, "SELECT string_agg(s,',') FROM t WHERE false", "<NULL>");
+    check(
+        &mut e,
+        "SELECT string_agg(s,',') FROM t WHERE false",
+        "<NULL>",
+    );
     check(&mut e, "SELECT bool_and(b) FROM t WHERE false", "<NULL>");
     check(&mut e, "SELECT bool_or(b) FROM t WHERE false", "<NULL>");
     check(&mut e, "SELECT array_agg(x) FROM t WHERE false", "<NULL>");
@@ -155,7 +170,11 @@ fn null_handling() {
     check(&mut e, "SELECT sum(x) FROM t", "130");
     check(&mut e, "SELECT count(x) FROM t", "5");
     check(&mut e, "SELECT count(*) FROM t", "6");
-    check(&mut e, "SELECT array_agg(x ORDER BY id) FROM t", "{10,20,NULL,30,30,40}");
+    check(
+        &mut e,
+        "SELECT array_agg(x ORDER BY id) FROM t",
+        "{10,20,NULL,30,30,40}",
+    );
     // all-NULL group
     check(&mut e, "SELECT sum(x) FROM t WHERE id=3", "<NULL>");
     check(&mut e, "SELECT count(x) FROM t WHERE id=3", "0");
@@ -174,11 +193,23 @@ fn distinct() {
     check(&mut e, "SELECT sum(DISTINCT x) FROM t", "100");
     check(&mut e, "SELECT count(DISTINCT s) FROM t", "3");
     // avg(DISTINCT) FLOAT; PG 25.0000000000000000
-    check(&mut e, "SELECT avg(DISTINCT x) FROM t", "25.0000000000000000");
+    check(
+        &mut e,
+        "SELECT avg(DISTINCT x) FROM t",
+        "25.0000000000000000",
+    );
     // SEMANTIC: PG sorts distinct set -> {10,20,30,40,NULL} / bar,baz,foo.
     // SPG keeps first-seen order (valid: DISTINCT order is unspecified).
-    check(&mut e, "SELECT array_agg(DISTINCT x) FROM t", "{10,20,NULL,30,40}");
-    check(&mut e, "SELECT string_agg(DISTINCT s, ',') FROM t", "foo,bar,baz");
+    check(
+        &mut e,
+        "SELECT array_agg(DISTINCT x) FROM t",
+        "{10,20,NULL,30,40}",
+    );
+    check(
+        &mut e,
+        "SELECT string_agg(DISTINCT s, ',') FROM t",
+        "foo,bar,baz",
+    );
 }
 
 // ---- FILTER ----
@@ -187,7 +218,11 @@ fn filter_clause() {
     let mut e = seed();
     check(&mut e, "SELECT count(*) FILTER (WHERE x>15) FROM t", "4");
     check(&mut e, "SELECT sum(x) FILTER (WHERE x>15) FROM t", "120");
-    check(&mut e, "SELECT sum(x) FILTER (WHERE x>100) FROM t", "<NULL>");
+    check(
+        &mut e,
+        "SELECT sum(x) FILTER (WHERE x>100) FROM t",
+        "<NULL>",
+    );
     // FILTER + GROUP BY
     check(
         &mut e,
@@ -200,9 +235,21 @@ fn filter_clause() {
 #[test]
 fn order_by_inside_agg() {
     let mut e = seed();
-    check(&mut e, "SELECT string_agg(s,',' ORDER BY s) FROM t", "bar,baz,foo,foo");
-    check(&mut e, "SELECT array_agg(x ORDER BY x DESC) FROM t", "{NULL,40,30,30,20,10}");
-    check(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM t", "10,20,30,30,40");
+    check(
+        &mut e,
+        "SELECT string_agg(s,',' ORDER BY s) FROM t",
+        "bar,baz,foo,foo",
+    );
+    check(
+        &mut e,
+        "SELECT array_agg(x ORDER BY x DESC) FROM t",
+        "{NULL,40,30,30,20,10}",
+    );
+    check(
+        &mut e,
+        "SELECT string_agg(x::text,',' ORDER BY x) FROM t",
+        "10,20,30,30,40",
+    );
 }
 
 // ---- stddev / variance: sample (n-1) vs population (n) divisors,
@@ -219,7 +266,11 @@ fn stddev_variance_family() {
     check(&mut e, "SELECT var_samp(x) FROM t", "130.0000000000000000");
     check(&mut e, "SELECT variance(x) FROM t", "130.0000000000000000");
     check(&mut e, "SELECT stddev_pop(x) FROM t", "10.1980390271855697");
-    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.4017542509913798");
+    check(
+        &mut e,
+        "SELECT stddev_samp(x) FROM t",
+        "11.4017542509913798",
+    );
     check(&mut e, "SELECT stddev(x) FROM t", "11.4017542509913798");
     // single-row group: samp undefined -> NULL, pop -> 0
     check(&mut e, "SELECT stddev_samp(x) FROM t WHERE id=1", "<NULL>");
@@ -278,8 +329,16 @@ fn min_max_typed_columns() {
     check(&mut e, "SELECT max(sm) FROM t2", "30");
     check(&mut e, "SELECT min(nm)::text FROM t2", "5.25");
     check(&mut e, "SELECT max(nm)::text FROM t2", "99.99");
-    check(&mut e, "SELECT min(ts)::text FROM t2", "2019-06-15 08:30:00");
-    check(&mut e, "SELECT max(ts)::text FROM t2", "2021-12-31 23:59:59");
+    check(
+        &mut e,
+        "SELECT min(ts)::text FROM t2",
+        "2019-06-15 08:30:00",
+    );
+    check(
+        &mut e,
+        "SELECT max(ts)::text FROM t2",
+        "2021-12-31 23:59:59",
+    );
 }
 
 // ---- BUG FIX: ordered-set aggregates + ORDER BY over a NUMERIC key ----
@@ -298,7 +357,11 @@ fn ordered_set_and_orderby_numeric() {
         "5.25,12.50,99.99",
     );
     // mode() ties resolve to the smallest under the sort; PG -> 5.25.
-    check(&mut e, "SELECT (mode() WITHIN GROUP (ORDER BY nm))::text FROM t3", "5.25");
+    check(
+        &mut e,
+        "SELECT (mode() WITHIN GROUP (ORDER BY nm))::text FROM t3",
+        "5.25",
+    );
     // percentile_disc(0.5) over 3 sorted values -> 2nd -> 12.50.
     check(
         &mut e,
@@ -328,7 +391,11 @@ fn sum_avg_numeric() {
     check(&mut e, "SELECT sum(n3)::text FROM nd", "6.600");
     // avg(numeric) → NUMERIC at PG's division display scale display scale.
     // PG: 117.74/3 carries 16 fractional digits.
-    check(&mut e, "SELECT avg(nm)::text FROM nd", "39.2466666666666667");
+    check(
+        &mut e,
+        "SELECT avg(nm)::text FROM nd",
+        "39.2466666666666667",
+    );
     // PG: 6.600/3 = 2.2 padded to 16 fractional digits.
     check(&mut e, "SELECT avg(n3)::text FROM nd", "2.2000000000000000");
     // Mixed-scale exact add: 117.74 + 6.600 = 124.340 (scale aligns to 3).
@@ -362,12 +429,32 @@ fn sum_avg_numeric() {
 #[test]
 fn ordered_set_and_json_int() {
     let mut e = seed();
-    check(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t", "30");
-    check(&mut e, "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY x))::text FROM t", "30");
-    check(&mut e, "SELECT (mode() WITHIN GROUP (ORDER BY x))::text FROM t", "30");
+    check(
+        &mut e,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+        "30",
+    );
+    check(
+        &mut e,
+        "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY x))::text FROM t",
+        "30",
+    );
+    check(
+        &mut e,
+        "SELECT (mode() WITHIN GROUP (ORDER BY x))::text FROM t",
+        "30",
+    );
     // json_agg / jsonb_agg keep NULLs, insertion order via ORDER BY id
-    check(&mut e, "SELECT json_agg(x ORDER BY id)::text FROM t", "[10, 20, null, 30, 30, 40]");
-    check(&mut e, "SELECT jsonb_agg(x ORDER BY id)::text FROM t", "[10, 20, null, 30, 30, 40]");
+    check(
+        &mut e,
+        "SELECT json_agg(x ORDER BY id)::text FROM t",
+        "[10, 20, null, 30, 30, 40]",
+    );
+    check(
+        &mut e,
+        "SELECT jsonb_agg(x ORDER BY id)::text FROM t",
+        "[10, 20, null, 30, 30, 40]",
+    );
 }
 
 // ---- GROUP BY: count / sum / avg per group ----

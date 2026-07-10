@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ints(e: &mut Engine, sql: &str) -> Vec<i64> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -20,10 +22,12 @@ fn ints(e: &mut Engine, sql: &str) -> Vec<i64> {
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE l (x INT)").unwrap();
     // Left multiset: {1, 2, 2, 3}.
-    e.execute("INSERT INTO l VALUES (1), (2), (2), (3)").unwrap();
+    e.execute("INSERT INTO l VALUES (1), (2), (2), (3)")
+        .unwrap();
     e.execute("CREATE TABLE r (x INT)").unwrap();
     // Right multiset: {2, 3, 3, 4}.
-    e.execute("INSERT INTO r VALUES (2), (3), (3), (4)").unwrap();
+    e.execute("INSERT INTO r VALUES (2), (3), (3), (4)")
+        .unwrap();
 }
 
 #[test]

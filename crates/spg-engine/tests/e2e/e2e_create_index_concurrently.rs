@@ -3,7 +3,8 @@
 use spg_engine::Engine;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -24,7 +25,10 @@ fn create_index_concurrently_parses_and_works() {
 fn create_unique_index_concurrently_parses() {
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT)");
-    ddl(&mut e, "CREATE UNIQUE INDEX CONCURRENTLY idx_t_id ON t (id)");
+    ddl(
+        &mut e,
+        "CREATE UNIQUE INDEX CONCURRENTLY idx_t_id ON t (id)",
+    );
 }
 
 #[test]

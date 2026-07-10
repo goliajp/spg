@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -81,12 +83,30 @@ fn multirange_constructor_normalizes() {
     let mut e = Engine::new();
     let mr = |e: &mut Engine, expr: &str| text(&first(e, &format!("SELECT ({expr})::text")));
     // Overlap and (int4-discrete) adjacency both merge.
-    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(4,8))"), "{[1,8)}");
-    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(5,8))"), "{[1,8)}");
+    assert_eq!(
+        mr(&mut e, "int4multirange(int4range(1,5),int4range(4,8))"),
+        "{[1,8)}"
+    );
+    assert_eq!(
+        mr(&mut e, "int4multirange(int4range(1,5),int4range(5,8))"),
+        "{[1,8)}"
+    );
     // Disjoint spans stay separate; unsorted input is sorted.
-    assert_eq!(mr(&mut e, "int4multirange(int4range(1,3),int4range(5,8))"), "{[1,3),[5,8)}");
-    assert_eq!(mr(&mut e, "int4multirange(int4range(10,20),int4range(1,5))"), "{[1,5),[10,20)}");
+    assert_eq!(
+        mr(&mut e, "int4multirange(int4range(1,3),int4range(5,8))"),
+        "{[1,3),[5,8)}"
+    );
+    assert_eq!(
+        mr(&mut e, "int4multirange(int4range(10,20),int4range(1,5))"),
+        "{[1,5),[10,20)}"
+    );
     // Empty member dropped; continuous (numeric) overlap merges.
-    assert_eq!(mr(&mut e, "int4multirange(int4range(1,5),int4range(3,3))"), "{[1,5)}");
-    assert_eq!(mr(&mut e, "nummultirange(numrange(1,5),numrange(4,8))"), "{[1,8)}");
+    assert_eq!(
+        mr(&mut e, "int4multirange(int4range(1,5),int4range(3,3))"),
+        "{[1,5)}"
+    );
+    assert_eq!(
+        mr(&mut e, "nummultirange(numrange(1,5),numrange(4,8))"),
+        "{[1,8)}"
+    );
 }

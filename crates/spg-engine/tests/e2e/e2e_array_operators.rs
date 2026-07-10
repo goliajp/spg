@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,7 +23,10 @@ fn overlap() {
     assert!(!b(&mut e, "SELECT ARRAY[1,2] && ARRAY[3,4]"));
     assert!(b(&mut e, "SELECT ARRAY['a','b'] && ARRAY['b']"));
     // NULL elements never match.
-    assert!(!b(&mut e, "SELECT ARRAY[NULL]::int[] && ARRAY[NULL]::int[]"));
+    assert!(!b(
+        &mut e,
+        "SELECT ARRAY[NULL]::int[] && ARRAY[NULL]::int[]"
+    ));
 }
 
 #[test]

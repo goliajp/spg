@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -43,9 +45,10 @@ fn inet_merge_common_prefix() {
 #[test]
 fn inet_merge_mixed_family_errors() {
     let mut e = Engine::new();
-    assert!(e
-        .execute("SELECT inet_merge('192.168.1.5/24', '::1')")
-        .is_err());
+    assert!(
+        e.execute("SELECT inet_merge('192.168.1.5/24', '::1')")
+            .is_err()
+    );
 }
 
 #[test]

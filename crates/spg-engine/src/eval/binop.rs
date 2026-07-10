@@ -48,12 +48,23 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                     detail: "smallint overflow on unary -".into(),
                 })
         }
-        (UnOp::Neg, Value::Numeric { scaled, scale, kind }) => {
+        (
+            UnOp::Neg,
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            },
+        ) => {
             use spg_storage::NumericKind as NK;
             match kind {
                 NK::Finite => scaled
                     .checked_neg()
-                    .map(|s| Value::Numeric { scaled: s, scale, kind: NK::Finite })
+                    .map(|s| Value::Numeric {
+                        scaled: s,
+                        scale,
+                        kind: NK::Finite,
+                    })
                     .ok_or(EvalError::TypeMismatch {
                         detail: "numeric overflow on unary -".into(),
                     }),
@@ -92,7 +103,11 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         // v7.38 (read01) — PG `~ inet` flips every host-address bit, keeping the
         // operand's netmask (`~ 255.0.0.0/8` → `0.255.255.255/8`).
         (UnOp::BitNot, Value::Inet { family, bits, addr }) => {
-            let mask = if family == 4 { u128::from(u32::MAX) } else { u128::MAX };
+            let mask = if family == 4 {
+                u128::from(u32::MAX)
+            } else {
+                u128::MAX
+            };
             let flipped = !inet_addr_u128(family, &addr) & mask;
             Ok(inet_from_u128(family, bits, flipped))
         }
@@ -319,8 +334,16 @@ pub(super) fn apply_binary(
     // family required, matching PG.
     if op == BinOp::Sub {
         if let (
-            Value::Inet { family: fa, addr: aa, .. },
-            Value::Inet { family: fb, addr: ab, .. },
+            Value::Inet {
+                family: fa,
+                addr: aa,
+                ..
+            },
+            Value::Inet {
+                family: fb,
+                addr: ab,
+                ..
+            },
         ) = (&l, &r)
         {
             if fa != fb {
@@ -329,9 +352,11 @@ pub(super) fn apply_binary(
                 });
             }
             let diff = inet_addr_u128(*fa, aa) as i128 - inet_addr_u128(*fb, ab) as i128;
-            return i64::try_from(diff).map(Value::BigInt).map_err(|_| EvalError::TypeMismatch {
-                detail: "result out of range".into(),
-            });
+            return i64::try_from(diff)
+                .map(Value::BigInt)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: "result out of range".into(),
+                });
         }
     }
     // `inet ± bigint` -> inet: shift the address by N, keeping family + bits.
@@ -350,9 +375,8 @@ pub(super) fn apply_binary(
         // is an inet shifted the same way.
         let arith = match (&l, &r) {
             (Value::Inet { family, bits, addr }, other)
-            | (Value::Cidr { family, bits, addr }, other) => {
-                as_int(other).map(|n| (*family, *bits, *addr, if op == BinOp::Sub { -n } else { n }))
-            }
+            | (Value::Cidr { family, bits, addr }, other) => as_int(other)
+                .map(|n| (*family, *bits, *addr, if op == BinOp::Sub { -n } else { n })),
             (other, Value::Inet { family, bits, addr })
             | (other, Value::Cidr { family, bits, addr })
                 if op == BinOp::Add =>
@@ -368,7 +392,11 @@ pub(super) fn apply_binary(
             } else {
                 cur.checked_sub(delta.unsigned_abs())
             };
-            let max = if family == 4 { u128::from(u32::MAX) } else { u128::MAX };
+            let max = if family == 4 {
+                u128::from(u32::MAX)
+            } else {
+                u128::MAX
+            };
             let next = match next {
                 Some(v) if v <= max => v,
                 _ => {
@@ -384,7 +412,11 @@ pub(super) fn apply_binary(
             } else {
                 new_addr.copy_from_slice(&next.to_be_bytes());
             }
-            return Ok(Value::Inet { family, bits, addr: new_addr });
+            return Ok(Value::Inet {
+                family,
+                bits,
+                addr: new_addr,
+            });
         }
     }
     // PG `path + path` concatenates the two point lists (both taken open);
@@ -393,7 +425,10 @@ pub(super) fn apply_binary(
         if let (Value::Path { points: pa, .. }, Value::Path { points: pb, .. }) = (&l, &r) {
             let mut points = pa.clone();
             points.extend_from_slice(pb);
-            return Ok(Value::Path { points, closed: false });
+            return Ok(Value::Path {
+                points,
+                closed: false,
+            });
         }
     }
     // PG `point ± point` translates a point by another's coordinates;
@@ -402,10 +437,16 @@ pub(super) fn apply_binary(
     if let (Value::Point(a), Value::Point(b)) = (&l, &r) {
         match op {
             BinOp::Add => {
-                return Ok(Value::Point(spg_storage::Point2D { x: a.x + b.x, y: a.y + b.y }));
+                return Ok(Value::Point(spg_storage::Point2D {
+                    x: a.x + b.x,
+                    y: a.y + b.y,
+                }));
             }
             BinOp::Sub => {
-                return Ok(Value::Point(spg_storage::Point2D { x: a.x - b.x, y: a.y - b.y }));
+                return Ok(Value::Point(spg_storage::Point2D {
+                    x: a.x - b.x,
+                    y: a.y - b.y,
+                }));
             }
             BinOp::Mul => {
                 // (a.x + a.y i)(b.x + b.y i)
@@ -432,20 +473,32 @@ pub(super) fn apply_binary(
     // before numeric/date arithmetic.
     if op == BinOp::Mul || op == BinOp::Add || op == BinOp::Sub {
         if let (
-            Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
-            Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+            Value::Range {
+                kind: ak,
+                lower: al,
+                upper: au,
+                lower_inc: ali,
+                upper_inc: aui,
+                empty: ae,
+            },
+            Value::Range {
+                kind: bk,
+                lower: bl,
+                upper: bu,
+                lower_inc: bli,
+                upper_inc: bui,
+                empty: be,
+            },
         ) = (&l, &r)
         {
             return match op {
                 BinOp::Mul => Ok(range_intersect(
                     *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
                 )),
-                BinOp::Add => range_union(
-                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
-                ),
-                _ => range_difference(
-                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
-                ),
+                BinOp::Add => {
+                    range_union(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
+                }
+                _ => range_difference(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be),
             };
         }
     }
@@ -490,7 +543,9 @@ pub(super) fn apply_binary(
         // appends arrays. Text `||` stays text concatenation.
         // tsquery `||` is boolean OR (claim it before text concatenation).
         BinOp::Concat if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) => {
-            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else {
+                unreachable!()
+            };
             Ok(Value::TsQuery(spg_storage::TsQueryAst::Or(
                 alloc::boxed::Box::new(a.clone()),
                 alloc::boxed::Box::new(b.clone()),
@@ -529,26 +584,62 @@ pub(super) fn apply_binary(
         // JSON / inet interpretations. `range @> elem|range`, `<@` swapped,
         // `&&` overlap. Verified vs PG18.
         BinOp::JsonContains if matches!(l, Value::Range { .. }) => {
-            let Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae } = &l
-            else { unreachable!() };
+            let Value::Range {
+                kind: ak,
+                lower: al,
+                upper: au,
+                lower_inc: ali,
+                upper_inc: aui,
+                empty: ae,
+            } = &l
+            else {
+                unreachable!()
+            };
             Ok(Value::Bool(match &r {
-                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be } =>
-                    range_contains_range(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be),
+                Value::Range {
+                    kind: bk,
+                    lower: bl,
+                    upper: bu,
+                    lower_inc: bli,
+                    upper_inc: bui,
+                    empty: be,
+                } => {
+                    range_contains_range(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
+                }
                 elem => range_contains_elem(*ak, al, au, *ali, *aui, *ae, elem),
             }))
         }
         BinOp::JsonContainedBy if matches!(r, Value::Range { .. }) => {
-            let Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be } = &r
-            else { unreachable!() };
+            let Value::Range {
+                kind: bk,
+                lower: bl,
+                upper: bu,
+                lower_inc: bli,
+                upper_inc: bui,
+                empty: be,
+            } = &r
+            else {
+                unreachable!()
+            };
             Ok(Value::Bool(match &l {
-                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae } =>
-                    range_contains_range(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae),
+                Value::Range {
+                    kind: ak,
+                    lower: al,
+                    upper: au,
+                    lower_inc: ali,
+                    upper_inc: aui,
+                    empty: ae,
+                } => {
+                    range_contains_range(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae)
+                }
                 elem => range_contains_elem(*bk, bl, bu, *bli, *bui, *be, elem),
             }))
         }
         // tsquery `&&` is boolean AND (claim it before array / inet overlap).
         BinOp::InetOverlap if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) => {
-            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else {
+                unreachable!()
+            };
             Ok(Value::TsQuery(spg_storage::TsQueryAst::And(
                 alloc::boxed::Box::new(a.clone()),
                 alloc::boxed::Box::new(b.clone()),
@@ -559,9 +650,14 @@ pub(super) fn apply_binary(
         BinOp::JsonContains | BinOp::JsonContainedBy
             if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) =>
         {
-            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else { unreachable!() };
-            let (container, contained) =
-                if matches!(op, BinOp::JsonContains) { (a, b) } else { (b, a) };
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else {
+                unreachable!()
+            };
+            let (container, contained) = if matches!(op, BinOp::JsonContains) {
+                (a, b)
+            } else {
+                (b, a)
+            };
             let mut cont_lex = alloc::collections::BTreeSet::new();
             tsquery_lexemes(container, &mut cont_lex);
             let mut sub_lex = alloc::collections::BTreeSet::new();
@@ -572,27 +668,44 @@ pub(super) fn apply_binary(
             if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
         {
             let (
-                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
-                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
-            ) = (&l, &r) else { unreachable!() };
+                Value::Range {
+                    kind: ak,
+                    lower: al,
+                    upper: au,
+                    lower_inc: ali,
+                    upper_inc: aui,
+                    empty: ae,
+                },
+                Value::Range {
+                    kind: bk,
+                    lower: bl,
+                    upper: bu,
+                    lower_inc: bli,
+                    upper_inc: bui,
+                    empty: be,
+                },
+            ) = (&l, &r)
+            else {
+                unreachable!()
+            };
             Ok(Value::Bool(range_overlaps(
                 *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
             )))
         }
         // Geometric `container @> point` / `point <@ container` for
         // polygon / box / circle, ahead of the array & JSON interpretations.
-        BinOp::JsonContains if geo_contains_point(&l, &r).is_some() => {
-            Ok(Value::Bool(geo_contains_point(&l, &r).expect("guard checked")))
-        }
-        BinOp::JsonContainedBy if geo_contains_point(&r, &l).is_some() => {
-            Ok(Value::Bool(geo_contains_point(&r, &l).expect("guard checked")))
-        }
-        BinOp::JsonContains if geo_contains_box(&l, &r).is_some() => {
-            Ok(Value::Bool(geo_contains_box(&l, &r).expect("guard checked")))
-        }
-        BinOp::JsonContainedBy if geo_contains_box(&r, &l).is_some() => {
-            Ok(Value::Bool(geo_contains_box(&r, &l).expect("guard checked")))
-        }
+        BinOp::JsonContains if geo_contains_point(&l, &r).is_some() => Ok(Value::Bool(
+            geo_contains_point(&l, &r).expect("guard checked"),
+        )),
+        BinOp::JsonContainedBy if geo_contains_point(&r, &l).is_some() => Ok(Value::Bool(
+            geo_contains_point(&r, &l).expect("guard checked"),
+        )),
+        BinOp::JsonContains if geo_contains_box(&l, &r).is_some() => Ok(Value::Bool(
+            geo_contains_box(&l, &r).expect("guard checked"),
+        )),
+        BinOp::JsonContainedBy if geo_contains_box(&r, &l).is_some() => Ok(Value::Bool(
+            geo_contains_box(&r, &l).expect("guard checked"),
+        )),
         // Array operands claim && / @> / <@ before the inet / JSON
         // interpretations: ARRAY[1,2] && ARRAY[2,3] is the overlap
         // test, ARRAY[1,2,3] @> ARRAY[2] the containment test.
@@ -616,9 +729,7 @@ pub(super) fn apply_binary(
         {
             let (a, _) = array_scalar_elems(&l).expect("guard checked");
             let (b, _) = array_scalar_elems(&r).expect("guard checked");
-            Ok(Value::Bool(
-                a.iter().any(|x| b.iter().any(|y| x == y)),
-            ))
+            Ok(Value::Bool(a.iter().any(|x| b.iter().any(|y| x == y))))
         }
         BinOp::JsonContains => crate::json::contains(&l, &r),
         // v7.37 — `jsonb @? jsonpath` = jsonb_path_exists: does the path
@@ -668,9 +779,26 @@ pub(super) fn apply_binary(
             if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
         {
             let (
-                Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
-                Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
-            ) = (&l, &r) else { unreachable!() };
+                Value::Range {
+                    kind: ak,
+                    lower: al,
+                    upper: au,
+                    lower_inc: ali,
+                    upper_inc: aui,
+                    empty: ae,
+                },
+                Value::Range {
+                    kind: bk,
+                    lower: bl,
+                    upper: bu,
+                    lower_inc: bli,
+                    upper_inc: bui,
+                    empty: be,
+                },
+            ) = (&l, &r)
+            else {
+                unreachable!()
+            };
             // `a >> b` is `b << a`.
             let strictly_left = if matches!(op, BinOp::InetContainedBy) {
                 range_strictly_left(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
@@ -684,7 +812,9 @@ pub(super) fn apply_binary(
         BinOp::InetContainedBy | BinOp::InetContains
             if matches!(l, Value::BitString { .. }) && int_operand(&r).is_some() =>
         {
-            let Value::BitString { nbits, bytes } = &l else { unreachable!() };
+            let Value::BitString { nbits, bytes } = &l else {
+                unreachable!()
+            };
             let k = int_operand(&r).expect("guard checked");
             let out = bitstring_shift(*nbits, bytes, k, matches!(op, BinOp::InetContainedBy));
             Ok(Value::BitString {
@@ -849,9 +979,7 @@ fn apply_binary_calendar(
         // v7.37 D.35 — `date + time` (and `time + date`) → timestamp at that
         // date's midnight plus the time-of-day. PG: date '2024-06-15' + time
         // '10:30' → 2024-06-15 10:30:00.
-        (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d))
-            if op == BinOp::Add =>
-        {
+        (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d)) if op == BinOp::Add => {
             let micros = i64::from(*d)
                 .checked_mul(86_400_000_000)
                 .and_then(|day_us| day_us.checked_add(*t))
@@ -913,7 +1041,11 @@ pub(crate) fn apply_binary_interval(
         | (other, Value::Interval { .. }, BinOp::Mul)
             if as_f64(other).is_ok() =>
         {
-            let iv = if matches!(l, Value::Interval { .. }) { l } else { r };
+            let iv = if matches!(l, Value::Interval { .. }) {
+                l
+            } else {
+                r
+            };
             return scale_interval(iv, as_f64(other)?).map(Some);
         }
         (Value::Interval { .. }, other, BinOp::Div) if as_f64(other).is_ok() => {
@@ -970,11 +1102,12 @@ pub(crate) fn apply_binary_interval(
             // midnight when the interval has no sub-day part), because the
             // interval may carry a time component. `date ± integer` stays a
             // date, but that is a different operator handled elsewhere.
-            let base = i64::from(*d)
-                .checked_mul(86_400_000_000)
-                .ok_or(EvalError::TypeMismatch {
-                    detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
-                })?;
+            let base =
+                i64::from(*d)
+                    .checked_mul(86_400_000_000)
+                    .ok_or(EvalError::TypeMismatch {
+                        detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
+                    })?;
             Ok(Some(Value::Timestamp(add_interval_to_micros(
                 base,
                 signed_months,
@@ -1222,7 +1355,11 @@ fn numeric_special_result(
     let res = match op {
         BinOp::Add => {
             if l_inf && r_inf {
-                if ls == rs { inf(ls) } else { return Some(nan()); }
+                if ls == rs {
+                    inf(ls)
+                } else {
+                    return Some(nan());
+                }
             } else if l_inf {
                 inf(ls)
             } else {
@@ -1232,7 +1369,11 @@ fn numeric_special_result(
         BinOp::Sub => {
             let rs2 = -rs;
             if l_inf && r_inf {
-                if ls == rs2 { inf(ls) } else { return Some(nan()); }
+                if ls == rs2 {
+                    inf(ls)
+                } else {
+                    return Some(nan());
+                }
             } else if l_inf {
                 inf(ls)
             } else {
@@ -1273,9 +1414,11 @@ pub(crate) fn value_to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumer
         Value::SmallInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
         Value::Int(n) => BigNumeric::from_i128(i128::from(*n), 0),
         Value::BigInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
-        Value::Numeric { scaled, scale, kind } if *kind == spg_storage::NumericKind::Finite => {
-            BigNumeric::from_i128(*scaled, *scale)
-        }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } if *kind == spg_storage::NumericKind::Finite => BigNumeric::from_i128(*scaled, *scale),
         Value::NumericBig(b) => (**b).clone(),
         _ => return None,
     })
@@ -1285,7 +1428,11 @@ pub(crate) fn value_to_bignum(v: &Value) -> Option<spg_storage::bignum::BigNumer
 /// `i128`, else keep the big form.
 pub(crate) fn bignum_to_value(b: spg_storage::bignum::BigNumeric) -> Value<'static> {
     match b.to_i128() {
-        Some(scaled) => Value::Numeric { scaled, scale: b.scale(), kind: spg_storage::NumericKind::Finite },
+        Some(scaled) => Value::Numeric {
+            scaled,
+            scale: b.scale(),
+            kind: spg_storage::NumericKind::Finite,
+        },
         None => Value::NumericBig(alloc::boxed::Box::new(b)),
     }
 }
@@ -1386,9 +1533,14 @@ fn apply_binary_numeric(
     // f64, narrow to f32); a float8 / numeric operand widens to the float path.
     let has_real = matches!(l, Value::Real(_)) || matches!(r, Value::Real(_));
     let has_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
-    let has_numeric = matches!(l, Value::Numeric { .. } | Value::NumericBig(_)) || matches!(r, Value::Numeric { .. } | Value::NumericBig(_));
+    let has_numeric = matches!(l, Value::Numeric { .. } | Value::NumericBig(_))
+        || matches!(r, Value::Numeric { .. } | Value::NumericBig(_));
     let both_real = matches!(l, Value::Real(_)) && matches!(r, Value::Real(_));
-    if both_real && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+    if both_real
+        && matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+        )
     {
         let af = as_f64(&l)?;
         let bf = as_f64(&r)?;
@@ -1522,7 +1674,8 @@ fn apply_binary_numeric(
             Ok(Value::Numeric {
                 scaled: lhs.wrapping_rem(rhs),
                 scale: target_scale,
-             kind: spg_storage::NumericKind::Finite })
+                kind: spg_storage::NumericKind::Finite,
+            })
         }
         BinOp::Mul => {
             // v7.38 (read01, T3.C3) — i128 product overflow promotes to bignum.
@@ -1548,9 +1701,11 @@ fn apply_binary_numeric(
             // (large dividend × 10^rscale), promote to the arbitrary-precision
             // path rather than erroring.
             match crate::numeric::numeric_div(a, sa, b, sb) {
-                Some((scaled, scale)) => {
-                    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
-                }
+                Some((scaled, scale)) => Ok(Value::Numeric {
+                    scaled,
+                    scale,
+                    kind: spg_storage::NumericKind::Finite,
+                }),
                 None => numeric_big_op(op, &l, &r).expect("numeric operands"),
             }
         }
@@ -1676,8 +1831,14 @@ fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
     // operands are MSB-packed and zero-padded, so the second string's bits
     // must be shifted to start at bit offset nbits(a), not byte-appended.
     if let (
-        Value::BitString { nbits: an, bytes: ab },
-        Value::BitString { nbits: bn, bytes: bb },
+        Value::BitString {
+            nbits: an,
+            bytes: ab,
+        },
+        Value::BitString {
+            nbits: bn,
+            bytes: bb,
+        },
     ) = (l, r)
     {
         let (total, out) = bit_concat(*an, ab, *bn, bb);
@@ -1907,7 +2068,11 @@ fn bitstring_shift(nbits: u32, bytes: &[u8], k: i64, mut left: bool) -> alloc::v
     let mut out = alloc::vec![0u8; n.div_ceil(8)];
     for i in 0..n {
         // shift-left: out[i] = in[i+k]; shift-right: out[i] = in[i-k].
-        let src = if left { i.checked_add(k) } else { i.checked_sub(k) };
+        let src = if left {
+            i.checked_add(k)
+        } else {
+            i.checked_sub(k)
+        };
         if src.is_some_and(get) {
             out[i / 8] |= 1 << (7 - (i % 8));
         }
@@ -1924,8 +2089,16 @@ fn bitop(
     // PG `bit(n) & / | bit(n)`: byte-wise over equal-length bit strings.
     // Operands are MSB-packed and zero-padded, so `&`/`|` keep the padding
     // zero. Differing lengths are an error, matching PG.
-    if let (Value::BitString { nbits: an, bytes: ab }, Value::BitString { nbits: bn, bytes: bb }) =
-        (&l, &r)
+    if let (
+        Value::BitString {
+            nbits: an,
+            bytes: ab,
+        },
+        Value::BitString {
+            nbits: bn,
+            bytes: bb,
+        },
+    ) = (&l, &r)
     {
         if an != bn {
             return Err(EvalError::TypeMismatch {
@@ -2073,7 +2246,9 @@ fn check_float8_range(result: f64, a: f64, b: f64, op_name: &str) -> Result<f64,
 fn small_int_result(res: i64) -> Result<Value<'static>, EvalError> {
     i16::try_from(res)
         .map(Value::SmallInt)
-        .map_err(|_| EvalError::TypeMismatch { detail: "smallint out of range".into() })
+        .map_err(|_| EvalError::TypeMismatch {
+            detail: "smallint out of range".into(),
+        })
 }
 
 fn arith(
@@ -2143,7 +2318,12 @@ fn arith(
         {
             let af = as_f64(&a)?;
             let bf = as_f64(&b)?;
-            Ok(Value::Float(check_float8_range(float_op(af, bf), af, bf, op_name)?))
+            Ok(Value::Float(check_float8_range(
+                float_op(af, bf),
+                af,
+                bf,
+                op_name,
+            )?))
         }
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!(
@@ -2185,8 +2365,14 @@ fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, E
     // PG `circle <-> circle` is the gap between the boundaries: the centre
     // distance minus both radii, clamped to 0 when they overlap.
     if let (
-        Value::Circle { center: ac, radius: ar },
-        Value::Circle { center: bc, radius: br },
+        Value::Circle {
+            center: ac,
+            radius: ar,
+        },
+        Value::Circle {
+            center: bc,
+            radius: br,
+        },
     ) = (&l, &r)
     {
         let (dx, dy) = (ac.x - bc.x, ac.y - bc.y);
@@ -2246,7 +2432,11 @@ fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         l,
         r,
         |a, b| {
-            if b == 0 { None } else { Some(a.wrapping_rem(b)) }
+            if b == 0 {
+                None
+            } else {
+                Some(a.wrapping_rem(b))
+            }
         },
         // f64 fallback (when widening to Float happens inside arith);
         // f64's `%` is C `fmod` semantics, matching PG `%` on floats.
@@ -2458,7 +2648,10 @@ fn crc32_traditional(bytes: &[u8]) -> u32 {
 
 /// v7.38 (read01, R2) — one item of a tsquery flattened to prefix order.
 enum QItem {
-    Val { crc: u32, bytes: alloc::vec::Vec<u8> },
+    Val {
+        crc: u32,
+        bytes: alloc::vec::Vec<u8>,
+    },
     Phrase(u16),
     Or,
     And,
@@ -2496,7 +2689,11 @@ fn tsquery_flatten(ast: &spg_storage::TsQueryAst, out: &mut alloc::vec::Vec<QIte
             tsquery_flatten(l, out);
             tsquery_flatten(r, out);
         }
-        Q::Phrase { left, right, distance } => {
+        Q::Phrase {
+            left,
+            right,
+            distance,
+        } => {
             out.push(QItem::Phrase(*distance));
             tsquery_flatten(left, out);
             tsquery_flatten(right, out);
@@ -2528,13 +2725,12 @@ fn tsquery_total_cmp(
     };
     let item_cmp = |x: &QItem, y: &QItem| -> core::cmp::Ordering {
         match (x, y) {
-            (
-                QItem::Val { crc: cx, bytes: bx },
-                QItem::Val { crc: cy, bytes: by },
-            ) => (*cx as i32) // PG's valcrc is int32 — the compare is SIGNED
-                .cmp(&(*cy as i32))
-                .then_with(|| bx.len().cmp(&by.len()))
-                .then_with(|| bx.cmp(by)),
+            (QItem::Val { crc: cx, bytes: bx }, QItem::Val { crc: cy, bytes: by }) => {
+                (*cx as i32) // PG's valcrc is int32 — the compare is SIGNED
+                    .cmp(&(*cy as i32))
+                    .then_with(|| bx.len().cmp(&by.len()))
+                    .then_with(|| bx.cmp(by))
+            }
             (QItem::Val { .. }, _) => Less,
             (_, QItem::Val { .. }) => Greater,
             (QItem::Phrase(dx), QItem::Phrase(dy)) => dy.cmp(dx), // larger distance first
@@ -2659,7 +2855,12 @@ fn range_canonical(
 
 /// Sort key for range uppers: `None` (+∞) greatest, then by value, then an
 /// inclusive upper after an exclusive one at the same value.
-fn upper_cmp(au: &Option<Value<'static>>, aui: bool, bu: &Option<Value<'static>>, bui: bool) -> core::cmp::Ordering {
+fn upper_cmp(
+    au: &Option<Value<'static>>,
+    aui: bool,
+    bu: &Option<Value<'static>>,
+    bui: bool,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (au, bu) {
         (None, None) => Ordering::Equal,
@@ -2711,9 +2912,18 @@ fn bound_cmp(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
         (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Numeric { scaled: xs, scale: xc , .. }, Value::Numeric { scaled: ys, scale: yc , .. }) => {
-            numeric_pair_cmp((*xs, *xc), (*ys, *yc))
-        }
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xc,
+                ..
+            },
+            Value::Numeric {
+                scaled: ys,
+                scale: yc,
+                ..
+            },
+        ) => numeric_pair_cmp((*xs, *xc), (*ys, *yc)),
         // Mixed real-number bounds/elements (e.g. `numrange(1.5,3.5) @> 2.5`
         // where the literal lexes as float but the range bounds are numeric):
         // compare as f64 so containment doesn't silently fall through to Equal.
@@ -2741,7 +2951,12 @@ fn num_as_f64(v: &Value<'_>) -> Option<f64> {
 
 /// Sort key for range lowers: `None` (−∞) first, then by value, then an
 /// inclusive lower before an exclusive one at the same value.
-fn lower_cmp(al: &Option<Value<'static>>, ali: bool, bl: &Option<Value<'static>>, bli: bool) -> core::cmp::Ordering {
+fn lower_cmp(
+    al: &Option<Value<'static>>,
+    ali: bool,
+    bl: &Option<Value<'static>>,
+    bli: bool,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (al, bl) {
         (None, None) => Ordering::Equal,
@@ -2753,21 +2968,31 @@ fn lower_cmp(al: &Option<Value<'static>>, ali: bool, bl: &Option<Value<'static>>
 
 /// Does a span ending at `(au, aui)` reach a following span starting at
 /// `(bl, bli)` — i.e. they overlap or are adjacent (no gap)?
-fn upper_reaches_lower(au: &Option<Value<'static>>, aui: bool, bl: &Option<Value<'static>>, bli: bool) -> bool {
+fn upper_reaches_lower(
+    au: &Option<Value<'static>>,
+    aui: bool,
+    bl: &Option<Value<'static>>,
+    bli: bool,
+) -> bool {
     use core::cmp::Ordering;
     match (au, bl) {
-        (None, _) => true,   // +∞ upper reaches anything
-        (_, None) => true,   // following span starts at −∞
+        (None, _) => true, // +∞ upper reaches anything
+        (_, None) => true, // following span starts at −∞
         (Some(u), Some(l)) => match bound_cmp(u, l) {
-            Ordering::Greater => true,       // overlap
-            Ordering::Equal => aui || bli,   // adjacent iff the touching point is covered
-            Ordering::Less => false,         // gap
+            Ordering::Greater => true,     // overlap
+            Ordering::Equal => aui || bli, // adjacent iff the touching point is covered
+            Ordering::Less => false,       // gap
         },
     }
 }
 
 /// Is upper `(au, aui)` strictly greater than upper `(bu, bui)`?
-fn upper_greater(au: &Option<Value<'static>>, aui: bool, bu: &Option<Value<'static>>, bui: bool) -> bool {
+fn upper_greater(
+    au: &Option<Value<'static>>,
+    aui: bool,
+    bu: &Option<Value<'static>>,
+    bui: bool,
+) -> bool {
     use core::cmp::Ordering;
     match (au, bu) {
         (None, None) => false,
@@ -2784,7 +3009,10 @@ fn upper_greater(au: &Option<Value<'static>>, aui: bool, bu: &Option<Value<'stat
 /// Normalise a multirange's spans to PG's canonical form: canonicalise each
 /// (discrete `[)`), drop empties, sort by lower, then merge any overlapping
 /// or adjacent spans. Two multiranges are equal iff their normal forms match.
-fn normalize_multirange(kind: spg_storage::RangeKind, spans: &[spg_storage::RangeSpan]) -> alloc::vec::Vec<CanonSpan> {
+fn normalize_multirange(
+    kind: spg_storage::RangeKind,
+    spans: &[spg_storage::RangeSpan],
+) -> alloc::vec::Vec<CanonSpan> {
     let mut cs: alloc::vec::Vec<CanonSpan> = spans
         .iter()
         .filter(|s| !s.empty)
@@ -2857,7 +3085,12 @@ fn multirange_cmp(
 /// Is the interval bounded below by `(l, l_inc)` and above by `(u, u_inc)`
 /// non-empty? (`−∞` lower / `+∞` upper are always fine; equal finite bounds
 /// need both inclusive.)
-fn range_point_le(l: &Option<Value<'static>>, l_inc: bool, u: &Option<Value<'static>>, u_inc: bool) -> bool {
+fn range_point_le(
+    l: &Option<Value<'static>>,
+    l_inc: bool,
+    u: &Option<Value<'static>>,
+    u_inc: bool,
+) -> bool {
     match (l, u) {
         (None, _) | (_, None) => true,
         (Some(lv), Some(uv)) => match bound_cmp(lv, uv) {
@@ -2872,8 +3105,18 @@ fn range_point_le(l: &Option<Value<'static>>, l_inc: bool, u: &Option<Value<'sta
 /// overlaps nothing.
 #[allow(clippy::too_many_arguments)]
 fn range_overlaps(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> bool {
     if ae || be {
         return false;
@@ -2887,8 +3130,18 @@ fn range_overlaps(
 /// only empty contains empty.
 #[allow(clippy::too_many_arguments)]
 fn range_contains_range(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> bool {
     if be {
         return true;
@@ -2904,7 +3157,12 @@ fn range_contains_range(
 
 /// Range `@>` element: `a` contains the scalar `e`.
 fn range_contains_elem(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
     e: &Value<'_>,
 ) -> bool {
     use core::cmp::Ordering;
@@ -2934,8 +3192,18 @@ fn range_contains_elem(
 /// Range `*` intersection: the overlapping sub-range (empty if disjoint).
 #[allow(clippy::too_many_arguments)]
 fn range_intersect(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> Value<'static> {
     let _ = bk;
     let empty = Value::Range {
@@ -2977,7 +3245,12 @@ fn range_intersect(
 
 /// Do bound `(up, up_inc)` and `(low, low_inc)` touch with no gap and no
 /// overlap? (equal values, exactly one side inclusive — the `[x) [x)` seam).
-fn bounds_touch(up: &Option<Value<'static>>, up_inc: bool, low: &Option<Value<'static>>, low_inc: bool) -> bool {
+fn bounds_touch(
+    up: &Option<Value<'static>>,
+    up_inc: bool,
+    low: &Option<Value<'static>>,
+    low_inc: bool,
+) -> bool {
     match (up, low) {
         (Some(u), Some(l)) => bound_cmp(u, l) == core::cmp::Ordering::Equal && (up_inc != low_inc),
         _ => false,
@@ -2988,10 +3261,25 @@ fn bounds_touch(up: &Option<Value<'static>>, up_inc: bool, low: &Option<Value<'s
 /// errors "result of range union would not be contiguous".
 #[allow(clippy::too_many_arguments)]
 fn range_union(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> Result<Value<'static>, EvalError> {
-    let mk = |k, lo: &Option<alloc::boxed::Box<Value<'static>>>, up: &Option<alloc::boxed::Box<Value<'static>>>, li, ui, e| Value::Range {
+    let mk = |k,
+              lo: &Option<alloc::boxed::Box<Value<'static>>>,
+              up: &Option<alloc::boxed::Box<Value<'static>>>,
+              li,
+              ui,
+              e| Value::Range {
         kind: k,
         lower: lo.clone(),
         upper: up.clone(),
@@ -3039,8 +3327,18 @@ fn range_union(
 /// removing `b` would split `a` into two disjoint ranges.
 #[allow(clippy::too_many_arguments)]
 fn range_difference(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> Result<Value<'static>, EvalError> {
     let empty = Value::Range {
         kind: ak,
@@ -3050,7 +3348,10 @@ fn range_difference(
         upper_inc: false,
         empty: true,
     };
-    let mk = |lo: Option<alloc::boxed::Box<Value<'static>>>, up: Option<alloc::boxed::Box<Value<'static>>>, li, ui| Value::Range {
+    let mk = |lo: Option<alloc::boxed::Box<Value<'static>>>,
+              up: Option<alloc::boxed::Box<Value<'static>>>,
+              li,
+              ui| Value::Range {
         kind: ak,
         lower: lo,
         upper: up,
@@ -3090,10 +3391,20 @@ fn range_difference(
     }
     if a_extends_left {
         // Keep `a`'s left part: [a.lower, b.lower).
-        Ok(mk(al2.map(alloc::boxed::Box::new), bl2.map(alloc::boxed::Box::new), ali2, !bli2))
+        Ok(mk(
+            al2.map(alloc::boxed::Box::new),
+            bl2.map(alloc::boxed::Box::new),
+            ali2,
+            !bli2,
+        ))
     } else {
         // Keep `a`'s right part: [b.upper, a.upper).
-        Ok(mk(bu2.map(alloc::boxed::Box::new), au2.map(alloc::boxed::Box::new), !bui2, aui2))
+        Ok(mk(
+            bu2.map(alloc::boxed::Box::new),
+            au2.map(alloc::boxed::Box::new),
+            !bui2,
+            aui2,
+        ))
     }
 }
 
@@ -3101,8 +3412,16 @@ fn range_difference(
 /// `money × number → money`, `money ÷ number → money`, `money ÷ money → float8`
 /// ratio. Returns `None` when the operator/operand shape is not money math (let
 /// the caller fall through). Rounding is half-away-from-zero, no_std-friendly.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'static>, EvalError>> {
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn money_arith(
+    op: BinOp,
+    l: &Value<'_>,
+    r: &Value<'_>,
+) -> Option<Result<Value<'static>, EvalError>> {
     if !matches!(l, Value::Money(_)) && !matches!(r, Value::Money(_)) {
         return None;
     }
@@ -3120,11 +3439,19 @@ fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'
         }
     };
     let round_cents = |v: f64| -> i64 {
-        if v >= 0.0 { (v + 0.5) as i64 } else { (v - 0.5) as i64 }
+        if v >= 0.0 {
+            (v + 0.5) as i64
+        } else {
+            (v - 0.5) as i64
+        }
     };
     match (op, l, r) {
-        (BinOp::Add, Value::Money(a), Value::Money(b)) => Some(Ok(Value::Money(a.saturating_add(*b)))),
-        (BinOp::Sub, Value::Money(a), Value::Money(b)) => Some(Ok(Value::Money(a.saturating_sub(*b)))),
+        (BinOp::Add, Value::Money(a), Value::Money(b)) => {
+            Some(Ok(Value::Money(a.saturating_add(*b))))
+        }
+        (BinOp::Sub, Value::Money(a), Value::Money(b)) => {
+            Some(Ok(Value::Money(a.saturating_sub(*b))))
+        }
         (BinOp::Div, Value::Money(a), Value::Money(b)) => Some(if *b == 0 {
             Err(EvalError::DivisionByZero)
         } else {
@@ -3134,7 +3461,11 @@ fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'
             factor(other).map(|f| Ok(Value::Money(round_cents(*a as f64 * f))))
         }
         (BinOp::Div, Value::Money(a), other) => factor(other).map(|f| {
-            if f == 0.0 { Err(EvalError::DivisionByZero) } else { Ok(Value::Money(round_cents(*a as f64 / f))) }
+            if f == 0.0 {
+                Err(EvalError::DivisionByZero)
+            } else {
+                Ok(Value::Money(round_cents(*a as f64 / f)))
+            }
         }),
         _ => None,
     }
@@ -3146,8 +3477,18 @@ fn money_arith(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Result<Value<'
 /// overlaps). Unbounded sides on the touching edges make it false.
 #[allow(clippy::too_many_arguments)]
 fn range_strictly_left(
-    ak: spg_storage::RangeKind, al: &Option<alloc::boxed::Box<Value<'static>>>, au: &Option<alloc::boxed::Box<Value<'static>>>, ali: bool, aui: bool, ae: bool,
-    bk: spg_storage::RangeKind, bl: &Option<alloc::boxed::Box<Value<'static>>>, bu: &Option<alloc::boxed::Box<Value<'static>>>, bli: bool, bui: bool, be: bool,
+    ak: spg_storage::RangeKind,
+    al: &Option<alloc::boxed::Box<Value<'static>>>,
+    au: &Option<alloc::boxed::Box<Value<'static>>>,
+    ali: bool,
+    aui: bool,
+    ae: bool,
+    bk: spg_storage::RangeKind,
+    bl: &Option<alloc::boxed::Box<Value<'static>>>,
+    bu: &Option<alloc::boxed::Box<Value<'static>>>,
+    bli: bool,
+    bui: bool,
+    be: bool,
 ) -> bool {
     use core::cmp::Ordering;
     if ae || be {
@@ -3247,10 +3588,19 @@ fn geo_contains_box(container: &Value<'_>, inner: &Value<'_>) -> Option<bool> {
 /// between centres is ≤ the sum of the radii. `None` for other operand pairs.
 fn geo_overlaps(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
     match (a, b) {
-        (Value::PgBox(aur, all), Value::PgBox(bur, bll)) => Some(
-            all.x <= bur.x && bll.x <= aur.x && all.y <= bur.y && bll.y <= aur.y,
-        ),
-        (Value::Circle { center: c1, radius: r1 }, Value::Circle { center: c2, radius: r2 }) => {
+        (Value::PgBox(aur, all), Value::PgBox(bur, bll)) => {
+            Some(all.x <= bur.x && bll.x <= aur.x && all.y <= bur.y && bll.y <= aur.y)
+        }
+        (
+            Value::Circle {
+                center: c1,
+                radius: r1,
+            },
+            Value::Circle {
+                center: c2,
+                radius: r2,
+            },
+        ) => {
             let (dx, dy) = (c1.x - c2.x, c1.y - c2.y);
             let rsum = r1 + r2;
             Some(dx * dx + dy * dy <= rsum * rsum)
@@ -3281,8 +3631,7 @@ fn geo_contains_point(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
             for i in 0..pts.len() {
                 let (xi, yi) = (pts[i].x, pts[i].y);
                 let (xj, yj) = (pts[j].x, pts[j].y);
-                if ((yi > pt.y) != (yj > pt.y))
-                    && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi)
+                if ((yi > pt.y) != (yj > pt.y)) && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi)
                 {
                     inside = !inside;
                 }
@@ -3300,15 +3649,39 @@ fn geo_contains_point(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
 pub(crate) fn range_adjacent_pair(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
     use core::cmp::Ordering;
     let (ak, al, au, ali, aui, ae) = match a {
-        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
-            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
-        }
+        Value::Range {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => (
+            *kind,
+            lower.clone(),
+            upper.clone(),
+            *lower_inc,
+            *upper_inc,
+            *empty,
+        ),
         _ => return None,
     };
     let (bk, bl, bu, bli, bui, be) = match b {
-        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
-            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
-        }
+        Value::Range {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => (
+            *kind,
+            lower.clone(),
+            upper.clone(),
+            *lower_inc,
+            *upper_inc,
+            *empty,
+        ),
         _ => return None,
     };
     if ae || be {
@@ -3335,19 +3708,55 @@ pub(crate) fn range_adjacent_pair(a: &Value<'_>, b: &Value<'_>) -> Option<bool> 
 /// if either value is not a range (caller falls back).
 pub(crate) fn range_merge_pair(a: &Value<'_>, b: &Value<'_>) -> Option<Value<'static>> {
     let (ak, al, au, ali, aui, ae) = match a {
-        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
-            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
-        }
+        Value::Range {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => (
+            *kind,
+            lower.clone(),
+            upper.clone(),
+            *lower_inc,
+            *upper_inc,
+            *empty,
+        ),
         _ => return None,
     };
     let (bk, bl, bu, bli, bui, be) = match b {
-        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
-            (*kind, lower.clone(), upper.clone(), *lower_inc, *upper_inc, *empty)
-        }
+        Value::Range {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => (
+            *kind,
+            lower.clone(),
+            upper.clone(),
+            *lower_inc,
+            *upper_inc,
+            *empty,
+        ),
         _ => return None,
     };
-    let mk = |k, lo: Option<alloc::boxed::Box<Value<'static>>>, up: Option<alloc::boxed::Box<Value<'static>>>, li, ui, e| {
-        Value::Range { kind: k, lower: lo, upper: up, lower_inc: li, upper_inc: ui, empty: e }
+    let mk = |k,
+              lo: Option<alloc::boxed::Box<Value<'static>>>,
+              up: Option<alloc::boxed::Box<Value<'static>>>,
+              li,
+              ui,
+              e| {
+        Value::Range {
+            kind: k,
+            lower: lo,
+            upper: up,
+            lower_inc: li,
+            upper_inc: ui,
+            empty: e,
+        }
     };
     if ae {
         return Some(mk(bk, bl, bu, bli, bui, be));
@@ -3368,14 +3777,23 @@ pub(crate) fn range_merge_pair(a: &Value<'_>, b: &Value<'_>) -> Option<Value<'st
     } else {
         (bu2, bui2)
     };
-    Some(mk(ak, lo.map(alloc::boxed::Box::new), up.map(alloc::boxed::Box::new), lo_inc, up_inc, false))
+    Some(mk(
+        ak,
+        lo.map(alloc::boxed::Box::new),
+        up.map(alloc::boxed::Box::new),
+        lo_inc,
+        up_inc,
+        false,
+    ))
 }
 
 /// The numeric value of an inet/cidr address (IPv4 in the low 4 bytes,
 /// IPv6 across all 16), MSB-first.
 fn inet_addr_u128(family: u8, addr: &[u8; 16]) -> u128 {
     let slice: &[u8] = if family == 4 { &addr[0..4] } else { &addr[..] };
-    slice.iter().fold(0u128, |acc, &b| (acc << 8) | u128::from(b))
+    slice
+        .iter()
+        .fold(0u128, |acc, &b| (acc << 8) | u128::from(b))
 }
 
 /// Rebuild a `Value::Inet` from a numeric address (inverse of
@@ -3396,8 +3814,16 @@ fn inet_from_u128(family: u8, bits: u8, val: u128) -> Value<'static> {
 /// of the two (`10.0.0.0/8 & 255.0.0.0` → `10.0.0.0/32`).
 fn inet_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError> {
     let (
-        Value::Inet { family: fa, bits: ba, addr: aa },
-        Value::Inet { family: fb, bits: bb, addr: ab },
+        Value::Inet {
+            family: fa,
+            bits: ba,
+            addr: aa,
+        },
+        Value::Inet {
+            family: fb,
+            bits: bb,
+            addr: ab,
+        },
     ) = (l, r)
     else {
         return Err(EvalError::TypeMismatch {
@@ -3466,9 +3892,7 @@ pub(super) fn compare(
     if matches!(l, Value::BpChar(_)) || matches!(r, Value::BpChar(_)) {
         let trimmed = |v: &Value<'_>| -> Option<alloc::string::String> {
             match v {
-                Value::BpChar(s) | Value::Text(s) => {
-                    Some(s.trim_end_matches(' ').to_string())
-                }
+                Value::BpChar(s) | Value::Text(s) => Some(s.trim_end_matches(' ').to_string()),
                 _ => None,
             }
         };
@@ -3485,7 +3909,8 @@ pub(super) fn compare(
         // shared scale (bare decimal literals are numeric now, so `n = 9.99`
         // lands here). A numeric-vs-float mix still falls to the float arm.
         (a, b)
-            if (matches!(a, Value::Numeric { .. } | Value::NumericBig(_)) || matches!(b, Value::Numeric { .. } | Value::NumericBig(_)))
+            if (matches!(a, Value::Numeric { .. } | Value::NumericBig(_))
+                || matches!(b, Value::Numeric { .. } | Value::NumericBig(_)))
                 && !matches!(a.data_type(), Some(DataType::Float))
                 && !matches!(b.data_type(), Some(DataType::Float)) =>
         {
@@ -3695,12 +4120,28 @@ pub(super) fn compare(
         // the full address. Live PG18.4-verified: 10.0.0.0/8 < 192.168/16,
         // 10.0.0.0/8 < 10.0.0.0/16, 1.2.3.4 < 1.2.3.5, IPv4 < IPv6.
         (
-            Value::Inet { family: af, bits: ab, addr: aa },
-            Value::Inet { family: bf, bits: bb, addr: ba },
+            Value::Inet {
+                family: af,
+                bits: ab,
+                addr: aa,
+            },
+            Value::Inet {
+                family: bf,
+                bits: bb,
+                addr: ba,
+            },
         )
         | (
-            Value::Cidr { family: af, bits: ab, addr: aa },
-            Value::Cidr { family: bf, bits: bb, addr: ba },
+            Value::Cidr {
+                family: af,
+                bits: ab,
+                addr: aa,
+            },
+            Value::Cidr {
+                family: bf,
+                bits: bb,
+                addr: ba,
+            },
         ) => {
             let ord = network_cmp(*af, *ab, aa, *bf, *bb, ba);
             return match op {
@@ -3723,8 +4164,14 @@ pub(super) fn compare(
         // bit string is a strict prefix of the longer, hence less). Verified
         // vs PG18: B'10'<B'11', B'1'<B'10', B'10'<B'100', B'101'<B'1010'.
         (
-            Value::BitString { nbits: an, bytes: ab },
-            Value::BitString { nbits: bn, bytes: bb },
+            Value::BitString {
+                nbits: an,
+                bytes: ab,
+            },
+            Value::BitString {
+                nbits: bn,
+                bytes: bb,
+            },
         ) => {
             let av = ab.as_ref();
             let bv = bb.as_ref();
@@ -3747,8 +4194,22 @@ pub(super) fn compare(
         // `int4range(1,5)` equals `'[1,4]'`; continuous kinds compare bounds
         // verbatim. An empty range sorts first. Verified vs PG18.
         (
-            Value::Range { kind: ak, lower: al, upper: au, lower_inc: ali, upper_inc: aui, empty: ae },
-            Value::Range { kind: bk, lower: bl, upper: bu, lower_inc: bli, upper_inc: bui, empty: be },
+            Value::Range {
+                kind: ak,
+                lower: al,
+                upper: au,
+                lower_inc: ali,
+                upper_inc: aui,
+                empty: ae,
+            },
+            Value::Range {
+                kind: bk,
+                lower: bl,
+                upper: bu,
+                lower_inc: bli,
+                upper_inc: bui,
+                empty: be,
+            },
         ) => {
             let ord = range_cmp(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be);
             return cmp_result(op, ord);
@@ -3756,7 +4217,16 @@ pub(super) fn compare(
         // v7.37 — MULTIRANGE comparison (=/<> and ordering). Normalise both
         // to PG's canonical form (canonicalise each span, drop empties, sort,
         // merge overlapping/adjacent) and compare the span lists lexically.
-        (Value::Multirange { kind: ak, ranges: ar }, Value::Multirange { kind: bk, ranges: br }) => {
+        (
+            Value::Multirange {
+                kind: ak,
+                ranges: ar,
+            },
+            Value::Multirange {
+                kind: bk,
+                ranges: br,
+            },
+        ) => {
             return cmp_result(op, multirange_cmp(*ak, ar, *bk, br));
         }
         // v7.37 — TSVECTOR equality (=/<>). SPG stores lexemes sorted by

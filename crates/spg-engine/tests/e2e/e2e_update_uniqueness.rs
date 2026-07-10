@@ -9,7 +9,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 fn err(e: &mut Engine, sql: &str) {
     assert!(e.execute(sql).is_err(), "{sql} should have been rejected");
@@ -45,7 +46,10 @@ fn update_to_duplicate_expression_unique_index_is_rejected() {
     let mut e = Engine::new();
     ok(&mut e, "CREATE TABLE u(email text, note text)");
     ok(&mut e, "CREATE UNIQUE INDEX u_le ON u(lower(email))");
-    ok(&mut e, "INSERT INTO u VALUES('A@x.com','a'),('b@y.com','b')");
+    ok(
+        &mut e,
+        "INSERT INTO u VALUES('A@x.com','a'),('b@y.com','b')",
+    );
     // Colliding on lower(email) is rejected...
     err(&mut e, "UPDATE u SET email='A@X.COM' WHERE email='b@y.com'");
     // ...a genuinely new key is fine...
@@ -73,7 +77,10 @@ fn update_swap_and_shift_are_rejected_like_pg() {
     ok(&mut e, "CREATE TABLE u(x int)");
     ok(&mut e, "CREATE UNIQUE INDEX ux ON u(x)");
     ok(&mut e, "INSERT INTO u VALUES(1),(2),(3)");
-    err(&mut e, "UPDATE u SET x=CASE WHEN x=1 THEN 2 WHEN x=2 THEN 1 ELSE x END");
+    err(
+        &mut e,
+        "UPDATE u SET x=CASE WHEN x=1 THEN 2 WHEN x=2 THEN 1 ELSE x END",
+    );
     err(&mut e, "UPDATE u SET x=x+1");
 }
 

@@ -31,11 +31,17 @@ fn jsonb_order_by_type_rank() {
 fn jsonb_array_by_length_then_elements() {
     let mut e = Engine::new();
     assert_eq!(
-        ordered(&mut e, "SELECT x FROM (VALUES ('[9]'::jsonb),('[1,2,3]'::jsonb)) v(x) ORDER BY x"),
+        ordered(
+            &mut e,
+            "SELECT x FROM (VALUES ('[9]'::jsonb),('[1,2,3]'::jsonb)) v(x) ORDER BY x"
+        ),
         vec!["[9]", "[1, 2, 3]"]
     );
     assert_eq!(
-        ordered(&mut e, "SELECT x FROM (VALUES ('[1,9]'::jsonb),('[1,2]'::jsonb)) v(x) ORDER BY x"),
+        ordered(
+            &mut e,
+            "SELECT x FROM (VALUES ('[1,9]'::jsonb),('[1,2]'::jsonb)) v(x) ORDER BY x"
+        ),
         vec!["[1, 2]", "[1, 9]"]
     );
 }
@@ -56,7 +62,9 @@ fn jsonb_object_by_pair_count() {
 fn jsonb_distinct_unaffected() {
     let mut e = Engine::new();
     match e
-        .execute("SELECT count(DISTINCT x) FROM (VALUES ('1'::jsonb),('1'::jsonb),('2'::jsonb)) v(x)")
+        .execute(
+            "SELECT count(DISTINCT x) FROM (VALUES ('1'::jsonb),('1'::jsonb),('2'::jsonb)) v(x)",
+        )
         .unwrap()
     {
         QueryResult::Rows { rows, .. } => {

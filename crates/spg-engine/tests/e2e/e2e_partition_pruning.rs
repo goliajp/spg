@@ -53,7 +53,8 @@ fn list_setup() -> Engine {
         .unwrap();
     e.execute("CREATE TABLE cust_emea PARTITION OF cust FOR VALUES IN ('de', 'fr', 'uk')")
         .unwrap();
-    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT").unwrap();
+    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT")
+        .unwrap();
     for (id, region) in [
         (1, "jp"),
         (2, "kr"),
@@ -158,8 +159,12 @@ fn spg_partition_health_lists_parent_and_every_child() {
     let names_roles: Vec<(String, String)> = rs
         .iter()
         .map(|r| {
-            let Value::Text(n) = &r[1] else { panic!("name") };
-            let Value::Text(role) = &r[2] else { panic!("role") };
+            let Value::Text(n) = &r[1] else {
+                panic!("name")
+            };
+            let Value::Text(role) = &r[2] else {
+                panic!("role")
+            };
             (n.to_string(), role.to_string())
         })
         .collect();
@@ -189,7 +194,9 @@ fn spg_partition_health_lists_parent_and_every_child() {
     let total_leaf_rows: i64 = rs
         .iter()
         .filter(|r| {
-            let Value::Text(role) = &r[2] else { return false };
+            let Value::Text(role) = &r[2] else {
+                return false;
+            };
             role.as_ref() != "Parent"
         })
         .map(|r| match r[3] {

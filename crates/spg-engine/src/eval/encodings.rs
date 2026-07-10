@@ -215,7 +215,11 @@ pub(super) fn encoding_table(enc: &str) -> Option<&'static [char; 128]> {
 }
 
 /// Decode single-byte-encoded bytes to UTF-8 via the high table.
-pub(super) fn single_byte_to_utf8(bytes: &[u8], high: &[char; 128], enc: &str) -> Result<String, EvalError> {
+pub(super) fn single_byte_to_utf8(
+    bytes: &[u8],
+    high: &[char; 128],
+    enc: &str,
+) -> Result<String, EvalError> {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         if b < 0x80 {
@@ -234,7 +238,11 @@ pub(super) fn single_byte_to_utf8(bytes: &[u8], high: &[char; 128], enc: &str) -
 }
 
 /// Encode a UTF-8 string to single-byte bytes via a reverse table lookup.
-pub(super) fn utf8_to_single_byte(s: &str, high: &[char; 128], enc: &str) -> Result<Vec<u8>, EvalError> {
+pub(super) fn utf8_to_single_byte(
+    s: &str,
+    high: &[char; 128],
+    enc: &str,
+) -> Result<Vec<u8>, EvalError> {
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
         if (c as u32) < 0x80 {

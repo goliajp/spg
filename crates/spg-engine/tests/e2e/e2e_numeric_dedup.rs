@@ -25,7 +25,8 @@ fn numeric_scale_dedup() {
     assert_eq!(nrows(&mut e, "SELECT 1.0 EXCEPT SELECT 1.00"), 0);
     // DISTINCT on a real column.
     e.execute("CREATE TABLE nd(x numeric)").unwrap();
-    e.execute("INSERT INTO nd VALUES (1.0),(1.00),(1.000),(2.0),(2.5)").unwrap();
+    e.execute("INSERT INTO nd VALUES (1.0),(1.00),(1.000),(2.0),(2.5)")
+        .unwrap();
     assert_eq!(nrows(&mut e, "SELECT DISTINCT x FROM nd"), 3); // {1, 2, 2.5}
     assert_eq!(nrows(&mut e, "SELECT DISTINCT x FROM nd ORDER BY x"), 3);
 }

@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -35,7 +37,10 @@ fn bit_count_bigint() {
     let mut e = Engine::new();
     // 2^63 - 1 = i64::MAX = 63 ones.
     assert_eq!(
-        as_bigint(&first(&mut e, "SELECT bit_count(9223372036854775807::bigint)")),
+        as_bigint(&first(
+            &mut e,
+            "SELECT bit_count(9223372036854775807::bigint)"
+        )),
         63
     );
 }
@@ -46,7 +51,10 @@ fn bit_count_bytea() {
     // 'A' = 0x41 = 0b01000001 → 2 bits.
     assert_eq!(as_bigint(&first(&mut e, "SELECT bit_count('A'::bytea)")), 2);
     // 'AB' = 0x41 0x42 = 2 + 2 = 4 bits.
-    assert_eq!(as_bigint(&first(&mut e, "SELECT bit_count('AB'::bytea)")), 4);
+    assert_eq!(
+        as_bigint(&first(&mut e, "SELECT bit_count('AB'::bytea)")),
+        4
+    );
     // Empty bytea → 0.
     assert_eq!(as_bigint(&first(&mut e, "SELECT bit_count(''::bytea)")), 0);
 }

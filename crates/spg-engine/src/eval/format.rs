@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::{civil_from_days, MONTH_ABBR, MONTH_FULL};
+use super::{MONTH_ABBR, MONTH_FULL, civil_from_days};
 
 /// Render a `Date` (days since epoch) as `YYYY-MM-DD`. Negative values
 /// for pre-1970 dates render with a leading `-` on the year.
@@ -279,7 +279,10 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     if ys.len() != 4 || ms.is_empty() || ms.len() > 2 || ds.is_empty() || ds.len() > 2 {
         return None;
     }
-    if [ys, ms, ds].iter().any(|p| !p.bytes().all(|b| b.is_ascii_digit())) {
+    if [ys, ms, ds]
+        .iter()
+        .any(|p| !p.bytes().all(|b| b.is_ascii_digit()))
+    {
         return None;
     }
     let y: i32 = ys.parse().ok()?;
@@ -416,9 +419,7 @@ fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
     // PG accepts both `HH:MM:SS` and the seconds-optional `HH:MM`
     // form in a TIMESTAMP literal (`'2024-01-15 10:30'::timestamp`
     // → `10:30:00`); hour-only (`'... 10'`) stays a parse error.
-    let (hh, mm, ss): (i64, i64, i64) = if bytes.len() == 8
-        && bytes[2] == b':'
-        && bytes[5] == b':'
+    let (hh, mm, ss): (i64, i64, i64) = if bytes.len() == 8 && bytes[2] == b':' && bytes[5] == b':'
     {
         (
             time[0..2].parse().ok()?,
@@ -603,7 +604,16 @@ pub fn format_text_array(items: &[Option<String>]) -> String {
                     || s.chars().any(|c| {
                         matches!(
                             c,
-                            ',' | '{' | '}' | '"' | '\\' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
+                            ',' | '{'
+                                | '}'
+                                | '"'
+                                | '\\'
+                                | ' '
+                                | '\t'
+                                | '\n'
+                                | '\r'
+                                | '\x0b'
+                                | '\x0c'
                         )
                     });
                 if needs_quote {

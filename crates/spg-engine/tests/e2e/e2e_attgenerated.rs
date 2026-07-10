@@ -20,12 +20,18 @@ fn attgenerated_marks_stored_generated_columns() {
     e.execute("CREATE TABLE g(a int, b int GENERATED ALWAYS AS (a*2) STORED)")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT attgenerated FROM pg_attribute WHERE attname='b'"),
+        one(
+            &mut e,
+            "SELECT attgenerated FROM pg_attribute WHERE attname='b'"
+        ),
         Some("s".to_string())
     );
     // A plain column is '' — so filtering attgenerated='s' excludes it.
     assert_eq!(
-        one(&mut e, "SELECT attname FROM pg_attribute WHERE attname='a' AND attgenerated='s'"),
+        one(
+            &mut e,
+            "SELECT attname FROM pg_attribute WHERE attname='a' AND attgenerated='s'"
+        ),
         None
     );
     // The generated value itself is still computed.

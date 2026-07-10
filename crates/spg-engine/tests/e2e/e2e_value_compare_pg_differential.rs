@@ -66,7 +66,10 @@ fn cell(eng: &mut Engine, sql: &str) -> String {
 
 fn ck(eng: &mut Engine, sql: &str, want: &str) {
     let got = cell(eng, sql);
-    assert_eq!(got, want, "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}");
+    assert_eq!(
+        got, want,
+        "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}"
+    );
 }
 
 // ---- scalar comparisons via literals ------------------------------------
@@ -116,8 +119,16 @@ fn money_compare() {
 #[test]
 fn macaddr_compare() {
     let mut e = Engine::new();
-    ck(&mut e, "SELECT '08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr", "t");
-    ck(&mut e, "SELECT '08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr", "t");
+    ck(
+        &mut e,
+        "SELECT '08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT '08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr",
+        "t",
+    );
     ck(
         &mut e,
         "SELECT '08:00:2b:01:02:03:04:05'::macaddr8 = '08:00:2b:01:02:03:04:05'::macaddr8",
@@ -136,10 +147,26 @@ fn inet_cidr_equality() {
     ck(&mut e, "SELECT '10.0.0.1'::inet = '10.0.0.1'::inet", "t");
     ck(&mut e, "SELECT '10.0.0.1'::inet <> '10.0.0.2'::inet", "t");
     // same address, different netmask bits -> not equal.
-    ck(&mut e, "SELECT '10.0.0.0/8'::inet <> '10.0.0.0/16'::inet", "t");
-    ck(&mut e, "SELECT '10.0.0.0/8'::cidr = '10.0.0.0/8'::cidr", "t");
-    ck(&mut e, "SELECT '10.0.0.0/8'::cidr <> '10.0.0.0/16'::cidr", "t");
-    ck(&mut e, "SELECT '2001:db8::1'::inet = '2001:db8::1'::inet", "t");
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::inet <> '10.0.0.0/16'::inet",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::cidr = '10.0.0.0/8'::cidr",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::cidr <> '10.0.0.0/16'::cidr",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT '2001:db8::1'::inet = '2001:db8::1'::inet",
+        "t",
+    );
 }
 
 #[test]
@@ -147,7 +174,11 @@ fn bit_equality() {
     let mut e = Engine::new();
     ck(&mut e, "SELECT '1010'::bit(4) = '1010'::bit(4)", "t");
     ck(&mut e, "SELECT '1010'::bit(4) <> '1011'::bit(4)", "t");
-    ck(&mut e, "SELECT '11111111'::varbit = '11111111'::varbit", "t");
+    ck(
+        &mut e,
+        "SELECT '11111111'::varbit = '11111111'::varbit",
+        "t",
+    );
     ck(&mut e, "SELECT '101'::varbit <> '1010'::varbit", "t");
 }
 
@@ -174,18 +205,34 @@ fn inet_ordering() {
     // address. All values captured live from PostgreSQL 18.4.
     let mut e = Engine::new();
     // address compared before netmask (10.x < 192.x despite /8 < /16).
-    ck(&mut e, "SELECT '10.0.0.0/8'::inet < '192.168.0.0/16'::inet", "t");
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::inet < '192.168.0.0/16'::inet",
+        "t",
+    );
     // same address, shorter netmask is less.
-    ck(&mut e, "SELECT '10.0.0.0/8'::inet < '10.0.0.0/16'::inet", "t");
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::inet < '10.0.0.0/16'::inet",
+        "t",
+    );
     // plain host address ordering.
     ck(&mut e, "SELECT '1.2.3.4'::inet < '1.2.3.5'::inet", "t");
     ck(&mut e, "SELECT '1.2.3.5'::inet > '1.2.3.4'::inet", "t");
     // family: IPv4 < IPv6.
     ck(&mut e, "SELECT '10.0.0.0'::inet < '::1'::inet", "t");
     // cidr follows the same comparator.
-    ck(&mut e, "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr", "t");
+    ck(
+        &mut e,
+        "SELECT '10.0.0.0/8'::cidr < '10.0.0.0/16'::cidr",
+        "t",
+    );
     ck(&mut e, "SELECT '10.0.0.1'::inet <= '10.0.0.1'::inet", "t");
-    ck(&mut e, "SELECT '2001:db8::1'::inet > '2001:db8::'::inet", "t");
+    ck(
+        &mut e,
+        "SELECT '2001:db8::1'::inet > '2001:db8::'::inet",
+        "t",
+    );
 }
 
 // ---- array comparisons via typed columns --------------------------------
@@ -252,7 +299,7 @@ fn numeric_array_value_equality() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE nv (id int, a numeric[])").unwrap();
     for (id, v) in [
-        (10, "ARRAY[1.10::numeric, 2.0::numeric]"), // [1.10, 2.0]
+        (10, "ARRAY[1.10::numeric, 2.0::numeric]"),  // [1.10, 2.0]
         (11, "ARRAY[1.1::numeric, 2.000::numeric]"), // value-equal, differing scale repr
         (20, "ARRAY[1.10::numeric]"),
         (21, "ARRAY[1.2::numeric]"),
@@ -260,11 +307,12 @@ fn numeric_array_value_equality() {
         (30, "ARRAY[1::numeric, 2::numeric]"),
         (31, "ARRAY[1::numeric]"), // length mismatch vs 30
         (40, "ARRAY[1::numeric, NULL]"),
-        (41, "ARRAY[1::numeric, NULL]"), // NULL == NULL
+        (41, "ARRAY[1::numeric, NULL]"),       // NULL == NULL
         (42, "ARRAY[1::numeric, 2::numeric]"), // NULL vs value
-        (43, "ARRAY[1::numeric]"),      // NULL + length mismatch
+        (43, "ARRAY[1::numeric]"),             // NULL + length mismatch
     ] {
-        e.execute(&format!("INSERT INTO nv VALUES ({id}, {v})")).unwrap();
+        e.execute(&format!("INSERT INTO nv VALUES ({id}, {v})"))
+            .unwrap();
     }
     // Scale-insensitive value equality: [1.10, 2.0] == [1.1, 2.000].
     assert_eq!(pair(&mut e, "nv", 10, 11, "="), "t");
@@ -299,7 +347,8 @@ fn float8_array_value_equality() {
         (40, "ARRAY[1.5::float8, NULL]"),
         (41, "ARRAY[1.5::float8, NULL]"),
     ] {
-        e.execute(&format!("INSERT INTO fv VALUES ({id}, {v})")).unwrap();
+        e.execute(&format!("INSERT INTO fv VALUES ({id}, {v})"))
+            .unwrap();
     }
     assert_eq!(pair(&mut e, "fv", 10, 11, "="), "t");
     assert_eq!(pair(&mut e, "fv", 10, 12, "<>"), "t");
@@ -325,7 +374,8 @@ fn interval_array_value_equality() {
         (20, "ARRAY['1 day'::interval, NULL]"),
         (21, "ARRAY['24 hours'::interval, NULL]"),
     ] {
-        e.execute(&format!("INSERT INTO iv VALUES ({id}, {v})")).unwrap();
+        e.execute(&format!("INSERT INTO iv VALUES ({id}, {v})"))
+            .unwrap();
     }
     // Unit-equivalence by canonical span.
     assert_eq!(pair(&mut e, "iv", 10, 11, "="), "t");
@@ -401,7 +451,11 @@ fn range_equality() {
     ck(&mut e, "SELECT int4range(1,5) = '[1,4]'::int4range", "t");
     ck(&mut e, "SELECT int4range(1,5) <> '[1,4]'::int4range", "f");
     // exclusive lower canonicalises: (1,5) == [2,5).
-    ck(&mut e, "SELECT '(1,5)'::int4range = '[2,5)'::int4range", "t");
+    ck(
+        &mut e,
+        "SELECT '(1,5)'::int4range = '[2,5)'::int4range",
+        "t",
+    );
     ck(&mut e, "SELECT int4range(1,5) = int4range(1,6)", "f");
     // empties are equal; empty != non-empty.
     ck(&mut e, "SELECT 'empty'::int4range = int4range(1,1)", "t");
@@ -425,16 +479,28 @@ fn multirange_equality() {
     // (sorted, merged) span lists. All values captured live from PostgreSQL 18.4.
     let mut e = Engine::new();
     // per-span discrete canonicalisation: {[1,4]} == {[1,5)}.
-    ck(&mut e, "SELECT '{[1,4]}'::int4multirange = '{[1,5)}'::int4multirange", "t");
+    ck(
+        &mut e,
+        "SELECT '{[1,4]}'::int4multirange = '{[1,5)}'::int4multirange",
+        "t",
+    );
     // multi-span identity.
     ck(
         &mut e,
         "SELECT '{[1,3),[5,7)}'::int4multirange = '{[1,3),[5,7)}'::int4multirange",
         "t",
     );
-    ck(&mut e, "SELECT '{[1,5)}'::int4multirange = '{[1,3)}'::int4multirange", "f");
+    ck(
+        &mut e,
+        "SELECT '{[1,5)}'::int4multirange = '{[1,3)}'::int4multirange",
+        "f",
+    );
     // empties equal.
-    ck(&mut e, "SELECT '{}'::int4multirange = '{}'::int4multirange", "t");
+    ck(
+        &mut e,
+        "SELECT '{}'::int4multirange = '{}'::int4multirange",
+        "t",
+    );
     // adjacent spans merge: {[1,3),[3,5)} normalises to {[1,5)}.
     ck(
         &mut e,
@@ -457,12 +523,20 @@ fn range_ordering() {
     ck(&mut e, "SELECT int4range(1,5) < int4range(2,6)", "t"); // lower 1<2
     ck(&mut e, "SELECT int4range(1,5) < int4range(1,6)", "t"); // same lower, upper 5<6
     ck(&mut e, "SELECT 'empty'::int4range < int4range(1,5)", "t"); // empty first
-    ck(&mut e, "SELECT '[1,5)'::int4range < '(1,5)'::int4range", "t"); // incl lower < excl lower
+    ck(
+        &mut e,
+        "SELECT '[1,5)'::int4range < '(1,5)'::int4range",
+        "t",
+    ); // incl lower < excl lower
     ck(&mut e, "SELECT int4range(1,5) < int4range(1,5)", "f"); // equal
     ck(&mut e, "SELECT int4range(1,5) <= int4range(1,5)", "t");
     ck(&mut e, "SELECT int4range(2,6) > int4range(1,5)", "t");
     ck(&mut e, "SELECT '(,5)'::int4range < int4range(1,5)", "t"); // -inf lower first
-    ck(&mut e, "SELECT '[1.5,3)'::numrange < '[2.0,3)'::numrange", "t");
+    ck(
+        &mut e,
+        "SELECT '[1.5,3)'::numrange < '[2.0,3)'::numrange",
+        "t",
+    );
     ck(&mut e, "SELECT '[1,5]'::numrange > '[1,5)'::numrange", "t"); // incl upper > excl upper
 }
 
@@ -470,13 +544,21 @@ fn range_ordering() {
 fn multirange_ordering() {
     // PG multirange order: lexical over the normalised span lists.
     let mut e = Engine::new();
-    ck(&mut e, "SELECT '{[1,3)}'::int4multirange < '{[2,4)}'::int4multirange", "t");
+    ck(
+        &mut e,
+        "SELECT '{[1,3)}'::int4multirange < '{[2,4)}'::int4multirange",
+        "t",
+    );
     ck(
         &mut e,
         "SELECT '{[1,3)}'::int4multirange < '{[1,3),[5,7)}'::int4multirange",
         "t",
     ); // prefix is less
-    ck(&mut e, "SELECT '{}'::int4multirange < '{[1,3)}'::int4multirange", "t"); // empty first
+    ck(
+        &mut e,
+        "SELECT '{}'::int4multirange < '{[1,3)}'::int4multirange",
+        "t",
+    ); // empty first
     ck(
         &mut e,
         "SELECT '{[1,3),[5,7)}'::int4multirange <= '{[1,3),[5,7)}'::int4multirange",
@@ -495,9 +577,21 @@ fn tsvector_equality() {
     // equality is order-independent but position-sensitive. Captured live
     // from PostgreSQL 18.4.
     let mut e = Engine::new();
-    ck(&mut e, "SELECT 'foo bar'::tsvector = 'foo bar'::tsvector", "t");
-    ck(&mut e, "SELECT 'bar foo'::tsvector = 'foo bar'::tsvector", "t"); // order-independent
+    ck(
+        &mut e,
+        "SELECT 'foo bar'::tsvector = 'foo bar'::tsvector",
+        "t",
+    );
+    ck(
+        &mut e,
+        "SELECT 'bar foo'::tsvector = 'foo bar'::tsvector",
+        "t",
+    ); // order-independent
     ck(&mut e, "SELECT 'foo:1'::tsvector = 'foo:2'::tsvector", "f"); // positions matter
-    ck(&mut e, "SELECT 'foo foo bar'::tsvector = 'foo bar'::tsvector", "t"); // deduped
+    ck(
+        &mut e,
+        "SELECT 'foo foo bar'::tsvector = 'foo bar'::tsvector",
+        "t",
+    ); // deduped
     ck(&mut e, "SELECT 'foo'::tsvector <> 'bar'::tsvector", "t");
 }

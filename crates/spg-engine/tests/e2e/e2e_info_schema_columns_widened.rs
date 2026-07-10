@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -23,10 +25,8 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 #[test]
 fn widened_columns_present() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE wc (id BIGSERIAL, n INT DEFAULT 7, note TEXT)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE wc (id BIGSERIAL, n INT DEFAULT 7, note TEXT)")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT column_name, column_default, numeric_precision, udt_name, is_identity \

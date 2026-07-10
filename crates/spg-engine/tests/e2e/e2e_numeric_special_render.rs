@@ -20,10 +20,19 @@ fn numeric_specials_parse_and_render() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT ('NaN'::numeric)::text"), "NaN");
     assert_eq!(text(&mut e, "SELECT ('nan'::numeric)::text"), "NaN");
-    assert_eq!(text(&mut e, "SELECT ('Infinity'::numeric)::text"), "Infinity");
+    assert_eq!(
+        text(&mut e, "SELECT ('Infinity'::numeric)::text"),
+        "Infinity"
+    );
     assert_eq!(text(&mut e, "SELECT ('inf'::numeric)::text"), "Infinity");
-    assert_eq!(text(&mut e, "SELECT ('+Infinity'::numeric)::text"), "Infinity");
-    assert_eq!(text(&mut e, "SELECT ('-Infinity'::numeric)::text"), "-Infinity");
+    assert_eq!(
+        text(&mut e, "SELECT ('+Infinity'::numeric)::text"),
+        "Infinity"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ('-Infinity'::numeric)::text"),
+        "-Infinity"
+    );
     assert_eq!(text(&mut e, "SELECT ('-inf'::numeric)::text"), "-Infinity");
     // Concatenation renders the special spelling, not a Debug/zero.
     assert_eq!(text(&mut e, "SELECT 'x=' || 'NaN'::numeric"), "x=NaN");

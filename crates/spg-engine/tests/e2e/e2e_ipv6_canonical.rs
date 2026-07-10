@@ -24,7 +24,10 @@ fn ipv6_renders_rfc5952_canonical() {
         ("::", "::/128"),
         ("fe80::1:2:3", "fe80::1:2:3/128"),
         // Fully-expanded input compresses on output.
-        ("2001:0db8:0000:0000:0000:ff00:0042:8329", "2001:db8::ff00:42:8329/128"),
+        (
+            "2001:0db8:0000:0000:0000:ff00:0042:8329",
+            "2001:db8::ff00:42:8329/128",
+        ),
         // Two zero runs: the LONGER (second, 3 groups) compresses, not the first (2).
         ("1:0:0:2:0:0:0:3", "1:0:0:2::3/128"),
         // CIDR bits survive the compression.

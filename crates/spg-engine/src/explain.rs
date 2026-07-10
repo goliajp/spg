@@ -122,8 +122,7 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
         // predicate columns regardless of order for equality-only
         // filters).
         if let Some(tbl) = cat.get(&owner) {
-            let pos_to_name =
-                |pos: usize| tbl.schema().columns.get(pos).map(|c| c.name.clone());
+            let pos_to_name = |pos: usize| tbl.schema().columns.get(pos).map(|c| c.name.clone());
             let already_in_index = tbl.indices().iter().any(|i| {
                 if !matches!(i.kind, spg_storage::IndexKind::BTree(_)) {
                     return false;
@@ -140,18 +139,11 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
                 }
                 cols.iter().all(|c| all_cols.contains(c))
             });
-            let already_in_uc = tbl
-                .schema()
-                .uniqueness_constraints
-                .iter()
-                .any(|uc| {
-                    let names: alloc::collections::BTreeSet<String> = uc
-                        .columns
-                        .iter()
-                        .filter_map(|&p| pos_to_name(p))
-                        .collect();
-                    cols.iter().all(|c| names.contains(c))
-                });
+            let already_in_uc = tbl.schema().uniqueness_constraints.iter().any(|uc| {
+                let names: alloc::collections::BTreeSet<String> =
+                    uc.columns.iter().filter_map(|&p| pos_to_name(p)).collect();
+                cols.iter().all(|c| names.contains(c))
+            });
             if already_in_index || already_in_uc {
                 continue;
             }
@@ -406,13 +398,8 @@ pub(crate) fn explain_select(
         // and dogfood-replay flagged as the missing piece).
         if crate::partition::is_partition_parent(engine.active_catalog(), &from.primary.name) {
             tag.push_str(" [partition parent]");
-            if let Some(kept) =
-                engine.explain_partition_kept_children(&from.primary.name, stmt)
-            {
-                tag.push_str(&alloc::format!(
-                    " kept=[{}]",
-                    kept.join(", ")
-                ));
+            if let Some(kept) = engine.explain_partition_kept_children(&from.primary.name, stmt) {
+                tag.push_str(&alloc::format!(" kept=[{}]", kept.join(", ")));
             }
             out.push(tag);
         } else {
@@ -616,13 +603,8 @@ impl Engine {
                     // Two-decimal-place integer arithmetic — keeps
                     // spg-engine no_std without pulling in libm.
                     // ratio_x10000 ∈ [0, 10000]; divide for output.
-                    let ratio_x10000 = (hot_rows.saturating_mul(10_000))
-                        / total_rows;
-                    alloc::format!(
-                        "{}.{:02}",
-                        ratio_x10000 / 100,
-                        ratio_x10000 % 100
-                    )
+                    let ratio_x10000 = (hot_rows.saturating_mul(10_000)) / total_rows;
+                    alloc::format!("{}.{:02}", ratio_x10000 / 100, ratio_x10000 % 100)
                 };
                 lines.push(alloc::format!(
                     "Buffers: hot_rows={hot_rows} cold_rows={cold_rows} cache_hit_ratio={ratio}"

@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ints(e: &mut Engine, sql: &str) -> Vec<i64> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -20,20 +22,20 @@ fn ints(e: &mut Engine, sql: &str) -> Vec<i64> {
 #[test]
 fn do_nothing_via_pkey_name() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO u VALUES (1, 10)").unwrap();
     // The synthetic PK constraint is named u_pkey.
-    e.execute(
-        "INSERT INTO u VALUES (1, 99) ON CONFLICT ON CONSTRAINT u_pkey DO NOTHING",
-    )
-    .unwrap();
+    e.execute("INSERT INTO u VALUES (1, 99) ON CONFLICT ON CONSTRAINT u_pkey DO NOTHING")
+        .unwrap();
     assert_eq!(ints(&mut e, "SELECT v FROM u WHERE id = 1"), [10]);
 }
 
 #[test]
 fn do_update_via_pkey_name() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE w (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE w (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO w VALUES (1, 10)").unwrap();
     e.execute(
         "INSERT INTO w VALUES (1, 99) ON CONFLICT ON CONSTRAINT w_pkey \

@@ -23,11 +23,21 @@ fn interval_arithmetic_is_component_wise() {
         ("interval '1 day' - interval '12 hours'", "1 day -12:00:00"),
         ("interval '1 day' - interval '26 hours'", "1 day -26:00:00"),
         ("interval '1 day' + interval '2 hours'", "1 day 02:00:00"),
-        ("interval '2 days' - interval '30 hours'", "2 days -30:00:00"),
+        (
+            "interval '2 days' - interval '30 hours'",
+            "2 days -30:00:00",
+        ),
         ("interval '1 mon' - interval '1 day'", "1 mon -1 days"),
-        ("interval '1 mon 2 days 03:00:00' + interval '1 day 01:30:00'", "1 mon 3 days 04:30:00"),
+        (
+            "interval '1 mon 2 days 03:00:00' + interval '1 day 01:30:00'",
+            "1 mon 3 days 04:30:00",
+        ),
     ];
     for (expr, want) in cases {
-        assert_eq!(text(&mut e, &format!("SELECT ({expr})::text")), want, "expr {expr}");
+        assert_eq!(
+            text(&mut e, &format!("SELECT ({expr})::text")),
+            want,
+            "expr {expr}"
+        );
     }
 }

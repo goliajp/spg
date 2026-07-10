@@ -44,7 +44,10 @@ fn generate_series_string_interval_step() {
         ),
         "2024-01-01 00:00:00,2024-01-03 00:00:00"
     );
-    assert!(e
-        .execute("SELECT * FROM generate_series('2024-01-01'::date, '2024-01-05'::date, 'garbage') g")
-        .is_err());
+    assert!(
+        e.execute(
+            "SELECT * FROM generate_series('2024-01-01'::date, '2024-01-05'::date, 'garbage') g"
+        )
+        .is_err()
+    );
 }

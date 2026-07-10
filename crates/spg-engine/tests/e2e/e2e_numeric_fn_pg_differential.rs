@@ -58,7 +58,10 @@ fn cell(eng: &mut Engine, sql: &str) -> String {
 /// Exact-render assertion.
 fn ck(eng: &mut Engine, sql: &str, want: &str) {
     let got = cell(eng, sql);
-    assert_eq!(got, want, "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}");
+    assert_eq!(
+        got, want,
+        "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}"
+    );
 }
 
 /// Float-tolerance assertion: `fn(numeric)` must equal the PG18 reference
@@ -68,7 +71,10 @@ fn ck(eng: &mut Engine, sql: &str, want: &str) {
 fn ckf(eng: &mut Engine, expr: &str, pg: &str) {
     let sql = format!("SELECT (abs(({expr}) - ({pg})) < 1e-9)::text");
     let got = cell(eng, &sql);
-    assert_eq!(got, "true", "\n  expr: {expr}\n  want(PG18): {pg}\n  got(SPG):   {got}");
+    assert_eq!(
+        got, "true",
+        "\n  expr: {expr}\n  want(PG18): {pg}\n  got(SPG):   {got}"
+    );
 }
 
 fn eng() -> Engine {
@@ -110,7 +116,11 @@ fn degree_trig_and_atan2_accept_numeric() {
     ckf(&mut e, "asind(0.5::numeric)", "30");
     ckf(&mut e, "acosd(0.5::numeric)", "60");
     ckf(&mut e, "atand(1::numeric)", "45");
-    ckf(&mut e, "atan2(1::numeric, 2::numeric)", "0.4636476090008061");
+    ckf(
+        &mut e,
+        "atan2(1::numeric, 2::numeric)",
+        "0.4636476090008061",
+    );
     ckf(&mut e, "atan2d(1::numeric, 1::numeric)", "45");
 }
 
@@ -142,7 +152,11 @@ fn abs_numeric_returns_numeric() {
 fn prng_functions_accept_numeric() {
     let mut e = eng();
     // setseed returns void (NULL) — proves acceptance without erroring.
-    ck(&mut e, "SELECT (setseed(0.5::numeric) IS NULL)::text", "true");
+    ck(
+        &mut e,
+        "SELECT (setseed(0.5::numeric) IS NULL)::text",
+        "true",
+    );
     ck(
         &mut e,
         "SELECT (random_normal(0.0::numeric, 1.0::numeric) IS NOT NULL)::text",
@@ -200,7 +214,11 @@ fn cast_numeric_to_float8() {
 fn preexisting_numeric_safe_functions_still_accept() {
     let mut e = eng();
     ckf(&mut e, "sqrt(2::numeric)", "1.4142135623730951");
-    ckf(&mut e, "power(2::numeric, 0.5::numeric)", "1.4142135623730951");
+    ckf(
+        &mut e,
+        "power(2::numeric, 0.5::numeric)",
+        "1.4142135623730951",
+    );
     ckf(&mut e, "ln(2::numeric)", "0.6931471805599453");
     ckf(&mut e, "log(100::numeric)", "2");
     ckf(&mut e, "exp(1::numeric)", "2.718281828459045");
@@ -212,5 +230,9 @@ fn preexisting_numeric_safe_functions_still_accept() {
     ck(&mut e, "SELECT (ceil(2.1::numeric))::text", "3");
     ck(&mut e, "SELECT (floor(2.9::numeric))::text", "2");
     // numrange already accepts numeric bounds.
-    ck(&mut e, "SELECT (numrange(1.1::numeric, 2.2::numeric))::text", "[1.1,2.2)");
+    ck(
+        &mut e,
+        "SELECT (numrange(1.1::numeric, 2.2::numeric))::text",
+        "[1.1,2.2)",
+    );
 }

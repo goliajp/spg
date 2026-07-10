@@ -118,9 +118,7 @@ fn count_tsquery_nodes(ast: &spg_storage::TsQueryAst) -> i32 {
         Q::Term { .. } => 1,
         Q::Not(inner) => 1 + count_tsquery_nodes(inner),
         Q::And(l, r) | Q::Or(l, r) => 1 + count_tsquery_nodes(l) + count_tsquery_nodes(r),
-        Q::Phrase { left, right, .. } => {
-            1 + count_tsquery_nodes(left) + count_tsquery_nodes(right)
-        }
+        Q::Phrase { left, right, .. } => 1 + count_tsquery_nodes(left) + count_tsquery_nodes(right),
     }
 }
 
@@ -134,7 +132,9 @@ fn querytree_indexable(ast: &spg_storage::TsQueryAst) -> Option<spg_storage::TsQ
         Q::Term { .. } => Some(ast.clone()),
         Q::Not(_) => None,
         Q::And(l, r) => match (querytree_indexable(l), querytree_indexable(r)) {
-            (Some(a), Some(b)) => Some(Q::And(alloc::boxed::Box::new(a), alloc::boxed::Box::new(b))),
+            (Some(a), Some(b)) => {
+                Some(Q::And(alloc::boxed::Box::new(a), alloc::boxed::Box::new(b)))
+            }
             (Some(a), None) | (None, Some(a)) => Some(a),
             (None, None) => None,
         },
@@ -142,17 +142,19 @@ fn querytree_indexable(ast: &spg_storage::TsQueryAst) -> Option<spg_storage::TsQ
             (Some(a), Some(b)) => Some(Q::Or(alloc::boxed::Box::new(a), alloc::boxed::Box::new(b))),
             _ => None,
         },
-        Q::Phrase { left, right, distance } => {
-            match (querytree_indexable(left), querytree_indexable(right)) {
-                (Some(a), Some(b)) => Some(Q::Phrase {
-                    left: alloc::boxed::Box::new(a),
-                    right: alloc::boxed::Box::new(b),
-                    distance: *distance,
-                }),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
-            }
-        }
+        Q::Phrase {
+            left,
+            right,
+            distance,
+        } => match (querytree_indexable(left), querytree_indexable(right)) {
+            (Some(a), Some(b)) => Some(Q::Phrase {
+                left: alloc::boxed::Box::new(a),
+                right: alloc::boxed::Box::new(b),
+                distance: *distance,
+            }),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
     }
 }
 
@@ -199,7 +201,10 @@ fn apply_function_dispatch(
         for (i, arg) in args.iter().enumerate() {
             if let (Value::Text(s), Some(co)) = (arg, spec.get(i).copied().flatten()) {
                 let target = match co {
-                    Co::N => spg_storage::DataType::Numeric { precision: 0, scale: 0 },
+                    Co::N => spg_storage::DataType::Numeric {
+                        precision: 0,
+                        scale: 0,
+                    },
                     Co::I => spg_storage::DataType::Int,
                     Co::F => spg_storage::DataType::Float,
                 };
@@ -14797,13 +14802,20 @@ fn adjust_partial_year_to_2020(year: i32) -> i32 {
 }
 
 #[allow(clippy::type_complexity)]
-fn parse_by_format(
-    input: &str,
-    fmt: &str,
-) -> Result<(i32, u32, u32, u32, u32, u32, u32), String> {
+fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u32, u32), String> {
     const MONTHS: [&str; 12] = [
-        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
-        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+        "JANUARY",
+        "FEBRUARY",
+        "MARCH",
+        "APRIL",
+        "MAY",
+        "JUNE",
+        "JULY",
+        "AUGUST",
+        "SEPTEMBER",
+        "OCTOBER",
+        "NOVEMBER",
+        "DECEMBER",
     ];
     let mut year: i32 = 1;
     // Deferred year resolution: (raw value, format-token digit width). A
@@ -14830,10 +14842,10 @@ fn parse_by_format(
     let mut ii = 0usize;
 
     fn starts_with_ci(hay: &[char], pos: usize, needle: &str) -> bool {
-        needle.chars().enumerate().all(|(k, c)| {
-            hay.get(pos + k)
-                .is_some_and(|h| h.eq_ignore_ascii_case(&c))
-        })
+        needle
+            .chars()
+            .enumerate()
+            .all(|(k, c)| hay.get(pos + k).is_some_and(|h| h.eq_ignore_ascii_case(&c)))
     }
     fn take_digits(input: &[char], pos: &mut usize, max: usize) -> Option<u64> {
         let start = *pos;
@@ -14887,8 +14899,7 @@ fn parse_by_format(
             ii += MONTHS[m].len();
             fi += 5;
         } else if starts_with_ci(&fmt_bytes, fi, "MON") {
-            let rest: alloc::string::String =
-                in_bytes[ii..].iter().take(3).collect();
+            let rest: alloc::string::String = in_bytes[ii..].iter().take(3).collect();
             let upper = rest.to_ascii_uppercase();
             let m = MONTHS
                 .iter()
@@ -14928,10 +14939,12 @@ fn parse_by_format(
                 .ok_or_else(|| alloc::format!("expected hour digits at position {ii}"))?;
             hour = v as u32;
             fi += 4;
-        } else if starts_with_ci(&fmt_bytes, fi, "HH12")
-            || starts_with_ci(&fmt_bytes, fi, "HH")
-        {
-            let width = if starts_with_ci(&fmt_bytes, fi, "HH12") { 4 } else { 2 };
+        } else if starts_with_ci(&fmt_bytes, fi, "HH12") || starts_with_ci(&fmt_bytes, fi, "HH") {
+            let width = if starts_with_ci(&fmt_bytes, fi, "HH12") {
+                4
+            } else {
+                2
+            };
             let v = take_digits(&in_bytes, &mut ii, 2)
                 .ok_or_else(|| alloc::format!("expected hour digits at position {ii}"))?;
             hour = v as u32;
@@ -14957,17 +14970,13 @@ fn parse_by_format(
                 .ok_or_else(|| alloc::format!("expected millisecond digits at position {ii}"))?;
             micros = v as u32 * 1000;
             fi += 2;
-        } else if starts_with_ci(&fmt_bytes, fi, "A.M.")
-            || starts_with_ci(&fmt_bytes, fi, "P.M.")
-        {
+        } else if starts_with_ci(&fmt_bytes, fi, "A.M.") || starts_with_ci(&fmt_bytes, fi, "P.M.") {
             if starts_with_ci(&in_bytes, ii, "P.M.") {
                 pm_shift = true;
             }
             ii += 4;
             fi += 4;
-        } else if starts_with_ci(&fmt_bytes, fi, "AM")
-            || starts_with_ci(&fmt_bytes, fi, "PM")
-        {
+        } else if starts_with_ci(&fmt_bytes, fi, "AM") || starts_with_ci(&fmt_bytes, fi, "PM") {
             if starts_with_ci(&in_bytes, ii, "PM") {
                 pm_shift = true;
             }
@@ -15000,7 +15009,11 @@ fn parse_by_format(
             year = (cc - 1) * 100 + 1;
         }
         (None, Some((v, digits))) => {
-            year = if digits >= 4 { v } else { adjust_partial_year_to_2020(v) };
+            year = if digits >= 4 {
+                v
+            } else {
+                adjust_partial_year_to_2020(v)
+            };
         }
         (None, None) => {}
     }
@@ -15022,9 +15035,7 @@ fn parse_by_format(
         return Err(alloc::format!("day {day} out of range"));
     }
     if hour > 23 || minute > 59 || second > 60 {
-        return Err(alloc::format!(
-            "time {hour}:{minute}:{second} out of range"
-        ));
+        return Err(alloc::format!("time {hour}:{minute}:{second} out of range"));
     }
     Ok((year, month, day, hour, minute, second, micros))
 }

@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -32,7 +34,8 @@ fn constraintdef_primary_key() {
 #[test]
 fn constraintdef_foreign_key() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .unwrap();
     e.execute(
         "CREATE TABLE child (pid INT, \
          CONSTRAINT child_pid_fk FOREIGN KEY (pid) \
@@ -76,7 +79,10 @@ fn constraintdef_check_and_not_null() {
     );
     // NOT NULL — one per NOT NULL column.
     assert_eq!(
-        text(&first(&mut e, "SELECT pg_get_constraintdef('cc_id_not_null')")),
+        text(&first(
+            &mut e,
+            "SELECT pg_get_constraintdef('cc_id_not_null')"
+        )),
         "NOT NULL id"
     );
     // Same via the OID form (pg_constraint.oid), as pg_dump uses.
@@ -105,7 +111,9 @@ fn unique_constraint_pg_naming() {
                    AND contype = 'u' ORDER BY conname",
             )
             .unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!()
+        };
         rows.iter()
             .filter_map(|row| match &row.values[0] {
                 spg_storage::Value::Text(s) => Some(s.to_string()),
@@ -122,9 +130,7 @@ fn unique_constraint_pg_naming() {
     e.execute("INSERT INTO nm VALUES (1, 2, 3)").unwrap();
     e.execute("INSERT INTO nm VALUES (1, 9, 9) ON CONFLICT ON CONSTRAINT nm_a_key DO NOTHING")
         .unwrap();
-    let QueryResult::Rows { rows, .. } =
-        e.execute("SELECT count(*) FROM nm").unwrap()
-    else {
+    let QueryResult::Rows { rows, .. } = e.execute("SELECT count(*) FROM nm").unwrap() else {
         panic!()
     };
     assert!(matches!(rows[0].values[0], spg_storage::Value::BigInt(1)));
@@ -149,7 +155,9 @@ fn check_constraint_pg_naming() {
                    AND contype = 'c' ORDER BY conname",
             )
             .unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!()
+        };
         rows.iter()
             .filter_map(|row| match &row.values[0] {
                 spg_storage::Value::Text(s) => Some(s.to_string()),

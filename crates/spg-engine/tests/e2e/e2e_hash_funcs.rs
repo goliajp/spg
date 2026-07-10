@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -52,9 +54,12 @@ fn sha1_matches_known_hash() {
 #[test]
 fn sha224_384_512_produce_correct_output_len() {
     let mut e = Engine::new();
-    for (fn_name, expected_bytes) in
-        &[("sha224", 28usize), ("sha256", 32), ("sha384", 48), ("sha512", 64)]
-    {
+    for (fn_name, expected_bytes) in &[
+        ("sha224", 28usize),
+        ("sha256", 32),
+        ("sha384", 48),
+        ("sha512", 64),
+    ] {
         let v = first(&mut e, &format!("SELECT {fn_name}('hello')"));
         match &v {
             spg_storage::Value::Bytes(b) => assert_eq!(b.len(), *expected_bytes),

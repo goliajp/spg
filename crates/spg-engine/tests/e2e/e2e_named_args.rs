@@ -18,17 +18,50 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn named_arguments() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (make_date(year => 2024, month => 6, day => 15))::text"), "2024-06-15");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (make_date(year => 2024, month => 6, day => 15))::text"
+        ),
+        "2024-06-15"
+    );
     // Reordered names.
-    assert_eq!(text(&mut e, "SELECT (make_date(day => 15, month => 6, year => 2024))::text"), "2024-06-15");
-    assert_eq!(text(&mut e, "SELECT (make_time(hour => 8, min => 30, sec => 0))::text"), "08:30:00");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (make_date(day => 15, month => 6, year => 2024))::text"
+        ),
+        "2024-06-15"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (make_time(hour => 8, min => 30, sec => 0))::text"
+        ),
+        "08:30:00"
+    );
     // make_interval omitted fields default to 0.
-    assert_eq!(text(&mut e, "SELECT (make_interval(days => 40))::text"), "40 days");
+    assert_eq!(
+        text(&mut e, "SELECT (make_interval(days => 40))::text"),
+        "40 days"
+    );
     // Leading positional + trailing named.
-    assert_eq!(text(&mut e, "SELECT (make_date(2024, month => 6, day => 15))::text"), "2024-06-15");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (make_date(2024, month => 6, day => 15))::text"
+        ),
+        "2024-06-15"
+    );
     // Plain positional is unaffected, and `=` still compares.
-    assert_eq!(text(&mut e, "SELECT (make_date(2024, 6, 15))::text"), "2024-06-15");
+    assert_eq!(
+        text(&mut e, "SELECT (make_date(2024, 6, 15))::text"),
+        "2024-06-15"
+    );
     assert_eq!(text(&mut e, "SELECT (1 = 1)::text"), "true");
     // An unknown argument name errors.
-    assert!(e.execute("SELECT make_date(nope => 2024, month => 6, day => 15)").is_err());
+    assert!(
+        e.execute("SELECT make_date(nope => 2024, month => 6, day => 15)")
+            .is_err()
+    );
 }

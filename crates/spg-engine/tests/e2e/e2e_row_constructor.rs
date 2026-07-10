@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -13,7 +15,9 @@ fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 
 fn survives(e: &mut Engine, cond: &str) -> bool {
     let sql = alloc_sql(cond);
-    let r = e.execute(&sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(&sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -44,7 +48,10 @@ fn bare_row_renders_record_text() {
     };
     assert_eq!(s.as_ref(), "(7)");
     // The bare value is a composite record.
-    assert!(matches!(one(&mut e, "SELECT ROW(1, 'a')"), spg_storage::Value::Composite(_)));
+    assert!(matches!(
+        one(&mut e, "SELECT ROW(1, 'a')"),
+        spg_storage::Value::Composite(_)
+    ));
 }
 
 #[test]

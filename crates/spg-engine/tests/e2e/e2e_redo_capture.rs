@@ -160,7 +160,8 @@ fn redo_in_explicit_tx_shares_one_committing_version() {
 
     e.execute("BEGIN").unwrap();
     let mut tx_changes = Vec::new();
-    e.execute("INSERT INTO u VALUES ('x', 10), ('y', 20)").unwrap();
+    e.execute("INSERT INTO u VALUES ('x', 10), ('y', 20)")
+        .unwrap();
     tx_changes.extend(e.take_redo());
     e.execute("UPDATE u SET n = 11 WHERE k = 'x'").unwrap();
     tx_changes.extend(e.take_redo());

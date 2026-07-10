@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn col(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r.values[0] {
@@ -29,7 +32,10 @@ fn setup() -> Engine {
 fn row_to_json_of_table_alias() {
     let mut e = setup();
     assert_eq!(
-        col(&mut e, "SELECT row_to_json(x)::text FROM emp x ORDER BY x.id"),
+        col(
+            &mut e,
+            "SELECT row_to_json(x)::text FROM emp x ORDER BY x.id"
+        ),
         vec!["{\"id\":1,\"name\":\"a\"}", "{\"id\":2,\"name\":\"b\"}"]
     );
 }
@@ -38,7 +44,10 @@ fn row_to_json_of_table_alias() {
 fn row_to_json_of_subquery_alias() {
     let mut e = setup();
     assert_eq!(
-        col(&mut e, "SELECT row_to_json(r)::text FROM (SELECT 1 a, 2 b) r"),
+        col(
+            &mut e,
+            "SELECT row_to_json(r)::text FROM (SELECT 1 a, 2 b) r"
+        ),
         vec!["{\"a\":1,\"b\":2}"]
     );
 }
@@ -48,7 +57,10 @@ fn to_jsonb_of_table_alias() {
     let mut e = setup();
     assert_eq!(
         col(&mut e, "SELECT to_jsonb(x)::text FROM emp x ORDER BY x.id"),
-        vec!["{\"id\": 1, \"name\": \"a\"}", "{\"id\": 2, \"name\": \"b\"}"]
+        vec![
+            "{\"id\": 1, \"name\": \"a\"}",
+            "{\"id\": 2, \"name\": \"b\"}"
+        ]
     );
 }
 

@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,8 +32,7 @@ fn gen_random_bytes_actually_random() {
     // 32 bytes twice — should differ (not deterministic).
     let a = first(&mut e, "SELECT gen_random_bytes(32)");
     let b = first(&mut e, "SELECT gen_random_bytes(32)");
-    let (spg_storage::Value::Bytes(ab), spg_storage::Value::Bytes(bb)) = (&a, &b)
-    else {
+    let (spg_storage::Value::Bytes(ab), spg_storage::Value::Bytes(bb)) = (&a, &b) else {
         panic!("expected Bytes");
     };
     assert_ne!(

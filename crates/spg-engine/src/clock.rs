@@ -26,7 +26,11 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
         Value::Vector(v) => Literal::Vector(v.into_owned()),
-        Value::Numeric { scaled, scale, kind } => Literal::String(eval::format_numeric_kind(kind, scaled, scale)),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => Literal::String(eval::format_numeric_kind(kind, scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
         // v7.17.0 Phase 3.P0-69 — UUID round-trips via canonical
@@ -154,7 +158,10 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(lhs, now);
             rewrite_expr_clock(rhs, now);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             rewrite_expr_clock(expr, now);
         }
         Expr::FunctionCall { args, .. } => {
@@ -299,7 +306,8 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         // unified clock has no session timezone, so the utc_*
         // family and the local family read the same instant.
         7 if kind == ClockSite::Fn
-            && (name.eq_ignore_ascii_case("curdate") || name.eq_ignore_ascii_case("sysdate")
+            && (name.eq_ignore_ascii_case("curdate")
+                || name.eq_ignore_ascii_case("sysdate")
                 || name.eq_ignore_ascii_case("curtime")) =>
         {
             Some(if name.eq_ignore_ascii_case("curdate") {
@@ -339,14 +347,10 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         }
         17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::TimestampTz),
         14 if name.eq_ignore_ascii_case("localtimestamp") => Some(ClockShape::Timestamp),
-        19 if kind == ClockSite::Fn
-            && name.eq_ignore_ascii_case("statement_timestamp") =>
-        {
+        19 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("statement_timestamp") => {
             Some(ClockShape::TimestampTz)
         }
-        21 if kind == ClockSite::Fn
-            && name.eq_ignore_ascii_case("transaction_timestamp") =>
-        {
+        21 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("transaction_timestamp") => {
             Some(ClockShape::TimestampTz)
         }
         _ => None,

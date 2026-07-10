@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -56,9 +58,10 @@ fn array_to_tsvector_sorts_and_dedups() {
 #[test]
 fn array_to_tsvector_rejects_nulls() {
     let mut e = Engine::new();
-    assert!(e
-        .execute("SELECT array_to_tsvector(ARRAY['fat', NULL])")
-        .is_err());
+    assert!(
+        e.execute("SELECT array_to_tsvector(ARRAY['fat', NULL])")
+            .is_err()
+    );
 }
 
 #[test]

@@ -3,7 +3,8 @@
 use spg_engine::Engine;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -26,6 +27,12 @@ fn set_session_characteristics_isolation_no_op() {
 #[test]
 fn set_session_characteristics_read_write_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE");
-    ddl(&mut e, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    ddl(
+        &mut e,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+    );
+    ddl(
+        &mut e,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+    );
 }

@@ -26,7 +26,13 @@ fn to_timestamp_and_to_date_honour_ww() {
         text(&mut e, "SELECT to_timestamp('2023 1', 'YYYY WW')::text"),
         "2023-01-01 00:00:00"
     );
-    assert_eq!(text(&mut e, "SELECT to_date('2020 10', 'YYYY WW')::text"), "2020-03-04");
+    assert_eq!(
+        text(&mut e, "SELECT to_date('2020 10', 'YYYY WW')::text"),
+        "2020-03-04"
+    );
     // DDD (day-of-year) still resolves via the same post-loop path.
-    assert_eq!(text(&mut e, "SELECT to_date('2023 100', 'YYYY DDD')::text"), "2023-04-10");
+    assert_eq!(
+        text(&mut e, "SELECT to_date('2023 100', 'YYYY DDD')::text"),
+        "2023-04-10"
+    );
 }

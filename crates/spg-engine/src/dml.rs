@@ -111,11 +111,10 @@ use crate::{
     apply_on_conflict_assignments, canonicalize_set_value, check_unsigned_range, coerce_value,
     enforce_check_constraints, enforce_enum_label, enforce_fk_inserts,
     enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
-    eval_runtime_default_free,
-    expr_has_subquery, literal_expr_to_value, lookup_row_position_by_keys, on_conflict_keys_exist,
-    plan_fk_parent_deletions, plan_fk_parent_updates, resolve_column_default_free,
-    resolve_on_conflict_columns, triggers, try_index_seek_positions, try_pk_predicate,
-    value_to_literal_expr_permissive,
+    eval_runtime_default_free, expr_has_subquery, literal_expr_to_value,
+    lookup_row_position_by_keys, on_conflict_keys_exist, plan_fk_parent_deletions,
+    plan_fk_parent_updates, resolve_column_default_free, resolve_on_conflict_columns, triggers,
+    try_index_seek_positions, try_pk_predicate, value_to_literal_expr_permissive,
 };
 
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
@@ -213,7 +212,10 @@ impl Engine {
                 }
             }
             return Ok(match ret_columns {
-                Some(columns) => QueryResult::Rows { columns, rows: ret_rows },
+                Some(columns) => QueryResult::Rows {
+                    columns,
+                    rows: ret_rows,
+                },
                 None => QueryResult::CommandOk {
                     affected: total_affected,
                     modified_catalog: true,
@@ -731,8 +733,7 @@ impl Engine {
         let (source_cols, source_rows) = if let Some(sub) = &stmt.source_select {
             // v7.37 D.44 — `USING (SELECT …) alias` subquery source: materialise
             // the SELECT and use its result columns/rows as the merge input.
-            let QueryResult::Rows { columns, rows } = self.exec_select_cancel(sub, cancel)?
-            else {
+            let QueryResult::Rows { columns, rows } = self.exec_select_cancel(sub, cancel)? else {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "MERGE USING subquery did not return rows"
                 )));
@@ -1032,7 +1033,10 @@ impl Engine {
             }
             return Ok(match ret_columns {
                 // DELETE … RETURNING: merge every child's returned rows.
-                Some(columns) => QueryResult::Rows { columns, rows: ret_rows },
+                Some(columns) => QueryResult::Rows {
+                    columns,
+                    rows: ret_rows,
+                },
                 None => QueryResult::CommandOk {
                     affected: total_affected,
                     modified_catalog: true,
@@ -1769,9 +1773,7 @@ impl Engine {
                     found = Some(
                         uc.columns
                             .iter()
-                            .filter_map(|&pos| {
-                                schema.columns.get(pos).map(|c| c.name.clone())
-                            })
+                            .filter_map(|&pos| schema.columns.get(pos).map(|c| c.name.clone()))
                             .collect(),
                     );
                     break;
@@ -2030,12 +2032,13 @@ impl Engine {
                 spg_storage::PartitionKind::Range => {
                     // v7.37 D.45 — route by the key's actual type (int-family /
                     // DATE / TIMESTAMPTZ / TEXT), not a forced TIMESTAMPTZ coercion.
-                    let key_bound = crate::partition::value_to_bound(&key_value).ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
-                            "INSERT INTO {parent_name:?}: partition key value \
+                    let key_bound =
+                        crate::partition::value_to_bound(&key_value).ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "INSERT INTO {parent_name:?}: partition key value \
                              {key_value:?} is not a supported RANGE key type"
-                        ))
-                    })?;
+                            ))
+                        })?;
                     range_children
                         .iter()
                         .find(|(_, lo, hi)| crate::partition::value_in_range(&key_bound, lo, hi))
@@ -2051,8 +2054,7 @@ impl Engine {
                 }
                 // v7.37.16 (16.1) — LIST routing: pick the first
                 // child whose values contains the key.
-                spg_storage::PartitionKind::List => {
-                    list_children
+                spg_storage::PartitionKind::List => list_children
                     .iter()
                     .find(|(_, values)| values.iter().any(|b| b.equals_value(&key_value)))
                     .map(|(name, _)| name.clone())
@@ -2063,8 +2065,7 @@ impl Engine {
                              row with partition key value (no LIST child matches \
                              and there is no DEFAULT partition)"
                         ))
-                    })?
-                }
+                    })?,
                 // v7.37.16 (16.2) — HASH routing: hash(key) mod
                 // modulus picks the child. All HASH siblings under
                 // a parent share a single modulus (DDL gate).
@@ -2378,7 +2379,10 @@ fn is_column_default_marker(e: &Expr) -> bool {
 /// The `DEFAULT`-slot marker expression (`__column_default()`), used to
 /// force a column to its declared default / sequence value.
 fn column_default_marker() -> Expr {
-    Expr::FunctionCall { name: String::from("__column_default"), args: Vec::new() }
+    Expr::FunctionCall {
+        name: String::from("__column_default"),
+        args: Vec::new(),
+    }
 }
 
 fn build_tuple_pos(

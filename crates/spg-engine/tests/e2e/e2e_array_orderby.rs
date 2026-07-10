@@ -37,12 +37,20 @@ fn order_by_array() {
         ]
     );
     // DESC reverses.
-    assert_eq!(col0(&mut e, "SELECT a FROM arr ORDER BY a DESC")[0], "[Some(10)]");
+    assert_eq!(
+        col0(&mut e, "SELECT a FROM arr ORDER BY a DESC")[0],
+        "[Some(10)]"
+    );
 
     e.execute("CREATE TABLE tarr(t text[])").unwrap();
-    e.execute("INSERT INTO tarr VALUES (ARRAY['b']),(ARRAY['a','z']),(ARRAY['a'])").unwrap();
+    e.execute("INSERT INTO tarr VALUES (ARRAY['b']),(ARRAY['a','z']),(ARRAY['a'])")
+        .unwrap();
     assert_eq!(
         col0(&mut e, "SELECT t FROM tarr ORDER BY t"),
-        vec!["[Some(\"a\")]", "[Some(\"a\"), Some(\"z\")]", "[Some(\"b\")]"]
+        vec![
+            "[Some(\"a\")]",
+            "[Some(\"a\"), Some(\"z\")]",
+            "[Some(\"b\")]"
+        ]
     );
 }

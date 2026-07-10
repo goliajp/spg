@@ -35,8 +35,9 @@ pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     let (weights, vec, query, norm) = parse_rank_args("ts_rank_cd", args)?;
     if norm & 4 != 0 {
         return Err(EvalError::TypeMismatch {
-            detail: "ts_rank_cd(): normalization flag 4 (cover-extent distance) is not yet supported"
-                .into(),
+            detail:
+                "ts_rank_cd(): normalization flag 4 (cover-extent distance) is not yet supported"
+                    .into(),
         });
     }
     match (vec, query) {
@@ -660,9 +661,7 @@ impl<'a> TsQueryParser<'a> {
                         1
                     } else {
                         let start = self.pos;
-                        while self.pos < self.bytes.len()
-                            && self.bytes[self.pos].is_ascii_digit()
-                        {
+                        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                             self.pos += 1;
                         }
                         if start == self.pos || self.peek() != Some(b'>') {
@@ -1117,14 +1116,8 @@ pub(super) fn fts_tsquery_bool(
     };
     use spg_storage::TsQueryAst as A;
     let out = match op {
-        "and" => A::And(
-            Box::new(as_query(&args[0])?),
-            Box::new(as_query(&args[1])?),
-        ),
-        "or" => A::Or(
-            Box::new(as_query(&args[0])?),
-            Box::new(as_query(&args[1])?),
-        ),
+        "and" => A::And(Box::new(as_query(&args[0])?), Box::new(as_query(&args[1])?)),
+        "or" => A::Or(Box::new(as_query(&args[0])?), Box::new(as_query(&args[1])?)),
         _ => A::Not(Box::new(as_query(&args[0])?)),
     };
     Ok(Value::TsQuery(out))

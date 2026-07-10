@@ -1576,8 +1576,7 @@ impl Engine {
         // PG rejects RIGHT/FULL LATERAL, so a single NULL-outer
         // materialisation is the correct fixed set. Also handles the
         // empty-drive case (no left tuples → every peer row unmatched).
-        let lateral_fixed: Option<Vec<Row<'static>>> = if right_or_full && peer.lateral.is_some()
-        {
+        let lateral_fixed: Option<Vec<Row<'static>>> = if right_or_full && peer.lateral.is_some() {
             let inner = peer.lateral.expect("lateral peer");
             // Materialise the derived table directly (no outer-column
             // substitution): a RIGHT/FULL peer must be non-correlated
@@ -1857,8 +1856,7 @@ impl Engine {
                         .cloned()
                         .or_else(|| t.alias.clone())
                         .unwrap_or_else(|| t.name.clone());
-                    let mut out =
-                        alloc::vec![ColumnSchema::new(first, elem_dtype, true)];
+                    let mut out = alloc::vec![ColumnSchema::new(first, elem_dtype, true)];
                     if t.with_ordinality {
                         let ord = t
                             .unnest_column_aliases
@@ -2668,8 +2666,12 @@ impl Engine {
             .map(|c| !prunable || needed.contains(&(primary_alias.clone(), c.name.clone())))
             .collect();
         let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
-        let descs: alloc::rc::Rc<[bool]> =
-            stmt.order_by.iter().map(|o| o.desc).collect::<Vec<bool>>().into();
+        let descs: alloc::rc::Rc<[bool]> = stmt
+            .order_by
+            .iter()
+            .map(|o| o.desc)
+            .collect::<Vec<bool>>()
+            .into();
         let mut where_memo = memoize::MemoizeCache::default();
         let mut heap: alloc::collections::BinaryHeap<TopNEntry> =
             alloc::collections::BinaryHeap::new();

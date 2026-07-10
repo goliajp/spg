@@ -7,7 +7,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,10 +32,7 @@ fn information_schema_schemata_lists_public_pg_catalog_info() {
         })
         .collect();
     assert!(names.contains(&"public".to_string()), "got {names:?}");
-    assert!(
-        names.contains(&"pg_catalog".to_string()),
-        "got {names:?}"
-    );
+    assert!(names.contains(&"pg_catalog".to_string()), "got {names:?}");
     assert!(
         names.contains(&"information_schema".to_string()),
         "got {names:?}"
@@ -83,10 +82,7 @@ fn information_schema_table_constraints_lists_pk_uk_fk_check() {
          FOREIGN KEY (pid) REFERENCES p(id))",
     )
     .unwrap();
-    let rs = rows(
-        &mut e,
-        "SELECT * FROM information_schema.table_constraints",
-    );
+    let rs = rows(&mut e, "SELECT * FROM information_schema.table_constraints");
     // Position 6 = constraint_type.
     let types: Vec<String> = rs
         .iter()
@@ -102,20 +98,23 @@ fn information_schema_table_constraints_lists_pk_uk_fk_check() {
         types.contains(&"PRIMARY KEY".to_string()),
         "missing PK: {types:?}"
     );
-    assert!(types.contains(&"UNIQUE".to_string()), "missing UK: {types:?}");
+    assert!(
+        types.contains(&"UNIQUE".to_string()),
+        "missing UK: {types:?}"
+    );
     assert!(
         types.contains(&"FOREIGN KEY".to_string()),
         "missing FK: {types:?}"
     );
-    assert!(types.contains(&"CHECK".to_string()), "missing CHECK: {types:?}");
+    assert!(
+        types.contains(&"CHECK".to_string()),
+        "missing CHECK: {types:?}"
+    );
 }
 
 #[test]
 fn information_schema_table_constraints_empty_when_no_user_tables() {
     let mut e = Engine::new();
-    let rs = rows(
-        &mut e,
-        "SELECT * FROM information_schema.table_constraints",
-    );
+    let rs = rows(&mut e, "SELECT * FROM information_schema.table_constraints");
     assert!(rs.is_empty(), "expected empty, got {rs:?}");
 }

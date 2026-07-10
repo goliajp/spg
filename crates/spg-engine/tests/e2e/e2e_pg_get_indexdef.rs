@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -24,7 +26,10 @@ fn indexdef_reconstructs_create_index() {
     e.execute("CREATE TABLE ti (id INT, name TEXT)").unwrap();
     e.execute("CREATE INDEX idx_ti_name ON ti (name)").unwrap();
     let def = text(&first(&mut e, "SELECT pg_get_indexdef('idx_ti_name')"));
-    assert_eq!(def, "CREATE INDEX idx_ti_name ON public.ti USING btree (name)");
+    assert_eq!(
+        def,
+        "CREATE INDEX idx_ti_name ON public.ti USING btree (name)"
+    );
     // Matches the pg_indexes view's construction exactly.
     let view_def = text(&first(
         &mut e,
@@ -90,7 +95,9 @@ fn pg_get_def_by_oid() {
                  WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 'd')",
             )
             .unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!() };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!()
+        };
         rows.iter()
             .filter_map(|row| match &row.values[0] {
                 spg_storage::Value::Text(s) => Some(s.to_string()),
@@ -99,7 +106,8 @@ fn pg_get_def_by_oid() {
             .collect()
     };
     assert!(
-        defs.iter().any(|d| d == "CREATE INDEX idx_d_a ON public.d USING btree (a)"),
+        defs.iter()
+            .any(|d| d == "CREATE INDEX idx_d_a ON public.d USING btree (a)"),
         "got {defs:?}"
     );
     // pg_get_constraintdef(oid) resolves the PK constraint by OID.
@@ -110,8 +118,12 @@ fn pg_get_def_by_oid() {
                AND contype = 'p'",
         )
         .unwrap();
-    let QueryResult::Rows { rows, .. } = pk else { panic!() };
-    assert!(matches!(&rows[0].values[0], spg_storage::Value::Text(s) if s.as_ref() == "PRIMARY KEY (id)"));
+    let QueryResult::Rows { rows, .. } = pk else {
+        panic!()
+    };
+    assert!(
+        matches!(&rows[0].values[0], spg_storage::Value::Text(s) if s.as_ref() == "PRIMARY KEY (id)")
+    );
 }
 
 // read01 — a plain (non-UNIQUE) multi-column index now persists every

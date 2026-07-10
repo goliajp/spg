@@ -21,20 +21,18 @@ use crate::system_catalog::collect_view_refs;
 use crate::{
     ByteBudget, CancelToken, Engine, EngineError, OrderKey, QueryResult, aggregate,
     apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
-    collect_meta_view_names,
-    collect_qualified_refs, collect_scalar_subqueries, collect_window_nodes,
-    compute_window_partition, eval, expr_tree_has_subquery, materialise_in_order,
-    materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp, partial_sort_tagged,
-    partition_key_cmp, rewrite_window_to_columns, select_has_window, select_references_meta_view,
-    select_refers_to, sort_by_keys, synth_info_key_column_usage, topk_trim,
+    collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
+    collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
+    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp,
+    partial_sort_tagged, partition_key_cmp, rewrite_window_to_columns, select_has_window,
+    select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
-    synth_pg_sequence,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
-    synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
-    try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n,
-    try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
+    synth_pg_roles, synth_pg_sequence, synth_pg_settings, synth_pg_trigger, synth_pg_type,
+    synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn,
+    try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
 
 impl Engine {
@@ -103,52 +101,52 @@ impl Engine {
                 }
                 filtered = owned;
             } else {
-            let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
-                StorageError::TableNotFound {
-                    name: primary.name.clone(),
-                }
-            })?;
-            let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
-            schema_cols_owned = table.schema().columns.clone();
-            alias_opt = Some(alias);
-            // Materialise WHERE-filtered rows owned so the JOIN
-            // and single-table paths share a single downstream
-            // shape. The clone is cheap relative to the window
-            // computation that follows.
-            let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
-            let mut owned: Vec<Row<'static>> = Vec::new();
-            let mut emit = |row: &Row<'static>, i: usize| -> Result<(), EngineError> {
-                if i.is_multiple_of(256) {
-                    cancel.check()?;
-                }
-                if let Some(w) = &stmt.where_ {
-                    let cond = eval::eval_expr(w, row, &ctx)?;
-                    if !matches!(cond, Value::Bool(true)) {
-                        return Ok(());
+                let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
+                    StorageError::TableNotFound {
+                        name: primary.name.clone(),
                     }
+                })?;
+                let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+                schema_cols_owned = table.schema().columns.clone();
+                alias_opt = Some(alias);
+                // Materialise WHERE-filtered rows owned so the JOIN
+                // and single-table paths share a single downstream
+                // shape. The clone is cheap relative to the window
+                // computation that follows.
+                let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
+                let mut owned: Vec<Row<'static>> = Vec::new();
+                let mut emit = |row: &Row<'static>, i: usize| -> Result<(), EngineError> {
+                    if i.is_multiple_of(256) {
+                        cancel.check()?;
+                    }
+                    if let Some(w) = &stmt.where_ {
+                        let cond = eval::eval_expr(w, row, &ctx)?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            return Ok(());
+                        }
+                    }
+                    owned.push(row.clone());
+                    Ok(())
+                };
+                // v7.37.15 Phase B — scan_visible filters rows by the
+                // engine's current snapshot. Phase B's `current_snapshot()`
+                // returns `Snapshot::unbounded()` so every row is visible,
+                // matching pre-v7.37.15 byte-for-byte. Phase C will wire
+                // real per-tx snapshots through this same callsite — no
+                // code change needed here when that lands.
+                let snap = self.current_snapshot();
+                for (i, row) in table.scan_visible(&snap) {
+                    emit(row, i)?;
                 }
-                owned.push(row.clone());
-                Ok(())
-            };
-            // v7.37.15 Phase B — scan_visible filters rows by the
-            // engine's current snapshot. Phase B's `current_snapshot()`
-            // returns `Snapshot::unbounded()` so every row is visible,
-            // matching pre-v7.37.15 byte-for-byte. Phase C will wire
-            // real per-tx snapshots through this same callsite — no
-            // code change needed here when that lands.
-            let snap = self.current_snapshot();
-            for (i, row) in table.scan_visible(&snap) {
-                emit(row, i)?;
-            }
-            // v7.36 (cold-tier coverage) — window single-table path
-            // mirrors `run_single_table_scan`: hot iter then cold iter,
-            // both routed through the same `emit` so WHERE / clone /
-            // cancel-poll semantics stay byte-identical.
-            let hot_len = table.row_count();
-            for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate() {
-                emit(row, hot_len + offset)?;
-            }
-            filtered = owned;
+                // v7.36 (cold-tier coverage) — window single-table path
+                // mirrors `run_single_table_scan`: hot iter then cold iter,
+                // both routed through the same `emit` so WHERE / clone /
+                // cancel-poll semantics stay byte-identical.
+                let hot_len = table.row_count();
+                for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate() {
+                    emit(row, hot_len + offset)?;
+                }
+                filtered = owned;
             }
         } else {
             let deferred = self.build_joined_filtered_rows(
@@ -423,9 +421,7 @@ impl Engine {
                 // (shape-stable empty until 21.12 persists slot state).
                 "__spg_pg_replication_slots" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_replication_slots(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_replication_slots(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.21 (21.13-b) — pg_catalog.pg_publication
@@ -457,26 +453,20 @@ impl Engine {
                 // (per-table churn counters; live_tup = row count).
                 "__spg_pg_stat_user_tables" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_user_tables(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_user_tables(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.15) — pg_catalog.pg_stat_user_indexes
                 // (per-index usage counters; flag unused indexes).
                 "__spg_pg_stat_user_indexes" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_user_indexes(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_user_indexes(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.16) — pg_catalog.pg_stat_bgwriter.
                 "__spg_pg_stat_bgwriter" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_bgwriter(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_bgwriter(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.38 (read01 P3.14) — pg_catalog.pg_stat_checkpointer /
@@ -507,23 +497,18 @@ impl Engine {
                 // v7.37.22 (22.17) — pg_catalog.pg_stat_archiver.
                 "__spg_pg_stat_archiver" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_archiver(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_archiver(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.21 (21.13-d) — pg_catalog.pg_stat_replication.
                 "__spg_pg_stat_replication" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_replication(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_replication(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.13) — pg_catalog.pg_am.
                 "__spg_pg_am" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_am(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_am(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.18) — pg_catalog.pg_stat_io (PG 16+).
@@ -535,17 +520,13 @@ impl Engine {
                 // v7.37.22 (22.19) — pg_catalog.pg_stat_user_functions.
                 "__spg_pg_stat_user_functions" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_user_functions(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_user_functions(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.23 (23.7-a) — pg_catalog.pg_statistic_ext.
                 "__spg_pg_statistic_ext" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_statistic_ext(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_statistic_ext(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.15) — pg_catalog.pg_statistic.
@@ -557,25 +538,21 @@ impl Engine {
                 // v7.37.22 (22.20) — pg_catalog.pg_stat_progress_vacuum.
                 "__spg_pg_stat_progress_vacuum" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_progress_vacuum(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_pg_stat_progress_vacuum(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.21) — pg_catalog.pg_stat_progress_create_index.
                 "__spg_pg_stat_progress_create_index" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_progress_create_index(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_pg_stat_progress_create_index(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.22) — pg_catalog.pg_stat_progress_analyze.
                 "__spg_pg_stat_progress_analyze" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_progress_analyze(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_pg_stat_progress_analyze(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.16) — pg_catalog.pg_inherits
@@ -695,34 +672,30 @@ impl Engine {
                 }
                 // v7.37.24 (24.3) — information_schema.attributes.
                 "__spg_info_attributes" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_information_schema_attributes(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_information_schema_attributes(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.2) — information_schema.domains.
                 "__spg_info_domains" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_information_schema_domains(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_information_schema_domains(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.9) — information_schema.schemata.
                 "__spg_info_schemata" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_information_schema_schemata(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_information_schema_schemata(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.9) — information_schema.views.
                 "__spg_info_views" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_information_schema_views(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_information_schema_views(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.9) — information_schema.table_constraints.
@@ -735,32 +708,27 @@ impl Engine {
                 }
                 // v7.37.17 — information_schema.constraint_column_usage.
                 "__spg_info_constraint_column_usage" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_info_constraint_column_usage(
-                            self.active_catalog(),
-                        );
+                    let (schema, rows) = crate::system_catalog::synth_info_constraint_column_usage(
+                        self.active_catalog(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.17 — information_schema.triggers.
                 "__spg_info_triggers" => {
-                    let (schema, rows) = crate::system_catalog::synth_info_triggers(
-                        self.active_catalog(),
-                    );
+                    let (schema, rows) =
+                        crate::system_catalog::synth_info_triggers(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.17 — information_schema.check_constraints.
                 "__spg_info_check_constraints" => {
                     let (schema, rows) =
-                        crate::system_catalog::synth_info_check_constraints(
-                            self.active_catalog(),
-                        );
+                        crate::system_catalog::synth_info_check_constraints(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.17 — information_schema.sequences.
                 "__spg_info_sequences" => {
-                    let (schema, rows) = crate::system_catalog::synth_info_sequences(
-                        self.active_catalog(),
-                    );
+                    let (schema, rows) =
+                        crate::system_catalog::synth_info_sequences(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-65 — mysql.user / mysql.db.
@@ -943,8 +911,8 @@ impl Engine {
                         body: spg_sql::ast::CteBody::Select(body.clone()),
                         recursive: true,
                         column_overrides: cte.column_overrides.clone(),
-                    search: None,
-                    cycle: None,
+                        search: None,
+                        cycle: None,
                     };
                     self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
                 }
@@ -1345,7 +1313,10 @@ impl Engine {
                 self.resolve_expr_subqueries(lhs, cancel)?;
                 self.resolve_expr_subqueries(rhs, cancel)?;
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::FieldAccess { base: expr, .. } => {
                 self.resolve_expr_subqueries(expr, cancel)?;
             }
             Expr::FunctionCall { args, .. } => {
@@ -1382,8 +1353,8 @@ impl Engine {
             Expr::ScalarSubquery(_)
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
-        | Expr::RowInSubquery { .. }
-        | Expr::RowCmpSubquery { .. }
+            | Expr::RowInSubquery { .. }
+            | Expr::RowCmpSubquery { .. }
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}
@@ -1951,50 +1922,50 @@ impl Engine {
             } else {
                 let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
                     match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
-                Value::Null => (DataType::Text, alloc::vec::Vec::new()),
-                Value::TextArray(items) => {
-                    let rows = items
-                        .into_iter()
-                        .map(|item| {
-                            Row::new(alloc::vec![match item {
-                                Some(s) => Value::text(s),
-                                None => Value::Null,
-                            }])
-                        })
-                        .collect();
-                    (DataType::Text, rows)
-                }
-                Value::IntArray(items) => {
-                    let rows = items
-                        .into_iter()
-                        .map(|item| {
-                            Row::new(alloc::vec![match item {
-                                Some(n) => Value::Int(n),
-                                None => Value::Null,
-                            }])
-                        })
-                        .collect();
-                    (DataType::Int, rows)
-                }
-                Value::BigIntArray(items) => {
-                    let rows = items
-                        .into_iter()
-                        .map(|item| {
-                            Row::new(alloc::vec![match item {
-                                Some(n) => Value::BigInt(n),
-                                None => Value::Null,
-                            }])
-                        })
-                        .collect();
-                    (DataType::BigInt, rows)
-                }
-                other => {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "unnest() expects an array argument, got {:?}",
-                        other.data_type()
-                    )));
-                }
-                };
+                        Value::Null => (DataType::Text, alloc::vec::Vec::new()),
+                        Value::TextArray(items) => {
+                            let rows = items
+                                .into_iter()
+                                .map(|item| {
+                                    Row::new(alloc::vec![match item {
+                                        Some(s) => Value::text(s),
+                                        None => Value::Null,
+                                    }])
+                                })
+                                .collect();
+                            (DataType::Text, rows)
+                        }
+                        Value::IntArray(items) => {
+                            let rows = items
+                                .into_iter()
+                                .map(|item| {
+                                    Row::new(alloc::vec![match item {
+                                        Some(n) => Value::Int(n),
+                                        None => Value::Null,
+                                    }])
+                                })
+                                .collect();
+                            (DataType::Int, rows)
+                        }
+                        Value::BigIntArray(items) => {
+                            let rows = items
+                                .into_iter()
+                                .map(|item| {
+                                    Row::new(alloc::vec![match item {
+                                        Some(n) => Value::BigInt(n),
+                                        None => Value::Null,
+                                    }])
+                                })
+                                .collect();
+                            (DataType::BigInt, rows)
+                        }
+                        other => {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "unnest() expects an array argument, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    };
                 (alloc::vec![elem_dtype], rows)
             };
         let alias = primary
@@ -2107,8 +2078,7 @@ impl Engine {
         let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
         if let Some(srf_idx) = srf_position {
             for row in &filtered {
-                let elements =
-                    top_level_srf_output(&projection[srf_idx].expr, row, &scan_ctx)?;
+                let elements = top_level_srf_output(&projection[srf_idx].expr, row, &scan_ctx)?;
                 // Empty array → zero rows for this input row (PG
                 // semantics: `SELECT unnest('{}'::int[])` returns
                 // 0 rows, not a single NULL row).
@@ -2563,40 +2533,47 @@ impl Engine {
         let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
             // BTree / col=literal seek first — covers the v7.11.3 multi-
             // column AND case and the leading-column equality lookup.
-            try_index_seek(w, schema_cols, self.active_catalog(), table, alias, &seek_snapshot)
-                .or_else(|| {
-                    // v7.12.3 — GIN-accelerated `WHERE col @@
-                    // tsquery` when the column has a `USING gin`
-                    // index. Returns an over-approximate candidate
-                    // set; the WHERE re-eval loop below verifies
-                    // the full `@@` predicate per row.
-                    try_gin_seek(
-                        w,
-                        schema_cols,
-                        self.active_catalog(),
-                        table,
-                        alias,
-                        &ctx,
-                        &seek_snapshot,
-                    )
-                })
-                .or_else(|| {
-                    // v7.15.0 — trigram-GIN-accelerated
-                    // `WHERE col LIKE / ILIKE '<pat>'` when the
-                    // column has a `gin_trgm_ops` GIN index.
-                    // Over-approximate candidate set; the WHERE
-                    // re-eval verifies the LIKE per row.
-                    try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot)
-                })
-                .or_else(|| {
-                    // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
-                    // accelerated `WHERE col @> <jsonb_literal>`
-                    // when the column has a `USING gin` index. The
-                    // posting-list intersection returns an over-
-                    // approximate candidate set; the WHERE re-eval
-                    // verifies the full `@>` predicate per row.
-                    try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot)
-                })
+            try_index_seek(
+                w,
+                schema_cols,
+                self.active_catalog(),
+                table,
+                alias,
+                &seek_snapshot,
+            )
+            .or_else(|| {
+                // v7.12.3 — GIN-accelerated `WHERE col @@
+                // tsquery` when the column has a `USING gin`
+                // index. Returns an over-approximate candidate
+                // set; the WHERE re-eval loop below verifies
+                // the full `@@` predicate per row.
+                try_gin_seek(
+                    w,
+                    schema_cols,
+                    self.active_catalog(),
+                    table,
+                    alias,
+                    &ctx,
+                    &seek_snapshot,
+                )
+            })
+            .or_else(|| {
+                // v7.15.0 — trigram-GIN-accelerated
+                // `WHERE col LIKE / ILIKE '<pat>'` when the
+                // column has a `gin_trgm_ops` GIN index.
+                // Over-approximate candidate set; the WHERE
+                // re-eval verifies the LIKE per row.
+                try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot)
+            })
+            .or_else(|| {
+                // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
+                // accelerated `WHERE col @> <jsonb_literal>`
+                // when the column has a `USING gin` index. The
+                // posting-list intersection returns an over-
+                // approximate candidate set; the WHERE re-eval
+                // verifies the full `@>` predicate per row.
+                try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot)
+            })
         });
 
         // Aggregate path: filter rows first, then hand off to the
@@ -2653,10 +2630,7 @@ impl Engine {
                 Row::new(alloc::vec![key_val, value_val])
             })
             .collect();
-        let alias = primary
-            .alias
-            .clone()
-            .unwrap_or_else(|| each_fn.to_string());
+        let alias = primary.alias.clone().unwrap_or_else(|| each_fn.to_string());
         let value_dtype = if as_text {
             spg_storage::DataType::Text
         } else {
@@ -3565,8 +3539,7 @@ impl Engine {
             && !self.env_cfg().disable_topk
         {
             stmt.limit_literal().and_then(|l| {
-                let keep =
-                    (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
+                let keep = (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
                 (keep >= 1).then(|| (keep, stmt.order_by.iter().map(|o| o.desc).collect()))
             })
         } else {
@@ -4119,8 +4092,7 @@ impl Engine {
             && !self.env_cfg().disable_topk
         {
             stmt.limit_literal().and_then(|l| {
-                let keep =
-                    (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
+                let keep = (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
                 (keep >= 1).then(|| (keep, stmt.order_by.iter().map(|o| o.desc).collect()))
             })
         } else {
@@ -4365,9 +4337,10 @@ fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
             collect_agg_exprs(lhs, out);
             collect_agg_exprs(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            collect_agg_exprs(expr, out)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => collect_agg_exprs(expr, out),
         Expr::FunctionCall { args, .. } => {
             for a in args {
                 collect_agg_exprs(a, out);
@@ -4414,9 +4387,10 @@ fn replace_agg_exprs(e: &mut Expr, aggs: &[Expr]) {
             replace_agg_exprs(lhs, aggs);
             replace_agg_exprs(rhs, aggs);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            replace_agg_exprs(expr, aggs)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => replace_agg_exprs(expr, aggs),
         Expr::FunctionCall { args, .. } => {
             for a in args {
                 replace_agg_exprs(a, aggs);
@@ -4630,16 +4604,24 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     let inf = || OrderKey::Num(f64::INFINITY);
     let arr = match v {
         Value::IntArray(a) => Some(
-            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+            a.iter()
+                .map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n))))
+                .collect(),
         ),
         Value::SmallIntArray(a) => Some(
-            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+            a.iter()
+                .map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n))))
+                .collect(),
         ),
-        Value::BigIntArray(a) => {
-            Some(a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect())
-        }
+        Value::BigIntArray(a) => Some(
+            a.iter()
+                .map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n))))
+                .collect(),
+        ),
         Value::BoolArray(a) => Some(
-            a.iter().map(|o| o.map_or_else(inf, |b| OrderKey::Int(i128::from(b)))).collect(),
+            a.iter()
+                .map(|o| o.map_or_else(inf, |b| OrderKey::Int(i128::from(b))))
+                .collect(),
         ),
         Value::TextArray(a) => Some(
             a.iter()
@@ -4647,9 +4629,11 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                 .collect(),
         ),
         #[allow(clippy::cast_precision_loss)]
-        Value::FloatArray(a) => {
-            Some(a.iter().map(|o| OrderKey::Num(o.unwrap_or(f64::INFINITY))).collect())
-        }
+        Value::FloatArray(a) => Some(
+            a.iter()
+                .map(|o| OrderKey::Num(o.unwrap_or(f64::INFINITY)))
+                .collect(),
+        ),
         Value::NumericArray(a) => Some(
             a.iter()
                 .map(|o| {
@@ -4660,7 +4644,9 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                 .collect(),
         ),
         Value::DateArray(a) => Some(
-            a.iter().map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n)))).collect(),
+            a.iter()
+                .map(|o| o.map_or_else(inf, |n| OrderKey::Int(i128::from(n))))
+                .collect(),
         ),
         _ => None,
     };
@@ -4744,7 +4730,11 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         // tie-breaks past that magnitude lose precision. Matches the
         // min/max(interval) comparator in aggregate.rs.
         #[allow(clippy::cast_precision_loss)]
-        Value::Interval { months, days, micros } => {
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
             let total = i128::from(*months) * 30 * 86_400_000_000
                 + i128::from(*days) * 86_400_000_000
                 + i128::from(*micros);
@@ -4752,7 +4742,8 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         }
         Value::Json(_) => {
             return Err(EngineError::Unsupported(
-                "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
+                "ORDER BY of a JSON value is not supported — cast the document to text first"
+                    .into(),
             ));
         }
         // v7.5.0 — Value is #[non_exhaustive]; future variants need
@@ -4988,12 +4979,14 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
     // is timestamptz the result is timestamptz (tstz ∪ ts, tstz ∪ date), else
     // if any is timestamp the result is timestamp (ts ∪ date). All values are
     // the same UTC-micros instant, so widening date/ts to tstz is lossless.
-    if non_text
+    if non_text.iter().all(|t| {
+        matches!(
+            t,
+            DataType::Date | DataType::Timestamp | DataType::Timestamptz
+        )
+    }) && non_text
         .iter()
-        .all(|t| matches!(t, DataType::Date | DataType::Timestamp | DataType::Timestamptz))
-        && non_text
-            .iter()
-            .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
+        .any(|t| matches!(t, DataType::Timestamp | DataType::Timestamptz))
     {
         if non_text.iter().any(|t| matches!(t, DataType::Timestamptz)) {
             return Some(DataType::Timestamptz);
@@ -5041,7 +5034,10 @@ fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) 
                 }
                 Some(v) => {
                     let cell_target = if scale_preserving_numeric {
-                        DataType::Numeric { precision: 0, scale: 0 }
+                        DataType::Numeric {
+                            precision: 0,
+                            scale: 0,
+                        }
                     } else {
                         target.clone()
                     };
@@ -5254,14 +5250,28 @@ pub(crate) fn generate_series_rows(
             // elements, int8 (bigint) args → int8. Any BigInt operand widens.
             let wide = value_is_bigint(start) || value_is_bigint(stop) || value_is_bigint(step);
             let rows = generate_series_integers(s, e, st, wide, cancel)?;
-            Ok((if wide { DataType::BigInt } else { DataType::Int }, rows))
+            Ok((
+                if wide {
+                    DataType::BigInt
+                } else {
+                    DataType::Int
+                },
+                rows,
+            ))
         }
         [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
             let s = value_to_i64(start);
             let e = value_to_i64(stop);
             let wide = value_is_bigint(start) || value_is_bigint(stop);
             let rows = generate_series_integers(s, e, 1, wide, cancel)?;
-            Ok((if wide { DataType::BigInt } else { DataType::Int }, rows))
+            Ok((
+                if wide {
+                    DataType::BigInt
+                } else {
+                    DataType::Int
+                },
+                rows,
+            ))
         }
         _ => Err(EngineError::Unsupported(alloc::format!(
             "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
@@ -5460,7 +5470,12 @@ fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
     if n == 1 && name_is(name, &["jsonb_array_elements", "json_array_elements"]) {
         return Some(SrfKind::ArrayElements { as_text: false });
     }
-    if n == 1 && name_is(name, &["jsonb_array_elements_text", "json_array_elements_text"]) {
+    if n == 1
+        && name_is(
+            name,
+            &["jsonb_array_elements_text", "json_array_elements_text"],
+        )
+    {
         return Some(SrfKind::ArrayElements { as_text: true });
     }
     if n == 2 && name_is(name, &["jsonb_path_query", "json_path_query"]) {
@@ -5493,7 +5508,9 @@ fn top_level_srf_output(
     let (Some(kind), spg_sql::ast::Expr::FunctionCall { name, args }) =
         (top_level_srf_kind(expr), expr)
     else {
-        return Err(EngineError::Unsupported("expected a SELECT-list SRF call".into()));
+        return Err(EngineError::Unsupported(
+            "expected a SELECT-list SRF call".into(),
+        ));
     };
     match kind {
         SrfKind::Unnest => {
@@ -5656,8 +5673,8 @@ impl Engine {
                 body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: view.columns.clone(),
-                    search: None,
-                    cycle: None,
+                search: None,
+                cycle: None,
             });
         }
         let mut out = stmt.clone();
@@ -5723,8 +5740,8 @@ impl Engine {
                 body: spg_sql::ast::CteBody::Select(body),
                 recursive: false,
                 column_overrides: Vec::new(),
-                    search: None,
-                    cycle: None,
+                search: None,
+                cycle: None,
             });
             expanded_parents.push(parent_name.clone());
         }

@@ -33,15 +33,14 @@ fn explain_text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn explain_lists_kept_children_for_list_eq_predicate() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp', 'kr')")
         .unwrap();
     e.execute("CREATE TABLE cust_emea PARTITION OF cust FOR VALUES IN ('de', 'fr')")
         .unwrap();
-    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT").unwrap();
+    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT")
+        .unwrap();
 
     let plan = explain_text(&mut e, "EXPLAIN SELECT * FROM cust WHERE region = 'jp'");
     assert!(
@@ -57,13 +56,12 @@ fn explain_lists_kept_children_for_list_eq_predicate() {
 #[test]
 fn explain_lists_default_only_when_no_concrete_match() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
         .unwrap();
-    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT").unwrap();
+    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT")
+        .unwrap();
 
     // region = 'us' isn't in any concrete LIST → only DEFAULT
     // survives.
@@ -81,15 +79,14 @@ fn explain_lists_default_only_when_no_concrete_match() {
 #[test]
 fn explain_lists_all_children_when_no_predicate() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
         .unwrap();
     e.execute("CREATE TABLE cust_emea PARTITION OF cust FOR VALUES IN ('de')")
         .unwrap();
-    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT").unwrap();
+    e.execute("CREATE TABLE cust_default PARTITION OF cust DEFAULT")
+        .unwrap();
 
     let plan = explain_text(&mut e, "EXPLAIN SELECT * FROM cust");
     // No equality literal → every concrete + DEFAULT child kept.
@@ -137,7 +134,9 @@ fn explain_range_keeps_overlapping_children() {
 // v7.37.16 (16.12) — PG partition catalog scalar functions.
 
 fn one_text(e: &mut Engine, sql: &str) -> Option<String> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -151,10 +150,8 @@ fn one_text(e: &mut Engine, sql: &str) -> Option<String> {
 #[test]
 fn pg_partition_root_walks_to_top_ancestor() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
         .unwrap();
 
@@ -184,10 +181,8 @@ fn pg_partition_root_walks_to_top_ancestor() {
 #[test]
 fn pg_partition_ancestors_returns_leaf_to_root_chain() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE cust (id BIGINT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
     e.execute("CREATE TABLE cust_apac PARTITION OF cust FOR VALUES IN ('jp')")
         .unwrap();
 

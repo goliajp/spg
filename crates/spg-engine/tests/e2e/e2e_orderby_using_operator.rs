@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,7 +32,9 @@ fn using_lt_is_asc_gt_is_desc() {
     let got = rows(&mut e, "SELECT v FROM ou ORDER BY v USING >");
     assert_eq!(as_i64(&got[0][0]), 3);
     // Non-btree operator errors honestly.
-    let err = e.execute("SELECT v FROM ou ORDER BY v USING +").unwrap_err();
+    let err = e
+        .execute("SELECT v FROM ou ORDER BY v USING +")
+        .unwrap_err();
     assert!(format!("{err:?}").contains("btree"));
 }
 

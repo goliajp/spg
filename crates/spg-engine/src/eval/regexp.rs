@@ -183,10 +183,7 @@ enum ReNode {
     /// at a position iff `inner` matches starting there; `(?!inner)` (negative
     /// == true) succeeds iff it does NOT. Either way it consumes no input. Runs
     /// under the same ReDoS step/depth budget as every other node.
-    Lookahead {
-        negative: bool,
-        inner: Box<ReNode>,
-    },
+    Lookahead { negative: bool, inner: Box<ReNode> },
     /// v7.38 (read01) — a capturing group `(inner)`. `idx` is the 1-based
     /// group number (assigned left-to-right at parse time). Matching is
     /// transparent — it matches exactly what `inner` matches — but the matcher
@@ -194,17 +191,11 @@ enum ReNode {
     /// captures array so regexp_replace `\N`, regexp_matches and
     /// substring(from pattern) can read the sub-match. `(?:…)` non-capturing
     /// groups and lookarounds are NOT wrapped in this node.
-    Group {
-        idx: usize,
-        inner: Box<ReNode>,
-    },
+    Group { idx: usize, inner: Box<ReNode> },
     /// v7.38 (read01, T7-br) — in-pattern backreference `\1`..`\9`: matches the
     /// literal text captured by group `idx`. `ci` is set by `fold_case` for the
     /// `~*` case-insensitive path (the comparison folds both sides).
-    Backref {
-        idx: usize,
-        ci: bool,
-    },
+    Backref { idx: usize, ci: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -602,10 +593,7 @@ fn re_parse_atom(
                 'x' | 'u' => {
                     let want = if esc == 'x' { 2 } else { 4 };
                     let mut hex = alloc::string::String::new();
-                    while hex.len() < want
-                        && *p < chars.len()
-                        && chars[*p].is_ascii_hexdigit()
-                    {
+                    while hex.len() < want && *p < chars.len() && chars[*p].is_ascii_hexdigit() {
                         hex.push(chars[*p]);
                         *p += 1;
                     }
@@ -614,11 +602,10 @@ fn re_parse_atom(
                             detail: alloc::format!("regex compile: `\\{esc}` needs hex digits"),
                         });
                     }
-                    let code = u32::from_str_radix(&hex, 16).map_err(|_| {
-                        EvalError::TypeMismatch {
+                    let code =
+                        u32::from_str_radix(&hex, 16).map_err(|_| EvalError::TypeMismatch {
                             detail: "regex compile: bad numeric escape".into(),
-                        }
-                    })?;
+                        })?;
                     Ok(ReNode::Literal(char::from_u32(code).unwrap_or('\u{fffd}')))
                 }
                 // v7.38 (read01, T7-br) — `\1`..`\9` backreference. A
@@ -962,11 +949,7 @@ fn re_match_at(
         // so `.` matches ANY character including `\n` (unlike Perl, where a
         // separate `s`/DOTALL flag is needed). SPG previously excluded `\n`,
         // diverging from PG on multi-line input.
-        ReNode::AnyChar => Ok(if pos < s.len() {
-            Some(pos + 1)
-        } else {
-            None
-        }),
+        ReNode::AnyChar => Ok(if pos < s.len() { Some(pos + 1) } else { None }),
         ReNode::Class { members, negated } => match s.get(pos) {
             Some(&c) => {
                 let hit = members.iter().any(|m| class_matches(m, c));
@@ -1301,7 +1284,12 @@ fn re_match_at_caps(
             }
             Ok(None)
         }
-        ReNode::Quant { inner, min, max, greedy } => {
+        ReNode::Quant {
+            inner,
+            min,
+            max,
+            greedy,
+        } => {
             // Standalone quantifier (no tail): greedy = longest, lazy = fewest.
             // Captures accumulate across reps (PG: `(a)*` keeps the LAST rep);
             // a rep that fails past the minimum leaves the earlier caps intact.
@@ -1407,7 +1395,13 @@ fn re_match_seq_caps(
         // inner quant's reachable ends, record caps[idx] at each rep count, and
         // try the tail (so `^(a*)\1$` on `aaaa` gives back to group = `aa`).
         ReNode::Group { idx, inner } if matches!(**inner, ReNode::Quant { .. }) => {
-            let ReNode::Quant { inner: qinner, min, max, greedy } = &**inner else {
+            let ReNode::Quant {
+                inner: qinner,
+                min,
+                max,
+                greedy,
+            } = &**inner
+            else {
                 unreachable!()
             };
             let mut ends = alloc::vec![pos];
@@ -1453,7 +1447,12 @@ fn re_match_seq_caps(
             }
             Ok(None)
         }
-        ReNode::Quant { inner, min, max, greedy } => {
+        ReNode::Quant {
+            inner,
+            min,
+            max,
+            greedy,
+        } => {
             // Enumerate reachable ends, recording a journal MARK before each
             // rep so trying the tail at `k` reps can undo the captures made by
             // the reps beyond `k` (otherwise a backtrack leaves stale caps).
@@ -1549,7 +1548,8 @@ fn re_find_caps(
     loop {
         let mut caps: Caps = alloc::vec![None; ngroups + 1];
         let mut journal: CapJournal = alloc::vec::Vec::new();
-        if let Some(end) = re_match_at_caps(node, s, start, 0, &mut steps, &mut caps, &mut journal)? {
+        if let Some(end) = re_match_at_caps(node, s, start, 0, &mut steps, &mut caps, &mut journal)?
+        {
             return Ok(Some(((start, end), caps)));
         }
         if start >= s.len() {
@@ -1714,7 +1714,11 @@ pub(crate) fn regexp_matches_rows(args: &[Value<'_>]) -> Result<Vec<Value<'stati
         2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),
         3 => {
             let flags = text_arg(&args[2])?.unwrap_or_default();
-            (text_arg(&args[0])?, text_arg(&args[1])?, flags.contains('g'))
+            (
+                text_arg(&args[0])?,
+                text_arg(&args[1])?,
+                flags.contains('g'),
+            )
         }
         n => {
             return Err(EvalError::TypeMismatch {
@@ -1968,10 +1972,7 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
 pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 6 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "regexp_instr() takes 2-6 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("regexp_instr() takes 2-6 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2055,10 +2056,7 @@ pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 5 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "regexp_substr() takes 2-5 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("regexp_substr() takes 2-5 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2134,10 +2132,7 @@ pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "regexp_like() takes 2 or 3 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("regexp_like() takes 2 or 3 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2207,8 +2202,14 @@ fn fold_case(node: &mut ReNode) {
                     ClassMember::Range(a, b)
                         if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() =>
                     {
-                        extra.push(ClassMember::Range(a.to_ascii_lowercase(), b.to_ascii_lowercase()));
-                        extra.push(ClassMember::Range(a.to_ascii_uppercase(), b.to_ascii_uppercase()));
+                        extra.push(ClassMember::Range(
+                            a.to_ascii_lowercase(),
+                            b.to_ascii_lowercase(),
+                        ));
+                        extra.push(ClassMember::Range(
+                            a.to_ascii_uppercase(),
+                            b.to_ascii_uppercase(),
+                        ));
                     }
                     _ => {}
                 }
@@ -2236,10 +2237,7 @@ fn fold_case(node: &mut ReNode) {
 pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 4 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "regexp_count() takes 2-4 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("regexp_count() takes 2-4 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2340,7 +2338,10 @@ mod redos_tests {
             })
             .expect("spawn");
         let res = handle.join().expect("match thread must not overflow/panic");
-        assert!(res.is_err(), "over-deep match must abort with a clean error");
+        assert!(
+            res.is_err(),
+            "over-deep match must abort with a clean error"
+        );
     }
 
     // (b) An `{m,n}` bound with n > REPEAT_MAX (65535) is rejected as
@@ -2362,8 +2363,14 @@ mod redos_tests {
     fn redos_normal_bounds_match_correctly() {
         let node = super::re_compile("^a{1,5}$").expect("compiles");
         // 3 and 5 a's match; 0 and 6 do not.
-        assert_eq!(super::re_find(&node, &chars("aaa"), 0).unwrap(), Some((0, 3)));
-        assert_eq!(super::re_find(&node, &chars("aaaaa"), 0).unwrap(), Some((0, 5)));
+        assert_eq!(
+            super::re_find(&node, &chars("aaa"), 0).unwrap(),
+            Some((0, 3))
+        );
+        assert_eq!(
+            super::re_find(&node, &chars("aaaaa"), 0).unwrap(),
+            Some((0, 5))
+        );
         assert_eq!(super::re_find(&node, &chars(""), 0).unwrap(), None);
         assert_eq!(super::re_find(&node, &chars("aaaaaa"), 0).unwrap(), None);
 
@@ -2382,7 +2389,10 @@ mod redos_tests {
     #[test]
     fn redos_stray_brace_is_literal() {
         let node = super::re_compile("a{foo").expect("stray brace compiles as literal");
-        assert_eq!(super::re_find(&node, &chars("a{foo"), 0).unwrap(), Some((0, 5)));
+        assert_eq!(
+            super::re_find(&node, &chars("a{foo"), 0).unwrap(),
+            Some((0, 5))
+        );
     }
 
     // A legitimately (but not pathologically) nested pattern still
@@ -2626,13 +2636,13 @@ mod matchall_tests {
         // (text, pattern, PG18 result)
         let cases: &[(&str, &str, bool)] = &[
             // \y — beginning OR end of word.
-            ("foobar", r"\yfoo\y", false),   // foo not at a word edge on the right
-            ("foo bar", r"\yfoo\y", true),   // foo is a whole word
-            ("a.b", r"\ya\y", true),         // '.' is a non-word char → boundaries
+            ("foobar", r"\yfoo\y", false), // foo not at a word edge on the right
+            ("foo bar", r"\yfoo\y", true), // foo is a whole word
+            ("a.b", r"\ya\y", true),       // '.' is a non-word char → boundaries
             ("hello world", r"\yworld\y", true),
-            ("foobar", r"\yfoo", true),      // \y at string start before a word
-            ("foobar", r"bar\y", true),      // \y at string end after a word
-            ("foobar", r"foo\ybar", false),  // o|b both word → no boundary
+            ("foobar", r"\yfoo", true), // \y at string start before a word
+            ("foobar", r"bar\y", true), // \y at string end after a word
+            ("foobar", r"foo\ybar", false), // o|b both word → no boundary
             ("foo_bar", r"foo\ybar", false), // '_' is a word char → no boundary
             // \m — beginning of a word only.
             ("foo bar", r"\mbar", true),
@@ -2641,14 +2651,14 @@ mod matchall_tests {
             ("foo bar", r"foo\M", true),
             ("foobar", r"foo\M", false),
             // \Y — NOT a word boundary.
-            ("foobar", r"oo\Yba", true),     // o|b both word → non-boundary
+            ("foobar", r"oo\Yba", true), // o|b both word → non-boundary
             ("foo bar", r"foo\Y bar", false), // o|space is a boundary → \Y fails
             // \b = backspace char (NOT a word boundary in PG ARE).
             ("foo bar", "foo\\bbar", false), // needs a literal backspace → no match
             ("a\u{08}c", "a\\bc", true),     // backspace present → matches
             // \B = literal backslash (NOT a word boundary in PG ARE).
-            ("foobar", r"foo\Bbar", false),  // needs a literal '\' → no match
-            ("a\\c", r"a\Bc", true),         // literal backslash present → matches
+            ("foobar", r"foo\Bbar", false), // needs a literal '\' → no match
+            ("a\\c", r"a\Bc", true),        // literal backslash present → matches
         ];
         for &(text, pat, expected) in cases {
             assert_eq!(

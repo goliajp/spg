@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -49,7 +51,10 @@ fn to_date_alternate_separators_and_order() {
     );
     // Month name forms.
     assert_eq!(
-        date_days(&first(&mut e, "SELECT to_date('15 Jun 2024', 'DD Mon YYYY')")),
+        date_days(&first(
+            &mut e,
+            "SELECT to_date('15 Jun 2024', 'DD Mon YYYY')"
+        )),
         date_days(&first(&mut e, "SELECT make_date(2024, 6, 15)")),
     );
     assert_eq!(
@@ -65,8 +70,7 @@ fn to_date_alternate_separators_and_order() {
 fn to_timestamp_text_format() {
     let mut e = Engine::new();
     // Epoch anchor: 2000-01-01 00:00:00 = 10957 days * 86400 s.
-    let expect = 10_957i64 * 86_400 * 1_000_000
-        + (13 * 3600 + 30 * 60 + 45) * 1_000_000;
+    let expect = 10_957i64 * 86_400 * 1_000_000 + (13 * 3600 + 30 * 60 + 45) * 1_000_000;
     assert_eq!(
         ts_micros(&first(
             &mut e,
@@ -87,16 +91,19 @@ fn to_timestamp_text_format() {
 #[test]
 fn to_date_out_of_range_errors() {
     let mut e = Engine::new();
-    assert!(e
-        .execute("SELECT to_date('2024-13-01', 'YYYY-MM-DD')")
-        .is_err());
-    assert!(e
-        .execute("SELECT to_date('2024-01-45', 'YYYY-MM-DD')")
-        .is_err());
+    assert!(
+        e.execute("SELECT to_date('2024-13-01', 'YYYY-MM-DD')")
+            .is_err()
+    );
+    assert!(
+        e.execute("SELECT to_date('2024-01-45', 'YYYY-MM-DD')")
+            .is_err()
+    );
     // Non-digits where digits expected.
-    assert!(e
-        .execute("SELECT to_date('abcd-01-01', 'YYYY-MM-DD')")
-        .is_err());
+    assert!(
+        e.execute("SELECT to_date('abcd-01-01', 'YYYY-MM-DD')")
+            .is_err()
+    );
 }
 
 /// U17 (read01 A-group): a 2-digit `YY` year used to be rendered as
@@ -121,7 +128,10 @@ fn to_date_partial_year_pivot_matches_pg18() {
     assert_eq!(d(&mut e, "to_date('970-01-15','YYY-MM-DD')"), "1970-01-15");
     // YYYY: literal, no pivot ('24' → year 24).
     assert_eq!(d(&mut e, "to_date('24-01-15','YYYY-MM-DD')"), "0024-01-15");
-    assert_eq!(d(&mut e, "to_date('2024-01-15','YYYY-MM-DD')"), "2024-01-15");
+    assert_eq!(
+        d(&mut e, "to_date('2024-01-15','YYYY-MM-DD')"),
+        "2024-01-15"
+    );
     // CC: century alone → first year of that century.
     assert_eq!(d(&mut e, "to_date('21-01-15','CC-MM-DD')"), "2001-01-15");
 }

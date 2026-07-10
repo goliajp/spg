@@ -19,15 +19,45 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn infinity_timestamp_and_date() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT ('infinity'::timestamp)::text"), "infinity");
-    assert_eq!(text(&mut e, "SELECT ('-infinity'::timestamp)::text"), "-infinity");
+    assert_eq!(
+        text(&mut e, "SELECT ('infinity'::timestamp)::text"),
+        "infinity"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ('-infinity'::timestamp)::text"),
+        "-infinity"
+    );
     assert_eq!(text(&mut e, "SELECT ('infinity'::date)::text"), "infinity");
-    assert_eq!(text(&mut e, "SELECT ('-infinity'::date)::text"), "-infinity");
+    assert_eq!(
+        text(&mut e, "SELECT ('-infinity'::date)::text"),
+        "-infinity"
+    );
     // Ordering.
-    assert_eq!(text(&mut e, "SELECT 'infinity'::timestamp > '2024-01-01'::timestamp"), "true");
-    assert_eq!(text(&mut e, "SELECT '-infinity'::timestamp < '2024-01-01'::timestamp"), "true");
-    assert_eq!(text(&mut e, "SELECT 'infinity'::date > '2024-01-01'::date"), "true");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT 'infinity'::timestamp > '2024-01-01'::timestamp"
+        ),
+        "true"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT '-infinity'::timestamp < '2024-01-01'::timestamp"
+        ),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT 'infinity'::date > '2024-01-01'::date"),
+        "true"
+    );
     // Finite values unaffected.
-    assert_eq!(text(&mut e, "SELECT ('2024-06-15 12:00:00'::timestamp)::text"), "2024-06-15 12:00:00");
-    assert_eq!(text(&mut e, "SELECT ('2024-06-15'::date)::text"), "2024-06-15");
+    assert_eq!(
+        text(&mut e, "SELECT ('2024-06-15 12:00:00'::timestamp)::text"),
+        "2024-06-15 12:00:00"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ('2024-06-15'::date)::text"),
+        "2024-06-15"
+    );
 }

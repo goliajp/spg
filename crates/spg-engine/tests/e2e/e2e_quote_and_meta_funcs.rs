@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -85,19 +87,31 @@ fn quote_literal_non_text_matches_pg18() {
     // Numbers / bool / temporal — no debug leak.
     assert_eq!(q(&mut e, "SELECT quote_literal(42)"), "'42'");
     assert_eq!(q(&mut e, "SELECT quote_literal(3.14)"), "'3.14'");
-    assert_eq!(q(&mut e, "SELECT quote_literal(12345678901234::bigint)"), "'12345678901234'");
+    assert_eq!(
+        q(&mut e, "SELECT quote_literal(12345678901234::bigint)"),
+        "'12345678901234'"
+    );
     assert_eq!(q(&mut e, "SELECT quote_literal(1.5::numeric)"), "'1.5'");
     // bool renders as the ::text cast (true/false), not the t/f wire form.
     assert_eq!(q(&mut e, "SELECT quote_literal(true)"), "'true'");
     assert_eq!(q(&mut e, "SELECT quote_literal(false)"), "'false'");
-    assert_eq!(q(&mut e, "SELECT quote_literal(DATE '2024-01-15')"), "'2024-01-15'");
     assert_eq!(
-        q(&mut e, "SELECT quote_literal(TIMESTAMP '2024-01-15 10:30:00')"),
+        q(&mut e, "SELECT quote_literal(DATE '2024-01-15')"),
+        "'2024-01-15'"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT quote_literal(TIMESTAMP '2024-01-15 10:30:00')"
+        ),
         "'2024-01-15 10:30:00'"
     );
     // Backslash triggers PG's E'…' escape-string form (both text and
     // non-text inputs). PG18: quote_literal('c:\p') = E'c:\\p'.
-    assert_eq!(q(&mut e, "SELECT quote_literal('c:\\path')"), "E'c:\\\\path'");
+    assert_eq!(
+        q(&mut e, "SELECT quote_literal('c:\\path')"),
+        "E'c:\\\\path'"
+    );
     assert_eq!(q(&mut e, "SELECT quote_literal('a\\b''c')"), "E'a\\\\b''c'");
     // Embedded quote still doubled without backslash.
     assert_eq!(q(&mut e, "SELECT quote_literal('a''b')"), "'a''b'");

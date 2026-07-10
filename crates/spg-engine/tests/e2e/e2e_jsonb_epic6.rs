@@ -272,7 +272,10 @@ fn key_exists_array_element_as_string() {
 #[test]
 fn keys_any_with_text_array() {
     let mut e = Engine::new();
-    let v = one_value(&mut e, r#"SELECT '{"a": 1, "b": 2}'::jsonb ?| ARRAY['z','b']"#);
+    let v = one_value(
+        &mut e,
+        r#"SELECT '{"a": 1, "b": 2}'::jsonb ?| ARRAY['z','b']"#,
+    );
     assert_eq!(v, Value::Bool(true));
     let v = one_value(&mut e, r#"SELECT '{"a": 1}'::jsonb ?| ARRAY['x','y','z']"#);
     assert_eq!(v, Value::Bool(false));
@@ -286,6 +289,9 @@ fn keys_all_with_text_array() {
         r#"SELECT '{"a":1,"b":2,"c":3}'::jsonb ?& ARRAY['a','b']"#,
     );
     assert_eq!(v, Value::Bool(true));
-    let v = one_value(&mut e, r#"SELECT '{"a": 1, "b": 2}'::jsonb ?& ARRAY['a','c']"#);
+    let v = one_value(
+        &mut e,
+        r#"SELECT '{"a": 1, "b": 2}'::jsonb ?& ARRAY['a','c']"#,
+    );
     assert_eq!(v, Value::Bool(false));
 }

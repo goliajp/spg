@@ -8,7 +8,8 @@ use spg_engine::Engine;
 #[test]
 fn fk_match_full() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p(a int, b int, PRIMARY KEY(a,b))").unwrap();
+    e.execute("CREATE TABLE p(a int, b int, PRIMARY KEY(a,b))")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1,2)").unwrap();
     e.execute("CREATE TABLE cf(x int, y int, FOREIGN KEY(x,y) REFERENCES p(a,b) MATCH FULL)")
         .unwrap();
@@ -25,7 +26,10 @@ fn fk_match_full() {
     e.execute("INSERT INTO cs VALUES (1, NULL)").unwrap();
 
     // MATCH PARTIAL is rejected at parse time (PG does not implement it either).
-    assert!(e
-        .execute("CREATE TABLE cp(x int, y int, FOREIGN KEY(x,y) REFERENCES p(a,b) MATCH PARTIAL)")
-        .is_err());
+    assert!(
+        e.execute(
+            "CREATE TABLE cp(x int, y int, FOREIGN KEY(x,y) REFERENCES p(a,b) MATCH PARTIAL)"
+        )
+        .is_err()
+    );
 }

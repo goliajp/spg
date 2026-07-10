@@ -85,9 +85,15 @@ fn matches_groups_and_sibling_broadcast() {
     );
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("x".into()));
-    assert_eq!(unwrap_text_array(&r[0][1]), vec![Some("a".into()), Some("1".into())]);
+    assert_eq!(
+        unwrap_text_array(&r[0][1]),
+        vec![Some("a".into()), Some("1".into())]
+    );
     assert_eq!(r[1][0], Value::Text("x".into()));
-    assert_eq!(unwrap_text_array(&r[1][1]), vec![Some("b".into()), Some("2".into())]);
+    assert_eq!(
+        unwrap_text_array(&r[1][1]),
+        vec![Some("b".into()), Some("2".into())]
+    );
 }
 
 // ── regexp_replace ─────────────────────────────────────────────────
@@ -234,18 +240,34 @@ fn from_regexp_matches_is_a_row_source() {
     let r = e
         .execute(r"SELECT * FROM regexp_matches('a1b2', '(\w)(\d)', 'g')")
         .unwrap();
-    let QueryResult::Rows { columns, rows: got_rows } = r else {
+    let QueryResult::Rows {
+        columns,
+        rows: got_rows,
+    } = r
+    else {
         panic!("rows")
     };
     assert_eq!(columns[0].name, "regexp_matches");
     assert_eq!(got_rows.len(), 2);
-    assert_eq!(unwrap_text_array(&got_rows[0].values[0]), vec![Some("a".into()), Some("1".into())]);
-    assert_eq!(unwrap_text_array(&got_rows[1].values[0]), vec![Some("b".into()), Some("2".into())]);
+    assert_eq!(
+        unwrap_text_array(&got_rows[0].values[0]),
+        vec![Some("a".into()), Some("1".into())]
+    );
+    assert_eq!(
+        unwrap_text_array(&got_rows[1].values[0]),
+        vec![Some("b".into()), Some("2".into())]
+    );
 
     // No `g` flag → the single first match.
-    let r = rows(e.execute(r"SELECT * FROM regexp_matches('abc', '(a)(b)')").unwrap());
+    let r = rows(
+        e.execute(r"SELECT * FROM regexp_matches('abc', '(a)(b)')")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
-    assert_eq!(unwrap_text_array(&r[0][0]), vec![Some("a".into()), Some("b".into())]);
+    assert_eq!(
+        unwrap_text_array(&r[0][0]),
+        vec![Some("a".into()), Some("b".into())]
+    );
 
     // Column alias + subscript access to the groups.
     let r = rows(
@@ -258,6 +280,9 @@ fn from_regexp_matches_is_a_row_source() {
     assert_eq!(r[1][0], Value::Text("b".into()));
 
     // count(*) composes.
-    let r = rows(e.execute(r"SELECT count(*) FROM regexp_matches('a1b2', '(\w)(\d)', 'g')").unwrap());
+    let r = rows(
+        e.execute(r"SELECT count(*) FROM regexp_matches('a1b2', '(\w)(\d)', 'g')")
+            .unwrap(),
+    );
     assert!(matches!(r[0][0], Value::Int(2) | Value::BigInt(2)));
 }

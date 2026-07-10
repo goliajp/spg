@@ -831,10 +831,7 @@ pub enum AlterTableTarget {
     /// <expr>`. Engine re-parses + freezes the literal at this point,
     /// matching CREATE TABLE-side default semantics. Volatile shapes
     /// (`now()` / `nextval`) take the runtime-default path.
-    AlterColumnSetDefault {
-        column: String,
-        default_expr: Expr,
-    },
+    AlterColumnSetDefault { column: String, default_expr: Expr },
     /// v7.37.18 (18.1) — `ALTER TABLE … ALTER COLUMN col DROP DEFAULT`.
     AlterColumnDropDefault { column: String },
     /// v7.37.18 (18.2) — `ALTER TABLE … ALTER COLUMN col SET NOT NULL`.
@@ -2894,8 +2891,16 @@ pub enum FrameBound {
     /// DATE / TIMESTAMP ORDER BY column (PG time-series windows). The
     /// interval is folded to its (months, days, micros) components at
     /// parse time.
-    IntervalPreceding { months: i32, days: i32, micros: i64 },
-    IntervalFollowing { months: i32, days: i32, micros: i64 },
+    IntervalPreceding {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
+    IntervalFollowing {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
 }
 
 impl fmt::Display for FrameBound {
@@ -3338,7 +3343,11 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
-            Self::CopyTo { table, columns, options } => {
+            Self::CopyTo {
+                table,
+                columns,
+                options,
+            } => {
                 write!(f, "COPY {table}")?;
                 if let Some(cols) = columns {
                     write!(f, " ({})", cols.join(", "))?;
@@ -3714,7 +3723,11 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "'{label}'")?;
                 if let Some((is_before, anchor)) = position {
-                    write!(f, " {} '{anchor}'", if *is_before { "BEFORE" } else { "AFTER" })?;
+                    write!(
+                        f,
+                        " {} '{anchor}'",
+                        if *is_before { "BEFORE" } else { "AFTER" }
+                    )?;
                 }
                 Ok(())
             }
@@ -4526,7 +4539,11 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             )
         }
         AlterTableTarget::AlterColumnSetExpression { column, expr } => {
-            write!(f, "ALTER COLUMN {} SET EXPRESSION AS ({expr})", quote_ident(column))
+            write!(
+                f,
+                "ALTER COLUMN {} SET EXPRESSION AS ({expr})",
+                quote_ident(column)
+            )
         }
     }
 }
@@ -5413,7 +5430,10 @@ pub fn render_exact_decimal(unscaled: i128, scale: u8) -> alloc::string::String 
     let digits = alloc::format!("{}", unscaled.unsigned_abs());
     let scale = scale as usize;
     let (int_part, frac_part) = if digits.len() > scale {
-        (digits[..digits.len() - scale].to_string(), digits[digits.len() - scale..].to_string())
+        (
+            digits[..digits.len() - scale].to_string(),
+            digits[digits.len() - scale..].to_string(),
+        )
     } else {
         ("0".to_string(), alloc::format!("{digits:0>scale$}"))
     };

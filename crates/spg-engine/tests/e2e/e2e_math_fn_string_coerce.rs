@@ -15,13 +15,48 @@ fn one(e: &mut Engine, sql: &str) -> Value<'static> {
 #[test]
 fn math_functions_coerce_string_argument() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT abs('-7')"), Value::Numeric { scaled: 7, scale: 0 , kind: spg_storage::NumericKind::Finite });
+    assert_eq!(
+        one(&mut e, "SELECT abs('-7')"),
+        Value::Numeric {
+            scaled: 7,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
     assert_eq!(one(&mut e, "SELECT sqrt('16')"), Value::Float(4.0));
     assert_eq!(one(&mut e, "SELECT cbrt('27')"), Value::Float(3.0));
-    assert_eq!(one(&mut e, "SELECT sign('-5')"), Value::Numeric { scaled: -1, scale: 0 , kind: spg_storage::NumericKind::Finite });
-    assert_eq!(one(&mut e, "SELECT ceil('3.2')"), Value::Numeric { scaled: 4, scale: 0 , kind: spg_storage::NumericKind::Finite });
-    assert_eq!(one(&mut e, "SELECT floor('3.8')"), Value::Numeric { scaled: 3, scale: 0 , kind: spg_storage::NumericKind::Finite });
-    assert_eq!(one(&mut e, "SELECT round('3.567', 2)"), Value::Numeric { scaled: 357, scale: 2 , kind: spg_storage::NumericKind::Finite });
+    assert_eq!(
+        one(&mut e, "SELECT sign('-5')"),
+        Value::Numeric {
+            scaled: -1,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
+    assert_eq!(
+        one(&mut e, "SELECT ceil('3.2')"),
+        Value::Numeric {
+            scaled: 4,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
+    assert_eq!(
+        one(&mut e, "SELECT floor('3.8')"),
+        Value::Numeric {
+            scaled: 3,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
+    assert_eq!(
+        one(&mut e, "SELECT round('3.567', 2)"),
+        Value::Numeric {
+            scaled: 357,
+            scale: 2,
+            kind: spg_storage::NumericKind::Finite
+        }
+    );
 }
 
 #[test]

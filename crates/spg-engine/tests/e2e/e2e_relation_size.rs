@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -23,25 +25,17 @@ fn relation_size_grows_with_rows() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE sz (id INT, body TEXT)").unwrap();
     let empty = bigint(&first(&mut e, "SELECT pg_relation_size('sz')"));
-    e.execute(
-        "INSERT INTO sz SELECT g, repeat('x', 100) FROM generate_series(1, 50) g",
-    )
-    .unwrap();
+    e.execute("INSERT INTO sz SELECT g, repeat('x', 100) FROM generate_series(1, 50) g")
+        .unwrap();
     let filled = bigint(&first(&mut e, "SELECT pg_relation_size('sz')"));
     assert!(
         filled > empty && filled > 1000,
         "size should grow: empty={empty}, filled={filled}"
     );
     // pg_table_size is the same heap meter.
-    assert_eq!(
-        filled,
-        bigint(&first(&mut e, "SELECT pg_table_size('sz')"))
-    );
+    assert_eq!(filled, bigint(&first(&mut e, "SELECT pg_table_size('sz')")));
     // total = heap + indexes ≥ heap.
-    let total = bigint(&first(
-        &mut e,
-        "SELECT pg_total_relation_size('sz')",
-    ));
+    let total = bigint(&first(&mut e, "SELECT pg_total_relation_size('sz')"));
     assert!(total >= filled);
 }
 

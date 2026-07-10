@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -24,7 +26,10 @@ fn trim_from_forms() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT trim(BOTH 'x' FROM 'xxaxx')"), "a");
     assert_eq!(text(&mut e, "SELECT trim(LEADING 'x' FROM 'xxaxx')"), "axx");
-    assert_eq!(text(&mut e, "SELECT trim(TRAILING 'x' FROM 'xxaxx')"), "xxa");
+    assert_eq!(
+        text(&mut e, "SELECT trim(TRAILING 'x' FROM 'xxaxx')"),
+        "xxa"
+    );
     // Keyword-less chars form + bare FROM (whitespace default).
     assert_eq!(text(&mut e, "SELECT trim('x' FROM 'xxaxx')"), "a");
     assert_eq!(text(&mut e, "SELECT trim(BOTH FROM '  a  ')"), "a");

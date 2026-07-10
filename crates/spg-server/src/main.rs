@@ -704,17 +704,11 @@ fn env_resolve(env_key: &str) -> Option<String> {
         // ms. PG operators converting will write a milliseconds
         // value here, matching the existing semantics; the GUC name
         // just makes the per-database scrape script obvious.
-        (
-            "SPG_AUTOVACUUM_NAPTIME",
-            "SPG_AUTO_ANALYZE_INTERVAL_MS",
-        ),
+        ("SPG_AUTOVACUUM_NAPTIME", "SPG_AUTO_ANALYZE_INTERVAL_MS"),
         // PG's log_min_duration_statement is the ms threshold below
         // which queries are not logged. SPG's existing name spells
         // the same semantics with a different label.
-        (
-            "SPG_LOG_MIN_DURATION",
-            "SPG_SLOW_QUERY_THRESHOLD_MS",
-        ),
+        ("SPG_LOG_MIN_DURATION", "SPG_SLOW_QUERY_THRESHOLD_MS"),
     ];
     // Prefer the PG-spelled alias when its mapping owns this key.
     for (pg_name, spg_name) in ALIASES {

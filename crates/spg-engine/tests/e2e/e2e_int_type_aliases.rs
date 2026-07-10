@@ -16,16 +16,27 @@ fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 fn int2_int4_int8_are_column_types() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(a int2, b int4, c int8)").unwrap();
-    e.execute("INSERT INTO t VALUES (5, 100000, 9999999999)").unwrap();
+    e.execute("INSERT INTO t VALUES (5, 100000, 9999999999)")
+        .unwrap();
     // Each maps to the right width.
-    assert_eq!(one(&mut e, "SELECT a FROM t"), spg_storage::Value::SmallInt(5));
-    assert_eq!(one(&mut e, "SELECT b FROM t"), spg_storage::Value::Int(100000));
+    assert_eq!(
+        one(&mut e, "SELECT a FROM t"),
+        spg_storage::Value::SmallInt(5)
+    );
+    assert_eq!(
+        one(&mut e, "SELECT b FROM t"),
+        spg_storage::Value::Int(100000)
+    );
     assert_eq!(
         one(&mut e, "SELECT c FROM t"),
         spg_storage::Value::BigInt(9999999999)
     );
     // Interchangeable with the standard names.
-    e.execute("CREATE TABLE u(a smallint, b int, c bigint)").unwrap();
+    e.execute("CREATE TABLE u(a smallint, b int, c bigint)")
+        .unwrap();
     e.execute("INSERT INTO u SELECT a, b, c FROM t").unwrap();
-    assert_eq!(one(&mut e, "SELECT c FROM u"), spg_storage::Value::BigInt(9999999999));
+    assert_eq!(
+        one(&mut e, "SELECT c FROM u"),
+        spg_storage::Value::BigInt(9999999999)
+    );
 }

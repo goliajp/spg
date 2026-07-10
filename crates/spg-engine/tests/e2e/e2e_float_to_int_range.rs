@@ -23,6 +23,12 @@ fn float_to_int_rejects_nonfinite_and_overflow() {
         }
     };
     assert_eq!(cell(&mut e, "SELECT 3.7::float8::int"), "Int(4)");
-    assert_eq!(cell(&mut e, "SELECT (-42.3)::float8::bigint"), "BigInt(-42)");
-    assert_eq!(cell(&mut e, "SELECT 2147483647.0::float8::int"), "Int(2147483647)");
+    assert_eq!(
+        cell(&mut e, "SELECT (-42.3)::float8::bigint"),
+        "BigInt(-42)"
+    );
+    assert_eq!(
+        cell(&mut e, "SELECT 2147483647.0::float8::int"),
+        "Int(2147483647)"
+    );
 }

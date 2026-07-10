@@ -66,7 +66,11 @@ pub(crate) fn numeric_to_text(scaled: i128, scale: u8) -> String {
 /// `types/text.rs` falls through to this helper.
 pub(crate) fn try_numeric_as_string(value: &EngineValue) -> Option<String> {
     match value {
-        EngineValue::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite } => Some(numeric_to_text(*scaled, *scale)),
+        EngineValue::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        } => Some(numeric_to_text(*scaled, *scale)),
         _ => None,
     }
 }
@@ -106,7 +110,11 @@ mod bd {
         ) -> Result<IsNull, BoxDynError> {
             let (scaled, scale) = bigdecimal_to_scaled(self)?;
             buf.push(SpgArgumentValue {
-                value: EngineValue::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite },
+                value: EngineValue::Numeric {
+                    scaled,
+                    scale,
+                    kind: spg_storage::NumericKind::Finite,
+                },
                 type_info: Some(SpgTypeInfo::of(Kind::Numeric)),
                 _phantom: core::marker::PhantomData,
             });
@@ -117,7 +125,11 @@ mod bd {
     impl<'r> Decode<'r, Spg> for BigDecimal {
         fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
             match value.engine() {
-                EngineValue::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite } => Ok(scaled_to_bigdecimal(*scaled, *scale)),
+                EngineValue::Numeric {
+                    scaled,
+                    scale,
+                    kind: spg_storage::NumericKind::Finite,
+                } => Ok(scaled_to_bigdecimal(*scaled, *scale)),
                 // Generous coerce: small ints are valid NUMERICs
                 // too. Mirrors what PG would do on the wire when
                 // a column is widened.

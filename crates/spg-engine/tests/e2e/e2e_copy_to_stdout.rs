@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn lines(e: &mut Engine, sql: &str) -> Vec<String> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, columns } = r else {
         panic!("expected Rows");
     };
@@ -118,7 +120,10 @@ fn copy_csv_delimiter_and_null() {
 #[test]
 fn copy_csv_custom_quote() {
     let mut e = csv_fixture();
-    let got = lines(&mut e, "COPY ct (a, b) TO STDOUT WITH (FORMAT csv, QUOTE '#')");
+    let got = lines(
+        &mut e,
+        "COPY ct (a, b) TO STDOUT WITH (FORMAT csv, QUOTE '#')",
+    );
     assert_eq!(got, ["1,#he,llo#", "2,#line\nbreak#", "3,plain"]);
 }
 
@@ -137,7 +142,10 @@ fn copy_text_custom_delimiter_escapes() {
     e.execute("CREATE TABLE ctd (a INT, b TEXT)").unwrap();
     e.execute("INSERT INTO ctd VALUES (1, 'a|b')").unwrap();
     // A literal delimiter char in the data is backslash-escaped.
-    let got = lines(&mut e, "COPY ctd TO STDOUT WITH (FORMAT text, DELIMITER '|')");
+    let got = lines(
+        &mut e,
+        "COPY ctd TO STDOUT WITH (FORMAT text, DELIMITER '|')",
+    );
     assert_eq!(got, ["1|a\\|b"]);
 }
 

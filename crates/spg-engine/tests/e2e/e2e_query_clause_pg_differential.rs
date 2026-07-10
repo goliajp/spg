@@ -95,7 +95,10 @@ fn cell(eng: &mut Engine, sql: &str) -> String {
 
 fn ck(eng: &mut Engine, sql: &str, want: &str) {
     let got = cell(eng, sql);
-    assert_eq!(got, want, "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}");
+    assert_eq!(
+        got, want,
+        "\n  SQL:  {sql}\n  want(PG18): {want}\n  got(SPG):   {got}"
+    );
 }
 
 fn seed() -> Engine {
@@ -127,25 +130,89 @@ fn seed() -> Engine {
 fn order_by_nulls_default_and_keys() {
     let mut e = seed();
     // ASC default -> NULLS LAST; DESC default -> NULLS FIRST.
-    ck(&mut e, "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a", "1|1|2|3|3|<NULL>|<NULL>");
-    ck(&mut e, "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a DESC", "<NULL>|<NULL>|3|3|2|1|1");
-    ck(&mut e, "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a ASC NULLS FIRST", "<NULL>|<NULL>|1|1|2|3|3");
-    ck(&mut e, "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a DESC NULLS LAST", "3|3|2|1|1|<NULL>|<NULL>");
-    ck(&mut e, "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s", "apple|apple|banana|banana|cherry|date|<NULL>");
-    ck(&mut e, "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s DESC", "<NULL>|date|cherry|banana|banana|apple|apple");
-    ck(&mut e, "SELECT coalesce(d::text,'<NULL>') FROM t ORDER BY d", "2018-03-03|2019-12-31|2020-01-01|2020-01-01|2020-01-01|2021-06-15|<NULL>");
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a",
+        "1|1|2|3|3|<NULL>|<NULL>",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a DESC",
+        "<NULL>|<NULL>|3|3|2|1|1",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a ASC NULLS FIRST",
+        "<NULL>|<NULL>|1|1|2|3|3",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a DESC NULLS LAST",
+        "3|3|2|1|1|<NULL>|<NULL>",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s",
+        "apple|apple|banana|banana|cherry|date|<NULL>",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s DESC",
+        "<NULL>|date|cherry|banana|banana|apple|apple",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(d::text,'<NULL>') FROM t ORDER BY d",
+        "2018-03-03|2019-12-31|2020-01-01|2020-01-01|2020-01-01|2021-06-15|<NULL>",
+    );
     // numeric ordering (render id to isolate order from numeric text-repr)
-    ck(&mut e, "SELECT id FROM t ORDER BY n ASC, id", "1|6|3|7|2|5|4");
-    ck(&mut e, "SELECT id FROM t ORDER BY n DESC, id", "4|5|2|3|7|1|6");
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY n ASC, id",
+        "1|6|3|7|2|5|4",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY n DESC, id",
+        "4|5|2|3|7|1|6",
+    );
     // multi-key: a ASC (NULLS LAST), b DESC (NULLS FIRST), id
-    ck(&mut e, "SELECT id FROM t ORDER BY a ASC, b DESC, id", "4|2|5|1|6|7|3");
-    ck(&mut e, "SELECT coalesce((a+b)::text,'<NULL>') FROM t ORDER BY a+b", "3|4|4|5|<NULL>|<NULL>|<NULL>");
-    ck(&mut e, "SELECT id FROM t ORDER BY length(s) ASC, id", "7|2|4|1|3|6|5");
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY a ASC, b DESC, id",
+        "4|2|5|1|6|7|3",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce((a+b)::text,'<NULL>') FROM t ORDER BY a+b",
+        "3|4|4|5|<NULL>|<NULL>|<NULL>",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY length(s) ASC, id",
+        "7|2|4|1|3|6|5",
+    );
     // positional & alias resolve to column a
-    ck(&mut e, "SELECT a, id FROM t ORDER BY 1, id", "2|4|5|1|6|3|7");
-    ck(&mut e, "SELECT a AS aa, id FROM t ORDER BY aa, id", "2|4|5|1|6|3|7");
-    ck(&mut e, "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a ASC NULLS FIRST", "<NULL>|<NULL>|1|1|2|3|3");
-    ck(&mut e, "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s DESC NULLS LAST", "date|cherry|banana|banana|apple|apple|<NULL>");
+    ck(
+        &mut e,
+        "SELECT a, id FROM t ORDER BY 1, id",
+        "2|4|5|1|6|3|7",
+    );
+    ck(
+        &mut e,
+        "SELECT a AS aa, id FROM t ORDER BY aa, id",
+        "2|4|5|1|6|3|7",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'<NULL>') FROM t ORDER BY a ASC NULLS FIRST",
+        "<NULL>|<NULL>|1|1|2|3|3",
+    );
+    ck(
+        &mut e,
+        "SELECT coalesce(s,'<NULL>') FROM t ORDER BY s DESC NULLS LAST",
+        "date|cherry|banana|banana|apple|apple|<NULL>",
+    );
     // positional out of range: PG errors ("ORDER BY position 5 is not in
     // select list"); SPG silently leaves the constant literal as the sort
     // key, so every row ties and the ORDER BY term is dropped (rows come
@@ -154,7 +221,11 @@ fn order_by_nulls_default_and_keys() {
     // a Result through several currently-infallible pre-pass call sites,
     // so it is out of scope for this localized clause fix. Asserted
     // against SPG's current behaviour to lock it.
-    ck(&mut e, "SELECT a FROM t ORDER BY 5", "3|1|<NULL>|1|2|3|<NULL>");
+    ck(
+        &mut e,
+        "SELECT a FROM t ORDER BY 5",
+        "3|1|<NULL>|1|2|3|<NULL>",
+    );
 }
 
 /// v7.37.16 — full-precision TEXT ORDER BY. The old f64 coarse key
@@ -175,55 +246,109 @@ fn order_by_text_full_precision() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ord (id int, txt text)").unwrap();
     for row in [
-        "(1,'product_001')", "(2,'product_010')", "(3,'product_002')",
-        "(4,'product_012')", "(5,'product_009')", "(6,'2024-01-15T10:30:09')",
-        "(7,'2024-01-15T10:30:01')", "(8,'2024-01-15T10:30:15')", "(9,'aaaaaaaaY')",
-        "(10,'aaaaaaaaX')", "(11,'aaaaaaaaX2')", "(12,'apple')", "(13,'app')",
-        "(14,NULL)", "(15,'Zebra')", "(16,'café')", "(17,'cafe')", "(18,'caff')",
+        "(1,'product_001')",
+        "(2,'product_010')",
+        "(3,'product_002')",
+        "(4,'product_012')",
+        "(5,'product_009')",
+        "(6,'2024-01-15T10:30:09')",
+        "(7,'2024-01-15T10:30:01')",
+        "(8,'2024-01-15T10:30:15')",
+        "(9,'aaaaaaaaY')",
+        "(10,'aaaaaaaaX')",
+        "(11,'aaaaaaaaX2')",
+        "(12,'apple')",
+        "(13,'app')",
+        "(14,NULL)",
+        "(15,'Zebra')",
+        "(16,'café')",
+        "(17,'cafe')",
+        "(18,'caff')",
     ] {
-        e.execute(&format!("INSERT INTO ord (id,txt) VALUES {row}")).unwrap();
+        e.execute(&format!("INSERT INTO ord (id,txt) VALUES {row}"))
+            .unwrap();
     }
     // Full corpus, ASC (default NULLS LAST). The long-common-prefix
     // groups order correctly: product_001<_002<_009<_010<_012 (1,3,5,2,4),
     // aaaaaaaaX<aaaaaaaaX2<aaaaaaaaY (10,11,9), cafe<caff<café (17,18,16,
     // 'é'=0xC3 sorts after 'f'=0x66), app<apple (13,12), 2024…01<09<15.
-    ck(&mut e, "SELECT id FROM ord ORDER BY txt ASC, id",
-        "7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4|14");
+    ck(
+        &mut e,
+        "SELECT id FROM ord ORDER BY txt ASC, id",
+        "7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4|14",
+    );
     // DESC (default NULLS FIRST).
-    ck(&mut e, "SELECT id FROM ord ORDER BY txt DESC, id",
-        "14|4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7");
+    ck(
+        &mut e,
+        "SELECT id FROM ord ORDER BY txt DESC, id",
+        "14|4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7",
+    );
     // product_* subset — the canonical long-common-prefix case the old
     // ~6-byte f64 key tied on (all share the 8-byte prefix "product_").
-    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'product%' ORDER BY txt ASC, id",
-        "1|3|5|2|4");
+    ck(
+        &mut e,
+        "SELECT id FROM ord WHERE txt LIKE 'product%' ORDER BY txt ASC, id",
+        "1|3|5|2|4",
+    );
     // ISO timestamps stored as text (19-byte common-prefix-heavy).
-    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE '2024-%' ORDER BY txt ASC, id",
-        "7|6|8");
+    ck(
+        &mut e,
+        "SELECT id FROM ord WHERE txt LIKE '2024-%' ORDER BY txt ASC, id",
+        "7|6|8",
+    );
     // >8-byte common prefix — beyond the entire old 8-byte f64 window.
-    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'aaaaaaaa%' ORDER BY txt ASC, id",
-        "10|11|9");
+    ck(
+        &mut e,
+        "SELECT id FROM ord WHERE txt LIKE 'aaaaaaaa%' ORDER BY txt ASC, id",
+        "10|11|9",
+    );
     // multibyte / unicode tail (café vs cafe/caff).
-    ck(&mut e, "SELECT id FROM ord WHERE txt LIKE 'caf%' ORDER BY txt ASC, id",
-        "17|18|16");
+    ck(
+        &mut e,
+        "SELECT id FROM ord WHERE txt LIKE 'caf%' ORDER BY txt ASC, id",
+        "17|18|16",
+    );
     // Full corpus, explicit ASC NULLS FIRST.
-    ck(&mut e, "SELECT id FROM ord ORDER BY txt ASC NULLS FIRST, id",
-        "14|7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4");
+    ck(
+        &mut e,
+        "SELECT id FROM ord ORDER BY txt ASC NULLS FIRST, id",
+        "14|7|6|8|15|10|11|9|13|12|17|18|16|1|3|5|2|4",
+    );
     // Full corpus, explicit DESC NULLS LAST.
-    ck(&mut e, "SELECT id FROM ord ORDER BY txt DESC NULLS LAST, id",
-        "4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7|14");
+    ck(
+        &mut e,
+        "SELECT id FROM ord ORDER BY txt DESC NULLS LAST, id",
+        "4|2|5|3|1|16|18|17|12|13|9|11|10|15|8|6|7|14",
+    );
 }
 
 #[test]
 fn group_by_semantics() {
     let mut e = seed();
     // NULL forms ONE group (a NULL:2). ASC -> NULLS LAST.
-    ck(&mut e, "SELECT coalesce(a::text,'NULL')||':'||count(*)::text FROM t GROUP BY a ORDER BY a", "1:2|2:1|3:2|NULL:2");
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'NULL')||':'||count(*)::text FROM t GROUP BY a ORDER BY a",
+        "1:2|2:1|3:2|NULL:2",
+    );
     // GROUP BY expression / positional
-    ck(&mut e, "SELECT (id%2)::text||':'||count(*)::text FROM t GROUP BY id%2 ORDER BY id%2", "0:3|1:4");
+    ck(
+        &mut e,
+        "SELECT (id%2)::text||':'||count(*)::text FROM t GROUP BY id%2 ORDER BY id%2",
+        "0:3|1:4",
+    );
     // positional GROUP BY 1 -> col 1 = s (render per-group counts, ordered by s ASC NULLS LAST)
-    ck(&mut e, "SELECT s, count(*) FROM t GROUP BY 1 ORDER BY 1", "2|2|1|1|1");
+    ck(
+        &mut e,
+        "SELECT s, count(*) FROM t GROUP BY 1 ORDER BY 1",
+        "2|2|1|1|1",
+    );
     // multi-key
-    ck(&mut e, "SELECT coalesce(a::text,'N')||','||coalesce(b::text,'N')||':'||count(*)::text FROM t GROUP BY a,b ORDER BY a, b", "1,2:1|1,N:1|2,3:1|3,1:2|N,2:1|N,5:1");
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'N')||','||coalesce(b::text,'N')||':'||count(*)::text FROM t GROUP BY a,b ORDER BY a, b",
+        "1,2:1|1,N:1|2,3:1|3,1:2|N,2:1|N,5:1",
+    );
     // GROUP BY constant expression -> one group
     ck(&mut e, "SELECT count(*) FROM t GROUP BY (id-id)", "7");
     // GROUP BY bare non-integer constant: PG rejects it ("non-integer
@@ -233,10 +358,22 @@ fn group_by_semantics() {
     // SPG's current behaviour (one group -> 7) to lock it.
     ck(&mut e, "SELECT count(*) FROM t GROUP BY true", "7");
     // COUNT(*) vs COUNT(col): NULLs not counted
-    ck(&mut e, "SELECT count(*)::text||'/'||count(a)::text||'/'||count(s)::text FROM t", "7/5/6");
-    ck(&mut e, "SELECT count(distinct a)::text||'/'||count(distinct n)::text FROM t", "3/4");
+    ck(
+        &mut e,
+        "SELECT count(*)::text||'/'||count(a)::text||'/'||count(s)::text FROM t",
+        "7/5/6",
+    );
+    ck(
+        &mut e,
+        "SELECT count(distinct a)::text||'/'||count(distinct n)::text FROM t",
+        "3/4",
+    );
     // grouping column not in select -> render per-group counts
-    ck(&mut e, "SELECT count(*) FROM t GROUP BY a ORDER BY a", "2|1|2|2");
+    ck(
+        &mut e,
+        "SELECT count(*) FROM t GROUP BY a ORDER BY a",
+        "2|1|2|2",
+    );
     // empty-table GROUP BY -> no rows; bare aggregate -> one row (0)
     ck(&mut e, "SELECT count(*) FROM e GROUP BY a", "<NOROWS>");
     ck(&mut e, "SELECT count(*) FROM e", "0");
@@ -245,37 +382,89 @@ fn group_by_semantics() {
 #[test]
 fn having_semantics() {
     let mut e = seed();
-    ck(&mut e, "SELECT coalesce(a::text,'NULL')||':'||count(*)::text FROM t GROUP BY a HAVING count(*)>1 ORDER BY a", "1:2|3:2|NULL:2");
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'NULL')||':'||count(*)::text FROM t GROUP BY a HAVING count(*)>1 ORDER BY a",
+        "1:2|3:2|NULL:2",
+    );
     // HAVING without GROUP BY = whole-table aggregate gate
-    ck(&mut e, "SELECT count(*) FROM t HAVING count(*)>100", "<NOROWS>");
+    ck(
+        &mut e,
+        "SELECT count(*) FROM t HAVING count(*)>100",
+        "<NOROWS>",
+    );
     ck(&mut e, "SELECT count(*) FROM t HAVING count(*)>1", "7");
     // HAVING referencing an aggregate NOT in the select list
-    ck(&mut e, "SELECT coalesce(a::text,'NULL') FROM t GROUP BY a HAVING sum(b)>3 ORDER BY a", "NULL");
+    ck(
+        &mut e,
+        "SELECT coalesce(a::text,'NULL') FROM t GROUP BY a HAVING sum(b)>3 ORDER BY a",
+        "NULL",
+    );
 }
 
 #[test]
 fn distinct_semantics() {
     let mut e = seed();
     // DISTINCT collapses the two NULL a's into one; ASC -> NULLS LAST
-    ck(&mut e, "SELECT DISTINCT a FROM t ORDER BY a", "1|2|3|<NULL>");
+    ck(
+        &mut e,
+        "SELECT DISTINCT a FROM t ORDER BY a",
+        "1|2|3|<NULL>",
+    );
     // multi-col DISTINCT: two NULLs equal for dedup
-    ck(&mut e, "SELECT DISTINCT coalesce(a::text,'N')||','||coalesce(b::text,'N') AS r FROM t ORDER BY r", "1,2|1,N|2,3|3,1|N,2|N,5");
+    ck(
+        &mut e,
+        "SELECT DISTINCT coalesce(a::text,'N')||','||coalesce(b::text,'N') AS r FROM t ORDER BY r",
+        "1,2|1,N|2,3|3,1|N,2|N,5",
+    );
     // DISTINCT on expression
-    ck(&mut e, "SELECT DISTINCT (id%2) AS r FROM t ORDER BY r", "0|1");
+    ck(
+        &mut e,
+        "SELECT DISTINCT (id%2) AS r FROM t ORDER BY r",
+        "0|1",
+    );
     // DISTINCT + ORDER BY DESC -> NULLS FIRST
-    ck(&mut e, "SELECT DISTINCT a FROM t ORDER BY a DESC", "<NULL>|3|2|1");
+    ck(
+        &mut e,
+        "SELECT DISTINCT a FROM t ORDER BY a DESC",
+        "<NULL>|3|2|1",
+    );
 }
 
 #[test]
 fn limit_offset_semantics() {
     let mut e = seed();
     ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT 0", "<NOROWS>");
-    ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT ALL", "1|2|3|4|5|6|7");
-    ck(&mut e, "SELECT id FROM t ORDER BY id OFFSET 100", "<NOROWS>");
-    ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 3", "4|5");
-    ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT NULL", "1|2|3|4|5|6|7");
-    ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 0", "1|2|3");
-    ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT 100", "1|2|3|4|5|6|7");
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id LIMIT ALL",
+        "1|2|3|4|5|6|7",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id OFFSET 100",
+        "<NOROWS>",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 3",
+        "4|5",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id LIMIT NULL",
+        "1|2|3|4|5|6|7",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 0",
+        "1|2|3",
+    );
+    ck(
+        &mut e,
+        "SELECT id FROM t ORDER BY id LIMIT 100",
+        "1|2|3|4|5|6|7",
+    );
     // negative LIMIT / OFFSET -> error
     ck(&mut e, "SELECT id FROM t ORDER BY id LIMIT -1", "<ERR>");
     ck(&mut e, "SELECT id FROM t ORDER BY id OFFSET -1", "<ERR>");

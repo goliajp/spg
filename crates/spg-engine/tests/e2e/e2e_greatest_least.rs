@@ -88,7 +88,7 @@ fn greatest_with_floats() {
     let row = one_row(e.execute("SELECT greatest(1.5, 2.5, 0.5)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 2.5),
-        Value::Numeric { scaled, scale , .. } => {
+        Value::Numeric { scaled, scale, .. } => {
             // 2.5 expressed as Numeric.
             let v = (*scaled as f64) / 10f64.powi(i32::from(*scale));
             assert_eq!(v, 2.5);

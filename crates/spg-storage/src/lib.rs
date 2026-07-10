@@ -25,9 +25,9 @@ pub mod row_header;
 pub mod row_locator;
 pub mod segment;
 pub mod snapshot;
-pub mod vacuum;
 mod table;
 pub mod trgm;
+pub mod vacuum;
 
 pub use self::bloom::{BloomError, BloomFilter};
 // v7.31 monster tier-3 cut 3 — on-disk codec moved to `codec`; the
@@ -910,7 +910,10 @@ impl<'arena> Value<'arena> {
                 precision: 0,
                 scale: *scale,
             }),
-            Self::NumericBig(b) => Some(DataType::Numeric { precision: 0, scale: b.scale() }),
+            Self::NumericBig(b) => Some(DataType::Numeric {
+                precision: 0,
+                scale: b.scale(),
+            }),
             Self::Date(_) => Some(DataType::Date),
             Self::Timestamp(_) => Some(DataType::Timestamp),
             Self::Interval { .. } => Some(DataType::Interval),
@@ -953,7 +956,9 @@ impl<'arena> Value<'arena> {
             Self::Xml(_) => Some(DataType::Xml),
             Self::Char1(_) => Some(DataType::Char1),
             // BpChar reports its declared width from the padded length.
-            Self::BpChar(s) => Some(DataType::Char(u32::try_from(s.chars().count()).unwrap_or(0))),
+            Self::BpChar(s) => Some(DataType::Char(
+                u32::try_from(s.chars().count()).unwrap_or(0),
+            )),
             Self::MoneyArray(_) => Some(DataType::MoneyArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
@@ -998,7 +1003,15 @@ impl<'arena> Value<'arena> {
             Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
             Value::Sq8Vector(q) => Value::Sq8Vector(q),
             Value::HalfVector(h) => Value::HalfVector(h),
-            Value::Numeric { scaled, scale, kind } => Value::Numeric { scaled, scale, kind },
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            } => Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            },
             Value::NumericBig(b) => Value::NumericBig(b),
             Value::Date(d) => Value::Date(d),
             Value::Timestamp(t) => Value::Timestamp(t),
@@ -1140,13 +1153,21 @@ impl Value<'static> {
 
     /// v7.38 (read01, T6) — a finite NUMERIC from its fixed-point parts.
     pub const fn numeric(scaled: i128, scale: u8) -> Self {
-        Value::Numeric { scaled, scale, kind: NumericKind::Finite }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: NumericKind::Finite,
+        }
     }
 
     /// v7.38 (read01, T6) — a special NUMERIC (NaN / ±Infinity). The fixed-point
     /// fields are canonicalized to 0 so equal specials compare byte-identical.
     pub const fn numeric_special(kind: NumericKind) -> Self {
-        Value::Numeric { scaled: 0, scale: 0, kind }
+        Value::Numeric {
+            scaled: 0,
+            scale: 0,
+            kind,
+        }
     }
 
     /// v7.37.42-arena Phase 1 — owned-Json constructor (mirrors `text`).
@@ -2659,8 +2680,7 @@ const REDO_META_VERSION: u8 = 1;
 /// naming a pre-checkpoint row is left visible rather than mis-applied.
 /// Surfaced for observability; never affects correctness of the resolved
 /// tombstones. Read via [`unresolved_tombstone_count`].
-static UNRESOLVED_TOMBSTONES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static UNRESOLVED_TOMBSTONES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// v7.37.15 (Epic W durable-tombstone slice) — read the process-wide
 /// count of redo tombstones that could not be resolved to a row by
@@ -3416,7 +3436,11 @@ impl Catalog {
         let mut total = vacuum::VacuumReport::default();
         // Snapshot the table names so we don't hold an immutable
         // borrow during the get_mut loop.
-        let names: Vec<String> = self.tables.iter().map(|t| t.schema().name.clone()).collect();
+        let names: Vec<String> = self
+            .tables
+            .iter()
+            .map(|t| t.schema().name.clone())
+            .collect();
         for name in names {
             let Some(t) = self.get_mut(&name) else {
                 continue;
@@ -3709,9 +3733,10 @@ impl Catalog {
         if_not_exists: bool,
         position: Option<(bool, String)>,
     ) -> Result<bool, StorageError> {
-        let def = self.enum_types.get_mut(type_name).ok_or_else(|| {
-            StorageError::Corrupt(format!("type {type_name:?} does not exist"))
-        })?;
+        let def = self
+            .enum_types
+            .get_mut(type_name)
+            .ok_or_else(|| StorageError::Corrupt(format!("type {type_name:?} does not exist")))?;
         if def.labels.iter().any(|l| l == label) {
             if if_not_exists {
                 return Ok(false);
@@ -3723,11 +3748,15 @@ impl Catalog {
         match position {
             None => def.labels.push(label.to_string()),
             Some((is_before, anchor)) => {
-                let at = def.labels.iter().position(|l| l == &anchor).ok_or_else(|| {
-                    StorageError::Corrupt(format!(
-                        "enum label {anchor:?} does not exist in type {type_name:?}"
-                    ))
-                })?;
+                let at = def
+                    .labels
+                    .iter()
+                    .position(|l| l == &anchor)
+                    .ok_or_else(|| {
+                        StorageError::Corrupt(format!(
+                            "enum label {anchor:?} does not exist in type {type_name:?}"
+                        ))
+                    })?;
                 let idx = if is_before { at } else { at + 1 };
                 def.labels.insert(idx, label.to_string());
             }
@@ -4106,9 +4135,7 @@ impl Catalog {
         // in a post-pass keyed by RowId. When the run has no tombstone
         // (every default gate-off replay) this is all skipped and the
         // path below stays byte-for-byte the legacy one.
-        let has_tomb = run
-            .iter()
-            .any(|c| matches!(c, RowChange::Tombstone { .. }));
+        let has_tomb = run.iter().any(|c| matches!(c, RowChange::Tombstone { .. }));
         // Ids of the pre-existing rows, snapshotted parallel to
         // `original_rows`, and ids of the tail rows filled from each
         // `Insert`'s carried `rowid`. Together they let a tombstone name
@@ -4360,8 +4387,7 @@ impl Catalog {
                         // never a correctness regression, only an
                         // unclosed durability gap the V6 envelope slice
                         // closes. Counted for observability.
-                        UNRESOLVED_TOMBSTONES
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        UNRESOLVED_TOMBSTONES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }

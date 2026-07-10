@@ -11,7 +11,9 @@ fn b(e: &mut Engine, sql: &str) -> bool {
 }
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -43,8 +45,12 @@ fn starts_with_operator() {
 fn power_and_xor() {
     let mut e = Engine::new();
     // ^ binds tighter than +.
-    assert!(matches!(one(&mut e, "SELECT 2 ^ 10"), spg_storage::Value::Float(f) if (f - 1024.0).abs() < 1e-9));
-    assert!(matches!(one(&mut e, "SELECT 3 + 2 ^ 2"), spg_storage::Value::Float(f) if (f - 7.0).abs() < 1e-9));
+    assert!(
+        matches!(one(&mut e, "SELECT 2 ^ 10"), spg_storage::Value::Float(f) if (f - 1024.0).abs() < 1e-9)
+    );
+    assert!(
+        matches!(one(&mut e, "SELECT 3 + 2 ^ 2"), spg_storage::Value::Float(f) if (f - 7.0).abs() < 1e-9)
+    );
     // # integer XOR.
     let xor = |e: &mut Engine, sql: &str| match one(e, sql) {
         spg_storage::Value::Int(n) => i64::from(n),

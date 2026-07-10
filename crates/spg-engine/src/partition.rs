@@ -343,14 +343,34 @@ mod tests {
     #[test]
     fn value_in_range_inclusive_lower_exclusive_upper() {
         use PartitionBound::{Date, Int};
-        assert!(value_in_range(&TimestampTz(50), &TimestampTz(0), &TimestampTz(100)));
-        assert!(value_in_range(&TimestampTz(0), &TimestampTz(0), &TimestampTz(100)));
-        assert!(!value_in_range(&TimestampTz(100), &TimestampTz(0), &TimestampTz(100)));
-        assert!(!value_in_range(&TimestampTz(-1), &TimestampTz(0), &TimestampTz(100)));
+        assert!(value_in_range(
+            &TimestampTz(50),
+            &TimestampTz(0),
+            &TimestampTz(100)
+        ));
+        assert!(value_in_range(
+            &TimestampTz(0),
+            &TimestampTz(0),
+            &TimestampTz(100)
+        ));
+        assert!(!value_in_range(
+            &TimestampTz(100),
+            &TimestampTz(0),
+            &TimestampTz(100)
+        ));
+        assert!(!value_in_range(
+            &TimestampTz(-1),
+            &TimestampTz(0),
+            &TimestampTz(100)
+        ));
         // MINVALUE always satisfies lower; MAXVALUE always satisfies
         // upper (the catch-all "everything" range).
         assert!(value_in_range(&TimestampTz(i64::MIN), &MinValue, &MaxValue));
-        assert!(value_in_range(&TimestampTz(i64::MAX - 1), &MinValue, &MaxValue));
+        assert!(value_in_range(
+            &TimestampTz(i64::MAX - 1),
+            &MinValue,
+            &MaxValue
+        ));
         // MAXVALUE as lower or MINVALUE as upper rejects everything.
         assert!(!value_in_range(&TimestampTz(0), &MaxValue, &MaxValue));
         assert!(!value_in_range(&TimestampTz(0), &MinValue, &MinValue));

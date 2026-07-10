@@ -88,7 +88,9 @@ impl BigNumeric {
     pub fn to_i128(&self) -> Option<i128> {
         let mut mag: u128 = 0;
         for &limb in self.limbs.iter().rev() {
-            mag = mag.checked_mul(u128::from(BASE))?.checked_add(u128::from(limb))?;
+            mag = mag
+                .checked_mul(u128::from(BASE))?
+                .checked_add(u128::from(limb))?;
         }
         if self.neg {
             // magnitude up to i128::MIN's magnitude (2^127) is representable.
@@ -200,11 +202,19 @@ impl BigNumeric {
             Ordering::Equal => (self.limbs.clone(), other.limbs.clone(), self.scale),
             Ordering::Less => {
                 let k = u32::from(other.scale - self.scale);
-                (Self::mul_pow10(&self.limbs, k), other.limbs.clone(), other.scale)
+                (
+                    Self::mul_pow10(&self.limbs, k),
+                    other.limbs.clone(),
+                    other.scale,
+                )
             }
             Ordering::Greater => {
                 let k = u32::from(self.scale - other.scale);
-                (self.limbs.clone(), Self::mul_pow10(&other.limbs, k), self.scale)
+                (
+                    self.limbs.clone(),
+                    Self::mul_pow10(&other.limbs, k),
+                    self.scale,
+                )
             }
         }
     }
@@ -231,14 +241,24 @@ impl BigNumeric {
     pub fn add(&self, other: &Self) -> Self {
         let (a, b, scale) = self.align(other);
         let out = if self.neg == other.neg {
-            BigNumeric { neg: self.neg, limbs: Self::add_mag(&a, &b), scale }
+            BigNumeric {
+                neg: self.neg,
+                limbs: Self::add_mag(&a, &b),
+                scale,
+            }
         } else {
             // opposite signs → subtract the smaller magnitude from the larger.
             match Self::cmp_mag(&a, &b) {
-                core::cmp::Ordering::Less => {
-                    BigNumeric { neg: other.neg, limbs: Self::sub_mag(&b, &a), scale }
-                }
-                _ => BigNumeric { neg: self.neg, limbs: Self::sub_mag(&a, &b), scale },
+                core::cmp::Ordering::Less => BigNumeric {
+                    neg: other.neg,
+                    limbs: Self::sub_mag(&b, &a),
+                    scale,
+                },
+                _ => BigNumeric {
+                    neg: self.neg,
+                    limbs: Self::sub_mag(&a, &b),
+                    scale,
+                },
             }
         };
         let mut out = out;
@@ -263,7 +283,11 @@ impl BigNumeric {
     #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
         if self.is_zero() || other.is_zero() {
-            return BigNumeric { neg: false, limbs: Vec::new(), scale: self.scale + other.scale };
+            return BigNumeric {
+                neg: false,
+                limbs: Vec::new(),
+                scale: self.scale + other.scale,
+            };
         }
         let mut acc = alloc::vec![0u64; self.limbs.len() + other.limbs.len()];
         for (i, &a) in self.limbs.iter().enumerate() {
@@ -343,7 +367,11 @@ impl BigNumeric {
             while q.last() == Some(&0) {
                 q.pop();
             }
-            let r = if rem == 0 { Vec::new() } else { alloc::vec![rem as u32] };
+            let r = if rem == 0 {
+                Vec::new()
+            } else {
+                alloc::vec![rem as u32]
+            };
             return (q, r);
         }
         // D1. Normalize so the divisor's top limb is >= BASE/2.
@@ -365,7 +393,8 @@ impl BigNumeric {
             let mut qhat = num / u128::from(vn[n - 1]);
             let mut rhat = num % u128::from(vn[n - 1]);
             while qhat >= u128::from(BASE)
-                || qhat * u128::from(vn[n - 2]) > rhat * u128::from(BASE) + u128::from(un[j + n - 2])
+                || qhat * u128::from(vn[n - 2])
+                    > rhat * u128::from(BASE) + u128::from(un[j + n - 2])
             {
                 qhat -= 1;
                 rhat += u128::from(vn[n - 1]);
@@ -422,8 +451,16 @@ impl BigNumeric {
     #[must_use]
     pub fn div_rem_int(&self, other: &Self) -> (Self, Self) {
         let (q, r) = Self::div_rem_mag(&self.limbs, &other.limbs);
-        let mut quo = BigNumeric { neg: self.neg != other.neg, limbs: q, scale: 0 };
-        let mut rem = BigNumeric { neg: self.neg, limbs: r, scale: 0 };
+        let mut quo = BigNumeric {
+            neg: self.neg != other.neg,
+            limbs: q,
+            scale: 0,
+        };
+        let mut rem = BigNumeric {
+            neg: self.neg,
+            limbs: r,
+            scale: 0,
+        };
         quo.normalize();
         rem.normalize();
         (quo, rem)
@@ -458,7 +495,11 @@ impl BigNumeric {
         if guard >= 5 {
             q = Self::add_mag(&q, &[1]);
         }
-        let mut out = BigNumeric { neg: self.neg != other.neg, limbs: q, scale: result_scale };
+        let mut out = BigNumeric {
+            neg: self.neg != other.neg,
+            limbs: q,
+            scale: result_scale,
+        };
         out.normalize();
         Some(out)
     }
@@ -469,9 +510,17 @@ impl BigNumeric {
     /// descending to the floor. Zero → zero.
     fn isqrt_mag(&self) -> Self {
         use core::cmp::Ordering;
-        let n = BigNumeric { neg: false, limbs: self.limbs.clone(), scale: 0 };
+        let n = BigNumeric {
+            neg: false,
+            limbs: self.limbs.clone(),
+            scale: 0,
+        };
         if n.is_zero() {
-            return BigNumeric { neg: false, limbs: Vec::new(), scale: 0 };
+            return BigNumeric {
+                neg: false,
+                limbs: Vec::new(),
+                scale: 0,
+            };
         }
         // Decimal digit count of the magnitude.
         let top = *n.limbs.last().unwrap();
@@ -514,18 +563,34 @@ impl BigNumeric {
             return None;
         }
         if self.is_zero() {
-            return Some(BigNumeric { neg: false, limbs: Vec::new(), scale: result_scale });
+            return Some(BigNumeric {
+                neg: false,
+                limbs: Vec::new(),
+                scale: result_scale,
+            });
         }
         // Compute one guard digit past result_scale, then round it off.
         // radicand = mantissa * 10^(2*(result_scale+1) - scale); isqrt of it is
         // floor(sqrt(value) * 10^(result_scale+1)).
         let shift = 2 * (i32::from(result_scale) + 1) - i32::from(self.scale);
-        let mant = BigNumeric { neg: false, limbs: self.limbs.clone(), scale: 0 };
+        let mant = BigNumeric {
+            neg: false,
+            limbs: self.limbs.clone(),
+            scale: 0,
+        };
         let radicand = if shift >= 0 {
-            BigNumeric { neg: false, limbs: Self::mul_pow10(&mant.limbs, shift as u32), scale: 0 }
+            BigNumeric {
+                neg: false,
+                limbs: Self::mul_pow10(&mant.limbs, shift as u32),
+                scale: 0,
+            }
         } else {
             let (q, _) = Self::div_rem_mag(&mant.limbs, &Self::mul_pow10(&[1], (-shift) as u32));
-            BigNumeric { neg: false, limbs: q, scale: 0 }
+            BigNumeric {
+                neg: false,
+                limbs: q,
+                scale: 0,
+            }
         };
         let root = radicand.isqrt_mag();
         // Round the guard digit half-away-from-zero, drop it.
@@ -569,7 +634,11 @@ impl BigNumeric {
                 if Self::cmp_mag(&two_r, &divisor) != Ordering::Less {
                     q = Self::add_mag(&q, &[1]);
                 }
-                let mut out = BigNumeric { neg: self.neg, limbs: q, scale: target_scale };
+                let mut out = BigNumeric {
+                    neg: self.neg,
+                    limbs: q,
+                    scale: target_scale,
+                };
                 out.normalize();
                 out
             }
@@ -677,7 +746,8 @@ impl BigNumeric {
             return None;
         }
         let two = BigNumeric::from_i128(2, 0);
-        let ln2 = BigNumeric::from_decimal_str("0.6931471805599453094172321214581765680755").unwrap();
+        let ln2 =
+            BigNumeric::from_decimal_str("0.6931471805599453094172321214581765680755").unwrap();
         let four_thirds = BigNumeric::from_decimal_str("1.3333333333333333").unwrap();
         let two_thirds = BigNumeric::from_decimal_str("0.6666666666666667").unwrap();
         let mut m = self.round_to(ws);
@@ -835,7 +905,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0
         }
         fn i128_small(&mut self) -> i128 {
@@ -847,14 +920,32 @@ mod tests {
 
     #[test]
     fn i128_bridge_round_trips() {
-        for v in [0i128, 1, -1, 123, -456, i64::MAX as i128, i128::MAX, i128::MIN, 10i128.pow(30)] {
+        for v in [
+            0i128,
+            1,
+            -1,
+            123,
+            -456,
+            i64::MAX as i128,
+            i128::MAX,
+            i128::MIN,
+            10i128.pow(30),
+        ] {
             assert_eq!(BigNumeric::from_i128(v, 0).to_i128(), Some(v), "v={v}");
         }
     }
 
     #[test]
     fn decimal_str_round_trips() {
-        for s in ["0", "123", "-123", "1.50", "-0.001", "1000000000", "999999999999999999999999999999"] {
+        for s in [
+            "0",
+            "123",
+            "-123",
+            "1.50",
+            "-0.001",
+            "1000000000",
+            "999999999999999999999999999999",
+        ] {
             let b = BigNumeric::from_decimal_str(s).unwrap();
             assert_eq!(b.to_decimal_str(), s, "s={s}");
         }
@@ -933,7 +1024,10 @@ mod tests {
         let eight = BigNumeric::from_decimal_str("8").unwrap();
         assert_eq!(one.div(&eight, 2).unwrap().to_decimal_str(), "0.13");
         // division by zero → None.
-        assert!(one.div(&BigNumeric::from_decimal_str("0").unwrap(), 4).is_none());
+        assert!(
+            one.div(&BigNumeric::from_decimal_str("0").unwrap(), 4)
+                .is_none()
+        );
     }
 
     #[test]
@@ -942,7 +1036,16 @@ mod tests {
         let n = BigNumeric::from_decimal_str("152415787532388367501905199875019052100").unwrap();
         assert_eq!(n.isqrt_mag().to_decimal_str(), "12345678901234567890");
         // Floor for a non-square: isqrt(10) = 3, isqrt(15) = 3, isqrt(16) = 4.
-        for (v, want) in [("0", "0"), ("1", "1"), ("2", "1"), ("10", "3"), ("15", "3"), ("16", "4"), ("99", "9"), ("100", "10")] {
+        for (v, want) in [
+            ("0", "0"),
+            ("1", "1"),
+            ("2", "1"),
+            ("10", "3"),
+            ("15", "3"),
+            ("16", "4"),
+            ("99", "9"),
+            ("100", "10"),
+        ] {
             let b = BigNumeric::from_decimal_str(v).unwrap();
             assert_eq!(b.isqrt_mag().to_decimal_str(), want, "isqrt({v})");
         }
@@ -961,10 +1064,25 @@ mod tests {
         assert_eq!(nine.sqrt(15).unwrap().to_decimal_str(), "3.000000000000000");
         // A big perfect square, scale 0.
         let big = BigNumeric::from_decimal_str("152415787532388367501905199875019052100").unwrap();
-        assert_eq!(big.sqrt(0).unwrap().to_decimal_str(), "12345678901234567890");
+        assert_eq!(
+            big.sqrt(0).unwrap().to_decimal_str(),
+            "12345678901234567890"
+        );
         // Negative → None (caller raises the domain error); zero is fine.
-        assert!(BigNumeric::from_decimal_str("-4").unwrap().sqrt(2).is_none());
-        assert_eq!(BigNumeric::from_decimal_str("0").unwrap().sqrt(3).unwrap().to_decimal_str(), "0.000");
+        assert!(
+            BigNumeric::from_decimal_str("-4")
+                .unwrap()
+                .sqrt(2)
+                .is_none()
+        );
+        assert_eq!(
+            BigNumeric::from_decimal_str("0")
+                .unwrap()
+                .sqrt(3)
+                .unwrap()
+                .to_decimal_str(),
+            "0.000"
+        );
     }
 
     #[test]
@@ -973,7 +1091,9 @@ mod tests {
         // x^2 <= n < (x+1)^2.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state
         };
         for _ in 0..20_000 {

@@ -6,7 +6,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -18,7 +20,8 @@ fn information_schema_domains_lists_user_domains() {
     let mut e = Engine::new();
     e.execute("CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)")
         .unwrap();
-    e.execute("CREATE DOMAIN short_text AS VARCHAR(50)").unwrap();
+    e.execute("CREATE DOMAIN short_text AS VARCHAR(50)")
+        .unwrap();
     let rs = rows(&mut e, "SELECT * FROM information_schema.domains");
     assert_eq!(rs.len(), 2, "got {rs:?}");
     let names: Vec<String> = rs

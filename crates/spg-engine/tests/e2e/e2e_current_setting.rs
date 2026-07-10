@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -25,15 +27,15 @@ fn current_setting_server_version() {
         "18.4 (SPG-compat)"
     );
     assert_eq!(
-        text(&first(&mut e, "SELECT current_setting('server_version_num')")),
+        text(&first(
+            &mut e,
+            "SELECT current_setting('server_version_num')"
+        )),
         "180004"
     );
     // SHOW and pg_settings agree with the function (drivers gate feature
     // use on server_version_num; live PG18.4 = 180004).
-    assert_eq!(
-        text(&first(&mut e, "SHOW server_version_num")),
-        "180004"
-    );
+    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180004");
     assert_eq!(
         text(&first(
             &mut e,
@@ -68,7 +70,10 @@ fn current_setting_encoding_and_locale() {
 fn current_setting_missing_ok_returns_null() {
     let mut e = Engine::new();
     assert!(matches!(
-        first(&mut e, "SELECT current_setting('bogus_unknown_param', true)"),
+        first(
+            &mut e,
+            "SELECT current_setting('bogus_unknown_param', true)"
+        ),
         spg_storage::Value::Null
     ));
 }
@@ -98,11 +103,17 @@ fn custom_namespaced_guc_round_trips() {
     // current_setting('app.user_id') = '42'). Verified vs live PG18.4.
     let mut e = Engine::new();
     e.execute("SET app.user_id = '42'").unwrap();
-    assert_eq!(text(&first(&mut e, "SELECT current_setting('app.user_id')")), "42");
+    assert_eq!(
+        text(&first(&mut e, "SELECT current_setting('app.user_id')")),
+        "42"
+    );
     // Two-segment namespace survives (the qualifier is NOT stripped as a
     // schema would be).
     e.execute("SET myapp.tenant = 'acme'").unwrap();
-    assert_eq!(text(&first(&mut e, "SELECT current_setting('myapp.tenant')")), "acme");
+    assert_eq!(
+        text(&first(&mut e, "SELECT current_setting('myapp.tenant')")),
+        "acme"
+    );
     // A SET value wins over the static default for a standard GUC too.
     e.execute("SET application_name = 'reports'").unwrap();
     assert_eq!(
@@ -127,12 +138,19 @@ fn set_client_encoding_rejects_non_utf8() {
     e.execute("SET client_encoding='utf-8'").unwrap();
     e.execute("SET client_encoding=UNICODE").unwrap();
     e.execute("SET client_encoding='UTF8'").unwrap();
-    for bad in ["SET client_encoding='SJIS'", "SET client_encoding='LATIN1'", "SET client_encoding='BOGUS'"] {
+    for bad in [
+        "SET client_encoding='SJIS'",
+        "SET client_encoding='LATIN1'",
+        "SET client_encoding='BOGUS'",
+    ] {
         assert!(e.execute(bad).is_err(), "should reject: {bad}");
     }
     // A rejected SET leaves the prior (UTF8) value in place, and other
     // GUCs are unaffected.
-    assert_eq!(text(&first(&mut e, "SELECT current_setting('client_encoding')")), "UTF8");
+    assert_eq!(
+        text(&first(&mut e, "SELECT current_setting('client_encoding')")),
+        "UTF8"
+    );
     e.execute("SET application_name='ok'").unwrap();
 }
 
@@ -181,9 +199,23 @@ fn pg_settings_has_full_17_column_shape() {
     assert_eq!(
         cols,
         vec![
-            "name", "setting", "unit", "category", "short_desc", "extra_desc",
-            "context", "vartype", "source", "min_val", "max_val", "enumvals",
-            "boot_val", "reset_val", "sourcefile", "sourceline", "pending_restart",
+            "name",
+            "setting",
+            "unit",
+            "category",
+            "short_desc",
+            "extra_desc",
+            "context",
+            "vartype",
+            "source",
+            "min_val",
+            "max_val",
+            "enumvals",
+            "boot_val",
+            "reset_val",
+            "sourcefile",
+            "sourceline",
+            "pending_restart",
         ]
     );
     // vartype is annotated (work_mem is integer even though shown as "4MB").
@@ -234,7 +266,10 @@ fn show_covers_more_params_and_unifies_with_pg_settings() {
         QueryResult::Rows { rows, .. } => rows.len(),
         _ => panic!(),
     };
-    assert!(show_all >= 30, "SHOW ALL should list the full set, got {show_all}");
+    assert!(
+        show_all >= 30,
+        "SHOW ALL should list the full set, got {show_all}"
+    );
     // A SET is reflected by both SHOW and pg_settings (one store).
     e.execute("SET extra_float_digits = '3'").unwrap();
     assert_eq!(text(&first(&mut e, "SHOW extra_float_digits")), "3");

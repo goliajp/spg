@@ -213,9 +213,8 @@ fn match_full_multi_column_parses() {
 #[test]
 fn match_partial_is_rejected() {
     // PG18.4 rejects MATCH PARTIAL with exactly this wording.
-    let err =
-        parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH PARTIAL)")
-            .expect_err("MATCH PARTIAL should be rejected");
+    let err = parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH PARTIAL)")
+        .expect_err("MATCH PARTIAL should be rejected");
     assert!(
         format!("{err:?}").contains("MATCH PARTIAL not yet implemented"),
         "got {err:?}"

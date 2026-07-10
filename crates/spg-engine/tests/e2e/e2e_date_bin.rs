@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -97,11 +99,17 @@ fn date_bin_accepts_text_stride() {
         }
     };
     assert_eq!(
-        q(&mut e, "SELECT date_bin('15 minutes', timestamp '2020-01-01 00:17:00', timestamp '2020-01-01 00:00:00')::text"),
+        q(
+            &mut e,
+            "SELECT date_bin('15 minutes', timestamp '2020-01-01 00:17:00', timestamp '2020-01-01 00:00:00')::text"
+        ),
         "2020-01-01 00:15:00"
     );
     assert_eq!(
-        q(&mut e, "SELECT date_bin('2 days', timestamp '2020-01-06 12:00:00', timestamp '2020-01-01 00:00:00')::text"),
+        q(
+            &mut e,
+            "SELECT date_bin('2 days', timestamp '2020-01-06 12:00:00', timestamp '2020-01-01 00:00:00')::text"
+        ),
         "2020-01-05 00:00:00"
     );
     // A month-bearing stride still errors (PG: "cannot be binned into

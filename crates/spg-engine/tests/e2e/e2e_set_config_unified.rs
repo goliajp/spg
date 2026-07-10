@@ -5,7 +5,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn scalar(e: &mut Engine, sql: &str) -> Option<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => Some(s.to_string()),
             spg_storage::Value::Null => None,
@@ -29,12 +32,17 @@ fn set_config_writes_and_unifies_all_read_paths() {
         Some("128MB")
     );
     assert_eq!(
-        scalar(&mut e, "SELECT setting FROM pg_settings WHERE name = 'work_mem'").as_deref(),
+        scalar(
+            &mut e,
+            "SELECT setting FROM pg_settings WHERE name = 'work_mem'"
+        )
+        .as_deref(),
         Some("128MB")
     );
     // A custom namespaced GUC set via set_config is visible via SHOW's
     // dotted-name form and current_setting.
-    e.execute("SELECT set_config('myapp.tenant', 'acme', false)").unwrap();
+    e.execute("SELECT set_config('myapp.tenant', 'acme', false)")
+        .unwrap();
     assert_eq!(scalar(&mut e, "SHOW myapp.tenant").as_deref(), Some("acme"));
     assert_eq!(
         scalar(&mut e, "SELECT current_setting('myapp.tenant')").as_deref(),
@@ -45,15 +53,18 @@ fn set_config_writes_and_unifies_all_read_paths() {
 #[test]
 fn set_config_local_reverts_and_validates() {
     let mut e = Engine::new();
-    e.execute("SELECT set_config('work_mem', '64MB', false)").unwrap();
+    e.execute("SELECT set_config('work_mem', '64MB', false)")
+        .unwrap();
     // is_local = true is transaction-scoped like SET LOCAL.
     e.execute("BEGIN").unwrap();
-    e.execute("SELECT set_config('work_mem', '256MB', true)").unwrap();
+    e.execute("SELECT set_config('work_mem', '256MB', true)")
+        .unwrap();
     assert_eq!(scalar(&mut e, "SHOW work_mem").as_deref(), Some("256MB"));
     e.execute("COMMIT").unwrap();
     assert_eq!(scalar(&mut e, "SHOW work_mem").as_deref(), Some("64MB"));
     // An invalid value is rejected the same way SET rejects it.
-    assert!(e
-        .execute("SELECT set_config('work_mem', 'bogus', false)")
-        .is_err());
+    assert!(
+        e.execute("SELECT set_config('work_mem', 'bogus', false)")
+            .is_err()
+    );
 }

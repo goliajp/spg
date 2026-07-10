@@ -18,40 +18,118 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn jsonpath_range() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('{\"a\":[1,2,3,4,5]}', '$.a[2 to 4]'))::text"), "[3, 4, 5]");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('{\"a\":[1,2,3,4,5]}', '$.a[2 to 4]'))::text"
+        ),
+        "[3, 4, 5]"
+    );
 }
 
 #[test]
 fn jsonpath_filter_predicates() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT jsonb_path_exists('{\"a\":5}', '$.a ? (@ > 3)')"), "true");
-    assert_eq!(text(&mut e, "SELECT jsonb_path_exists('{\"a\":5}', '$.a ? (@ > 9)')"), "false");
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('{\"items\":[{\"p\":10},{\"p\":25},{\"p\":5}]}', '$.items[*] ? (@.p > 8).p'))::text"), "[10, 25]");
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[1,2,3,4]', '$[*] ? (@ >= 3)'))::text"), "[3, 4]");
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[{\"n\":\"a\"},{\"n\":\"b\"}]', '$[*] ? (@.n == \"b\").n'))::text"), "[\"b\"]");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_exists('{\"a\":5}', '$.a ? (@ > 3)')"
+        ),
+        "true"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_exists('{\"a\":5}', '$.a ? (@ > 9)')"
+        ),
+        "false"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('{\"items\":[{\"p\":10},{\"p\":25},{\"p\":5}]}', '$.items[*] ? (@.p > 8).p'))::text"
+        ),
+        "[10, 25]"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('[1,2,3,4]', '$[*] ? (@ >= 3)'))::text"
+        ),
+        "[3, 4]"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('[{\"n\":\"a\"},{\"n\":\"b\"}]', '$[*] ? (@.n == \"b\").n'))::text"
+        ),
+        "[\"b\"]"
+    );
 }
 
 #[test]
 fn jsonpath_at_question_with_filter() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT '{\"a\":1}'::jsonb @? '$.a ? (@ > 0)'"), "true");
-    assert_eq!(text(&mut e, "SELECT '{\"a\":1}'::jsonb @? '$.a ? (@ > 5)'"), "false");
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":1}'::jsonb @? '$.a ? (@ > 0)'"),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":1}'::jsonb @? '$.a ? (@ > 5)'"),
+        "false"
+    );
 }
 
 #[test]
 fn jsonpath_at_at_toplevel_predicate() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a > 3'"), "true");
-    assert_eq!(text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a < 3'"), "false");
-    assert_eq!(text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a == 5'"), "true");
-    assert_eq!(text(&mut e, "SELECT '{\"a\":{\"b\":10}}'::jsonb @@ '$.a.b >= 10'"), "true");
-    assert_eq!(text(&mut e, "SELECT jsonb_path_match('{\"a\":5}', '$.a > 3')"), "true");
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a > 3'"),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a < 3'"),
+        "false"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":5}'::jsonb @@ '$.a == 5'"),
+        "true"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT '{\"a\":{\"b\":10}}'::jsonb @@ '$.a.b >= 10'"
+        ),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_match('{\"a\":5}', '$.a > 3')"),
+        "true"
+    );
 }
 
 #[test]
 fn jsonpath_filter_and_or() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[{\"a\":5,\"b\":2},{\"a\":5,\"b\":9},{\"a\":1,\"b\":2}]', '$[*] ? (@.a == 5 && @.b < 5)'))::text"), "[{\"a\": 5, \"b\": 2}]");
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[1,2,3,4,5]', '$[*] ? (@ < 2 || @ > 4)'))::text"), "[1, 5]");
-    assert_eq!(text(&mut e, "SELECT (jsonb_path_query_array('[1,2,3,4,5,6]', '$[*] ? ((@ > 1 && @ < 3) || @ == 6)'))::text"), "[2, 6]");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('[{\"a\":5,\"b\":2},{\"a\":5,\"b\":9},{\"a\":1,\"b\":2}]', '$[*] ? (@.a == 5 && @.b < 5)'))::text"
+        ),
+        "[{\"a\": 5, \"b\": 2}]"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('[1,2,3,4,5]', '$[*] ? (@ < 2 || @ > 4)'))::text"
+        ),
+        "[1, 5]"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (jsonb_path_query_array('[1,2,3,4,5,6]', '$[*] ? ((@ > 1 && @ < 3) || @ == 6)'))::text"
+        ),
+        "[2, 6]"
+    );
 }

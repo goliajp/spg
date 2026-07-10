@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -59,10 +61,7 @@ fn extract_path_array_index() {
 fn extract_path_missing_key_returns_null() {
     let mut e = Engine::new();
     assert!(matches!(
-        first(
-            &mut e,
-            r#"SELECT json_extract_path('{"a": 1}', 'missing')"#
-        ),
+        first(&mut e, r#"SELECT json_extract_path('{"a": 1}', 'missing')"#),
         spg_storage::Value::Null
     ));
 }

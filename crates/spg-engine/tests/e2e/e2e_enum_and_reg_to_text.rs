@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -55,10 +57,7 @@ fn regclass_to_text_roundtrips_text() {
 #[test]
 fn regclass_to_text_int_input() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&first(&mut e, "SELECT regclass_to_text(42)")),
-        "42"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT regclass_to_text(42)")), "42");
 }
 
 #[test]

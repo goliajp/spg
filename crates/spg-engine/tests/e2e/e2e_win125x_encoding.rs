@@ -7,7 +7,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn ascii_of(e: &mut Engine, hex: &str, enc: &str) -> i64 {
     let sql = format!("SELECT ascii(convert_from('\\x{hex}'::bytea, '{enc}'))");
-    match e.execute(&sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(&sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Int(n) => i64::from(*n),
             spg_storage::Value::BigInt(n) => *n,
@@ -44,7 +47,10 @@ fn win125x_round_trips() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!("rows")
     };
-    assert_eq!(rows[0].values[0], spg_storage::Value::Bytes(vec![0x8a].into()));
+    assert_eq!(
+        rows[0].values[0],
+        spg_storage::Value::Bytes(vec![0x8a].into())
+    );
 }
 
 #[test]
@@ -52,7 +58,10 @@ fn win125x_undefined_byte_errors_like_pg() {
     // 0x81 is undefined in WIN1250 — PG errors, so SPG must too (no silent
     // U+FFFD substitution).
     let mut e = Engine::new();
-    assert!(e.execute("SELECT convert_from('\\x81'::bytea, 'WIN1250')").is_err());
+    assert!(
+        e.execute("SELECT convert_from('\\x81'::bytea, 'WIN1250')")
+            .is_err()
+    );
     // A char with no WIN1253 (Greek) representation can't be encoded to it.
     assert!(e.execute("SELECT convert_to('А', 'WIN1253')").is_err());
 }

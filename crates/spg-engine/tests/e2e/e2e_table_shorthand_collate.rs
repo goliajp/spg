@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -23,7 +25,8 @@ fn as_i64(v: &spg_storage::Value<'_>) -> i64 {
 fn table_shorthand_selects_star() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE th (v INT, t TEXT)").unwrap();
-    e.execute("INSERT INTO th VALUES (2, 'b'), (1, 'a')").unwrap();
+    e.execute("INSERT INTO th VALUES (2, 'b'), (1, 'a')")
+        .unwrap();
     let got = rows(&mut e, "TABLE th ORDER BY v LIMIT 1");
     assert_eq!(got.len(), 1);
     assert_eq!(as_i64(&got[0][0]), 1);

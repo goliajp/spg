@@ -63,7 +63,11 @@ fn multiple_independent_filters_one_pass() {
             Value::text("t1"),
             Value::BigInt(2),
             Value::BigInt(1),
-            Value::Numeric { scaled: 2, scale: 0 , kind: spg_storage::NumericKind::Finite },
+            Value::Numeric {
+                scaled: 2,
+                scale: 0,
+                kind: spg_storage::NumericKind::Finite
+            },
         ]
     );
     // t2: total 3, seen 2, sum(id where flags=1) = 4
@@ -73,7 +77,11 @@ fn multiple_independent_filters_one_pass() {
             Value::text("t2"),
             Value::BigInt(3),
             Value::BigInt(2),
-            Value::Numeric { scaled: 4, scale: 0 , kind: spg_storage::NumericKind::Finite },
+            Value::Numeric {
+                scaled: 4,
+                scale: 0,
+                kind: spg_storage::NumericKind::Finite
+            },
         ]
     );
 }
@@ -185,7 +193,7 @@ fn filter_round_trips_through_display() {
 fn num_f64(v: &Value) -> f64 {
     match v {
         Value::Float(x) => *x,
-        Value::Numeric { scaled, scale , .. } => *scaled as f64 / 10f64.powi(i32::from(*scale)),
+        Value::Numeric { scaled, scale, .. } => *scaled as f64 / 10f64.powi(i32::from(*scale)),
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
         other => panic!("not a numeric value: {other:?}"),

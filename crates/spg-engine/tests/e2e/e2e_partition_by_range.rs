@@ -460,10 +460,12 @@ fn add_partition_rejects_conflicting_default_rows() {
     // matching PG ("updated partition constraint for default partition …
     // would be violated by some row"). Otherwise the row would be stranded.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p(id int) PARTITION BY RANGE(id)").unwrap();
+    e.execute("CREATE TABLE p(id int) PARTITION BY RANGE(id)")
+        .unwrap();
     e.execute("CREATE TABLE p_lo PARTITION OF p FOR VALUES FROM (1) TO (10)")
         .unwrap();
-    e.execute("CREATE TABLE p_def PARTITION OF p DEFAULT").unwrap();
+    e.execute("CREATE TABLE p_def PARTITION OF p DEFAULT")
+        .unwrap();
     e.execute("INSERT INTO p VALUES(5),(50)").unwrap();
     // 50 sits in the default and falls in [40,60) → reject.
     assert!(

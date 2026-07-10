@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,7 +23,10 @@ fn as_bigint(v: &spg_storage::Value<'_>) -> i64 {
 #[test]
 fn pg_size_bytes_kb_mb_gb_tb() {
     let mut e = Engine::new();
-    assert_eq!(as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 kB')")), 2048);
+    assert_eq!(
+        as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 kB')")),
+        2048
+    );
     assert_eq!(
         as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 MB')")),
         2 * 1024 * 1024
@@ -67,8 +72,14 @@ fn pg_size_bytes_no_unit_is_bytes() {
 #[test]
 fn pg_size_bytes_case_insensitive() {
     let mut e = Engine::new();
-    assert_eq!(as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 mb')")), 2 * 1024 * 1024);
-    assert_eq!(as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 KB')")), 2048);
+    assert_eq!(
+        as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 mb')")),
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        as_bigint(&first(&mut e, "SELECT pg_size_bytes('2 KB')")),
+        2048
+    );
 }
 
 #[test]

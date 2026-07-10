@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -42,15 +44,36 @@ fn log10_of_100_is_2() {
     // NUMERIC in PG (an integer argument keeps the double overload). PG's
     // log(x) is base-10. Oracle: live PG18.4.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (log10(100.0))::text"), "2.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log(100.0))::text"), "2.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log10(1000.0))::text"), "3.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log10(0.001))::text"), "-3.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log10(2.0))::text"), "0.3010299956639812");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(log10(100.0))::text"), "numeric");
+    assert_eq!(
+        text(&mut e, "SELECT (log10(100.0))::text"),
+        "2.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log(100.0))::text"),
+        "2.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log10(1000.0))::text"),
+        "3.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log10(0.001))::text"),
+        "-3.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log10(2.0))::text"),
+        "0.3010299956639812"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(log10(100.0))::text"),
+        "numeric"
+    );
     // An integer argument stays double precision.
     assert_eq!(as_f64(&first(&mut e, "SELECT log10(100)")), 2.0);
-    assert_eq!(text(&mut e, "SELECT pg_typeof(log(100))::text"), "double precision");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(log(100))::text"),
+        "double precision"
+    );
 }
 
 #[test]
@@ -58,9 +81,18 @@ fn log_base_2_of_8_is_3() {
     // PG's two-argument `log(base, x)` has only a numeric overload, so even
     // integer arguments give an exact numeric. Oracle: live PG18.4.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (log(2.0, 8.0))::text"), "3.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log(2, 8))::text"), "3.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (log(2, 10))::text"), "3.3219280948873623");
+    assert_eq!(
+        text(&mut e, "SELECT (log(2.0, 8.0))::text"),
+        "3.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log(2, 8))::text"),
+        "3.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (log(2, 10))::text"),
+        "3.3219280948873623"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(log(2, 8))::text"), "numeric");
     // Domain errors: base 1 divides by zero; a zero / negative operand.
     assert!(e.execute("SELECT log(1, 5)").is_err());
@@ -99,10 +131,16 @@ fn sqrt_matches_pg() {
     };
     assert_eq!(txt(&mut e, "SELECT sqrt(16.0)::text"), "4.000000000000000");
     assert_eq!(txt(&mut e, "SELECT sqrt(2.0)::text"), "1.414213562373095");
-    assert_eq!(txt(&mut e, "SELECT sqrt(130.0)::text"), "11.401754250991380");
+    assert_eq!(
+        txt(&mut e, "SELECT sqrt(130.0)::text"),
+        "11.401754250991380"
+    );
     // An integer arg resolves to the double overload (PG returns double `4`).
     assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(16)")), 4.0);
-    assert_eq!(as_f64(&first(&mut e, "SELECT sqrt(2.0::float8)")), 1.414_213_562_373_095_1);
+    assert_eq!(
+        as_f64(&first(&mut e, "SELECT sqrt(2.0::float8)")),
+        1.414_213_562_373_095_1
+    );
 }
 
 #[test]
@@ -127,9 +165,15 @@ fn gcd_lcm_basic() {
     assert_eq!(text(&mut e, "SELECT (gcd(-12, 18))::text"), "6");
     assert_eq!(text(&mut e, "SELECT (lcm(4, 6))::text"), "12");
     assert_eq!(text(&mut e, "SELECT (lcm(0, 5))::text"), "0");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(gcd(12, 18))::text"), "integer");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(gcd(12, 18))::text"),
+        "integer"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(lcm(4, 6))::text"), "integer");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(gcd(12::bigint, 18))::text"), "bigint");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(gcd(12::bigint, 18))::text"),
+        "bigint"
+    );
 }
 
 #[test]
@@ -153,14 +197,20 @@ fn float8_overflow_and_underflow_error_like_pg() {
         "SELECT 1e308::float8 / 1e-10",
         "SELECT 1e-300::float8 * 1e-300", // underflow
     ] {
-        assert!(e.execute(sql).is_err(), "{sql} should error (overflow/underflow)");
+        assert!(
+            e.execute(sql).is_err(),
+            "{sql} should error (overflow/underflow)"
+        );
     }
     // Legitimate results are unaffected.
     assert_eq!(as_f64(&first(&mut e, "SELECT 2.0::float8 * 3.0")), 6.0);
     // An Inf operand keeps its Inf result (no overflow error), and
     // additive cancellation to 0 is fine.
     assert!(as_f64(&first(&mut e, "SELECT 'inf'::float8 * 2")).is_infinite());
-    assert_eq!(as_f64(&first(&mut e, "SELECT 1e-300::float8 - 1e-300")), 0.0);
+    assert_eq!(
+        as_f64(&first(&mut e, "SELECT 1e-300::float8 - 1e-300")),
+        0.0
+    );
     // NaN propagates without erroring.
     assert!(as_f64(&first(&mut e, "SELECT 'nan'::float8 * 2")).is_nan());
 }
@@ -181,11 +231,11 @@ fn float8_out_uses_scientific_notation_like_pg() {
         }
     };
     for (expr, want) in [
-        ("1e14", "100000000000000"),   // E=14 → fixed
-        ("1e15", "1e+15"),             // E=15 → scientific
+        ("1e14", "100000000000000"), // E=14 → fixed
+        ("1e15", "1e+15"),           // E=15 → scientific
         ("1e20", "1e+20"),
-        ("0.0001", "0.0001"),          // E=-4 → fixed
-        ("0.00001", "1e-05"),          // E=-5 → scientific
+        ("0.0001", "0.0001"), // E=-4 → fixed
+        ("0.00001", "1e-05"), // E=-5 → scientific
         ("123456.789", "123456.789"),
         ("1234567890123456", "1.234567890123456e+15"),
         ("-2.5e-10", "-2.5e-10"),
@@ -208,7 +258,10 @@ fn float8_out_uses_scientific_notation_like_pg() {
     // elements are cast explicitly: bare `2.0`/`0.00001` are NUMERIC literals
     // now, and array-element type unification to float8 is a separate residual.)
     assert_eq!(
-        txt(&mut e, "SELECT (ARRAY[1e30::float8, 2.0::float8, 0.00001::float8])::text"),
+        txt(
+            &mut e,
+            "SELECT (ARRAY[1e30::float8, 2.0::float8, 0.00001::float8])::text"
+        ),
         "{1e+30,2,1e-05}"
     );
     // Non-finite values keep their float8out spelling.

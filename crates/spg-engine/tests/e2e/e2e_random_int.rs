@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -37,7 +39,10 @@ fn random_int_negative_range() {
     let mut e = Engine::new();
     for _ in 0..50 {
         let v = as_bigint(&first(&mut e, "SELECT random_int(-10, 10)"));
-        assert!(v >= -10 && v <= 10, "random_int(-10, 10) = {v} out of range");
+        assert!(
+            v >= -10 && v <= 10,
+            "random_int(-10, 10) = {v} out of range"
+        );
     }
 }
 

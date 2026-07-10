@@ -28,7 +28,10 @@ fn numeric_into_int_column_rounds_half_away() {
             .unwrap();
     }
     // 1.7→2, 2.5→3, 1.4→1, -1.5→-2, -2.5→-3, 0.5→1
-    assert_eq!(ints(&mut e, "SELECT i FROM ti ORDER BY i"), vec![-3, -2, 1, 1, 2, 3]);
+    assert_eq!(
+        ints(&mut e, "SELECT i FROM ti ORDER BY i"),
+        vec![-3, -2, 1, 1, 2, 3]
+    );
 
     // bigint + smallint columns round the same way.
     e.execute("CREATE TABLE tb (b bigint, s smallint)").unwrap();

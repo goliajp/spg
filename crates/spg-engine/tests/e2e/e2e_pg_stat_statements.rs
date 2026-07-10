@@ -9,9 +9,7 @@ use spg_storage::Value;
 #[test]
 fn pg_stat_statements_columns_match_pg() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_stat_statements")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_stat_statements").unwrap();
     let QueryResult::Rows { columns, .. } = r else {
         panic!("expected Rows");
     };
@@ -95,7 +93,7 @@ fn pg_stat_statements_rows_column_tracks_row_count() {
     e.execute("INSERT INTO t VALUES (1)").unwrap(); // 1 affected
     e.execute("INSERT INTO t VALUES (2)").unwrap(); // 1 affected
     e.execute("INSERT INTO t VALUES (3)").unwrap(); // 1 affected
-    e.execute("SELECT * FROM t").unwrap();          // 3 returned
+    e.execute("SELECT * FROM t").unwrap(); // 3 returned
     let r = e.execute("SELECT * FROM pg_stat_statements").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
@@ -144,9 +142,7 @@ fn pg_stat_statements_rows_get_populated_after_select() {
     // registry.
     e.execute("SELECT * FROM t").unwrap();
     e.execute("SELECT COUNT(*) FROM t").unwrap();
-    let r = e
-        .execute("SELECT * FROM pg_stat_statements")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_stat_statements").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };

@@ -7,7 +7,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn one(e: &mut Engine, sql: &str) -> Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -70,9 +72,7 @@ fn alter_column_set_not_null_accepts_clean_data_then_blocks_inserts() {
     e.execute("INSERT INTO t VALUES (1, 'ok')").unwrap();
     e.execute("ALTER TABLE t ALTER COLUMN status SET NOT NULL")
         .unwrap();
-    let err = e
-        .execute("INSERT INTO t (id) VALUES (2)")
-        .unwrap_err();
+    let err = e.execute("INSERT INTO t (id) VALUES (2)").unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("NULL") || msg.contains("status") || msg.contains("not"),
@@ -83,7 +83,8 @@ fn alter_column_set_not_null_accepts_clean_data_then_blocks_inserts() {
 #[test]
 fn alter_column_drop_not_null_reallows_nulls() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT, status TEXT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE t (id INT, status TEXT NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, 'ok')").unwrap();
     // Drop NOT NULL → omitted column now allowed.
     e.execute("ALTER TABLE t ALTER COLUMN status DROP NOT NULL")

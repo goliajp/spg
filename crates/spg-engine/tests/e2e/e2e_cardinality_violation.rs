@@ -23,7 +23,8 @@ fn single_row_subquery_cardinality() {
     );
     // Row-comparison subquery has the same rule.
     assert!(matches!(
-        e.execute("SELECT (1, 10) = (SELECT v, w FROM m)").unwrap_err(),
+        e.execute("SELECT (1, 10) = (SELECT v, w FROM m)")
+            .unwrap_err(),
         EngineError::CardinalityViolation
     ));
 

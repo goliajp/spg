@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,11 +24,13 @@ fn as_i64(v: &spg_storage::Value<'_>) -> i64 {
 #[test]
 fn update_from_joins_source_values() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE tgt (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE tgt (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("CREATE TABLE src (id INT, w INT)").unwrap();
     e.execute("INSERT INTO tgt VALUES (1, 10), (2, 20), (3, 30)")
         .unwrap();
-    e.execute("INSERT INTO src VALUES (1, 100), (3, 300)").unwrap();
+    e.execute("INSERT INTO src VALUES (1, 100), (3, 300)")
+        .unwrap();
     // Matched rows take the source value; unmatched stay.
     e.execute("UPDATE tgt SET v = src.w FROM src WHERE tgt.id = src.id")
         .unwrap();
@@ -46,10 +50,8 @@ fn update_from_with_alias_and_mixed_assignment() {
     e.execute("INSERT INTO s2 VALUES (1, 7)").unwrap();
     // One assignment reads the source, one only the target —
     // only the former wraps into a subquery.
-    e.execute(
-        "UPDATE t2 SET v = s.w * 2, n = 5 FROM s2 AS s WHERE t2.id = s.id",
-    )
-    .unwrap();
+    e.execute("UPDATE t2 SET v = s.w * 2, n = 5 FROM s2 AS s WHERE t2.id = s.id")
+        .unwrap();
     let got = rows(&mut e, "SELECT v, n FROM t2");
     assert_eq!(as_i64(&got[0][0]), 14);
     assert_eq!(as_i64(&got[0][1]), 5);

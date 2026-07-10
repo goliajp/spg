@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,7 +24,8 @@ fn as_i64(v: &spg_storage::Value<'_>) -> i64 {
 #[test]
 fn delete_returning_feeds_outer_select() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE q (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE q (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO q VALUES (1, 10), (2, 20), (3, 30)")
         .unwrap();
     // The moved rows surface through the CTE; the delete lands.
@@ -42,7 +45,8 @@ fn delete_returning_feeds_outer_select() {
 #[test]
 fn update_returning_aggregated_by_outer() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE u2 (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE u2 (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO u2 VALUES (1, 1), (2, 2)").unwrap();
     let got = rows(
         &mut e,

@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -45,10 +47,7 @@ fn sec_to_time_roundtrip() {
         "25:00:00"
     );
     // Negative time keeps its sign.
-    assert_eq!(
-        text(&first(&mut e, "SELECT sec_to_time(-90)")),
-        "-00:01:30"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT sec_to_time(-90)")), "-00:01:30");
 }
 
 #[test]

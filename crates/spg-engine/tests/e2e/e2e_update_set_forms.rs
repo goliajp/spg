@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -24,7 +26,8 @@ fn multi_assign_row_values() {
     e.execute("CREATE TABLE ma (id INT PRIMARY KEY, a INT, b INT)")
         .unwrap();
     e.execute("INSERT INTO ma VALUES (1, 0, 0)").unwrap();
-    e.execute("UPDATE ma SET (a, b) = (7, 8) WHERE id = 1").unwrap();
+    e.execute("UPDATE ma SET (a, b) = (7, 8) WHERE id = 1")
+        .unwrap();
     let got = rows(&mut e, "SELECT a, b FROM ma");
     assert_eq!(as_i64(&got[0][0]), 7);
     assert_eq!(as_i64(&got[0][1]), 8);
@@ -56,7 +59,8 @@ fn set_default_restores_declared_default() {
     e.execute("CREATE TABLE sd (id INT PRIMARY KEY, tag TEXT DEFAULT 'fresh', n INT)")
         .unwrap();
     e.execute("INSERT INTO sd VALUES (1, 'dirty', 9)").unwrap();
-    e.execute("UPDATE sd SET tag = DEFAULT WHERE id = 1").unwrap();
+    e.execute("UPDATE sd SET tag = DEFAULT WHERE id = 1")
+        .unwrap();
     let got = rows(&mut e, "SELECT tag, n FROM sd");
     assert!(matches!(&got[0][0], spg_storage::Value::Text(s) if s == "fresh"));
     assert_eq!(as_i64(&got[0][1]), 9);

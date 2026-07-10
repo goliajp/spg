@@ -5,7 +5,9 @@ use spg_engine::{Engine, QueryResult};
 
 fn survives(e: &mut Engine, cond: &str) -> bool {
     let sql = format!("SELECT 1 WHERE {cond}");
-    let r = e.execute(&sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(&sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };

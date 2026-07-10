@@ -525,9 +525,8 @@ pub fn encode_copy_csv_cells(
             None => out.push_str(null_str),
             Some(s) => {
                 let needs_quote = s.as_str() == null_str
-                    || s.chars().any(|c| {
-                        c == delimiter || c == quote || c == '\n' || c == '\r'
-                    });
+                    || s.chars()
+                        .any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
                 if needs_quote {
                     out.push(quote);
                     for c in s.chars() {

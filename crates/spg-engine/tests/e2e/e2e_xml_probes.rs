@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -31,10 +33,7 @@ fn xmlcomment_wraps_text() {
         text(&first(&mut e, "SELECT xmlcomment('hello')")),
         "<!--hello-->"
     );
-    assert_eq!(
-        text(&first(&mut e, "SELECT xmlcomment('')")),
-        "<!---->"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT xmlcomment('')")), "<!---->");
 }
 
 #[test]
@@ -46,11 +45,20 @@ fn xmlcomment_rejects_dashes() {
 #[test]
 fn xml_is_well_formed_shape_heuristic() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT xml_is_well_formed('<a></a>')")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT xml_is_well_formed('<a></a>')"
+    )));
     assert!(as_bool(&first(&mut e, "SELECT xml_is_well_formed('')")));
-    assert!(!as_bool(&first(&mut e, "SELECT xml_is_well_formed('not xml')")));
+    assert!(!as_bool(&first(
+        &mut e,
+        "SELECT xml_is_well_formed('not xml')"
+    )));
     // Well-formed nesting.
-    assert!(as_bool(&first(&mut e, "SELECT xml_is_well_formed('<a><b></b></a>')")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT xml_is_well_formed('<a><b></b></a>')"
+    )));
     // Note: SPG's heuristic uses only tag-count balance and can
     // report false positives for malformed-nesting cases like
     // '<a><b></a>'. Real DOM-based validation queues with the

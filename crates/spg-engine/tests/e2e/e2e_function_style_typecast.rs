@@ -19,11 +19,23 @@ fn function_style_typecast_matches_cast() {
     assert_eq!(cell(&mut e, "SELECT text(42)"), "Text(\"42\")");
     assert_eq!(cell(&mut e, "SELECT bool('t')"), "Bool(true)");
     assert_eq!(cell(&mut e, "SELECT float8('1.5')"), "Float(1.5)");
-    assert_eq!(cell(&mut e, "SELECT (date('2024-01-15'))::text"), "Text(\"2024-01-15\")");
+    assert_eq!(
+        cell(&mut e, "SELECT (date('2024-01-15'))::text"),
+        "Text(\"2024-01-15\")"
+    );
     // Geometric constructors that used to error as "unknown function".
-    assert_eq!(cell(&mut e, "SELECT circle('<(0,0),5>') @> point(3,4)"), "Bool(true)");
-    assert_eq!(cell(&mut e, "SELECT box('(0,0),(10,10)') @> point(5,5)"), "Bool(true)");
-    assert_eq!(cell(&mut e, "SELECT radius(circle('<(0,0),5>'))"), "Float(5.0)");
+    assert_eq!(
+        cell(&mut e, "SELECT circle('<(0,0),5>') @> point(3,4)"),
+        "Bool(true)"
+    );
+    assert_eq!(
+        cell(&mut e, "SELECT box('(0,0),(10,10)') @> point(5,5)"),
+        "Bool(true)"
+    );
+    assert_eq!(
+        cell(&mut e, "SELECT radius(circle('<(0,0),5>'))"),
+        "Float(5.0)"
+    );
     // A genuinely unknown function name still errors (not a type name).
     assert!(e.execute("SELECT nonexistent_fn(1)").is_err());
     // Two args → not a typecast even if the name is a type.

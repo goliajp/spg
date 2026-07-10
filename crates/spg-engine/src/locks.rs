@@ -159,7 +159,11 @@ impl LockTable {
 
         if blockers.is_empty() {
             // Grant: record the holder if not already present.
-            if !entry.holders.iter().any(|&(hv, hm)| hv == version && hm == mode) {
+            if !entry
+                .holders
+                .iter()
+                .any(|&(hv, hm)| hv == version && hm == mode)
+            {
                 entry.holders.push((version, mode));
             }
             // A previously-parked waiter that now gets in drops its

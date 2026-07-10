@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -71,9 +73,7 @@ fn jsonb_array_length_errors_on_non_array() {
         e.execute("SELECT jsonb_array_length('{\"a\": 1}'::jsonb)")
             .is_err()
     );
-    assert!(
-        e.execute("SELECT jsonb_array_length('42'::jsonb)").is_err()
-    );
+    assert!(e.execute("SELECT jsonb_array_length('42'::jsonb)").is_err());
 }
 
 #[test]

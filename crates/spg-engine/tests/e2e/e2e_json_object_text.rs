@@ -34,7 +34,10 @@ fn json_object_accepts_text_array_literals() {
     );
     // The ARRAY[...] spelling still works.
     assert_eq!(
-        text(&mut e, "SELECT json_object(ARRAY['a','b'], ARRAY['1','2'])::text"),
+        text(
+            &mut e,
+            "SELECT json_object(ARRAY['a','b'], ARRAY['1','2'])::text"
+        ),
         r#"{"a" : "1", "b" : "2"}"#
     );
 }

@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -89,7 +91,13 @@ fn row_is_null_over_columns() {
     e.execute("INSERT INTO rn VALUES (1, 2), (3, NULL), (NULL, NULL)")
         .unwrap();
     // Only the all-NULL row satisfies (a,b) IS NULL.
-    assert!(b(&mut e, "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NULL"));
+    assert!(b(
+        &mut e,
+        "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NULL"
+    ));
     // Only the all-non-NULL row satisfies (a,b) IS NOT NULL.
-    assert!(b(&mut e, "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NOT NULL"));
+    assert!(b(
+        &mut e,
+        "SELECT count(*) = 1 FROM rn WHERE (a, b) IS NOT NULL"
+    ));
 }

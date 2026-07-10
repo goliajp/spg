@@ -25,8 +25,14 @@ fn uuidv7_prefix_is_host_wall_clock() {
     let mut e = Engine::new().with_clock(fixed_clock);
     // The 48-bit prefix (12 hex chars) equals the injected ms since epoch:
     // 1_717_200_000_000 ms = 0x018fd1189400.
-    let hex = text(&mut e, "SELECT substring(replace(uuidv7()::text,'-',''),1,12)");
-    assert_eq!(hex, "018fd1189400", "prefix should be the injected wall clock");
+    let hex = text(
+        &mut e,
+        "SELECT substring(replace(uuidv7()::text,'-',''),1,12)",
+    );
+    assert_eq!(
+        hex, "018fd1189400",
+        "prefix should be the injected wall clock"
+    );
     // Version nibble is 7.
     assert_eq!(text(&mut e, "SELECT substring(uuidv7()::text,15,1)"), "7");
 }

@@ -74,7 +74,8 @@ fn main() {
         Some(verb)
             if matches!(
                 verb,
-                "\\d" | "\\dt"
+                "\\d"
+                    | "\\dt"
                     | "\\di"
                     | "\\dv"
                     | "\\df"
@@ -322,10 +323,7 @@ fn main() {
                 );
                 return;
             };
-            if retention_hours.is_none()
-                && retention_bytes.is_none()
-                && retention_count.is_none()
-            {
+            if retention_hours.is_none() && retention_bytes.is_none() && retention_count.is_none() {
                 die(
                     "prune-pitr: at least one of --retention-hours / --retention-bytes / \
                      --retention-count is required",
@@ -408,9 +406,7 @@ fn main() {
                         std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
                 }
-                eprintln!(
-                    "[watch summary] runs={run_idx} failed={fail_count}"
-                );
+                eprintln!("[watch summary] runs={run_idx} failed={fail_count}");
                 if fail_count > 0 {
                     process::exit(1);
                 }
@@ -1179,7 +1175,11 @@ fn prune_pitr(
             .unwrap_or(0);
         let prefix_s = (prefix_us / 1_000_000) as u64;
         let size = fs::metadata(&path).map_or(0, |m| m.len());
-        chunks.push(ChunkEntry { path, prefix_s, size });
+        chunks.push(ChunkEntry {
+            path,
+            prefix_s,
+            size,
+        });
     }
     chunks.sort_by(|a, b| b.prefix_s.cmp(&a.prefix_s)); // newest first
 
@@ -1194,11 +1194,7 @@ fn prune_pitr(
         let keep_by_bytes = match retention_bytes {
             Some(budget) => {
                 let after = running_bytes.saturating_add(c.size);
-                if after <= budget {
-                    true
-                } else {
-                    false
-                }
+                if after <= budget { true } else { false }
             }
             None => false,
         };
@@ -2396,13 +2392,7 @@ mod tests {
         }
 
         // Budget = 2048 → newest 2 fit; oldest gets dropped.
-        let summary = prune_pitr(
-            backup_dir.to_str().unwrap(),
-            None,
-            Some(2048),
-            None,
-        )
-        .unwrap();
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), None, Some(2048), None).unwrap();
         assert!(summary.contains("removed=1"), "summary: {summary}");
         assert!(summary.contains("kept=2"), "summary: {summary}");
 
@@ -2427,13 +2417,7 @@ mod tests {
             fs::write(&chunk, b"x").unwrap();
         }
 
-        let summary = prune_pitr(
-            backup_dir.to_str().unwrap(),
-            Some(1),
-            None,
-            Some(1),
-        )
-        .unwrap();
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), Some(1), None, Some(1)).unwrap();
         assert!(summary.contains("kept=1"), "summary: {summary}");
         assert!(summary.contains("removed=1"), "summary: {summary}");
 
