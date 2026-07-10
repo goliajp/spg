@@ -63,20 +63,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Three TCP-fronted servers via sqlx.
+    // Three TCP-fronted competitor servers via sqlx. A backend that isn't up
+    // is skipped (logged to stderr) rather than aborting the whole sweep — the
+    // SPG-vs-PG18 comparison must still print when MySQL/MariaDB are absent.
     for (label, url) in connection_strings() {
-        let pool = AnyPoolOptions::new()
+        let pool = match AnyPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(&url)
-            .await?;
-        let (insert, select) = bench_via_sqlx(&pool, label).await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip {label}: connect failed ({e})");
+                continue;
+            }
+        };
+        match bench_via_sqlx(&pool, label).await {
+            Ok((insert, select)) => rows.push(Row3 {
+                backend: label.into(),
+                insert,
+                select,
+            }),
+            Err(e) => eprintln!("skip {label}: bench failed ({e})"),
+        }
         pool.close().await;
-        rows.push(Row3 {
-            backend: label.into(),
-            insert,
-            select,
-        });
     }
 
     print_table(&rows);
