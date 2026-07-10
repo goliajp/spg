@@ -2,7 +2,7 @@
 //! engine wiring lands in v7.6.1+; this file pins the AST shape so
 //! later phases can rely on it.
 
-use spg_sql::ast::{FkAction, ForeignKeyConstraint, Statement};
+use spg_sql::ast::{FkAction, ForeignKeyConstraint, MatchType, Statement};
 use spg_sql::parser::parse_statement;
 
 fn parse_create_table(sql: &str) -> Vec<ForeignKeyConstraint> {
@@ -197,25 +197,27 @@ fn match_full_single_column_is_accepted() {
 }
 
 #[test]
-fn match_full_multi_column_is_rejected() {
-    // Multi-column MATCH FULL needs the all-or-none-NULL rule, still unwired.
-    let err = parse_statement(
+fn match_full_multi_column_parses() {
+    // v7.38 (T29) — multi-column MATCH FULL is accepted (PG accepts it too) and
+    // carries MatchType::Full through the AST; the engine enforces the
+    // all-or-none-NULL rule. This test used to assert a parser rejection, which
+    // T29 made obsolete.
+    let fks = parse_create_table(
         "CREATE TABLE c (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p (a, b) MATCH FULL)",
-    )
-    .expect_err("multi-column MATCH FULL should be rejected");
-    assert!(
-        format!("{err:?}").contains("MATCH FULL on a multi-column foreign key"),
-        "got {err:?}"
     );
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].match_type, MatchType::Full);
+    assert_eq!(fks[0].columns, ["a", "b"]);
 }
 
 #[test]
 fn match_partial_is_rejected() {
+    // PG18.4 rejects MATCH PARTIAL with exactly this wording.
     let err =
         parse_statement("CREATE TABLE c (x INT REFERENCES q(id) MATCH PARTIAL)")
             .expect_err("MATCH PARTIAL should be rejected");
     assert!(
-        format!("{err:?}").contains("MATCH PARTIAL is not implemented"),
+        format!("{err:?}").contains("MATCH PARTIAL not yet implemented"),
         "got {err:?}"
     );
 }
