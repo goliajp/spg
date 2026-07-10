@@ -2010,7 +2010,7 @@ impl Engine {
             rows.into_iter()
                 .enumerate()
                 .map(|(i, row)| {
-                    let mut vals = row.values.to_vec();
+                    let mut vals = row.values.clone();
                     vals.push(Value::BigInt(i as i64 + 1));
                     Row::new(vals)
                 })
@@ -2219,7 +2219,7 @@ impl Engine {
             rows.into_iter()
                 .enumerate()
                 .map(|(i, row)| {
-                    let mut vals = row.values.to_vec();
+                    let mut vals = row.values.clone();
                     vals.push(Value::BigInt(i as i64 + 1));
                     Row::new(vals)
                 })
@@ -4525,8 +4525,8 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         having: None,
         unions: Vec::new(),
         order_by: outer_order,
-        limit: stmt.limit.clone(),
-        offset: stmt.offset.clone(),
+        limit: stmt.limit,
+        offset: stmt.offset,
         limit_with_ties: stmt.limit_with_ties,
     })
 }
@@ -4969,7 +4969,7 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
         return types
             .iter()
             .max_by_key(|t| numeric_rank(t).unwrap_or(0))
-            .cloned();
+            .copied();
     }
     let non_text: Vec<&DataType> = types
         .iter()
@@ -4995,7 +4995,7 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
     }
     // A single concrete non-TEXT type mixed with TEXT literals.
     if non_text.len() == 1 {
-        return Some(non_text[0].clone());
+        return Some(*non_text[0]);
     }
     None
 }
@@ -5039,7 +5039,7 @@ fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) 
                             scale: 0,
                         }
                     } else {
-                        target.clone()
+                        target
                     };
                     match crate::conversions::coerce_value(
                         v.clone(),

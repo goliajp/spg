@@ -463,7 +463,7 @@ fn expand_wildcards(
                 spliced = true;
             }
             SelectItem::Wildcard => {}
-            other => out.push(other),
+            other @ SelectItem::Expr { .. } => out.push(other),
         }
     }
     *items = out;

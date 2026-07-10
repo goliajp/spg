@@ -1793,7 +1793,7 @@ fn apply_function_dispatch(
         // semantics, so '' is the honest PG-shaped answer for all.
         "pg_tablespace_location" => match args.first() {
             Some(Value::Null) => Ok(Value::Null),
-            _ => Ok(Value::text::<String>("".into())),
+            _ => Ok(Value::text::<String>(String::new())),
         },
         // pg_tablespace_databases(oid) — SRF of database oids in a
         // tablespace; pg_filenode_relation — filenode → regclass.
@@ -3344,7 +3344,7 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::SmallInt(n) => Ok(Value::BigInt(
-                    (*n as i16).count_ones() as i64
+                    (*n).count_ones() as i64
                 )),
                 Value::Int(n) => Ok(Value::BigInt(n.count_ones() as i64)),
                 Value::BigInt(n) => Ok(Value::BigInt(n.count_ones() as i64)),
@@ -6455,14 +6455,16 @@ fn apply_function_dispatch(
             let mut chars = s.chars().filter(|c| c.is_ascii_alphabetic()).peekable();
             let mut out = alloc::string::String::new();
             let Some(first) = chars.next() else {
-                return Ok(Value::text::<String>("".into()));
+                return Ok(Value::text::<String>(String::new()));
             };
             out.push(first.to_ascii_uppercase());
             let mut last_code = code(first);
             for c in chars {
                 let cur = code(c);
-                if cur.is_some() && cur != last_code {
-                    out.push(cur.unwrap());
+                if let Some(cv) = cur
+                    && cur != last_code
+                {
+                    out.push(cv);
                     if out.len() >= 4 {
                         break;
                     }
@@ -6528,8 +6530,10 @@ fn apply_function_dispatch(
                 let mut last_code = code(first);
                 for c in chars {
                     let cur = code(c);
-                    if cur.is_some() && cur != last_code {
-                        out.push(cur.unwrap());
+                    if let Some(cv) = cur
+                        && cur != last_code
+                    {
+                        out.push(cv);
                         if out.len() >= 4 {
                             break;
                         }
@@ -6615,7 +6619,7 @@ fn apply_function_dispatch(
                 let mut curr: alloc::vec::Vec<i32> = alloc::vec![0; short.len() + 1];
                 curr[0] = j as i32;
                 for i in 1..=short.len() {
-                    let cost = if short[i - 1] == long_[j - 1] { 0 } else { 1 };
+                    let cost = i32::from(short[i - 1] != long_[j - 1]);
                     curr[i] = (curr[i - 1] + 1)
                         .min(prev[i] + 1)
                         .min(prev[i - 1] + cost);
@@ -7430,9 +7434,8 @@ fn apply_function_dispatch(
                                 bytes[i]
                             ),
                         });
-                    } else {
-                        break;
                     }
+                    break;
                 }
                 // Look for a separator.
                 while i < bytes.len() && bytes[i].is_whitespace() {
@@ -7614,7 +7617,7 @@ fn apply_function_dispatch(
                 Value::Numeric { scaled, scale, .. } => {
                     // scaled / 10^scale = seconds. Multiply by 1e6.
                     let ten_pow = 10i128.pow(*scale as u32);
-                    let us_i128 = *scaled as i128 * 1_000_000 / ten_pow;
+                    let us_i128 = *scaled * 1_000_000 / ten_pow;
                     let us = i64::try_from(us_i128).unwrap_or(i64::MAX);
                     Ok(Value::Timestamp(us))
                 }
@@ -8387,7 +8390,7 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            if seed < -1.0 || seed > 1.0 {
+            if !(-1.0..=1.0).contains(&seed) {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "setseed(): seed {seed} out of range [-1, 1]"
@@ -8851,7 +8854,7 @@ fn apply_function_dispatch(
                 let exp_int: Option<u32> = match &args[1] {
                     Value::SmallInt(n) if *n >= 0 => Some(u32::from(*n as u16)),
                     Value::Int(n) if *n >= 0 => Some(*n as u32),
-                    Value::BigInt(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Some(*n as u32),
+                    Value::BigInt(n) if u32::try_from(*n).is_ok() => Some(*n as u32),
                     Value::Numeric { scaled, scale: 0 , .. }
                         if *scaled >= 0 && *scaled <= i128::from(u32::MAX) =>
                     {
@@ -9357,7 +9360,7 @@ fn apply_function_dispatch(
                 }
             };
             if count == 0 || delim.is_empty() {
-                return Ok(Value::text::<String>("".into()));
+                return Ok(Value::text::<String>(String::new()));
             }
             if count > 0 {
                 let mut pos = 0usize;
@@ -9497,7 +9500,7 @@ fn apply_function_dispatch(
                 }
             };
             if n <= 0 {
-                return Ok(Value::text::<String>("".into()));
+                return Ok(Value::text::<String>(String::new()));
             }
             if n > 1_000_000 {
                 return Err(EvalError::TypeMismatch {
@@ -12494,7 +12497,7 @@ fn apply_function_dispatch(
                 Value::BigInt(x) => *x,
                 Value::Numeric { scaled, scale, .. } => {
                     let ten_pow = 10i128.pow(*scale as u32);
-                    (*scaled as i128 / ten_pow) as i64
+                    (*scaled / ten_pow) as i64
                 }
                 other => {
                     return Err(EvalError::TypeMismatch {
@@ -15020,7 +15023,7 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
     // v7.37 — resolve DDD (day of year) to month/day now that the year is
     // known (Jan 1 + doy - 1).
     if let Some(d) = doy {
-        if d < 1 || d > 366 {
+        if !(1..=366).contains(&d) {
             return Err(alloc::format!("day-of-year {d} out of range"));
         }
         let abs = super::days_from_civil(year, 1, 1) + (d as i32) - 1;

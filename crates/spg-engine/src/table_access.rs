@@ -62,7 +62,7 @@ impl Engine {
                     rows.into_iter()
                         .enumerate()
                         .map(|(i, row)| {
-                            let mut vals = row.values.to_vec();
+                            let mut vals = row.values.clone();
                             vals.push(Value::BigInt(i as i64 + 1));
                             Row::new(vals)
                         })
@@ -136,7 +136,7 @@ impl Engine {
                 rows.into_iter()
                     .enumerate()
                     .map(|(i, row)| {
-                        let mut vals = row.values.to_vec();
+                        let mut vals = row.values.clone();
                         vals.push(Value::BigInt(i as i64 + 1));
                         Row::new(vals)
                     })
@@ -168,7 +168,7 @@ impl Engine {
                 rows.into_iter()
                     .enumerate()
                     .map(|(i, row)| {
-                        let mut vals = row.values.to_vec();
+                        let mut vals = row.values.clone();
                         vals.push(Value::BigInt(i as i64 + 1));
                         Row::new(vals)
                     })

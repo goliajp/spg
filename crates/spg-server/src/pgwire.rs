@@ -2840,10 +2840,9 @@ fn parse_set_statement(sql: &str) -> Option<(String, String)> {
     // Find name + assign operator (= or TO).
     let (name, value_part) = if let Some(idx) = rest.find('=') {
         (rest[..idx].trim().to_string(), rest[idx + 1..].trim())
-    } else if let Some(idx) = rest.find(" to ") {
-        (rest[..idx].trim().to_string(), rest[idx + 4..].trim())
     } else {
-        return None;
+        let idx = rest.find(" to ")?;
+        (rest[..idx].trim().to_string(), rest[idx + 4..].trim())
     };
     if name.is_empty() {
         return None;

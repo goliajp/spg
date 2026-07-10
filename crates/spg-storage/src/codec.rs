@@ -2776,7 +2776,7 @@ fn read_partition_bound(cur: &mut Cursor<'_>) -> Result<crate::PartitionBound, S
         7 => {
             let len = cur.read_u32()? as usize;
             let bytes = cur.read_bytes(len)?;
-            let s = alloc::string::String::from_utf8(bytes.to_vec()).map_err(|e| {
+            let s = alloc::string::String::from_utf8(bytes.clone()).map_err(|e| {
                 StorageError::Corrupt(format!("partition_bound Text: invalid UTF-8: {e}"))
             })?;
             Ok(PartitionBound::Text(s))

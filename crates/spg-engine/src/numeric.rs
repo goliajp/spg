@@ -472,7 +472,7 @@ fn weight_firstdigit_core(s: &str, scale: u8) -> (i32, i32) {
         for _ in 0..lead_zeros {
             frac.push('0');
         }
-        frac.push_str(&s);
+        frac.push_str(s);
         let start = (4 * g) as usize;
         let mut group: alloc::string::String = frac[start..].chars().take(4).collect();
         while group.len() < 4 {

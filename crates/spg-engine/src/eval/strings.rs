@@ -1018,7 +1018,7 @@ fn to_char_roman(n: f64, fill_mode: bool) -> String {
     #[allow(clippy::cast_possible_truncation)]
     let v = libm::round(n) as i64;
     if !(1..=3999).contains(&v) {
-        return core::iter::repeat('#').take(15).collect();
+        return core::iter::repeat_n('#', 15).collect();
     }
     const VALS: [(i64, &str); 13] = [
         (1000, "M"),
@@ -1519,7 +1519,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let week_of_year = (day_of_year - 1) / 7 + 1; // WW
     let week_of_month = i64::from((d - 1) / 7) + 1; // W
     let dow_sun1 = (i64::from(days) + 4).rem_euclid(7) + 1; // D: Sunday = 1
-    let iso_dow = i64::from(dow_mon0 as i64) + 1; // ID: Monday = 1
+    let iso_dow = (dow_mon0 as i64) + 1; // ID: Monday = 1
     let julian = i64::from(days) + 2_440_588; // J
     let century: i64 = if y > 0 {
         i64::from((y - 1) / 100) + 1

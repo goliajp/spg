@@ -1,5 +1,7 @@
 //! v7.37.17 (17.6 siblings) — pgcrypto hmac(data, key, type).
 
+use std::fmt::Write;
+
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
@@ -14,7 +16,13 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 
 fn to_hex(v: &spg_storage::Value<'_>) -> String {
     match v {
-        spg_storage::Value::Bytes(b) => b.iter().map(|byte| format!("{byte:02x}")).collect(),
+        spg_storage::Value::Bytes(b) => {
+            let mut out = String::with_capacity(b.len() * 2);
+            for byte in b.iter() {
+                write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            out
+        }
         other => panic!("expected Bytes, got {other:?}"),
     }
 }

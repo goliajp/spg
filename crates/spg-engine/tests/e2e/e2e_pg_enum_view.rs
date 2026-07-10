@@ -73,7 +73,7 @@ fn pg_enum_enumtypid_groups_labels_of_same_type() {
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_enum");
     // Position 1 = enumtypid. Group by it; expect one group of
     // size 2 and one group of size 3.
-    let mut counts: std::collections::HashMap<i64, usize> = Default::default();
+    let mut counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
     for r in &rs {
         if let Value::BigInt(typid) = r[1] {
             *counts.entry(typid).or_default() += 1;

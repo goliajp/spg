@@ -1350,7 +1350,7 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) 
             scale: 0,
         }
     } else {
-        common.clone()
+        *common
     };
     match crate::conversions::coerce_value(v.clone(), target, "", 0) {
         Ok(cv) => cv,

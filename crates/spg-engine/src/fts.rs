@@ -609,7 +609,7 @@ fn calc_rank_or(vec: &[TsLexeme], terms: &[&str], weights: &RankWeights) -> f32 
                 }
             }
             let jm_denom = ((jm + 1) * (jm + 1)) as f32;
-            res += (wjm + resj - wjm / jm_denom) / 1.644_934_1;
+            res += (wjm + resj - wjm / jm_denom) / 1.644_934;
         }
     }
     res / (terms.len().max(1) as f32)

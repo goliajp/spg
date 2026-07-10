@@ -1349,7 +1349,7 @@ fn re_match_at_caps(
                     && (0..need_len).all(|k| {
                         let (a, b) = (s[pos + k], s[cs + k]);
                         if *ci {
-                            a.to_ascii_lowercase() == b.to_ascii_lowercase()
+                            a.eq_ignore_ascii_case(&b)
                         } else {
                             a == b
                         }
@@ -2030,21 +2030,16 @@ pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     let chars: Vec<char> = text.chars().collect();
     let mut from = (start_1based - 1) as usize;
     let mut hits = 0i64;
-    loop {
-        match re_find(&node, &chars, from)? {
-            Some((s_pos, e_pos)) => {
-                hits += 1;
-                if hits == nth {
-                    let idx = if endoption == 1 { e_pos } else { s_pos };
-                    return Ok(Value::Int((idx + 1) as i32));
-                }
-                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
-                from = step;
-                if from > chars.len() {
-                    break;
-                }
-            }
-            None => break,
+    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from)? {
+        hits += 1;
+        if hits == nth {
+            let idx = if endoption == 1 { e_pos } else { s_pos };
+            return Ok(Value::Int((idx + 1) as i32));
+        }
+        let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+        from = step;
+        if from > chars.len() {
+            break;
         }
     }
     Ok(Value::Int(0))
@@ -2106,21 +2101,16 @@ pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
     let chars: Vec<char> = text.chars().collect();
     let mut from = (start_1based - 1) as usize;
     let mut hits = 0i64;
-    loop {
-        match re_find(&node, &chars, from)? {
-            Some((s_pos, e_pos)) => {
-                hits += 1;
-                if hits == nth {
-                    let substr: String = chars[s_pos..e_pos].iter().collect();
-                    return Ok(Value::text(substr));
-                }
-                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
-                from = step;
-                if from > chars.len() {
-                    break;
-                }
-            }
-            None => break,
+    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from)? {
+        hits += 1;
+        if hits == nth {
+            let substr: String = chars[s_pos..e_pos].iter().collect();
+            return Ok(Value::text(substr));
+        }
+        let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+        from = step;
+        if from > chars.len() {
+            break;
         }
     }
     Ok(Value::Null)
@@ -2274,17 +2264,12 @@ pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     let chars: Vec<char> = text.chars().collect();
     let mut count: i64 = 0;
     let mut from = (start_1based - 1) as usize;
-    loop {
-        match re_find(&node, &chars, from)? {
-            Some((s_pos, e_pos)) => {
-                count += 1;
-                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
-                from = step;
-                if from > chars.len() {
-                    break;
-                }
-            }
-            None => break,
+    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from)? {
+        count += 1;
+        let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+        from = step;
+        if from > chars.len() {
+            break;
         }
     }
     Ok(Value::BigInt(count))
@@ -2304,11 +2289,11 @@ mod redos_tests {
     }
 
     fn repeat_char(c: char, n: usize) -> String {
-        core::iter::repeat(c).take(n).collect()
+        core::iter::repeat_n(c, n).collect()
     }
 
     fn repeat_char_str(s: &str, n: usize) -> String {
-        core::iter::repeat(s).take(n).collect()
+        core::iter::repeat_n(s, n).collect()
     }
 
     // (a) A deeply-nested pattern hits the parser recursion cap and
@@ -2477,7 +2462,7 @@ mod matchall_tests {
     }
 
     fn repeat_char(c: char, n: usize) -> String {
-        core::iter::repeat(c).take(n).collect()
+        core::iter::repeat_n(c, n).collect()
     }
 
     // Detector recognizes the fully-anchored dot-repetition shapes and

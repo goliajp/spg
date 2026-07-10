@@ -746,7 +746,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         #[allow(clippy::cast_possible_truncation)]
         Value::Float(x) => {
             let r = f64_round_half_even(x);
-            if !r.is_finite() || r < -2_147_483_648.0 || r > 2_147_483_647.0 {
+            if !r.is_finite() || !(-2_147_483_648.0..=2_147_483_647.0).contains(&r) {
                 return Err(EvalError::TypeMismatch {
                     detail: "integer out of range".into(),
                 });
@@ -789,8 +789,7 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         Value::Float(x) => {
             let r = f64_round_half_even(x);
             if !r.is_finite()
-                || r < -9_223_372_036_854_775_808.0
-                || r >= 9_223_372_036_854_775_808.0
+                || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r)
             {
                 return Err(EvalError::TypeMismatch {
                     detail: "bigint out of range".into(),

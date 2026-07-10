@@ -2067,8 +2067,7 @@ impl Engine {
                 let key_pos = match &self
                     .active_catalog()
                     .get(&spec.parent_name)
-                    .and_then(|p| Some(p.schema().partition_role.clone()))
-                    .flatten()
+                    .and_then(|p| p.schema().partition_role.clone())
                 {
                     Some(PartitionRole::Parent {
                         key_column_positions,

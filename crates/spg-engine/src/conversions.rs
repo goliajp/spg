@@ -1161,14 +1161,11 @@ pub fn parse_lseg_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Po
     let two_points = |v: Option<alloc::vec::Vec<spg_storage::Point2D>>| v.filter(|p| p.len() == 2);
     let pts = if let Some(p) = two_points(parse_point_list(inner)) {
         p
-    } else if let Some(p) = inner
-        .strip_prefix('(')
-        .and_then(|x| x.strip_suffix(')'))
-        .and_then(|w| two_points(parse_point_list(w)))
-    {
-        p
     } else {
-        return None;
+        inner
+            .strip_prefix('(')
+            .and_then(|x| x.strip_suffix(')'))
+            .and_then(|w| two_points(parse_point_list(w)))?
     };
     Some((pts[0], pts[1]))
 }
@@ -2295,7 +2292,7 @@ fn coerce_text_array_to(
     for item in items {
         match item {
             None => scal.push(None),
-            Some(s) => scal.push(Some(coerce_value(Value::text(s), elem_dt.clone(), col, 0)?)),
+            Some(s) => scal.push(Some(coerce_value(Value::text(s), elem_dt, col, 0)?)),
         }
     }
     let out = match target {

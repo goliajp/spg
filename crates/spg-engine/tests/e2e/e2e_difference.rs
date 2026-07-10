@@ -40,7 +40,7 @@ fn difference_partial_match() {
     // smith (S530) vs snow (S500) — first 2 chars same (S5), 3rd
     // differs (3 vs 0), 4th differs (0 vs 0 = same).
     let n = as_int(&first(&mut e, "SELECT difference('smith', 'snow')"));
-    assert!(n >= 2 && n <= 4, "got {n}");
+    assert!((2..=4).contains(&n), "got {n}");
 }
 
 #[test]

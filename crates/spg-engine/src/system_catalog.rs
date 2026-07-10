@@ -413,8 +413,8 @@ pub(crate) fn synth_information_schema_views(
     ];
     let rows: Vec<Row<'static>> = cat
         .views()
-        .iter()
-        .map(|(_, v)| {
+        .values()
+        .map(|v| {
             Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
@@ -1612,8 +1612,8 @@ pub(crate) fn synth_information_schema_domains(
     ];
     let rows: Vec<Row<'static>> = cat
         .domain_types()
-        .iter()
-        .map(|(_name, def)| {
+        .values()
+        .map(|def| {
             let base_name = pg_data_type_text(def.base_type);
             Row::new(alloc::vec![
                 Value::text("spg"),
@@ -1699,7 +1699,7 @@ pub(crate) fn synth_information_schema_table_constraints(
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         // Uniqueness constraints — both PK and UNIQUE forms.
-        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+        for uc in t.schema().uniqueness_constraints.iter() {
             let conname = pg_unique_conname(t, uc, &tname);
             let kind = if uc.is_primary_key {
                 "PRIMARY KEY"
@@ -2589,7 +2589,7 @@ pub(crate) fn synth_info_constraint_column_usage(
             cols.get(pos)
                 .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
         };
-        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+        for uc in t.schema().uniqueness_constraints.iter() {
             let conname = pg_unique_conname(t, uc, &tname);
             for &p in &uc.columns {
                 push(&tname, col_name_at(p), conname.clone());
@@ -2764,7 +2764,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
             }
         }
         // PK / composite UC entries.
-        for (_ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+        for uc in t.schema().uniqueness_constraints.iter() {
             let conname = pg_unique_conname(t, uc, &tname);
             for (i, &local) in uc.columns.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
@@ -3009,7 +3009,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         // Uniqueness constraints.
         for uc in t.schema().uniqueness_constraints.iter() {
             let kind = if uc.is_primary_key { "p" } else { "u" };
-            let conname = pg_unique_conname(t, uc, &tname);
+            let conname = pg_unique_conname(t, uc, tname);
             let conkey = conkey_vec(&uc.columns);
             let conkey_names: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
             // Hybrid: PG's `conkey` is int2vector; expose the
@@ -3090,7 +3090,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, tname));
             let confrelid = by_table.get(&fk.parent_table).copied().unwrap_or(0);
             let conkey = conkey_vec(&fk.local_columns);
             let confkey = conkey_vec(&fk.parent_columns);
@@ -3143,7 +3143,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously
         // omitted, so pg_constraint enumeration missed every CHECK.
-        let check_names = pg_check_connames(t, &tname, &t.schema().checks);
+        let check_names = pg_check_connames(t, tname, &t.schema().checks);
         for conname in check_names {
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
@@ -3983,7 +3983,9 @@ pub(crate) fn collect_meta_view_names(
             }
             Expr::InList { expr, list, .. } => {
                 walk_expr(expr, into);
-                list.iter().for_each(|it| walk_expr(it, into));
+                for it in list {
+                    walk_expr(it, into);
+                }
             }
             Expr::AnyAll { expr, array, .. } => {
                 walk_expr(expr, into);
@@ -4018,7 +4020,9 @@ pub(crate) fn collect_meta_view_names(
         walk_expr(h, into);
     }
     if let Some(gs) = &stmt.group_by {
-        gs.iter().for_each(|g| walk_expr(g, into));
+        for g in gs {
+            walk_expr(g, into);
+        }
     }
     for o in &stmt.order_by {
         walk_expr(&o.expr, into);

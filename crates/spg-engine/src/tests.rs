@@ -2432,10 +2432,7 @@ fn rollback_marks_writer_version_aborted() {
 /// Extract the rows of a `SELECT` result as `Vec<Vec<Value>>`.
 fn select_values(e: &mut Engine, sql: &str) -> alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => rows
-            .into_iter()
-            .map(|r| r.values.iter().cloned().collect())
-            .collect(),
+        QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values.clone()).collect(),
         QueryResult::CommandOk { .. } => panic!("expected Rows from `{sql}`"),
     }
 }

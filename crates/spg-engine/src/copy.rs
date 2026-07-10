@@ -247,10 +247,8 @@ pub fn csv_record_end(buf: &[u8], delimiter: u8, quote: u8) -> Option<usize> {
             at_field_start = false;
         } else if b == b'\n' {
             return Some(i + 1);
-        } else if b == delimiter {
-            at_field_start = true;
         } else {
-            at_field_start = false;
+            at_field_start = b == delimiter;
         }
         i += 1;
     }
@@ -341,6 +339,99 @@ fn copy_cell_looks_numeric(s: &str) -> bool {
         }
     }
     seen_digit
+}
+
+/// Encode one row's selected cells as a COPY text-format line —
+/// the inverse of [`decode_copy_text_row`]: tab-separated, `\N`
+/// for NULL, C-style backslash escapes for the control characters
+/// the decoder understands.
+#[must_use]
+pub fn encode_copy_text_cells(cells: &[Option<String>]) -> String {
+    encode_copy_text_cells_opts(cells, '\t', "\\N")
+}
+
+/// Encode one row's cells as a COPY text-format line with a custom
+/// delimiter and NULL marker (PG `COPY … WITH (FORMAT text, DELIMITER
+/// 'c', NULL 'str')`). The named C-escapes (`\t \n \r \b \f \v \\`) are
+/// always applied; a delimiter character that is not itself one of those
+/// gets a literal `\<char>` escape so it round-trips.
+#[must_use]
+pub fn encode_copy_text_cells_opts(
+    cells: &[Option<String>],
+    delimiter: char,
+    null_str: &str,
+) -> String {
+    let mut out = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push(delimiter);
+        }
+        match cell {
+            None => out.push_str(null_str),
+            Some(s) => {
+                for c in s.chars() {
+                    match c {
+                        '\\' => out.push_str("\\\\"),
+                        '\t' => out.push_str("\\t"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\u{08}' => out.push_str("\\b"),
+                        '\u{0c}' => out.push_str("\\f"),
+                        '\u{0b}' => out.push_str("\\v"),
+                        other if other == delimiter => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                        other => out.push(other),
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode one row's cells as a CSV line (PG `COPY … WITH (FORMAT csv)`).
+/// A non-NULL field is quoted when it contains the delimiter, the quote
+/// character, a CR or LF, or when its text equals `null_str` — so an
+/// empty string under the default empty NULL, or any value that collides
+/// with the NULL marker, reads back as itself rather than as NULL. The
+/// quote character is doubled inside a quoted field. NULL is emitted as
+/// `null_str`, unquoted.
+#[must_use]
+pub fn encode_copy_csv_cells(
+    cells: &[Option<String>],
+    delimiter: char,
+    quote: char,
+    null_str: &str,
+) -> String {
+    let mut out = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push(delimiter);
+        }
+        match cell {
+            None => out.push_str(null_str),
+            Some(s) => {
+                let needs_quote = s.as_str() == null_str
+                    || s.chars()
+                        .any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
+                if needs_quote {
+                    out.push(quote);
+                    for c in s.chars() {
+                        if c == quote {
+                            out.push(quote);
+                        }
+                        out.push(c);
+                    }
+                    out.push(quote);
+                } else {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -450,97 +541,4 @@ mod tests {
         // Incomplete: no newline yet.
         assert_eq!(csv_record_end(b"a,b", b',', b'"'), None);
     }
-}
-
-/// Encode one row's selected cells as a COPY text-format line —
-/// the inverse of [`decode_copy_text_row`]: tab-separated, `\N`
-/// for NULL, C-style backslash escapes for the control characters
-/// the decoder understands.
-#[must_use]
-pub fn encode_copy_text_cells(cells: &[Option<String>]) -> String {
-    encode_copy_text_cells_opts(cells, '\t', "\\N")
-}
-
-/// Encode one row's cells as a COPY text-format line with a custom
-/// delimiter and NULL marker (PG `COPY … WITH (FORMAT text, DELIMITER
-/// 'c', NULL 'str')`). The named C-escapes (`\t \n \r \b \f \v \\`) are
-/// always applied; a delimiter character that is not itself one of those
-/// gets a literal `\<char>` escape so it round-trips.
-#[must_use]
-pub fn encode_copy_text_cells_opts(
-    cells: &[Option<String>],
-    delimiter: char,
-    null_str: &str,
-) -> String {
-    let mut out = String::new();
-    for (i, cell) in cells.iter().enumerate() {
-        if i > 0 {
-            out.push(delimiter);
-        }
-        match cell {
-            None => out.push_str(null_str),
-            Some(s) => {
-                for c in s.chars() {
-                    match c {
-                        '\\' => out.push_str("\\\\"),
-                        '\t' => out.push_str("\\t"),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\u{08}' => out.push_str("\\b"),
-                        '\u{0c}' => out.push_str("\\f"),
-                        '\u{0b}' => out.push_str("\\v"),
-                        other if other == delimiter => {
-                            out.push('\\');
-                            out.push(other);
-                        }
-                        other => out.push(other),
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Encode one row's cells as a CSV line (PG `COPY … WITH (FORMAT csv)`).
-/// A non-NULL field is quoted when it contains the delimiter, the quote
-/// character, a CR or LF, or when its text equals `null_str` — so an
-/// empty string under the default empty NULL, or any value that collides
-/// with the NULL marker, reads back as itself rather than as NULL. The
-/// quote character is doubled inside a quoted field. NULL is emitted as
-/// `null_str`, unquoted.
-#[must_use]
-pub fn encode_copy_csv_cells(
-    cells: &[Option<String>],
-    delimiter: char,
-    quote: char,
-    null_str: &str,
-) -> String {
-    let mut out = String::new();
-    for (i, cell) in cells.iter().enumerate() {
-        if i > 0 {
-            out.push(delimiter);
-        }
-        match cell {
-            None => out.push_str(null_str),
-            Some(s) => {
-                let needs_quote = s.as_str() == null_str
-                    || s.chars()
-                        .any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
-                if needs_quote {
-                    out.push(quote);
-                    for c in s.chars() {
-                        if c == quote {
-                            out.push(quote);
-                        }
-                        out.push(c);
-                    }
-                    out.push(quote);
-                } else {
-                    out.push_str(s);
-                }
-            }
-        }
-    }
-    out
 }

@@ -10,7 +10,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
         panic!("expected Rows");
     };
     rows.into_iter()
-        .map(|row| row.values.into_iter().map(|v| v.clone()).collect())
+        .map(|row| row.values.into_iter().collect())
         .collect()
 }
 

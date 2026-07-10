@@ -573,7 +573,7 @@ fn execute_stmts(
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
-                        early => return Ok(early),
+                        early @ BodyOutcome::Return(_) => return Ok(early),
                     }
                     i = i.saturating_add(step);
                     iter += 1;
@@ -594,7 +594,7 @@ fn execute_stmts(
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
-                        early => return Ok(early),
+                        early @ BodyOutcome::Return(_) => return Ok(early),
                     }
                     iter += 1;
                 }
@@ -688,7 +688,7 @@ fn execute_stmts(
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
-                        early => return Ok(early),
+                        early @ BodyOutcome::Return(_) => return Ok(early),
                     }
                 }
             }
@@ -729,7 +729,7 @@ fn execute_stmts(
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
-                        early => return Ok(early),
+                        early @ BodyOutcome::Return(_) => return Ok(early),
                     }
                 }
             }
@@ -847,7 +847,7 @@ fn execute_stmts(
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::FellThrough | BodyOutcome::Continue => {}
                         BodyOutcome::Break => break,
-                        early => return Ok(early),
+                        early @ BodyOutcome::Return(_) => return Ok(early),
                     }
                     iter += 1;
                 }
