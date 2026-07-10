@@ -105,6 +105,30 @@ pub(super) fn extract_field(
         };
         return Ok(Value::BigInt(result));
     }
+    // v7.38 (read01) — EXTRACT from TIME. `Value::Time` is micros within the
+    // day; only the time-of-day fields apply, and PG returns them all as
+    // NUMERIC. A date field is rejected with PG's exact wording.
+    if let Value::Time(micros) = *v {
+        let secs = micros / 1_000_000;
+        let frac = micros % 1_000_000;
+        let num = |scaled: i128, scale: u8| {
+            Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+        };
+        return match field {
+            F::Hour => num(i128::from(secs / 3600), 0),
+            F::Minute => num(i128::from((secs / 60) % 60), 0),
+            F::Second => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 6),
+            F::Millisecond => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 3),
+            F::Microsecond => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 0),
+            F::Epoch => num(i128::from(secs) * 1_000_000 + i128::from(frac), 6),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "unit \"{}\" not supported for type time without time zone",
+                    alloc::format!("{other}").to_lowercase()
+                ),
+            }),
+        };
+    }
     let (days, day_micros) = match *v {
         Value::Date(d) => (d, 0_i64),
         Value::Timestamp(t) => {
