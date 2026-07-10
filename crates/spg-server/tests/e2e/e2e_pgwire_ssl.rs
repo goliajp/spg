@@ -281,6 +281,46 @@ fn operator_supplied_cert_is_served() {
 }
 
 #[test]
+fn require_tls_rejects_plaintext_but_allows_tls() {
+    let dir = unique_tmpdir("reqtls");
+    let db = dir.join("spg.db");
+    let (child, addrs) = common::ServerBuilder::new()
+        .arg_path(&db)
+        .with_pgwire()
+        .env("SPG_REQUIRE_TLS", "1")
+        .spawn();
+    let _guard = common::ChildGuard(child);
+    let addr = addrs.pgwire.expect("pgwire addr");
+
+    // Plaintext startup → ErrorResponse ('E'), no AuthenticationOk.
+    {
+        let mut s = common::connect_to(&addr);
+        s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        s.write_all(&startup_message()).unwrap();
+        let (ty, _) = read_msg(&mut s);
+        assert_eq!(
+            ty, b'E',
+            "plaintext must be refused when SPG_REQUIRE_TLS is set"
+        );
+    }
+
+    // The same server still accepts a TLS connection.
+    {
+        let mut s = common::connect_to(&addr);
+        s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        s.write_all(&ssl_request()).unwrap();
+        let mut reply = [0u8; 1];
+        s.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[0], b'S');
+        let cfg = client_config();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut conn = rustls::ClientConnection::new(cfg, name).unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut s);
+        drive_to_ready(&mut tls);
+    }
+}
+
+#[test]
 fn plaintext_still_works_without_ssl() {
     // Regression: a client that connects without SSLRequest reaches
     // ReadyForQuery the old way (peek left the StartupMessage intact).
