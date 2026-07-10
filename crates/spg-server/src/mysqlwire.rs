@@ -327,7 +327,7 @@ fn looks_like_ssl_request(payload: &[u8]) -> bool {
 /// cost stays zero when nothing's connected yet. Operator
 /// deployments that need a real cert hook `SPG_MYSQLWIRE_TLS_*`
 /// env vars in a follow-on commit.
-fn build_server_connection() -> Result<rustls::ServerConnection, String> {
+pub(crate) fn build_server_connection() -> Result<rustls::ServerConnection, String> {
     let cfg = tls_server_config()?;
     rustls::ServerConnection::new(cfg).map_err(|e| format!("rustls accept: {e}"))
 }

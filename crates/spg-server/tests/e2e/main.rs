@@ -377,6 +377,7 @@ mod e2e_pgwire_describe;
     clippy::uninlined_format_args
 )]
 mod e2e_pgwire_pipelined;
+mod e2e_pgwire_ssl;
 mod e2e_ping;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_prefetch;
