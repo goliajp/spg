@@ -911,12 +911,17 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         "MVCC appendix must appear exactly once in the image"
     );
     let start = hits[0];
+    // v7.39 — also strip the empty (4-byte) policy appendix (v59): for `t`
+    // that is [row_security u8=0][force u8=0][policy_count u16=0], written
+    // right after the default_text block and before the MVCC appendix.
+    const EMPTY_POLICY_APPENDIX: usize = 4;
     // v7.38 — strip the empty (2-byte zero-count) default_text appendix (v58)
     // that the current writer emits immediately before the MVCC appendix, so
     // the spliced image is byte-for-byte a genuine pre-v53 catalog.
     const EMPTY_DEFAULT_TEXT_APPENDIX: usize = 2;
-    let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - EMPTY_DEFAULT_TEXT_APPENDIX);
-    v52.extend_from_slice(&v53[..start - EMPTY_DEFAULT_TEXT_APPENDIX]);
+    let trailing_v53plus = EMPTY_DEFAULT_TEXT_APPENDIX + EMPTY_POLICY_APPENDIX;
+    let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus);
+    v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len()..]);
     // Set the version byte to 52 — the format before the MVCC appendix (v53)
     // and before the CRC trailer (v54): byte-for-byte what the pre-slice
@@ -1047,6 +1052,49 @@ fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
         t.next_rowid_for_test() > 5,
         "next_rowid must exceed every loaded id"
     );
+}
+
+/// v7.39 (RLS) — policies + the two RLS flags survive a serialize/deserialize
+/// round-trip through the FILE_VERSION 59 policy appendix.
+#[test]
+fn rls_policies_round_trip() {
+    let mut c = Catalog::new();
+    let mut schema = TableSchema::new("d", vec![ColumnSchema::new("id", DataType::Int, false)]);
+    schema.row_security = true;
+    schema.force_row_security = true;
+    schema.policies.push(crate::PolicyDef {
+        name: "p_sel".into(),
+        cmd: crate::PolicyCmd::Select,
+        permissive: true,
+        roles: alloc::vec::Vec::new(),
+        using_expr: Some("(id > 5)".into()),
+        with_check_expr: None,
+    });
+    schema.policies.push(crate::PolicyDef {
+        name: "p_upd".into(),
+        cmd: crate::PolicyCmd::Update,
+        permissive: false,
+        roles: alloc::vec![String::from("alice"), String::from("bob")],
+        using_expr: Some("(id > 0)".into()),
+        with_check_expr: Some("(id > 10)".into()),
+    });
+    c.create_table(schema).unwrap();
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v59 image loads");
+    let s = restored.get("d").unwrap().schema();
+    assert!(s.row_security && s.force_row_security, "RLS flags survive");
+    assert_eq!(s.policies.len(), 2);
+    assert_eq!(s.policies[0].name, "p_sel");
+    assert_eq!(s.policies[0].cmd, crate::PolicyCmd::Select);
+    assert!(s.policies[0].permissive);
+    assert!(s.policies[0].roles.is_empty());
+    assert_eq!(s.policies[0].using_expr.as_deref(), Some("(id > 5)"));
+    assert_eq!(s.policies[0].with_check_expr, None);
+    assert_eq!(s.policies[1].name, "p_upd");
+    assert_eq!(s.policies[1].cmd, crate::PolicyCmd::Update);
+    assert!(!s.policies[1].permissive);
+    assert_eq!(s.policies[1].roles, alloc::vec!["alice", "bob"]);
+    assert_eq!(s.policies[1].with_check_expr.as_deref(), Some("(id > 10)"));
 }
 
 /// v7.38 — a row restored from a durable image must be visible to a snapshot

@@ -328,6 +328,45 @@ pub(crate) fn deserialize_table(
             }
         }
     }
+    // v7.39 (RLS) — per-table policy appendix + the two RLS flags
+    // (FILE_VERSION 59+). Written after the default_text block and before the
+    // MVCC appendix. v58-and-below catalogs default to no policies, RLS off.
+    if version >= 59 {
+        t.schema_mut().row_security = cur.read_u8()? != 0;
+        t.schema_mut().force_row_security = cur.read_u8()? != 0;
+        let policy_count = cur.read_u16()? as usize;
+        let mut policies = alloc::vec::Vec::with_capacity(policy_count);
+        for _ in 0..policy_count {
+            let name = cur.read_str()?;
+            let cmd = crate::PolicyCmd::from_wire_byte(cur.read_u8()?)
+                .ok_or_else(|| StorageError::Corrupt("policy appendix: unknown cmd byte".into()))?;
+            let permissive = cur.read_u8()? != 0;
+            let role_count = cur.read_u16()? as usize;
+            let mut roles = alloc::vec::Vec::with_capacity(role_count);
+            for _ in 0..role_count {
+                roles.push(cur.read_str()?);
+            }
+            let using_expr = if cur.read_u8()? != 0 {
+                Some(cur.read_str()?)
+            } else {
+                None
+            };
+            let with_check_expr = if cur.read_u8()? != 0 {
+                Some(cur.read_str()?)
+            } else {
+                None
+            };
+            policies.push(crate::PolicyDef {
+                name,
+                cmd,
+                permissive,
+                roles,
+                using_expr,
+                with_check_expr,
+            });
+        }
+        t.schema_mut().policies = policies;
+    }
     // v7.37.16 (Epic W) — per-row MVCC header + stable RowId appendix
     // (FILE_VERSION 53+). Overwrites the frozen headers + dense rowids
     // that `deserialize_rows` installed above, restoring xmin/xmax/flags

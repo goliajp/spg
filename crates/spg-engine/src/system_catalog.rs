@@ -669,6 +669,100 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     (schema, rows)
 }
 
+/// v7.39 (RLS) — synthesise `pg_catalog.pg_policy` (raw). One row per policy.
+/// `polqual` / `polwithcheck` hold the deparsed qual text (SPG has no real
+/// node tree); `pg_get_expr(polqual, polrelid)` returns it verbatim, matching
+/// the pg_attrdef.adbin convention.
+///
+/// PG columns: oid, polname, polrelid, polcmd (char), polpermissive (bool),
+/// polroles (oid[]), polqual (pg_node_tree), polwithcheck (pg_node_tree).
+pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("polname", DataType::Text, false),
+        ColumnSchema::new("polrelid", DataType::BigInt, false),
+        ColumnSchema::new("polcmd", DataType::Text, false),
+        ColumnSchema::new("polpermissive", DataType::Bool, false),
+        ColumnSchema::new("polroles", DataType::Text, false),
+        ColumnSchema::new("polqual", DataType::Text, true),
+        ColumnSchema::new("polwithcheck", DataType::Text, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut table_oid: i64 = 16384;
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else {
+            table_oid = table_oid.saturating_add(1);
+            continue;
+        };
+        for (i, p) in t.schema().policies.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let row_oid = table_oid.saturating_mul(1000).saturating_add(i as i64 + 1);
+            let roles = if p.roles.is_empty() {
+                // PUBLIC — PG's polroles = {0}.
+                alloc::string::String::from("{0}")
+            } else {
+                alloc::format!("{{{}}}", p.roles.join(","))
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(row_oid),
+                Value::text(p.name.clone()),
+                Value::BigInt(table_oid),
+                Value::text(alloc::string::String::from(p.cmd.as_pg_char())),
+                Value::Bool(p.permissive),
+                Value::text(roles),
+                p.using_expr.clone().map_or(Value::Null, Value::text),
+                p.with_check_expr.clone().map_or(Value::Null, Value::text),
+            ]));
+        }
+        table_oid = table_oid.saturating_add(1);
+    }
+    (schema, rows)
+}
+
+/// v7.39 (RLS) — synthesise `pg_catalog.pg_policies` (the human-readable view
+/// over pg_policy). ORM / psql `\d` read this.
+///
+/// PG columns: schemaname, tablename, policyname, permissive
+/// ('PERMISSIVE'|'RESTRICTIVE'), roles (name[]), cmd (word), qual, with_check.
+pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("policyname", DataType::Text, false),
+        ColumnSchema::new("permissive", DataType::Text, false),
+        ColumnSchema::new("roles", DataType::Text, false),
+        ColumnSchema::new("cmd", DataType::Text, false),
+        ColumnSchema::new("qual", DataType::Text, true),
+        ColumnSchema::new("with_check", DataType::Text, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for p in &t.schema().policies {
+            let roles = if p.roles.is_empty() {
+                alloc::string::String::from("{public}")
+            } else {
+                alloc::format!("{{{}}}", p.roles.join(","))
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::text("public"),
+                Value::text(tname.clone()),
+                Value::text(p.name.clone()),
+                Value::text(if p.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                }),
+                Value::text(roles),
+                Value::text(p.cmd.as_pg_word()),
+                p.using_expr.clone().map_or(Value::Null, Value::text),
+                p.with_check_expr.clone().map_or(Value::Null, Value::text),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.37.23 (23.7-a) — synthesise `pg_catalog.pg_statistic_ext`.
 /// PG's extended-statistics catalog (one row per CREATE
 /// STATISTICS). SPG accepts CREATE STATISTICS as a parser
@@ -1896,11 +1990,11 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
             Value::Bool(false), // relhasrules — SPG has no rule system
             Value::Bool(has_triggers),
-            Value::Bool(false), // relhassubclass
-            Value::Bool(false), // relrowsecurity
-            Value::Bool(false), // relforcerowsecurity
-            Value::Bool(true),  // relispopulated
-            Value::text("d"),   // relreplident — 'd' default
+            Value::Bool(false),                         // relhassubclass
+            Value::Bool(schema_ref.row_security),       // relrowsecurity (v7.39 RLS)
+            Value::Bool(schema_ref.force_row_security), // relforcerowsecurity
+            Value::Bool(true),                          // relispopulated
+            Value::text("d"),                           // relreplident — 'd' default
             Value::Bool(is_partition),
         ]));
         oid = oid.saturating_add(1);

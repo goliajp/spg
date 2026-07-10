@@ -104,7 +104,32 @@ impl Engine {
             T::AlterColumnSetExpression { column, expr } => {
                 self.alter_column_set_expression(tbl, column, expr)
             }
+            T::SetRowSecurity { enabled, force } => {
+                self.alter_set_row_security(tbl, enabled, force)
+            }
         }
+    }
+
+    /// v7.39 (RLS) — `ALTER TABLE t { ENABLE|DISABLE|FORCE|NO FORCE } ROW LEVEL
+    /// SECURITY`. Sets the schema flags (`relrowsecurity` / `relforcerowsecurity`
+    /// mirrors). Enforcement is gated on the session role (Phase 1); Phase 0
+    /// only records the flags for catalog / pg_dump fidelity.
+    fn alter_set_row_security(
+        &mut self,
+        tbl: &str,
+        enabled: Option<bool>,
+        force: Option<bool>,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        if let Some(e) = enabled {
+            table.schema_mut().row_security = e;
+        }
+        if let Some(fo) = force {
+            table.schema_mut().force_row_security = fo;
+        }
+        Ok(())
     }
 
     /// v7.38 (read01 U12) — `ALTER COLUMN col SET EXPRESSION AS (expr)`
@@ -2574,6 +2599,128 @@ impl Engine {
 }
 
 impl Engine {
+    /// v7.39 (RLS) — `CREATE POLICY`. Stores the policy on the table schema
+    /// (independent of the RLS enable flag). Enforcement is Phase 1.
+    pub(crate) fn exec_create_policy(
+        &mut self,
+        s: spg_sql::ast::CreatePolicyStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let cmd = policy_cmd_to_storage(s.cmd);
+        let using_expr = s.using.as_ref().map(|e| alloc::format!("{e}"));
+        let with_check_expr = s.with_check.as_ref().map(|e| alloc::format!("{e}"));
+        let table = self.active_catalog_mut().get_mut(&s.table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: s.table.clone(),
+            })
+        })?;
+        if table.schema().policies.iter().any(|p| p.name == s.name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "policy {:?} for table {:?} already exists",
+                s.name,
+                s.table
+            )));
+        }
+        table.schema_mut().policies.push(spg_storage::PolicyDef {
+            name: s.name,
+            cmd,
+            permissive: s.permissive,
+            roles: s.roles,
+            using_expr,
+            with_check_expr,
+        });
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.39 (RLS) — `ALTER POLICY … { RENAME TO | [TO roles] [USING] [WITH
+    /// CHECK] }`.
+    pub(crate) fn exec_alter_policy(
+        &mut self,
+        s: spg_sql::ast::AlterPolicyStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let new_using = s.using.as_ref().map(|e| alloc::format!("{e}"));
+        let new_check = s.with_check.as_ref().map(|e| alloc::format!("{e}"));
+        let table = self.active_catalog_mut().get_mut(&s.table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: s.table.clone(),
+            })
+        })?;
+        // Duplicate-name pre-check for RENAME (before taking the mutable slot).
+        if let Some(new) = &s.rename_to
+            && table.schema().policies.iter().any(|p| &p.name == new)
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "policy {new:?} for table {:?} already exists",
+                s.table
+            )));
+        }
+        let pol = table
+            .schema_mut()
+            .policies
+            .iter_mut()
+            .find(|p| p.name == s.name)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "policy {:?} for table {:?} does not exist",
+                    s.name,
+                    s.table
+                ))
+            })?;
+        if let Some(new) = s.rename_to {
+            pol.name = new;
+        } else {
+            if let Some(roles) = s.roles {
+                pol.roles = roles;
+            }
+            if new_using.is_some() {
+                pol.using_expr = new_using;
+            }
+            if new_check.is_some() {
+                pol.with_check_expr = new_check;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.39 (RLS) — `DROP POLICY [IF EXISTS] name ON table`.
+    pub(crate) fn exec_drop_policy(
+        &mut self,
+        s: spg_sql::ast::DropPolicyStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table = match self.active_catalog_mut().get_mut(&s.table) {
+            Some(t) => t,
+            None if s.if_exists => {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: !self.in_transaction(),
+                });
+            }
+            None => {
+                return Err(EngineError::Storage(StorageError::TableNotFound {
+                    name: s.table.clone(),
+                }));
+            }
+        };
+        let before = table.schema().policies.len();
+        table.schema_mut().policies.retain(|p| p.name != s.name);
+        if table.schema().policies.len() == before && !s.if_exists {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "policy {:?} for table {:?} does not exist",
+                s.name,
+                s.table
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     pub(crate) fn exec_create_user(
         &mut self,
         s: &CreateUserStatement,
@@ -3459,6 +3606,19 @@ pub(crate) fn eval_runtime_default_free(
 /// FunctionCall is the immediate case (`now()`,
 /// `current_timestamp`). Literal expressions and simple sign-
 /// flipped numerics still take the static-cache path.
+/// v7.39 (RLS) — translate the parser's `PolicyCmd` to the storage one.
+fn policy_cmd_to_storage(c: spg_sql::ast::PolicyCmd) -> spg_storage::PolicyCmd {
+    use spg_sql::ast::PolicyCmd as A;
+    use spg_storage::PolicyCmd as S;
+    match c {
+        A::All => S::All,
+        A::Select => S::Select,
+        A::Insert => S::Insert,
+        A::Update => S::Update,
+        A::Delete => S::Delete,
+    }
+}
+
 fn is_runtime_default_expr(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { .. } => true,
