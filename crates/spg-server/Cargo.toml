@@ -70,6 +70,9 @@ sha2        = { version = "0.10", default-features = false }
 # v7.17.0 Phase 3.P0-77 — the SSL e2e test drives the client side
 # of a TLS handshake against the server's self-signed cert.
 rustls      = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
+# v7.39 (TLS/SCRAM Phase 3) — the SCRAM-SHA-256-PLUS e2e drives the client side
+# of the SASL exchange (PBKDF2 / HMAC / SHA-256 / base64) against the server.
+spg-crypto  = { workspace = true }
 
 [lints]
 workspace = true

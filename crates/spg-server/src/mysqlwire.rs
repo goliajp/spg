@@ -332,37 +332,128 @@ pub(crate) fn build_server_connection() -> Result<rustls::ServerConnection, Stri
     rustls::ServerConnection::new(cfg).map_err(|e| format!("rustls accept: {e}"))
 }
 
-fn tls_server_config() -> Result<Arc<rustls::ServerConfig>, String> {
-    static CFG: std::sync::OnceLock<Result<Arc<rustls::ServerConfig>, String>> =
-        std::sync::OnceLock::new();
-    CFG.get_or_init(|| {
-        // Install the ring crypto provider if no provider has
-        // been registered yet. rustls 0.23 demands an explicit
-        // pick; ring is what we depend on.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+/// The process-global TLS config, paired with the SCRAM-SHA-256-PLUS
+/// channel-binding data derived from the leaf cert (None when it can't be
+/// computed — see `channel_binding_hash`).
+type TlsState = (Arc<rustls::ServerConfig>, Option<[u8; 32]>);
 
-        // v7.39 (TLS Phase 2) — an operator can supply a real cert chain +
-        // private key (PEM) via SPG_TLS_CERT / SPG_TLS_KEY; production clients
-        // reject the self-signed default. Both must be set to opt in; otherwise
-        // fall back to the lazily-minted self-signed `localhost` cert.
-        let cert_env = std::env::var("SPG_TLS_CERT").ok().filter(|s| !s.is_empty());
-        let key_env = std::env::var("SPG_TLS_KEY").ok().filter(|s| !s.is_empty());
-        let (cert_chain, key_der) = match (cert_env, key_env) {
-            (Some(cert_path), Some(key_path)) => load_operator_pem(&cert_path, &key_path)?,
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(
-                    "TLS: SPG_TLS_CERT and SPG_TLS_KEY must both be set (or neither)".into(),
-                );
-            }
-            (None, None) => self_signed_cert()?,
-        };
-        let cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key_der)
-            .map_err(|e| format!("rustls cert: {e}"))?;
-        Ok(Arc::new(cfg))
-    })
-    .clone()
+fn tls_state() -> Result<TlsState, String> {
+    static STATE: std::sync::OnceLock<Result<TlsState, String>> = std::sync::OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            // Install the ring crypto provider if no provider has
+            // been registered yet. rustls 0.23 demands an explicit
+            // pick; ring is what we depend on.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
+            // v7.39 (TLS Phase 2) — an operator can supply a real cert chain +
+            // private key (PEM) via SPG_TLS_CERT / SPG_TLS_KEY; production
+            // clients reject the self-signed default. Both must be set to opt
+            // in; otherwise fall back to the lazily-minted self-signed
+            // `localhost` cert.
+            let cert_env = std::env::var("SPG_TLS_CERT").ok().filter(|s| !s.is_empty());
+            let key_env = std::env::var("SPG_TLS_KEY").ok().filter(|s| !s.is_empty());
+            let (cert_chain, key_der) = match (cert_env, key_env) {
+                (Some(cert_path), Some(key_path)) => load_operator_pem(&cert_path, &key_path)?,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(
+                        "TLS: SPG_TLS_CERT and SPG_TLS_KEY must both be set (or neither)".into(),
+                    );
+                }
+                (None, None) => self_signed_cert()?,
+            };
+            // v7.39 (TLS/SCRAM Phase 3) — the `tls-server-end-point` channel
+            // binding (RFC 5929) for SCRAM-SHA-256-PLUS: the hash of the leaf
+            // cert DER, computed with the cert's own signature hash. We can
+            // only produce it when that hash is SHA-256 (spg-crypto has no
+            // SHA-384/512); otherwise channel binding is not offered.
+            let cb_hash = cert_chain
+                .first()
+                .and_then(|c| channel_binding_hash(c.as_ref()));
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key_der)
+                .map_err(|e| format!("rustls cert: {e}"))?;
+            Ok((Arc::new(cfg), cb_hash))
+        })
+        .clone()
+}
+
+fn tls_server_config() -> Result<Arc<rustls::ServerConfig>, String> {
+    tls_state().map(|(cfg, _)| cfg)
+}
+
+/// v7.39 (TLS/SCRAM Phase 3) — the `tls-server-end-point` channel-binding data
+/// SCRAM-SHA-256-PLUS binds to, or None when TLS isn't configured or the leaf
+/// cert's signature hash isn't SHA-256.
+pub(crate) fn tls_channel_binding_hash() -> Option<[u8; 32]> {
+    tls_state().ok().and_then(|(_, h)| h)
+}
+
+/// RFC 5929 §4.1 `tls-server-end-point`: the hash of the DER-encoded server
+/// certificate, using the hash from the cert's own `signatureAlgorithm`
+/// (MD5/SHA-1 upgraded to SHA-256). We return `Some(SHA-256(der))` only when
+/// the signature hash is SHA-256 — the one hash spg-crypto implements — so the
+/// value we bind matches exactly what an RFC-5929 client computes; any other
+/// signature algorithm yields None (channel binding simply isn't advertised).
+fn channel_binding_hash(der: &[u8]) -> Option<[u8; 32]> {
+    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, signatureAlgorithm
+    // SEQUENCE { algorithm OID, ... }, signatureValue BIT STRING }.
+    let (outer_tag, outer_start, _outer_len) = der_read_tlv(der, 0)?;
+    if outer_tag != 0x30 {
+        return None;
+    }
+    // First element of the outer SEQUENCE is tbsCertificate; skip past it.
+    let (tbs_tag, tbs_start, tbs_len) = der_read_tlv(der, outer_start)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
+    let sigalg_pos = tbs_start + tbs_len;
+    let (sa_tag, sa_start, _sa_len) = der_read_tlv(der, sigalg_pos)?;
+    if sa_tag != 0x30 {
+        return None;
+    }
+    // First element of signatureAlgorithm is the algorithm OID.
+    let (oid_tag, oid_start, oid_len) = der_read_tlv(der, sa_start)?;
+    if oid_tag != 0x06 {
+        return None;
+    }
+    let oid = &der[oid_start..oid_start + oid_len];
+    // sha256WithRSAEncryption 1.2.840.113549.1.1.11 and ecdsa-with-SHA256
+    // 1.2.840.10045.4.3.2 — the two common SHA-256 signature OIDs (the latter
+    // is rcgen's default for the self-signed cert).
+    const SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+    const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+    if oid == SHA256_RSA || oid == ECDSA_SHA256 {
+        Some(spg_crypto::sha256::hash(der))
+    } else {
+        None
+    }
+}
+
+/// Minimal DER TLV reader: at `pos`, returns `(tag, content_start, content_len)`
+/// handling short- and long-form lengths. None if the frame runs past `buf`.
+fn der_read_tlv(buf: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+    let tag = *buf.get(pos)?;
+    let len_byte = *buf.get(pos + 1)?;
+    let (content_len, header_len) = if len_byte & 0x80 == 0 {
+        (len_byte as usize, 2)
+    } else {
+        let n = (len_byte & 0x7f) as usize;
+        if n == 0 || n > 4 || pos + 2 + n > buf.len() {
+            return None;
+        }
+        let mut l = 0usize;
+        for i in 0..n {
+            l = (l << 8) | buf[pos + 2 + i] as usize;
+        }
+        (l, 2 + n)
+    };
+    let content_start = pos + header_len;
+    if content_start.checked_add(content_len)? > buf.len() {
+        return None;
+    }
+    Some((tag, content_start, content_len))
 }
 
 /// v7.39 (TLS Phase 2) — the lazily-minted self-signed `localhost` cert used
