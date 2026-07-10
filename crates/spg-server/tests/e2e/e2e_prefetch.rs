@@ -170,15 +170,35 @@ fn sequential_scan_triggers_prefetch() {
                 exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i}, 'row-{i}')"));
             }
             wait_for_cold_segments(&mut s, 2);
-            exec_ok(&mut s, "CHECKPOINT");
-            // The boot prefetch pool walks the MANIFEST's live
-            // segments — counting `seg_*.spg` files over-counts
-            // whenever auto-compaction retired a segment whose disk
-            // file is still present (tombstoned slots keep their
-            // files; see EmbeddedMetrics::cold_segments). Take the
-            // expected count from the live catalog instead — this
-            // was the suite's recurring "hits 3 ≠ 4" flake.
-            expected_hits = count_stat_segment_rows(&mut s);
+            // The boot prefetch pool walks the MANIFEST's live segments.
+            //
+            // Counting `seg_*.spg` files over-counts whenever auto-compaction
+            // retired a segment whose disk file is still present (tombstoned
+            // slots keep their files; see EmbeddedMetrics::cold_segments), so
+            // take the count from the live catalog instead.
+            //
+            // But the catalog alone still races the freezer: it keeps ticking
+            // every SPG_FREEZER_TICK_MS while we talk to the server, so a
+            // segment can land AFTER the CHECKPOINT that wrote the manifest.
+            // That segment is in the catalog we count but not in the manifest
+            // the boot pool walks, leaving hits exactly one short — the
+            // suite's recurring "hits N-1 ≠ N" flake, which only reproduced
+            // under load because that widens the window between the two
+            // statements. Bracket the CHECKPOINT with two counts and retry
+            // until they agree: no freeze crossed it, so the manifest and the
+            // catalog list the same segments.
+            let mut settled = None;
+            for _ in 0..20 {
+                let before = count_stat_segment_rows(&mut s);
+                exec_ok(&mut s, "CHECKPOINT");
+                let after = count_stat_segment_rows(&mut s);
+                if before == after {
+                    settled = Some(after);
+                    break;
+                }
+            }
+            expected_hits =
+                settled.expect("freezer never quiesced across a CHECKPOINT in 20 attempts");
         }
         let _ = raw.kill();
         let _ = raw.wait();
