@@ -1355,6 +1355,17 @@ pub struct ColumnSchema {
     /// only for now — not yet in the catalog appendix, so a reloaded table
     /// deserialises as `false` (the pre-existing permissive behaviour).
     pub identity_always: bool,
+    /// v7.38 (read01) — the DEFAULT expression's source text, deparsed to
+    /// PG-compatible form at CREATE TABLE time (e.g. `0`, `(3 + 4)`,
+    /// `'hi'::text`, `now()`, `CURRENT_DATE`). Distinct from `default`
+    /// (the coerced value the INSERT path fills) and `runtime_default`
+    /// (the recompute-per-row Display form): those lose the source
+    /// spelling, so `information_schema.columns.column_default` /
+    /// `pg_attrdef` / `pg_get_expr` reported the coerced render
+    /// (`0.00` for `numeric(10,2) DEFAULT 0`) instead of PG's `0`.
+    /// `None` for a column with no explicit default. Persisted in catalog
+    /// FILE_VERSION 58+; older catalogs deserialise with None.
+    pub default_text: Option<String>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -5635,6 +5646,7 @@ impl ColumnSchema {
             inline_set_variants: None,
             generated_stored_expr: None,
             identity_always: false,
+            default_text: None,
         }
     }
 
@@ -5968,7 +5980,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 57;
+const FILE_VERSION: u8 = 58;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -6502,6 +6514,23 @@ impl Catalog {
                 u16::try_from(gen_bindings.len()).expect("≤ 65k GENERATED STORED columns/table"),
             );
             for (pos, src) in gen_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, src);
+            }
+            // v7.38 (read01) — per-table default_text appendix
+            // (FILE_VERSION 58+). Sparse: only columns whose default_text
+            // is Some land here. Mirrors the generated_stored_expr shape.
+            let mut default_texts: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(src) = &c.default_text {
+                    default_texts.push((i, src.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(default_texts.len()).expect("≤ 65k defaulted columns/table"),
+            );
+            for (pos, src) in default_texts {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, src);
             }

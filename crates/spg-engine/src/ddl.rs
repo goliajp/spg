@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use spg_sql::ast::{
     ColumnDef, CreateIndexStatement, CreateTableStatement, CreateUserStatement, Expr, IndexMethod,
-    PartitionKindAst, PartitionOfBoundsAst, Statement, VecEncoding as SqlVecEncoding,
+    Literal, PartitionKindAst, PartitionOfBoundsAst, Statement, VecEncoding as SqlVecEncoding,
 };
 use spg_storage::{
     ColumnSchema, DataType, PartitionKind, PartitionRole, StorageError, TableSchema, Value,
@@ -3484,6 +3484,83 @@ fn is_runtime_default_expr(expr: &Expr) -> bool {
     }
 }
 
+/// v7.38 (read01) — PG's canonical parenless deparse spelling for the SQL-
+/// standard niladic keyword functions. The parser lowers `CURRENT_DATE` &c
+/// to a synthetic `FunctionCall { name: "current_date", args: [] }`; PG's
+/// `pg_get_expr` renders these as the bare uppercase keyword (not
+/// `current_date()`), so a default that uses one must deparse the same way.
+/// Returns `None` for a real function (`now()`) which keeps its call form.
+fn pg_parenless_keyword(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "current_date" => Some("CURRENT_DATE"),
+        "current_time" => Some("CURRENT_TIME"),
+        "current_timestamp" => Some("CURRENT_TIMESTAMP"),
+        "localtime" => Some("LOCALTIME"),
+        "localtimestamp" => Some("LOCALTIMESTAMP"),
+        "current_user" => Some("CURRENT_USER"),
+        "session_user" => Some("SESSION_USER"),
+        "current_role" => Some("CURRENT_ROLE"),
+        "current_catalog" => Some("CURRENT_CATALOG"),
+        _ => None,
+    }
+}
+
+/// v7.38 (read01) — deparse a column DEFAULT expression to the PG-compatible
+/// source text cached on `ColumnSchema.default_text` (surfaced by
+/// information_schema.columns.column_default / pg_attrdef / pg_get_expr).
+///
+/// SPG's `Expr` Display already matches PG's deparse for non-negative integer
+/// / numeric / boolean literals, arithmetic (`(3 + 4)`), and ordinary function
+/// calls (`now()`). This additionally matches PG for the shapes where Display
+/// diverges: bare string literals (PG types them, `'hi'::text`), the parenless
+/// SQL-standard keyword functions (`CURRENT_DATE`, not `current_date()`), and
+/// negative numeric constants, which PG's `get_const_expr` folds into a typed
+/// literal (`int DEFAULT -5` → `'-5'::integer`, `numeric DEFAULT -1.5` →
+/// `'-1.5'::numeric`).
+///
+/// KNOWN Phase-2 residuals (fall through to Display, a valid but not
+/// byte-identical-to-PG spelling — documented in the read01 checklist):
+///   * integer literals wider than int4 (`bigint DEFAULT 5000000000` →
+///     PG `'5000000000'::bigint`; SPG `5000000000`);
+///   * string / numeric literals nested inside a larger expression, which PG
+///     types per operand (`'hi' || 'there'` → PG `('hi'::text ||
+///     'there'::text)`). Full parity needs PG's recursive `get_rule_expr`
+///     constant-typing deparser.
+fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
+    match expr {
+        // Bare string literal → PG's typed-literal form `'…'::<coltype>`.
+        Expr::Literal(Literal::String(s)) => alloc::format!(
+            "'{}'::{}",
+            s.replace('\'', "''"),
+            crate::system_catalog::pg_data_type_text(col_ty)
+        ),
+        // Boolean literal → PG's lowercase `true` / `false` (SPG's Literal
+        // Display emits uppercase `TRUE`).
+        Expr::Literal(Literal::Bool(b)) => {
+            alloc::string::String::from(if *b { "true" } else { "false" })
+        }
+        // Negative numeric constant: PG folds `- <lit>` into a typed Const.
+        // The cast type is the *literal's* natural type (integer / numeric),
+        // not the column type.
+        Expr::Unary { op: spg_sql::ast::UnOp::Neg, expr: inner } => match inner.as_ref() {
+            Expr::Literal(Literal::Integer(n)) => alloc::format!("'-{n}'::integer"),
+            Expr::Literal(
+                Literal::Float(_) | Literal::NumericBig(_) | Literal::Numeric { .. },
+            ) => alloc::format!("'-{inner}'::numeric"),
+            _ => alloc::format!("{expr}"),
+        },
+        // Parenless SQL-standard keyword functions → bare uppercase keyword.
+        Expr::FunctionCall { name, args } if args.is_empty() => {
+            if let Some(kw) = pg_parenless_keyword(name) {
+                alloc::string::String::from(kw)
+            } else {
+                alloc::format!("{expr}")
+            }
+        }
+        _ => alloc::format!("{expr}"),
+    }
+}
+
 /// v7.17.0 Phase 1.4 — INSERT/UPDATE-time enum label check. When
 /// `col_idx` has a registered label list, the cell value must be
 /// NULL or one of the labels (case-sensitive per PG).
@@ -3623,6 +3700,10 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // unless the statement carries OVERRIDING SYSTEM VALUE.
     schema.identity_always = c.identity_always;
     if let Some(default_expr) = c.default {
+        // v7.38 (read01) — cache the PG-compatible source text of the DEFAULT
+        // expression for catalog introspection, independent of the
+        // literal/runtime split below (which loses the source spelling).
+        schema.default_text = Some(deparse_default(&default_expr, ty));
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
         // INSERT). Function calls (`now()`, `current_timestamp`

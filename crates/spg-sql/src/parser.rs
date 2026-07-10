@@ -7036,6 +7036,7 @@ impl Parser {
         // mis-target them.)
         const PG_META_TABLES: &[&str] = &[
             "pg_am",
+            "pg_attrdef",
             "pg_attribute",
             "pg_class",
             "pg_collation",

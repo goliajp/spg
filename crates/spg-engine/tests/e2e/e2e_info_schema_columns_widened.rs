@@ -74,7 +74,9 @@ fn numeric_and_typed_columns_report_pg_names() {
     assert_eq!(text(&got[0][1]), "numeric");
     assert!(matches!(&got[0][2], spg_storage::Value::Int(10)));
     assert!(matches!(&got[0][3], spg_storage::Value::Int(2)));
-    assert_eq!(text(&got[0][4]), "0.00"); // rendered numeric, not Debug
+    // v7.38 (read01) — PG reports the DEFAULT's *source text* (`0`), not the
+    // coerced/rendered value `0.00`. Re-verified live PG18.4.
+    assert_eq!(text(&got[0][4]), "0");
     // typed scalar columns report their PG data_type name.
     assert_eq!(text(&got[1][1]), "uuid");
     assert_eq!(text(&got[2][1]), "money");

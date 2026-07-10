@@ -803,11 +803,14 @@ fn mvcc_appendix_bytes(t: &Table) -> Vec<u8> {
 /// exact same result as before this slice: every row `RowHeader::frozen()`
 /// and dense `1..=N` rowids with `next_rowid = N + 1`.
 ///
-/// The v53 image differs from the v52 image by exactly two things: the
-/// version byte, and the per-table MVCC appendix appended in the table
-/// loop. So we serialize (v53), splice the (uniquely-locatable) appendix
-/// back out, flip the version byte to 52, and assert the result loads
-/// with the pre-v53 frozen/dense contract — a real old-image load.
+/// The current image differs from the v52 image by: the version byte, the
+/// per-table MVCC appendix (v53), and the per-table default_text appendix
+/// (v58) — the latter an empty 2-byte zero count here (`t` has no column
+/// default) sitting immediately before the MVCC appendix. So we serialize,
+/// splice out the (uniquely-locatable) MVCC appendix plus the 2 empty
+/// default_text bytes preceding it, flip the version byte to 52, and assert
+/// the result loads with the pre-v53 frozen/dense contract — a real old-image
+/// load.
 #[test]
 fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     use crate::row_header::{RowHeader, RowId, XMAX_ALIVE, XMIN_FROZEN};
@@ -842,8 +845,12 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         .collect();
     assert_eq!(hits.len(), 1, "MVCC appendix must appear exactly once in the image");
     let start = hits[0];
-    let mut v52 = Vec::with_capacity(v53.len() - appendix.len());
-    v52.extend_from_slice(&v53[..start]);
+    // v7.38 — strip the empty (2-byte zero-count) default_text appendix (v58)
+    // that the current writer emits immediately before the MVCC appendix, so
+    // the spliced image is byte-for-byte a genuine pre-v53 catalog.
+    const EMPTY_DEFAULT_TEXT_APPENDIX: usize = 2;
+    let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - EMPTY_DEFAULT_TEXT_APPENDIX);
+    v52.extend_from_slice(&v53[..start - EMPTY_DEFAULT_TEXT_APPENDIX]);
     v52.extend_from_slice(&v53[start + appendix.len()..]);
     // Set the version byte to 52 — the format before the MVCC appendix (v53)
     // and before the CRC trailer (v54): byte-for-byte what the pre-slice
