@@ -104,3 +104,23 @@ fn pg_typeof_bit_reports_bit_varying_not_unknown() {
     // No longer "unknown" for a plain bit literal either.
     assert_eq!(t(&mut e, "SELECT pg_typeof(B'101')::text"), "bit varying");
 }
+
+#[test]
+fn bit_concat_projected_column_type_is_bit_varying() {
+    // read01 A-bitcat — the *declared* column type a client sees for
+    // `B'10' || B'11'` (RowDescription / QueryResult column) must be
+    // `bit varying`, not the left operand's `bit`. PG's `||` is bitcat,
+    // whose result is always varbit. Live-PG18.4: pg_typeof(B'10'||B'11')
+    // = "bit varying".
+    use spg_storage::DataType;
+    let mut e = Engine::new();
+    let QueryResult::Rows { columns, .. } = e.execute("SELECT B'10' || B'11'").unwrap() else {
+        panic!("expected Rows");
+    };
+    assert_eq!(
+        columns[0].ty,
+        DataType::BitVarying,
+        "bit concat projects a bit varying column, not {:?}",
+        columns[0].ty
+    );
+}

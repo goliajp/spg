@@ -344,9 +344,22 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 }
                 _ => {
                     let inner = describe_expr(lhs, schema_cols)?;
+                    // v7.38 (read01 A-bitcat) — PG's `||` on bit strings is
+                    // `bitcat`, whose result is always `bit varying`: the
+                    // operands widen to varbit and the concatenated length
+                    // isn't a fixed `bit(N)`. So `B'10' || B'11'` is
+                    // `bit varying`, matching PG's pg_typeof — not the left
+                    // operand's `bit`.
+                    let ty = if matches!(op, B::Concat)
+                        && matches!(inner.ty, DataType::Bit | DataType::BitVarying)
+                    {
+                        DataType::BitVarying
+                    } else {
+                        inner.ty
+                    };
                     Some(ExprShape {
                         name: "?column?".to_string(),
-                        ty: inner.ty,
+                        ty,
                         nullable: true,
                     })
                 }
