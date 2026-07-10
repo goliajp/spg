@@ -210,25 +210,25 @@ fn order_by_inside_agg() {
 #[test]
 fn stddev_variance_family() {
     let mut e = seed();
-    // var_pop = 104, var_samp = variance = 130 (exact integers here)
-    check(&mut e, "SELECT var_pop(x) FROM t", "104");
-    check(&mut e, "SELECT var_samp(x) FROM t", "130");
-    check(&mut e, "SELECT variance(x) FROM t", "130");
-    // stddev_pop = sqrt(104), stddev_samp = stddev = sqrt(130).
-    // live PG18.4: stddev_samp == sqrt(130::float8) (verified equal),
-    // whose shortest round-trip is 11.40175425099138 — the prior
-    // 11.401754250991381 was a 1-ULP artifact of the old hand-rolled
-    // Newton sqrt, now replaced by libm::sqrt.
-    check(&mut e, "SELECT stddev_pop(x) FROM t", "10.198039027185569");
-    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.40175425099138");
-    check(&mut e, "SELECT stddev(x) FROM t", "11.40175425099138");
+    // v7.38 (read01) — over an exact (integer) column PG's NUMERIC overload
+    // applies: the variance is an exact numeric division and stddev its
+    // numeric sqrt, so both carry PG's display scale. The old expectations
+    // here ("104", "11.40175425099138") came from SPG's f64 accumulator and
+    // did NOT match PG. Every value below is from live PG18.4.
+    check(&mut e, "SELECT var_pop(x) FROM t", "104.0000000000000000");
+    check(&mut e, "SELECT var_samp(x) FROM t", "130.0000000000000000");
+    check(&mut e, "SELECT variance(x) FROM t", "130.0000000000000000");
+    check(&mut e, "SELECT stddev_pop(x) FROM t", "10.1980390271855697");
+    check(&mut e, "SELECT stddev_samp(x) FROM t", "11.4017542509913798");
+    check(&mut e, "SELECT stddev(x) FROM t", "11.4017542509913798");
     // single-row group: samp undefined -> NULL, pop -> 0
     check(&mut e, "SELECT stddev_samp(x) FROM t WHERE id=1", "<NULL>");
     check(&mut e, "SELECT var_samp(x) FROM t WHERE id=1", "<NULL>");
     check(&mut e, "SELECT stddev_pop(x) FROM t WHERE id=1", "0");
-    // Float data exercises the operation-order sensitivity: variance
-    // uses PG's `(N*Σx² - (Σx)²)/N²` form (float.c float8_var_pop),
-    // so these match live PG18.4 bit-for-bit (y = 1.5,2.5,3.5,3.5).
+    // A float8 column resolves PG's float8 overload → double precision, and
+    // the f64 accumulator uses PG's `(N*Σx² - (Σx)²)/N²` operation order
+    // (float.c float8_var_pop), matching live PG18.4 bit-for-bit
+    // (y = 1.5,2.5,3.5,3.5).
     check(&mut e, "SELECT var_pop(y) FROM t", "0.6875");
     check(&mut e, "SELECT var_samp(y) FROM t", "0.9166666666666666");
     check(&mut e, "SELECT stddev_pop(y) FROM t", "0.82915619758885");

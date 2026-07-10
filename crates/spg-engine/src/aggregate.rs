@@ -387,6 +387,16 @@ struct AggState {
     /// v7.32 (round-29) — sum of squares for the variance / stddev
     /// family (`sum_float` carries the running sum; `count` the n).
     sum_sq: f64,
+    /// v7.38 (read01) — exact accumulators for the stddev/variance family.
+    /// PG computes those aggregates in NUMERIC over exact inputs (its float8
+    /// overload only serves float inputs), so an f64 accumulator loses PG's
+    /// exact division scale — `var_pop(1,2,3)` is `0.66666666666666666667`,
+    /// not the 16-digit double. `stddev_saw_float` flips on the first
+    /// float/real input and drops the family back to the f64 accumulators,
+    /// whose result is then double precision, matching PG's float8 overload.
+    stddev_saw_float: bool,
+    stddev_sum: Option<spg_storage::bignum::BigNumeric>,
+    stddev_sum_sq: Option<spg_storage::bignum::BigNumeric>,
     /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
     /// bit_xor. `None` until the first non-NULL input → SQL NULL.
     bit_acc: Option<i64>,
@@ -3117,6 +3127,21 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
+            // v7.38 (read01) — keep an exact NUMERIC Σx / Σx² alongside the f64
+            // pair for as long as every input is exact; a float input abandons it.
+            if !st.stddev_saw_float {
+                match crate::eval::binop::value_to_bignum(v) {
+                    Some(b) => {
+                        let sq = b.mul(&b);
+                        st.stddev_sum =
+                            Some(st.stddev_sum.as_ref().map_or_else(|| b.clone(), |s| s.add(&b)));
+                        st.stddev_sum_sq = Some(
+                            st.stddev_sum_sq.as_ref().map_or_else(|| sq.clone(), |s| s.add(&sq)),
+                        );
+                    }
+                    None => st.stddev_saw_float = true,
+                }
+            }
             let Some(x) = agg_value_to_f64(v) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("{name} needs numeric, got {:?}", v.data_type()),
@@ -3408,6 +3433,44 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 // var_samp / stddev (samp) with n == 1 → NULL.
                 return Value::Null;
             }
+            // v7.38 (read01) — over exact inputs PG's numeric overload applies:
+            // variance = (N·Σx² − (Σx)²) / (N² | N·(N−1)) using numeric division's
+            // display scale, and stddev is its numeric sqrt. Falls through to the
+            // f64 path (a double result, PG's float8 overload) on a float input.
+            if !st.stddev_saw_float {
+                if let (Some(sum), Some(sum_sq)) =
+                    (st.stddev_sum.as_ref(), st.stddev_sum_sq.as_ref())
+                {
+                    use spg_storage::bignum::BigNumeric as BN;
+                    let nb = BN::from_i128(i128::from(n), 0);
+                    let numerator = nb.mul(sum_sq).sub(&sum.mul(sum));
+                    let divisor = if pop {
+                        nb.mul(&nb)
+                    } else {
+                        nb.mul(&BN::from_i128(i128::from(n - 1), 0))
+                    };
+                    // PG returns a bare `0` (scale 0) for a zero / clamped-negative
+                    // numerator rather than the division's padded zero.
+                    if numerator.is_zero() || numerator.parts().0 {
+                        return Value::Numeric {
+                            scaled: 0,
+                            scale: 0,
+                            kind: spg_storage::NumericKind::Finite,
+                        };
+                    }
+                    let rscale = crate::numeric::division_display_scale_big(&numerator, &divisor);
+                    if let Some(var) = numerator.div(&divisor, rscale) {
+                        let out = if name.starts_with("stddev") {
+                            var.sqrt(crate::numeric::sqrt_display_scale_big(&var))
+                        } else {
+                            Some(var)
+                        };
+                        if let Some(o) = out {
+                            return crate::eval::binop::bignum_to_value(o);
+                        }
+                    }
+                }
+            }
             // Match PG's float8 accumulator operation order exactly
             // (utils/adt/float.c float8_var_pop / _samp): the numerator
             // is `N*Σx² - (Σx)²` and the divisor is `N²` (pop) or
@@ -3423,16 +3486,8 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             } else {
                 var
             };
-            // v7.38 (read01, T4.3) — PG stddev/variance return NUMERIC. Route the
-            // f64 result through its shortest decimal text into an exact numeric
-            // (matches PG's rendering for the common cases).
-            crate::conversions::coerce_value(
-                Value::Float(result),
-                DataType::Numeric { precision: 0, scale: 0 },
-                "stddev",
-                0,
-            )
-            .unwrap_or(Value::Float(result))
+            // A float input resolves PG's float8 overload → double precision.
+            Value::Float(result)
         }
         // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
         // → SQL NULL.
