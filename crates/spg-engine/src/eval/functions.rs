@@ -12438,10 +12438,18 @@ fn apply_function_dispatch(
                 None => Ok(Value::Null),
             }
         }
+        // v7.38 (read01) — pg_get_expr(adbin, adrelid) deparses a stored node
+        // tree to source text. SPG's pg_attrdef.adbin already holds the
+        // deparsed default text (SPG has no real pg_node_tree), so the
+        // canonical `pg_get_expr(adbin, adrelid) FROM pg_attrdef` form just
+        // returns the first argument. A NULL / non-text first arg → NULL.
+        "pg_get_expr" => match args.first() {
+            Some(Value::Text(s)) => Ok(Value::text(s.clone())),
+            _ => Ok(Value::Null),
+        },
         "pg_get_functiondef"
         | "pg_get_triggerdef"
         | "pg_get_ruledef"
-        | "pg_get_expr"
         | "pg_get_partkeydef"
         | "pg_get_statisticsobjdef" => Ok(Value::Null),
         // pg_get_userbyid always returns "admin" — SPG's single-user

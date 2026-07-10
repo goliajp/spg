@@ -56,6 +56,7 @@ pub(crate) fn deserialize_table(
             inline_set_variants: None,
             generated_stored_expr: None,
             identity_always: false,
+            default_text: None,
         });
     }
     let n_cols = cols.len();
@@ -310,6 +311,20 @@ pub(crate) fn deserialize_table(
             let src = cur.read_str()?;
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.generated_stored_expr = Some(src);
+            }
+        }
+    }
+    // v7.38 (read01) — per-table default_text appendix (FILE_VERSION 58+).
+    // Sparse; written right after the generated_stored_expr block, so it is
+    // read here before the MVCC row appendix. v57-and-below catalogs default
+    // every column to default_text = None.
+    if version >= 58 {
+        let default_count = cur.read_u16()? as usize;
+        for _ in 0..default_count {
+            let col_pos = cur.read_u16()? as usize;
+            let src = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.default_text = Some(src);
             }
         }
     }

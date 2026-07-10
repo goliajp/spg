@@ -22,10 +22,13 @@ fn ddl_reconstruction_funcs_return_null_or_admin() {
         first(&mut e, "SELECT pg_get_functiondef(1)"),
         spg_storage::Value::Null
     ));
-    assert!(matches!(
-        first(&mut e, "SELECT pg_get_expr('x', 1)"),
-        spg_storage::Value::Null
-    ));
+    // v7.38 (read01) — pg_get_expr now passes through its text first arg:
+    // SPG's pg_attrdef.adbin holds the already-deparsed default text (no real
+    // pg_node_tree), so `pg_get_expr(adbin, adrelid)` returns it verbatim.
+    match first(&mut e, "SELECT pg_get_expr('x', 1)") {
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "x"),
+        other => panic!("expected 'x', got {other:?}"),
+    }
     match first(&mut e, "SELECT pg_get_userbyid(10)") {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "admin"),
         other => panic!("expected admin, got {other:?}"),

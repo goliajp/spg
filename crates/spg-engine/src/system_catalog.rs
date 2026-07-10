@@ -248,47 +248,12 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            // column_default: runtime expressions keep their SQL
-            // text; literal defaults render via Display.
-            let default_text: Value<'static> = if let Some(expr) =
-                &col.runtime_default
-            {
-                Value::text(expr.clone())
-            } else if let Some(v) = &col.default {
-                // Render the literal default's SQL form.
-                let rendered = match v {
-                    Value::Text(s) => alloc::format!("'{s}'::text"),
-                    Value::Int(n) => n.to_string(),
-                    Value::BigInt(n) => n.to_string(),
-                    Value::SmallInt(n) => n.to_string(),
-                    Value::Float(f) => f.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    // Typed literal defaults render via the engine's
-                    // canonical text formatters (PG stores the default
-                    // expression text) instead of leaking Rust Debug
-                    // (`Numeric { scaled: 0, scale: 2 }`).
-                    Value::Numeric { scaled, scale, kind } => {
-                        crate::eval::format_numeric_kind(*kind, *scaled, *scale)
-                    }
-                    Value::Date(d) => alloc::format!("'{}'::date", crate::eval::format_date(*d)),
-                    // v7.38 (T-tstz Phase 1) — a timestamptz column's default
-                    // renders with the offset and the full type name, like PG.
-                    Value::Timestamp(t) if matches!(col.ty, DataType::Timestamptz) => {
-                        alloc::format!(
-                            "'{}'::timestamp with time zone",
-                            crate::eval::format_timestamptz(*t)
-                        )
-                    }
-                    Value::Timestamp(t) => {
-                        alloc::format!(
-                            "'{}'::timestamp without time zone",
-                            crate::eval::format_timestamp(*t)
-                        )
-                    }
-                    Value::Uuid(b) => alloc::format!("'{}'::uuid", spg_storage::format_uuid(b)),
-                    other => alloc::format!("{other:?}"),
-                };
-                Value::text(rendered)
+            // column_default: v7.38 (read01) — the deparsed source text of the
+            // DEFAULT expression (cached at CREATE TABLE), matching PG's
+            // pg_get_expr output. Falls back to the serial nextval
+            // spelling, else NULL.
+            let default_text: Value<'static> = if let Some(txt) = &col.default_text {
+                Value::text(txt.clone())
             } else if col.auto_increment {
                 Value::text(alloc::format!(
                     "nextval('{tname}_{}_seq'::regclass)",
@@ -650,6 +615,51 @@ pub(crate) fn synth_pg_depend(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("deptype", DataType::Text, false),
     ];
     let rows: Vec<Row<'static>> = Vec::new();
+    (schema, rows)
+}
+
+/// v7.38 (read01) — synthesise `pg_catalog.pg_attrdef`, the column-default
+/// catalog. One row per column that has an explicit DEFAULT, carrying the
+/// deparsed source text in `adbin` (SPG stores the PG-compatible text there
+/// rather than a real `pg_node_tree`; `pg_get_expr(adbin, adrelid)` returns it
+/// verbatim). ORM reflection (SQLAlchemy, Alembic autogenerate) and pg_dump
+/// read this via `SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef`.
+///
+/// PG-canonical columns:
+///   * oid (BigInt) — the attrdef row OID (synthetic; not asserted-parity)
+///   * adrelid (BigInt) — owning table OID (pg_class's 16384+ band)
+///   * adnum (SmallInt) — 1-based column position
+///   * adbin (Text) — the default expression (pg_node_tree in PG)
+pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("adrelid", DataType::BigInt, false),
+        ColumnSchema::new("adnum", DataType::SmallInt, false),
+        ColumnSchema::new("adbin", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut table_oid: i64 = 16384;
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else {
+            table_oid = table_oid.saturating_add(1);
+            continue;
+        };
+        for (i, col) in t.schema().columns.iter().enumerate() {
+            let Some(txt) = &col.default_text else { continue };
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let adnum = (i + 1) as i16;
+            // Synthetic row OID: table OID × 1000 + column position. Distinct
+            // per default, in a band that won't collide with table OIDs.
+            let row_oid = table_oid.saturating_mul(1000).saturating_add(i64::from(adnum));
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(row_oid),
+                Value::BigInt(table_oid),
+                Value::SmallInt(adnum),
+                Value::text(txt.clone()),
+            ]));
+        }
+        table_oid = table_oid.saturating_add(1);
+    }
     (schema, rows)
 }
 

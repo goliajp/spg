@@ -593,6 +593,13 @@ impl Engine {
                         crate::system_catalog::synth_pg_depend(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.38 (read01) — pg_catalog.pg_attrdef (column defaults;
+                // ORM reflection + pg_dump read the deparsed default text).
+                "__spg_pg_attrdef" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_attrdef(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.14) — pg_catalog.pg_collation.
                 "__spg_pg_collation" => {
                     let (schema, rows) =
