@@ -26,7 +26,7 @@ fn json_object_flat_array() {
             &mut e,
             "SELECT json_object(ARRAY['a', '1', 'b', '2'])"
         )),
-        r#"{"a":"1","b":"2"}"#
+        r#"{"a" : "1", "b" : "2"}"#
     );
     // Empty array → empty object.
     assert_eq!(
@@ -43,7 +43,7 @@ fn json_object_two_arrays() {
             &mut e,
             "SELECT json_object(ARRAY['x', 'y'], ARRAY['10', '20'])"
         )),
-        r#"{"x":"10","y":"20"}"#
+        r#"{"x" : "10", "y" : "20"}"#
     );
 }
 
@@ -54,7 +54,7 @@ fn json_object_escapes_quotes() {
         &mut e,
         r#"SELECT json_object(ARRAY['k', 'has "quote"'])"#,
     ));
-    assert_eq!(v, r#"{"k":"has \"quote\""}"#);
+    assert_eq!(v, r#"{"k" : "has \"quote\""}"#);
 }
 
 #[test]
@@ -81,6 +81,6 @@ fn jsonb_object_alias() {
     let mut e = Engine::new();
     assert_eq!(
         json(&first(&mut e, "SELECT jsonb_object(ARRAY['a', '1'])")),
-        r#"{"a":"1"}"#
+        r#"{"a": "1"}"#
     );
 }

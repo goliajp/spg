@@ -20,21 +20,21 @@ fn json_object_accepts_text_array_literals() {
     // Two-array text-literal form.
     assert_eq!(
         text(&mut e, "SELECT json_object('{a,b}', '{1,2}')::text"),
-        r#"{"a":"1","b":"2"}"#
+        r#"{"a" : "1", "b" : "2"}"#
     );
     // Flat single-array text-literal form.
     assert_eq!(
         text(&mut e, "SELECT json_object('{a,1,b,2}')::text"),
-        r#"{"a":"1","b":"2"}"#
+        r#"{"a" : "1", "b" : "2"}"#
     );
-    // jsonb_object too.
+    // jsonb_object too (canonical `: ` spacing).
     assert_eq!(
         text(&mut e, "SELECT jsonb_object('{a,b}', '{1,2}')::text"),
-        r#"{"a":"1","b":"2"}"#
+        r#"{"a": "1", "b": "2"}"#
     );
     // The ARRAY[...] spelling still works.
     assert_eq!(
         text(&mut e, "SELECT json_object(ARRAY['a','b'], ARRAY['1','2'])::text"),
-        r#"{"a":"1","b":"2"}"#
+        r#"{"a" : "1", "b" : "2"}"#
     );
 }
