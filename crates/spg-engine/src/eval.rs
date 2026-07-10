@@ -446,6 +446,108 @@ fn apply_enum_cast<'a>(
     }
 }
 
+/// Apply one `[index]` subscript to a value — the single-step semantics shared
+/// by 1-D array elements and JSON path access (`j['a']`, `j[0]`). NULL target
+/// or index → NULL; a 1-based integer indexes a 1-D array (out of range → NULL,
+/// non-array → error); JSON delegates to `path_get`.
+fn apply_one_subscript(
+    target_v: Value<'static>,
+    index: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let idx_v = eval_expr(index, row, ctx)?;
+    if matches!(target_v, Value::Null) || matches!(idx_v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // v7.38 (read01) — JSON/JSONB subscripting (`j['a']`, `j[0]`, chained
+    // `j['a']['b']`) is object/array access, identical to the `->` operator
+    // (text key → object field, integer → 0-based array element). PG 14+.
+    if matches!(target_v, Value::Json(_)) {
+        return crate::json::path_get(&target_v, &idx_v, false);
+    }
+    let i: i64 = match idx_v {
+        Value::Int(n) => i64::from(n),
+        Value::BigInt(n) => n,
+        Value::SmallInt(n) => i64::from(n),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "array subscript must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    if i < 1 {
+        return Ok(Value::Null);
+    }
+    let pos = (i - 1) as usize;
+    match array_element_at(&target_v, pos) {
+        Some(v) => Ok(v),
+        None if array_len(&target_v).is_some() => Ok(Value::Null),
+        None => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "subscript target must be an array, got {:?}",
+                target_v.data_type()
+            ),
+        }),
+    }
+}
+
+/// v7.38 (read01, 2D-subscript) — index a 2-D array (`arr[i][j]`). PG needs
+/// exactly two subscripts to reach an element; a single subscript on a 2-D
+/// array yields NULL (not the row), and any out-of-range index → NULL. Both
+/// subscripts are 1-based.
+fn eval_matrix_subscript(
+    base: &Value<'static>,
+    idx_exprs: &[&Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    if idx_exprs.len() != 2 {
+        return Ok(Value::Null);
+    }
+    let mut idx = [0i64; 2];
+    for (k, ix) in idx_exprs.iter().enumerate() {
+        idx[k] = match eval_expr(ix, row, ctx)? {
+            Value::Null => return Ok(Value::Null),
+            Value::Int(n) => i64::from(n),
+            Value::BigInt(n) => n,
+            Value::SmallInt(n) => i64::from(n),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array subscript must be integer, got {:?}",
+                        other.data_type()
+                    ),
+                });
+            }
+        };
+    }
+    let (r, c) = (idx[0], idx[1]);
+    if r < 1 || c < 1 {
+        return Ok(Value::Null);
+    }
+    let (ri, ci) = ((r - 1) as usize, (c - 1) as usize);
+    macro_rules! elem {
+        ($rows:expr, $map:expr) => {
+            Ok($rows
+                .get(ri)
+                .and_then(|inner| inner.get(ci))
+                .map_or(Value::Null, |cell| cell.as_ref().map_or(Value::Null, $map)))
+        };
+    }
+    match base {
+        Value::IntArray2D(rows) => elem!(rows, |n| Value::Int(*n)),
+        Value::BigIntArray2D(rows) => elem!(rows, |n| Value::BigInt(*n)),
+        Value::TextArray2D(rows) => {
+            elem!(rows, |s| Value::Text(alloc::borrow::Cow::Owned(s.clone())))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
 pub fn eval_expr(
     expr: &Expr,
     row: &Row<'static>,
@@ -1015,50 +1117,34 @@ pub fn eval_expr(
         }
         // v7.10.12 — `arr[i]` PG-style 1-based indexing.
         // Out-of-range indices (including i ≤ 0) return NULL.
-        Expr::ArraySubscript { target, index } => {
-            let target_v = eval_expr(target, row, ctx)?;
-            let idx_v = eval_expr(index, row, ctx)?;
-            if matches!(target_v, Value::Null) || matches!(idx_v, Value::Null) {
-                return Ok(Value::Null);
+        Expr::ArraySubscript { .. } => {
+            // Collect the whole subscript chain so PG's multi-dimensional
+            // access (`arr[i][j]` is ONE N-subscript op) is distinguishable
+            // from chained 1-D indexing. `arr[1][2]` parses as
+            // `(arr[1])[2]`; PG indexes the matrix directly and returns NULL
+            // for a partial subscript (`arr[1]` on a 2-D array is NULL).
+            let mut idx_exprs: Vec<&Expr> = Vec::new();
+            let mut base = expr;
+            while let Expr::ArraySubscript { target, index } = base {
+                idx_exprs.push(index);
+                base = target;
             }
-            // v7.38 (read01) — JSON/JSONB subscripting (`j['a']`, `j[0]`, chained
-            // `j['a']['b']`) is object/array access, identical to the `->`
-            // operator (text key → object field, integer → 0-based array
-            // element). PG 14+ subscript syntax.
-            if matches!(target_v, Value::Json(_)) {
-                return crate::json::path_get(&target_v, &idx_v, false);
+            idx_exprs.reverse();
+            let base_v = eval_expr(base, row, ctx)?;
+            if matches!(
+                base_v,
+                Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_)
+            ) {
+                return eval_matrix_subscript(&base_v, &idx_exprs, row, ctx);
             }
-            let i: i64 = match idx_v {
-                Value::Int(n) => i64::from(n),
-                Value::BigInt(n) => n,
-                Value::SmallInt(n) => i64::from(n),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array subscript must be integer, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
-            };
-            if i < 1 {
-                return Ok(Value::Null);
+            // 1-D array / JSON: apply each subscript left-to-right. This
+            // reproduces the prior single-subscript semantics exactly, and
+            // chained JSON (`j['a']['b']`) still resolves step by step.
+            let mut cur = base_v;
+            for ix in idx_exprs {
+                cur = apply_one_subscript(cur, ix, row, ctx)?;
             }
-            let pos = (i - 1) as usize;
-            // Covers every 1-D array element type uniformly. An in-range
-            // element (or NULL hole) yields the element / NULL; an
-            // out-of-range index on a real array yields NULL; a non-array
-            // target errors.
-            match array_element_at(&target_v, pos) {
-                Some(v) => Ok(v),
-                None if array_len(&target_v).is_some() => Ok(Value::Null),
-                None => Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "subscript target must be an array, got {:?}",
-                        target_v.data_type()
-                    ),
-                }),
-            }
+            Ok(cur)
         }
         // Array slice `arr[lo:hi]` — PG 1-based, both ends
         // inclusive, out-of-range bounds clamp, missing bounds

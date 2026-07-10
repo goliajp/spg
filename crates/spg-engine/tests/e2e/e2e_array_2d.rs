@@ -17,6 +17,34 @@ fn text(e: &mut Engine, sql: &str) -> String {
 }
 
 #[test]
+fn array_2d_element_subscript() {
+    // read01 2D-subscript — PG treats `arr[i][j]` as ONE 2-subscript op:
+    // it reaches an element; a single subscript on a 2-D array is NULL (not
+    // the row), and any out-of-range index is NULL. All values live-PG18.4.
+    let mut e = Engine::new();
+    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])[1][2]"), "2");
+    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])[2][1]"), "3");
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[['a','b'],['c','d']])[2][2]"),
+        "d"
+    );
+    // bigint matrix (values > i32::MAX force BigIntArray2D); cast to text
+    // since the test helper has no BigInt arm.
+    assert_eq!(
+        text(&mut e, "SELECT ((ARRAY[[9999999999,2],[3,4]])[1][1])::text"),
+        "9999999999"
+    );
+    // Partial subscript on a 2-D array → NULL (PG), not the sub-row.
+    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])[1]"), "Null");
+    // Out-of-range → NULL.
+    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])[3][1]"), "Null");
+    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])[1][9]"), "Null");
+    // Regression: 1-D subscript and chained JSON subscript still work.
+    assert_eq!(text(&mut e, "SELECT (ARRAY[7,8,9])[2]"), "8");
+    assert_eq!(text(&mut e, "SELECT (ARRAY[7,8,9])[9]"), "Null");
+}
+
+#[test]
 fn array_2d_construct_and_introspect() {
     let mut e = Engine::new();
     assert_eq!(
