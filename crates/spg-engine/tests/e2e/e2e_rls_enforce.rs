@@ -149,20 +149,95 @@ fn join_on_rls_table_fails_closed() {
     );
 }
 
+/// Rows affected by a CommandOk statement.
+fn affected(e: &mut Engine, sql: &str) -> usize {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
+        QueryResult::CommandOk { affected, .. } => affected,
+        other => panic!("{sql}: expected CommandOk, got {other:?}"),
+    }
+}
+
 #[test]
-fn writes_fail_closed_under_non_superuser() {
+fn insert_with_check_enforced() {
+    let mut e = Engine::new();
+    // Policy has USING; its WITH CHECK falls back to USING (PG semantics).
+    e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    e.execute("CREATE POLICY p ON doc USING (owner = current_user)")
+        .unwrap();
+    e.execute("SET ROLE alice").unwrap();
+    // Own row → allowed; another owner → "new row violates ...".
+    e.execute("INSERT INTO doc VALUES (1,'alice')").unwrap();
+    assert!(e.execute("INSERT INTO doc VALUES (2,'bob')").is_err());
+    assert_eq!(
+        col(&mut e, "SELECT id::text FROM doc ORDER BY id"),
+        vec!["1"]
+    );
+}
+
+#[test]
+fn insert_denied_when_no_policy() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t(id int)").unwrap();
+    e.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    e.execute("SET ROLE alice").unwrap();
+    // RLS on, no applicable policy → every new row violates.
+    assert!(e.execute("INSERT INTO t VALUES (1)").is_err());
+}
+
+#[test]
+fn update_using_visibility_and_with_check() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob'),(3,'alice')")
+        .unwrap();
+    e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    e.execute(
+        "CREATE POLICY p ON doc USING (owner = current_user) WITH CHECK (owner = current_user)",
+    )
+    .unwrap();
+    e.execute("SET ROLE alice").unwrap();
+    // Update own row, keep owner → 1 row.
+    assert_eq!(affected(&mut e, "UPDATE doc SET id=99 WHERE id=1"), 1);
+    // Flip owner to bob → WITH CHECK violation.
+    assert!(e.execute("UPDATE doc SET owner='bob' WHERE id=3").is_err());
+    // Update a row hidden by USING (bob's) → silently 0, no error.
+    assert_eq!(affected(&mut e, "UPDATE doc SET id=88 WHERE id=2"), 0);
+}
+
+#[test]
+fn delete_using_visibility() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob')")
+        .unwrap();
+    e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    e.execute("CREATE POLICY p ON doc USING (owner = current_user)")
+        .unwrap();
+    e.execute("SET ROLE alice").unwrap();
+    // Delete own row → 1; delete a hidden (bob's) row → 0.
+    assert_eq!(affected(&mut e, "DELETE FROM doc WHERE id=1"), 1);
+    assert_eq!(affected(&mut e, "DELETE FROM doc WHERE id=2"), 0);
+    // Bob's row survives (superuser view).
+    e.execute("RESET ROLE").unwrap();
+    assert_eq!(
+        col(&mut e, "SELECT owner FROM doc ORDER BY id"),
+        vec!["bob"]
+    );
+}
+
+#[test]
+fn superuser_writes_bypass() {
     let mut e = Engine::new();
     owned_docs(&mut e);
-    e.execute("SET ROLE alice").unwrap();
-    // Phase-1 write-side is fail-closed (WITH CHECK / USING enforcement is
-    // Phase 2): a policy-subject session cannot write an RLS table yet.
-    assert!(e.execute("INSERT INTO doc VALUES (9,'alice')").is_err());
-    assert!(
-        e.execute("UPDATE doc SET owner='alice' WHERE id=1")
-            .is_err()
-    );
-    assert!(e.execute("DELETE FROM doc WHERE id=1").is_err());
-    // The superuser session still writes freely (bypass).
-    e.execute("RESET ROLE").unwrap();
-    e.execute("INSERT INTO doc VALUES (9,'x')").unwrap();
+    // Default session writes any owner freely (bypass).
+    e.execute("INSERT INTO doc VALUES (9,'anyone')").unwrap();
+    assert_eq!(affected(&mut e, "UPDATE doc SET owner='x' WHERE id=2"), 1);
 }

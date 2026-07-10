@@ -141,11 +141,25 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
         }
+        // v7.39 (RLS) Phase 2 — UPDATE USING visibility: AND the policy's USING
+        // predicate into WHERE so a policy-subject session only updates rows it
+        // can see (a hidden row is silently skipped). None for superuser / non-
+        // RLS tables (no clone).
+        let rls_upd;
+        let stmt = match self.rls_write_using_predicate(&stmt.table, spg_storage::PolicyCmd::Update)
+        {
+            Some(pred) => {
+                let mut s = stmt.clone();
+                s.where_ = and_optional_predicates(s.where_.take(), Some(pred));
+                rls_upd = s;
+                &rls_upd
+            }
+            None => stmt,
+        };
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
@@ -496,6 +510,18 @@ impl Engine {
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
             enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows)?;
+            // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
+            let cols = self
+                .active_catalog()
+                .get(&stmt.table)
+                .map(|t| t.schema().columns.clone())
+                .unwrap_or_default();
+            self.rls_check_new_rows(
+                &stmt.table,
+                spg_storage::PolicyCmd::Update,
+                &cols,
+                &new_rows,
+            )?;
         }
         // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
         // enforcement on UPDATE. The pre-image of each updated row is
@@ -995,11 +1021,23 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body (DELETE).
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
         }
+        // v7.39 (RLS) Phase 2 — DELETE USING visibility: only delete rows the
+        // policy-subject session can see (a hidden row is silently skipped).
+        let rls_del;
+        let stmt = match self.rls_write_using_predicate(&stmt.table, spg_storage::PolicyCmd::Delete)
+        {
+            Some(pred) => {
+                let mut s = stmt.clone();
+                s.where_ = and_optional_predicates(s.where_.take(), Some(pred));
+                rls_del = s;
+                &rls_del
+            }
+            None => stmt,
+        };
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
@@ -1497,7 +1535,6 @@ impl Engine {
         &mut self,
         mut stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
-        self.rls_write_guard(&stmt.table)?;
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
         // leading WITH clause first (running any modifying CTE
         // bodies against the active catalog so their writes land
@@ -1647,6 +1684,14 @@ impl Engine {
         }
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
         enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values)?;
+        // v7.39 (RLS) Phase 2 — INSERT WITH CHECK: a policy-subject session's
+        // new rows must satisfy the combined WITH CHECK predicate.
+        self.rls_check_new_rows(
+            &stmt.table,
+            spg_storage::PolicyCmd::Insert,
+            &column_meta,
+            &all_values,
+        )?;
         // NOTE (mailrs embed round-12): UNIQUE / PRIMARY KEY and
         // UNIQUE INDEX enforcement moved BELOW the ON CONFLICT
         // resolution pass. Running them first made every
