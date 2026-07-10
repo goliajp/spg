@@ -1105,21 +1105,48 @@ pub fn eval_expr(
             if matches!(arr, Value::Null) {
                 return Ok(Value::Null);
             }
-            let elems: Vec<Option<Value>> = match arr {
-                Value::TextArray(items) => items.into_iter().map(|o| o.map(Value::text)).collect(),
-                Value::IntArray(items) => items.into_iter().map(|o| o.map(Value::Int)).collect(),
-                Value::BigIntArray(items) => {
-                    items.into_iter().map(|o| o.map(Value::BigInt)).collect()
+            // v7.38 (read01) — an unknown-string RHS (`x = ANY('{1,2,3}')`)
+            // takes the LHS's type: coerce the external array text to the array
+            // type matching the LHS's element type, like PG.
+            let arr = match &arr {
+                Value::Text(_) => {
+                    // The LHS's element type, or TEXT when the LHS is an
+                    // untyped NULL (PG's unknown → text default).
+                    let arr_ty = match lhs.data_type() {
+                        Some(spg_storage::DataType::SmallInt) => {
+                            spg_storage::DataType::SmallIntArray
+                        }
+                        Some(spg_storage::DataType::Int) => spg_storage::DataType::IntArray,
+                        Some(spg_storage::DataType::BigInt) => spg_storage::DataType::BigIntArray,
+                        Some(spg_storage::DataType::Numeric { .. }) => {
+                            spg_storage::DataType::NumericArray
+                        }
+                        Some(spg_storage::DataType::Float) => spg_storage::DataType::FloatArray,
+                        Some(spg_storage::DataType::Bool) => spg_storage::DataType::BoolArray,
+                        Some(spg_storage::DataType::Date) => spg_storage::DataType::DateArray,
+                        _ => spg_storage::DataType::TextArray,
+                    };
+                    crate::conversions::coerce_value(arr.clone(), arr_ty, "", 0).unwrap_or(arr)
                 }
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "ANY/ALL right-hand side must be an array, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+                _ => arr,
             };
+            // Build the element list generically so every scalar array type
+            // (numeric[], float8[], bool[], date[], …) is accepted, not just
+            // int/bigint/text.
+            let Some(len) = array_len(&arr) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ANY/ALL right-hand side must be an array, got {:?}",
+                        arr.data_type()
+                    ),
+                });
+            };
+            let elems: Vec<Option<Value>> = (0..len)
+                .map(|i| match array_element_at(&arr, i) {
+                    Some(Value::Null) | None => None,
+                    Some(v) => Some(v),
+                })
+                .collect();
             // PG: `x op ANY (empty)` → false and `x op ALL (empty)` →
             // true, decided purely by emptiness — the comparison is
             // never evaluated, so a NULL LHS is irrelevant. This must
