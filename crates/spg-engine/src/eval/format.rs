@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::civil_from_days;
+use super::{civil_from_days, MONTH_ABBR, MONTH_FULL};
 
 /// Render a `Date` (days since epoch) as `YYYY-MM-DD`. Negative values
 /// for pre-1970 dates render with a leading `-` on the year.
@@ -260,6 +260,13 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
         }
         return Some(days_from_civil(y, m, d));
     }
+    // v7.38 (read01) — month-name forms in any of PG's field orders
+    // (`Jan 5, 2020`, `5 Jan 2020`, `2020-Jan-05`, `5-Jan-2020`), case
+    // insensitive. Try this before the numeric split so a `Mon-D-Y` dashed
+    // form isn't mistaken for a numeric field.
+    if s.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return parse_month_name_date(s);
+    }
     // v7.38 (read01) — year-first numeric form with `-`, `/` or `.` separators
     // and non-zero-padded month/day (`2020-1-5`, `2020/01/5`, `2020.1.05`), all
     // of which PG accepts. Requires exactly three all-digit fields, the first
@@ -282,6 +289,51 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     // `'2024-02-30'` / `'2024-04-31'` / `'2023-02-29'` all raise "date/time
     // field value out of range". Without this the parser would silently roll
     // the overflow forward (Feb 30 → Mar 1) and corrupt data.
+    if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// v7.38 (read01) — resolve a month-name date in any of PG's field orders.
+/// Tokenises on space / comma / dash, then classifies exactly one month name,
+/// one 4-digit year, and one 1–2 digit day, in any order. Case insensitive;
+/// both `Jan` and `January` spellings. Leap-aware day validation, like the
+/// numeric path. Returns `None` for anything ambiguous or malformed so the
+/// caller raises the same "invalid input" / "out of range" errors as PG.
+fn parse_month_name_date(s: &str) -> Option<i32> {
+    let tokens: alloc::vec::Vec<&str> = s
+        .split(|c: char| c == ' ' || c == ',' || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() != 3 {
+        return None;
+    }
+    let month_of = |t: &str| -> Option<u32> {
+        let up = t.to_ascii_uppercase();
+        MONTH_ABBR
+            .iter()
+            .position(|a| a.eq_ignore_ascii_case(&up))
+            .or_else(|| MONTH_FULL.iter().position(|f| f.eq_ignore_ascii_case(&up)))
+            .map(|i| i as u32 + 1)
+    };
+    let (mut month, mut year, mut day) = (None, None, None);
+    for t in tokens {
+        if let Some(m) = month_of(t) {
+            if month.replace(m).is_some() {
+                return None; // two month names
+            }
+        } else if t.bytes().all(|b| b.is_ascii_digit()) {
+            match t.len() {
+                4 if year.is_none() => year = t.parse().ok(),
+                1 | 2 if day.is_none() => day = t.parse().ok(),
+                _ => return None,
+            }
+        } else {
+            return None; // a non-month alphabetic token (`Foo`)
+        }
+    }
+    let (m, y, d): (u32, i32, u32) = (month?, year?, day?);
     if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
         return None;
     }
