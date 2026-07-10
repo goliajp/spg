@@ -282,32 +282,31 @@ pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
 /// the 7th bit (0x02, locally-administered) of the first byte,
 /// converting an EUI-64 into a modified EUI-64 for IPv6 autoconf.
 pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let s = match args {
-        [Value::Text(s)] => s.clone(),
+    // v7.38 (read01) — PG's macaddr8_set7bit takes (and returns) a macaddr8.
+    // An unadorned string literal is the unknown-type form PG casts for you.
+    let mut out: [u8; 8] = match args {
+        [Value::Macaddr8(b)] => *b,
         [Value::Null] => return Ok(Value::Null),
+        [Value::Text(s)] => {
+            let bytes: Vec<u8> = s
+                .split(|c| c == ':' || c == '-')
+                .filter_map(|part| u8::from_str_radix(part, 16).ok())
+                .collect();
+            <[u8; 8]>::try_from(bytes.as_slice()).map_err(|_| EvalError::TypeMismatch {
+                detail: alloc::format!("macaddr8_set7bit(): invalid macaddr8 '{s}'"),
+            })?
+        }
         _ => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "macaddr8_set7bit() takes one TEXT arg, got {} args",
+                    "macaddr8_set7bit() takes one macaddr8 arg, got {} args",
                     args.len()
                 ),
             });
         }
     };
-    let bytes: Vec<u8> = s
-        .split(|c| c == ':' || c == '-')
-        .filter_map(|part| u8::from_str_radix(part, 16).ok())
-        .collect();
-    if bytes.len() != 8 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("macaddr8_set7bit(): invalid macaddr8 '{s}'"),
-        });
-    }
-    let mut out = bytes;
     out[0] |= 0x02;
-    let hex: Vec<alloc::string::String> =
-        out.iter().map(|b| alloc::format!("{b:02x}")).collect();
-    Ok(Value::text(hex.join(":")))
+    Ok(Value::Macaddr8(out))
 }
 
 /// v7.37.17 (17.6 siblings) — inet_same_family(a, b).

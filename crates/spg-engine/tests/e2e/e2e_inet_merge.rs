@@ -50,20 +50,38 @@ fn inet_merge_mixed_family_errors() {
 
 #[test]
 fn macaddr8_set7bit_sets_bit() {
+    // v7.38 (read01) — PG's macaddr8_set7bit takes and returns a macaddr8; it
+    // used to insist on TEXT and hand a TEXT back. An unadorned literal is the
+    // unknown-type form PG casts for you. Oracle: live PG18.4.
     let mut e = Engine::new();
     // PG doc example: 00:34:56:ab:cd:ef:12:34 → 02:34:56:ab:cd:ef:12:34
     assert_eq!(
         text(&first(
             &mut e,
-            "SELECT macaddr8_set7bit('00:34:56:ab:cd:ef:12:34')"
+            "SELECT (macaddr8_set7bit('00:34:56:ab:cd:ef:12:34'))::text"
         )),
         "02:34:56:ab:cd:ef:12:34"
+    );
+    // A real macaddr8 argument works and keeps the macaddr8 type.
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT (macaddr8_set7bit('00:34:56:ab:cd:ef:12:34'::macaddr8))::text"
+        )),
+        "02:34:56:ab:cd:ef:12:34"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT pg_typeof(macaddr8_set7bit('00:34:56:ab:cd:ef:12:34'::macaddr8))::text"
+        )),
+        "macaddr8"
     );
     // Already set — unchanged.
     assert_eq!(
         text(&first(
             &mut e,
-            "SELECT macaddr8_set7bit('02:34:56:ab:cd:ef:12:34')"
+            "SELECT (macaddr8_set7bit('02:34:56:ab:cd:ef:12:34'::macaddr8))::text"
         )),
         "02:34:56:ab:cd:ef:12:34"
     );
