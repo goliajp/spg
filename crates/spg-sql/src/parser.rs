@@ -11157,7 +11157,19 @@ impl Parser {
             self.advance();
             let mut tuple = Vec::new();
             loop {
-                tuple.push(self.parse_expr(0)?);
+                // v7.38 (read01) — `INSERT INTO t VALUES (…, DEFAULT, …)` uses
+                // the column's declared default for that slot. Rides out as the
+                // same `__column_default` marker call the UPDATE `SET c = DEFAULT`
+                // path uses; the INSERT executor resolves it per target column.
+                if matches!(self.peek(), Token::Default) {
+                    self.advance();
+                    tuple.push(Expr::FunctionCall {
+                        name: "__column_default".to_string(),
+                        args: Vec::new(),
+                    });
+                } else {
+                    tuple.push(self.parse_expr(0)?);
+                }
                 match self.peek() {
                     Token::Comma => {
                         self.advance();

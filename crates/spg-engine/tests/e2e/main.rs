@@ -297,6 +297,7 @@ mod e2e_numeric_underscore_input;
 mod e2e_any_all_unknown_array;
 mod e2e_rollup_nested_group_col;
 mod e2e_array_concat_null;
+mod e2e_default_in_values;
 mod e2e_ctas;
 mod e2e_domain_cast;
 mod e2e_win1252_encoding;

@@ -2364,6 +2364,13 @@ impl Engine {
 /// column `c` is filled from the `j`-th tuple slot; `None` = fill with
 /// NULL / DEFAULT). `None` overall means the 1-1 fast path. Validates
 /// the column list once for reuse across every row.
+/// v7.38 (read01) — the parser's `DEFAULT`-in-VALUES marker: a `__column_default()`
+/// call with no args. `INSERT … VALUES (…, DEFAULT, …)` uses it for a slot, and
+/// the INSERT executor resolves it against the target column's declared default.
+fn is_column_default_marker(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, args } if name == "__column_default" && args.is_empty())
+}
+
 fn build_tuple_pos(
     columns: &Option<Vec<String>>,
     column_meta: &[ColumnSchema],
@@ -2522,22 +2529,26 @@ fn parse_insert_rows(
     // table; subsequent rows increment.
     let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
         alloc::collections::BTreeMap::new();
-    // v7.38 (read01 P6.41) — PG rejects an explicit value for a generated
-    // column ("cannot insert a non-DEFAULT value into column …"). SPG has no
-    // DEFAULT keyword in VALUES, so any slot provided for a generated column
-    // is a real user value and must be refused; the column list must omit it.
+    // v7.38 (read01 P6.41) — PG rejects an EXPLICIT value for a generated
+    // column ("cannot insert a non-DEFAULT value into column …"), but a
+    // `DEFAULT` marker for it is allowed (the column recomputes). So a
+    // generated column is refused only when SOME row supplies a non-DEFAULT
+    // value at its slot.
     // v7.38 (read01 sweep) — with no column list a short row omits its trailing
-    // positions, so a column is "provided" only when SOME row reaches its slot.
-    let max_tuple_len = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // positions, so a slot is "reached" only when a row is long enough.
     for (i, col) in column_meta.iter().enumerate() {
         if col.generated_stored_expr.is_none() {
             continue;
         }
-        let provided = match tuple_pos {
-            Some(map) => map.get(i).copied().flatten().is_some(),
-            None => i < max_tuple_len,
+        let slot: Option<usize> = match tuple_pos {
+            Some(map) => map.get(i).copied().flatten(),
+            None => Some(i),
         };
-        if provided {
+        let Some(j) = slot else { continue };
+        let has_explicit_value = rows
+            .iter()
+            .any(|row| row.get(j).is_some_and(|e| !is_column_default_marker(e)));
+        if has_explicit_value {
             return Err(EngineError::Unsupported(alloc::format!(
                 "cannot insert a non-DEFAULT value into column {:?} — it is a generated column",
                 col.name
@@ -2562,15 +2573,26 @@ fn parse_insert_rows(
         // maps to schema column j. We can zip schema with tuple
         // and skip the `raw_tuple` staging allocation entirely.
         let values: Vec<Value<'static>> = if let Some(map) = &tuple_pos {
-            // Permuted path: still need raw_tuple to index by `map[i]`.
-            let raw_tuple: Vec<Value<'static>> = tuple
+            // Permuted path: still need raw_tuple to index by `map[i]`. A
+            // `DEFAULT` marker maps to None here and is resolved per-column
+            // below (it has no column-free value).
+            let raw_tuple: Vec<Option<Value<'static>>> = tuple
                 .into_iter()
-                .map(literal_expr_to_value)
+                .map(|e| {
+                    if is_column_default_marker(&e) {
+                        Ok(None)
+                    } else {
+                        literal_expr_to_value(e).map(Some)
+                    }
+                })
                 .collect::<Result<_, _>>()?;
             let mut out = Vec::with_capacity(schema_cols_len);
             for (i, col) in column_meta.iter().enumerate() {
                 let mut raw = match map[i] {
-                    Some(j) => raw_tuple[j].clone(),
+                    Some(j) => match &raw_tuple[j] {
+                        Some(v) => v.clone(),
+                        None => resolve_column_default_free(col, clock)?,
+                    },
                     None => resolve_column_default_free(col, clock)?,
                 };
                 if col.auto_increment && raw.is_null() {
@@ -2605,7 +2627,12 @@ fn parse_insert_rows(
             let mut tuple_iter = tuple.into_iter();
             for (i, col) in column_meta.iter().enumerate() {
                 let mut raw = if i < tuple_len {
-                    literal_expr_to_value(tuple_iter.next().expect("i < tuple_len has a value"))?
+                    let e = tuple_iter.next().expect("i < tuple_len has a value");
+                    if is_column_default_marker(&e) {
+                        resolve_column_default_free(col, clock)?
+                    } else {
+                        literal_expr_to_value(e)?
+                    }
                 } else {
                     resolve_column_default_free(col, clock)?
                 };
