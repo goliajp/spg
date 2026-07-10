@@ -415,6 +415,13 @@ pub(crate) fn compute_window_partition(
                                 i128::from(count),
                             );
                             Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                        } else if all_int {
+                            // v7.38 (read01) — avg over integer inputs is NUMERIC
+                            // in PG (as it is for the GROUP BY avg() path), not
+                            // double. Divide the exact integer sum at scale 0.
+                            let (scaled, scale) =
+                                crate::numeric::numeric_avg(int_sum, 0, i128::from(count));
+                            Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
                         } else {
                             Value::Float(sum / count as f64)
                         }
