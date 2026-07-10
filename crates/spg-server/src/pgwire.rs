@@ -1058,16 +1058,32 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 let mut tls_conn =
                     crate::mysqlwire::build_server_connection().map_err(std::io::Error::other)?;
                 let mut tls = rustls::Stream::new(&mut tls_conn, &mut stream);
-                return run_pg_session(&mut tls, state);
+                return run_pg_session(&mut tls, state, true);
             }
             Some(80877104) => {
                 let mut hdr = [0u8; 8];
                 stream.read_exact(&mut hdr)?;
                 stream.write_all(b"N")?;
             }
-            _ => return run_pg_session(&mut stream, state),
+            _ => return run_pg_session(&mut stream, state, false),
         }
     }
+}
+
+/// v7.39 (TLS) — whether the server refuses plaintext (non-TLS) pgwire
+/// connections (`SPG_REQUIRE_TLS` set to a truthy value). Cached once.
+fn require_tls() -> bool {
+    static REQUIRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUIRE.get_or_init(|| {
+        std::env::var("SPG_REQUIRE_TLS")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// v7.39 (TLS) — peek the first 8 bytes (length + request code) WITHOUT
@@ -1086,10 +1102,25 @@ fn peek_startup_proto(stream: &TcpStream) -> std::io::Result<Option<u32>> {
 }
 
 /// Run the pgwire session (startup, auth, query loop) over a plain or
-/// TLS-wrapped stream.
-fn run_pg_session(stream: &mut dyn ReadWrite, state: &Arc<ServerState>) -> std::io::Result<()> {
+/// TLS-wrapped stream. `secure` is true when the stream is TLS-wrapped.
+fn run_pg_session(
+    stream: &mut dyn ReadWrite,
+    state: &Arc<ServerState>,
+    secure: bool,
+) -> std::io::Result<()> {
     // ---- Startup phase ----
     let (user, params) = read_startup(stream)?;
+    // v7.39 (TLS) — SPG_REQUIRE_TLS refuses a plaintext connection. Reported
+    // after the startup so the client sees a clean ErrorResponse (SQLSTATE
+    // 08P01) rather than a dropped socket.
+    if !secure && require_tls() {
+        send_error(
+            stream,
+            "08P01",
+            "SSL/TLS connection required (SPG_REQUIRE_TLS is set)",
+        )?;
+        return Ok(());
+    }
     // v7.17 Phase 2.4 — surface `application_name` from the startup
     // params on the per-connection ConnState (read back via
     // `spg_stat_activity.application_name`). Other params
