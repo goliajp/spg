@@ -143,10 +143,7 @@ impl QueryStats {
                 }
                 param_counter += 1;
                 out.push('$');
-                let _ = core::fmt::Write::write_fmt(
-                    &mut out,
-                    format_args!("{param_counter}"),
-                );
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{param_counter}"));
                 last_was_space = false;
                 continue;
             }
@@ -161,9 +158,7 @@ impl QueryStats {
                 let prev_is_ident = out
                     .as_bytes()
                     .last()
-                    .map(|c| {
-                        c.is_ascii_alphanumeric() || *c == b'_'
-                    })
+                    .map(|c| c.is_ascii_alphanumeric() || *c == b'_')
                     .unwrap_or(false);
                 if !prev_is_ident {
                     while i < bytes.len()
@@ -179,10 +174,7 @@ impl QueryStats {
                     }
                     param_counter += 1;
                     out.push('$');
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut out,
-                        format_args!("{param_counter}"),
-                    );
+                    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{param_counter}"));
                     last_was_space = false;
                     continue;
                 }
@@ -224,13 +216,7 @@ impl QueryStats {
     /// (SELECT result.len()) or affected (INSERT/UPDATE/DELETE
     /// affected). Aggregates over the normalised template into
     /// `total_rows` (cumulative) and `max_rows` (per-call peak).
-    pub fn record_with_rows(
-        &mut self,
-        sql: &str,
-        elapsed_us: u64,
-        now_us: u64,
-        rows: u64,
-    ) {
+    pub fn record_with_rows(&mut self, sql: &str, elapsed_us: u64, now_us: u64, rows: u64) {
         let sql = &Self::normalize_sql(sql);
         let sql: &str = sql.as_str();
         if let Some(stat) = self.entries.get_mut(sql) {
@@ -311,10 +297,7 @@ mod tests {
             "select * from t where name = $1"
         );
         // Embedded escaped quote.
-        assert_eq!(
-            QueryStats::normalize_sql("SELECT 'a''b'"),
-            "select $1"
-        );
+        assert_eq!(QueryStats::normalize_sql("SELECT 'a''b'"), "select $1");
     }
 
     #[test]

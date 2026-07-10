@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -15,7 +17,7 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 fn as_float(v: &spg_storage::Value<'_>) -> f64 {
     match v {
         spg_storage::Value::Float(f) => *f,
-        spg_storage::Value::Numeric { scaled, scale , .. } => {
+        spg_storage::Value::Numeric { scaled, scale, .. } => {
             *scaled as f64 / 10f64.powi(i32::from(*scale))
         }
         other => panic!("expected numeric, got {other:?}"),
@@ -25,9 +27,18 @@ fn as_float(v: &spg_storage::Value<'_>) -> f64 {
 #[test]
 fn to_number_basic() {
     let mut e = Engine::new();
-    assert_eq!(as_float(&first(&mut e, "SELECT to_number('12345', '99999')")), 12345.0);
-    assert_eq!(as_float(&first(&mut e, "SELECT to_number('-42', 'S99')")), -42.0);
-    assert_eq!(as_float(&first(&mut e, "SELECT to_number('3.14', '9D99')")), 3.14);
+    assert_eq!(
+        as_float(&first(&mut e, "SELECT to_number('12345', '99999')")),
+        12345.0
+    );
+    assert_eq!(
+        as_float(&first(&mut e, "SELECT to_number('-42', 'S99')")),
+        -42.0
+    );
+    assert_eq!(
+        as_float(&first(&mut e, "SELECT to_number('3.14', '9D99')")),
+        3.14
+    );
 }
 
 #[test]
@@ -77,7 +88,11 @@ fn to_number_returns_numeric_with_full_precision() {
     let mut e = Engine::new();
     assert!(matches!(
         first(&mut e, "SELECT to_number('1.5', 'FM9.9')"),
-        spg_storage::Value::Numeric { scaled: 15, scale: 1 , .. }
+        spg_storage::Value::Numeric {
+            scaled: 15,
+            scale: 1,
+            ..
+        }
     ));
     // 20-digit input survives (would have been mangled through f64).
     assert!(matches!(
@@ -85,11 +100,22 @@ fn to_number_returns_numeric_with_full_precision() {
             &mut e,
             "SELECT to_number('1234567890123456789.12', 'FM999999999999999999.99')"
         ),
-        spg_storage::Value::Numeric { scaled: 123456789012345678912, scale: 2 , .. }
+        spg_storage::Value::Numeric {
+            scaled: 123456789012345678912,
+            scale: 2,
+            ..
+        }
     ));
     // Numeric arithmetic on the result stays exact.
     assert!(matches!(
-        first(&mut e, "SELECT to_number('0.1','9.9') + to_number('0.2','9.9')"),
-        spg_storage::Value::Numeric { scaled: 3, scale: 1 , .. }
+        first(
+            &mut e,
+            "SELECT to_number('0.1','9.9') + to_number('0.2','9.9')"
+        ),
+        spg_storage::Value::Numeric {
+            scaled: 3,
+            scale: 1,
+            ..
+        }
     ));
 }

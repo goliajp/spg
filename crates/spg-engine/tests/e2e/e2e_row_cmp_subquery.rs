@@ -7,7 +7,10 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn scalar(e: &mut Engine, sql: &str) -> Value<'static> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
         _ => panic!("expected rows"),
     }

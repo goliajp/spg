@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -52,10 +54,7 @@ fn inet6_aton_ntoa_roundtrip() {
     );
     // IPv4 input keeps the 4-byte form (MySQL semantics).
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT inet6_ntoa(inet6_aton('10.0.5.9'))"
-        )),
+        text(&first(&mut e, "SELECT inet6_ntoa(inet6_aton('10.0.5.9'))")),
         "10.0.5.9"
     );
 }
@@ -86,26 +85,17 @@ fn mysql_insert_function() {
     let mut e = Engine::new();
     // MySQL doc vector: INSERT('Quadratic', 3, 4, 'What') → 'QuWhattic'.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT insert('Quadratic', 3, 4, 'What')"
-        )),
+        text(&first(&mut e, "SELECT insert('Quadratic', 3, 4, 'What')")),
         "QuWhattic"
     );
     // MySQL doc vector: INSERT('Quadratic', -1, 4, 'What') → 'Quadratic'.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT insert('Quadratic', -1, 4, 'What')"
-        )),
+        text(&first(&mut e, "SELECT insert('Quadratic', -1, 4, 'What')")),
         "Quadratic"
     );
     // MySQL doc vector: INSERT('Quadratic', 3, 100, 'What') → 'QuWhat'.
     assert_eq!(
-        text(&first(
-            &mut e,
-            "SELECT insert('Quadratic', 3, 100, 'What')"
-        )),
+        text(&first(&mut e, "SELECT insert('Quadratic', 3, 100, 'What')")),
         "QuWhat"
     );
 }

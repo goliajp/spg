@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -77,10 +79,7 @@ fn broadcast_sets_host_bits() {
 #[test]
 fn same_family_checks() {
     let mut e = Engine::new();
-    match first(
-        &mut e,
-        "SELECT inet_same_family('192.168.1.1', '10.0.0.1')",
-    ) {
+    match first(&mut e, "SELECT inet_same_family('192.168.1.1', '10.0.0.1')") {
         spg_storage::Value::Bool(true) => {}
         other => panic!("got {other:?}"),
     }
@@ -115,22 +114,43 @@ fn abbrev_inet_vs_cidr_and_same_family_values() {
     // values (not just text). All live-PG18.4-verified.
     let mut e = Engine::new();
     // inet: full form.
-    assert_eq!(text(&first(&mut e, "SELECT abbrev(inet '192.168.1.0/24')")), "192.168.1.0/24");
-    assert_eq!(text(&first(&mut e, "SELECT abbrev(inet '192.168.1.5')")), "192.168.1.5");
+    assert_eq!(
+        text(&first(&mut e, "SELECT abbrev(inet '192.168.1.0/24')")),
+        "192.168.1.0/24"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT abbrev(inet '192.168.1.5')")),
+        "192.168.1.5"
+    );
     // cidr: abbreviated.
-    assert_eq!(text(&first(&mut e, "SELECT abbrev(cidr '192.168.1.0/24')")), "192.168.1/24");
-    assert_eq!(text(&first(&mut e, "SELECT abbrev(cidr '10.0.0.0/8')")), "10/8");
+    assert_eq!(
+        text(&first(&mut e, "SELECT abbrev(cidr '192.168.1.0/24')")),
+        "192.168.1/24"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT abbrev(cidr '10.0.0.0/8')")),
+        "10/8"
+    );
     // inet_same_family over inet/cidr values.
     assert_eq!(
-        first(&mut e, "SELECT inet_same_family(inet '192.168.1.1', inet '10.0.0.1')"),
+        first(
+            &mut e,
+            "SELECT inet_same_family(inet '192.168.1.1', inet '10.0.0.1')"
+        ),
         spg_storage::Value::Bool(true)
     );
     assert_eq!(
-        first(&mut e, "SELECT inet_same_family(inet '192.168.1.1', inet '::1')"),
+        first(
+            &mut e,
+            "SELECT inet_same_family(inet '192.168.1.1', inet '::1')"
+        ),
         spg_storage::Value::Bool(false)
     );
     assert_eq!(
-        first(&mut e, "SELECT inet_same_family(cidr '192.168.1.0/24', inet '10.0.0.1')"),
+        first(
+            &mut e,
+            "SELECT inet_same_family(cidr '192.168.1.0/24', inet '10.0.0.1')"
+        ),
         spg_storage::Value::Bool(true)
     );
 }

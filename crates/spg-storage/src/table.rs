@@ -127,11 +127,7 @@ impl Table {
     /// `xmin = XMIN_FROZEN` short-circuits to plain `insert`
     /// behaviour so the legacy in-memory / WAL-replay paths keep
     /// returning identical results when they end up here.
-    pub fn insert_with_xmin(
-        &mut self,
-        row: Row<'static>,
-        xmin: u64,
-    ) -> Result<(), StorageError> {
+    pub fn insert_with_xmin(&mut self, row: Row<'static>, xmin: u64) -> Result<(), StorageError> {
         if xmin == crate::row_header::XMIN_FROZEN {
             return self.insert(row);
         }
@@ -220,21 +216,14 @@ impl Table {
     /// when the row is already tombstoned (a later DELETE on an
     /// already-deleted row should not change xmax — the original
     /// deletion wins).
-    pub fn mark_row_deleted(
-        &mut self,
-        position: usize,
-        xmax: u64,
-    ) -> Result<(), StorageError> {
+    pub fn mark_row_deleted(&mut self, position: usize, xmax: u64) -> Result<(), StorageError> {
         if position >= self.headers.len() {
             return Err(StorageError::Corrupt(alloc::format!(
                 "mark_row_deleted: position {position} out of bounds (headers={})",
                 self.headers.len()
             )));
         }
-        let mut h = *self
-            .headers
-            .get(position)
-            .expect("position bounds-checked");
+        let mut h = *self.headers.get(position).expect("position bounds-checked");
         if h.xmax != crate::row_header::XMAX_ALIVE {
             // Already tombstoned by an earlier delete. Keep the
             // original xmax — first-deleter-wins.
@@ -1661,8 +1650,7 @@ impl Table {
         // letting recovery preserve real xmin/xmax instead of
         // freezing everything; until then frozen is the safe
         // default for replay (all visible to every snapshot).
-        let mut new_headers: PersistentVec<crate::row_header::RowHeader> =
-            PersistentVec::new();
+        let mut new_headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
         // v7.37.15 (Phase C.1) — fresh monotonic ids for the
         // replacement rows drawn from the relation allocator, so a
         // post-replay id never collides with a pre-replay one.

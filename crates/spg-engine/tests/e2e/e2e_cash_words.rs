@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -64,10 +66,7 @@ fn cash_words_negative_and_dollar_sign() {
 #[test]
 fn to_ascii_strips_accents() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&first(&mut e, "SELECT to_ascii('Karél')")),
-        "Karel"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT to_ascii('Karél')")), "Karel");
     assert_eq!(
         text(&first(&mut e, "SELECT to_ascii('café naïve')")),
         "cafe naive"

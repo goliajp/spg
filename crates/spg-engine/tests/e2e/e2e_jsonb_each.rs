@@ -7,7 +7,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -78,9 +80,7 @@ fn each_text_still_unwraps() {
 #[test]
 fn non_object_input_errors() {
     let mut e = Engine::new();
-    let err = e
-        .execute("SELECT * FROM jsonb_each('[1, 2]')")
-        .unwrap_err();
+    let err = e.execute("SELECT * FROM jsonb_each('[1, 2]')").unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("non-object"), "unexpected error: {msg}");
 }
@@ -137,12 +137,16 @@ fn jsonb_each_in_select_list_is_composite_srf() {
     assert_eq!(comp(&got[0][0]), (Some("a".into()), Some("1".into())));
     assert_eq!(comp(&got[1][0]), (Some("b".into()), Some("2".into())));
     // _text: string values unwrap, JSON null → SQL NULL.
-    let got = rows(&mut e, "SELECT jsonb_each_text('{\"a\": \"x\", \"b\": null}'::jsonb)");
+    let got = rows(
+        &mut e,
+        "SELECT jsonb_each_text('{\"a\": \"x\", \"b\": null}'::jsonb)",
+    );
     assert_eq!(comp(&got[0][0]), (Some("a".into()), Some("x".into())));
     assert_eq!(comp(&got[1][0]), (Some("b".into()), None));
     // Over a real table: one composite row per member per source row.
     e.execute("CREATE TABLE je(j jsonb)").unwrap();
-    e.execute("INSERT INTO je VALUES ('{\"k\": 10}'), ('{\"m\": 20}')").unwrap();
+    e.execute("INSERT INTO je VALUES ('{\"k\": 10}'), ('{\"m\": 20}')")
+        .unwrap();
     let got = rows(&mut e, "SELECT jsonb_each(j) FROM je");
     assert_eq!(got.len(), 2);
     assert_eq!(comp(&got[0][0]), (Some("k".into()), Some("10".into())));

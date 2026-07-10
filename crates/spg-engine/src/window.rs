@@ -37,9 +37,10 @@ fn expr_has_window(e: &Expr) -> bool {
             expr_has_window(call) || order_by.iter().any(|o| expr_has_window(&o.expr))
         }
         Expr::Binary { lhs, rhs, .. } => expr_has_window(lhs) || expr_has_window(rhs),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            expr_has_window(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => expr_has_window(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_window),
         Expr::Like { expr, pattern, .. } => expr_has_window(expr) || expr_has_window(pattern),
         Expr::Extract { source, .. } => expr_has_window(source),
@@ -94,7 +95,10 @@ pub(crate) fn collect_window_nodes(e: &Expr, out: &mut Vec<Expr>) {
             collect_window_nodes(lhs, out);
             collect_window_nodes(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             collect_window_nodes(expr, out);
         }
         Expr::FunctionCall { args, .. } => {
@@ -126,7 +130,10 @@ pub(crate) fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
             rewrite_window_to_columns(lhs, window_nodes);
             rewrite_window_to_columns(rhs, window_nodes);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             rewrite_window_to_columns(expr, window_nodes);
         }
         Expr::FunctionCall { args, .. } => {
@@ -396,7 +403,11 @@ pub(crate) fn compute_window_partition(
                         if count == 0 {
                             Value::Null
                         } else if use_numeric {
-                            Value::Numeric { scaled: num_scaled, scale: num_scale , kind: spg_storage::NumericKind::Finite }
+                            Value::Numeric {
+                                scaled: num_scaled,
+                                scale: num_scale,
+                                kind: spg_storage::NumericKind::Finite,
+                            }
                         } else if all_int && i64::try_from(int_sum).is_ok() {
                             // Integer inputs → BIGINT, matching PG and the
                             // GROUP BY sum() path.
@@ -414,14 +425,22 @@ pub(crate) fn compute_window_partition(
                                 num_scale,
                                 i128::from(count),
                             );
-                            Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                            Value::Numeric {
+                                scaled,
+                                scale,
+                                kind: spg_storage::NumericKind::Finite,
+                            }
                         } else if all_int {
                             // v7.38 (read01) — avg over integer inputs is NUMERIC
                             // in PG (as it is for the GROUP BY avg() path), not
                             // double. Divide the exact integer sum at scale 0.
                             let (scaled, scale) =
                                 crate::numeric::numeric_avg(int_sum, 0, i128::from(count));
-                            Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                            Value::Numeric {
+                                scaled,
+                                scale,
+                                kind: spg_storage::NumericKind::Finite,
+                            }
                         } else {
                             Value::Float(sum / count as f64)
                         }
@@ -779,8 +798,12 @@ fn frame_bounds_for_row(
     // FOLLOWING`): the frame is value-based — row j is in it iff its single
     // ORDER BY key sits within the offset window around row i's key. Handled
     // before the peer-aware Range arm below (which covers UNBOUNDED / CURRENT).
-    let is_int_offset =
-        |b: &FrameBound| matches!(b, FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_));
+    let is_int_offset = |b: &FrameBound| {
+        matches!(
+            b,
+            FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+        )
+    };
     let is_interval_offset = |b: &FrameBound| {
         matches!(
             b,

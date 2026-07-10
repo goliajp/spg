@@ -26,7 +26,9 @@ fn col0_texts(r: QueryResult) -> Vec<Option<String>> {
 #[test]
 fn path_query_root() {
     let mut e = Engine::new();
-    let r = e.execute(r#"SELECT jsonb_path_query('{"k":1}'::JSONB, '$')"#).unwrap();
+    let r = e
+        .execute(r#"SELECT jsonb_path_query('{"k":1}'::JSONB, '$')"#)
+        .unwrap();
     assert_eq!(col0_texts(r), vec![Some(r#"{"k": 1}"#.into())]);
 }
 
@@ -87,7 +89,9 @@ fn path_query_wildcard_with_field_after() {
 fn path_query_no_match_empty() {
     // No match → zero rows (PG: the SRF emits nothing), not one row of `[]`.
     let mut e = Engine::new();
-    let r = e.execute(r#"SELECT jsonb_path_query('{"k":1}'::JSONB, '$.missing')"#).unwrap();
+    let r = e
+        .execute(r#"SELECT jsonb_path_query('{"k":1}'::JSONB, '$.missing')"#)
+        .unwrap();
     assert!(col0_texts(r).is_empty());
 }
 
@@ -95,7 +99,9 @@ fn path_query_no_match_empty() {
 fn path_query_null_doc_emits_no_rows() {
     // A NULL document yields zero rows (PG), not one NULL row.
     let mut e = Engine::new();
-    let r = e.execute(r#"SELECT jsonb_path_query(NULL::JSONB, '$.k')"#).unwrap();
+    let r = e
+        .execute(r#"SELECT jsonb_path_query(NULL::JSONB, '$.k')"#)
+        .unwrap();
     assert!(rows(r).is_empty());
 }
 

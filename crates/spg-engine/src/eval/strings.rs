@@ -18,7 +18,13 @@ use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days, days_from_civil}
 /// Full weekday names, indexed Monday = 0 .. Sunday = 6 (matching
 /// `(days + 3).rem_euclid(7)` since 1970-01-01 was a Thursday).
 const DAY_FULL: [&str; 7] = [
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
 ];
 /// Abbreviated weekday names, same Monday = 0 indexing.
 const DAY_ABBR: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -240,27 +246,170 @@ pub(super) fn string_trim(
 /// class is otherwise identifier-safe. Sorted ascending for
 /// `binary_search`. Captured live from PG 18.4.
 const PG_QUOTE_KEYWORDS: &[&str] = &[
-    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
-    "asymmetric", "authorization", "between", "bigint", "binary", "bit", "boolean", "both",
-    "case", "cast", "char", "character", "check", "coalesce", "collate", "collation",
-    "column", "concurrently", "constraint", "create", "cross", "current_catalog", "current_date", "current_role",
-    "current_schema", "current_time", "current_timestamp", "current_user", "dec", "decimal", "default", "deferrable",
-    "desc", "distinct", "do", "else", "end", "except", "exists", "extract",
-    "false", "fetch", "float", "for", "foreign", "freeze", "from", "full",
-    "grant", "greatest", "group", "grouping", "having", "ilike", "in", "initially",
-    "inner", "inout", "int", "integer", "intersect", "interval", "into", "is",
-    "isnull", "join", "json", "json_array", "json_arrayagg", "json_exists", "json_object", "json_objectagg",
-    "json_query", "json_scalar", "json_serialize", "json_table", "json_value", "lateral", "leading", "least",
-    "left", "like", "limit", "localtime", "localtimestamp", "merge_action", "national", "natural",
-    "nchar", "none", "normalize", "not", "notnull", "null", "nullif", "numeric",
-    "offset", "on", "only", "or", "order", "out", "outer", "overlaps",
-    "overlay", "placing", "position", "precision", "primary", "real", "references", "returning",
-    "right", "row", "select", "session_user", "setof", "similar", "smallint", "some",
-    "substring", "symmetric", "system_user", "table", "tablesample", "then", "time", "timestamp",
-    "to", "trailing", "treat", "trim", "true", "union", "unique", "user",
-    "using", "values", "varchar", "variadic", "verbose", "when", "where", "window",
-    "with", "xmlattributes", "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse",
-    "xmlpi", "xmlroot", "xmlserialize", "xmltable",
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
 ];
 
 /// True when `s` must be double-quoted to survive as a SQL
@@ -415,7 +564,10 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
         let width: usize = if width_from_arg {
             // The `*` consumes one implicit argument as the width. PG: a
             // negative width means left-justify with the absolute width.
-            let w_arg = arg_values.get(implicit_cursor).cloned().unwrap_or(Value::Null);
+            let w_arg = arg_values
+                .get(implicit_cursor)
+                .cloned()
+                .unwrap_or(Value::Null);
             implicit_cursor += 1;
             let w = match w_arg {
                 Value::SmallInt(n) => i64::from(n),
@@ -618,7 +770,11 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
         Value::Float(x) => format!("{x}"),
         // PG renders numeric in concat/format/text-coercion as its exact
         // decimal (`x || 2.5::numeric` → `x2.5`), not a debug dump.
-        Value::Numeric { scaled, scale, kind } => super::format::format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => super::format::format_numeric_kind(*kind, *scaled, *scale),
         Value::Bool(b) => {
             if *b {
                 "t".into()
@@ -835,14 +991,12 @@ fn to_char_scientific(n: f64, mant_fmt: &str, fill_mode: bool) -> String {
             libm::floor(libm::log10(a)) as i32
         }
     };
-    let frac_digits = mant_fmt
-        .find(['.', 'D', 'd'])
-        .map_or(0, |dot| {
-            mant_fmt[dot + 1..]
-                .chars()
-                .filter(|c| matches!(c, '9' | '0'))
-                .count()
-        });
+    let frac_digits = mant_fmt.find(['.', 'D', 'd']).map_or(0, |dot| {
+        mant_fmt[dot + 1..]
+            .chars()
+            .filter(|c| matches!(c, '9' | '0'))
+            .count()
+    });
     let mantissa = if a == 0.0 {
         0.0
     } else {
@@ -867,8 +1021,19 @@ fn to_char_roman(n: f64, fill_mode: bool) -> String {
         return core::iter::repeat('#').take(15).collect();
     }
     const VALS: [(i64, &str); 13] = [
-        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
-        (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
     ];
     let mut out = String::new();
     let mut rem = v;
@@ -921,7 +1086,9 @@ fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
         return Ok(());
     };
     let before = &sig[..epos];
-    if ["FM", "MI", "PL", "SG", "PR", "RN"].iter().any(|f| before.contains(f))
+    if ["FM", "MI", "PL", "SG", "PR", "RN"]
+        .iter()
+        .any(|f| before.contains(f))
         || before.contains(['S', 'V', 'B'])
     {
         return Err(EvalError::TypeMismatch {
@@ -971,14 +1138,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     // v7.37 — `TH` / `th` ordinal suffix and a trailing `%` literal. Both are
     // stripped here and re-applied post-pass (like PR), so the slot machinery
     // never sees them. `TH` (upper) → uppercase suffix; `th` → lowercase.
-    let th_suffix: Option<bool> = if pat.len() >= 2 && pat[pat.len() - 2..].eq_ignore_ascii_case("TH")
-    {
-        let upper = pat.ends_with("TH");
-        pat = &pat[..pat.len() - 2];
-        Some(upper)
-    } else {
-        None
-    };
+    let th_suffix: Option<bool> =
+        if pat.len() >= 2 && pat[pat.len() - 2..].eq_ignore_ascii_case("TH") {
+            let upper = pat.ends_with("TH");
+            pat = &pat[..pat.len() - 2];
+            Some(upper)
+        } else {
+            None
+        };
     let has_pct = pat.ends_with('%');
     if has_pct {
         pat = &pat[..pat.len() - 1];
@@ -1043,12 +1210,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     // trailing `S` position the sign at the end, so PG drops the reserved
     // leading column (`PL` and `$` keep it).
     let sign_col = usize::from(!(has_mi || has_sg || has_trailing_s));
-    let int_field_width =
-        int_pat.chars().filter(|c| is_slot(*c) || is_group(*c)).count() + sign_col;
+    let int_field_width = int_pat
+        .chars()
+        .filter(|c| is_slot(*c) || is_group(*c))
+        .count()
+        + sign_col;
     // Right-most integer slot char (units position) and left-most
     // `0` slot position from the right (units = 0).
-    let int_slot_chars: alloc::vec::Vec<char> =
-        int_pat.chars().filter(|c| is_slot(*c)).collect();
+    let int_slot_chars: alloc::vec::Vec<char> = int_pat.chars().filter(|c| is_slot(*c)).collect();
     let units_slot = int_slot_chars.last().copied().unwrap_or('9');
     // Force leading zeros up to (and including) the left-most `0`
     // slot: its distance from the units position sets the minimum
@@ -1070,7 +1239,9 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
         let fd = u32::try_from(frac_digits).ok()?;
         let insc = u32::from(in_scale);
         let rescaled: u128 = if fd >= insc {
-            10_u128.checked_pow(fd - insc).and_then(|m| abs.checked_mul(m))?
+            10_u128
+                .checked_pow(fd - insc)
+                .and_then(|m| abs.checked_mul(m))?
         } else {
             // Drop excess fraction digits, rounding half away from zero.
             let divisor = 10_u128.checked_pow(insc - fd)?;
@@ -1135,7 +1306,11 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
         } else {
             units_slot == '0' || !has_decimal
         };
-        if show_zero { "0".to_string() } else { String::new() }
+        if show_zero {
+            "0".to_string()
+        } else {
+            String::new()
+        }
     } else {
         alloc::format!("{int_part}")
     };
@@ -1175,10 +1350,7 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
             // Consume the reserved sign column with `<` and append `>`.
             let trimmed = out.trim_start();
             let lead = out.chars().count() - trimmed.chars().count();
-            out = alloc::format!(
-                "{}<{trimmed}>",
-                " ".repeat(lead.saturating_sub(1))
-            );
+            out = alloc::format!("{}<{trimmed}>", " ".repeat(lead.saturating_sub(1)));
         } else if !fill_mode {
             out.push(' ');
         }
@@ -1279,7 +1451,12 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         });
     };
     // Interval form: to_char(interval, 'HH24:MI:SS' / 'DD' / 'YYYY-MM' / …).
-    if let Value::Interval { months, days, micros } = &args[0] {
+    if let Value::Interval {
+        months,
+        days,
+        micros,
+    } = &args[0]
+    {
         return Ok(Value::text(to_char_interval(
             i64::from(*months),
             i64::from(*days),
@@ -1430,22 +1607,52 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             num!(day_of_year, 3);
             consumed = 3;
         } else if rest.starts_with(b"Month") {
-            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], false, false, pad(9)));
+            out.push_str(&cased_name(
+                MONTH_FULL[(mo - 1) as usize],
+                false,
+                false,
+                pad(9),
+            ));
             consumed = 5;
         } else if rest.starts_with(b"MONTH") {
-            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], true, false, pad(9)));
+            out.push_str(&cased_name(
+                MONTH_FULL[(mo - 1) as usize],
+                true,
+                false,
+                pad(9),
+            ));
             consumed = 5;
         } else if rest.starts_with(b"month") {
-            out.push_str(&cased_name(MONTH_FULL[(mo - 1) as usize], false, true, pad(9)));
+            out.push_str(&cased_name(
+                MONTH_FULL[(mo - 1) as usize],
+                false,
+                true,
+                pad(9),
+            ));
             consumed = 5;
         } else if rest.starts_with(b"Mon") {
-            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], false, false, None));
+            out.push_str(&cased_name(
+                MONTH_ABBR[(mo - 1) as usize],
+                false,
+                false,
+                None,
+            ));
             consumed = 3;
         } else if rest.starts_with(b"MON") {
-            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], true, false, None));
+            out.push_str(&cased_name(
+                MONTH_ABBR[(mo - 1) as usize],
+                true,
+                false,
+                None,
+            ));
             consumed = 3;
         } else if rest.starts_with(b"mon") {
-            out.push_str(&cased_name(MONTH_ABBR[(mo - 1) as usize], false, true, None));
+            out.push_str(&cased_name(
+                MONTH_ABBR[(mo - 1) as usize],
+                false,
+                true,
+                None,
+            ));
             consumed = 3;
         } else if rest.starts_with(b"Day") {
             out.push_str(&cased_name(DAY_FULL[dow_mon0], false, false, pad(9)));
@@ -1505,9 +1712,19 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         } else if rest.starts_with(b"CC") {
             num!(century, 2);
         } else if rest.starts_with(b"RM") {
-            out.push_str(&cased_name(MONTH_ROMAN[(mo - 1) as usize], true, false, pad(4)));
+            out.push_str(&cased_name(
+                MONTH_ROMAN[(mo - 1) as usize],
+                true,
+                false,
+                pad(4),
+            ));
         } else if rest.starts_with(b"rm") {
-            out.push_str(&cased_name(MONTH_ROMAN[(mo - 1) as usize], false, true, pad(4)));
+            out.push_str(&cased_name(
+                MONTH_ROMAN[(mo - 1) as usize],
+                false,
+                true,
+                pad(4),
+            ));
         } else if rest.starts_with(b"HH") {
             num!(hh12, 2);
         } else if rest.starts_with(b"A.M.") || rest.starts_with(b"P.M.") {
@@ -1535,9 +1752,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             out.push_str(if i64::from(y) <= 0 { "BC" } else { "AD" });
         } else if rest.starts_with(b"bc") || rest.starts_with(b"ad") {
             out.push_str(if i64::from(y) <= 0 { "bc" } else { "ad" });
-        } else if (rest.starts_with(b"TH") || rest.starts_with(b"th"))
-            && pending_ord.is_some()
-        {
+        } else if (rest.starts_with(b"TH") || rest.starts_with(b"th")) && pending_ord.is_some() {
             // v7.37 — ordinal suffix for the preceding numeric field
             // (`DDth` → 21st, `HH12th` → 02nd). Only fires right after a
             // number; a bare `th`/`TH` still passes through as a literal.
@@ -1549,7 +1764,11 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             }
         } else if rest.starts_with(b"Y") || rest.starts_with(b"I") {
             // Single-digit year / ISO-year (last digit).
-            let base = if rest[0] == b'I' { iso_year } else { i64::from(y) };
+            let base = if rest[0] == b'I' {
+                iso_year
+            } else {
+                i64::from(y)
+            };
             let _ = write!(out, "{}", base.rem_euclid(10));
             consumed = 1;
         } else if rest.starts_with(b"Q") {

@@ -153,7 +153,13 @@ fn insert_int4range_unbounded_lower() {
         "INSERT INTO t VALUES (1, '(,10]')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { lower, upper, upper_inc, .. } = &rows[0][0] else {
+    let Value::Range {
+        lower,
+        upper,
+        upper_inc,
+        ..
+    } = &rows[0][0]
+    else {
         panic!()
     };
     // Discrete canonicalization: '(,10]' → '(,11)' (read01 U26). The

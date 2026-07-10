@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -57,10 +59,7 @@ fn date_subtract_days() {
 fn date_add_null_passthrough() {
     let mut e = Engine::new();
     assert!(matches!(
-        first(
-            &mut e,
-            "SELECT date_add(NULL::timestamp, INTERVAL '1 day')"
-        ),
+        first(&mut e, "SELECT date_add(NULL::timestamp, INTERVAL '1 day')"),
         spg_storage::Value::Null
     ));
     assert!(matches!(

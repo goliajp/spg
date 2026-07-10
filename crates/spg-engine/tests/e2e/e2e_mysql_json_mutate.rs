@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first_text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -89,10 +91,7 @@ fn json_remove_keys_and_elements() {
 fn pg_jsonb_set_spelling_still_works() {
     let mut e = Engine::new();
     // The PG text-array path form must keep routing to json::set.
-    let got = first_text(
-        &mut e,
-        "SELECT jsonb_set('{\"a\": 1}', '{a}', '2')",
-    );
+    let got = first_text(&mut e, "SELECT jsonb_set('{\"a\": 1}', '{a}', '2')");
     assert!(got.contains("\"a\""), "unexpected: {got}");
     assert!(got.contains('2'), "unexpected: {got}");
 }

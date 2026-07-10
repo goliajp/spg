@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,7 +23,10 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn spg_version_returns_text() {
     let mut e = Engine::new();
     let v = text(&first(&mut e, "SELECT spg_version()"));
-    assert!(v.starts_with("SPG "), "expected 'SPG N.M.O' prefix, got {v:?}");
+    assert!(
+        v.starts_with("SPG "),
+        "expected 'SPG N.M.O' prefix, got {v:?}"
+    );
 }
 
 #[test]

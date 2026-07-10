@@ -31,7 +31,9 @@ use spg_storage::Value;
 /// Render the first scalar of the first row as PG-comparable text.
 /// NULL → `<NULL>` so trailing-space / null divergences are visible.
 fn scalar(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -51,7 +53,10 @@ fn check(cases: &[(&str, &str)]) {
     let mut e = Engine::new();
     for (sql, want) in cases {
         let got = scalar(&mut e, sql);
-        assert_eq!(&got, want, "\n  sql: {sql}\n  PG18: {want:?}\n  SPG:  {got:?}");
+        assert_eq!(
+            &got, want,
+            "\n  sql: {sql}\n  PG18: {want:?}\n  SPG:  {got:?}"
+        );
     }
 }
 
@@ -103,7 +108,10 @@ fn overlay_placing_syntax_matches_pg() {
         ("SELECT overlay('12345' placing 'ab' from 2 for 3)", "1ab5"),
         ("SELECT overlay('12345' placing 'ab' from 2)", "1ab45"),
         ("SELECT overlay('12345' placing 'abc' from 6)", "12345abc"),
-        ("SELECT overlay('Txxxxas' placing 'hom' from 2 for 4)", "Thomas"),
+        (
+            "SELECT overlay('Txxxxas' placing 'hom' from 2 for 4)",
+            "Thomas",
+        ),
     ]);
 }
 
@@ -223,7 +231,10 @@ fn case_and_misc_matches_pg() {
         ("SELECT upper('héllo')", "HÉLLO"),
         ("SELECT lower('HÉLLO')", "héllo"),
         ("SELECT initcap('hello WORLD')", "Hello World"),
-        ("SELECT initcap('the quick brown fox')", "The Quick Brown Fox"),
+        (
+            "SELECT initcap('the quick brown fox')",
+            "The Quick Brown Fox",
+        ),
         ("SELECT repeat('ab',3)", "ababab"),
         ("SELECT reverse('abc')", "cba"),
         ("SELECT reverse('héllo')", "olléh"),
@@ -277,15 +288,33 @@ fn documented_boundaries() {
 fn like_any_all_quantified() {
     check(&[
         ("SELECT ('hello' LIKE ALL(ARRAY['h%', '%o']))::text", "true"),
-        ("SELECT ('hello' LIKE ALL(ARRAY['h%', 'x%']))::text", "false"),
+        (
+            "SELECT ('hello' LIKE ALL(ARRAY['h%', 'x%']))::text",
+            "false",
+        ),
         ("SELECT ('hello' LIKE ANY(ARRAY['x%', '%o']))::text", "true"),
-        ("SELECT ('hello' LIKE ANY(ARRAY['x%', 'y%']))::text", "false"),
-        ("SELECT ('hello' NOT LIKE ANY(ARRAY['x%', 'y%']))::text", "true"),
+        (
+            "SELECT ('hello' LIKE ANY(ARRAY['x%', 'y%']))::text",
+            "false",
+        ),
+        (
+            "SELECT ('hello' NOT LIKE ANY(ARRAY['x%', 'y%']))::text",
+            "true",
+        ),
         // NOT LIKE ALL: false because 'hello' DOES match 'h%'.
-        ("SELECT ('hello' NOT LIKE ALL(ARRAY['h%', 'x%']))::text", "false"),
-        ("SELECT ('hello' NOT LIKE ALL(ARRAY['x%', 'y%']))::text", "true"),
+        (
+            "SELECT ('hello' NOT LIKE ALL(ARRAY['h%', 'x%']))::text",
+            "false",
+        ),
+        (
+            "SELECT ('hello' NOT LIKE ALL(ARRAY['x%', 'y%']))::text",
+            "true",
+        ),
         // Case-insensitive quantified match.
-        ("SELECT ('HeLLo' ILIKE ANY(ARRAY['h%', 'z%']))::text", "true"),
+        (
+            "SELECT ('HeLLo' ILIKE ANY(ARRAY['h%', 'z%']))::text",
+            "true",
+        ),
     ]);
     // A NULL pattern under ANY yields SQL NULL (three-valued logic), not
     // false — the OR desugar preserves it.

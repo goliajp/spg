@@ -22,14 +22,20 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 #[test]
 fn extended_flag_ignores_unescaped_whitespace() {
     let mut e = Engine::new();
-    assert_eq!(text(&scalar(&mut e, "SELECT substring('abc' from '(?x) a b c')")), "abc");
+    assert_eq!(
+        text(&scalar(&mut e, "SELECT substring('abc' from '(?x) a b c')")),
+        "abc"
+    );
 }
 
 #[test]
 fn extended_flag_strips_hash_comments() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&scalar(&mut e, "SELECT regexp_match('foo123bar', '(?x) \\d+  # the digits')")),
+        text(&scalar(
+            &mut e,
+            "SELECT regexp_match('foo123bar', '(?x) \\d+  # the digits')"
+        )),
         "123"
     );
 }
@@ -38,13 +44,22 @@ fn extended_flag_strips_hash_comments() {
 fn extended_flag_keeps_escaped_and_class_whitespace() {
     let mut e = Engine::new();
     // Escaped space is a literal space.
-    assert_eq!(text(&scalar(&mut e, "SELECT regexp_match('a b','(?x)a\\ b')")), "a b");
+    assert_eq!(
+        text(&scalar(&mut e, "SELECT regexp_match('a b','(?x)a\\ b')")),
+        "a b"
+    );
     // Space inside a character class is literal.
-    assert_eq!(text(&scalar(&mut e, "SELECT regexp_match('a b','(?x)[ ]')")), " ");
+    assert_eq!(
+        text(&scalar(&mut e, "SELECT regexp_match('a b','(?x)[ ]')")),
+        " "
+    );
 }
 
 #[test]
 fn without_extended_flag_whitespace_is_literal() {
     let mut e = Engine::new();
-    assert_eq!(text(&scalar(&mut e, "SELECT substring('a b c' from 'a b c')")), "a b c");
+    assert_eq!(
+        text(&scalar(&mut e, "SELECT substring('a b c' from 'a b c')")),
+        "a b c"
+    );
 }

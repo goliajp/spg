@@ -10,7 +10,10 @@ use spg_engine::{Engine, QueryResult};
 use std::collections::BTreeSet;
 
 fn rows_set(e: &mut Engine, sql: &str) -> BTreeSet<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| {
@@ -36,7 +39,8 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 fn seed() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE rl(g text, h text, v int)").unwrap();
-    e.execute("INSERT INTO rl VALUES ('a','x',1),('a','y',2),('b','x',3)").unwrap();
+    e.execute("INSERT INTO rl VALUES ('a','x',1),('a','y',2),('b','x',3)")
+        .unwrap();
     e
 }
 
@@ -44,12 +48,18 @@ fn seed() -> Engine {
 fn coalesce_of_group_key_in_rollup() {
     let mut e = seed();
     assert_eq!(
-        rows_set(&mut e, "SELECT COALESCE(g,'TOTAL')::text, sum(v)::text FROM rl GROUP BY ROLLUP(g)"),
+        rows_set(
+            &mut e,
+            "SELECT COALESCE(g,'TOTAL')::text, sum(v)::text FROM rl GROUP BY ROLLUP(g)"
+        ),
         set(&["a|3", "b|3", "TOTAL|6"])
     );
     // Nested inside a `||` alongside the aggregate.
     assert_eq!(
-        rows_set(&mut e, "SELECT (COALESCE(g,'TOTAL')||':'||sum(v))::text FROM rl GROUP BY ROLLUP(g)"),
+        rows_set(
+            &mut e,
+            "SELECT (COALESCE(g,'TOTAL')||':'||sum(v))::text FROM rl GROUP BY ROLLUP(g)"
+        ),
         set(&["a:3", "b:3", "TOTAL:6"])
     );
 }
@@ -85,11 +95,16 @@ fn cube_and_grouping_sets_nested_keys() {
             &mut e,
             "SELECT COALESCE(g,'-')::text, COALESCE(h,'-')::text, sum(v)::text FROM rl GROUP BY CUBE(g,h)"
         ),
-        set(&["a|x|1", "a|y|2", "b|x|3", "a|-|3", "b|-|3", "-|x|4", "-|y|2", "-|-|6"])
+        set(&[
+            "a|x|1", "a|y|2", "b|x|3", "a|-|3", "b|-|3", "-|x|4", "-|y|2", "-|-|6"
+        ])
     );
     // grouping() still works alongside the nested key.
     assert_eq!(
-        rows_set(&mut e, "SELECT COALESCE(g,'x')::text, count(*)::text, grouping(g)::text FROM rl GROUP BY ROLLUP(g)"),
+        rows_set(
+            &mut e,
+            "SELECT COALESCE(g,'x')::text, count(*)::text, grouping(g)::text FROM rl GROUP BY ROLLUP(g)"
+        ),
         set(&["a|2|0", "b|1|0", "x|3|1"])
     );
 }

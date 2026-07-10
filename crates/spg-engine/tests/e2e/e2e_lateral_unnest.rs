@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,10 +32,8 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn unnest_of_outer_array_column() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ua (id INT, tags TEXT[])").unwrap();
-    e.execute(
-        "INSERT INTO ua VALUES (1, ARRAY['a','b']), (2, ARRAY['c'])",
-    )
-    .unwrap();
+    e.execute("INSERT INTO ua VALUES (1, ARRAY['a','b']), (2, ARRAY['c'])")
+        .unwrap();
     // Each outer row fans out into its own tags: 2 + 1 = 3.
     let got = rows(
         &mut e,
@@ -50,7 +50,8 @@ fn unnest_of_outer_array_column() {
 fn explicit_lateral_unnest_with_ordinality() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ub (id INT, xs TEXT[])").unwrap();
-    e.execute("INSERT INTO ub VALUES (1, ARRAY['p','q'])").unwrap();
+    e.execute("INSERT INTO ub VALUES (1, ARRAY['p','q'])")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT v, i FROM ub, LATERAL unnest(ub.xs) \

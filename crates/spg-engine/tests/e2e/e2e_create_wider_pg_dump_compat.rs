@@ -4,7 +4,8 @@
 use spg_engine::Engine;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -22,10 +23,7 @@ fn create_text_search_no_op() {
         &mut e,
         "CREATE TEXT SEARCH PARSER myparser (START = 'x', GETTOKEN = 'y', END = 'z', LEXTYPES = 'w')",
     );
-    ddl(
-        &mut e,
-        "CREATE TEXT SEARCH TEMPLATE mytmpl (LEXIZE = 'x')",
-    );
+    ddl(&mut e, "CREATE TEXT SEARCH TEMPLATE mytmpl (LEXIZE = 'x')");
 }
 
 #[test]

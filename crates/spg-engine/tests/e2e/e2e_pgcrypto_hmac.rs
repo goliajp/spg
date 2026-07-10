@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -73,9 +75,7 @@ fn hmac_all_algos_produce_correct_size() {
 #[test]
 fn hmac_unsupported_algo_errors() {
     let mut e = Engine::new();
-    assert!(
-        e.execute("SELECT hmac('data', 'key', 'blake2b')").is_err()
-    );
+    assert!(e.execute("SELECT hmac('data', 'key', 'blake2b')").is_err());
 }
 
 #[test]

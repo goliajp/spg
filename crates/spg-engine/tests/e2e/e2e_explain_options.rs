@@ -10,7 +10,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn plan_text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -78,10 +80,7 @@ fn explain_timing_off_strips_elapsed() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
-    let plan_off = plan_text(
-        &mut e,
-        "EXPLAIN (ANALYZE, TIMING OFF) SELECT * FROM t",
-    );
+    let plan_off = plan_text(&mut e, "EXPLAIN (ANALYZE, TIMING OFF) SELECT * FROM t");
     assert!(
         !plan_off.contains("elapsed="),
         "TIMING OFF must strip elapsed: {plan_off}"
@@ -89,10 +88,7 @@ fn explain_timing_off_strips_elapsed() {
     // TIMING ON parses through without error; the engine's
     // clock guards whether elapsed actually lands. (The
     // clock-bound branch is covered by e2e_explain_analyze.)
-    let plan_on = plan_text(
-        &mut e,
-        "EXPLAIN (ANALYZE, TIMING ON) SELECT * FROM t",
-    );
+    let plan_on = plan_text(&mut e, "EXPLAIN (ANALYZE, TIMING ON) SELECT * FROM t");
     assert!(
         plan_on.contains("Total: rows="),
         "TIMING ON plan body broken: {plan_on}"
@@ -104,10 +100,7 @@ fn explain_settings_emits_overrides_or_placeholder() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     let plan = plan_text(&mut e, "EXPLAIN (SETTINGS) SELECT * FROM t");
-    assert!(
-        plan.contains("Settings:"),
-        "missing Settings line: {plan}"
-    );
+    assert!(plan.contains("Settings:"), "missing Settings line: {plan}");
 }
 
 #[test]
@@ -164,10 +157,7 @@ fn explain_format_xml_wraps_plan_in_explain_element() {
         plan.starts_with("<explain"),
         "XML must open with <explain: {plan}"
     );
-    assert!(
-        plan.ends_with("</explain>"),
-        "XML must close: {plan}"
-    );
+    assert!(plan.ends_with("</explain>"), "XML must close: {plan}");
     assert!(plan.contains("<line>"), "line element missing: {plan}");
 }
 

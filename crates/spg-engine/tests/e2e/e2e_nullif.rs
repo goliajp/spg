@@ -207,7 +207,7 @@ fn nullif_with_floats() {
     let row = one_row(e.execute("SELECT nullif(1.5, 2.5)").unwrap());
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 1.5),
-        Value::Numeric { scaled, scale , .. } => {
+        Value::Numeric { scaled, scale, .. } => {
             assert_eq!(*scaled, 15 * 10_i128.pow(u32::from(*scale) - 1));
         }
         other => panic!("got {other:?}"),

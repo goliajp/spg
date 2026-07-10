@@ -8,7 +8,9 @@ use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => matches!(rows[0].values[0], spg_storage::Value::Bool(true)),
+        QueryResult::Rows { rows, .. } => {
+            matches!(rows[0].values[0], spg_storage::Value::Bool(true))
+        }
         _ => panic!("rows"),
     }
 }

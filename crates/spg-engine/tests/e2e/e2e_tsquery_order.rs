@@ -8,7 +8,9 @@ use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => matches!(rows[0].values[0], spg_storage::Value::Bool(true)),
+        QueryResult::Rows { rows, .. } => {
+            matches!(rows[0].values[0], spg_storage::Value::Bool(true))
+        }
         _ => panic!("rows"),
     }
 }
@@ -27,7 +29,10 @@ fn tsquery_total_order() {
     assert!(!b(&mut e, "SELECT 'a & b'::tsquery < 'a & c'::tsquery"));
     // Operator order OR < AND; operand (VAL) before operator.
     assert!(b(&mut e, "SELECT 'a | b'::tsquery < 'a & b'::tsquery"));
-    assert!(!b(&mut e, "SELECT '(a & b) | c'::tsquery < 'a | (b & c)'::tsquery"));
+    assert!(!b(
+        &mut e,
+        "SELECT '(a & b) | c'::tsquery < 'a | (b & c)'::tsquery"
+    ));
     // Two PHRASE nodes: larger distance sorts first.
     assert!(b(&mut e, "SELECT 'a <2> b'::tsquery < 'a <-> b'::tsquery"));
     // Equality stays structural (operand order matters).

@@ -6,7 +6,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -35,10 +37,7 @@ fn current_schemas_search_path() {
         spg_storage::Value::TextArray(items) => {
             assert_eq!(
                 items,
-                vec![
-                    Some("pg_catalog".to_string()),
-                    Some("public".to_string())
-                ]
+                vec![Some("pg_catalog".to_string()), Some("public".to_string())]
             );
         }
         other => panic!("got {other:?}"),

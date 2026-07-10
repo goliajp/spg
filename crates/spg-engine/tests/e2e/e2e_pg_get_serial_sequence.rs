@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -21,7 +23,10 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn pg_get_serial_sequence_bare_table() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&first(&mut e, "SELECT pg_get_serial_sequence('users', 'id')")),
+        text(&first(
+            &mut e,
+            "SELECT pg_get_serial_sequence('users', 'id')"
+        )),
         "public.users_id_seq"
     );
 }
@@ -43,17 +48,11 @@ fn pg_get_serial_sequence_qualified_table() {
 fn pg_get_serial_sequence_null_passthrough() {
     let mut e = Engine::new();
     assert!(matches!(
-        first(
-            &mut e,
-            "SELECT pg_get_serial_sequence(NULL::text, 'id')"
-        ),
+        first(&mut e, "SELECT pg_get_serial_sequence(NULL::text, 'id')"),
         spg_storage::Value::Null
     ));
     assert!(matches!(
-        first(
-            &mut e,
-            "SELECT pg_get_serial_sequence('users', NULL::text)"
-        ),
+        first(&mut e, "SELECT pg_get_serial_sequence('users', NULL::text)"),
         spg_storage::Value::Null
     ));
 }

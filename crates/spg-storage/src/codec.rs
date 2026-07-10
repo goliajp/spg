@@ -434,8 +434,7 @@ fn deserialize_rows(
         // will add a parallel `headers` stream in the snapshot codec
         // to round-trip actual xmin / xmax per row; for now the
         // load path mirrors the insert path's lock-step invariant.
-        t.headers
-            .push_mut(crate::row_header::RowHeader::frozen());
+        t.headers.push_mut(crate::row_header::RowHeader::frozen());
     }
     debug_assert_eq!(
         t.rows.len(),
@@ -1104,7 +1103,10 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         Value::HalfVector(h) => 4 + h.bytes.len(),
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 1 + 16 + 1, // form byte + scaled + scale (T6.P4)
-        Value::NumericBig(b) => { let (_, l, _) = b.parts(); 1 + 1 + 2 + 4 * l.len() }
+        Value::NumericBig(b) => {
+            let (_, l, _) = b.parts();
+            1 + 1 + 2 + 4 * l.len()
+        }
         // v7.10.4: BYTEA on-disk shape mirrors Text — [u16 len][bytes].
         // The 16-bit length cap is the same TEXT/JSON limit (~65 KB);
         // larger blobs need toast-style chunking which is a v7.11
@@ -1500,7 +1502,14 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
             out.extend_from_slice(&dim.to_le_bytes());
             out.extend_from_slice(&h.bytes);
         }
-        (Value::Numeric { scaled, scale, kind }, DataType::Numeric { .. }) => {
+        (
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            },
+            DataType::Numeric { .. },
+        ) => {
             // v7.38 (read01, T6.P4) — a form byte prefixes the body (FILE_VERSION
             // 56+): 0 = finite (scaled + scale follow), 1 = NaN, 2 = +Infinity,
             // 3 = -Infinity (specials carry no body). The value's OWN scale is
@@ -2072,7 +2081,11 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
             out.extend_from_slice(&dim.to_le_bytes());
             out.extend_from_slice(&h.bytes);
         }
-        Value::Numeric { scaled, scale, kind } => {
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => {
             out.push(8);
             // v7.38 (read01, T6.P4) — form byte after the tag (FILE_VERSION 56+).
             match kind {
@@ -2998,9 +3011,7 @@ impl<'a> Cursor<'a> {
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
-            DataType::Text | DataType::Varchar(_) => {
-                Ok(Value::Text(Cow::Owned(self.read_str()?)))
-            }
+            DataType::Text | DataType::Varchar(_) => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             // v7.38 (read01, T11) — a CHAR(n) column reads back as bpchar.
             DataType::Char(_) => Ok(Value::BpChar(Cow::Owned(self.read_str()?))),
             DataType::Vector {
@@ -3042,7 +3053,11 @@ impl<'a> Cursor<'a> {
                             let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                             let scaled = i128::from_le_bytes(arr);
                             let scale = self.read_u8()?;
-                            Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                            Ok(Value::Numeric {
+                                scaled,
+                                scale,
+                                kind: crate::NumericKind::Finite,
+                            })
                         }
                         1 => Ok(Value::numeric_special(crate::NumericKind::NaN)),
                         2 => Ok(Value::numeric_special(crate::NumericKind::PosInf)),
@@ -3055,7 +3070,11 @@ impl<'a> Cursor<'a> {
                     let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                     let scaled = i128::from_le_bytes(arr);
                     let scale = self.read_u8()?;
-                    Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                    Ok(Value::Numeric {
+                        scaled,
+                        scale,
+                        kind: crate::NumericKind::Finite,
+                    })
                 }
             }
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
@@ -3763,7 +3782,11 @@ impl<'a> Cursor<'a> {
                             let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                             let scaled = i128::from_le_bytes(arr);
                             let scale = self.read_u8()?;
-                            Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                            Ok(Value::Numeric {
+                                scaled,
+                                scale,
+                                kind: crate::NumericKind::Finite,
+                            })
                         }
                         1 => Ok(Value::numeric_special(crate::NumericKind::NaN)),
                         2 => Ok(Value::numeric_special(crate::NumericKind::PosInf)),
@@ -3776,7 +3799,11 @@ impl<'a> Cursor<'a> {
                     let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                     let scaled = i128::from_le_bytes(arr);
                     let scale = self.read_u8()?;
-                    Ok(Value::Numeric { scaled, scale, kind: crate::NumericKind::Finite })
+                    Ok(Value::Numeric {
+                        scaled,
+                        scale,
+                        kind: crate::NumericKind::Finite,
+                    })
                 }
             }
             9 => Ok(Value::Date(self.read_i32()?)),

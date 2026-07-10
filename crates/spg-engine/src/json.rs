@@ -249,7 +249,8 @@ fn scan_value(b: &[u8], i: usize) -> Option<usize> {
         }
         _ => {
             let mut j = i;
-            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
                 j += 1;
             }
             (j > i).then_some(j)
@@ -442,9 +443,15 @@ fn canon_json_number(lexeme: &str) -> String {
     } else {
         let shift = shift as usize;
         let (int_str, frac_str) = if digits.len() > shift {
-            (digits[..digits.len() - shift].to_string(), digits[digits.len() - shift..].to_string())
+            (
+                digits[..digits.len() - shift].to_string(),
+                digits[digits.len() - shift..].to_string(),
+            )
         } else {
-            ("0".to_string(), alloc::format!("{}{}", "0".repeat(shift - digits.len()), digits))
+            (
+                "0".to_string(),
+                alloc::format!("{}{}", "0".repeat(shift - digits.len()), digits),
+            )
         };
         alloc::format!("{sign}{}.{frac_str}", strip(&int_str))
     }
@@ -504,9 +511,9 @@ pub fn each_rows(
                         } else {
                             "false".to_string()
                         }),
-                        JsonValue::Number(_)
-                        | JsonValue::NumberText(_)
-                        | JsonValue::String(_) => Some(v.as_text()),
+                        JsonValue::Number(_) | JsonValue::NumberText(_) | JsonValue::String(_) => {
+                            Some(v.as_text())
+                        }
                         JsonValue::Array(_) | JsonValue::Object(_) => {
                             Some(json_canonical_string(&v))
                         }
@@ -519,9 +526,7 @@ pub fn each_rows(
             Ok(out)
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "cannot call {fn_name} on a non-object ({other:?})"
-            ),
+            detail: alloc::format!("cannot call {fn_name} on a non-object ({other:?})"),
         }),
     }
 }
@@ -567,9 +572,9 @@ pub fn array_element_rows(
                         } else {
                             "false".to_string()
                         }),
-                        JsonValue::Number(_)
-                        | JsonValue::NumberText(_)
-                        | JsonValue::String(_) => Some(v.as_text()),
+                        JsonValue::Number(_) | JsonValue::NumberText(_) | JsonValue::String(_) => {
+                            Some(v.as_text())
+                        }
                         JsonValue::Array(_) | JsonValue::Object(_) => {
                             Some(json_canonical_string(&v))
                         }
@@ -976,7 +981,9 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
         Value::Null => return Ok(Value::Null),
         _ => None,
     };
-    Ok(located.map_or(Value::Null, |slice| verbatim_accessor_result(slice, as_text)))
+    Ok(located.map_or(Value::Null, |slice| {
+        verbatim_accessor_result(slice, as_text)
+    }))
 }
 
 // ---- Tiny recursive-descent JSON parser ----
@@ -1427,7 +1434,9 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                             "type" => steps.push(PathStep::TypeOf),
                             other => {
                                 return Err(EvalError::TypeMismatch {
-                                    detail: alloc::format!("jsonpath: unsupported method .{other}()"),
+                                    detail: alloc::format!(
+                                        "jsonpath: unsupported method .{other}()"
+                                    ),
                                 });
                             }
                         }
@@ -1487,11 +1496,14 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                         while i < chars.len() && chars[i].is_ascii_digit() {
                             i += 1;
                         }
-                        let hi: usize = chars[s2..i].iter().collect::<String>().parse().map_err(
-                            |_| EvalError::TypeMismatch {
-                                detail: "jsonpath: invalid range upper bound".into(),
-                            },
-                        )?;
+                        let hi: usize =
+                            chars[s2..i]
+                                .iter()
+                                .collect::<String>()
+                                .parse()
+                                .map_err(|_| EvalError::TypeMismatch {
+                                    detail: "jsonpath: invalid range upper bound".into(),
+                                })?;
                         while i < chars.len() && chars[i].is_whitespace() {
                             i += 1;
                         }
@@ -2178,7 +2190,11 @@ fn delete_key_inner(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalErro
         (JsonValue::Array(items), Value::Int(idx)) => {
             let n = *idx;
             let len = items.len() as i64;
-            let real = if n >= 0 { i64::from(n) } else { len + i64::from(n) };
+            let real = if n >= 0 {
+                i64::from(n)
+            } else {
+                len + i64::from(n)
+            };
             let filtered: Vec<JsonValue> = items
                 .into_iter()
                 .enumerate()
@@ -2308,10 +2324,7 @@ pub fn delete_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 fn delete_path_inner(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "jsonb_delete_path() takes 2 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("jsonb_delete_path() takes 2 args, got {}", args.len()),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -2618,9 +2631,7 @@ mod tests {
 
     #[test]
     fn json_number_equality_by_value() {
-        let eq = |a: &str, b: &str| {
-            json_eq(&parse(a).unwrap(), &parse(b).unwrap())
-        };
+        let eq = |a: &str, b: &str| json_eq(&parse(a).unwrap(), &parse(b).unwrap());
         assert!(eq("1", "1.0"));
         assert!(eq("1.50", "1.5"));
         assert!(eq("1e3", "1000.00"));
@@ -2643,7 +2654,10 @@ mod tests {
         assert_eq!(canon("{}"), "{}");
         assert_eq!(canon("[]"), "[]");
         // Non-ASCII stays verbatim UTF-8; escapes preserved.
-        assert_eq!(canon(r#"{"e":"café","t":"a\nb"}"#), r#"{"e": "café", "t": "a\nb"}"#);
+        assert_eq!(
+            canon(r#"{"e":"café","t":"a\nb"}"#),
+            r#"{"e": "café", "t": "a\nb"}"#
+        );
     }
 
     #[test]
@@ -2793,9 +2807,7 @@ pub fn mysql_path_steps(path: &str) -> Result<Vec<MysqlPathStep>, EvalError> {
                     steps.push(MysqlPathStep::Key(key));
                 } else {
                     let mut key = String::new();
-                    while i < chars.len()
-                        && (chars[i].is_alphanumeric() || chars[i] == '_')
-                    {
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                         key.push(chars[i]);
                         i += 1;
                     }
@@ -2847,10 +2859,7 @@ pub fn mysql_path_steps(path: &str) -> Result<Vec<MysqlPathStep>, EvalError> {
 
 /// Walk a parsed JSON document along a MySQL path. Returns None
 /// when any step misses.
-pub fn mysql_path_get<'a>(
-    doc: &'a JsonValue,
-    steps: &[MysqlPathStep],
-) -> Option<&'a JsonValue> {
+pub fn mysql_path_get<'a>(doc: &'a JsonValue, steps: &[MysqlPathStep]) -> Option<&'a JsonValue> {
     let mut cur = doc;
     for step in steps {
         match (step, cur) {
@@ -3356,16 +3365,13 @@ pub fn mysql_json_array_insert(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 /// scalar is contained in an array when it equals some element.
 fn mysql_contains(target: &JsonValue, cand: &JsonValue) -> bool {
     match (target, cand) {
-        (JsonValue::Object(t), JsonValue::Object(c)) => c.iter().all(|(ck, cv)| {
-            t.iter()
-                .any(|(tk, tv)| tk == ck && mysql_contains(tv, cv))
-        }),
-        (JsonValue::Array(t), JsonValue::Array(c)) => c
+        (JsonValue::Object(t), JsonValue::Object(c)) => c
             .iter()
-            .all(|cv| t.iter().any(|tv| mysql_contains(tv, cv))),
-        (JsonValue::Array(t), scalar) => {
-            t.iter().any(|tv| mysql_contains(tv, scalar))
+            .all(|(ck, cv)| t.iter().any(|(tk, tv)| tk == ck && mysql_contains(tv, cv))),
+        (JsonValue::Array(t), JsonValue::Array(c)) => {
+            c.iter().all(|cv| t.iter().any(|tv| mysql_contains(tv, cv)))
         }
+        (JsonValue::Array(t), scalar) => t.iter().any(|tv| mysql_contains(tv, scalar)),
         // Numbers compare numerically across the two lexeme forms.
         (JsonValue::Number(a), JsonValue::NumberText(b))
         | (JsonValue::NumberText(b), JsonValue::Number(a)) => {
@@ -3494,10 +3500,7 @@ fn mysql_json_merge(
 ) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "{fn_name}() takes at least 2 documents, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("{fn_name}() takes at least 2 documents, got {}", args.len()),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -3568,9 +3571,10 @@ pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     let a = parse_arg(&args[0])?;
     let b = parse_arg(&args[1])?;
     let overlaps = match (&a, &b) {
-        (JsonValue::Array(xs), JsonValue::Array(ys)) => {
-            xs.iter().any(|x| ys.iter().any(|y| mysql_contains(x, y) && mysql_contains(y, x)))
-        }
+        (JsonValue::Array(xs), JsonValue::Array(ys)) => xs.iter().any(|x| {
+            ys.iter()
+                .any(|y| mysql_contains(x, y) && mysql_contains(y, x))
+        }),
         (JsonValue::Object(ma), JsonValue::Object(mb)) => ma.iter().any(|(k, v)| {
             mb.iter()
                 .any(|(k2, v2)| k == k2 && mysql_contains(v, v2) && mysql_contains(v2, v))
@@ -3588,9 +3592,7 @@ pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 fn like_match(text: &[char], pat: &[char], escape: char) -> bool {
     match pat {
         [] => text.is_empty(),
-        ['%', rest @ ..] => {
-            (0..=text.len()).any(|skip| like_match(&text[skip..], rest, escape))
-        }
+        ['%', rest @ ..] => (0..=text.len()).any(|skip| like_match(&text[skip..], rest, escape)),
         ['_', rest @ ..] => !text.is_empty() && like_match(&text[1..], rest, escape),
         [e, lit, rest @ ..] if *e == escape => {
             text.first() == Some(lit) && like_match(&text[1..], rest, escape)
@@ -3725,7 +3727,9 @@ pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
         }
     }
     let mut hits: Vec<String> = Vec::new();
-    let start_paths: Vec<String> = args.get(4..).unwrap_or(&[])
+    let start_paths: Vec<String> = args
+        .get(4..)
+        .unwrap_or(&[])
         .iter()
         .map(|v| match v {
             Value::Text(p) => Ok(p.to_string()),

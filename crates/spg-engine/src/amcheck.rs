@@ -78,9 +78,7 @@ pub fn check_btree_indices(catalog: &Catalog, table_name: &str) -> Result<(), St
     let n_cols = table.schema().columns.len();
     for idx in table.indices() {
         if idx.name.is_empty() {
-            return Err(format!(
-                "index on {table_name:?} has empty name"
-            ));
+            return Err(format!("index on {table_name:?} has empty name"));
         }
         if idx.column_position >= n_cols {
             return Err(format!(

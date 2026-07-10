@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -44,10 +46,7 @@ fn check_constraints_listed_with_clause() {
 fn check_constraints_empty_without_checks() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE nc (v INT)").unwrap();
-    let got = rows(
-        &mut e,
-        "SELECT * FROM information_schema.check_constraints",
-    );
+    let got = rows(&mut e, "SELECT * FROM information_schema.check_constraints");
     assert!(got.is_empty());
 }
 
@@ -61,19 +60,26 @@ fn pg_indexes_marks_pk_index_unique() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE pk (id INT PRIMARY KEY, email TEXT)")
         .unwrap();
-    e.execute("CREATE INDEX idx_pk_email ON pk (email)").unwrap();
+    e.execute("CREATE INDEX idx_pk_email ON pk (email)")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'pk' ORDER BY indexname",
     );
     // pk_pkey → UNIQUE; idx_pk_email → plain.
-    let pkey = got.iter().find(|r| text(&r[0]) == "pk_pkey").expect("pk_pkey row");
+    let pkey = got
+        .iter()
+        .find(|r| text(&r[0]) == "pk_pkey")
+        .expect("pk_pkey row");
     assert!(
         text(&pkey[1]).contains("CREATE UNIQUE INDEX"),
         "pkey indexdef: {}",
         text(&pkey[1])
     );
-    let sec = got.iter().find(|r| text(&r[0]) == "idx_pk_email").expect("email idx row");
+    let sec = got
+        .iter()
+        .find(|r| text(&r[0]) == "idx_pk_email")
+        .expect("email idx row");
     assert!(
         text(&sec[1]).starts_with("CREATE INDEX"),
         "secondary indexdef: {}",

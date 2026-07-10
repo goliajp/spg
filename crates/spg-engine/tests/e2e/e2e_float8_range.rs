@@ -7,7 +7,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
             other => panic!("{sql}: expected Text, got {other:?}"),
@@ -19,9 +22,15 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn out_of_range_float8_literals_error() {
     let mut e = Engine::new();
-    assert!(e.execute("SELECT '1e400'::float8").is_err(), "overflow → out of range");
+    assert!(
+        e.execute("SELECT '1e400'::float8").is_err(),
+        "overflow → out of range"
+    );
     assert!(e.execute("SELECT '-1e400'::float8").is_err());
-    assert!(e.execute("SELECT '1e-400'::float8").is_err(), "nonzero underflow → out of range");
+    assert!(
+        e.execute("SELECT '1e-400'::float8").is_err(),
+        "nonzero underflow → out of range"
+    );
     // The `::float` / `::double` spelling agrees.
     assert!(e.execute("SELECT '1e400'::float").is_err());
     // Unparseable text is still an error.
@@ -34,7 +43,10 @@ fn in_range_and_special_float8_literals_pass() {
     assert_eq!(one(&mut e, "SELECT ('1e308'::float8)::text"), "1e+308");
     assert_eq!(one(&mut e, "SELECT ('3.14'::float8)::text"), "3.14");
     assert_eq!(one(&mut e, "SELECT ('inf'::float8)::text"), "Infinity");
-    assert_eq!(one(&mut e, "SELECT ('-Infinity'::float8)::text"), "-Infinity");
+    assert_eq!(
+        one(&mut e, "SELECT ('-Infinity'::float8)::text"),
+        "-Infinity"
+    );
     assert_eq!(one(&mut e, "SELECT ('nan'::float8)::text"), "NaN");
     // Zero and a zero-mantissa exponent are legitimately zero, not underflow.
     assert_eq!(one(&mut e, "SELECT ('0'::float8)::text"), "0");

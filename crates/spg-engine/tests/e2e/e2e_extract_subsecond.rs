@@ -18,24 +18,39 @@ fn cast_text(e: &mut Engine, sql: &str) -> String {
 fn extract_keeps_subsecond_precision() {
     let mut e = Engine::new();
     assert_eq!(
-        cast_text(&mut e, "SELECT extract(epoch FROM TIMESTAMP '2024-01-01 00:00:00.5')::text"),
+        cast_text(
+            &mut e,
+            "SELECT extract(epoch FROM TIMESTAMP '2024-01-01 00:00:00.5')::text"
+        ),
         "1704067200.500000"
     );
     assert_eq!(
-        cast_text(&mut e, "SELECT extract(second FROM TIMESTAMP '2024-01-01 00:00:30.75')::text"),
+        cast_text(
+            &mut e,
+            "SELECT extract(second FROM TIMESTAMP '2024-01-01 00:00:30.75')::text"
+        ),
         "30.750000"
     );
     assert_eq!(
-        cast_text(&mut e, "SELECT extract(milliseconds FROM TIMESTAMP '2024-01-01 00:00:30.75')::text"),
+        cast_text(
+            &mut e,
+            "SELECT extract(milliseconds FROM TIMESTAMP '2024-01-01 00:00:30.75')::text"
+        ),
         "30750.000"
     );
     assert_eq!(
-        cast_text(&mut e, "SELECT extract(epoch FROM INTERVAL '1.5 seconds')::text"),
+        cast_text(
+            &mut e,
+            "SELECT extract(epoch FROM INTERVAL '1.5 seconds')::text"
+        ),
         "1.500000"
     );
     // A whole-second value still renders its zero fraction.
     assert_eq!(
-        cast_text(&mut e, "SELECT extract(second FROM TIMESTAMP '2024-01-01 00:00:30')::text"),
+        cast_text(
+            &mut e,
+            "SELECT extract(second FROM TIMESTAMP '2024-01-01 00:00:30')::text"
+        ),
         "30.000000"
     );
 }

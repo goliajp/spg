@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -13,7 +15,11 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 
 fn as_interval(v: &spg_storage::Value<'_>) -> (i32, i32, i64) {
     match v {
-        spg_storage::Value::Interval { months, days, micros } => (*months, *days, *micros),
+        spg_storage::Value::Interval {
+            months,
+            days,
+            micros,
+        } => (*months, *days, *micros),
         other => panic!("expected Interval, got {other:?}"),
     }
 }

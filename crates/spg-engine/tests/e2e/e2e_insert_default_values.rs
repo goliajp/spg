@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -41,7 +43,8 @@ fn default_values_fills_serial_and_defaults() {
 #[test]
 fn default_values_with_returning() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE r (id SERIAL, v INT DEFAULT 7)").unwrap();
+    e.execute("CREATE TABLE r (id SERIAL, v INT DEFAULT 7)")
+        .unwrap();
     let got = rows(&mut e, "INSERT INTO r DEFAULT VALUES RETURNING id, v");
     assert_eq!(got.len(), 1);
     assert_eq!(as_i64(&got[0][0]), 1);

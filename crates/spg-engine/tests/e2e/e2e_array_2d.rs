@@ -19,21 +19,48 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn array_2d_construct_and_introspect() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])::text"), "{{1,2},{3,4}}");
-    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2,3],[4,5,6]])::text"), "{{1,2,3},{4,5,6}}");
-    assert_eq!(text(&mut e, "SELECT (ARRAY[['a','b'],['c','d']])::text"), "{{a,b},{c,d}}");
-    assert_eq!(text(&mut e, "SELECT array_dims(ARRAY[[1,2],[3,4]])"), "[1:2][1:2]");
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[[1,2],[3,4]])::text"),
+        "{{1,2},{3,4}}"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[[1,2,3],[4,5,6]])::text"),
+        "{{1,2,3},{4,5,6}}"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[['a','b'],['c','d']])::text"),
+        "{{a,b},{c,d}}"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_dims(ARRAY[[1,2],[3,4]])"),
+        "[1:2][1:2]"
+    );
     assert_eq!(text(&mut e, "SELECT array_ndims(ARRAY[[1,2],[3,4]])"), "2");
     assert_eq!(text(&mut e, "SELECT cardinality(ARRAY[[1,2],[3,4]])"), "4");
-    assert_eq!(text(&mut e, "SELECT array_length(ARRAY[[1,2,3],[4,5,6]],1)"), "2");
-    assert_eq!(text(&mut e, "SELECT array_length(ARRAY[[1,2,3],[4,5,6]],2)"), "3");
-    assert_eq!(text(&mut e, "SELECT array_upper(ARRAY[[1,2,3],[4,5,6]],2)"), "3");
-    assert_eq!(text(&mut e, "SELECT array_lower(ARRAY[[1,2,3],[4,5,6]],1)"), "1");
+    assert_eq!(
+        text(&mut e, "SELECT array_length(ARRAY[[1,2,3],[4,5,6]],1)"),
+        "2"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_length(ARRAY[[1,2,3],[4,5,6]],2)"),
+        "3"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_upper(ARRAY[[1,2,3],[4,5,6]],2)"),
+        "3"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_lower(ARRAY[[1,2,3],[4,5,6]],1)"),
+        "1"
+    );
     // Ragged sub-arrays error.
     assert!(e.execute("SELECT ARRAY[[1,2],[3]]").is_err());
     // 1-D arrays and pgvector literals are unaffected.
     assert_eq!(text(&mut e, "SELECT array_ndims(ARRAY[1,2,3])"), "1");
     assert_eq!(text(&mut e, "SELECT array_dims(ARRAY[1,2,3])"), "[1:3]");
     // pgvector literal `[...]` is unaffected by the ARRAY[[..]] nesting change.
-    assert_eq!(text(&mut e, "SELECT ('[1,2,3]'::vector)::text"), "[1, 2, 3]");
+    assert_eq!(
+        text(&mut e, "SELECT ('[1,2,3]'::vector)::text"),
+        "[1, 2, 3]"
+    );
 }

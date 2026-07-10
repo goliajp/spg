@@ -17,8 +17,20 @@ fn cell(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn lseg_intersection_point() {
     let mut e = Engine::new();
-    assert_eq!(cell(&mut e, "SELECT (lseg('[(0,0),(1,1)]') # lseg('[(0,1),(1,0)]'))::text"), "(0.5,0.5)");
-    assert_eq!(cell(&mut e, "SELECT COALESCE((lseg('[(0,0),(1,0)]') # lseg('[(0,1),(1,1)]'))::text, '<NULL>')"), "<NULL>");
+    assert_eq!(
+        cell(
+            &mut e,
+            "SELECT (lseg('[(0,0),(1,1)]') # lseg('[(0,1),(1,0)]'))::text"
+        ),
+        "(0.5,0.5)"
+    );
+    assert_eq!(
+        cell(
+            &mut e,
+            "SELECT COALESCE((lseg('[(0,0),(1,0)]') # lseg('[(0,1),(1,1)]'))::text, '<NULL>')"
+        ),
+        "<NULL>"
+    );
     // Integer XOR `#` is unaffected.
     assert_eq!(cell(&mut e, "SELECT (12 # 10)::text"), "6");
 }

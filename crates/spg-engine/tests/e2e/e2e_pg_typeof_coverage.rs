@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
             other => panic!("{sql}: expected Text, got {other:?}"),
@@ -33,18 +36,34 @@ fn pg_typeof_names_the_network_and_geometric_types() {
         ("'((0,0),(1,1),(2,0))'::polygon", "polygon"),
         ("'[(0,0),(1,1)]'::path", "path"),
     ] {
-        assert_eq!(one(&mut e, &format!("SELECT pg_typeof({expr})::text")), want, "{expr}");
+        assert_eq!(
+            one(&mut e, &format!("SELECT pg_typeof({expr})::text")),
+            want,
+            "{expr}"
+        );
     }
 }
 
 #[test]
 fn pg_typeof_names_ranges_and_records() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT pg_typeof(int4range(1,5))::text"), "int4range");
-    assert_eq!(one(&mut e, "SELECT pg_typeof(int8range(1,5))::text"), "int8range");
-    assert_eq!(one(&mut e, "SELECT pg_typeof(numrange(1,5))::text"), "numrange");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(int4range(1,5))::text"),
+        "int4range"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(int8range(1,5))::text"),
+        "int8range"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(numrange(1,5))::text"),
+        "numrange"
+    );
     assert_eq!(one(&mut e, "SELECT pg_typeof(ROW(1,'a'))::text"), "record");
-    assert_eq!(one(&mut e, "SELECT pg_typeof('a'::char(3))::text"), "character");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof('a'::char(3))::text"),
+        "character"
+    );
 }
 
 #[test]
@@ -57,7 +76,10 @@ fn bare_varchar_has_no_length_limit() {
     // An explicit typmod still truncates on cast (PG semantics).
     assert_eq!(one(&mut e, "SELECT ('abcd'::varchar(2))::text"), "ab");
     // GREATEST over a varchar and a text no longer errors.
-    assert_eq!(one(&mut e, "SELECT (GREATEST('a'::varchar, 'bb'::text))::text"), "bb");
+    assert_eq!(
+        one(&mut e, "SELECT (GREATEST('a'::varchar, 'bb'::text))::text"),
+        "bb"
+    );
     // A varchar(n) COLUMN still rejects an over-long value on assignment.
     e.execute("CREATE TABLE vt(a varchar(2))").unwrap();
     assert!(e.execute("INSERT INTO vt VALUES ('abcd')").is_err());

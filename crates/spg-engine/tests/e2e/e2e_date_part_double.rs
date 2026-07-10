@@ -19,9 +19,30 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn date_part_is_double() {
     let mut e = Engine::new();
     // date_part → double: epoch has no trailing zeros; a fractional second shows.
-    assert_eq!(text(&mut e, "SELECT date_part('epoch', TIMESTAMP '2024-01-01 00:00:01')::text"), "1704067201");
-    assert_eq!(text(&mut e, "SELECT date_part('second', TIMESTAMP '2024-01-01 00:00:01.5')::text"), "1.5");
-    assert_eq!(text(&mut e, "SELECT date_part('dow', DATE '2024-01-07')::text"), "0");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT date_part('epoch', TIMESTAMP '2024-01-01 00:00:01')::text"
+        ),
+        "1704067201"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT date_part('second', TIMESTAMP '2024-01-01 00:00:01.5')::text"
+        ),
+        "1.5"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT date_part('dow', DATE '2024-01-07')::text"),
+        "0"
+    );
     // EXTRACT stays numeric (keeps its trailing zeros).
-    assert_eq!(text(&mut e, "SELECT extract(epoch FROM TIMESTAMP '2024-01-01 00:00:01')::text"), "1704067201.000000");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT extract(epoch FROM TIMESTAMP '2024-01-01 00:00:01')::text"
+        ),
+        "1704067201.000000"
+    );
 }

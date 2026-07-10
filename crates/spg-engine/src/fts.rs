@@ -453,7 +453,10 @@ pub fn ts_rank_cd(weights: &RankWeights, vec: &[TsLexeme], query: &TsQueryAst) -
         }
         let p = doc[begin].0;
         let q = doc[end].0;
-        let inv_sum: f32 = doc[begin..=end].iter().map(|d| 1.0 / weight_factor(d.2, weights)).sum();
+        let inv_sum: f32 = doc[begin..=end]
+            .iter()
+            .map(|d| 1.0 / weight_factor(d.2, weights))
+            .sum();
         let mut cpos = ((end - begin + 1) as f32) / inv_sum;
         let nnoise = (i32::from(q) - i32::from(p)) - (end as i32 - begin as i32);
         if nnoise > 0 {
@@ -642,11 +645,7 @@ fn calc_rank_and(vec: &[TsLexeme], terms: &[&str], weights: &RankWeights) -> f32
             };
         }
     }
-    if res < 0.0 {
-        1e-20
-    } else {
-        res
-    }
+    if res < 0.0 { 1e-20 } else { res }
 }
 
 /// no_std `sqrt` for f32 (Newton, ample precision for ranking).
@@ -660,8 +659,6 @@ fn sqrt_approx(x: f32) -> f32 {
     }
     g as f32
 }
-
-
 
 /// Tokenise on Unicode word boundaries — anything that is not an
 /// alphanumeric scalar value (or `_`) splits the token. Lowercases

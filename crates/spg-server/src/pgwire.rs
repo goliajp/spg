@@ -2567,7 +2567,8 @@ fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value<'static>, St
     Ok(spg_storage::Value::Numeric {
         scaled: final_value,
         scale,
-     kind: spg_storage::NumericKind::Finite })
+        kind: spg_storage::NumericKind::Finite,
+    })
 }
 
 /// Parse `[f1,f2,...,fn]` into `Vec<f32>`. Returns None on any
@@ -3056,18 +3057,18 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // generic 42000. Match the engine's violation phrasings; the
     // "violation" / "NOT NULL column" qualifiers keep DDL errors that merely
     // mention a constraint kind from being misclassified.
-    let code = if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY"))
-    {
-        "23505"
-    } else if msg.contains("FOREIGN KEY violation") {
-        "23503"
-    } else if msg.contains("CHECK constraint violation") {
-        "23514"
-    } else if msg.contains("NOT NULL column") {
-        "23502"
-    } else {
-        "42000"
-    };
+    let code =
+        if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")) {
+            "23505"
+        } else if msg.contains("FOREIGN KEY violation") {
+            "23503"
+        } else if msg.contains("CHECK constraint violation") {
+            "23514"
+        } else if msg.contains("NOT NULL column") {
+            "23502"
+        } else {
+            "42000"
+        };
     (code, msg)
 }
 
@@ -3083,17 +3084,34 @@ mod engine_error_sqlstate_tests {
     #[test]
     fn constraint_violations_map_to_class_23() {
         assert_eq!(
-            code("PRIMARY KEY violation on \"t\" columns [\"id\"]: row #0 duplicates an existing key"),
+            code(
+                "PRIMARY KEY violation on \"t\" columns [\"id\"]: row #0 duplicates an existing key"
+            ),
             "23505"
         );
-        assert_eq!(code("UNIQUE INDEX \"i\" violation on \"t\": row #0 duplicates"), "23505");
-        assert_eq!(code("FOREIGN KEY violation: no parent row in \"t\" where id = Int(9)"), "23503");
-        assert_eq!(code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""), "23514");
+        assert_eq!(
+            code("UNIQUE INDEX \"i\" violation on \"t\": row #0 duplicates"),
+            "23505"
+        );
+        assert_eq!(
+            code("FOREIGN KEY violation: no parent row in \"t\" where id = Int(9)"),
+            "23503"
+        );
+        assert_eq!(
+            code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""),
+            "23514"
+        );
         // NOT NULL flows through Storage(NullInNotNull) whose Display is
         // "NULL value in NOT NULL column …".
-        assert_eq!(code("storage: NULL value in NOT NULL column \"x\""), "23502");
+        assert_eq!(
+            code("storage: NULL value in NOT NULL column \"x\""),
+            "23502"
+        );
         // A DDL error mentioning a constraint kind is not a violation.
-        assert_eq!(code("cannot add UNIQUE constraint to column with duplicate data"), "42000");
+        assert_eq!(
+            code("cannot add UNIQUE constraint to column with duplicate data"),
+            "42000"
+        );
         assert_eq!(code("syntax error near \"FROM\""), "42000");
     }
 }
@@ -3798,7 +3816,11 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
-        Value::Numeric { scaled, scale, kind } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => {
             if matches!(ty, Some(DataType::Timestamptz)) {
@@ -4859,7 +4881,11 @@ fn value_to_pg_text<'a>(
             let _ = write!(&mut buf, "P{months}M{days}D{micros}U");
             buf.into_bump_str()
         }
-        Value::Numeric { scaled, scale, kind } => into_arena(&format_numeric_kind(*kind, *scaled, *scale)),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => into_arena(&format_numeric_kind(*kind, *scaled, *scale)),
         Value::Vector(vec) => {
             // Inline join into the arena buffer — avoids
             // intermediate `Vec<String> + parts.join(", ")` heap

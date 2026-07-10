@@ -72,9 +72,11 @@ pub(crate) fn numeric_bignum_cmp(a: &Value, b: &Value) -> Option<core::cmp::Orde
             Value::SmallInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
             Value::Int(n) => BigNumeric::from_i128(i128::from(*n), 0),
             Value::BigInt(n) => BigNumeric::from_i128(i128::from(*n), 0),
-            Value::Numeric { scaled, scale, kind }
-                if *kind == spg_storage::NumericKind::Finite =>
-            {
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            } if *kind == spg_storage::NumericKind::Finite => {
                 BigNumeric::from_i128(*scaled, *scale)
             }
             Value::NumericBig(b) => (**b).clone(),
@@ -162,51 +164,107 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             x.partial_cmp(&f64::from(*n)).unwrap_or(Ordering::Equal)
         }
         #[allow(clippy::cast_precision_loss)]
-        (Value::BigInt(n), Value::Float(x)) => (*n as f64).partial_cmp(x).unwrap_or(Ordering::Equal),
+        (Value::BigInt(n), Value::Float(x)) => {
+            (*n as f64).partial_cmp(x).unwrap_or(Ordering::Equal)
+        }
         #[allow(clippy::cast_precision_loss)]
-        (Value::Float(x), Value::BigInt(n)) => x.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::BigInt(n)) => {
+            x.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal)
+        }
         // Exact decimal — align scales, then compare the integral
         // forms. The old `_ => debug-string` fallback sorted
         // `12.50 < 5.25 < 99.99` (lexicographic on `Numeric { scaled:
         // .. }`), corrupting `ORDER BY numeric_col` and every
         // aggregate-internal `ORDER BY` over a NUMERIC key.
         (
-            Value::Numeric { scaled: xs, scale: xsc , .. },
-            Value::Numeric { scaled: ys, scale: ysc , .. },
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
         ) => cmp_numeric(*xs, *xsc, *ys, *ysc),
         // Mixed exact-decimal ↔ integer — promote the integer to a
         // NUMERIC at scale 0 and compare exactly. Mirrors the int→numeric
         // promotion `apply_binary_numeric` (binop.rs `numeric_or_widen`)
         // uses for arithmetic + WHERE comparison, so ORDER BY / min / max
         // over a mixed NUMERIC/int key orders consistently with them.
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::SmallInt(y)) => {
-            cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Int(y)) => {
-            cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::BigInt(y)) => {
-            cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::SmallInt(y),
+        ) => cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::SmallInt(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => cmp_numeric(i128::from(*x), 0, *ys, *ysc),
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Int(y),
+        ) => cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::Int(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => cmp_numeric(i128::from(*x), 0, *ys, *ysc),
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::BigInt(y),
+        ) => cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::BigInt(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => cmp_numeric(i128::from(*x), 0, *ys, *ysc),
         // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
         // `numeric op double precision` (the float_path in
         // `apply_binary_numeric`), so compare as f64 with the same
         // NaN-as-Equal fallback the Float arms above use.
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Float(y)) => {
-            numeric_to_f64(*xs, *xsc).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            x.partial_cmp(&numeric_to_f64(*ys, *ysc)).unwrap_or(Ordering::Equal)
-        }
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Float(y),
+        ) => numeric_to_f64(*xs, *xsc)
+            .partial_cmp(y)
+            .unwrap_or(Ordering::Equal),
+        (
+            Value::Float(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => x
+            .partial_cmp(&numeric_to_f64(*ys, *ysc))
+            .unwrap_or(Ordering::Equal),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // Cross-type compare: fall back to the debug rendering —
@@ -224,7 +282,9 @@ pub(crate) fn cmp_numeric(xs: i128, xsc: u8, ys: i128, ysc: u8) -> core::cmp::Or
     use core::cmp::Ordering;
     let max_scale = xsc.max(ysc);
     let widen = |v: i128, sc: u8| -> Option<i128> {
-        10i128.checked_pow(u32::from(max_scale - sc)).and_then(|f| v.checked_mul(f))
+        10i128
+            .checked_pow(u32::from(max_scale - sc))
+            .and_then(|f| v.checked_mul(f))
     };
     match (widen(xs, xsc), widen(ys, ysc)) {
         (Some(a), Some(b)) => a.cmp(&b),
@@ -283,12 +343,10 @@ pub(crate) fn sort_values_for_histogram(a: &Value, b: &Value) -> core::cmp::Orde
         // (Null<String<Number<Boolean<Array<Object, recursive), not by its
         // text spelling. Fall back to text order only if either side fails to
         // parse (should not happen for stored jsonb).
-        (Value::Json(a), Value::Json(b)) => {
-            match (crate::json::parse(a), crate::json::parse(b)) {
-                (Ok(ja), Ok(jb)) => crate::json::jsonb_compare(&ja, &jb),
-                _ => a.cmp(b),
-            }
-        }
+        (Value::Json(a), Value::Json(b)) => match (crate::json::parse(a), crate::json::parse(b)) {
+            (Ok(ja), Ok(jb)) => crate::json::jsonb_compare(&ja, &jb),
+            _ => a.cmp(b),
+        },
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
@@ -395,7 +453,11 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
             days,
             micros,
         } => eval::format_interval(*months, *days, *micros),
-        Value::Numeric { scaled, scale, kind } => eval::format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => eval::format_numeric_kind(*kind, *scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
             // Unreachable in practice (vector columns are filtered
             // out before this). Defensive fallback so a future
@@ -702,10 +764,18 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
             }
         }
         (OrderKey::BigNum(x), _) => {
-            if x.parts().0 { Ordering::Less } else { Ordering::Greater }
+            if x.parts().0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
         }
         (_, OrderKey::BigNum(y)) => {
-            if y.parts().0 { Ordering::Greater } else { Ordering::Less }
+            if y.parts().0 {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         }
     }
 }
@@ -715,8 +785,7 @@ pub(crate) fn partial_sort_tagged(
     keep: Option<usize>,
     descs: &[bool],
 ) {
-    let cmp =
-        |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
+    let cmp = |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
     match keep {
         Some(k) if k < tagged.len() && k > 0 => {
             let pivot = k - 1;
@@ -792,7 +861,10 @@ fn enum_order_ordinal(expr: &Expr, v: &Value, ctx: &EvalContext) -> Option<f64> 
     let pos = eval::find_column_pos(c, ctx)?;
     let enum_name = ctx.columns.get(pos)?.user_enum_type.as_deref()?;
     let def = ctx.catalog?.enum_types().get(enum_name)?;
-    let ord = def.labels.iter().position(|l| l.as_str() == label.as_ref())?;
+    let ord = def
+        .labels
+        .iter()
+        .position(|l| l.as_str() == label.as_ref())?;
     #[allow(clippy::cast_precision_loss)]
     Some(ord as f64)
 }
@@ -906,7 +978,11 @@ mod value_cmp_mixed_numeric_tests {
     use spg_storage::Value;
 
     fn num(scaled: i128, scale: u8) -> Value<'static> {
-        Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        }
     }
 
     #[test]
@@ -917,11 +993,23 @@ mod value_cmp_mixed_numeric_tests {
         // The debug-string-fallback bug: 1000 (numeric, scale 0) vs 9.
         // Lexical debug order put "Numeric{scaled:1000}" before
         // "SmallInt(9)" -> Less (WRONG). Value order is Greater.
-        assert_eq!(value_cmp(&num(1000, 0), &Value::SmallInt(9)), Ordering::Greater);
-        assert_eq!(value_cmp(&Value::SmallInt(9), &num(1000, 0)), Ordering::Less);
+        assert_eq!(
+            value_cmp(&num(1000, 0), &Value::SmallInt(9)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            value_cmp(&Value::SmallInt(9), &num(1000, 0)),
+            Ordering::Less
+        );
         // BigInt both directions.
-        assert_eq!(value_cmp(&num(350, 2), &Value::BigInt(3)), Ordering::Greater);
-        assert_eq!(value_cmp(&Value::BigInt(4), &num(350, 2)), Ordering::Greater);
+        assert_eq!(
+            value_cmp(&num(350, 2), &Value::BigInt(3)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            value_cmp(&Value::BigInt(4), &num(350, 2)),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -936,8 +1024,14 @@ mod value_cmp_mixed_numeric_tests {
     fn numeric_vs_float_demote() {
         // 3.5 numeric vs 3.5 float -> Equal ; 3.5 vs 3.0 -> Greater.
         assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.5)), Ordering::Equal);
-        assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.0)), Ordering::Greater);
+        assert_eq!(
+            value_cmp(&num(35, 1), &Value::Float(3.0)),
+            Ordering::Greater
+        );
         assert_eq!(value_cmp(&Value::Float(1.0), &num(25, 1)), Ordering::Less);
-        assert_eq!(value_cmp(&Value::Float(9.9), &num(25, 1)), Ordering::Greater);
+        assert_eq!(
+            value_cmp(&Value::Float(9.9), &num(25, 1)),
+            Ordering::Greater
+        );
     }
 }

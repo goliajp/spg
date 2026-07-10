@@ -8,7 +8,8 @@ use spg_engine::Engine;
 
 fn fresh() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     e
 }
 
@@ -27,7 +28,8 @@ fn alter_table_set_schema_accepted() {
 #[test]
 fn alter_table_set_tablespace_accepted() {
     let mut e = fresh();
-    e.execute("ALTER TABLE t SET TABLESPACE pg_default").unwrap();
+    e.execute("ALTER TABLE t SET TABLESPACE pg_default")
+        .unwrap();
 }
 
 #[test]
@@ -46,7 +48,8 @@ fn alter_table_set_storage_parameters_accepted() {
 #[test]
 fn alter_table_set_replica_identity_accepted() {
     let mut e = fresh();
-    e.execute("ALTER TABLE t SET REPLICA IDENTITY FULL").unwrap();
+    e.execute("ALTER TABLE t SET REPLICA IDENTITY FULL")
+        .unwrap();
     e.execute("ALTER TABLE t SET REPLICA IDENTITY DEFAULT")
         .unwrap();
 }
@@ -70,5 +73,6 @@ fn alter_table_cluster_on_accepted() {
 #[test]
 fn alter_table_validate_constraint_accepted() {
     let mut e = fresh();
-    e.execute("ALTER TABLE t VALIDATE CONSTRAINT some_fk").unwrap();
+    e.execute("ALTER TABLE t VALIDATE CONSTRAINT some_fk")
+        .unwrap();
 }

@@ -258,9 +258,13 @@ fn value_to_wire(v: &Value) -> WireValue {
         // NUMERIC / DATE / TIMESTAMP render as their canonical
         // text form on the wire. Drivers receive plain UTF-8,
         // identical to what `value_to_text` produces in the engine.
-        Value::Numeric { scaled, scale, kind } => {
-            WireValue::Text(spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale))
-        }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => WireValue::Text(spg_engine::eval::format_numeric_kind(
+            *kind, *scaled, *scale,
+        )),
         Value::Date(d) => WireValue::Text(spg_engine::eval::format_date(*d)),
         Value::Timestamp(t) => WireValue::Text(spg_engine::eval::format_timestamp(*t)),
         Value::Interval {

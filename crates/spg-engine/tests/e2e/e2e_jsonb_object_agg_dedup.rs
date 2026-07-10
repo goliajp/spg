@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn json_text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -56,7 +58,8 @@ fn jsonb_object_agg_canonicalises_key_order() {
     // keeps first-seen order.
     let mut e = Engine::new();
     e.execute("CREATE TABLE ord (k TEXT, v INT)").unwrap();
-    e.execute("INSERT INTO ord VALUES ('b',2),('a',1),('c',3)").unwrap();
+    e.execute("INSERT INTO ord VALUES ('b',2),('a',1),('c',3)")
+        .unwrap();
     assert_eq!(
         json_text(&mut e, "SELECT jsonb_object_agg(k, v) FROM ord"),
         "{\"a\": 1, \"b\": 2, \"c\": 3}"

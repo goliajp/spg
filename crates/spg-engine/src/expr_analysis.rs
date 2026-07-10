@@ -147,7 +147,10 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
             visit_expr_columns_and_subqueries(lhs, on_col, on_sub);
             visit_expr_columns_and_subqueries(rhs, on_col, on_sub);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             visit_expr_columns_and_subqueries(expr, on_col, on_sub);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -252,7 +255,10 @@ pub(crate) fn collect_column_qualifiers<'e>(
             collect_column_qualifiers(lhs, out, all_qualified);
             collect_column_qualifiers(rhs, out, all_qualified);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             collect_column_qualifiers(expr, out, all_qualified);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -298,9 +304,10 @@ pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
             row.iter().any(|el| expr_refers_to(el, target)) || select_refers_to(subquery, target)
         }
         Expr::Binary { lhs, rhs, .. } => expr_refers_to(lhs, target) || expr_refers_to(rhs, target),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            expr_refers_to(expr, target)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => expr_refers_to(expr, target),
         Expr::Like { expr, pattern, .. } => {
             expr_refers_to(expr, target) || expr_refers_to(pattern, target)
         }

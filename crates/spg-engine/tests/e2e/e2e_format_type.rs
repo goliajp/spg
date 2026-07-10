@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -23,7 +25,10 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 fn base_type_names() {
     let mut e = Engine::new();
     // PG's SQL-standard deparse names, not internal typnames.
-    assert_eq!(text(&first(&mut e, "SELECT format_type(23, -1)")), "integer");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type(23, -1)")),
+        "integer"
+    );
     assert_eq!(text(&first(&mut e, "SELECT format_type(20, -1)")), "bigint");
     assert_eq!(text(&first(&mut e, "SELECT format_type(25, -1)")), "text");
     assert_eq!(
@@ -77,20 +82,32 @@ fn unknown_oid_and_null() {
 #[test]
 fn format_type_accepts_regtype_name() {
     let mut e = Engine::new();
-    assert_eq!(text(&first(&mut e, "SELECT format_type('int4'::regtype, NULL)")), "integer");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('int4'::regtype, NULL)")),
+        "integer"
+    );
     assert_eq!(
         text(&first(&mut e, "SELECT format_type('varchar'::regtype, 14)")),
         "character varying(10)"
     );
     assert_eq!(
-        text(&first(&mut e, "SELECT format_type('numeric'::regtype, 655366)")),
+        text(&first(
+            &mut e,
+            "SELECT format_type('numeric'::regtype, 655366)"
+        )),
         "numeric(10,2)"
     );
     assert_eq!(
-        text(&first(&mut e, "SELECT format_type('timestamp'::regtype, 3)")),
+        text(&first(
+            &mut e,
+            "SELECT format_type('timestamp'::regtype, 3)"
+        )),
         "timestamp(3) without time zone"
     );
-    assert_eq!(text(&first(&mut e, "SELECT format_type('bool'::regtype, NULL)")), "boolean");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('bool'::regtype, NULL)")),
+        "boolean"
+    );
 }
 
 // read01 — a numeric OID cast to `::regtype` renders the type name (the
@@ -100,7 +117,10 @@ fn format_type_accepts_regtype_name() {
 fn regtype_numeric_oid_renders_type_name() {
     let mut e = Engine::new();
     assert_eq!(text(&first(&mut e, "SELECT 23::regtype::text")), "integer");
-    assert_eq!(text(&first(&mut e, "SELECT 1043::regtype::text")), "character varying");
+    assert_eq!(
+        text(&first(&mut e, "SELECT 1043::regtype::text")),
+        "character varying"
+    );
     assert_eq!(text(&first(&mut e, "SELECT 20::regtype::text")), "bigint");
     assert_eq!(
         text(&first(&mut e, "SELECT 1114::regtype::text")),
@@ -116,14 +136,35 @@ fn format_type_renders_array_as_element_brackets() {
     // PG renders an array type as `<element>[]`, not the internal `_int4`
     // spelling. Live-PG18.4-verified.
     let mut e = Engine::new();
-    assert_eq!(text(&first(&mut e, "SELECT format_type('_int4'::regtype, null)")), "integer[]");
-    assert_eq!(text(&first(&mut e, "SELECT format_type('_text'::regtype, null)")), "text[]");
-    assert_eq!(text(&first(&mut e, "SELECT format_type('_numeric'::regtype, null)")), "numeric[]");
     assert_eq!(
-        text(&first(&mut e, "SELECT format_type('_timestamp'::regtype, null)")),
+        text(&first(&mut e, "SELECT format_type('_int4'::regtype, null)")),
+        "integer[]"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('_text'::regtype, null)")),
+        "text[]"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT format_type('_numeric'::regtype, null)"
+        )),
+        "numeric[]"
+    );
+    assert_eq!(
+        text(&first(
+            &mut e,
+            "SELECT format_type('_timestamp'::regtype, null)"
+        )),
         "timestamp without time zone[]"
     );
     // Scalar spelling + typmod unchanged.
-    assert_eq!(text(&first(&mut e, "SELECT format_type('int4'::regtype, null)")), "integer");
-    assert_eq!(text(&first(&mut e, "SELECT format_type('varchar'::regtype, 14)")), "character varying(10)");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('int4'::regtype, null)")),
+        "integer"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type('varchar'::regtype, 14)")),
+        "character varying(10)"
+    );
 }

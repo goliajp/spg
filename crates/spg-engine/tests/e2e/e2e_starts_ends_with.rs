@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -20,8 +22,14 @@ fn as_bool(v: &spg_storage::Value<'_>) -> bool {
 #[test]
 fn starts_with_basic() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT starts_with('hello world', 'hello')")));
-    assert!(!as_bool(&first(&mut e, "SELECT starts_with('hello world', 'world')")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT starts_with('hello world', 'hello')"
+    )));
+    assert!(!as_bool(&first(
+        &mut e,
+        "SELECT starts_with('hello world', 'world')"
+    )));
     // Empty prefix always matches.
     assert!(as_bool(&first(&mut e, "SELECT starts_with('abc', '')")));
     // Empty string never has non-empty prefix.
@@ -35,15 +43,24 @@ fn starts_with_basic() {
 #[test]
 fn ends_with_basic() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT ends_with('hello world', 'world')")));
-    assert!(!as_bool(&first(&mut e, "SELECT ends_with('hello world', 'hello')")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT ends_with('hello world', 'world')"
+    )));
+    assert!(!as_bool(&first(
+        &mut e,
+        "SELECT ends_with('hello world', 'hello')"
+    )));
     assert!(as_bool(&first(&mut e, "SELECT ends_with('abc', '')")));
 }
 
 #[test]
 fn text_starts_with_alias() {
     let mut e = Engine::new();
-    assert!(as_bool(&first(&mut e, "SELECT text_starts_with('abc', 'a')")));
+    assert!(as_bool(&first(
+        &mut e,
+        "SELECT text_starts_with('abc', 'a')"
+    )));
 }
 
 #[test]

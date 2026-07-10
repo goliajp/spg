@@ -18,7 +18,9 @@ use spg_storage::Value;
 /// Render the single scalar cell the way PG's `-tA` would for a boolean-typed
 /// column: NULL → `NULL`, booleans → `t`/`f`, everything else as text.
 fn b1(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -142,12 +144,27 @@ fn any_all_with_null() {
 fn case_with_null_conditions() {
     let mut e = Engine::new();
     // NULL condition is "not true" → ELSE branch.
-    assert_eq!(b1(&mut e, "SELECT (CASE WHEN NULL THEN 'a' ELSE 'b' END)"), "b");
-    assert_eq!(b1(&mut e, "SELECT (CASE WHEN 1=NULL THEN 'a' ELSE 'b' END)"), "b");
+    assert_eq!(
+        b1(&mut e, "SELECT (CASE WHEN NULL THEN 'a' ELSE 'b' END)"),
+        "b"
+    );
+    assert_eq!(
+        b1(&mut e, "SELECT (CASE WHEN 1=NULL THEN 'a' ELSE 'b' END)"),
+        "b"
+    );
     // searched CASE: NULL never equals NULL → ELSE.
-    assert_eq!(b1(&mut e, "SELECT (CASE 1 WHEN NULL THEN 'a' ELSE 'b' END)"), "b");
-    assert_eq!(b1(&mut e, "SELECT (CASE NULL WHEN NULL THEN 'a' ELSE 'b' END)"), "b");
-    assert_eq!(b1(&mut e, "SELECT (CASE WHEN true THEN NULL END)::text"), "NULL");
+    assert_eq!(
+        b1(&mut e, "SELECT (CASE 1 WHEN NULL THEN 'a' ELSE 'b' END)"),
+        "b"
+    );
+    assert_eq!(
+        b1(&mut e, "SELECT (CASE NULL WHEN NULL THEN 'a' ELSE 'b' END)"),
+        "b"
+    );
+    assert_eq!(
+        b1(&mut e, "SELECT (CASE WHEN true THEN NULL END)::text"),
+        "NULL"
+    );
     assert_eq!(b1(&mut e, "SELECT (CASE WHEN false THEN 'a' END)"), "NULL");
 }
 
@@ -198,7 +215,8 @@ fn boolean_casts_and_literals() {
 #[test]
 fn where_filtering_and_bool_aggregates() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t3vl (id int, v int, b bool)").unwrap();
+    e.execute("CREATE TABLE t3vl (id int, v int, b bool)")
+        .unwrap();
     e.execute(
         "INSERT INTO t3vl VALUES (1,10,true),(2,NULL,false),(3,30,NULL),(4,NULL,NULL),(5,50,true)",
     )
@@ -207,7 +225,9 @@ fn where_filtering_and_bool_aggregates() {
     let agg = |e: &mut Engine, sql: &str| -> String {
         b1(
             e,
-            &format!("SELECT coalesce(string_agg(id::text,',' ORDER BY id),'<empty>') FROM t3vl {sql}"),
+            &format!(
+                "SELECT coalesce(string_agg(id::text,',' ORDER BY id),'<empty>') FROM t3vl {sql}"
+            ),
         )
     };
 
@@ -221,7 +241,10 @@ fn where_filtering_and_bool_aggregates() {
     assert_eq!(agg(&mut e, "WHERE v NOT IN (10,30)"), "5");
     // NOT IN against a subquery that yields a NULL → whole predicate NULL → no rows.
     assert_eq!(
-        agg(&mut e, "WHERE v NOT IN (SELECT v FROM t3vl WHERE id IN (1,2))"),
+        agg(
+            &mut e,
+            "WHERE v NOT IN (SELECT v FROM t3vl WHERE id IN (1,2))"
+        ),
         "<empty>",
     );
     assert_eq!(agg(&mut e, "WHERE v IS DISTINCT FROM 10"), "2,3,4,5");
@@ -233,9 +256,15 @@ fn where_filtering_and_bool_aggregates() {
     // bool_and / bool_or ignore NULLs; all-NULL group → NULL.
     assert_eq!(b1(&mut e, "SELECT bool_and(b) FROM t3vl"), "f");
     assert_eq!(b1(&mut e, "SELECT bool_or(b) FROM t3vl"), "t");
-    assert_eq!(b1(&mut e, "SELECT bool_and(b) FROM t3vl WHERE b IS NOT NULL"), "f");
     assert_eq!(
-        b1(&mut e, "SELECT coalesce(bool_and(b)::text,'NULL') FROM t3vl WHERE id=4"),
+        b1(&mut e, "SELECT bool_and(b) FROM t3vl WHERE b IS NOT NULL"),
+        "f"
+    );
+    assert_eq!(
+        b1(
+            &mut e,
+            "SELECT coalesce(bool_and(b)::text,'NULL') FROM t3vl WHERE id=4"
+        ),
         "NULL",
     );
 

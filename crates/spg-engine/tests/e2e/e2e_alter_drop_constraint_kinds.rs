@@ -32,10 +32,8 @@ fn drop_constraint_unique_via_synth_name() {
 #[test]
 fn drop_constraint_check_via_synth_name() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (id INT NOT NULL, status TEXT, CHECK (status IN ('a', 'b')))",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, status TEXT, CHECK (status IN ('a', 'b')))")
+        .unwrap();
     // pg_constraint synthesises CHECK names as
     // `<table>_check<idx>` — idx 0 for the first.
     e.execute("ALTER TABLE t DROP CONSTRAINT t_check0").unwrap();
@@ -55,8 +53,6 @@ fn drop_constraint_if_exists_silently_succeeds() {
 fn drop_constraint_unknown_without_if_exists_errors() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
-    let err = e
-        .execute("ALTER TABLE t DROP CONSTRAINT nope")
-        .unwrap_err();
+    let err = e.execute("ALTER TABLE t DROP CONSTRAINT nope").unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(ref s) if s.contains("no constraint named")));
 }

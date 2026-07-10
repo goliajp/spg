@@ -17,10 +17,19 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn to_char_leading_dollar_currency() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT to_char(1234.5, 'FM$9,999.00')"), "$1,234.50");
+    assert_eq!(
+        text(&mut e, "SELECT to_char(1234.5, 'FM$9,999.00')"),
+        "$1,234.50"
+    );
     assert_eq!(text(&mut e, "SELECT to_char(5, 'FM$99')"), "$5");
     // Without FM the field keeps its sign-column space (PG: '$ 1,234.50').
-    assert_eq!(text(&mut e, "SELECT to_char(1234.5, '$9,999.00')"), "$ 1,234.50");
+    assert_eq!(
+        text(&mut e, "SELECT to_char(1234.5, '$9,999.00')"),
+        "$ 1,234.50"
+    );
     // A trailing `$` still renders at the end.
-    assert_eq!(text(&mut e, "SELECT to_char(1234.5, 'FM9,999.00$')"), "1,234.50$");
+    assert_eq!(
+        text(&mut e, "SELECT to_char(1234.5, 'FM9,999.00$')"),
+        "1,234.50$"
+    );
 }

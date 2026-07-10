@@ -302,10 +302,8 @@ pub type SelectIntoResolver<'a> =
 /// statement against the engine and returns every row's values.
 pub type ForQueryResolver<'a> = dyn Fn(
         &spg_sql::ast::Statement,
-    ) -> Result<
-        alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
-        TriggerError,
-    > + 'a;
+    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>, TriggerError>
+    + 'a;
 
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
@@ -536,31 +534,26 @@ fn execute_stmts(
                     function: ctx.function.into(),
                     cause,
                 })?;
-                let to_i64 =
-                    |v: &spg_storage::Value<'static>| -> Result<i64, TriggerError> {
-                        match v {
-                            spg_storage::Value::Int(n) => Ok(i64::from(*n)),
-                            spg_storage::Value::BigInt(n) => Ok(*n),
-                            spg_storage::Value::SmallInt(n) => Ok(i64::from(*n)),
-                            other => Err(TriggerError::UnsupportedConstruct {
-                                function: ctx.function.into(),
-                                detail: alloc::format!(
-                                    "FOR <var> IN start..end: bounds must be integer, got {:?}",
-                                    other.data_type()
-                                ),
-                            }),
-                        }
-                    };
+                let to_i64 = |v: &spg_storage::Value<'static>| -> Result<i64, TriggerError> {
+                    match v {
+                        spg_storage::Value::Int(n) => Ok(i64::from(*n)),
+                        spg_storage::Value::BigInt(n) => Ok(*n),
+                        spg_storage::Value::SmallInt(n) => Ok(i64::from(*n)),
+                        other => Err(TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::format!(
+                                "FOR <var> IN start..end: bounds must be integer, got {:?}",
+                                other.data_type()
+                            ),
+                        }),
+                    }
+                };
                 let s = to_i64(&s_v)?;
                 let e = to_i64(&e_v)?;
                 // PG's `FOR i IN REVERSE 5..1` iterates 5, 4, 3, 2, 1 —
                 // the first bound is the start, the second is the end,
                 // step is -1.
-                let (lo, hi, step): (i64, i64, i64) = if *reverse {
-                    (s, e, -1)
-                } else {
-                    (s, e, 1)
-                };
+                let (lo, hi, step): (i64, i64, i64) = if *reverse { (s, e, -1) } else { (s, e, 1) };
                 let mut i = lo;
                 let mut iter: i64 = 0;
                 loop {
@@ -595,9 +588,7 @@ fn execute_stmts(
                     if iter >= LOOP_BUDGET {
                         return Err(TriggerError::RaiseException {
                             function: ctx.function.into(),
-                            message: alloc::format!(
-                                "LOOP iteration budget {LOOP_BUDGET} reached"
-                            ),
+                            message: alloc::format!("LOOP iteration budget {LOOP_BUDGET} reached"),
                         });
                     }
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
@@ -644,14 +635,14 @@ fn execute_stmts(
                 // Evaluate the expression at runtime to obtain a SQL
                 // string, parse it, run through the for_query_resolver,
                 // iterate rows same way ForQuery does.
-                let resolver = ctx.for_query_resolver.ok_or_else(|| {
-                    TriggerError::UnsupportedConstruct {
-                        function: ctx.function.into(),
-                        detail: alloc::format!(
-                            "FOR <var> IN EXECUTE <expr> LOOP: only supported inside DO blocks"
-                        ),
-                    }
-                })?;
+                let resolver =
+                    ctx.for_query_resolver
+                        .ok_or_else(|| TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::format!(
+                                "FOR <var> IN EXECUTE <expr> LOOP: only supported inside DO blocks"
+                            ),
+                        })?;
                 let v = eval_with_new_old_and_locals(
                     sql_expr,
                     current_new.as_ref(),
@@ -778,10 +769,7 @@ fn execute_stmts(
                 let parsed = spg_sql::parser::parse_statement(&sql_text).map_err(|e| {
                     TriggerError::UnparseableBody {
                         function: ctx.function.into(),
-                        detail: alloc::format!(
-                            "EXECUTE {sql_text:?}: parse failed: {}",
-                            e.message
-                        ),
+                        detail: alloc::format!("EXECUTE {sql_text:?}: parse failed: {}", e.message),
                     }
                 })?;
                 deferred.push(DeferredEmbeddedStmt {
@@ -1032,10 +1020,7 @@ pub fn execute_do_block_top_level<'a>(
                         // error code (matches PG's default for
                         // RAISE EXCEPTION without ERRCODE) until a
                         // v7.40 error-code table lands.
-                        locals.insert(
-                            "sqlerrm".into(),
-                            Value::text(message.clone()),
-                        );
+                        locals.insert("sqlerrm".into(), Value::text(message.clone()));
                         locals.insert(
                             "sqlstate".into(),
                             Value::text(alloc::string::String::from("P0001")),
@@ -1219,7 +1204,10 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             substitute_locals(lhs, locals);
             substitute_locals(rhs, locals);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             substitute_locals(expr, locals);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -1356,7 +1344,10 @@ fn substitute_new_old(
             substitute_new_old(lhs, new_row, old_row, columns)?;
             substitute_new_old(rhs, new_row, old_row, columns)?;
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;
         }
         Expr::Like { expr, pattern, .. } => {

@@ -4,13 +4,12 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn count(e: &mut Engine, table: &str) -> i64 {
-    let r = e
-        .execute(&alloc_string_fmt(table))
-        .expect("SELECT COUNT");
+    let r = e.execute(&alloc_string_fmt(table)).expect("SELECT COUNT");
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };

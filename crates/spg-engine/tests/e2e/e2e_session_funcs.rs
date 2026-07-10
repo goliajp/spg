@@ -98,7 +98,10 @@ fn database_in_select_list_alongside_table_column() {
 fn reported_server_version_is_pg18() {
     let mut e = Engine::new();
     let v = one_text(&mut e, "SELECT version()");
-    assert!(v.contains("18.4"), "version() should report 18.4, got {v:?}");
+    assert!(
+        v.contains("18.4"),
+        "version() should report 18.4, got {v:?}"
+    );
     assert_eq!(
         one_text(&mut e, "SELECT current_setting('server_version')"),
         "18.4 (SPG-compat)"

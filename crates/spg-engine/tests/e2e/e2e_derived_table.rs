@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -88,7 +90,8 @@ fn derived_table_joins_a_real_table() {
 fn aggregate_over_derived_table() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE a (x INT)").unwrap();
-    e.execute("INSERT INTO a VALUES (1), (2), (3), (4)").unwrap();
+    e.execute("INSERT INTO a VALUES (1), (2), (3), (4)")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT COUNT(*), SUM(x) FROM (SELECT x FROM a WHERE x > 1) big",
@@ -144,5 +147,8 @@ fn values_union_column_type_unification() {
          (ORDER BY d RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) c \
          FROM (VALUES('2020-01-01'::date),('2020-01-02'),('2020-01-02'),('2020-01-05')) t(d)) s",
     );
-    assert!(matches!(&got[0][0], Value::Text(s) if s == "1,3,3,1"), "got {got:?}");
+    assert!(
+        matches!(&got[0][0], Value::Text(s) if s == "1,3,3,1"),
+        "got {got:?}"
+    );
 }

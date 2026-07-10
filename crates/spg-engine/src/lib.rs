@@ -35,6 +35,7 @@ macro_rules! bump_counter {
 }
 
 pub mod aggregate;
+pub(crate) mod amcheck;
 mod bytebudget;
 mod cancel;
 mod clock;
@@ -61,7 +62,6 @@ pub mod memoize;
 mod numeric;
 mod orderby;
 mod partition;
-pub(crate) mod amcheck;
 pub(crate) mod partition_walks;
 pub mod plan_cache;
 mod plpgsql;
@@ -888,8 +888,7 @@ impl Engine {
                 reader_tx_id,
             );
         }
-        let sorted: alloc::vec::Vec<u64> =
-            self.active_writer_versions.iter().copied().collect();
+        let sorted: alloc::vec::Vec<u64> = self.active_writer_versions.iter().copied().collect();
         let oldest = *sorted.first().unwrap_or(&version);
         spg_storage::snapshot::Snapshot::new(
             version,
@@ -1159,12 +1158,12 @@ impl Engine {
                     backslash_escapes: false,
                     last_sequence_used: None,
                     next_tx_id: 1,
-            active_writer_versions: BTreeSet::new(),
-            aborted_versions: BTreeSet::new(),
-            locks: crate::locks::LockTable::new(),
-            mvcc_inplace: false,
-            tx_writer_versions: BTreeMap::new(),
-            stmt_writer_version: None,
+                    active_writer_versions: BTreeSet::new(),
+                    aborted_versions: BTreeSet::new(),
+                    locks: crate::locks::LockTable::new(),
+                    mvcc_inplace: false,
+                    tx_writer_versions: BTreeMap::new(),
+                    stmt_writer_version: None,
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
@@ -1181,12 +1180,12 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
-            stat_tup_inserted: 0,
-            stat_tup_updated: 0,
-            stat_tup_deleted: 0,
-            local_guc_saves: Vec::new(),
-            savepoint_guc_marks: Vec::new(),
-            tx_aborted: false,
+                    stat_tup_inserted: 0,
+                    stat_tup_updated: 0,
+                    stat_tup_deleted: 0,
+                    local_guc_saves: Vec::new(),
+                    savepoint_guc_marks: Vec::new(),
+                    tx_aborted: false,
                     trigger_recursion_depth: 0,
                     foreign_key_checks: true,
                     meta_views_materialised: false,

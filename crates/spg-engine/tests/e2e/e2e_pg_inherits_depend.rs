@@ -4,7 +4,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };
@@ -19,12 +21,7 @@ fn pg_inherits_emits_pg_canonical_columns() {
         panic!("Rows");
     };
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-    for must in [
-        "inhrelid",
-        "inhparent",
-        "inhseqno",
-        "inhdetachpending",
-    ] {
+    for must in ["inhrelid", "inhparent", "inhseqno", "inhdetachpending"] {
         assert!(
             names.contains(&must),
             "pg_inherits missing {must}: {names:?}"
@@ -81,10 +78,7 @@ fn pg_depend_returns_empty_with_pg_columns() {
         "refobjsubid",
         "deptype",
     ] {
-        assert!(
-            names.contains(&must),
-            "pg_depend missing {must}: {names:?}"
-        );
+        assert!(names.contains(&must), "pg_depend missing {must}: {names:?}");
     }
     assert!(rows.is_empty());
 }

@@ -24,7 +24,11 @@ fn autoanalyze_pass_picks_up_tables_with_pending_modifications() {
         e.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
     }
     let analyzed = e.autoanalyze_pass().unwrap();
-    assert_eq!(analyzed.len(), 1, "expected one analyzed table, got {analyzed:?}");
+    assert_eq!(
+        analyzed.len(),
+        1,
+        "expected one analyzed table, got {analyzed:?}"
+    );
     assert_eq!(analyzed[0], "t");
     // After autoanalyze, the candidate set is empty again.
     let second = e.autoanalyze_pass().unwrap();
@@ -45,7 +49,8 @@ fn autoanalyze_pass_skips_internal_tables() {
     e.execute("CREATE TABLE users (id INT)").unwrap();
     // 60 > PG threshold 50 + ceil(60/10) = 56 → the user table analyzes.
     for i in 0..60 {
-        e.execute(&format!("INSERT INTO users VALUES ({i})")).unwrap();
+        e.execute(&format!("INSERT INTO users VALUES ({i})"))
+            .unwrap();
     }
     let analyzed = e.autoanalyze_pass().unwrap();
     assert_eq!(analyzed, vec!["users".to_string()]);

@@ -15,7 +15,8 @@ fn show(e: &mut Engine, param: &str) -> String {
 }
 
 fn run(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]

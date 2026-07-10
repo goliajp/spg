@@ -7,7 +7,10 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn run(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
         _ => panic!("expected rows"),
     }
@@ -43,7 +46,8 @@ fn cycle_detects_and_stops() {
 fn cycle_no_cycle_terminates_normally() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE dag(a int, b int)").unwrap();
-    e.execute("INSERT INTO dag VALUES(1,2),(2,3),(3,4)").unwrap();
+    e.execute("INSERT INTO dag VALUES(1,2),(2,3),(3,4)")
+        .unwrap();
     let out = run(
         &mut e,
         "WITH RECURSIVE t(a,b) AS (\

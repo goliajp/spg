@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -64,10 +66,16 @@ fn bit_concat_yields_bitstring() {
     assert_eq!(txt(&mut e, "SELECT (B'1010' || B'0101')::text"), "10100101");
     // Cross-byte alignment (first operand not byte-aligned).
     assert_eq!(txt(&mut e, "SELECT (B'101' || B'1')::text"), "1011");
-    assert_eq!(txt(&mut e, "SELECT (B'11111111' || B'0000')::text"), "111111110000");
+    assert_eq!(
+        txt(&mut e, "SELECT (B'11111111' || B'0000')::text"),
+        "111111110000"
+    );
     assert_eq!(txt(&mut e, "SELECT (B'' || B'11')::text"), "11");
     // Equality with the literal confirms the packed bits.
-    assert_eq!(one(&mut e, "SELECT (B'101' || B'1') = B'1011'"), spg_storage::Value::Bool(true));
+    assert_eq!(
+        one(&mut e, "SELECT (B'101' || B'1') = B'1011'"),
+        spg_storage::Value::Bool(true)
+    );
 }
 
 #[test]
@@ -85,8 +93,14 @@ fn pg_typeof_bit_reports_bit_varying_not_unknown() {
             o => panic!("{o:?}"),
         }
     };
-    assert_eq!(t(&mut e, "SELECT pg_typeof('101'::varbit)::text"), "bit varying");
-    assert_eq!(t(&mut e, "SELECT pg_typeof(B'10' || B'11')::text"), "bit varying");
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof('101'::varbit)::text"),
+        "bit varying"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(B'10' || B'11')::text"),
+        "bit varying"
+    );
     // No longer "unknown" for a plain bit literal either.
     assert_eq!(t(&mut e, "SELECT pg_typeof(B'101')::text"), "bit varying");
 }

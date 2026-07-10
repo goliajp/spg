@@ -36,23 +36,77 @@ fn scalar(e: &mut Engine, sql: &str) -> i64 {
 fn topk_asc_selects_smallest() {
     let mut e = seed();
     // LIMIT 5: five smallest → all v = 0 (there are ten).
-    assert_eq!(scalar(&mut e, "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"), 5);
-    assert_eq!(scalar(&mut e, "SELECT coalesce(sum(v),0) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"), 0);
-    assert_eq!(scalar(&mut e, "SELECT max(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"), 0);
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"
+        ),
+        5
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT coalesce(sum(v),0) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT max(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 5) s"
+        ),
+        0
+    );
 
     // LIMIT 25 spans v=0 (10) + v=1 (10) + v=2 (5): sum = 20, max = 2.
-    assert_eq!(scalar(&mut e, "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"), 25);
-    assert_eq!(scalar(&mut e, "SELECT sum(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"), 20);
-    assert_eq!(scalar(&mut e, "SELECT max(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"), 2);
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"
+        ),
+        25
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT sum(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"
+        ),
+        20
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT max(v) FROM (SELECT v FROM topk ORDER BY v LIMIT 25) s"
+        ),
+        2
+    );
 }
 
 #[test]
 fn topk_desc_selects_largest() {
     let mut e = seed();
     // DESC LIMIT 25: v=19 (10) + v=18 (10) + v=17 (5) → sum = 455, min = 17.
-    assert_eq!(scalar(&mut e, "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"), 25);
-    assert_eq!(scalar(&mut e, "SELECT sum(v) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"), 455);
-    assert_eq!(scalar(&mut e, "SELECT min(v) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"), 17);
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT count(*) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"
+        ),
+        25
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT sum(v) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"
+        ),
+        455
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT min(v) FROM (SELECT v FROM topk ORDER BY v DESC LIMIT 25) s"
+        ),
+        17
+    );
 }
 
 #[test]

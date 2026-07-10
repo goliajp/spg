@@ -6,7 +6,8 @@
 use spg_engine::Engine;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -44,15 +45,24 @@ fn alter_aggregate_language_operator_no_op() {
 #[test]
 fn alter_server_foreign_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "ALTER SERVER myserver OPTIONS (SET host 'localhost')");
+    ddl(
+        &mut e,
+        "ALTER SERVER myserver OPTIONS (SET host 'localhost')",
+    );
     ddl(&mut e, "ALTER FOREIGN TABLE foreign_t RENAME TO ft");
-    ddl(&mut e, "ALTER FOREIGN DATA WRAPPER pgfdw OPTIONS (SET debug 'on')");
+    ddl(
+        &mut e,
+        "ALTER FOREIGN DATA WRAPPER pgfdw OPTIONS (SET debug 'on')",
+    );
 }
 
 #[test]
 fn alter_text_search_event_large_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres");
+    ddl(
+        &mut e,
+        "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres",
+    );
     ddl(&mut e, "ALTER EVENT TRIGGER my_trg DISABLE");
     ddl(&mut e, "ALTER LARGE OBJECT 12345 OWNER TO postgres");
 }

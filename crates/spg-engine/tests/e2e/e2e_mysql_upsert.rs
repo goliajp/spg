@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,7 +24,8 @@ fn as_i64(v: &spg_storage::Value<'_>) -> i64 {
 #[test]
 fn on_duplicate_key_update_basic() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE du (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE du (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO du VALUES (1, 10)").unwrap();
     // New key inserts; duplicate key updates.
     e.execute("INSERT INTO du VALUES (2, 20) ON DUPLICATE KEY UPDATE v = 99")
@@ -37,7 +40,8 @@ fn on_duplicate_key_update_basic() {
 #[test]
 fn on_duplicate_key_values_reads_incoming() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE dv (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE dv (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO dv VALUES (1, 10)").unwrap();
     // MySQL VALUES(col) is the incoming row's value.
     e.execute("INSERT INTO dv VALUES (1, 42) ON DUPLICATE KEY UPDATE v = VALUES(v) * 2")

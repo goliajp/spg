@@ -14,13 +14,26 @@ fn scalar(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 #[test]
 fn enum_cast_validates_membership() {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')").unwrap();
-    assert_eq!(scalar(&mut e, "SELECT 'happy'::mood"), spg_storage::Value::text("happy"));
-    assert_eq!(scalar(&mut e, "SELECT 'sad'::mood"), spg_storage::Value::text("sad"));
+    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')")
+        .unwrap();
+    assert_eq!(
+        scalar(&mut e, "SELECT 'happy'::mood"),
+        spg_storage::Value::text("happy")
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT 'sad'::mood"),
+        spg_storage::Value::text("sad")
+    );
     // A non-member is rejected.
     assert!(e.execute("SELECT 'bad'::mood").is_err());
     // A typed NULL passes through.
-    assert_eq!(scalar(&mut e, "SELECT NULL::mood"), spg_storage::Value::Null);
+    assert_eq!(
+        scalar(&mut e, "SELECT NULL::mood"),
+        spg_storage::Value::Null
+    );
     // Equality on the validated label works.
-    assert_eq!(scalar(&mut e, "SELECT ('ok'::mood = 'ok')"), spg_storage::Value::Bool(true));
+    assert_eq!(
+        scalar(&mut e, "SELECT ('ok'::mood = 'ok')"),
+        spg_storage::Value::Bool(true)
+    );
 }

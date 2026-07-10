@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -44,7 +46,8 @@ fn correlated_outer_column() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE emp (id INT, sal INT)").unwrap();
     e.execute("CREATE TABLE cap (limit_v INT)").unwrap();
-    e.execute("INSERT INTO emp VALUES (1, 50), (2, 150)").unwrap();
+    e.execute("INSERT INTO emp VALUES (1, 50), (2, 150)")
+        .unwrap();
     e.execute("INSERT INTO cap VALUES (100)").unwrap();
     // Per-row: keep employees above every cap.
     let QueryResult::Rows { rows, .. } = e

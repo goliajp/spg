@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -40,7 +42,10 @@ fn strip_removes_positions() {
 fn tsvector_length_counts_lexemes() {
     let mut e = Engine::new();
     assert_eq!(
-        as_int(&first(&mut e, "SELECT tsvector_length('cat:3 dog:7 fish:12')")),
+        as_int(&first(
+            &mut e,
+            "SELECT tsvector_length('cat:3 dog:7 fish:12')"
+        )),
         3
     );
     assert_eq!(as_int(&first(&mut e, "SELECT tsvector_length('')")), 0);
@@ -58,10 +63,7 @@ fn numnode_counts_nodes() {
 #[test]
 fn querytree_drops_negated() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&first(&mut e, "SELECT querytree('cat !dog')")),
-        "cat"
-    );
+    assert_eq!(text(&first(&mut e, "SELECT querytree('cat !dog')")), "cat");
     // All-negated → 'T' (matches everything indexably).
     assert_eq!(text(&first(&mut e, "SELECT querytree('!dog')")), "T");
 }

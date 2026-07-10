@@ -13,7 +13,10 @@ use spg_engine::{Engine, QueryResult};
 
 /// One scalar text (or "NULL") per row, in row order.
 fn col(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r.values[0] {
@@ -28,7 +31,10 @@ fn col(e: &mut Engine, sql: &str) -> Vec<String> {
 
 /// Two columns joined by '|', one string per row.
 fn pair(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| {
@@ -75,19 +81,19 @@ fn column_default_reports_pg_source_text() {
     assert_eq!(
         got,
         vec![
-            "0",                    // a int
-            "0",                    // b numeric(10,2) DEFAULT 0  (was 0.00)
-            "0.5",                  // n numeric(10,2) DEFAULT 0.5
-            "'hi'::text",           // c text
+            "0",                      // a int
+            "0",                      // b numeric(10,2) DEFAULT 0  (was 0.00)
+            "0.5",                    // n numeric(10,2) DEFAULT 0.5
+            "'hi'::text",             // c text
             "'x'::character varying", // v varchar(10)
-            "'a''b'::text",         // q text, escaped quote
-            "true",                 // g boolean
-            "now()",                // d timestamp
-            "CURRENT_DATE",         // h date
-            "(3 + 4)",              // e int arithmetic
-            "'-5'::integer",        // m int negative
-            "'-1.5'::numeric",      // p numeric negative
-            "NULL",                 // f no default
+            "'a''b'::text",           // q text, escaped quote
+            "true",                   // g boolean
+            "now()",                  // d timestamp
+            "CURRENT_DATE",           // h date
+            "(3 + 4)",                // e int arithmetic
+            "'-5'::integer",          // m int negative
+            "'-1.5'::numeric",        // p numeric negative
+            "NULL",                   // f no default
         ]
     );
 }
@@ -95,7 +101,8 @@ fn column_default_reports_pg_source_text() {
 #[test]
 fn pg_attrdef_lists_defaults_with_pg_get_expr() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id int DEFAULT 7, v text DEFAULT 'hi', plain int)").unwrap();
+    e.execute("CREATE TABLE t(id int DEFAULT 7, v text DEFAULT 'hi', plain int)")
+        .unwrap();
     // Only the two defaulted columns appear; pg_get_expr returns the text.
     let got = pair(
         &mut e,
@@ -108,6 +115,9 @@ fn pg_attrdef_lists_defaults_with_pg_get_expr() {
 fn pg_attrdef_empty_when_no_defaults() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(a int, b text)").unwrap();
-    let got = pair(&mut e, "SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef");
+    let got = pair(
+        &mut e,
+        "SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef",
+    );
     assert!(got.is_empty(), "expected no pg_attrdef rows, got {got:?}");
 }

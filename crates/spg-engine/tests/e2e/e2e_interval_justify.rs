@@ -4,21 +4,22 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
     rows[0].values[0].clone()
 }
 
-fn assert_interval(
-    v: &spg_storage::Value<'_>,
-    exp_months: i32,
-    exp_days: i32,
-    exp_micros: i64,
-) {
+fn assert_interval(v: &spg_storage::Value<'_>, exp_months: i32, exp_days: i32, exp_micros: i64) {
     match v {
-        spg_storage::Value::Interval { months, days, micros } => {
+        spg_storage::Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
             assert_eq!(*months, exp_months, "months mismatch");
             assert_eq!(*days, exp_days, "days mismatch");
             assert_eq!(*micros, exp_micros, "micros mismatch");

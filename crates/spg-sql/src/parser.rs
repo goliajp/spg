@@ -22,12 +22,11 @@ use crate::ast::{
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
-    FunctionArg,
-    FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
-    IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare,
-    PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem,
-    SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp,
-    UnionKind, VecEncoding, WindowFrame,
+    FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod,
+    InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, Overriding,
+    PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst,
+    ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
+    TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -203,9 +202,7 @@ fn reorder_named_args(
     let params: &[&str] = match fname.to_ascii_lowercase().as_str() {
         "make_date" => &["year", "month", "day"],
         "make_time" => &["hour", "min", "sec"],
-        "make_timestamp" | "make_timestamptz" => {
-            &["year", "month", "mday", "hour", "min", "sec"]
-        }
+        "make_timestamp" | "make_timestamptz" => &["year", "month", "mday", "hour", "min", "sec"],
         "make_interval" => &["years", "months", "weeks", "days", "hours", "mins", "secs"],
         other => {
             return Err(alloc::format!(
@@ -5140,13 +5137,9 @@ impl Parser {
                             .qualifier
                             .as_deref()
                             .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q))),
-                        Expr::Binary { lhs, rhs, .. } => {
-                            walk(lhs, names) || walk(rhs, names)
-                        }
+                        Expr::Binary { lhs, rhs, .. } => walk(lhs, names) || walk(rhs, names),
                         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, names),
-                        Expr::FunctionCall { args, .. } => {
-                            args.iter().any(|a| walk(a, names))
-                        }
+                        Expr::FunctionCall { args, .. } => args.iter().any(|a| walk(a, names)),
                         Expr::Case {
                             operand,
                             branches,
@@ -5196,8 +5189,7 @@ impl Parser {
                 refs: &dyn Fn(&Expr) -> bool,
             ) {
                 if let Expr::Column(c) = e {
-                    if c
-                        .qualifier
+                    if c.qualifier
                         .as_deref()
                         .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q)))
                     {
@@ -5410,9 +5402,7 @@ impl Parser {
             _ => None,
         };
         if source_select.is_some() && source_alias.is_none() {
-            return Err(self.err(
-                "MERGE USING (subquery) requires an alias".into(),
-            ));
+            return Err(self.err("MERGE USING (subquery) requires an alias".into()));
         }
         // ON
         if !matches!(self.peek(), Token::On) {
@@ -5714,7 +5704,8 @@ impl Parser {
                     self.advance(); // VALUE
                     // `IF NOT EXISTS` — NOT lexes as the keyword `Token::Not`,
                     // IF/EXISTS as identifiers.
-                    let if_not_exists = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                    let if_not_exists = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"))
+                    {
                         let n1 = self.tokens.get(self.pos + 1);
                         let n2 = self.tokens.get(self.pos + 2);
                         if matches!(n1, Some(Token::Not))
@@ -5731,7 +5722,8 @@ impl Parser {
                         false
                     };
                     let label = self.expect_string_literal()?;
-                    let position = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("before") || s.eq_ignore_ascii_case("after")) {
+                    let position = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("before") || s.eq_ignore_ascii_case("after"))
+                    {
                         let is_before = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("before"));
                         self.advance();
                         let anchor = self.expect_string_literal()?;
@@ -6742,9 +6734,9 @@ impl Parser {
             Token::Null => alloc::string::String::from("NULL"),
             Token::Ident(s) => s.to_uppercase(),
             other => {
-                return Err(
-                    self.err(alloc::format!("expected a COPY option keyword, got {other:?}"))
-                );
+                return Err(self.err(alloc::format!(
+                    "expected a COPY option keyword, got {other:?}"
+                )));
             }
         };
         match kw.as_str() {
@@ -6826,7 +6818,9 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_partition_bounds_tail(&mut self) -> Result<crate::ast::PartitionOfBoundsAst, ParseError> {
+    fn parse_partition_bounds_tail(
+        &mut self,
+    ) -> Result<crate::ast::PartitionOfBoundsAst, ParseError> {
         use crate::ast::PartitionOfBoundsAst;
         match self.peek() {
             Token::Default => {
@@ -6893,10 +6887,11 @@ impl Parser {
                             }
                         }
                     }
-                    let modulus =
-                        modulus.ok_or_else(|| self.err("FOR VALUES WITH: missing MODULUS".to_string()))?;
-                    let remainder = remainder
-                        .ok_or_else(|| self.err("FOR VALUES WITH: missing REMAINDER".to_string()))?;
+                    let modulus = modulus
+                        .ok_or_else(|| self.err("FOR VALUES WITH: missing MODULUS".to_string()))?;
+                    let remainder = remainder.ok_or_else(|| {
+                        self.err("FOR VALUES WITH: missing REMAINDER".to_string())
+                    })?;
                     if modulus == 0 {
                         return Err(self.err("FOR VALUES WITH: MODULUS must be > 0".to_string()));
                     }
@@ -6949,9 +6944,9 @@ impl Parser {
                             }
                         }
                         if values.is_empty() {
-                            return Err(self.err(
-                                "FOR VALUES IN requires at least one literal".to_string(),
-                            ));
+                            return Err(
+                                self.err("FOR VALUES IN requires at least one literal".to_string())
+                            );
                         }
                         Ok(PartitionOfBoundsAst::List { values })
                     }
@@ -7199,7 +7194,11 @@ impl Parser {
             // chain only; with no new previous element it stays at
             // the outer level (the left fold applies it to the
             // whole head, group included).
-            match (is_intersect, regrouped.len() > boundary, regrouped.last_mut()) {
+            match (
+                is_intersect,
+                regrouped.len() > boundary,
+                regrouped.last_mut(),
+            ) {
                 (true, true, Some((_, prev))) => prev.unions.push((kind, peer)),
                 _ => regrouped.push((kind, peer)),
             }
@@ -7207,7 +7206,6 @@ impl Parser {
         head.unions = regrouped;
         Ok(())
     }
-
 
     /// v7.37.17 (17.6 siblings) — the shared SELECT tail: ORDER BY /
     /// LIMIT / OFFSET / FETCH FIRST / FOR-lock clauses. Extracted so
@@ -7669,10 +7667,8 @@ impl Parser {
             // group head, then wrap the group as a derived table
             // (SELECT * FROM (group)) so the outer chain / outer
             // tail can't clobber the group's own ordering or limit.
-            let has_tail = matches!(
-                self.peek(),
-                Token::Order | Token::Limit | Token::Offset
-            ) || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            let has_tail = matches!(self.peek(), Token::Order | Token::Limit | Token::Offset)
+                || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                     if s.eq_ignore_ascii_case("fetch"));
             if has_tail {
                 self.parse_select_tail_into(&mut head)?;
@@ -7800,9 +7796,7 @@ impl Parser {
                     let lname = name.to_ascii_lowercase();
                     let colname = alias.clone().unwrap_or_else(|| lname.clone());
                     let (unnest, gs) = match lname.as_str() {
-                        "unnest" if args.len() == 1 => {
-                            (Some(Box::new(args[0].clone())), None)
-                        }
+                        "unnest" if args.len() == 1 => (Some(Box::new(args[0].clone())), None),
                         "generate_series" if (2..=3).contains(&args.len()) => {
                             (None, Some(args.clone()))
                         }
@@ -8468,9 +8462,7 @@ impl Parser {
             }
         }
         if key_columns.is_empty() {
-            return Err(self.err(
-                "PARTITION BY requires at least one key column".to_string(),
-            ));
+            return Err(self.err("PARTITION BY requires at least one key column".to_string()));
         }
         Ok(PartitionBySpec { kind, key_columns })
     }
@@ -8561,16 +8553,13 @@ impl Parser {
                             }
                         }
                     }
-                    let modulus = modulus.ok_or_else(|| {
-                        self.err("FOR VALUES WITH: missing MODULUS".to_string())
-                    })?;
+                    let modulus = modulus
+                        .ok_or_else(|| self.err("FOR VALUES WITH: missing MODULUS".to_string()))?;
                     let remainder = remainder.ok_or_else(|| {
                         self.err("FOR VALUES WITH: missing REMAINDER".to_string())
                     })?;
                     if modulus == 0 {
-                        return Err(self.err(
-                            "FOR VALUES WITH: MODULUS must be > 0".to_string(),
-                        ));
+                        return Err(self.err("FOR VALUES WITH: MODULUS must be > 0".to_string()));
                     }
                     if remainder >= modulus {
                         return Err(self.err(format!(
@@ -8580,61 +8569,61 @@ impl Parser {
                     }
                     PartitionOfBoundsAst::Hash { modulus, remainder }
                 } else {
-                match self.peek() {
-                    Token::From => {
-                        self.advance();
-                        let lower = Box::new(self.parse_partition_bound_expr()?);
-                        if !matches!(self.peek(), Token::To) {
-                            return Err(self.err(format!(
-                                "expected TO after FROM (...), got {:?}",
-                                self.peek()
-                            )));
+                    match self.peek() {
+                        Token::From => {
+                            self.advance();
+                            let lower = Box::new(self.parse_partition_bound_expr()?);
+                            if !matches!(self.peek(), Token::To) {
+                                return Err(self.err(format!(
+                                    "expected TO after FROM (...), got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                            let upper = Box::new(self.parse_partition_bound_expr()?);
+                            PartitionOfBoundsAst::Range { lower, upper }
                         }
-                        self.advance();
-                        let upper = Box::new(self.parse_partition_bound_expr()?);
-                        PartitionOfBoundsAst::Range { lower, upper }
-                    }
-                    // v7.37.16 (16.1) — FOR VALUES IN (lit [, lit, …])
-                    Token::In => {
-                        self.advance();
-                        if !matches!(self.peek(), Token::LParen) {
-                            return Err(self.err(format!(
-                                "expected '(' after FOR VALUES IN, got {:?}",
-                                self.peek()
-                            )));
-                        }
-                        self.advance();
-                        let mut values = Vec::new();
-                        loop {
-                            values.push(self.parse_expr(0)?);
-                            match self.peek() {
-                                Token::Comma => {
-                                    self.advance();
-                                }
-                                Token::RParen => {
-                                    self.advance();
-                                    break;
-                                }
-                                other => {
-                                    return Err(self.err(format!(
+                        // v7.37.16 (16.1) — FOR VALUES IN (lit [, lit, …])
+                        Token::In => {
+                            self.advance();
+                            if !matches!(self.peek(), Token::LParen) {
+                                return Err(self.err(format!(
+                                    "expected '(' after FOR VALUES IN, got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                            let mut values = Vec::new();
+                            loop {
+                                values.push(self.parse_expr(0)?);
+                                match self.peek() {
+                                    Token::Comma => {
+                                        self.advance();
+                                    }
+                                    Token::RParen => {
+                                        self.advance();
+                                        break;
+                                    }
+                                    other => {
+                                        return Err(self.err(format!(
                                         "expected ',' or ')' in FOR VALUES IN list, got {other:?}"
                                     )));
+                                    }
                                 }
                             }
+                            if values.is_empty() {
+                                return Err(self.err(
+                                    "FOR VALUES IN requires at least one literal".to_string(),
+                                ));
+                            }
+                            PartitionOfBoundsAst::List { values }
                         }
-                        if values.is_empty() {
-                            return Err(self.err(
-                                "FOR VALUES IN requires at least one literal".to_string(),
-                            ));
+                        other => {
+                            return Err(self.err(format!(
+                                "expected FROM / IN / WITH after FOR VALUES, got {other:?}"
+                            )));
                         }
-                        PartitionOfBoundsAst::List { values }
                     }
-                    other => {
-                        return Err(self.err(format!(
-                            "expected FROM / IN / WITH after FOR VALUES, got {other:?}"
-                        )));
-                    }
-                }
                 }
             }
             other => {
@@ -9246,7 +9235,16 @@ impl Parser {
     fn parse_references_tail(
         &mut self,
         expected_arity: usize,
-    ) -> Result<(String, Vec<String>, FkAction, FkAction, crate::ast::MatchType), ParseError> {
+    ) -> Result<
+        (
+            String,
+            Vec<String>,
+            FkAction,
+            FkAction,
+            crate::ast::MatchType,
+        ),
+        ParseError,
+    > {
         match self.advance() {
             Token::Ident(s) if s.eq_ignore_ascii_case("references") => {}
             other => return Err(self.err(format!("expected REFERENCES, got {other:?}"))),
@@ -9309,9 +9307,7 @@ impl Parser {
                 // when ALL referencing columns are NULL; a mixed-NULL key errors.
                 "FULL" => match_type = crate::ast::MatchType::Full,
                 "PARTIAL" => {
-                    return Err(self.err(
-                        "MATCH PARTIAL not yet implemented".to_string(),
-                    ));
+                    return Err(self.err("MATCH PARTIAL not yet implemented".to_string()));
                 }
                 _ => {
                     return Err(self.err(format!(
@@ -9377,7 +9373,13 @@ impl Parser {
                 }
             }
         }
-        Ok((parent_table, parent_columns, on_delete, on_update, match_type))
+        Ok((
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+            match_type,
+        ))
     }
 
     /// v7.6.0 — parse `CASCADE | RESTRICT | SET NULL | SET DEFAULT |
@@ -11112,9 +11114,7 @@ impl Parser {
             }
             self.advance();
             if columns.is_some() {
-                return Err(self.err(
-                    "DEFAULT VALUES cannot follow an INSERT column list".into(),
-                ));
+                return Err(self.err("DEFAULT VALUES cannot follow an INSERT column list".into()));
             }
             let on_conflict = self.parse_optional_on_conflict()?;
             let returning = self.parse_optional_returning()?;
@@ -11374,8 +11374,8 @@ impl Parser {
         if matches!(self.peek(), Token::On) {
             self.advance(); // ON
             match self.advance() {
-                Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("constraint") => {}
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraint") => {
+                }
                 other => {
                     return Err(self.err(alloc::format!(
                         "expected CONSTRAINT after ON CONFLICT ON, got {other:?}"
@@ -11754,8 +11754,10 @@ impl Parser {
         // (parse_with_cte_then_select), so widen the second-token gate to
         // Select | LParen | WITH.
         if matches!(self.peek(), Token::LParen)
-            && (matches!(self.tokens.get(self.pos + 1), Some(Token::Select | Token::LParen))
-                || matches!(self.tokens.get(self.pos + 1),
+            && (matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Select | Token::LParen)
+            ) || matches!(self.tokens.get(self.pos + 1),
                     Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("with")))
         {
             self.advance(); // (
@@ -11908,7 +11910,9 @@ impl Parser {
             }
             self.advance();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
-            let table_alias = alias_ident.clone().unwrap_or_else(|| "regexp_matches".to_string());
+            let table_alias = alias_ident
+                .clone()
+                .unwrap_or_else(|| "regexp_matches".to_string());
             let col_name = column_aliases
                 .first()
                 .cloned()
@@ -12090,20 +12094,22 @@ impl Parser {
                 let entry = match fn_name.as_str() {
                     "unnest" => {
                         if fn_args.len() != 1 {
-                            return Err(self.err(
-                                "unnest inside ROWS FROM takes exactly one array".into(),
-                            ));
+                            return Err(
+                                self.err("unnest inside ROWS FROM takes exactly one array".into())
+                            );
                         }
                         fn_args.pop().expect("len checked")
                     }
-                    "jsonb_array_elements" | "json_array_elements"
-                    | "jsonb_array_elements_text" | "json_array_elements_text"
-                    | "jsonb_object_keys" | "json_object_keys" | "generate_subscripts" => {
-                        crate::ast::Expr::FunctionCall {
-                            name: fn_name,
-                            args: fn_args,
-                        }
-                    }
+                    "jsonb_array_elements"
+                    | "json_array_elements"
+                    | "jsonb_array_elements_text"
+                    | "json_array_elements_text"
+                    | "jsonb_object_keys"
+                    | "json_object_keys"
+                    | "generate_subscripts" => crate::ast::Expr::FunctionCall {
+                        name: fn_name,
+                        args: fn_args,
+                    },
                     "string_to_table" => crate::ast::Expr::FunctionCall {
                         name: "string_to_array".to_string(),
                         args: fn_args,
@@ -12349,8 +12355,7 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("tablesample")) {
             self.advance();
             let method = self.expect_ident_like()?;
-            if !method.eq_ignore_ascii_case("bernoulli") && !method.eq_ignore_ascii_case("system")
-            {
+            if !method.eq_ignore_ascii_case("bernoulli") && !method.eq_ignore_ascii_case("system") {
                 return Err(self.err(alloc::format!(
                     "TABLESAMPLE method {method:?} not supported; use BERNOULLI or SYSTEM"
                 )));
@@ -12449,7 +12454,9 @@ impl Parser {
                 branches,
                 else_branch,
             } => {
-                operand.as_deref().is_some_and(Self::expr_has_qualified_column)
+                operand
+                    .as_deref()
+                    .is_some_and(Self::expr_has_qualified_column)
                     || branches.iter().any(|(w, t)| {
                         Self::expr_has_qualified_column(w) || Self::expr_has_qualified_column(t)
                     })
@@ -12474,12 +12481,18 @@ impl Parser {
             Expr::Unary { expr, .. } => Self::expr_has_any_column(expr),
             Expr::Cast { expr, .. } => Self::expr_has_any_column(expr),
             Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_any_column),
-            Expr::Case { operand, branches, else_branch } => {
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
                 operand.as_deref().is_some_and(Self::expr_has_any_column)
-                    || branches.iter().any(|(w, t)| {
-                        Self::expr_has_any_column(w) || Self::expr_has_any_column(t)
-                    })
-                    || else_branch.as_deref().is_some_and(Self::expr_has_any_column)
+                    || branches
+                        .iter()
+                        .any(|(w, t)| Self::expr_has_any_column(w) || Self::expr_has_any_column(t))
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(Self::expr_has_any_column)
             }
             _ => false,
         }
@@ -12536,9 +12549,7 @@ impl Parser {
             Expr::Binary { lhs, rhs, .. } => {
                 Self::expr_has_named_window(lhs) || Self::expr_has_named_window(rhs)
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
-                Self::expr_has_named_window(expr)
-            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => Self::expr_has_named_window(expr),
             Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_named_window),
             Expr::Case {
                 operand,
@@ -12549,7 +12560,9 @@ impl Parser {
                     || branches.iter().any(|(w, t)| {
                         Self::expr_has_named_window(w) || Self::expr_has_named_window(t)
                     })
-                    || else_branch.as_deref().is_some_and(Self::expr_has_named_window)
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(Self::expr_has_named_window)
             }
             _ => false,
         }
@@ -12583,9 +12596,7 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(wname) = named {
-                    let Some((_, def)) = defs
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(&wname))
+                    let Some((_, def)) = defs.iter().find(|(n, _)| n.eq_ignore_ascii_case(&wname))
                     else {
                         return Err(alloc::format!("window {wname:?} does not exist"));
                     };
@@ -12675,7 +12686,9 @@ impl Parser {
     /// Rides the existing lateral-subquery channel, so no new executor or
     /// AST is needed.
     fn parse_json_to_record_from(&mut self) -> Result<TableRef, ParseError> {
-        use crate::ast::{BinOp, ColumnName, Expr, FromClause, Literal, SelectItem, SelectStatement};
+        use crate::ast::{
+            BinOp, ColumnName, Expr, FromClause, Literal, SelectItem, SelectStatement,
+        };
         let fn_name = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
             _ => unreachable!("caller guarded is_json_to_record_name"),
@@ -13588,15 +13601,11 @@ impl Parser {
             // carrying the source mantissa + scale so no precision is lost. A
             // literal too wide for i128 falls back to double precision.
             Token::Numeric(s) => match parse_decimal_literal(&s) {
-                Some((unscaled, scale)) => {
-                    Ok(Expr::Literal(Literal::Numeric { unscaled, scale }))
-                }
+                Some((unscaled, scale)) => Ok(Expr::Literal(Literal::Numeric { unscaled, scale })),
                 // v7.38 (read01, T3.C3) — a plain decimal too wide for i128 keeps
                 // its exact value as a NumericBig (only scientific `e`-notation
                 // still widens to double).
-                None if !s.contains(['e', 'E']) => {
-                    Ok(Expr::Literal(Literal::NumericBig(s)))
-                }
+                None if !s.contains(['e', 'E']) => Ok(Expr::Literal(Literal::NumericBig(s))),
                 None => s
                     .parse::<f64>()
                     .map(|x| Expr::Literal(Literal::Float(x)))
@@ -13695,8 +13704,8 @@ impl Parser {
                 if typed_literal_cast_target(&s.to_ascii_lowercase()).is_some()
                     && matches!(self.peek(), Token::String(_)) =>
             {
-                let target = typed_literal_cast_target(&s.to_ascii_lowercase())
-                    .expect("guard checked");
+                let target =
+                    typed_literal_cast_target(&s.to_ascii_lowercase()).expect("guard checked");
                 let Token::String(lit) = self.advance() else {
                     unreachable!("peek guaranteed a string token");
                 };
@@ -13994,9 +14003,9 @@ impl Parser {
                 let field = match self.advance() {
                     Token::Ident(s) | Token::QuotedIdent(s) => s,
                     other => {
-                        return Err(self.err(format!(
-                            "expected a field name after '.', got {other:?}"
-                        )));
+                        return Err(
+                            self.err(format!("expected a field name after '.', got {other:?}"))
+                        );
                     }
                 };
                 expr = Expr::FieldAccess {
@@ -14077,10 +14086,7 @@ impl Parser {
                     };
                     let call = Expr::FunctionCall {
                         name: "pg_is_json".to_string(),
-                        args: alloc::vec![
-                            expr,
-                            Expr::Literal(Literal::String(kind)),
-                        ],
+                        args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
                     };
                     expr = if negated {
                         Expr::Unary {
@@ -14157,10 +14163,7 @@ impl Parser {
                         // NULL and false both land in ELSE.
                         Some(true) => Expr::Case {
                             operand: None,
-                            branches: alloc::vec![(
-                                expr,
-                                Expr::Literal(Literal::Bool(!negated)),
-                            )],
+                            branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
                             else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
                         },
                         // IS FALSE: CASE WHEN NOT x THEN t ELSE f
@@ -14271,8 +14274,7 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
                     self.advance();
                     let esc = self.parse_expr(5)?;
-                    pattern = Self::rewrite_like_escape(pattern, esc)
-                        .map_err(|m| self.err(m))?;
+                    pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
                 }
                 expr = Expr::Like {
                     expr: Box::new(expr),
@@ -14382,8 +14384,10 @@ impl Parser {
                     }
                 };
                 let lc = cname.to_ascii_lowercase();
-                if !matches!(lc.as_str(), "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8")
-                {
+                if !matches!(
+                    lc.as_str(),
+                    "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
+                ) {
                     return Err(self.err(alloc::format!(
                         "COLLATE {cname:?}: SPG orders text by bytes (the C \
                          collation); locale collations are not supported yet — \
@@ -14841,17 +14845,16 @@ impl Parser {
         // SYMMETRIC — the bounds may arrive in either order; both
         // orientations OR together. ASYMMETRIC is the default and
         // absorbs as noise.
-        let symmetric =
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("symmetric")) {
+        let symmetric = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("symmetric"))
+        {
+            self.advance();
+            true
+        } else {
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("asymmetric")) {
                 self.advance();
-                true
-            } else {
-                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("asymmetric"))
-                {
-                    self.advance();
-                }
-                false
-            };
+            }
+            false
+        };
         let low = self.parse_expr(5)?;
         if !matches!(self.peek(), Token::And) {
             return Err(self.err(format!(
@@ -14951,9 +14954,9 @@ impl Parser {
         let cte_name = cte.name.clone();
         let col_names = cte.column_overrides.clone();
         if col_names.is_empty() {
-            return Err(self.err(
-                "SEARCH / CYCLE requires an explicit WITH name(cols) column list".into(),
-            ));
+            return Err(
+                self.err("SEARCH / CYCLE requires an explicit WITH name(cols) column list".into())
+            );
         }
         let search = cte.search.take();
         let cycle = cte.cycle.take();
@@ -14985,7 +14988,10 @@ impl Parser {
                     }
                 }
             }
-            Ok(Expr::FunctionCall { name: "row".into(), args })
+            Ok(Expr::FunctionCall {
+                name: "row".into(),
+                args,
+            })
         };
         let CteBody::Select(body) = &mut cte.body else {
             return Err(self.err("SEARCH / CYCLE requires a SELECT CTE body".into()));
@@ -15018,17 +15024,17 @@ impl Parser {
             let base_key = match body.items.get(key_pos) {
                 Some(SelectItem::Expr { expr, .. }) => expr.clone(),
                 _ => {
-                    return Err(self.err(
-                        "SEARCH BY column maps to a non-expression select item".into(),
-                    ));
+                    return Err(
+                        self.err("SEARCH BY column maps to a non-expression select item".into())
+                    );
                 }
             };
             let rec_key = match body.unions[rec].1.items.get(key_pos) {
                 Some(SelectItem::Expr { expr, .. }) => expr.clone(),
                 _ => {
-                    return Err(self.err(
-                        "SEARCH BY column maps to a non-expression select item".into(),
-                    ));
+                    return Err(
+                        self.err("SEARCH BY column maps to a non-expression select item".into())
+                    );
                 }
             };
             if srch.depth_first {
@@ -15049,10 +15055,7 @@ impl Parser {
                 // leading depth element dominates the element-wise comparison,
                 // so shallower rows sort first, then by key — PG's (depth, key).
                 body.items.push(SelectItem::Expr {
-                    expr: Expr::Array(alloc::vec![
-                        Expr::Literal(Literal::Integer(0)),
-                        base_key,
-                    ]),
+                    expr: Expr::Array(alloc::vec![Expr::Literal(Literal::Integer(0)), base_key,]),
                     alias: Some(srch.set_column.clone()),
                 });
                 // rec depth = cte.set[1] + 1.
@@ -15164,16 +15167,24 @@ impl Parser {
             Token::Ident(s) if s.eq_ignore_ascii_case("depth") => true,
             Token::Ident(s) if s.eq_ignore_ascii_case("breadth") => false,
             other => {
-                return Err(self.err(format!("expected DEPTH or BREADTH after SEARCH, got {other:?}")));
+                return Err(self.err(format!(
+                    "expected DEPTH or BREADTH after SEARCH, got {other:?}"
+                )));
             }
         };
         self.advance();
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("first")) {
-            return Err(self.err(format!("expected FIRST after SEARCH mode, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected FIRST after SEARCH mode, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         if !matches!(self.peek(), Token::By) {
-            return Err(self.err(format!("expected BY after SEARCH … FIRST, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected BY after SEARCH … FIRST, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         let mut by_columns = alloc::vec![self.expect_ident_like()?];
@@ -15182,11 +15193,18 @@ impl Parser {
             by_columns.push(self.expect_ident_like()?);
         }
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("set")) {
-            return Err(self.err(format!("expected SET in SEARCH clause, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected SET in SEARCH clause, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         let set_column = self.expect_ident_like()?;
-        Ok(Some(crate::ast::SearchClause { depth_first, by_columns, set_column }))
+        Ok(Some(crate::ast::SearchClause {
+            depth_first,
+            by_columns,
+            set_column,
+        }))
     }
 
     /// v7.38 (read01 U16) — `CYCLE col [, col…] SET markcol [TO v DEFAULT w]
@@ -15202,7 +15220,10 @@ impl Parser {
             columns.push(self.expect_ident_like()?);
         }
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("set")) {
-            return Err(self.err(format!("expected SET in CYCLE clause, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected SET in CYCLE clause, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         let mark_column = self.expect_ident_like()?;
@@ -15212,13 +15233,19 @@ impl Parser {
             self.advance();
             mark_value = Some(self.parse_cycle_literal()?);
             if !matches!(self.peek(), Token::Default) {
-                return Err(self.err(format!("expected DEFAULT after CYCLE … TO, got {:?}", self.peek())));
+                return Err(self.err(format!(
+                    "expected DEFAULT after CYCLE … TO, got {:?}",
+                    self.peek()
+                )));
             }
             self.advance();
             default_value = Some(self.parse_cycle_literal()?);
         }
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
-            return Err(self.err(format!("expected USING in CYCLE clause, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected USING in CYCLE clause, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         let path_column = self.expect_ident_like()?;
@@ -16652,10 +16679,9 @@ impl Parser {
                     self.advance();
                     let target = self.parse_expr(0)?;
                     if !matches!(self.peek(), Token::RParen) {
-                        return Err(self.err(format!(
-                            "expected ')' to close TRIM, got {:?}",
-                            self.peek()
-                        )));
+                        return Err(
+                            self.err(format!("expected ')' to close TRIM, got {:?}", self.peek()))
+                        );
                     }
                     self.advance();
                     let mut trim_args = alloc::vec![target];
@@ -16671,14 +16697,8 @@ impl Parser {
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     // v7.38 (read01, T14) — `argname => value` names this arg.
-                    let this_name = match (
-                        &self.tokens[self.pos],
-                        self.tokens.get(self.pos + 1),
-                    ) {
-                        (
-                            Token::Ident(n) | Token::QuotedIdent(n),
-                            Some(Token::FatArrow),
-                        ) => {
+                    let this_name = match (&self.tokens[self.pos], self.tokens.get(self.pos + 1)) {
+                        (Token::Ident(n) | Token::QuotedIdent(n), Some(Token::FatArrow)) => {
                             let name = n.clone();
                             self.advance(); // name
                             self.advance(); // =>
@@ -16721,8 +16741,7 @@ impl Parser {
                         let form = match self.tokens.get(self.pos + 1) {
                             Some(Token::Ident(f) | Token::QuotedIdent(f)) => {
                                 let up = f.to_ascii_uppercase();
-                                matches!(up.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD")
-                                    .then_some(up)
+                                matches!(up.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD").then_some(up)
                             }
                             _ => None,
                         };
@@ -16885,8 +16904,7 @@ impl Parser {
             // v7.38 (read01, T14) — resolve any `argname => value` to positional
             // order (the AST stays positional, so no downstream site changes).
             if arg_names.iter().any(Option::is_some) {
-                args = reorder_named_args(&first, args, &arg_names)
-                    .map_err(|msg| self.err(msg))?;
+                args = reorder_named_args(&first, args, &arg_names).map_err(|msg| self.err(msg))?;
             }
             // v7.32 (round-29) — ordered-set aggregate tail
             // `name(direct_args) WITHIN GROUP (ORDER BY …)`
@@ -17195,7 +17213,11 @@ fn parse_iso8601_interval(rest: &str) -> Option<(i32, i32, i64)> {
     if !num.is_empty() {
         return None;
     }
-    Some((i32::try_from(months).ok()?, i32::try_from(days).ok()?, micros))
+    Some((
+        i32::try_from(months).ok()?,
+        i32::try_from(days).ok()?,
+        micros,
+    ))
 }
 
 /// PG year-month shorthand for INTERVAL: `1-2` = 1 year 2 mons (an optional
@@ -17317,7 +17339,11 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
             // casts (toward-zero) + explicit round-half-away-from-zero.
             #[allow(clippy::cast_possible_truncation)]
             fn round_i64(x: f64) -> i64 {
-                if x >= 0.0 { (x + 0.5) as i64 } else { (x - 0.5) as i64 }
+                if x >= 0.0 {
+                    (x + 0.5) as i64
+                } else {
+                    (x - 0.5) as i64
+                }
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             fn add_days_frac(days: &mut i32, micros: &mut i64, d: f64) -> Option<()> {
@@ -18178,14 +18204,17 @@ mod tests {
         // v7.37.16 (16.1) — `PARTITION BY LIST (key)` parent + a
         // child with `FOR VALUES IN (lit, lit, …)`.
         use crate::ast::{PartitionBySpec, PartitionKindAst, PartitionOfBoundsAst};
-        let parent = parse_statement(
-            "CREATE TABLE events_listed (region TEXT) PARTITION BY LIST (region)",
-        )
-        .unwrap();
+        let parent =
+            parse_statement("CREATE TABLE events_listed (region TEXT) PARTITION BY LIST (region)")
+                .unwrap();
         let Statement::CreateTable(t) = parent else {
             panic!("expected CreateTable");
         };
-        let Some(PartitionBySpec { kind, ref key_columns }) = t.partition_by else {
+        let Some(PartitionBySpec {
+            kind,
+            ref key_columns,
+        }) = t.partition_by
+        else {
             panic!("expected PARTITION BY");
         };
         assert_eq!(kind, PartitionKindAst::List);
@@ -18219,7 +18248,11 @@ mod tests {
         let Statement::CreateTable(t) = parent else {
             panic!("expected CreateTable");
         };
-        let Some(PartitionBySpec { kind, ref key_columns }) = t.partition_by else {
+        let Some(PartitionBySpec {
+            kind,
+            ref key_columns,
+        }) = t.partition_by
+        else {
             panic!("expected PARTITION BY");
         };
         assert_eq!(kind, PartitionKindAst::Hash);

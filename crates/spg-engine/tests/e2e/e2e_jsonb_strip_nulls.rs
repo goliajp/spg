@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,10 +32,7 @@ fn strips_null_keys_from_object() {
 #[test]
 fn keeps_null_array_items() {
     let mut e = Engine::new();
-    let v = first(
-        &mut e,
-        "SELECT jsonb_strip_nulls('[1, null, 2]'::jsonb)",
-    );
+    let v = first(&mut e, "SELECT jsonb_strip_nulls('[1, null, 2]'::jsonb)");
     assert_eq!(as_json(&v), r#"[1, null, 2]"#);
 }
 
@@ -50,7 +49,10 @@ fn recurses_into_nested_objects() {
 #[test]
 fn no_nulls_unchanged() {
     let mut e = Engine::new();
-    let v = first(&mut e, "SELECT jsonb_strip_nulls('{\"a\": 1, \"b\": 2}'::jsonb)");
+    let v = first(
+        &mut e,
+        "SELECT jsonb_strip_nulls('{\"a\": 1, \"b\": 2}'::jsonb)",
+    );
     assert_eq!(as_json(&v), r#"{"a": 1, "b": 2}"#);
 }
 

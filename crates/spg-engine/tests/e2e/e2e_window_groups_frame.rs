@@ -4,11 +4,14 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };
@@ -22,7 +25,10 @@ fn groups_unbounded_preceding_and_current_row_matches_range() {
     // the peer-group at the current row.
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT, v INT)");
-    ddl(&mut e, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)");
+    ddl(
+        &mut e,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)",
+    );
 
     let groups = rows(
         &mut e,
@@ -41,7 +47,10 @@ fn groups_unbounded_preceding_and_current_row_matches_range() {
 fn groups_current_row_to_unbounded_following_matches_range() {
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT, v INT)");
-    ddl(&mut e, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)");
+    ddl(
+        &mut e,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)",
+    );
 
     let groups = rows(
         &mut e,

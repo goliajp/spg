@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn b(e: &mut Engine, sql: &str) -> bool {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };

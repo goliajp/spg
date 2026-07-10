@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -32,11 +34,7 @@ fn sin_cos_tan_basic_values() {
     assert_close(as_float(&first(&mut e, "SELECT cos(0)")), 1.0, 1e-12);
     assert_close(as_float(&first(&mut e, "SELECT tan(0)")), 0.0, 1e-12);
     // sin(π/2) = 1
-    assert_close(
-        as_float(&first(&mut e, "SELECT sin(pi() / 2)")),
-        1.0,
-        1e-12,
-    );
+    assert_close(as_float(&first(&mut e, "SELECT sin(pi() / 2)")), 1.0, 1e-12);
     // cos(π) = -1
     assert_close(as_float(&first(&mut e, "SELECT cos(pi())")), -1.0, 1e-12);
 }

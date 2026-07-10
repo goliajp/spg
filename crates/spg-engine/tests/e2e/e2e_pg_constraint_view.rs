@@ -58,7 +58,10 @@ fn pg_constraint_lists_foreign_key() {
     assert_eq!(r[0][0], Value::text("f"));
     // conrelid + confrelid are now BigInt OIDs that match
     // pg_class.oid for the respective tables.
-    let cls = rows(e.execute("SELECT oid, relname FROM pg_catalog.pg_class").unwrap());
+    let cls = rows(
+        e.execute("SELECT oid, relname FROM pg_catalog.pg_class")
+            .unwrap(),
+    );
     let oid_of = |t: &str| -> i64 {
         cls.iter()
             .find(|row| matches!(&row[1], Value::Text(s) if s.as_ref() == t))

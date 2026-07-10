@@ -4,7 +4,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ddl(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]

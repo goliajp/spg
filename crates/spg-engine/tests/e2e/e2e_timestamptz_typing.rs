@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| {
@@ -61,7 +64,8 @@ fn copy_renders_timestamptz_with_its_offset() {
     // `2024-01-15 10:30:00` for timestamp. The offset used to be dropped for
     // both, because the COPY cell renderer never saw the column's type.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE cz(a timestamptz, b timestamp)").unwrap();
+    e.execute("CREATE TABLE cz(a timestamptz, b timestamp)")
+        .unwrap();
     e.execute("INSERT INTO cz VALUES ('2024-01-15 10:30:00+00', '2024-01-15 10:30:00')")
         .unwrap();
     let got = rows(&mut e, "COPY cz TO STDOUT");
@@ -75,7 +79,8 @@ fn timestamptz_input_is_normalized_to_utc() {
     // instant. Locking it so the rendering work above can't drift it.
     let mut e = Engine::new();
     e.execute("CREATE TABLE cz2(a timestamptz)").unwrap();
-    e.execute("INSERT INTO cz2 VALUES ('2024-01-15 10:30:00+09')").unwrap();
+    e.execute("INSERT INTO cz2 VALUES ('2024-01-15 10:30:00+09')")
+        .unwrap();
     let got = rows(&mut e, "COPY cz2 TO STDOUT");
     assert_eq!(got[0][0], "2024-01-15 01:30:00+00");
 }
@@ -85,12 +90,19 @@ fn pg_typeof_uses_the_static_type_not_the_runtime_value() {
     // The runtime value is a tz-less Value::Timestamp, so pg_typeof must read
     // the static expression type. Oracle: PG18.4.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE tzt(a timestamptz, b timestamp)").unwrap();
+    e.execute("CREATE TABLE tzt(a timestamptz, b timestamp)")
+        .unwrap();
     e.execute("INSERT INTO tzt VALUES ('2024-01-15 10:30:00+00', '2024-01-15 10:30:00')")
         .unwrap();
     let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
-    assert_eq!(t(&mut e, "SELECT pg_typeof(a) FROM tzt"), "timestamp with time zone");
-    assert_eq!(t(&mut e, "SELECT pg_typeof(b) FROM tzt"), "timestamp without time zone");
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(a) FROM tzt"),
+        "timestamp with time zone"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(b) FROM tzt"),
+        "timestamp without time zone"
+    );
 }
 
 #[test]
@@ -99,7 +111,10 @@ fn clock_functions_carry_the_right_tz_type() {
     // is not. Oracle: PG18.4.
     let mut e = Engine::new().with_clock(|| 1_705_314_600_000_000);
     let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
-    assert_eq!(t(&mut e, "SELECT pg_typeof(now())"), "timestamp with time zone");
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(now())"),
+        "timestamp with time zone"
+    );
     assert_eq!(
         t(&mut e, "SELECT pg_typeof(current_timestamp)"),
         "timestamp with time zone"
@@ -118,11 +133,15 @@ fn clock_functions_carry_the_right_tz_type() {
 fn cast_to_text_renders_offset_for_timestamptz() {
     // `<timestamptz>::text` carries the +00 offset; `<timestamp>::text` does not.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE tzc(a timestamptz, b timestamp)").unwrap();
+    e.execute("CREATE TABLE tzc(a timestamptz, b timestamp)")
+        .unwrap();
     e.execute("INSERT INTO tzc VALUES ('2024-01-15 10:30:00+00', '2024-01-15 10:30:00')")
         .unwrap();
     let t = |e: &mut Engine, sql: &str| rows(e, sql)[0][0].clone();
-    assert_eq!(t(&mut e, "SELECT a::text FROM tzc"), "2024-01-15 10:30:00+00");
+    assert_eq!(
+        t(&mut e, "SELECT a::text FROM tzc"),
+        "2024-01-15 10:30:00+00"
+    );
     assert_eq!(t(&mut e, "SELECT b::text FROM tzc"), "2024-01-15 10:30:00");
     // A non-UTC literal folds to UTC then renders +00.
     assert_eq!(
@@ -189,11 +208,17 @@ fn timestamptz_text_honours_session_timezone() {
 
     // AT TIME ZONE unchanged: numeric adds, named subtracts (PG's quirk).
     assert_eq!(
-        t(&mut e, "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE '+09')::text"),
+        t(
+            &mut e,
+            "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE '+09')::text"
+        ),
         "2024-01-15 19:30:00"
     );
     assert_eq!(
-        t(&mut e, "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE 'JST')::text"),
+        t(
+            &mut e,
+            "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE 'JST')::text"
+        ),
         "2024-01-15 01:30:00"
     );
 }

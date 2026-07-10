@@ -5,7 +5,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn n(e: &mut Engine, sql: &str) -> i64 {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -15,7 +17,7 @@ fn n(e: &mut Engine, sql: &str) -> i64 {
         // v7.38 (read01 sweep) — fraction-bearing fields (epoch/second/
         // milliseconds) now return NUMERIC to keep sub-second precision;
         // truncate to the integer part for these whole-number assertions.
-        spg_storage::Value::Numeric { scaled, scale , .. } => {
+        spg_storage::Value::Numeric { scaled, scale, .. } => {
             (scaled / 10i128.pow(u32::from(scale))) as i64
         }
         ref other => panic!("{sql}: expected integer, got {other:?}"),
@@ -29,7 +31,10 @@ fn day_of_week_and_year() {
     assert_eq!(n(&mut e, "SELECT extract(DOW FROM DATE '2024-01-01')"), 1);
     // Sundays: DOW 0, ISODOW 7.
     assert_eq!(n(&mut e, "SELECT extract(DOW FROM DATE '2024-01-07')"), 0);
-    assert_eq!(n(&mut e, "SELECT extract(ISODOW FROM DATE '2024-01-07')"), 7);
+    assert_eq!(
+        n(&mut e, "SELECT extract(ISODOW FROM DATE '2024-01-07')"),
+        7
+    );
     // 2024 is a leap year.
     assert_eq!(n(&mut e, "SELECT extract(DOY FROM DATE '2024-12-31')"), 366);
     assert_eq!(n(&mut e, "SELECT extract(DOY FROM DATE '2024-01-01')"), 1);
@@ -41,25 +46,49 @@ fn iso_week_and_isoyear() {
     assert_eq!(n(&mut e, "SELECT extract(WEEK FROM DATE '2024-01-01')"), 1);
     // 2023-01-01 is a Sunday — ISO week 52 of ISO year 2022.
     assert_eq!(n(&mut e, "SELECT extract(WEEK FROM DATE '2023-01-01')"), 52);
-    assert_eq!(n(&mut e, "SELECT extract(ISOYEAR FROM DATE '2023-01-01')"), 2022);
+    assert_eq!(
+        n(&mut e, "SELECT extract(ISOYEAR FROM DATE '2023-01-01')"),
+        2022
+    );
     // 2020 is a 53-week ISO year.
     assert_eq!(n(&mut e, "SELECT extract(WEEK FROM DATE '2020-12-31')"), 53);
     // 2019-12-30 (Monday) already belongs to ISO week 1 of 2020.
     assert_eq!(n(&mut e, "SELECT extract(WEEK FROM DATE '2019-12-30')"), 1);
-    assert_eq!(n(&mut e, "SELECT extract(ISOYEAR FROM DATE '2019-12-30')"), 2020);
+    assert_eq!(
+        n(&mut e, "SELECT extract(ISOYEAR FROM DATE '2019-12-30')"),
+        2020
+    );
 }
 
 #[test]
 fn era_buckets_and_julian() {
     let mut e = Engine::new();
-    assert_eq!(n(&mut e, "SELECT extract(QUARTER FROM DATE '2024-05-15')"), 2);
-    assert_eq!(n(&mut e, "SELECT extract(DECADE FROM DATE '2024-01-01')"), 202);
-    assert_eq!(n(&mut e, "SELECT extract(CENTURY FROM DATE '2024-01-01')"), 21);
+    assert_eq!(
+        n(&mut e, "SELECT extract(QUARTER FROM DATE '2024-05-15')"),
+        2
+    );
+    assert_eq!(
+        n(&mut e, "SELECT extract(DECADE FROM DATE '2024-01-01')"),
+        202
+    );
+    assert_eq!(
+        n(&mut e, "SELECT extract(CENTURY FROM DATE '2024-01-01')"),
+        21
+    );
     // Century boundary: year 2000 is still century 20.
-    assert_eq!(n(&mut e, "SELECT extract(CENTURY FROM DATE '2000-01-01')"), 20);
-    assert_eq!(n(&mut e, "SELECT extract(MILLENNIUM FROM DATE '2024-01-01')"), 3);
+    assert_eq!(
+        n(&mut e, "SELECT extract(CENTURY FROM DATE '2000-01-01')"),
+        20
+    );
+    assert_eq!(
+        n(&mut e, "SELECT extract(MILLENNIUM FROM DATE '2024-01-01')"),
+        3
+    );
     // JD of 2000-01-01 is 2451545.
-    assert_eq!(n(&mut e, "SELECT extract(JULIAN FROM DATE '2000-01-01')"), 2_451_545);
+    assert_eq!(
+        n(&mut e, "SELECT extract(JULIAN FROM DATE '2000-01-01')"),
+        2_451_545
+    );
 }
 
 #[test]
@@ -75,7 +104,10 @@ fn subsecond_timezone_and_date_part() {
     );
     // SPG sessions run UTC.
     assert_eq!(
-        n(&mut e, "SELECT extract(TIMEZONE FROM TIMESTAMP '2024-01-01 00:00:00')"),
+        n(
+            &mut e,
+            "SELECT extract(TIMEZONE FROM TIMESTAMP '2024-01-01 00:00:00')"
+        ),
         0
     );
     // date_part shares the field table.
@@ -86,5 +118,8 @@ fn subsecond_timezone_and_date_part() {
         n(&mut e, "SELECT extract(QUARTER FROM INTERVAL '5 months')"),
         2
     );
-    assert!(e.execute("SELECT extract(DOW FROM INTERVAL '1 day')").is_err());
+    assert!(
+        e.execute("SELECT extract(DOW FROM INTERVAL '1 day')")
+            .is_err()
+    );
 }

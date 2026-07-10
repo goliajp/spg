@@ -22,5 +22,8 @@ fn numnode_counts_tsquery_nodes() {
     // !a & b = AND + NOT + a + b
     assert_eq!(int(&mut e, "SELECT numnode('!a & b'::tsquery)"), 4);
     // Also works on a query built by plainto_tsquery.
-    assert_eq!(int(&mut e, "SELECT numnode(plainto_tsquery('simple','a b c'))"), 5);
+    assert_eq!(
+        int(&mut e, "SELECT numnode(plainto_tsquery('simple','a b c'))"),
+        5
+    );
 }

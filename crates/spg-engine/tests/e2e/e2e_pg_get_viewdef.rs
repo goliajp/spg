@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -30,16 +32,10 @@ fn viewdef_returns_body() {
         "viewdef: {def}"
     );
     // 'public.' qualification accepted.
-    let def2 = text(&first(
-        &mut e,
-        "SELECT pg_get_viewdef('public.v_names')",
-    ));
+    let def2 = text(&first(&mut e, "SELECT pg_get_viewdef('public.v_names')"));
     assert_eq!(def, def2);
     // Pretty flag accepted + ignored.
-    let def3 = text(&first(
-        &mut e,
-        "SELECT pg_get_viewdef('v_names', true)",
-    ));
+    let def3 = text(&first(&mut e, "SELECT pg_get_viewdef('v_names', true)"));
     assert_eq!(def, def3);
 }
 

@@ -20,7 +20,10 @@ fn numeric_array_coerces_into_float8_array() {
     let mut e = Engine::new();
     // Explicit cast.
     assert_eq!(
-        text(&mut e, "SELECT (ARRAY[2.25::numeric, 3.5::numeric]::float8[])::text"),
+        text(
+            &mut e,
+            "SELECT (ARRAY[2.25::numeric, 3.5::numeric]::float8[])::text"
+        ),
         "{2.25,3.5}"
     );
     // INSERT into a float8[] column coerces the numeric array element-wise.

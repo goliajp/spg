@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -16,10 +18,8 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
 fn any_value_picks_non_null() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE av (g INT, v TEXT)").unwrap();
-    e.execute(
-        "INSERT INTO av VALUES (1, NULL), (1, 'first'), (1, 'second'), (2, 'only')",
-    )
-    .unwrap();
+    e.execute("INSERT INTO av VALUES (1, NULL), (1, 'first'), (1, 'second'), (2, 'only')")
+        .unwrap();
     let got = rows(
         &mut e,
         "SELECT g, any_value(v) FROM av GROUP BY g ORDER BY g",

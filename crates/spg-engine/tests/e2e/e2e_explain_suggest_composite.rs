@@ -6,7 +6,9 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn plan_text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -41,9 +43,7 @@ fn explain_suggest_composite_for_and_chain_of_equals() {
     let composite_line = plan
         .lines()
         .find(|l| {
-            l.contains("SUGGEST: CREATE INDEX")
-                && l.contains("status")
-                && l.contains("region")
+            l.contains("SUGGEST: CREATE INDEX") && l.contains("status") && l.contains("region")
         })
         .expect("composite suggestion line");
     assert!(
@@ -55,7 +55,8 @@ fn explain_suggest_composite_for_and_chain_of_equals() {
 #[test]
 fn explain_suggest_no_composite_for_single_predicate() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE orders (id INT, status TEXT)").unwrap();
+    e.execute("CREATE TABLE orders (id INT, status TEXT)")
+        .unwrap();
     let plan = plan_text(
         &mut e,
         "EXPLAIN (SUGGEST) SELECT * FROM orders WHERE status = 'paid'",

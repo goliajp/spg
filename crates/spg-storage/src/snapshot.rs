@@ -31,7 +31,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use crate::row_header::{RowHeader, HEAP_XMIN_FROZEN, XMAX_ALIVE};
+use crate::row_header::{HEAP_XMIN_FROZEN, RowHeader, XMAX_ALIVE};
 
 /// v7.37.15 (Phase C.2) — terminal state of a transaction / row
 /// version, as seen by the visibility oracle.
@@ -434,9 +434,21 @@ mod tests {
             RowHeader::frozen(),
             RowHeader::alive(60),
             RowHeader::alive(250),
-            RowHeader { xmin: 50, xmax: 100, flags: 0 },
-            RowHeader { xmin: 50, xmax: 150, flags: 0 },
-            RowHeader { xmin: 42, xmax: XMAX_ALIVE, flags: 0 },
+            RowHeader {
+                xmin: 50,
+                xmax: 100,
+                flags: 0,
+            },
+            RowHeader {
+                xmin: 50,
+                xmax: 150,
+                flags: 0,
+            },
+            RowHeader {
+                xmin: 42,
+                xmax: XMAX_ALIVE,
+                flags: 0,
+            },
         ];
         for h in &headers {
             assert_eq!(
@@ -466,8 +478,15 @@ mod tests {
         // Row inserted by (committed) 50, deleted by 90 which aborted.
         // The delete never took effect → the row is still visible.
         let s = Snapshot::new(200, ips(&[]), 50, 0);
-        let row = RowHeader { xmin: 50, xmax: 90, flags: 0 };
-        assert!(!s.visible(&row), "two-state rule treats delete as committed");
+        let row = RowHeader {
+            xmin: 50,
+            xmax: 90,
+            flags: 0,
+        };
+        assert!(
+            !s.visible(&row),
+            "two-state rule treats delete as committed"
+        );
         assert!(
             s.visible_with_status(&row, &AbortedSet(alloc::vec![90])),
             "abort oracle keeps the row whose delete was rolled back"

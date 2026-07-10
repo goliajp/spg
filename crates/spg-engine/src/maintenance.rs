@@ -187,9 +187,9 @@ impl Engine {
         for name in tables {
             let cat = self.active_catalog_mut();
             let Some(t) = cat.get_mut(name) else {
-                return Err(EngineError::Storage(StorageError::Corrupt(
-                    alloc::format!("table {name:?} does not exist"),
-                )));
+                return Err(EngineError::Storage(StorageError::Corrupt(alloc::format!(
+                    "table {name:?} does not exist"
+                ))));
             };
             affected = affected.saturating_add(t.row_count());
             t.truncate();

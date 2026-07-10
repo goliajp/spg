@@ -127,7 +127,11 @@ fn cast_pg18_differential_corpus() {
     ck(&mut e, r#"true::text"#, r#"true"#);
     ck(&mut e, r#"'2024-01-15'::date"#, r#"2024-01-15"#);
     ck(&mut e, r#"'2024-01-15'::date::text"#, r#"2024-01-15"#);
-    ck(&mut e, r#"'2024-01-15 10:30'::timestamp"#, r#"2024-01-15 10:30:00"#);
+    ck(
+        &mut e,
+        r#"'2024-01-15 10:30'::timestamp"#,
+        r#"2024-01-15 10:30:00"#,
+    );
     ck(&mut e, r#"'10:30:00'::time"#, r#"10:30:00"#);
     ck(&mut e, r#"'invalid'::date"#, r#"ERR"#);
     ck(&mut e, r#"'2024-13-01'::date"#, r#"ERR"#);
@@ -138,7 +142,11 @@ fn cast_pg18_differential_corpus() {
     ck(&mut e, r#"'256'::int2"#, r#"256"#);
     ck(&mut e, r#"32767::int2"#, r#"32767"#);
     ck(&mut e, r#"32768::int2"#, r#"ERR"#);
-    ck(&mut e, r#"9223372036854775807::bigint"#, r#"9223372036854775807"#);
+    ck(
+        &mut e,
+        r#"9223372036854775807::bigint"#,
+        r#"9223372036854775807"#,
+    );
     ck(&mut e, r#"'9223372036854775808'::bigint"#, r#"ERR"#);
     ck(&mut e, r#"'1.239'::numeric(4,2)"#, r#"1.24"#);
     ck(&mut e, r#"'123.4'::numeric(3,0)"#, r#"123"#);
@@ -182,7 +190,11 @@ fn cast_pg18_differential_corpus() {
     ck(&mut e, r#"'+5'::int"#, r#"5"#);
     ck(&mut e, r#"'5.'::numeric"#, r#"5"#);
     ck(&mut e, r#"'.5'::numeric"#, r#"0.5"#);
-    ck(&mut e, r#"'2024-01-15T10:30:00'::timestamp"#, r#"2024-01-15 10:30:00"#);
+    ck(
+        &mut e,
+        r#"'2024-01-15T10:30:00'::timestamp"#,
+        r#"2024-01-15 10:30:00"#,
+    );
     ck(&mut e, r#"'10:30'::time"#, r#"10:30:00"#);
     ck(&mut e, r#"'2024-01-15 10'::timestamp"#, r#"ERR"#);
     ck(&mut e, r#"'2024-02-29'::date"#, r#"2024-02-29"#);
@@ -277,12 +289,28 @@ fn string_function_edge_cases() {
 #[test]
 fn timestamp_interval_arithmetic() {
     let mut e = Engine::new();
-    ck(&mut e, r#"'2024-01-02 12:00:00'::timestamp - '2024-01-01 06:00:00'::timestamp"#, r#"1 day 06:00:00"#);
-    ck(&mut e, r#"'2024-01-01 00:00:00'::timestamp - '2024-01-01 00:00:00'::timestamp"#, r#"00:00:00"#);
+    ck(
+        &mut e,
+        r#"'2024-01-02 12:00:00'::timestamp - '2024-01-01 06:00:00'::timestamp"#,
+        r#"1 day 06:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"'2024-01-01 00:00:00'::timestamp - '2024-01-01 00:00:00'::timestamp"#,
+        r#"00:00:00"#,
+    );
     // controls that already matched PG.
     ck(&mut e, r#"'2024-01-31'::date + 1"#, r#"2024-02-01"#);
-    ck(&mut e, r#"'2024-03-01'::date - '2024-02-01'::date"#, r#"29"#);
-    ck(&mut e, r#"interval '2 days' - interval '1 day'"#, r#"1 day"#);
+    ck(
+        &mut e,
+        r#"'2024-03-01'::date - '2024-02-01'::date"#,
+        r#"29"#,
+    );
+    ck(
+        &mut e,
+        r#"interval '2 days' - interval '1 day'"#,
+        r#"1 day"#,
+    );
     ck(&mut e, r#"'2024-01-01'::date - 5"#, r#"2023-12-27"#);
 }
 /// Array + bytea function edge cases. `POSITION(bytea IN bytea)` lowered to
@@ -293,18 +321,38 @@ fn timestamp_interval_arithmetic() {
 fn array_bytea_edge_cases() {
     let mut e = Engine::new();
     // the fix: byte-level POSITION.
-    ck(&mut e, r#"position('\x34'::bytea in '\x1234'::bytea)"#, r#"2"#);
-    ck(&mut e, r#"position('\xff'::bytea in '\x1234'::bytea)"#, r#"0"#);
-    ck(&mut e, r#"position('\x1234'::bytea in '\x001234ab'::bytea)"#, r#"2"#);
+    ck(
+        &mut e,
+        r#"position('\x34'::bytea in '\x1234'::bytea)"#,
+        r#"2"#,
+    );
+    ck(
+        &mut e,
+        r#"position('\xff'::bytea in '\x1234'::bytea)"#,
+        r#"0"#,
+    );
+    ck(
+        &mut e,
+        r#"position('\x1234'::bytea in '\x001234ab'::bytea)"#,
+        r#"2"#,
+    );
     // controls that already matched PG.
     ck(&mut e, r#"array_length(ARRAY[]::int[], 1)"#, r#"<NULL>"#);
     ck(&mut e, r#"cardinality(ARRAY[]::int[])"#, r#"0"#);
     ck(&mut e, r#"(ARRAY[1,2,3])[5]"#, r#"<NULL>"#);
-    ck(&mut e, r#"array_position(ARRAY[10,20,30], 99)"#, r#"<NULL>"#);
+    ck(
+        &mut e,
+        r#"array_position(ARRAY[10,20,30], 99)"#,
+        r#"<NULL>"#,
+    );
     ck(&mut e, r#"array_remove(ARRAY[1,2,2,3], 2)"#, r#"{1,3}"#);
     ck(&mut e, r#"'\x12'::bytea || '\x34'::bytea"#, r#"\x1234"#);
     ck(&mut e, r#"get_byte('\x1234'::bytea, 0)"#, r#"18"#);
-    ck(&mut e, r#"substring('\x1234abcd'::bytea from 2 for 2)"#, r#"\x34ab"#);
+    ck(
+        &mut e,
+        r#"substring('\x1234abcd'::bytea from 2 for 2)"#,
+        r#"\x34ab"#,
+    );
 }
 
 /// inet builtins accept a real INET/CIDR value, not only its TEXT form.
@@ -315,8 +363,16 @@ fn inet_functions_accept_inet_value() {
     let mut e = Engine::new();
     ck(&mut e, r#"host('192.168.1.5/24'::inet)"#, r#"192.168.1.5"#);
     ck(&mut e, r#"masklen('192.168.1.5/24'::inet)"#, r#"24"#);
-    ck(&mut e, r#"network('192.168.1.5/24'::inet)"#, r#"192.168.1.0/24"#);
-    ck(&mut e, r#"broadcast('192.168.1.5/24'::inet)"#, r#"192.168.1.255/24"#);
+    ck(
+        &mut e,
+        r#"network('192.168.1.5/24'::inet)"#,
+        r#"192.168.1.0/24"#,
+    );
+    ck(
+        &mut e,
+        r#"broadcast('192.168.1.5/24'::inet)"#,
+        r#"192.168.1.255/24"#,
+    );
     ck(&mut e, r#"family('192.168.1.5'::inet)"#, r#"4"#);
     // TEXT form still works (legacy path).
     ck(&mut e, r#"host('192.168.1.5/24')"#, r#"192.168.1.5"#);
@@ -337,10 +393,26 @@ fn range_boolean_operators() {
     ck(&mut e, r#"int4range(2,5) <@ int4range(1,10)"#, r#"true"#);
     ck(&mut e, r#"int4range(1,5) && int4range(4,10)"#, r#"true"#);
     ck(&mut e, r#"int4range(1,5) && int4range(5,10)"#, r#"false"#);
-    ck(&mut e, r#"numrange(1,5,'[]') && numrange(5,10,'[]')"#, r#"true"#);
-    ck(&mut e, r#"'empty'::int4range <@ int4range(1,10)"#, r#"true"#);
-    ck(&mut e, r#"int4range(1,10) @> 'empty'::int4range"#, r#"true"#);
-    ck(&mut e, r#"'empty'::int4range && int4range(1,10)"#, r#"false"#);
+    ck(
+        &mut e,
+        r#"numrange(1,5,'[]') && numrange(5,10,'[]')"#,
+        r#"true"#,
+    );
+    ck(
+        &mut e,
+        r#"'empty'::int4range <@ int4range(1,10)"#,
+        r#"true"#,
+    );
+    ck(
+        &mut e,
+        r#"int4range(1,10) @> 'empty'::int4range"#,
+        r#"true"#,
+    );
+    ck(
+        &mut e,
+        r#"'empty'::int4range && int4range(1,10)"#,
+        r#"false"#,
+    );
 }
 
 /// bit-string bitwise & / | over equal-length bit(n) values (byte-wise;
@@ -385,7 +457,11 @@ fn range_intersection_operator() {
     ck(&mut e, r#"int4range(1,10) * int4range(3,7)"#, r#"[3,7)"#);
     ck(&mut e, r#"int4range(1,5) * int4range(10,20)"#, r#"empty"#);
     ck(&mut e, r#"int4range(1,5) * int4range(5,10)"#, r#"empty"#);
-    ck(&mut e, r#"int4range(1,10) * 'empty'::int4range"#, r#"empty"#);
+    ck(
+        &mut e,
+        r#"int4range(1,10) * 'empty'::int4range"#,
+        r#"empty"#,
+    );
 }
 
 /// Range `+` union returns the merged range (overlap/adjacent/contained) or
@@ -396,8 +472,16 @@ fn range_union_operator() {
     ck(&mut e, r#"int4range(1,5) + int4range(4,10)"#, r#"[1,10)"#);
     ck(&mut e, r#"int4range(1,5) + int4range(5,10)"#, r#"[1,10)"#);
     ck(&mut e, r#"int4range(1,10) + int4range(3,7)"#, r#"[1,10)"#);
-    ck(&mut e, r#"'empty'::int4range + int4range(1,10)"#, r#"[1,10)"#);
-    ck(&mut e, r#"int4range(1,10) + 'empty'::int4range"#, r#"[1,10)"#);
+    ck(
+        &mut e,
+        r#"'empty'::int4range + int4range(1,10)"#,
+        r#"[1,10)"#,
+    );
+    ck(
+        &mut e,
+        r#"int4range(1,10) + 'empty'::int4range"#,
+        r#"[1,10)"#,
+    );
     // a gap between the operands is a contiguity error.
     ck(&mut e, r#"int4range(1,5) + int4range(10,20)"#, r#"ERR"#);
 }
@@ -420,10 +504,22 @@ fn bit_string_shift_operators() {
 #[test]
 fn inet_minus_inet_bigint() {
     let mut e = Engine::new();
-    ck(&mut e, r#"'192.168.1.5'::inet - '192.168.1.1'::inet"#, r#"4"#);
-    ck(&mut e, r#"'192.168.1.1'::inet - '192.168.1.5'::inet"#, r#"-4"#);
+    ck(
+        &mut e,
+        r#"'192.168.1.5'::inet - '192.168.1.1'::inet"#,
+        r#"4"#,
+    );
+    ck(
+        &mut e,
+        r#"'192.168.1.1'::inet - '192.168.1.5'::inet"#,
+        r#"-4"#,
+    );
     ck(&mut e, r#"'10.0.0.0'::inet - '10.0.0.0'::inet"#, r#"0"#);
-    ck(&mut e, r#"'192.168.1.0'::inet - '192.168.0.0'::inet"#, r#"256"#);
+    ck(
+        &mut e,
+        r#"'192.168.1.0'::inet - '192.168.0.0'::inet"#,
+        r#"256"#,
+    );
 }
 
 /// array_fill(value, ARRAY[n]) builds a 1-D array of n copies (previously
@@ -442,23 +538,58 @@ fn array_fill_one_dim() {
 #[test]
 fn age_calendar_breakdown() {
     let mut e = Engine::new();
-    ck(&mut e, r#"age(timestamp '2024-03-15', timestamp '2024-01-10')"#, r#"2 mons 5 days"#);
-    ck(&mut e, r#"age(timestamp '2024-03-05', timestamp '2024-01-10')"#, r#"1 mon 26 days"#);
-    ck(&mut e, r#"age(timestamp '2024-03-01', timestamp '2024-01-01')"#, r#"2 mons"#);
-    ck(&mut e, r#"age(timestamp '2024-01-10', timestamp '2024-03-15')"#, r#"-2 mons -5 days"#);
-    ck(&mut e, r#"age(timestamp '2024-03-15 14:30:00', timestamp '2024-01-10 10:00:00')"#, r#"2 mons 5 days 04:30:00"#);
+    ck(
+        &mut e,
+        r#"age(timestamp '2024-03-15', timestamp '2024-01-10')"#,
+        r#"2 mons 5 days"#,
+    );
+    ck(
+        &mut e,
+        r#"age(timestamp '2024-03-05', timestamp '2024-01-10')"#,
+        r#"1 mon 26 days"#,
+    );
+    ck(
+        &mut e,
+        r#"age(timestamp '2024-03-01', timestamp '2024-01-01')"#,
+        r#"2 mons"#,
+    );
+    ck(
+        &mut e,
+        r#"age(timestamp '2024-01-10', timestamp '2024-03-15')"#,
+        r#"-2 mons -5 days"#,
+    );
+    ck(
+        &mut e,
+        r#"age(timestamp '2024-03-15 14:30:00', timestamp '2024-01-10 10:00:00')"#,
+        r#"2 mons 5 days 04:30:00"#,
+    );
 }
 
 /// time - time returns the signed interval between them (was ERR). PG18.4.
 #[test]
 fn time_minus_time_interval() {
     let mut e = Engine::new();
-    ck(&mut e, r#"'10:30:00'::time - '08:15:00'::time"#, r#"02:15:00"#);
-    ck(&mut e, r#"'08:15:00'::time - '10:30:00'::time"#, r#"-02:15:00"#);
-    ck(&mut e, r#"'12:00:00'::time - '12:00:00'::time"#, r#"00:00:00"#);
-    ck(&mut e, r#"'23:59:59'::time - '00:00:00'::time"#, r#"23:59:59"#);
+    ck(
+        &mut e,
+        r#"'10:30:00'::time - '08:15:00'::time"#,
+        r#"02:15:00"#,
+    );
+    ck(
+        &mut e,
+        r#"'08:15:00'::time - '10:30:00'::time"#,
+        r#"-02:15:00"#,
+    );
+    ck(
+        &mut e,
+        r#"'12:00:00'::time - '12:00:00'::time"#,
+        r#"00:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"'23:59:59'::time - '00:00:00'::time"#,
+        r#"23:59:59"#,
+    );
 }
-
 
 /// PG shows an explicit `+` on the time part of an interval when a preceding
 /// date field is negative but the time is positive: `-1 days +02:00:00`.
@@ -467,11 +598,27 @@ fn time_minus_time_interval() {
 fn interval_mixed_sign_plus_render() {
     let mut e = Engine::new();
     ck(&mut e, r#"interval '1 day 2 hours'"#, r#"1 day 02:00:00"#);
-    ck(&mut e, r#"interval '-1 day 2 hours'"#, r#"-1 days +02:00:00"#);
+    ck(
+        &mut e,
+        r#"interval '-1 day 2 hours'"#,
+        r#"-1 days +02:00:00"#,
+    );
     ck(&mut e, r#"interval '1 day -2 hours'"#, r#"1 day -02:00:00"#);
-    ck(&mut e, r#"interval '-1 day -2 hours'"#, r#"-1 days -02:00:00"#);
-    ck(&mut e, r#"interval '-1 month -1 day -2 hours'"#, r#"-1 mons -1 days -02:00:00"#);
-    ck(&mut e, r#"interval '1 month -2 hours'"#, r#"1 mon -02:00:00"#);
+    ck(
+        &mut e,
+        r#"interval '-1 day -2 hours'"#,
+        r#"-1 days -02:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"interval '-1 month -1 day -2 hours'"#,
+        r#"-1 mons -1 days -02:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"interval '1 month -2 hours'"#,
+        r#"1 mon -02:00:00"#,
+    );
     ck(&mut e, r#"interval '-2 hours'"#, r#"-02:00:00"#);
 }
 
@@ -487,7 +634,11 @@ fn interval_fractional_units() {
     ck(&mut e, r#"interval '1.5 weeks'"#, r#"10 days 12:00:00"#);
     ck(&mut e, r#"interval '1.5 months'"#, r#"1 mon 15 days"#);
     ck(&mut e, r#"interval '1.5 years'"#, r#"1 year 6 mons"#);
-    ck(&mut e, r#"interval '1.5 months 2.5 hours'"#, r#"1 mon 15 days 02:30:00"#);
+    ck(
+        &mut e,
+        r#"interval '1.5 months 2.5 hours'"#,
+        r#"1 mon 15 days 02:30:00"#,
+    );
 }
 
 /// PG `TYPE 'literal'` typed literals for the scalar type family (== the
@@ -501,10 +652,18 @@ fn typed_literals_scalar_family() {
     ck(&mut e, r#"int '42'"#, r#"42"#);
     ck(&mut e, r#"bigint '9000000000'"#, r#"9000000000"#);
     ck(&mut e, r#"numeric '3.14'"#, r#"3.14"#);
-    ck(&mut e, r#"uuid '00000000-0000-0000-0000-000000000001'"#, r#"00000000-0000-0000-0000-000000000001"#);
+    ck(
+        &mut e,
+        r#"uuid '00000000-0000-0000-0000-000000000001'"#,
+        r#"00000000-0000-0000-0000-000000000001"#,
+    );
     // regression: the datetime typed literals still work.
     ck(&mut e, r#"date '2024-01-15'"#, r#"2024-01-15"#);
-    ck(&mut e, r#"timestamp '2024-01-15 10:30:00'"#, r#"2024-01-15 10:30:00"#);
+    ck(
+        &mut e,
+        r#"timestamp '2024-01-15 10:30:00'"#,
+        r#"2024-01-15 10:30:00"#,
+    );
 }
 
 /// PG's total float order: NaN == NaN and NaN > every number, so scalar
@@ -541,13 +700,29 @@ fn to_char_pr_notation() {
 #[test]
 fn regexp_replace_case_insensitive_flag() {
     let mut e = Engine::new();
-    ck(&mut e, r#"regexp_replace('HELLO', 'hello', 'x', 'i')"#, r#"x"#);
-    ck(&mut e, r#"regexp_replace('FooBar', 'o', 'O', 'gi')"#, r#"FOOBar"#);
+    ck(
+        &mut e,
+        r#"regexp_replace('HELLO', 'hello', 'x', 'i')"#,
+        r#"x"#,
+    );
+    ck(
+        &mut e,
+        r#"regexp_replace('FooBar', 'o', 'O', 'gi')"#,
+        r#"FOOBar"#,
+    );
     ck(&mut e, r#"regexp_replace('ABC', 'abc', 'z', 'i')"#, r#"z"#);
     // case-sensitive default still doesn't match.
-    ck(&mut e, r#"regexp_replace('HELLO', 'hello', 'x')"#, r#"HELLO"#);
+    ck(
+        &mut e,
+        r#"regexp_replace('HELLO', 'hello', 'x')"#,
+        r#"HELLO"#,
+    );
     // g flag unaffected.
-    ck(&mut e, r#"regexp_replace('hello world', 'o', 'O', 'g')"#, r#"hellO wOrld"#);
+    ck(
+        &mut e,
+        r#"regexp_replace('hello world', 'o', 'O', 'g')"#,
+        r#"hellO wOrld"#,
+    );
 }
 
 /// The whole regexp family honours the `i` (case-insensitive) flag at its
@@ -556,8 +731,16 @@ fn regexp_replace_case_insensitive_flag() {
 fn regexp_family_case_insensitive_flag() {
     let mut e = Engine::new();
     ck(&mut e, r#"regexp_count('AbAb', 'a', 1, 'i')"#, r#"2"#);
-    ck(&mut e, r#"regexp_substr('HELLO', 'l+', 1, 1, 'i')"#, r#"LL"#);
-    ck(&mut e, r#"regexp_instr('xxAB', 'ab', 1, 1, 0, 'i')"#, r#"3"#);
+    ck(
+        &mut e,
+        r#"regexp_substr('HELLO', 'l+', 1, 1, 'i')"#,
+        r#"LL"#,
+    );
+    ck(
+        &mut e,
+        r#"regexp_instr('xxAB', 'ab', 1, 1, 0, 'i')"#,
+        r#"3"#,
+    );
     ck(&mut e, r#"regexp_match('HELLO', 'ell', 'i')"#, r#"{ELL}"#);
     // case-sensitive default still no match.
     ck(&mut e, r#"regexp_count('AbAb', 'a')"#, r#"0"#);
@@ -585,9 +768,17 @@ fn modulo_operator_sign_of_dividend() {
 #[test]
 fn cast_to_float_array() {
     let mut e = Engine::new();
-    ck(&mut e, r#"(ARRAY[1.5,2.5]::float8[])::text"#, r#"{1.5,2.5}"#);
+    ck(
+        &mut e,
+        r#"(ARRAY[1.5,2.5]::float8[])::text"#,
+        r#"{1.5,2.5}"#,
+    );
     ck(&mut e, r#"(ARRAY[1,2]::float8[])::text"#, r#"{1,2}"#);
-    ck(&mut e, r#"(ARRAY[1.5,2.5]::float4[])::text"#, r#"{1.5,2.5}"#);
+    ck(
+        &mut e,
+        r#"(ARRAY[1.5,2.5]::float4[])::text"#,
+        r#"{1.5,2.5}"#,
+    );
     ck(&mut e, r#"(ARRAY[10,20]::int[])::text"#, r#"{10,20}"#);
 }
 
@@ -599,10 +790,22 @@ fn cast_to_float_array() {
 fn cast_to_typed_array_family() {
     let mut e = Engine::new();
     ck(&mut e, r#"(ARRAY[true,false]::bool[])::text"#, r#"{t,f}"#);
-    ck(&mut e, r#"(ARRAY[1.5,2.5]::numeric[])::text"#, r#"{1.5,2.5}"#);
-    ck(&mut e, r#"(ARRAY['2024-01-01','2024-02-01']::date[])::text"#, r#"{2024-01-01,2024-02-01}"#);
+    ck(
+        &mut e,
+        r#"(ARRAY[1.5,2.5]::numeric[])::text"#,
+        r#"{1.5,2.5}"#,
+    );
+    ck(
+        &mut e,
+        r#"(ARRAY['2024-01-01','2024-02-01']::date[])::text"#,
+        r#"{2024-01-01,2024-02-01}"#,
+    );
     ck(&mut e, r#"(ARRAY['a','b']::varchar[])::text"#, r#"{a,b}"#);
-    ck(&mut e, r#"(ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[])::text"#, r#"{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}"#);
+    ck(
+        &mut e,
+        r#"(ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[])::text"#,
+        r#"{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}"#,
+    );
     // controls that already worked.
     ck(&mut e, r#"(ARRAY[1,2]::smallint[])::text"#, r#"{1,2}"#);
     ck(&mut e, r#"(ARRAY[1,2]::int[])::text"#, r#"{1,2}"#);
@@ -615,10 +818,26 @@ fn cast_to_typed_array_family() {
 #[test]
 fn date_interval_promotes_to_timestamp() {
     let mut e = Engine::new();
-    ck(&mut e, r#"date '2024-03-01' - interval '1 day'"#, r#"2024-02-29 00:00:00"#);
-    ck(&mut e, r#"date '2024-03-01' + interval '1 day'"#, r#"2024-03-02 00:00:00"#);
-    ck(&mut e, r#"date '2024-03-01' + interval '2 hours'"#, r#"2024-03-01 02:00:00"#);
-    ck(&mut e, r#"date '2024-03-01' - interval '1 month'"#, r#"2024-02-01 00:00:00"#);
+    ck(
+        &mut e,
+        r#"date '2024-03-01' - interval '1 day'"#,
+        r#"2024-02-29 00:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"date '2024-03-01' + interval '1 day'"#,
+        r#"2024-03-02 00:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"date '2024-03-01' + interval '2 hours'"#,
+        r#"2024-03-01 02:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"date '2024-03-01' - interval '1 month'"#,
+        r#"2024-02-01 00:00:00"#,
+    );
     // date ± integer stays a date.
     ck(&mut e, r#"date '2024-03-01' + 5"#, r#"2024-03-06"#);
     ck(&mut e, r#"date '2024-03-01' - 5"#, r#"2024-02-25"#);
@@ -630,11 +849,27 @@ fn date_interval_promotes_to_timestamp() {
 #[test]
 fn to_char_ts_quoted_literal() {
     let mut e = Engine::new();
-    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'HH24"h"MI"m"')"#, r#"14h30m"#);
-    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY"年"MM"月"DD"日"')"#, r#"2024年03月05日"#);
-    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', '"at" HH24:MI')"#, r#"at 14:30"#);
+    ck(
+        &mut e,
+        r#"to_char(timestamp '2024-03-05 14:30:45', 'HH24"h"MI"m"')"#,
+        r#"14h30m"#,
+    );
+    ck(
+        &mut e,
+        r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY"年"MM"月"DD"日"')"#,
+        r#"2024年03月05日"#,
+    );
+    ck(
+        &mut e,
+        r#"to_char(timestamp '2024-03-05 14:30:45', '"at" HH24:MI')"#,
+        r#"at 14:30"#,
+    );
     // control: no quotes unaffected.
-    ck(&mut e, r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY-MM-DD')"#, r#"2024-03-05"#);
+    ck(
+        &mut e,
+        r#"to_char(timestamp '2024-03-05 14:30:45', 'YYYY-MM-DD')"#,
+        r#"2024-03-05"#,
+    );
 }
 
 /// encode 'escape' format + decode returns bytea (was Text, which broke
@@ -647,8 +882,16 @@ fn encode_escape_and_decode_bytea() {
     ck(&mut e, r#"(decode('YWJj', 'base64'))::text"#, r#"\x616263"#);
     ck(&mut e, r#"(decode('616263', 'hex'))::text"#, r#"\x616263"#);
     // non-UTF-8 decode round-trips through encode (was ERR).
-    ck(&mut e, r#"encode(decode('deadbeef','hex'),'base64')"#, r#"3q2+7w=="#);
-    ck(&mut e, r#"encode(decode('deadbeef','hex'),'hex')"#, r#"deadbeef"#);
+    ck(
+        &mut e,
+        r#"encode(decode('deadbeef','hex'),'base64')"#,
+        r#"3q2+7w=="#,
+    );
+    ck(
+        &mut e,
+        r#"encode(decode('deadbeef','hex'),'hex')"#,
+        r#"deadbeef"#,
+    );
     // controls unaffected.
     ck(&mut e, r#"encode('abc'::bytea, 'hex')"#, r#"616263"#);
     ck(&mut e, r#"encode('abc'::bytea, 'base64')"#, r#"YWJj"#);
@@ -662,7 +905,8 @@ fn stat_agg_on_numeric() {
     use spg_engine::QueryResult;
     let mut e = Engine::new();
     e.execute("CREATE TABLE s(v numeric)").unwrap();
-    e.execute("INSERT INTO s VALUES (1),(2),(3),(4),(5)").unwrap();
+    e.execute("INSERT INTO s VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
@@ -677,11 +921,32 @@ fn stat_agg_on_numeric() {
     // v7.38 (read01, T4.3) — stddev / variance return NUMERIC (PG), so
     // round(numeric, 4) keeps the 4-decimal scale (`2.5000`, `2.0000`), matching
     // PG exactly (was SPG's float `2.5` / `2` divergence).
-    assert_eq!(q(&mut e, "SELECT round(stddev(v),4)::text FROM s"), "1.5811");
-    assert_eq!(q(&mut e, "SELECT round(variance(v),4)::text FROM s"), "2.5000");
-    assert_eq!(q(&mut e, "SELECT round(var_pop(v),4)::text FROM s"), "2.0000");
-    assert_eq!(q(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::text FROM s"), "3");
-    assert_eq!(q(&mut e, "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v)::text FROM s"), "2");
+    assert_eq!(
+        q(&mut e, "SELECT round(stddev(v),4)::text FROM s"),
+        "1.5811"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT round(variance(v),4)::text FROM s"),
+        "2.5000"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT round(var_pop(v),4)::text FROM s"),
+        "2.0000"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::text FROM s"
+        ),
+        "3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v)::text FROM s"
+        ),
+        "2"
+    );
     assert_eq!(q(&mut e, "SELECT corr(v, v)::text FROM s"), "1");
 }
 
@@ -705,14 +970,42 @@ fn mod_on_numeric() {
 #[test]
 fn range_difference_operator() {
     let mut e = Engine::new();
-    ck(&mut e, r#"(int4range(1,10) - int4range(5,15))::text"#, r#"[1,5)"#);
-    ck(&mut e, r#"(int4range(1,5) - int4range(4,10))::text"#, r#"[1,4)"#);
-    ck(&mut e, r#"(int4range(5,15) - int4range(1,10))::text"#, r#"[10,15)"#);
-    ck(&mut e, r#"(int4range(1,10) - int4range(1,10))::text"#, r#"empty"#);
-    ck(&mut e, r#"(int4range(1,10) - int4range(20,30))::text"#, r#"[1,10)"#);
+    ck(
+        &mut e,
+        r#"(int4range(1,10) - int4range(5,15))::text"#,
+        r#"[1,5)"#,
+    );
+    ck(
+        &mut e,
+        r#"(int4range(1,5) - int4range(4,10))::text"#,
+        r#"[1,4)"#,
+    );
+    ck(
+        &mut e,
+        r#"(int4range(5,15) - int4range(1,10))::text"#,
+        r#"[10,15)"#,
+    );
+    ck(
+        &mut e,
+        r#"(int4range(1,10) - int4range(1,10))::text"#,
+        r#"empty"#,
+    );
+    ck(
+        &mut e,
+        r#"(int4range(1,10) - int4range(20,30))::text"#,
+        r#"[1,10)"#,
+    );
     // control: union/intersect still work.
-    ck(&mut e, r#"(int4range(1,5) + int4range(4,10))::text"#, r#"[1,10)"#);
-    ck(&mut e, r#"(int4range(1,10) * int4range(5,15))::text"#, r#"[5,10)"#);
+    ck(
+        &mut e,
+        r#"(int4range(1,5) + int4range(4,10))::text"#,
+        r#"[1,10)"#,
+    );
+    ck(
+        &mut e,
+        r#"(int4range(1,10) * int4range(5,15))::text"#,
+        r#"[5,10)"#,
+    );
 }
 
 /// tsquery `&&` (AND) and `||` (OR) operators — the function forms existed but
@@ -721,15 +1014,35 @@ fn range_difference_operator() {
 #[test]
 fn tsquery_bool_operators() {
     let mut e = Engine::new();
-    ck(&mut e, r#"(to_tsquery('quick') || to_tsquery('fox'))::text"#, r#"'quick' | 'fox'"#);
-    ck(&mut e, r#"(to_tsquery('quick') && to_tsquery('fox'))::text"#, r#"'quick' & 'fox'"#);
+    ck(
+        &mut e,
+        r#"(to_tsquery('quick') || to_tsquery('fox'))::text"#,
+        r#"'quick' | 'fox'"#,
+    );
+    ck(
+        &mut e,
+        r#"(to_tsquery('quick') && to_tsquery('fox'))::text"#,
+        r#"'quick' & 'fox'"#,
+    );
     // combined AST evaluates against a tsvector correctly.
-    ck(&mut e, r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') || to_tsquery('fox'))"#, r#"true"#);
-    ck(&mut e, r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') && to_tsquery('fox'))"#, r#"false"#);
+    ck(
+        &mut e,
+        r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') || to_tsquery('fox'))"#,
+        r#"true"#,
+    );
+    ck(
+        &mut e,
+        r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') && to_tsquery('fox'))"#,
+        r#"false"#,
+    );
     // control: tsvector || tsvector concat still works (SPG's default Simple
     // config does not stem, unlike PG's english default — a separate config
     // matter, not a bug in the operator).
-    ck(&mut e, r#"(to_tsvector('cats') || to_tsvector('dogs'))::text"#, r#"'cats':1 'dogs':2"#);
+    ck(
+        &mut e,
+        r#"(to_tsvector('cats') || to_tsvector('dogs'))::text"#,
+        r#"'cats':1 'dogs':2"#,
+    );
 }
 
 /// MONEY arithmetic (money±money, money×/÷ number, money/money ratio) and
@@ -737,16 +1050,32 @@ fn tsquery_bool_operators() {
 #[test]
 fn money_arithmetic() {
     let mut e = Engine::new();
-    ck(&mut e, r#"('$100.00'::money + '$50.00'::money)::text"#, r#"$150.00"#);
-    ck(&mut e, r#"('$100.00'::money - '$30.00'::money)::text"#, r#"$70.00"#);
+    ck(
+        &mut e,
+        r#"('$100.00'::money + '$50.00'::money)::text"#,
+        r#"$150.00"#,
+    );
+    ck(
+        &mut e,
+        r#"('$100.00'::money - '$30.00'::money)::text"#,
+        r#"$70.00"#,
+    );
     ck(&mut e, r#"('$100.00'::money * 2)::text"#, r#"$200.00"#);
     ck(&mut e, r#"(2 * '$100.00'::money)::text"#, r#"$200.00"#);
     ck(&mut e, r#"('$100.00'::money / 4)::text"#, r#"$25.00"#);
-    ck(&mut e, r#"('$100.00'::money / '$50.00'::money)::text"#, r#"2"#);
+    ck(
+        &mut e,
+        r#"('$100.00'::money / '$50.00'::money)::text"#,
+        r#"2"#,
+    );
     ck(&mut e, r#"('$100.00'::money::numeric)::text"#, r#"100.00"#);
     // controls: literal, render, compare unchanged.
     ck(&mut e, r#"('$1,234.56'::money)::text"#, r#"$1,234.56"#);
-    ck(&mut e, r#"('$100.00'::money > '$50.00'::money)::text"#, r#"true"#);
+    ck(
+        &mut e,
+        r#"('$100.00'::money > '$50.00'::money)::text"#,
+        r#"true"#,
+    );
 }
 
 /// bit-string length/bit_length + bit→integer cast. Postfix `::` on a bare
@@ -770,11 +1099,27 @@ fn bit_string_length_and_int_cast() {
 #[test]
 fn macaddr_trunc_and_widen() {
     let mut e = Engine::new();
-    ck(&mut e, r#"trunc('08:00:2b:01:02:03'::macaddr)::text"#, r#"08:00:2b:00:00:00"#);
-    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr::macaddr8)::text"#, r#"08:00:2b:ff:fe:01:02:03"#);
+    ck(
+        &mut e,
+        r#"trunc('08:00:2b:01:02:03'::macaddr)::text"#,
+        r#"08:00:2b:00:00:00"#,
+    );
+    ck(
+        &mut e,
+        r#"('08:00:2b:01:02:03'::macaddr::macaddr8)::text"#,
+        r#"08:00:2b:ff:fe:01:02:03"#,
+    );
     // controls: comparison + equality unchanged.
-    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr)::text"#, r#"true"#);
-    ck(&mut e, r#"('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text"#, r#"true"#);
+    ck(
+        &mut e,
+        r#"('08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr)::text"#,
+        r#"true"#,
+    );
+    ck(
+        &mut e,
+        r#"('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text"#,
+        r#"true"#,
+    );
 }
 
 /// point <-> point Euclidean distance + point ± point translation. point
@@ -783,10 +1128,26 @@ fn macaddr_trunc_and_widen() {
 #[test]
 fn point_distance_and_arith() {
     let mut e = Engine::new();
-    ck(&mut e, r#"('(0,0)'::point <-> '(3,4)'::point)::text"#, r#"5"#);
-    ck(&mut e, r#"('(1,2)'::point + '(3,4)'::point)::text"#, r#"(4,6)"#);
-    ck(&mut e, r#"('(4,6)'::point - '(1,2)'::point)::text"#, r#"(3,4)"#);
-    ck(&mut e, r#"('(1,1)'::point <-> '(1,1)'::point)::text"#, r#"0"#);
+    ck(
+        &mut e,
+        r#"('(0,0)'::point <-> '(3,4)'::point)::text"#,
+        r#"5"#,
+    );
+    ck(
+        &mut e,
+        r#"('(1,2)'::point + '(3,4)'::point)::text"#,
+        r#"(4,6)"#,
+    );
+    ck(
+        &mut e,
+        r#"('(4,6)'::point - '(1,2)'::point)::text"#,
+        r#"(3,4)"#,
+    );
+    ck(
+        &mut e,
+        r#"('(1,1)'::point <-> '(1,1)'::point)::text"#,
+        r#"0"#,
+    );
     // control: point literal/render unchanged.
     ck(&mut e, r#"('(1,2)'::point)::text"#, r#"(1,2)"#);
 }
@@ -796,8 +1157,16 @@ fn point_distance_and_arith() {
 #[test]
 fn inet_set_masklen_and_abbrev() {
     let mut e = Engine::new();
-    ck(&mut e, r#"set_masklen('192.168.1.5/24'::inet, 16)::text"#, r#"192.168.1.5/16"#);
-    ck(&mut e, r#"abbrev('192.168.1.0/24'::cidr)"#, r#"192.168.1/24"#);
+    ck(
+        &mut e,
+        r#"set_masklen('192.168.1.5/24'::inet, 16)::text"#,
+        r#"192.168.1.5/16"#,
+    );
+    ck(
+        &mut e,
+        r#"abbrev('192.168.1.0/24'::cidr)"#,
+        r#"192.168.1/24"#,
+    );
     ck(&mut e, r#"abbrev('10.0.0.0/8'::cidr)"#, r#"10/8"#);
     // controls: host/network/masklen unchanged.
     ck(&mut e, r#"host('192.168.1.5/24'::inet)"#, r#"192.168.1.5"#);
@@ -812,7 +1181,7 @@ fn numrange_contains_float_element() {
     let mut e = Engine::new();
     ck(&mut e, r#"(numrange(1.5,3.5) @> 2.5)::text"#, r#"true"#);
     ck(&mut e, r#"(numrange(1.5,3.5) @> 3.5)::text"#, r#"false"#); // exclusive upper
-    ck(&mut e, r#"(numrange(1.5,3.5) @> 1.5)::text"#, r#"true"#);  // inclusive lower
+    ck(&mut e, r#"(numrange(1.5,3.5) @> 1.5)::text"#, r#"true"#); // inclusive lower
     ck(&mut e, r#"(numrange(1.5,3.5) @> 0.5)::text"#, r#"false"#);
     ck(&mut e, r#"(2.5 <@ numrange(1.5,3.5))::text"#, r#"true"#);
     // control: integer range containment unchanged.
@@ -836,12 +1205,28 @@ fn insert_text_into_interval_column() {
     e.execute("CREATE TABLE ivt (a int, iv interval)").unwrap();
     e.execute("INSERT INTO ivt VALUES (1,'1 day'),(2,'2 hours 30 minutes'),(3,'1 mon 5 days')")
         .expect("text literals coerce into an interval column");
-    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"), "Text(\"1 day\")");
-    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=2"), "Text(\"02:30:00\")");
-    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=3"), "Text(\"1 mon 5 days\")");
-    e.execute("UPDATE ivt SET iv='45 seconds' WHERE a=1").unwrap();
-    assert_eq!(row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"), "Text(\"00:00:45\")");
-    assert!(e.execute("INSERT INTO ivt VALUES (4,'not an interval')").is_err());
+    assert_eq!(
+        row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"),
+        "Text(\"1 day\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT iv::text FROM ivt WHERE a=2"),
+        "Text(\"02:30:00\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT iv::text FROM ivt WHERE a=3"),
+        "Text(\"1 mon 5 days\")"
+    );
+    e.execute("UPDATE ivt SET iv='45 seconds' WHERE a=1")
+        .unwrap();
+    assert_eq!(
+        row(&mut e, "SELECT iv::text FROM ivt WHERE a=1"),
+        "Text(\"00:00:45\")"
+    );
+    assert!(
+        e.execute("INSERT INTO ivt VALUES (4,'not an interval')")
+            .is_err()
+    );
 }
 
 /// BUG: `CREATE TABLE t (x bit(4))` failed to parse — the column-type parser
@@ -853,7 +1238,8 @@ fn create_table_bit_typmod() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE bc (a bit(4), b varbit(8), c bit varying(16), d bit)")
         .expect("bit/varbit column types accept a length modifier");
-    e.execute("INSERT INTO bc VALUES ('1010','11110000','1','0')").unwrap();
+    e.execute("INSERT INTO bc VALUES ('1010','11110000','1','0')")
+        .unwrap();
     let row = |e: &mut Engine, q: &str| -> String {
         match e.execute(q) {
             Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
@@ -890,7 +1276,8 @@ fn create_table_datetime_typmods() {
 fn agg_interval_sum_avg() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ait (iv interval)").unwrap();
-    e.execute("INSERT INTO ait VALUES ('1 day'),('2 hours'),('30 minutes')").unwrap();
+    e.execute("INSERT INTO ait VALUES ('1 day'),('2 hours'),('30 minutes')")
+        .unwrap();
     let row = |e: &mut Engine, q: &str| -> String {
         match e.execute(q) {
             Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
@@ -899,14 +1286,30 @@ fn agg_interval_sum_avg() {
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(row(&mut e, "SELECT sum(iv)::text FROM ait"), "Text(\"1 day 02:30:00\")");
-    assert_eq!(row(&mut e, "SELECT avg(iv)::text FROM ait"), "Text(\"08:50:00\")");
-    assert_eq!(row(&mut e, "SELECT max(iv)::text FROM ait"), "Text(\"1 day\")");
+    assert_eq!(
+        row(&mut e, "SELECT sum(iv)::text FROM ait"),
+        "Text(\"1 day 02:30:00\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT avg(iv)::text FROM ait"),
+        "Text(\"08:50:00\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT max(iv)::text FROM ait"),
+        "Text(\"1 day\")"
+    );
     // month component: sum('1 mon','2 mons') = 3 mons; avg = 1 mon 15 days.
     e.execute("CREATE TABLE ait2 (iv interval)").unwrap();
-    e.execute("INSERT INTO ait2 VALUES ('1 mon'),('2 mons')").unwrap();
-    assert_eq!(row(&mut e, "SELECT sum(iv)::text FROM ait2"), "Text(\"3 mons\")");
-    assert_eq!(row(&mut e, "SELECT avg(iv)::text FROM ait2"), "Text(\"1 mon 15 days\")");
+    e.execute("INSERT INTO ait2 VALUES ('1 mon'),('2 mons')")
+        .unwrap();
+    assert_eq!(
+        row(&mut e, "SELECT sum(iv)::text FROM ait2"),
+        "Text(\"3 mons\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT avg(iv)::text FROM ait2"),
+        "Text(\"1 mon 15 days\")"
+    );
 }
 
 /// Range `<<` (strictly left of) and `>>` (strictly right of). Boundary rule:
@@ -914,13 +1317,41 @@ fn agg_interval_sum_avg() {
 #[test]
 fn range_strictly_left_right() {
     let mut e = Engine::new();
-    ck(&mut e, "(int4range(1,10) << int4range(20,30))::text", "true");
-    ck(&mut e, "(int4range(1,10) << int4range(10,20))::text", "true"); // excl upper meets incl lower
-    ck(&mut e, "(int4range(1,10) << int4range(5,20))::text", "false"); // overlap
-    ck(&mut e, "('[1,10]'::int4range << '[10,20]'::int4range)::text", "false"); // both incl at 10
-    ck(&mut e, "(int4range(20,30) >> int4range(1,10))::text", "true");
-    ck(&mut e, "(int4range(1,10) >> int4range(20,30))::text", "false");
-    ck(&mut e, "(numrange(1.5,3.5) << numrange(3.5,5.5))::text", "true");
+    ck(
+        &mut e,
+        "(int4range(1,10) << int4range(20,30))::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "(int4range(1,10) << int4range(10,20))::text",
+        "true",
+    ); // excl upper meets incl lower
+    ck(
+        &mut e,
+        "(int4range(1,10) << int4range(5,20))::text",
+        "false",
+    ); // overlap
+    ck(
+        &mut e,
+        "('[1,10]'::int4range << '[10,20]'::int4range)::text",
+        "false",
+    ); // both incl at 10
+    ck(
+        &mut e,
+        "(int4range(20,30) >> int4range(1,10))::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "(int4range(1,10) >> int4range(20,30))::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "(numrange(1.5,3.5) << numrange(3.5,5.5))::text",
+        "true",
+    );
     // control: overlap/union unaffected.
     ck(&mut e, "(int4range(1,5) && int4range(4,10))::text", "true");
 }
@@ -930,11 +1361,31 @@ fn range_strictly_left_right() {
 #[test]
 fn range_merge_typed() {
     let mut e = Engine::new();
-    ck(&mut e, "range_merge(int4range(1,5), int4range(8,10))::text", "[1,10)");
-    ck(&mut e, "range_merge(int4range(1,5), int4range(3,8))::text", "[1,8)");
-    ck(&mut e, "range_merge(numrange(1.5,3.5), numrange(5.5,7.5))::text", "[1.5,7.5)");
-    ck(&mut e, "range_merge(int4range(1,5), 'empty'::int4range)::text", "[1,5)");
-    ck(&mut e, "range_merge('[1,10]'::int4range, '[3,20]'::int4range)::text", "[1,21)"); // int4range canonicalizes []→[)
+    ck(
+        &mut e,
+        "range_merge(int4range(1,5), int4range(8,10))::text",
+        "[1,10)",
+    );
+    ck(
+        &mut e,
+        "range_merge(int4range(1,5), int4range(3,8))::text",
+        "[1,8)",
+    );
+    ck(
+        &mut e,
+        "range_merge(numrange(1.5,3.5), numrange(5.5,7.5))::text",
+        "[1.5,7.5)",
+    );
+    ck(
+        &mut e,
+        "range_merge(int4range(1,5), 'empty'::int4range)::text",
+        "[1,5)",
+    );
+    ck(
+        &mut e,
+        "range_merge('[1,10]'::int4range, '[3,20]'::int4range)::text",
+        "[1,21)",
+    ); // int4range canonicalizes []→[)
     // control: union of contiguous ranges still works.
     ck(&mut e, "(int4range(1,5) + int4range(4,10))::text", "[1,10)");
 }
@@ -946,7 +1397,7 @@ fn bit_xor_operator() {
     let mut e = Engine::new();
     ck(&mut e, "(B'1100' # B'1010')::text", "0110");
     ck(&mut e, "(B'11110000' # B'00001111')::text", "11111111");
-    ck(&mut e, "(5 # 3)::text", "6");     // integer XOR unchanged
+    ck(&mut e, "(5 # 3)::text", "6"); // integer XOR unchanged
     ck(&mut e, "(12 # 10)::text", "6");
     ck(&mut e, "(255 # 0)::text", "255");
 }
@@ -956,10 +1407,26 @@ fn bit_xor_operator() {
 fn range_adjacent_operator() {
     let mut e = Engine::new();
     ck(&mut e, "(int4range(1,5) -|- int4range(5,10))::text", "true");
-    ck(&mut e, "(int4range(1,5) -|- int4range(6,10))::text", "false"); // gap
-    ck(&mut e, "(int4range(1,5) -|- int4range(4,10))::text", "false"); // overlap
-    ck(&mut e, "('[1,5]'::int4range -|- '[6,10]'::int4range)::text", "true");
-    ck(&mut e, "(numrange(1.0,5.0) -|- numrange(5.0,9.0))::text", "true");
+    ck(
+        &mut e,
+        "(int4range(1,5) -|- int4range(6,10))::text",
+        "false",
+    ); // gap
+    ck(
+        &mut e,
+        "(int4range(1,5) -|- int4range(4,10))::text",
+        "false",
+    ); // overlap
+    ck(
+        &mut e,
+        "('[1,5]'::int4range -|- '[6,10]'::int4range)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "(numrange(1.0,5.0) -|- numrange(5.0,9.0))::text",
+        "true",
+    );
     // control: subtraction still works (a-b), not mislexed as -|-.
     ck(&mut e, "(10 - 3)::text", "7");
 }
@@ -970,8 +1437,16 @@ fn range_adjacent_operator() {
 fn tsquery_double_bang() {
     let mut e = Engine::new();
     ck(&mut e, "(!! 'cat'::tsquery)::text", "!'cat'");
-    ck(&mut e, "(!! 'cat & dog'::tsquery)::text", "!( 'cat' & 'dog' )");
-    ck(&mut e, "('cat'::tsquery && !! 'dog'::tsquery)::text", "'cat' & !'dog'");
+    ck(
+        &mut e,
+        "(!! 'cat & dog'::tsquery)::text",
+        "!( 'cat' & 'dog' )",
+    );
+    ck(
+        &mut e,
+        "('cat'::tsquery && !! 'dog'::tsquery)::text",
+        "'cat' & !'dog'",
+    );
     // control: != still works (not mislexed as !!).
     ck(&mut e, "(1 != 2)::text", "true");
 }
@@ -1009,7 +1484,11 @@ fn geometric_accessors() {
     ck(&mut e, "center('(0,0),(2,4)'::box)::text", "(1,2)");
     ck(&mut e, "radius('<(0,0),5>'::circle)::text", "5");
     ck(&mut e, "diameter('<(0,0),5>'::circle)::text", "10");
-    ck(&mut e, "area('<(0,0),1>'::circle)::text", "3.141592653589793");
+    ck(
+        &mut e,
+        "area('<(0,0),1>'::circle)::text",
+        "3.141592653589793",
+    );
     ck(&mut e, "center('<(1,2),5>'::circle)::text", "(1,2)");
     ck(&mut e, "length('[(0,0),(3,4)]'::lseg)::text", "5");
     ck(&mut e, "isvertical('[(0,0),(0,4)]'::lseg)::text", "true");
@@ -1021,7 +1500,11 @@ fn geometric_accessors() {
 fn npoints_path_polygon() {
     let mut e = Engine::new();
     ck(&mut e, "npoints('[(0,0),(1,1),(2,2)]'::path)::text", "3");
-    ck(&mut e, "npoints('((0,0),(1,1),(2,0),(3,1))'::polygon)::text", "4");
+    ck(
+        &mut e,
+        "npoints('((0,0),(1,1),(2,0),(3,1))'::polygon)::text",
+        "4",
+    );
     ck(&mut e, "npoints('((0,0),(1,1),(2,0))'::polygon)::text", "3");
 }
 
@@ -1030,9 +1513,21 @@ fn npoints_path_polygon() {
 #[test]
 fn geo_containment() {
     let mut e = Engine::new();
-    ck(&mut e, "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(2,2))::text", "true");
-    ck(&mut e, "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(5,5))::text", "false");
-    ck(&mut e, "(point(2,2) <@ '((0,0),(4,0),(4,4),(0,4))'::polygon)::text", "true");
+    ck(
+        &mut e,
+        "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(2,2))::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(4,0),(4,4),(0,4))'::polygon @> point(5,5))::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "(point(2,2) <@ '((0,0),(4,0),(4,4),(0,4))'::polygon)::text",
+        "true",
+    );
     ck(&mut e, "('<(0,0),5>'::circle @> point(3,3))::text", "true");
     ck(&mut e, "('<(0,0),5>'::circle @> point(9,9))::text", "false");
     // control: array containment unaffected.
@@ -1047,10 +1542,18 @@ fn geometric_typed_literals() {
     ck(&mut e, "(point '(1,2)')::text", "(1,2)");
     ck(&mut e, "(circle '<(0,0),5>')::text", "<(0,0),5>");
     ck(&mut e, "(lseg '[(0,0),(1,1)]')::text", "[(0,0),(1,1)]");
-    ck(&mut e, "(polygon '((0,0),(1,1),(2,0))')::text", "((0,0),(1,1),(2,0))");
+    ck(
+        &mut e,
+        "(polygon '((0,0),(1,1),(2,0))')::text",
+        "((0,0),(1,1),(2,0))",
+    );
     ck(&mut e, "(box '(1,1),(2,2)')::text", "(2,2),(1,1)");
     // it composes with operators now.
-    ck(&mut e, "(circle '<(0,0),5>' @> point '(3,3)')::text", "true");
+    ck(
+        &mut e,
+        "(circle '<(0,0),5>' @> point '(3,3)')::text",
+        "true",
+    );
 }
 
 /// Range/multirange `TYPE 'literal'` typed-literal-prefix spelling. PG18.4-verified.
@@ -1060,7 +1563,11 @@ fn range_typed_literals() {
     ck(&mut e, "(int4range '[1,5)')::text", "[1,5)");
     ck(&mut e, "(int8range '[1,9)')::text", "[1,9)");
     ck(&mut e, "(numrange '[1.5,3.5)')::text", "[1.5,3.5)");
-    ck(&mut e, "(daterange '[2024-01-01,2024-02-01)')::text", "[2024-01-01,2024-02-01)");
+    ck(
+        &mut e,
+        "(daterange '[2024-01-01,2024-02-01)')::text",
+        "[2024-01-01,2024-02-01)",
+    );
     // composes with operators.
     ck(&mut e, "(int4range '[1,5)' @> 3)::text", "true");
 }
@@ -1070,17 +1577,37 @@ fn range_typed_literals() {
 #[test]
 fn to_char_interval_fmt() {
     let mut e = Engine::new();
-    ck(&mut e, "to_char(interval '1 day 2 hours', 'HH24:MI:SS')", "02:00:00");
+    ck(
+        &mut e,
+        "to_char(interval '1 day 2 hours', 'HH24:MI:SS')",
+        "02:00:00",
+    );
     ck(&mut e, "to_char(interval '25 hours', 'HH24')", "25");
-    ck(&mut e, "to_char(interval '1 day 2 hours', 'DD HH24')", "01 02");
-    ck(&mut e, "to_char(interval '14 months', 'YYYY-MM')", "0001-02");
-    ck(&mut e, "to_char(interval '1 day 2 hours 3 minutes 4 seconds', 'DD HH24:MI:SS')", "01 02:03:04");
+    ck(
+        &mut e,
+        "to_char(interval '1 day 2 hours', 'DD HH24')",
+        "01 02",
+    );
+    ck(
+        &mut e,
+        "to_char(interval '14 months', 'YYYY-MM')",
+        "0001-02",
+    );
+    ck(
+        &mut e,
+        "to_char(interval '1 day 2 hours 3 minutes 4 seconds', 'DD HH24:MI:SS')",
+        "01 02:03:04",
+    );
     ck(&mut e, "to_char(interval '90 minutes', 'HH24:MI')", "01:30");
     ck(&mut e, "to_char(interval '2 hours', 'HH12 AM')", "02 AM");
     // negative time fields keep their sign (HH24/MI/SS/MM zero-pad after it).
     ck(&mut e, "to_char(interval '-2 hours', 'HH24')", "-02");
     // control: numeric/timestamp to_char unaffected.
-    ck(&mut e, "to_char(timestamp '2024-03-15 14:30:45', 'HH24:MI:SS')", "14:30:45");
+    ck(
+        &mut e,
+        "to_char(timestamp '2024-03-15 14:30:45', 'HH24:MI:SS')",
+        "14:30:45",
+    );
     ck(&mut e, "to_char(1234.5, 'FM9999.00')", "1234.50");
 }
 
@@ -1088,10 +1615,26 @@ fn to_char_interval_fmt() {
 #[test]
 fn geo_overlap() {
     let mut e = Engine::new();
-    ck(&mut e, "('(0,0),(2,2)'::box && '(1,1),(3,3)'::box)::text", "true");
-    ck(&mut e, "('(0,0),(2,2)'::box && '(5,5),(6,6)'::box)::text", "false");
-    ck(&mut e, "('<(0,0),5>'::circle && '<(3,0),5>'::circle)::text", "true");
-    ck(&mut e, "('<(0,0),1>'::circle && '<(10,0),1>'::circle)::text", "false");
+    ck(
+        &mut e,
+        "('(0,0),(2,2)'::box && '(1,1),(3,3)'::box)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('(0,0),(2,2)'::box && '(5,5),(6,6)'::box)::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "('<(0,0),5>'::circle && '<(3,0),5>'::circle)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('<(0,0),1>'::circle && '<(10,0),1>'::circle)::text",
+        "false",
+    );
     // control: array overlap unaffected.
     ck(&mut e, "(ARRAY[1,2] && ARRAY[2,3])::text", "true");
 }
@@ -1117,17 +1660,29 @@ fn point_geo_distance() {
 fn sum_money_agg() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE mt (m money)").unwrap();
-    e.execute("INSERT INTO mt VALUES ('$10.00'),('$20.50'),('$5.25')").unwrap();
+    e.execute("INSERT INTO mt VALUES ('$10.00'),('$20.50'),('$5.25')")
+        .unwrap();
     let row = |e: &mut Engine, q: &str| -> String {
         match e.execute(q) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(row(&mut e, "SELECT sum(m)::text FROM mt"), "Text(\"$35.75\")");
-    assert_eq!(row(&mut e, "SELECT max(m)::text FROM mt"), "Text(\"$20.50\")");
+    assert_eq!(
+        row(&mut e, "SELECT sum(m)::text FROM mt"),
+        "Text(\"$35.75\")"
+    );
+    assert_eq!(
+        row(&mut e, "SELECT max(m)::text FROM mt"),
+        "Text(\"$20.50\")"
+    );
     // superset avg(money): (1000+2050+525)/3 = 1191.67c → $11.92 (rounded).
-    assert_eq!(row(&mut e, "SELECT avg(m)::text FROM mt"), "Text(\"$11.92\")");
+    assert_eq!(
+        row(&mut e, "SELECT avg(m)::text FROM mt"),
+        "Text(\"$11.92\")"
+    );
 }
 
 /// min/max over time / inet / bytea — value_cmp had no arms for these, so they
@@ -1136,16 +1691,60 @@ fn sum_money_agg() {
 fn maxmin_more_types() {
     let mut e = Engine::new();
     let row = |e: &mut Engine, setup: &[&str], q: &str| -> String {
-        for s in setup { e.execute(s).unwrap(); }
+        for s in setup {
+            e.execute(s).unwrap();
+        }
         match e.execute(q) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(row(&mut e, &["CREATE TABLE tt (x time)","INSERT INTO tt VALUES ('10:00'),('14:00'),('02:30')"], "SELECT max(x)::text FROM tt"), "Text(\"14:00:00\")");
-    assert_eq!(row(&mut e, &["CREATE TABLE tt2 (x time)","INSERT INTO tt2 VALUES ('10:00'),('14:00'),('02:30')"], "SELECT min(x)::text FROM tt2"), "Text(\"02:30:00\")");
-    assert_eq!(row(&mut e, &["CREATE TABLE it (x inet)","INSERT INTO it VALUES ('192.168.1.1'),('10.0.0.1')"], "SELECT min(x)::text FROM it"), "Text(\"10.0.0.1/32\")");
-    assert_eq!(row(&mut e, &["CREATE TABLE bt (x bytea)","INSERT INTO bt VALUES ('\\x01'),('\\xff'),('\\x80')"], "SELECT max(x)::text FROM bt"), "Text(\"\\\\xff\")");
+    assert_eq!(
+        row(
+            &mut e,
+            &[
+                "CREATE TABLE tt (x time)",
+                "INSERT INTO tt VALUES ('10:00'),('14:00'),('02:30')"
+            ],
+            "SELECT max(x)::text FROM tt"
+        ),
+        "Text(\"14:00:00\")"
+    );
+    assert_eq!(
+        row(
+            &mut e,
+            &[
+                "CREATE TABLE tt2 (x time)",
+                "INSERT INTO tt2 VALUES ('10:00'),('14:00'),('02:30')"
+            ],
+            "SELECT min(x)::text FROM tt2"
+        ),
+        "Text(\"02:30:00\")"
+    );
+    assert_eq!(
+        row(
+            &mut e,
+            &[
+                "CREATE TABLE it (x inet)",
+                "INSERT INTO it VALUES ('192.168.1.1'),('10.0.0.1')"
+            ],
+            "SELECT min(x)::text FROM it"
+        ),
+        "Text(\"10.0.0.1/32\")"
+    );
+    assert_eq!(
+        row(
+            &mut e,
+            &[
+                "CREATE TABLE bt (x bytea)",
+                "INSERT INTO bt VALUES ('\\x01'),('\\xff'),('\\x80')"
+            ],
+            "SELECT max(x)::text FROM bt"
+        ),
+        "Text(\"\\\\xff\")"
+    );
 }
 
 /// ORDER BY over inet / bytea / uuid — the sort-key extractor rejected these
@@ -1154,16 +1753,62 @@ fn maxmin_more_types() {
 fn orderby_byte_types() {
     let mut e = Engine::new();
     let rows = |e: &mut Engine, setup: &[&str], q: &str| -> String {
-        for s in setup { e.execute(s).unwrap(); }
+        for s in setup {
+            e.execute(s).unwrap();
+        }
         match e.execute(q) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows.iter().map(|r| format!("{:?}", r.values[0])).collect::<Vec<_>>().join(","),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows
+                .iter()
+                .map(|r| format!("{:?}", r.values[0]))
+                .collect::<Vec<_>>()
+                .join(","),
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(rows(&mut e, &["CREATE TABLE t2 (x inet)","INSERT INTO t2 VALUES ('192.168.1.1'),('10.0.0.1'),('172.16.0.1')"], "SELECT x::text FROM t2 ORDER BY x"), "Text(\"10.0.0.1/32\"),Text(\"172.16.0.1/32\"),Text(\"192.168.1.1/32\")");
-    assert_eq!(rows(&mut e, &["CREATE TABLE t3 (x bytea)","INSERT INTO t3 VALUES ('\\xff'),('\\x01'),('\\x80')"], "SELECT x::text FROM t3 ORDER BY x"), "Text(\"\\\\x01\"),Text(\"\\\\x80\"),Text(\"\\\\xff\")");
-    assert_eq!(rows(&mut e, &["CREATE TABLE t4 (x uuid)","INSERT INTO t4 VALUES ('550e8400-e29b-41d4-a716-446655440000'),('00000000-0000-0000-0000-000000000001')"], "SELECT x::text FROM t4 ORDER BY x"), "Text(\"00000000-0000-0000-0000-000000000001\"),Text(\"550e8400-e29b-41d4-a716-446655440000\")");
-    assert_eq!(rows(&mut e, &["CREATE TABLE t5 (x bytea)","INSERT INTO t5 VALUES ('\\xff'),('\\x01'),('\\x80')"], "SELECT x::text FROM t5 ORDER BY x DESC"), "Text(\"\\\\xff\"),Text(\"\\\\x80\"),Text(\"\\\\x01\")");
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE t2 (x inet)",
+                "INSERT INTO t2 VALUES ('192.168.1.1'),('10.0.0.1'),('172.16.0.1')"
+            ],
+            "SELECT x::text FROM t2 ORDER BY x"
+        ),
+        "Text(\"10.0.0.1/32\"),Text(\"172.16.0.1/32\"),Text(\"192.168.1.1/32\")"
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE t3 (x bytea)",
+                "INSERT INTO t3 VALUES ('\\xff'),('\\x01'),('\\x80')"
+            ],
+            "SELECT x::text FROM t3 ORDER BY x"
+        ),
+        "Text(\"\\\\x01\"),Text(\"\\\\x80\"),Text(\"\\\\xff\")"
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE t4 (x uuid)",
+                "INSERT INTO t4 VALUES ('550e8400-e29b-41d4-a716-446655440000'),('00000000-0000-0000-0000-000000000001')"
+            ],
+            "SELECT x::text FROM t4 ORDER BY x"
+        ),
+        "Text(\"00000000-0000-0000-0000-000000000001\"),Text(\"550e8400-e29b-41d4-a716-446655440000\")"
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE t5 (x bytea)",
+                "INSERT INTO t5 VALUES ('\\xff'),('\\x01'),('\\x80')"
+            ],
+            "SELECT x::text FROM t5 ORDER BY x DESC"
+        ),
+        "Text(\"\\\\xff\"),Text(\"\\\\x80\"),Text(\"\\\\x01\")"
+    );
 }
 
 /// ORDER BY interval — was explicitly rejected; PG orders by total time
@@ -1172,16 +1817,40 @@ fn orderby_byte_types() {
 fn orderby_interval() {
     let mut e = Engine::new();
     let rows = |e: &mut Engine, setup: &[&str], q: &str| -> String {
-        for s in setup { e.execute(s).unwrap(); }
+        for s in setup {
+            e.execute(s).unwrap();
+        }
         match e.execute(q) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows.iter().map(|r| format!("{:?}", r.values[0])).collect::<Vec<_>>().join(","),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) => rows
+                .iter()
+                .map(|r| format!("{:?}", r.values[0]))
+                .collect::<Vec<_>>()
+                .join(","),
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(rows(&mut e, &["CREATE TABLE iv (x interval)","INSERT INTO iv VALUES ('1 day'),('1 hour'),('1 month'),('90 minutes')"], "SELECT x::text FROM iv ORDER BY x"),
-        "Text(\"01:00:00\"),Text(\"01:30:00\"),Text(\"1 day\"),Text(\"1 mon\")");
-    assert_eq!(rows(&mut e, &["CREATE TABLE iv2 (x interval)","INSERT INTO iv2 VALUES ('1 day'),('1 hour'),('1 month')"], "SELECT x::text FROM iv2 ORDER BY x DESC"),
-        "Text(\"1 mon\"),Text(\"1 day\"),Text(\"01:00:00\")");
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE iv (x interval)",
+                "INSERT INTO iv VALUES ('1 day'),('1 hour'),('1 month'),('90 minutes')"
+            ],
+            "SELECT x::text FROM iv ORDER BY x"
+        ),
+        "Text(\"01:00:00\"),Text(\"01:30:00\"),Text(\"1 day\"),Text(\"1 mon\")"
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            &[
+                "CREATE TABLE iv2 (x interval)",
+                "INSERT INTO iv2 VALUES ('1 day'),('1 hour'),('1 month')"
+            ],
+            "SELECT x::text FROM iv2 ORDER BY x DESC"
+        ),
+        "Text(\"1 mon\"),Text(\"1 day\"),Text(\"01:00:00\")"
+    );
 }
 
 /// Comparison / BETWEEN / IN between a typed scalar and a string literal —
@@ -1189,11 +1858,31 @@ fn orderby_interval() {
 #[test]
 fn cmp_text_coercion() {
     let mut e = Engine::new();
-    ck(&mut e, "('12:00'::time BETWEEN '10:00' AND '14:00')::text", "true");
-    ck(&mut e, "('\\x80'::bytea BETWEEN '\\x01' AND '\\xff')::text", "true");
-    ck(&mut e, "('172.16.0.1'::inet BETWEEN '10.0.0.1' AND '192.168.1.1')::text", "true");
-    ck(&mut e, "('10.0.0.1'::inet IN ('10.0.0.1','192.168.1.1'))::text", "true");
-    ck(&mut e, "('1 day'::interval BETWEEN '1 hour' AND '1 month')::text", "true");
+    ck(
+        &mut e,
+        "('12:00'::time BETWEEN '10:00' AND '14:00')::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('\\x80'::bytea BETWEEN '\\x01' AND '\\xff')::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('172.16.0.1'::inet BETWEEN '10.0.0.1' AND '192.168.1.1')::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('10.0.0.1'::inet IN ('10.0.0.1','192.168.1.1'))::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('1 day'::interval BETWEEN '1 hour' AND '1 month')::text",
+        "true",
+    );
     ck(&mut e, "('14:00'::time > '10:00')::text", "true");
     ck(&mut e, "('10:00'::time = '10:00')::text", "true");
     // control: existing numeric-vs-text and text-vs-text unaffected.
@@ -1208,7 +1897,11 @@ fn greatest_least_coerce() {
     ck(&mut e, "GREATEST('10:00'::time, '14:00')::text", "14:00:00");
     ck(&mut e, "LEAST('10:00'::time, '14:00')::text", "10:00:00");
     ck(&mut e, "GREATEST('\\x01'::bytea, '\\xff')::text", "\\xff");
-    ck(&mut e, "GREATEST('2024-01-01'::date, '2024-06-01')::text", "2024-06-01");
+    ck(
+        &mut e,
+        "GREATEST('2024-01-01'::date, '2024-06-01')::text",
+        "2024-06-01",
+    );
     // control: all-text greatest unaffected.
     ck(&mut e, "GREATEST('abc', 'abd', 'aaa')::text", "abd");
     ck(&mut e, "GREATEST(3, 7, 5)::text", "7");
@@ -1220,10 +1913,18 @@ fn greatest_least_coerce() {
 fn temporal_minus_text() {
     let mut e = Engine::new();
     ck(&mut e, "('2024-01-15'::date - '2024-01-10')::text", "5");
-    ck(&mut e, "('2024-06-01'::timestamp - '2024-05-01')::text", "31 days");
+    ck(
+        &mut e,
+        "('2024-06-01'::timestamp - '2024-05-01')::text",
+        "31 days",
+    );
     ck(&mut e, "('14:00'::time - '10:00')::text", "04:00:00");
     // control: date-date, date-int still work.
-    ck(&mut e, "('2024-01-15'::date - '2024-01-10'::date)::text", "5");
+    ck(
+        &mut e,
+        "('2024-01-15'::date - '2024-01-10'::date)::text",
+        "5",
+    );
     ck(&mut e, "('2024-01-15'::date - 5)::text", "2024-01-10");
 }
 
@@ -1244,16 +1945,34 @@ fn concurrent_tx_isolation() {
     e.execute_in("INSERT INTO t VALUES (1)", tx1).unwrap();
     let cnt = |e: &mut Engine, tx| -> String {
         match e.execute_in("SELECT count(*) FROM t", tx) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(cnt(&mut e, tx1), "BigInt(1)", "tx1 sees its own uncommitted insert");
-    assert_eq!(cnt(&mut e, tx2), "BigInt(0)", "tx2 is isolated from tx1's uncommitted insert");
+    assert_eq!(
+        cnt(&mut e, tx1),
+        "BigInt(1)",
+        "tx1 sees its own uncommitted insert"
+    );
+    assert_eq!(
+        cnt(&mut e, tx2),
+        "BigInt(0)",
+        "tx2 is isolated from tx1's uncommitted insert"
+    );
     assert!(e.is_tx_open(tx1) && e.is_tx_open(tx2), "both tx open");
     e.execute_in("COMMIT", tx1).unwrap();
-    assert_eq!(cnt(&mut e, tx2), "BigInt(0)", "tx2 keeps its snapshot after tx1 commits (SI)");
-    assert_eq!(cnt(&mut e, IMPLICIT_TX), "BigInt(1)", "autocommit reads main catalog with tx1's committed row");
+    assert_eq!(
+        cnt(&mut e, tx2),
+        "BigInt(0)",
+        "tx2 keeps its snapshot after tx1 commits (SI)"
+    );
+    assert_eq!(
+        cnt(&mut e, IMPLICIT_TX),
+        "BigInt(1)",
+        "autocommit reads main catalog with tx1's committed row"
+    );
     assert!(!e.is_tx_open(tx1), "tx1 closed after commit");
     e.execute_in("ROLLBACK", tx2).unwrap();
     assert!(!e.is_tx_open(tx2), "tx2 closed after rollback");
@@ -1275,13 +1994,26 @@ fn autocommit_under_conn_tx() {
     e.execute_in("INSERT INTO t VALUES (1)", conn_a).unwrap();
     let cnt = |e: &mut Engine, tx| -> String {
         match e.execute_in("SELECT count(*) FROM t", tx) {
-            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => format!("{:?}", rows[0].values[0]),
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) if !rows.is_empty() => {
+                format!("{:?}", rows[0].values[0])
+            }
             other => format!("{other:?}"),
         }
     };
-    assert_eq!(cnt(&mut e, conn_b), "BigInt(1)", "conn_b sees conn_a's autocommit write");
-    assert_eq!(cnt(&mut e, IMPLICIT_TX), "BigInt(1)", "IMPLICIT_TX sees it too");
-    assert!(!e.is_tx_open(conn_a), "autocommit leaves no open shadow under conn_a");
+    assert_eq!(
+        cnt(&mut e, conn_b),
+        "BigInt(1)",
+        "conn_b sees conn_a's autocommit write"
+    );
+    assert_eq!(
+        cnt(&mut e, IMPLICIT_TX),
+        "BigInt(1)",
+        "IMPLICIT_TX sees it too"
+    );
+    assert!(
+        !e.is_tx_open(conn_a),
+        "autocommit leaves no open shadow under conn_a"
+    );
 }
 
 /// v7.37 D.1 — COALESCE result-type coercion: a typed sibling branch coerces
@@ -1290,8 +2022,16 @@ fn autocommit_under_conn_tx() {
 fn coalesce_result_type() {
     let mut e = Engine::new();
     ck(&mut e, "COALESCE(NULL::time, '12:00')::text", "12:00:00");
-    ck(&mut e, "COALESCE(NULL::date, '2024-06-01')::text", "2024-06-01");
-    ck(&mut e, "COALESCE(NULL::timestamp, '2024-06-01 09:30')::text", "2024-06-01 09:30:00");
+    ck(
+        &mut e,
+        "COALESCE(NULL::date, '2024-06-01')::text",
+        "2024-06-01",
+    );
+    ck(
+        &mut e,
+        "COALESCE(NULL::timestamp, '2024-06-01 09:30')::text",
+        "2024-06-01 09:30:00",
+    );
     ck(&mut e, "COALESCE('14:30'::time, '09:00')::text", "14:30:00");
     // control: all-text COALESCE returns the raw text unchanged.
     ck(&mut e, "COALESCE(NULL, 'hello')::text", "hello");
@@ -1302,9 +2042,21 @@ fn coalesce_result_type() {
 #[test]
 fn case_result_type() {
     let mut e = Engine::new();
-    ck(&mut e, "(CASE WHEN false THEN '10:00'::time ELSE '11:30' END)::text", "11:30:00");
-    ck(&mut e, "(CASE WHEN true THEN '10:00'::time ELSE '11:30' END)::text", "10:00:00");
-    ck(&mut e, "(CASE WHEN false THEN '2024-01-01'::date ELSE '2024-06-01' END)::text", "2024-06-01");
+    ck(
+        &mut e,
+        "(CASE WHEN false THEN '10:00'::time ELSE '11:30' END)::text",
+        "11:30:00",
+    );
+    ck(
+        &mut e,
+        "(CASE WHEN true THEN '10:00'::time ELSE '11:30' END)::text",
+        "10:00:00",
+    );
+    ck(
+        &mut e,
+        "(CASE WHEN false THEN '2024-01-01'::date ELSE '2024-06-01' END)::text",
+        "2024-06-01",
+    );
     // control: all-text CASE unchanged.
     ck(&mut e, "(CASE WHEN true THEN 'a' ELSE 'b' END)::text", "a");
 }
@@ -1316,16 +2068,26 @@ fn case_result_type() {
 fn temporal_plus_text() {
     let mut e = Engine::new();
     ck(&mut e, "('10:00'::time + '30 minutes')::text", "10:30:00");
-    ck(&mut e, "('1 day'::interval + '12 hours')::text", "1 day 12:00:00");
+    ck(
+        &mut e,
+        "('1 day'::interval + '12 hours')::text",
+        "1 day 12:00:00",
+    );
     ck(&mut e, "('30 minutes' + '10:00'::time)::text", "10:30:00");
-    ck(&mut e, "('2024-01-01 10:00'::timestamp + '1 hour')::text", "2024-01-01 11:00:00");
+    ck(
+        &mut e,
+        "('2024-01-01 10:00'::timestamp + '1 hour')::text",
+        "2024-01-01 11:00:00",
+    );
     // control: time + interval (typed) still works.
-    ck(&mut e, "('10:00'::time + '30 minutes'::interval)::text", "10:30:00");
+    ck(
+        &mut e,
+        "('10:00'::time + '30 minutes'::interval)::text",
+        "10:30:00",
+    );
     // date + text stays an error (ambiguous) — matches PG.
     assert_eq!(cast(&mut e, "'2024-01-01'::date + '5 days'"), "ERR");
 }
-
-
 
 /// v7.37 D.5 — polygon text accepts the bare (no outer-paren) point list, like
 /// PG: both `(0,0),(1,1)` and `((0,0),(1,1))`. Unblocks npoints(polygon) and
@@ -1333,9 +2095,21 @@ fn temporal_plus_text() {
 #[test]
 fn polygon_bare_input() {
     let mut e = Engine::new();
-    ck(&mut e, "('(0,0),(4,0),(4,3),(0,3)'::polygon)::text", "((0,0),(4,0),(4,3),(0,3))");
-    ck(&mut e, "('((0,0),(4,0),(4,3),(0,3))'::polygon)::text", "((0,0),(4,0),(4,3),(0,3))");
-    ck(&mut e, "npoints('(0,0),(4,0),(4,3),(0,3)'::polygon)::text", "4");
+    ck(
+        &mut e,
+        "('(0,0),(4,0),(4,3),(0,3)'::polygon)::text",
+        "((0,0),(4,0),(4,3),(0,3))",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(4,0),(4,3),(0,3))'::polygon)::text",
+        "((0,0),(4,0),(4,3),(0,3))",
+    );
+    ck(
+        &mut e,
+        "npoints('(0,0),(4,0),(4,3),(0,3)'::polygon)::text",
+        "4",
+    );
     ck(&mut e, "npoints('((0,0),(1,1))'::polygon)::text", "2");
 }
 
@@ -1344,9 +2118,21 @@ fn polygon_bare_input() {
 #[test]
 fn path_bare_input() {
     let mut e = Engine::new();
-    ck(&mut e, "('[(0,0),(1,1),(2,0)]'::path)::text", "[(0,0),(1,1),(2,0)]");
-    ck(&mut e, "('((0,0),(1,1),(2,0))'::path)::text", "((0,0),(1,1),(2,0))");
-    ck(&mut e, "('(0,0),(1,1),(2,0)'::path)::text", "((0,0),(1,1),(2,0))");
+    ck(
+        &mut e,
+        "('[(0,0),(1,1),(2,0)]'::path)::text",
+        "[(0,0),(1,1),(2,0)]",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(1,1),(2,0))'::path)::text",
+        "((0,0),(1,1),(2,0))",
+    );
+    ck(
+        &mut e,
+        "('(0,0),(1,1),(2,0)'::path)::text",
+        "((0,0),(1,1),(2,0))",
+    );
     ck(&mut e, "npoints('(0,0),(1,1),(2,0)'::path)::text", "3");
 }
 
@@ -1366,14 +2152,25 @@ fn circle_box_bare_input() {
 #[test]
 fn interval_iso8601_and_yearmonth() {
     let mut e = Engine::new();
-    ck(&mut e, "('P1Y2M3DT4H'::interval)::text", "1 year 2 mons 3 days 04:00:00");
-    ck(&mut e, "('P1Y2M3D'::interval)::text", "1 year 2 mons 3 days");
+    ck(
+        &mut e,
+        "('P1Y2M3DT4H'::interval)::text",
+        "1 year 2 mons 3 days 04:00:00",
+    );
+    ck(
+        &mut e,
+        "('P1Y2M3D'::interval)::text",
+        "1 year 2 mons 3 days",
+    );
     ck(&mut e, "('PT1H30M'::interval)::text", "01:30:00");
     ck(&mut e, "('1-2'::interval)::text", "1 year 2 mons");
     // control: the `<n> <unit>` word form still works.
-    ck(&mut e, "('1 year 2 mons 3 days'::interval)::text", "1 year 2 mons 3 days");
+    ck(
+        &mut e,
+        "('1 year 2 mons 3 days'::interval)::text",
+        "1 year 2 mons 3 days",
+    );
 }
-
 
 /// v7.37 D — integer text accepts PG 16+ radix prefixes (0x/0o/0b) and `_`
 /// digit separators, both via `::int` cast and the generic coerce path.
@@ -1391,7 +2188,6 @@ fn integer_radix_and_underscores() {
     ck(&mut e, "('42'::int4)::text", "42");
 }
 
-
 /// v7.37 D — numeric text accepts scientific notation (`1e3`, `1.5e2`, `3E-4`),
 /// like PG; the exponent folds into the decimal scale. PG18.4-verified.
 #[test]
@@ -1404,7 +2200,6 @@ fn numeric_scientific_notation() {
     // control: plain decimal unchanged.
     ck(&mut e, "('3.14'::numeric)::text", "3.14");
 }
-
 
 /// v7.37 D — DATE accepts the compact ISO basic form `YYYYMMDD` and both DATE
 /// and TIMESTAMP accept the special value `epoch`. PG18.4-verified.
@@ -1437,7 +2232,6 @@ fn date_cast_truncates_timestamp_string() {
     ck(&mut e, "('2020-01-01'::date)::text", "2020-01-01");
 }
 
-
 /// v7.37 D — TIME accepts the `allballs` special value (midnight) and the
 /// `24:00:00` end-of-day sentinel; `24:00:01` stays rejected. PG18.4-verified.
 #[test]
@@ -1449,10 +2243,6 @@ fn time_allballs_and_24h() {
     ck(&mut e, "('12:30'::time)::text", "12:30:00");
     assert_eq!(cast(&mut e, "'24:00:01'::time"), "ERR");
 }
-
-
-
-
 
 /// v7.37 D — round(numeric, scale) does exact mantissa rounding instead of
 /// routing through f64, so `round(1.255::numeric, 2)` = 1.26 like PG (1.255 has
@@ -1468,7 +2258,6 @@ fn round_numeric_exact_scale() {
     ck(&mut e, "round(2.5::numeric)::text", "3");
 }
 
-
 /// v7.37 D — unary minus works on NUMERIC / SMALLINT / MONEY (only Int / BigInt
 /// / Float / Interval were handled, so `-1.255::numeric` errored). PG18.4-verified.
 #[test]
@@ -1480,9 +2269,6 @@ fn unary_minus_numeric_smallint() {
     // control: existing int / float unary minus unchanged.
     ck(&mut e, "(-5)::text", "-5");
 }
-
-
-
 
 /// v7.37 D — to_char(n, 'RN') renders Roman numerals (1..=3999), 15-char
 /// right-justified; `FM` trims; out-of-range → 15 `#`. PG18.4-verified.
@@ -1518,7 +2304,11 @@ fn format_width_spec() {
 fn regex_noncapturing_group() {
     let mut e = Engine::new();
     ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
-    ck(&mut e, "regexp_replace('xayaz', '(?:a)', 'Q', 'g')", "xQyQz");
+    ck(
+        &mut e,
+        "regexp_replace('xayaz', '(?:a)', 'Q', 'g')",
+        "xQyQz",
+    );
     ck(&mut e, "('foobar' ~ '(?:foo)(?:bar)')::text", "true");
     // control: a plain capturing group still matches as before.
     ck(&mut e, "('abcabc' ~ '(abc)+')::text", "true");
@@ -1532,7 +2322,11 @@ fn regex_inline_flags() {
     let mut e = Engine::new();
     ck(&mut e, "('ABC' ~ '(?i)abc')::text", "true");
     ck(&mut e, "('abc' ~ '(?i)ABC')::text", "true");
-    ck(&mut e, "regexp_replace('AbCd', '(?i)[a-z]', 'Q', 'g')", "QQQQ");
+    ck(
+        &mut e,
+        "regexp_replace('AbCd', '(?i)[a-z]', 'Q', 'g')",
+        "QQQQ",
+    );
     // control: case-sensitive without the flag; `(?:...)` still non-capturing.
     ck(&mut e, "('ABC' ~ 'abc')::text", "false");
     ck(&mut e, "('abcabc' ~ '(?:abc)+')::text", "true");
@@ -1581,7 +2375,11 @@ fn inet_int_arithmetic() {
     ck(&mut e, "host('192.168.1.5/24'::inet + 1)", "192.168.1.6");
     ck(&mut e, "masklen('192.168.1.5/24'::inet + 1)::text", "24");
     // control: inet - inet still yields the address count.
-    ck(&mut e, "('192.168.1.20'::inet - '192.168.1.5'::inet)::text", "15");
+    ck(
+        &mut e,
+        "('192.168.1.20'::inet - '192.168.1.5'::inet)::text",
+        "15",
+    );
 }
 
 /// v7.37 D — box accepts the fully-wrapped `((x1,y1),(x2,y2))` form (only the
@@ -1591,8 +2389,16 @@ fn inet_int_arithmetic() {
 fn box_double_paren_input() {
     let mut e = Engine::new();
     ck(&mut e, "('((0,0),(2,2))'::box)::text", "(2,2),(0,0)");
-    ck(&mut e, "('((0,0),(2,2))'::box @> '(1,1)'::point)::text", "true");
-    ck(&mut e, "('(1,1)'::point <@ '((0,0),(2,2))'::box)::text", "true");
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box @> '(1,1)'::point)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('(1,1)'::point <@ '((0,0),(2,2))'::box)::text",
+        "true",
+    );
     ck(&mut e, "(area('((0,0),(2,2))'::box))::text", "4");
     // control: the bare + single-paren forms still parse.
     ck(&mut e, "('(0,0),(2,2)'::box)::text", "(2,2),(0,0)");
@@ -1604,11 +2410,27 @@ fn box_double_paren_input() {
 #[test]
 fn macaddr_bitwise() {
     let mut e = Engine::new();
-    ck(&mut e, "('08:00:2b:01:02:03'::macaddr & '00:00:00:ff:ff:ff'::macaddr)::text", "00:00:00:01:02:03");
-    ck(&mut e, "('08:00:2b:01:02:03'::macaddr | '00:00:00:ff:ff:ff'::macaddr)::text", "08:00:2b:ff:ff:ff");
-    ck(&mut e, "(~ '08:00:2b:01:02:03'::macaddr)::text", "f7:ff:d4:fe:fd:fc");
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03'::macaddr & '00:00:00:ff:ff:ff'::macaddr)::text",
+        "00:00:00:01:02:03",
+    );
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03'::macaddr | '00:00:00:ff:ff:ff'::macaddr)::text",
+        "08:00:2b:ff:ff:ff",
+    );
+    ck(
+        &mut e,
+        "(~ '08:00:2b:01:02:03'::macaddr)::text",
+        "f7:ff:d4:fe:fd:fc",
+    );
     // control: macaddr comparison still works.
-    ck(&mut e, "('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text", "true");
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03'::macaddr = '08:00:2b:01:02:03'::macaddr)::text",
+        "true",
+    );
 }
 
 /// v7.37 D — macaddr8 (EUI-64) bitwise operators `&` / `|` and unary `~`,
@@ -1616,11 +2438,27 @@ fn macaddr_bitwise() {
 #[test]
 fn macaddr8_bitwise() {
     let mut e = Engine::new();
-    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 & 'ff:ff:ff:00:00:00:ff:ff'::macaddr8)::text", "08:00:2b:00:00:00:04:05");
-    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 | '00:00:00:ff:ff:ff:00:00'::macaddr8)::text", "08:00:2b:ff:ff:ff:04:05");
-    ck(&mut e, "(~ '08:00:2b:01:02:03:04:05'::macaddr8)::text", "f7:ff:d4:fe:fd:fc:fb:fa");
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03:04:05'::macaddr8 & 'ff:ff:ff:00:00:00:ff:ff'::macaddr8)::text",
+        "08:00:2b:00:00:00:04:05",
+    );
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03:04:05'::macaddr8 | '00:00:00:ff:ff:ff:00:00'::macaddr8)::text",
+        "08:00:2b:ff:ff:ff:04:05",
+    );
+    ck(
+        &mut e,
+        "(~ '08:00:2b:01:02:03:04:05'::macaddr8)::text",
+        "f7:ff:d4:fe:fd:fc:fb:fa",
+    );
     // control: macaddr8 comparison still works.
-    ck(&mut e, "('08:00:2b:01:02:03:04:05'::macaddr8 = '08:00:2b:01:02:03:04:05'::macaddr8)::text", "true");
+    ck(
+        &mut e,
+        "('08:00:2b:01:02:03:04:05'::macaddr8 = '08:00:2b:01:02:03:04:05'::macaddr8)::text",
+        "true",
+    );
 }
 
 /// v7.37 D — lseg accepts the fully-wrapped `((x1,y1),(x2,y2))` form (only
@@ -1630,7 +2468,11 @@ fn macaddr8_bitwise() {
 fn lseg_double_paren_input() {
     let mut e = Engine::new();
     ck(&mut e, "('((0,0),(4,0))'::lseg)::text", "[(0,0),(4,0)]");
-    ck(&mut e, "('(1,1)'::point <-> '((0,0),(4,0))'::lseg)::text", "1");
+    ck(
+        &mut e,
+        "('(1,1)'::point <-> '((0,0),(4,0))'::lseg)::text",
+        "1",
+    );
     // control: the bracketed + bare forms still parse.
     ck(&mut e, "('[(0,0),(4,0)]'::lseg)::text", "[(0,0),(4,0)]");
     ck(&mut e, "('(0,0),(4,0)'::lseg)::text", "[(0,0),(4,0)]");
@@ -1643,12 +2485,32 @@ fn lseg_double_paren_input() {
 fn geo_line_distance_and_box_containment() {
     let mut e = Engine::new();
     // point-to-line distance: point (0,0), line x - 5 = 0 → distance 5.
-    ck(&mut e, "(('(0,0)'::point) <-> ('{1,0,-5}'::line))::text", "5");
-    ck(&mut e, "('((0,0),(2,2))'::box @> '((0.5,0.5),(1,1))'::box)::text", "true");
-    ck(&mut e, "('((0.5,0.5),(1,1))'::box <@ '((0,0),(2,2))'::box)::text", "true");
-    ck(&mut e, "('((0,0),(2,2))'::box @> '((1,1),(3,3))'::box)::text", "false");
+    ck(
+        &mut e,
+        "(('(0,0)'::point) <-> ('{1,0,-5}'::line))::text",
+        "5",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box @> '((0.5,0.5),(1,1))'::box)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('((0.5,0.5),(1,1))'::box <@ '((0,0),(2,2))'::box)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box @> '((1,1),(3,3))'::box)::text",
+        "false",
+    );
     // control: box @> point still works.
-    ck(&mut e, "('((0,0),(2,2))'::box @> '(1,1)'::point)::text", "true");
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box @> '(1,1)'::point)::text",
+        "true",
+    );
 }
 
 /// v7.37 D — box <-> box distance is the distance between box centres (PG18.4:
@@ -1657,10 +2519,22 @@ fn geo_line_distance_and_box_containment() {
 #[test]
 fn box_box_distance() {
     let mut e = Engine::new();
-    ck(&mut e, "('((0,0),(2,2))'::box <-> '((10,0),(12,2))'::box)::text", "10");
-    ck(&mut e, "('((0,0),(2,2))'::box <-> '((0,10),(2,12))'::box)::text", "10");
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box <-> '((10,0),(12,2))'::box)::text",
+        "10",
+    );
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box <-> '((0,10),(2,12))'::box)::text",
+        "10",
+    );
     // overlapping boxes: centre distance sqrt(2), not 0.
-    ck(&mut e, "('((0,0),(2,2))'::box <-> '((1,1),(3,3))'::box)::text", "1.4142135623730951");
+    ck(
+        &mut e,
+        "('((0,0),(2,2))'::box <-> '((1,1),(3,3))'::box)::text",
+        "1.4142135623730951",
+    );
     // control: point <-> point distance still works.
     ck(&mut e, "('(0,0)'::point <-> '(3,4)'::point)::text", "5");
 }
@@ -1686,7 +2560,11 @@ fn bit_get_set_bit() {
 fn tsvector_length_ops() {
     let mut e = Engine::new();
     ck(&mut e, "length('a:1 b:2 c:3'::tsvector)::text", "3");
-    ck(&mut e, "tsvector_length('a:1 b:2 c:3'::tsvector)::text", "3");
+    ck(
+        &mut e,
+        "tsvector_length('a:1 b:2 c:3'::tsvector)::text",
+        "3",
+    );
     ck(&mut e, "length('the quick brown fox'::tsvector)::text", "4");
     // control: length(text) unchanged.
     ck(&mut e, "length('abcd')::text", "4");
@@ -1729,7 +2607,11 @@ fn path_length_and_concat() {
     ck(&mut e, "(length('[(0,0),(3,0),(3,4)]'::path))::text", "7");
     // closed path adds the wrap-around segment (3,4)->(0,0) = 5 → 7 + 5 = 12.
     ck(&mut e, "(length('((0,0),(3,0),(3,4))'::path))::text", "12");
-    ck(&mut e, "('[(0,0),(3,0)]'::path + '[(3,0),(3,4)]'::path)::text", "[(0,0),(3,0),(3,0),(3,4)]");
+    ck(
+        &mut e,
+        "('[(0,0),(3,0)]'::path + '[(3,0),(3,4)]'::path)::text",
+        "[(0,0),(3,0),(3,0),(3,4)]",
+    );
     // control: npoints still works.
     ck(&mut e, "(npoints('[(0,0),(3,4),(5,5)]'::path))::text", "3");
 }
@@ -1739,11 +2621,23 @@ fn path_length_and_concat() {
 #[test]
 fn circle_circle_distance() {
     let mut e = Engine::new();
-    ck(&mut e, "('<(0,0),2>'::circle <-> '<(10,0),2>'::circle)::text", "6");
+    ck(
+        &mut e,
+        "('<(0,0),2>'::circle <-> '<(10,0),2>'::circle)::text",
+        "6",
+    );
     // overlapping circles: gap clamped to 0.
-    ck(&mut e, "('<(0,0),3>'::circle <-> '<(4,0),3>'::circle)::text", "0");
+    ck(
+        &mut e,
+        "('<(0,0),3>'::circle <-> '<(4,0),3>'::circle)::text",
+        "0",
+    );
     // control: point <-> circle still works.
-    ck(&mut e, "('(0,0)'::point <-> '<(5,0),1>'::circle)::text", "4");
+    ck(
+        &mut e,
+        "('(0,0)'::point <-> '<(5,0),1>'::circle)::text",
+        "4",
+    );
 }
 
 /// v7.37 D — cidr ± integer behaves as PG's implicit cidr->inet cast then
@@ -1781,18 +2675,48 @@ fn window_over_derived_table() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => {
-                let c: Vec<String> = rows.iter().map(|r| match &r.values[0] {
-                    Value::Null => "N".into(), Value::Text(s) => s.to_string(), o => format!("{o:?}"),
-                }).collect();
+                let c: Vec<String> = rows
+                    .iter()
+                    .map(|r| match &r.values[0] {
+                        Value::Null => "N".into(),
+                        Value::Text(s) => s.to_string(),
+                        o => format!("{o:?}"),
+                    })
+                    .collect();
                 format!("[{}]", c.join(","))
             }
-            Ok(o) => format!("<NON:{o:?}>"), Err(e2) => format!("ERR:{e2:?}"),
+            Ok(o) => format!("<NON:{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT (row_number() OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"), "[1,2,3]");
-    assert_eq!(q(&mut e, "SELECT (nth_value(v,2) OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"), "[N,20,20]");
-    assert_eq!(q(&mut e, "SELECT (lag(v,1,0) OVER (ORDER BY v))::text FROM (SELECT v FROM (VALUES (5),(10),(15)) x(v)) s(v)"), "[0,5,10]");
-    assert_eq!(q(&mut e, "SELECT (rank() OVER (ORDER BY v))::text FROM (VALUES (1),(1),(3)) t(v)"), "[1,1,3]");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (row_number() OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"
+        ),
+        "[1,2,3]"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (nth_value(v,2) OVER (ORDER BY v))::text FROM (VALUES (10),(20),(30)) t(v)"
+        ),
+        "[N,20,20]"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (lag(v,1,0) OVER (ORDER BY v))::text FROM (SELECT v FROM (VALUES (5),(10),(15)) x(v)) s(v)"
+        ),
+        "[0,5,10]"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (rank() OVER (ORDER BY v))::text FROM (VALUES (1),(1),(3)) t(v)"
+        ),
+        "[1,1,3]"
+    );
 }
 
 /// v7.37 D — XMLELEMENT(NAME ident [, content …]) — parse the NAME-keyword
@@ -1802,11 +2726,31 @@ fn window_over_derived_table() {
 fn xmlelement_basic() {
     let mut e = Engine::new();
     ck(&mut e, "(xmlelement(name foo))::text", "<foo/>");
-    ck(&mut e, "(xmlelement(name foo, 'bar'))::text", "<foo>bar</foo>");
-    ck(&mut e, "(xmlelement(name foo, 'a', 'b', 'c'))::text", "<foo>abc</foo>");
-    ck(&mut e, "(xmlelement(name \"Foo-Bar\", 42))::text", "<Foo-Bar>42</Foo-Bar>");
-    ck(&mut e, "(xmlelement(name item, xmlelement(name sub, 'x')))::text", "<item><sub>x</sub></item>");
-    ck(&mut e, "(xmlelement(name t, '<b>'))::text", "<t>&lt;b&gt;</t>");
+    ck(
+        &mut e,
+        "(xmlelement(name foo, 'bar'))::text",
+        "<foo>bar</foo>",
+    );
+    ck(
+        &mut e,
+        "(xmlelement(name foo, 'a', 'b', 'c'))::text",
+        "<foo>abc</foo>",
+    );
+    ck(
+        &mut e,
+        "(xmlelement(name \"Foo-Bar\", 42))::text",
+        "<Foo-Bar>42</Foo-Bar>",
+    );
+    ck(
+        &mut e,
+        "(xmlelement(name item, xmlelement(name sub, 'x')))::text",
+        "<item><sub>x</sub></item>",
+    );
+    ck(
+        &mut e,
+        "(xmlelement(name t, '<b>'))::text",
+        "<t>&lt;b&gt;</t>",
+    );
 }
 
 /// v7.37 D — XMLFOREST(value AS name, …) builds a concatenation of named
@@ -1814,23 +2758,55 @@ fn xmlelement_basic() {
 #[test]
 fn xmlforest_basic() {
     let mut e = Engine::new();
-    ck(&mut e, "(xmlforest('a' AS foo, 'b' AS bar))::text", "<foo>a</foo><bar>b</bar>");
+    ck(
+        &mut e,
+        "(xmlforest('a' AS foo, 'b' AS bar))::text",
+        "<foo>a</foo><bar>b</bar>",
+    );
     ck(&mut e, "(xmlforest(42 AS num))::text", "<num>42</num>");
-    ck(&mut e, "(xmlforest('x' AS \"My-Col\"))::text", "<My-Col>x</My-Col>");
+    ck(
+        &mut e,
+        "(xmlforest('x' AS \"My-Col\"))::text",
+        "<My-Col>x</My-Col>",
+    );
     ck(&mut e, "(xmlforest('<b>' AS t))::text", "<t>&lt;b&gt;</t>");
     // nested xmlelement content stays verbatim inside the forest element.
-    ck(&mut e, "(xmlforest(xmlelement(name s, 'x') AS wrap))::text", "<wrap><s>x</s></wrap>");
+    ck(
+        &mut e,
+        "(xmlforest(xmlelement(name s, 'x') AS wrap))::text",
+        "<wrap><s>x</s></wrap>",
+    );
 }
 
 /// v7.37 D — tsquery @> / <@ tsquery containment by lexeme set. PG18.4-verified.
 #[test]
 fn tsquery_containment() {
     let mut e = Engine::new();
-    ck(&mut e, "('cat & dog'::tsquery @> 'cat'::tsquery)::text", "true");
-    ck(&mut e, "('cat'::tsquery @> 'cat & dog'::tsquery)::text", "false");
-    ck(&mut e, "('cat & dog'::tsquery @> 'bird'::tsquery)::text", "false");
-    ck(&mut e, "('cat'::tsquery <@ 'cat & dog'::tsquery)::text", "true");
-    ck(&mut e, "('cat | dog'::tsquery @> 'dog'::tsquery)::text", "true");
+    ck(
+        &mut e,
+        "('cat & dog'::tsquery @> 'cat'::tsquery)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('cat'::tsquery @> 'cat & dog'::tsquery)::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "('cat & dog'::tsquery @> 'bird'::tsquery)::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "('cat'::tsquery <@ 'cat & dog'::tsquery)::text",
+        "true",
+    );
+    ck(
+        &mut e,
+        "('cat | dog'::tsquery @> 'dog'::tsquery)::text",
+        "true",
+    );
 }
 
 /// v7.37 D — range @> numeric element (numeric operand no longer stolen by the
@@ -1839,8 +2815,16 @@ fn tsquery_containment() {
 fn numrange_contains_numeric() {
     let mut e = Engine::new();
     ck(&mut e, "(numrange(1.5, 3.5) @> 2.0::numeric)::text", "true");
-    ck(&mut e, "(numrange(1.5, 3.5) @> 4.0::numeric)::text", "false");
-    ck(&mut e, "('[1.5,3.5)'::numrange @> 2.0::numeric)::text", "true");
+    ck(
+        &mut e,
+        "(numrange(1.5, 3.5) @> 4.0::numeric)::text",
+        "false",
+    );
+    ck(
+        &mut e,
+        "('[1.5,3.5)'::numrange @> 2.0::numeric)::text",
+        "true",
+    );
     ck(&mut e, "(2.0::numeric <@ numrange(1.5, 3.5))::text", "true");
     // int4range with a plain-int probe is unaffected by the guard.
     // (PG rejects `int4range @> numeric` outright; SPG is leniently
@@ -1855,13 +2839,27 @@ fn percentile_cont_array() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Text(s) => s.to_string(), o => format!("{o:?}"),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
             },
-            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+            Ok(o) => format!("<NON:{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT (percentile_cont(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"), "{1.75,2.5,3.25}");
-    assert_eq!(q(&mut e, "SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"), "2.5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (percentile_cont(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"
+        ),
+        "{1.75,2.5,3.25}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1.0),(2.0),(3.0),(4.0)) t(v)"
+        ),
+        "2.5"
+    );
 }
 
 /// v7.37 D — percentile_disc(ARRAY[...]) returns an array of the ordered-column
@@ -1872,15 +2870,35 @@ fn percentile_disc_array() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Text(s) => s.to_string(), o => format!("{o:?}"),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
             },
-            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+            Ok(o) => format!("<NON:{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT (percentile_disc(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (10),(20),(30),(40)) t(v)"), "{10,20,30}");
-    assert_eq!(q(&mut e, "SELECT (percentile_disc(ARRAY[0.5,1.0]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES ('a'),('b'),('c')) t(v)"), "{b,c}");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (percentile_disc(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (10),(20),(30),(40)) t(v)"
+        ),
+        "{10,20,30}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (percentile_disc(ARRAY[0.5,1.0]) WITHIN GROUP (ORDER BY v))::text FROM (VALUES ('a'),('b'),('c')) t(v)"
+        ),
+        "{b,c}"
+    );
     // scalar form unchanged
-    assert_eq!(q(&mut e, "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1),(2),(3),(4)) t(v)"), "2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY v))::text FROM (VALUES (1),(2),(3),(4)) t(v)"
+        ),
+        "2"
+    );
 }
 
 /// v7.37 D — RANGE offset frame (`RANGE BETWEEN n PRECEDING AND n FOLLOWING`)
@@ -1892,15 +2910,42 @@ fn range_offset_frame() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
             },
-            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+            Ok(o) => format!("<NON:{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "3,6,5,5");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "6,5,8,5");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"), "1,3,6,8");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(4)) t(v)) s"), "3,2,2,1");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"
+        ),
+        "3,6,5,5"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"
+        ),
+        "6,5,8,5"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(3),(5)) t(v)) s"
+        ),
+        "1,3,6,8"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(4)) t(v)) s"
+        ),
+        "3,2,2,1"
+    );
 }
 
 /// v7.37 D — GROUPS offset frame (`GROUPS BETWEEN n PRECEDING AND n FOLLOWING`)
@@ -1912,15 +2957,42 @@ fn groups_offset_frame() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
             },
-            Ok(o)=>format!("<NON:{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+            Ok(o) => format!("<NON:{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3),(5)) t(v)) s"), "5,8,8,12,8");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"), "1,3,3,3");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"), "5,7,7,3");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v DESC GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"), "3,4,4,3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3),(5)) t(v)) s"
+        ),
+        "5,8,8,12,8"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"
+        ),
+        "1,3,3,3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (sum(v) OVER (ORDER BY v GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"
+        ),
+        "5,7,7,3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY ord) FROM (SELECT v ord, (count(*) OVER (ORDER BY v DESC GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING))::text x FROM (VALUES (1),(2),(2),(3)) t(v)) s"
+        ),
+        "3,4,4,3"
+    );
 }
 
 /// v7.37 D.19 — a bare (VALUES …) join operand must cross-join fully, not yield
@@ -1931,23 +3003,57 @@ fn join_bare_values_operand() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // CROSS JOIN two bare VALUES
-    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) CROSS JOIN (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) CROSS JOIN (VALUES ('1'),('2')) b(v)"
+        ),
+        "a1,a2,b1,b2"
+    );
     // comma-join
-    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v), (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v), (VALUES ('1'),('2')) b(v)"
+        ),
+        "a1,a2,b1,b2"
+    );
     // JOIN ... ON true
-    assert_eq!(q(&mut e, "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) JOIN (VALUES ('1'),('2')) b(v) ON true"), "a1,a2,b1,b2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a.v||b.v, ',' ORDER BY a.v||b.v) FROM (VALUES ('a'),('b')) a(v) JOIN (VALUES ('1'),('2')) b(v) ON true"
+        ),
+        "a1,a2,b1,b2"
+    );
     // real table CROSS bare VALUES
     e.execute("CREATE TABLE ct19(v TEXT)").ok();
     e.execute("INSERT INTO ct19 VALUES ('a'),('b')").ok();
-    assert_eq!(q(&mut e, "SELECT string_agg(ct19.v||b.v, ',' ORDER BY ct19.v||b.v) FROM ct19 CROSS JOIN (VALUES ('1'),('2')) b(v)"), "a1,a2,b1,b2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(ct19.v||b.v, ',' ORDER BY ct19.v||b.v) FROM ct19 CROSS JOIN (VALUES ('1'),('2')) b(v)"
+        ),
+        "a1,a2,b1,b2"
+    );
     // regression guard: a genuinely correlated LATERAL still evaluates
     // per-left-row (must NOT take the new eager path).
-    assert_eq!(q(&mut e, "SELECT string_agg(s.y, ',' ORDER BY s.y) FROM ct19 CROSS JOIN LATERAL (SELECT ct19.v || '!' AS y) s"), "a!,b!");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(s.y, ',' ORDER BY s.y) FROM ct19 CROSS JOIN LATERAL (SELECT ct19.v || '!' AS y) s"
+        ),
+        "a!,b!"
+    );
 }
 
 /// v7.37 D.21 — a correlated subquery in the projection/WHERE of a query whose
@@ -1959,16 +3065,38 @@ fn correlated_subq_over_derived() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // correlated scalar subquery in projection over VALUES-derived outer
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||mx, ',' ORDER BY g) FROM (SELECT g, (SELECT max(v) FROM (VALUES (1,10),(1,20),(2,5)) u(gg,v) WHERE u.gg=t.g)::text mx FROM (VALUES (1),(2)) t(g)) s"), "1:20,2:5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||mx, ',' ORDER BY g) FROM (SELECT g, (SELECT max(v) FROM (VALUES (1,10),(1,20),(2,5)) u(gg,v) WHERE u.gg=t.g)::text mx FROM (VALUES (1),(2)) t(g)) s"
+        ),
+        "1:20,2:5"
+    );
     // correlated in WHERE over derived outer
-    assert_eq!(q(&mut e, "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE g < (SELECT max(v) FROM (VALUES (1),(3)) u(v) WHERE u.v <> t.g)"), "1,2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE g < (SELECT max(v) FROM (VALUES (1),(3)) u(v) WHERE u.v <> t.g)"
+        ),
+        "1,2"
+    );
     // EXISTS correlated over derived outer
-    assert_eq!(q(&mut e, "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE EXISTS (SELECT 1 FROM (VALUES (2),(3)) u(v) WHERE u.v=t.g)"), "2,3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g::text, ',' ORDER BY g) FROM (VALUES (1),(2),(3)) t(g) WHERE EXISTS (SELECT 1 FROM (VALUES (2),(3)) u(v) WHERE u.v=t.g)"
+        ),
+        "2,3"
+    );
 }
 
 /// v7.37 D.22 — a bare set-returning function in the SELECT projection (no FROM)
@@ -1979,18 +3107,46 @@ fn srf_in_projection() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // bare unnest in projection (column named "unnest")
-    assert_eq!(q(&mut e, "SELECT string_agg(unnest::text,',' ORDER BY unnest) FROM (SELECT unnest(ARRAY[5,3])) x"), "3,5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(unnest::text,',' ORDER BY unnest) FROM (SELECT unnest(ARRAY[5,3])) x"
+        ),
+        "3,5"
+    );
     // aliased
-    assert_eq!(q(&mut e, "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v) x"), "3,5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v) x"
+        ),
+        "3,5"
+    );
     // generate_series in projection
-    assert_eq!(q(&mut e, "SELECT string_agg(generate_series::text,',' ORDER BY generate_series) FROM (SELECT generate_series(1,4)) x"), "1,2,3,4");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(generate_series::text,',' ORDER BY generate_series) FROM (SELECT generate_series(1,4)) x"
+        ),
+        "1,2,3,4"
+    );
     // UNION of two projection-SRFs (the D.22 trigger)
-    assert_eq!(q(&mut e, "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v UNION SELECT unnest(ARRAY[3,1])) z"), "1,3,5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v::text,',' ORDER BY v) FROM (SELECT unnest(ARRAY[5,3]) v UNION SELECT unnest(ARRAY[3,1])) z"
+        ),
+        "1,3,5"
+    );
 }
 
 /// v7.37 D.23 — window functions compose with GROUP BY aggregation: the
@@ -2002,20 +3158,49 @@ fn window_over_aggregate() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // rank() OVER (ORDER BY sum(v)) — window ORDER BY an aggregate
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||s||':'||rk, ',' ORDER BY g) FROM (SELECT g, sum(v) s, rank() OVER (ORDER BY sum(v) DESC) rk FROM (VALUES (1,10),(1,20),(2,5)) t(g,v) GROUP BY g) z"), "1:30:1,2:5:2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||s||':'||rk, ',' ORDER BY g) FROM (SELECT g, sum(v) s, rank() OVER (ORDER BY sum(v) DESC) rk FROM (VALUES (1,10),(1,20),(2,5)) t(g,v) GROUP BY g) z"
+        ),
+        "1:30:1,2:5:2"
+    );
     // plain aggregate + row_number window coexisting
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||rn, ',' ORDER BY g) FROM (SELECT g, sum(v), row_number() OVER (ORDER BY g) rn FROM (VALUES (1,10),(2,5),(3,7)) t(g,v) GROUP BY g) z"), "1:1,2:2,3:3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||rn, ',' ORDER BY g) FROM (SELECT g, sum(v), row_number() OVER (ORDER BY g) rn FROM (VALUES (1,10),(2,5),(3,7)) t(g,v) GROUP BY g) z"
+        ),
+        "1:1,2:2,3:3"
+    );
     // window AGGREGATE over a plain aggregate (sum(count(*)) OVER ())
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||c||':'||tot, ',' ORDER BY g) FROM (SELECT g, count(*) c, sum(count(*)) OVER () tot FROM (VALUES (1,1),(1,1),(2,1)) t(g,v) GROUP BY g) z"), "1:2:3,2:1:3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||c||':'||tot, ',' ORDER BY g) FROM (SELECT g, count(*) c, sum(count(*)) OVER () tot FROM (VALUES (1,1),(1,1),(2,1)) t(g,v) GROUP BY g) z"
+        ),
+        "1:2:3,2:1:3"
+    );
     // real table too
     e.execute("CREATE TABLE wtab(g INT, v INT)").unwrap();
-    e.execute("INSERT INTO wtab VALUES (1,10),(1,20),(2,5)").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||rk, ',' ORDER BY g) FROM (SELECT g, rank() OVER (ORDER BY sum(v) DESC) rk FROM wtab GROUP BY g) z"), "1:1,2:2");
+    e.execute("INSERT INTO wtab VALUES (1,10),(1,20),(2,5)")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||rk, ',' ORDER BY g) FROM (SELECT g, rank() OVER (ORDER BY sum(v) DESC) rk FROM wtab GROUP BY g) z"
+        ),
+        "1:1,2:2"
+    );
 }
 
 /// v7.37 D.24 — substring(string FROM pattern) POSIX regex extraction (no capture
@@ -2026,19 +3211,44 @@ fn substring_regex_form() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"NULL".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(_)=>"ERR".into(),
+                Value::Null => "NULL".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(_) => "ERR".into(),
         }
     };
-    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '[a-z]+')"), "hello");
-    assert_eq!(q(&mut e, "SELECT COALESCE(substring('xyz' FROM '[0-9]+'), 'NULL')"), "NULL");
-    assert_eq!(q(&mut e, "SELECT substring('id-4567-end' FROM '[0-9]+')"), "4567");
+    assert_eq!(
+        q(&mut e, "SELECT substring('hello world' FROM '[a-z]+')"),
+        "hello"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT COALESCE(substring('xyz' FROM '[0-9]+'), 'NULL')"
+        ),
+        "NULL"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT substring('id-4567-end' FROM '[0-9]+')"),
+        "4567"
+    );
     assert_eq!(q(&mut e, "SELECT substring('abcdef' FROM 2 FOR 3)"), "bcd");
     assert_eq!(q(&mut e, "SELECT substring('abcdef', 2)"), "bcdef");
-    assert_eq!(q(&mut e, "SELECT substring('foo@bar.com', '@[a-z.]+')"), "@bar.com");
+    assert_eq!(
+        q(&mut e, "SELECT substring('foo@bar.com', '@[a-z.]+')"),
+        "@bar.com"
+    );
     // v7.38 (read01, T7) — a capturing-group pattern returns the FIRST group
     // (PG), via the capture-aware matcher.
-    assert_eq!(q(&mut e, "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"), "hello");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT substring('hello world' FROM '(\\w+) (\\w+)')"
+        ),
+        "hello"
+    );
 }
 
 /// v7.37 D.25 — PG operator spellings of LIKE/ILIKE: ~~ / ~~* / !~~ / !~~*.
@@ -2049,8 +3259,13 @@ fn like_operators() {
     let b = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Bool(v)=>v.to_string(), Value::Text(s)=>s.to_string(), Value::Null=>"N".into(), o=>format!("{o:?}") },
-            Ok(_)=>"OK".into(), Err(_)=>"ERR".into(),
+                Value::Bool(v) => v.to_string(),
+                Value::Text(s) => s.to_string(),
+                Value::Null => "N".into(),
+                o => format!("{o:?}"),
+            },
+            Ok(_) => "OK".into(),
+            Err(_) => "ERR".into(),
         }
     };
     assert_eq!(b(&mut e, "SELECT 'hello' ~~ 'h%'"), "true");
@@ -2059,7 +3274,13 @@ fn like_operators() {
     assert_eq!(b(&mut e, "SELECT 'hello' !~~* 'X%'"), "true");
     assert_eq!(b(&mut e, "SELECT 'hello' ~~ 'H%'"), "false");
     assert_eq!(b(&mut e, "SELECT ('abc' ~ 'b')::text"), "true"); // regex ~ still distinct
-    assert_eq!(b(&mut e, "SELECT string_agg(v, ',' ORDER BY v) FROM (VALUES ('apple'),('banana'),('avocado')) t(v) WHERE v ~~ 'a%'"), "apple,avocado");
+    assert_eq!(
+        b(
+            &mut e,
+            "SELECT string_agg(v, ',' ORDER BY v) FROM (VALUES ('apple'),('banana'),('avocado')) t(v) WHERE v ~~ 'a%'"
+        ),
+        "apple,avocado"
+    );
 }
 
 /// v7.37 D.20 — a parenthesized set-op group or a CTE as a derived table.
@@ -2070,18 +3291,46 @@ fn derived_setop_group_and_cte() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // parenthesized set-op group as derived table
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2)) s(x)"), "1,2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2)) s(x)"
+        ),
+        "1,2"
+    );
     // 3-way group
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2) UNION (SELECT 3)) s(x)"), "1,2,3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text,',' ORDER BY x) FROM ((SELECT 1) UNION (SELECT 2) UNION (SELECT 3)) s(x)"
+        ),
+        "1,2,3"
+    );
     // CTE as derived table
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY x) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n::text x FROM r) z"), "1,2,3,4");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY x) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n::text x FROM r) z"
+        ),
+        "1,2,3,4"
+    );
     // regression: plain (SELECT ... UNION ...) without inner parens still works
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM (SELECT 1 UNION SELECT 2) s(x)"), "1,2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text,',' ORDER BY x) FROM (SELECT 1 UNION SELECT 2) s(x)"
+        ),
+        "1,2"
+    );
 }
 
 /// v7.37 D.20 follow-up — a (VALUES…) list as a set-op group operand, as a
@@ -2092,13 +3341,35 @@ fn derived_values_group() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION (VALUES (2),(3))) s(x)"), "1,2,3");
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION ALL (VALUES (2),(3))) s(x)"), "1,2,2,3");
-    assert_eq!(q(&mut e, "SELECT string_agg(x,',' ORDER BY x) FROM ((VALUES ('a')) UNION (SELECT 'b')) s(x)"), "a,b");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION (VALUES (2),(3))) s(x)"
+        ),
+        "1,2,3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text,',' ORDER BY x) FROM ((VALUES (1),(2)) UNION ALL (VALUES (2),(3))) s(x)"
+        ),
+        "1,2,2,3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x,',' ORDER BY x) FROM ((VALUES ('a')) UNION (SELECT 'b')) s(x)"
+        ),
+        "a,b"
+    );
 }
 
 /// v7.37 D.22 follow-up — a set-returning function alongside scalar columns in a
@@ -2110,20 +3381,49 @@ fn mixed_srf_in_projection() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // scalar + SRF, no FROM
-    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||u, ',' ORDER BY a, u) FROM (SELECT 'x' a, unnest(ARRAY[1,2]) u) s"), "x:1,x:2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a||':'||u, ',' ORDER BY a, u) FROM (SELECT 'x' a, unnest(ARRAY[1,2]) u) s"
+        ),
+        "x:1,x:2"
+    );
     // scalar + generate_series, no FROM
-    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||g, ',' ORDER BY g) FROM (SELECT 'y' a, generate_series(1,3) g) s"), "y:1,y:2,y:3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a||':'||g, ',' ORDER BY g) FROM (SELECT 'y' a, generate_series(1,3) g) s"
+        ),
+        "y:1,y:2,y:3"
+    );
     // bare single SRF still works (D.22 base case)
-    assert_eq!(q(&mut e, "SELECT string_agg(u::text,',' ORDER BY u) FROM (SELECT unnest(ARRAY[5,3]) u) s"), "3,5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(u::text,',' ORDER BY u) FROM (SELECT unnest(ARRAY[5,3]) u) s"
+        ),
+        "3,5"
+    );
     // mixed SRF over a real FROM still works (targetlist-SRF path, unchanged)
     e.execute("CREATE TABLE mt(id int, tags int[])").unwrap();
-    e.execute("INSERT INTO mt VALUES (1, ARRAY[10,20]),(2,ARRAY[30])").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||u, ',' ORDER BY id, u) FROM (SELECT id, unnest(tags) u FROM mt) s"), "1:10,1:20,2:30");
+    e.execute("INSERT INTO mt VALUES (1, ARRAY[10,20]),(2,ARRAY[30])")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||u, ',' ORDER BY id, u) FROM (SELECT id, unnest(tags) u FROM mt) s"
+        ),
+        "1:10,1:20,2:30"
+    );
 }
 
 /// v7.37 D.26 — count(col) over a VALUES/UNION-derived table excludes NULL rows.
@@ -2134,22 +3434,50 @@ fn count_col_over_values_excludes_null() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
     // count(col) over VALUES with a NULL → 2 (was 3)
-    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (VALUES (1),(NULL),(3)) t(v)"), "2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT count(v)::text FROM (VALUES (1),(NULL),(3)) t(v)"
+        ),
+        "2"
+    );
     // explicit UNION ALL with a NULL branch
-    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (SELECT 1 v UNION ALL SELECT NULL UNION ALL SELECT 3) t"), "2");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT count(v)::text FROM (SELECT 1 v UNION ALL SELECT NULL UNION ALL SELECT 3) t"
+        ),
+        "2"
+    );
     // count(col) with no NULLs still all rows
-    assert_eq!(q(&mut e, "SELECT count(v)::text FROM (VALUES (1),(2),(3)) t(v)"), "3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT count(v)::text FROM (VALUES (1),(2),(3)) t(v)"
+        ),
+        "3"
+    );
     // real-table count(col) with NULL unchanged (was already correct)
     e.execute("CREATE TABLE ct2(v int)").unwrap();
     e.execute("INSERT INTO ct2 VALUES (1),(NULL),(3)").unwrap();
     assert_eq!(q(&mut e, "SELECT count(v)::text FROM ct2"), "2");
     // count(*) over VALUES counts all rows including NULL
-    assert_eq!(q(&mut e, "SELECT count(*)::text FROM (VALUES (1),(NULL),(3)) t(v)"), "3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT count(*)::text FROM (VALUES (1),(NULL),(3)) t(v)"
+        ),
+        "3"
+    );
 }
 
 /// v7.37 D.27 — an array-returning scalar subquery materialises (was "not yet
@@ -2160,14 +3488,42 @@ fn array_scalar_subquery() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(_)=>"ERR".into(),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(_) => "ERR".into(),
         }
     };
-    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES (3),(1),(2)) t(v))::text"), "{1,2,3}");
-    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES ('b'),('a'),('c')) t(v))::text"), "{a,b,c}");
-    assert_eq!(q(&mut e, "SELECT (SELECT array_agg(v) FROM (VALUES (1),(NULL),(3)) t(v))::text"), "{1,NULL,3}");
-    assert_eq!(q(&mut e, "SELECT array_length((SELECT array_agg(v) FROM (VALUES (1),(2),(3)) t(v)), 1)::text"), "3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES (3),(1),(2)) t(v))::text"
+        ),
+        "{1,2,3}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (SELECT array_agg(v ORDER BY v) FROM (VALUES ('b'),('a'),('c')) t(v))::text"
+        ),
+        "{a,b,c}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (SELECT array_agg(v) FROM (VALUES (1),(NULL),(3)) t(v))::text"
+        ),
+        "{1,NULL,3}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT array_length((SELECT array_agg(v) FROM (VALUES (1),(2),(3)) t(v)), 1)::text"
+        ),
+        "3"
+    );
 }
 
 /// v7.37 D.28 — a VIEW whose body has a `(VALUES …) t(cols)` derived table now
@@ -2179,21 +3535,44 @@ fn view_over_values_derived() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    e.execute("CREATE VIEW vv AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)").unwrap();
+    e.execute("CREATE VIEW vv AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)")
+        .unwrap();
     // top-level view query
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||d, ',' ORDER BY g) FROM vv WHERE d > 10"), "2:20,3:30");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||d, ',' ORDER BY g) FROM vv WHERE d > 10"
+        ),
+        "2:20,3:30"
+    );
     // aggregate over the view
     assert_eq!(q(&mut e, "SELECT count(*)::text FROM vv"), "3");
     // view inside a derived table + UNION
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text, ',' ORDER BY x) FROM (SELECT g x FROM vv UNION SELECT d FROM vv) u"), "1,2,3,10,20,30");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text, ',' ORDER BY x) FROM (SELECT g x FROM vv UNION SELECT d FROM vv) u"
+        ),
+        "1,2,3,10,20,30"
+    );
     // real LATERAL still round-trips (regression: parser now reads AS t(cols) after LATERAL)
     e.execute("CREATE TABLE lt(a int)").unwrap();
     e.execute("INSERT INTO lt VALUES (1),(2)").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(a||':'||b, ',' ORDER BY a) FROM lt CROSS JOIN LATERAL (SELECT lt.a*10 b) s"), "1:10,2:20");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(a||':'||b, ',' ORDER BY a) FROM lt CROSS JOIN LATERAL (SELECT lt.a*10 b) s"
+        ),
+        "1:10,2:20"
+    );
 }
 
 /// v7.37 D.29 — a view referenced inside an uncorrelated scalar / EXISTS / IN
@@ -2205,15 +3584,32 @@ fn view_in_scalar_subquery() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null=>"N".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") },
-            Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}"),
+                Value::Null => "N".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
         }
     };
-    e.execute("CREATE VIEW vw AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)").unwrap();
+    e.execute("CREATE VIEW vw AS SELECT g, g*10 AS d FROM (VALUES (1),(2),(3)) t(g)")
+        .unwrap();
     assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM vw)::text"), "3");
     assert_eq!(q(&mut e, "SELECT (SELECT sum(d) FROM vw)::text"), "60");
-    assert_eq!(q(&mut e, "SELECT (EXISTS (SELECT 1 FROM vw WHERE d > 25))::text"), "true");
-    assert_eq!(q(&mut e, "SELECT string_agg(g::text,',' ORDER BY g) FROM vw WHERE d IN (SELECT d FROM vw WHERE g > 1)"), "2,3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (EXISTS (SELECT 1 FROM vw WHERE d > 25))::text"
+        ),
+        "true"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g::text,',' ORDER BY g) FROM vw WHERE d IN (SELECT d FROM vw WHERE g > 1)"
+        ),
+        "2,3"
+    );
 }
 
 /// v7.37 D.30 — UPDATE ... FROM with a target-column reference in the SET RHS
@@ -2223,23 +3619,69 @@ fn view_in_scalar_subquery() {
 fn update_from_target_col_in_set() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
-    e.execute("CREATE TABLE t(id int primary key, v int, note text)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b')").unwrap();
+    e.execute("CREATE TABLE t(id int primary key, v int, note text)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b')")
+        .unwrap();
     e.execute("CREATE TABLE u(id int, bonus int)").unwrap();
     e.execute("INSERT INTO u VALUES (1,5),(2,7)").unwrap();
-    e.execute("UPDATE t SET v = v + u.bonus FROM u WHERE u.id = t.id").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:15,2:27");
-    e.execute("UPDATE t SET v = v * 2, note = note || u.bonus::text FROM u WHERE u.id = t.id").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v||':'||note, ',' ORDER BY id) FROM t"), "1:30:a5,2:54:b7");
-    e.execute("UPDATE t SET v = CASE WHEN u.bonus > 6 THEN v + 100 ELSE v END FROM u WHERE u.id = t.id").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:30,2:154");
-    e.execute("UPDATE t SET v = GREATEST(v, u.bonus) FROM u WHERE u.id = t.id").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:30,2:154");
+    e.execute("UPDATE t SET v = v + u.bonus FROM u WHERE u.id = t.id")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"
+        ),
+        "1:15,2:27"
+    );
+    e.execute("UPDATE t SET v = v * 2, note = note || u.bonus::text FROM u WHERE u.id = t.id")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||v||':'||note, ',' ORDER BY id) FROM t"
+        ),
+        "1:30:a5,2:54:b7"
+    );
+    e.execute(
+        "UPDATE t SET v = CASE WHEN u.bonus > 6 THEN v + 100 ELSE v END FROM u WHERE u.id = t.id",
+    )
+    .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"
+        ),
+        "1:30,2:154"
+    );
+    e.execute("UPDATE t SET v = GREATEST(v, u.bonus) FROM u WHERE u.id = t.id")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"
+        ),
+        "1:30,2:154"
+    );
     // whole-RHS-is-source-col still works (regression)
-    e.execute("UPDATE t SET v = u.bonus FROM u WHERE u.id = t.id").unwrap();
-    assert_eq!(q(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"), "1:5,2:7");
+    e.execute("UPDATE t SET v = u.bonus FROM u WHERE u.id = t.id")
+        .unwrap();
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t"
+        ),
+        "1:5,2:7"
+    );
 }
 
 /// v7.37 D.31 — numeric / numeric keeps PG's division display scale (≥16 sig digits)
@@ -2248,7 +3690,14 @@ fn update_from_target_col_in_set() {
 fn numeric_division_scale() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     let out = [
         q(&mut e, "SELECT (10::numeric / 3)::text"),
@@ -2259,7 +3708,10 @@ fn numeric_division_scale() {
         q(&mut e, "SELECT (-10::numeric / 3)::text"),
         q(&mut e, "SELECT (0::numeric / 5)::text"),
         q(&mut e, "SELECT (123.456::numeric / 1)::text"),
-        q(&mut e, "SELECT (avg(x))::text FROM (VALUES (10::numeric),(20),(31)) t(x)"),
+        q(
+            &mut e,
+            "SELECT (avg(x))::text FROM (VALUES (10::numeric),(20),(31)) t(x)",
+        ),
         q(&mut e, "SELECT (1000000::numeric / 3)::text"),
     ];
     let exp = "3.3333333333333333|3.3333333333333333|0.14285714285714285714|25.0000000000000000|15.0000000000000000|-3.3333333333333333|0.00000000000000000000|123.4560000000000000|20.3333333333333333|333333.333333333333";
@@ -2271,22 +3723,53 @@ fn numeric_division_scale() {
 fn extract_plural_fields() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     let out = [
-        q(&mut e, "SELECT extract(years from interval '3 years')::text"),
-        q(&mut e, "SELECT extract(months from interval '5 months')::text"),
+        q(
+            &mut e,
+            "SELECT extract(years from interval '3 years')::text",
+        ),
+        q(
+            &mut e,
+            "SELECT extract(months from interval '5 months')::text",
+        ),
         q(&mut e, "SELECT extract(days from interval '7 days')::text"),
-        q(&mut e, "SELECT extract(hours from interval '4 hours')::text"),
-        q(&mut e, "SELECT extract(minutes from interval '30 minutes')::text"),
+        q(
+            &mut e,
+            "SELECT extract(hours from interval '4 hours')::text",
+        ),
+        q(
+            &mut e,
+            "SELECT extract(minutes from interval '30 minutes')::text",
+        ),
         q(&mut e, "SELECT extract(weeks from date '2024-06-15')::text"),
-        q(&mut e, "SELECT extract(decades from date '2024-06-15')::text"),
-        q(&mut e, "SELECT extract(centuries from date '2024-06-15')::text"),
-        q(&mut e, "SELECT extract(millenniums from date '2024-06-15')::text"),
+        q(
+            &mut e,
+            "SELECT extract(decades from date '2024-06-15')::text",
+        ),
+        q(
+            &mut e,
+            "SELECT extract(centuries from date '2024-06-15')::text",
+        ),
+        q(
+            &mut e,
+            "SELECT extract(millenniums from date '2024-06-15')::text",
+        ),
         q(&mut e, "SELECT extract(day from interval '7 days')::text"),
         // date_part function form shares the plural aliases
         q(&mut e, "SELECT date_part('days', interval '7 days')::text"),
-        q(&mut e, "SELECT date_part('months', interval '5 months')::text"),
+        q(
+            &mut e,
+            "SELECT date_part('months', interval '5 months')::text",
+        ),
     ];
     assert_eq!(out.join("|"), "3|5|7|4|30|24|202|21|3|7|7|5");
 }
@@ -2297,12 +3780,25 @@ fn extract_plural_fields() {
 fn text_numeric_concat() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     assert_eq!(q(&mut e, "SELECT ('x' || 1.5::numeric)"), "x1.5");
     assert_eq!(q(&mut e, "SELECT (1.5::numeric || 'x')"), "1.5x");
-    assert_eq!(q(&mut e, "SELECT ('val=' || 3.14::numeric || '!')"), "val=3.14!");
-    assert_eq!(q(&mut e, "SELECT ('n' || (10::numeric/4))"), "n2.5000000000000000");
+    assert_eq!(
+        q(&mut e, "SELECT ('val=' || 3.14::numeric || '!')"),
+        "val=3.14!"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT ('n' || (10::numeric/4))"),
+        "n2.5000000000000000"
+    );
     // int || numeric still fine (int coerces to text)
     assert_eq!(q(&mut e, "SELECT (5 || ':' || 2.5::numeric)"), "5:2.5");
 }
@@ -2312,13 +3808,35 @@ fn text_numeric_concat() {
 fn date_plus_time_is_timestamp() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + time '10:30:00')::text"), "2024-06-15 10:30:00");
-    assert_eq!(q(&mut e, "SELECT (time '23:59:59' + date '2024-06-15')::text"), "2024-06-15 23:59:59");
-    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + time '00:00:00')::text"), "2024-06-15 00:00:00");
+    assert_eq!(
+        q(&mut e, "SELECT (date '2024-06-15' + time '10:30:00')::text"),
+        "2024-06-15 10:30:00"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT (time '23:59:59' + date '2024-06-15')::text"),
+        "2024-06-15 23:59:59"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT (date '2024-06-15' + time '00:00:00')::text"),
+        "2024-06-15 00:00:00"
+    );
     // date + interval still works (regression)
-    assert_eq!(q(&mut e, "SELECT (date '2024-06-15' + interval '1 day')::text"), "2024-06-16 00:00:00");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (date '2024-06-15' + interval '1 day')::text"
+        ),
+        "2024-06-16 00:00:00"
+    );
 }
 
 /// A timestamp-shaped string INSERTed into a DATE column truncates to
@@ -2333,10 +3851,20 @@ fn date_column_coerces_timestamp_string() {
     )
     .unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     assert_eq!(
-        q(&mut e, "SELECT string_agg(d::text, '|' ORDER BY d) FROM dcoerce"),
+        q(
+            &mut e,
+            "SELECT string_agg(d::text, '|' ORDER BY d) FROM dcoerce"
+        ),
         "2020-01-01|2020-03-15|2020-06-01"
     );
 }
@@ -2348,7 +3876,14 @@ fn value_to_charn_cast() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
         // v7.38 (read01, T11) — CHAR(n) casts now yield bpchar values.
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)|Value::BpChar(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     assert_eq!(q(&mut e, "SELECT (99::char(2))"), "99");
     assert_eq!(q(&mut e, "SELECT (99::varchar(2))"), "99");
@@ -2364,20 +3899,58 @@ fn value_to_charn_cast() {
 fn window_aggregate_filter() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(g int, v int)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(1,30),(2,5),(2,15)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(1,30),(2,5),(2,15)")
+        .unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     // count FILTER over whole partition
-    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) FILTER (WHERE v > 15) OVER () c FROM t WHERE g=1) s"), "10:3,20:3,20:3,30:3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) FILTER (WHERE v > 15) OVER () c FROM t WHERE g=1) s"
+        ),
+        "10:3,20:3,20:3,30:3"
+    );
     // sum FILTER over a running (ORDER BY) frame — excludes v=20 rows
-    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||s, ',' ORDER BY v) FROM (SELECT v, sum(v) FILTER (WHERE v <> 20) OVER (ORDER BY v) s FROM t WHERE g=1) x"), "10:10,20:10,20:10,30:40");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v||':'||s, ',' ORDER BY v) FROM (SELECT v, sum(v) FILTER (WHERE v <> 20) OVER (ORDER BY v) s FROM t WHERE g=1) x"
+        ),
+        "10:10,20:10,20:10,30:40"
+    );
     // count FILTER over PARTITION BY
-    assert_eq!(q(&mut e, "SELECT string_agg(g||':'||v||':'||c, ',' ORDER BY g,v) FROM (SELECT g, v, count(*) FILTER (WHERE v >= 15) OVER (PARTITION BY g) c FROM t) s"), "1:10:3,1:20:3,1:20:3,1:30:3,2:5:1,2:15:1");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(g||':'||v||':'||c, ',' ORDER BY g,v) FROM (SELECT g, v, count(*) FILTER (WHERE v >= 15) OVER (PARTITION BY g) c FROM t) s"
+        ),
+        "1:10:3,1:20:3,1:20:3,1:30:3,2:5:1,2:15:1"
+    );
     // min FILTER (exact — avg would hit the D.33 avg(int)→float divergence)
-    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||m, ',' ORDER BY v) FROM (SELECT v, min(v) FILTER (WHERE v > 10) OVER () m FROM t WHERE g=1) x"), "10:20,20:20,20:20,30:20");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v||':'||m, ',' ORDER BY v) FROM (SELECT v, min(v) FILTER (WHERE v > 10) OVER () m FROM t WHERE g=1) x"
+        ),
+        "10:20,20:20,20:20,30:20"
+    );
     // plain OVER without FILTER unchanged (regression)
-    assert_eq!(q(&mut e, "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) OVER () c FROM t WHERE g=1) s"), "10:4,20:4,20:4,30:4");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(v||':'||c, ',' ORDER BY v) FROM (SELECT v, count(*) OVER () c FROM t WHERE g=1) s"
+        ),
+        "10:4,20:4,20:4,30:4"
+    );
 }
 
 /// v7.37 D.41 — SELECT DISTINCT dedups over a window projection. PG18.4-verified.
@@ -2385,15 +3958,48 @@ fn window_aggregate_filter() {
 fn distinct_over_window() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(g int, v int)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(2,5),(2,15),(3,7)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(1,20),(1,20),(2,5),(2,15),(3,7)")
+        .unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Null=>"".into(), Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Null => "".into(),
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT g||':'||(count(*) OVER (PARTITION BY g)) x FROM t) s"), "1:3,2:2,3:1");
-    assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM (SELECT DISTINCT g, sum(v) OVER (PARTITION BY g) FROM t) s)::text"), "3");
-    assert_eq!(q(&mut e, "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT (rank() OVER (ORDER BY g))::text x FROM t) s"), "1,4,6");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT g||':'||(count(*) OVER (PARTITION BY g)) x FROM t) s"
+        ),
+        "1:3,2:2,3:1"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (SELECT count(*) FROM (SELECT DISTINCT g, sum(v) OVER (PARTITION BY g) FROM t) s)::text"
+        ),
+        "3"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT (rank() OVER (ORDER BY g))::text x FROM t) s"
+        ),
+        "1,4,6"
+    );
     // plain DISTINCT (no window) unchanged
-    assert_eq!(q(&mut e, "SELECT (SELECT count(*) FROM (SELECT DISTINCT g FROM t) s)::text"), "3");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (SELECT count(*) FROM (SELECT DISTINCT g FROM t) s)::text"
+        ),
+        "3"
+    );
 }
 
 /// v7.37 D.42 — a multi-row VALUES seed recursive CTE terminates (non-recursive
@@ -2402,16 +4008,47 @@ fn distinct_over_window() {
 fn recursive_cte_multirow_seed() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
     // multi-row VALUES seed (previously ran away to 100k iterations)
-    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1),(2) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"), "1,2,11,12,21,22");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1),(2) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"
+        ),
+        "1,2,11,12,21,22"
+    );
     // single-row VALUES seed unchanged (task #387)
-    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"), "1,11,21");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT n FROM c) s"
+        ),
+        "1,11,21"
+    );
     // SELECT-based two-anchor seed
-    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT 2 UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT DISTINCT n FROM c) s"), "1,2,11,12,21,22");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT 2 UNION ALL SELECT n+10 FROM c WHERE n < 15) SELECT DISTINCT n FROM c) s"
+        ),
+        "1,2,11,12,21,22"
+    );
     // plain single-anchor recursion unchanged (regression)
-    assert_eq!(q(&mut e, "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c) s"), "1,2,3,4,5");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(n::text, ',' ORDER BY n) FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c) s"
+        ),
+        "1,2,3,4,5"
+    );
 }
 
 /// v7.37 D.43 — a WITH/RECURSIVE CTE in scalar-subquery position parses + runs.
@@ -2420,11 +4057,36 @@ fn recursive_cte_multirow_seed() {
 fn cte_in_scalar_subquery() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, Ok(o)=>format!("<{o:?}>"), Err(e2)=>format!("ERR:{e2:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            Ok(o) => format!("<{o:?}>"),
+            Err(e2) => format!("ERR:{e2:?}"),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 100) SELECT count(*) FROM c)::text"), "100");
-    assert_eq!(q(&mut e, "SELECT (WITH x AS (SELECT 5 v) SELECT v FROM x)::text"), "5");
-    assert_eq!(q(&mut e, "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT sum(n) FROM c)::text"), "15");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 100) SELECT count(*) FROM c)::text"
+        ),
+        "100"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (WITH x AS (SELECT 5 v) SELECT v FROM x)::text"
+        ),
+        "5"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT sum(n) FROM c)::text"
+        ),
+        "15"
+    );
     // non-subquery parenthesised expression still works (regression)
     assert_eq!(q(&mut e, "SELECT ((1 + 2) * 3)::text"), "9");
 }
@@ -2435,23 +4097,51 @@ fn cte_in_scalar_subquery() {
 fn merge_subquery_source() {
     let mut e = Engine::new();
     let agg = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), _=>"?".into() }, o=>format!("{o:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                _ => "?".into(),
+            },
+            o => format!("{o:?}"),
+        }
     };
-    e.execute("CREATE TABLE tgt(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE tgt(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO tgt VALUES (1,10),(2,20)").unwrap();
     e.execute("MERGE INTO tgt USING (SELECT * FROM (VALUES (1,100),(3,300)) s(id,v)) src ON tgt.id=src.id WHEN MATCHED THEN UPDATE SET v=src.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (src.id,src.v)").unwrap();
-    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tgt"), "1:100,2:20,3:300");
-    e.execute("CREATE TABLE t2(id int primary key, v int)").unwrap();
-    e.execute("INSERT INTO t2 VALUES (1,1),(2,2),(3,3)").unwrap();
+    assert_eq!(
+        agg(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tgt"
+        ),
+        "1:100,2:20,3:300"
+    );
+    e.execute("CREATE TABLE t2(id int primary key, v int)")
+        .unwrap();
+    e.execute("INSERT INTO t2 VALUES (1,1),(2,2),(3,3)")
+        .unwrap();
     e.execute("MERGE INTO t2 USING (SELECT id, v*10 w FROM (VALUES (2,5),(4,7)) s(id,v)) src ON t2.id=src.id WHEN MATCHED THEN UPDATE SET v=src.w WHEN NOT MATCHED THEN INSERT (id,v) VALUES (src.id, src.w)").unwrap();
-    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t2"), "1:1,2:50,3:3,4:70");
+    assert_eq!(
+        agg(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t2"
+        ),
+        "1:1,2:50,3:3,4:70"
+    );
     // plain table source unchanged (regression)
-    e.execute("CREATE TABLE tg3(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE tg3(id int primary key, v int)")
+        .unwrap();
     e.execute("CREATE TABLE sr3(id int, v int)").unwrap();
     e.execute("INSERT INTO tg3 VALUES (1,10)").unwrap();
     e.execute("INSERT INTO sr3 VALUES (1,99),(2,88)").unwrap();
     e.execute("MERGE INTO tg3 USING sr3 ON tg3.id=sr3.id WHEN MATCHED THEN UPDATE SET v=sr3.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (sr3.id,sr3.v)").unwrap();
-    assert_eq!(agg(&mut e, "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tg3"), "1:99,2:88");
+    assert_eq!(
+        agg(
+            &mut e,
+            "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM tg3"
+        ),
+        "1:99,2:88"
+    );
 }
 
 /// v7.37 D.45 — RANGE partitioning on INTEGER / DATE / BIGINT keys (not just
@@ -2459,28 +4149,89 @@ fn merge_subquery_source() {
 #[test]
 fn range_partition_nontimestamp_key() {
     let mut e = Engine::new();
-    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
+    let g = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(Value::Null) => "".into(),
+                _ => "?".into(),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // INTEGER range key
-    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)").unwrap();
-    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)").unwrap();
-    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)").unwrap();
-    e.execute("CREATE TABLE mi_def PARTITION OF mi DEFAULT").unwrap();
-    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12),(5,25)").unwrap();
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"), "1:5,3:8");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_hi"), "2:15,4:12");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_def"), "5:25");
+    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)")
+        .unwrap();
+    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)")
+        .unwrap();
+    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)")
+        .unwrap();
+    e.execute("CREATE TABLE mi_def PARTITION OF mi DEFAULT")
+        .unwrap();
+    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12),(5,25)")
+        .unwrap();
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"
+        ),
+        "1:5,3:8"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_hi"
+        ),
+        "2:15,4:12"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_def"
+        ),
+        "5:25"
+    );
     // DATE range key
-    e.execute("CREATE TABLE md(id int, d date) PARTITION BY RANGE (d)").unwrap();
-    e.execute("CREATE TABLE md_2025 PARTITION OF md FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')").unwrap();
-    e.execute("CREATE TABLE md_2026 PARTITION OF md FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')").unwrap();
-    e.execute("INSERT INTO md VALUES (1,'2025-06-15'),(2,'2026-03-20')").unwrap();
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2025"), "1:2025-06-15");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2026"), "2:2026-03-20");
+    e.execute("CREATE TABLE md(id int, d date) PARTITION BY RANGE (d)")
+        .unwrap();
+    e.execute(
+        "CREATE TABLE md_2025 PARTITION OF md FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    )
+    .unwrap();
+    e.execute(
+        "CREATE TABLE md_2026 PARTITION OF md FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+    )
+    .unwrap();
+    e.execute("INSERT INTO md VALUES (1,'2025-06-15'),(2,'2026-03-20')")
+        .unwrap();
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2025"
+        ),
+        "1:2025-06-15"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||d,',' ORDER BY id) FROM md_2026"
+        ),
+        "2:2026-03-20"
+    );
     // BIGINT range key
-    e.execute("CREATE TABLE mb(id int, k bigint) PARTITION BY RANGE (k)").unwrap();
-    e.execute("CREATE TABLE mb_a PARTITION OF mb FOR VALUES FROM (0) TO (1000000000000)").unwrap();
-    e.execute("INSERT INTO mb VALUES (1, 500000000000)").unwrap();
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||k,',' ORDER BY id) FROM mb_a"), "1:500000000000");
+    e.execute("CREATE TABLE mb(id int, k bigint) PARTITION BY RANGE (k)")
+        .unwrap();
+    e.execute("CREATE TABLE mb_a PARTITION OF mb FOR VALUES FROM (0) TO (1000000000000)")
+        .unwrap();
+    e.execute("INSERT INTO mb VALUES (1, 500000000000)")
+        .unwrap();
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||k,',' ORDER BY id) FROM mb_a"
+        ),
+        "1:500000000000"
+    );
 }
 
 /// v7.37 D.46 — DELETE on a partition parent fans out to children (RANGE + LIST).
@@ -2488,23 +4239,61 @@ fn range_partition_nontimestamp_key() {
 #[test]
 fn delete_on_partition_parent() {
     let mut e = Engine::new();
-    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
-    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)").unwrap();
-    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)").unwrap();
-    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)").unwrap();
-    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12)").unwrap();
+    let g = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(Value::Null) => "".into(),
+                _ => "?".into(),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    e.execute("CREATE TABLE mi(id int, g int) PARTITION BY RANGE (g)")
+        .unwrap();
+    e.execute("CREATE TABLE mi_lo PARTITION OF mi FOR VALUES FROM (0) TO (10)")
+        .unwrap();
+    e.execute("CREATE TABLE mi_hi PARTITION OF mi FOR VALUES FROM (10) TO (20)")
+        .unwrap();
+    e.execute("INSERT INTO mi VALUES (1,5),(2,15),(3,8),(4,12)")
+        .unwrap();
     // DELETE on the parent removes matching rows from every child.
     let del = e.execute("DELETE FROM mi WHERE g < 10").unwrap();
-    assert!(matches!(del, QueryResult::CommandOk { affected: 2, .. }), "{del:?}");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi"), "2:15,4:12");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"), "");
+    assert!(
+        matches!(del, QueryResult::CommandOk { affected: 2, .. }),
+        "{del:?}"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi"
+        ),
+        "2:15,4:12"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM mi_lo"
+        ),
+        ""
+    );
     // LIST parent DELETE fans out across the value + DEFAULT partitions.
-    e.execute("CREATE TABLE l(id int, c text) PARTITION BY LIST (c)").unwrap();
-    e.execute("CREATE TABLE l_a PARTITION OF l FOR VALUES IN ('a','b')").unwrap();
-    e.execute("CREATE TABLE l_def PARTITION OF l DEFAULT").unwrap();
-    e.execute("INSERT INTO l VALUES (1,'a'),(2,'z'),(3,'b'),(4,'y')").unwrap();
+    e.execute("CREATE TABLE l(id int, c text) PARTITION BY LIST (c)")
+        .unwrap();
+    e.execute("CREATE TABLE l_a PARTITION OF l FOR VALUES IN ('a','b')")
+        .unwrap();
+    e.execute("CREATE TABLE l_def PARTITION OF l DEFAULT")
+        .unwrap();
+    e.execute("INSERT INTO l VALUES (1,'a'),(2,'z'),(3,'b'),(4,'y')")
+        .unwrap();
     e.execute("DELETE FROM l WHERE c IN ('a','z')").unwrap();
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||c,',' ORDER BY id) FROM l"), "3:b,4:y");
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||c,',' ORDER BY id) FROM l"
+        ),
+        "3:b,4:y"
+    );
 }
 
 /// v7.37 D.47 (partial) — UPDATE on a partition parent fans out to children for
@@ -2513,22 +4302,58 @@ fn delete_on_partition_parent() {
 #[test]
 fn update_on_partition_parent_nonkey() {
     let mut e = Engine::new();
-    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Null)=>"".into(), _=>"?".into() }, o=>format!("{o:?}") } };
-    e.execute("CREATE TABLE t(id int, g int, label text) PARTITION BY RANGE (g)").unwrap();
-    e.execute("CREATE TABLE t_lo PARTITION OF t FOR VALUES FROM (0) TO (10)").unwrap();
-    e.execute("CREATE TABLE t_hi PARTITION OF t FOR VALUES FROM (10) TO (20)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,5,'a'),(2,15,'b'),(3,8,'c')").unwrap();
+    let g = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(Value::Null) => "".into(),
+                _ => "?".into(),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    e.execute("CREATE TABLE t(id int, g int, label text) PARTITION BY RANGE (g)")
+        .unwrap();
+    e.execute("CREATE TABLE t_lo PARTITION OF t FOR VALUES FROM (0) TO (10)")
+        .unwrap();
+    e.execute("CREATE TABLE t_hi PARTITION OF t FOR VALUES FROM (10) TO (20)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1,5,'a'),(2,15,'b'),(3,8,'c')")
+        .unwrap();
     // non-key UPDATE with WHERE fans out and applies SET in each child
-    let u1 = e.execute("UPDATE t SET label = upper(label) WHERE g < 10").unwrap();
-    assert!(matches!(u1, QueryResult::CommandOk { affected: 2, .. }), "{u1:?}");
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g||':'||label, ',' ORDER BY id) FROM t"), "1:5:A,2:15:b,3:8:C");
+    let u1 = e
+        .execute("UPDATE t SET label = upper(label) WHERE g < 10")
+        .unwrap();
+    assert!(
+        matches!(u1, QueryResult::CommandOk { affected: 2, .. }),
+        "{u1:?}"
+    );
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g||':'||label, ',' ORDER BY id) FROM t"
+        ),
+        "1:5:A,2:15:b,3:8:C"
+    );
     // non-key UPDATE with no WHERE touches every child row
     e.execute("UPDATE t SET label = 'X'").unwrap();
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||label, ',' ORDER BY id) FROM t"), "1:X,2:X,3:X");
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||label, ',' ORDER BY id) FROM t"
+        ),
+        "1:X,2:X,3:X"
+    );
     // key-touching UPDATE on the parent is rejected honestly (not silently misfiled)
     assert!(e.execute("UPDATE t SET g = 17 WHERE id = 1").is_err());
     // the rejected UPDATE left the data untouched
-    assert_eq!(g(&mut e, "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM t"), "1:5,2:15,3:8");
+    assert_eq!(
+        g(
+            &mut e,
+            "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM t"
+        ),
+        "1:5,2:15,3:8"
+    );
 }
 
 /// v7.37 D.49 — jsonb_array_length / json_array_length accept a TEXT arg (PG
@@ -2537,12 +4362,22 @@ fn update_on_partition_parent_nonkey() {
 fn jsonb_array_length_text_arg() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => format!("{:?}", &rows[0].values[0]), Ok(o)=>format!("{o:?}"), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => format!("{:?}", &rows[0].values[0]),
+            Ok(o) => format!("{o:?}"),
+            Err(er) => format!("ERR:{:.30}", format!("{er:?}")),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]')"), "Int(4)");
+    assert_eq!(
+        q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]')"),
+        "Int(4)"
+    );
     assert_eq!(q(&mut e, "SELECT json_array_length('[1,2,3,4]')"), "Int(4)");
     // explicit ::jsonb still works
-    assert_eq!(q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]'::jsonb)"), "Int(4)");
+    assert_eq!(
+        q(&mut e, "SELECT jsonb_array_length('[1,2,3,4]'::jsonb)"),
+        "Int(4)"
+    );
     // NULL passthrough + non-array error preserved
     assert_eq!(q(&mut e, "SELECT jsonb_array_length(NULL)"), "Null");
     assert!(q(&mut e, "SELECT jsonb_array_length('{\"a\":1}')").starts_with("ERR"));
@@ -2554,14 +4389,28 @@ fn jsonb_array_length_text_arg() {
 fn jsonb_typeof_strip_text_arg() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Null=>"".into(), o=>format!("{o:?}") }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.25}", format!("{er:?}")) }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Null => "".into(),
+                o => format!("{o:?}"),
+            },
+            Ok(_) => "OK".into(),
+            Err(er) => format!("ERR:{:.25}", format!("{er:?}")),
+        }
     };
     assert_eq!(q(&mut e, "SELECT jsonb_typeof('[1,2]')"), "array");
     assert_eq!(q(&mut e, "SELECT jsonb_typeof('{\"a\":1}')"), "object");
     assert_eq!(q(&mut e, "SELECT jsonb_typeof('42')"), "number");
     assert_eq!(q(&mut e, "SELECT json_typeof('\"hi\"')"), "string");
     // strip_nulls returns jsonb; its spacing is D.8-architectural so just check keys
-    assert_eq!(q(&mut e, "SELECT (jsonb_strip_nulls('{\"a\":null,\"b\":1}')->>'b')"), "1");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (jsonb_strip_nulls('{\"a\":null,\"b\":1}')->>'b')"
+        ),
+        "1"
+    );
     // NULL passthrough + ::jsonb still work
     assert_eq!(q(&mut e, "SELECT jsonb_typeof(NULL)"), "");
     assert_eq!(q(&mut e, "SELECT jsonb_typeof('[1]'::jsonb)"), "array");
@@ -2573,14 +4422,52 @@ fn jsonb_typeof_strip_text_arg() {
 fn tsquery_adjacency_operator() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Bool(b)=>format!("{b}"), o=>format!("{o:?}") }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Bool(b) => format!("{b}"),
+                o => format!("{o:?}"),
+            },
+            Ok(_) => "OK".into(),
+            Err(er) => format!("ERR:{:.30}", format!("{er:?}")),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'quick <-> brown'))::text"), "'quick' <-> 'brown'");
-    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'quick <2> fox'))::text"), "'quick' <2> 'fox'");
-    assert_eq!(q(&mut e, "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> brown'))::text"), "true");
-    assert_eq!(q(&mut e, "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> fox'))::text"), "false");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (to_tsquery('english', 'quick <-> brown'))::text"
+        ),
+        "'quick' <-> 'brown'"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (to_tsquery('english', 'quick <2> fox'))::text"
+        ),
+        "'quick' <2> 'fox'"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> brown'))::text"
+        ),
+        "true"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (to_tsvector('english', 'the quick brown fox') @@ to_tsquery('english', 'quick <-> fox'))::text"
+        ),
+        "false"
+    );
     // <-> binds tighter than & (no stop words here to keep it about the operator)
-    assert_eq!(q(&mut e, "SELECT (to_tsquery('english', 'foo <-> bar & baz'))::text"), "'foo' <-> 'bar' & 'baz'");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT (to_tsquery('english', 'foo <-> bar & baz'))::text"
+        ),
+        "'foo' <-> 'bar' & 'baz'"
+    );
 }
 
 /// v7.37 D.53 — `UPDATE t SET arr[i] = v` array element assignment, PG NULL-pads
@@ -2588,19 +4475,40 @@ fn tsquery_adjacency_operator() {
 #[test]
 fn update_set_array_element() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id int primary key, arr int[], tags text[])").unwrap();
-    e.execute("INSERT INTO t VALUES (1, ARRAY[10,20,30], ARRAY['x','y']), (2, ARRAY[5], NULL)").unwrap();
-    let g = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, o=>format!("{o:?}") } };
+    e.execute("CREATE TABLE t(id int primary key, arr int[], tags text[])")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, ARRAY[10,20,30], ARRAY['x','y']), (2, ARRAY[5], NULL)")
+        .unwrap();
+    let g = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     e.execute("UPDATE t SET arr[2] = 99 WHERE id=1").unwrap();
-    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=1"), "{10,99,30}");
+    assert_eq!(
+        g(&mut e, "SELECT arr::text FROM t WHERE id=1"),
+        "{10,99,30}"
+    );
     e.execute("UPDATE t SET tags[1] = 'z' WHERE id=1").unwrap();
     assert_eq!(g(&mut e, "SELECT tags::text FROM t WHERE id=1"), "{z,y}");
     // out-of-bounds NULL-pads
     e.execute("UPDATE t SET arr[10] = 7 WHERE id=2").unwrap();
-    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=2"), "{5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,7}");
+    assert_eq!(
+        g(&mut e, "SELECT arr::text FROM t WHERE id=2"),
+        "{5,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,7}"
+    );
     // two element assignments in one SET
-    e.execute("UPDATE t SET arr[1] = 100, arr[3] = 300 WHERE id=1").unwrap();
-    assert_eq!(g(&mut e, "SELECT arr::text FROM t WHERE id=1"), "{100,99,300}");
+    e.execute("UPDATE t SET arr[1] = 100, arr[3] = 300 WHERE id=1")
+        .unwrap();
+    assert_eq!(
+        g(&mut e, "SELECT arr::text FROM t WHERE id=1"),
+        "{100,99,300}"
+    );
 }
 
 /// v7.37 D.54 — IN/NOT IN subquery three-valued NULL logic. When the IN-list holds
@@ -2610,17 +4518,40 @@ fn update_set_array_element() {
 fn in_subquery_null_three_valued_logic() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int, v int)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,NULL)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,NULL)")
+        .unwrap();
     e.execute("CREATE TABLE s(x int)").unwrap();
     e.execute("INSERT INTO s VALUES (10),(NULL)").unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(Value::Bool(b))=>format!("{b}"), Some(Value::Null)=>"".into(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.30}", format!("{er:?}")) }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(Value::Bool(b)) => format!("{b}"),
+                Some(Value::Null) => "".into(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(_) => "OK".into(),
+            Err(er) => format!("ERR:{:.30}", format!("{er:?}")),
+        }
     };
     let out = [
-        q(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s)"),
-        q(&mut e, "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s)"),
-        q(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s WHERE x IS NOT NULL)"),
-        q(&mut e, "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s WHERE x IS NOT NULL)"),
+        q(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s)",
+        ),
+        q(
+            &mut e,
+            "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s)",
+        ),
+        q(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE v IN (SELECT x FROM s WHERE x IS NOT NULL)",
+        ),
+        q(
+            &mut e,
+            "SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'(none)') FROM t WHERE v NOT IN (SELECT x FROM s WHERE x IS NOT NULL)",
+        ),
         q(&mut e, "SELECT (5 IN (SELECT x FROM s))::text"),
         q(&mut e, "SELECT (5 NOT IN (SELECT x FROM s))::text"),
         q(&mut e, "SELECT (10 IN (SELECT x FROM s))::text"),
@@ -2640,18 +4571,35 @@ fn alter_type_add_value() {
     e.execute("CREATE TABLE m(x mood)").unwrap();
     e.execute("INSERT INTO m VALUES ('happy')").unwrap();
     // BEFORE / AFTER positioning
-    e.execute("ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok'").unwrap();
-    e.execute("ALTER TYPE mood ADD VALUE 'awful' BEFORE 'sad'").unwrap();
+    e.execute("ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok'")
+        .unwrap();
+    e.execute("ALTER TYPE mood ADD VALUE 'awful' BEFORE 'sad'")
+        .unwrap();
     e.execute("INSERT INTO m VALUES ('meh'),('awful')").unwrap();
     // IF NOT EXISTS is a no-op on a duplicate
-    e.execute("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'happy'").unwrap();
+    e.execute("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'happy'")
+        .unwrap();
     // duplicate without IF NOT EXISTS errors
     assert!(e.execute("ALTER TYPE mood ADD VALUE 'happy'").is_err());
     // enum ordering reflected via enum_range/ordering
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // all three ADD VALUE labels round-trip (ordered by text — SPG orders enum
     // columns lexically, not by ordinal; enum-ordinal ORDER BY is a separate gap).
-    assert_eq!(q(&mut e, "SELECT string_agg(x::text, ',' ORDER BY x::text) FROM m"), "awful,happy,meh");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT string_agg(x::text, ',' ORDER BY x::text) FROM m"
+        ),
+        "awful,happy,meh"
+    );
 }
 
 /// v7.37 U5+U6 — pg_constraint now emits CHECK ('c') and NOT NULL ('n', PG18) rows.
@@ -2661,67 +4609,210 @@ fn pg_constraint_check_and_notnull_rows() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int PRIMARY KEY, age int CHECK (age >= 0), email text NOT NULL, UNIQUE(email))").unwrap();
     let q = |e: &mut Engine, sql: &str| -> String {
-        match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => rows.iter().map(|r| match &r.values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }).collect::<Vec<_>>().join(","), o=>format!("{o:?}") }
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => rows
+                .iter()
+                .map(|r| match &r.values[0] {
+                    Value::Text(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            o => format!("{o:?}"),
+        }
     };
-    assert_eq!(q(&mut e, "SELECT contype||':'||count(*)::text FROM pg_constraint GROUP BY contype ORDER BY contype"), "c:1,n:2,p:1,u:1");
-    assert_eq!(q(&mut e, "SELECT conname FROM pg_constraint WHERE contype='n' ORDER BY conname"), "t_email_not_null,t_id_not_null");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT contype||':'||count(*)::text FROM pg_constraint GROUP BY contype ORDER BY contype"
+        ),
+        "c:1,n:2,p:1,u:1"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT conname FROM pg_constraint WHERE contype='n' ORDER BY conname"
+        ),
+        "t_email_not_null,t_id_not_null"
+    );
 }
 
 /// v7.37 U11 — pg_catalog.pg_sequence view, one row per sequence. PG18.4-verified.
 #[test]
 fn pg_sequence_catalog_view() {
     let mut e = Engine::new();
-    e.execute("CREATE SEQUENCE q START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CACHE 1 CYCLE").unwrap();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    e.execute("CREATE SEQUENCE q START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 100 CACHE 1 CYCLE")
+        .unwrap();
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // PG18.4: seqstart|seqincrement|seqmax|seqmin|seqcache|seqcycle = 5|2|100|1|1|true
-    assert_eq!(q(&mut e, "SELECT seqstart::text||'|'||seqincrement::text||'|'||seqmax::text||'|'||seqmin::text||'|'||seqcache::text||'|'||seqcycle::text FROM pg_sequence"), "5|2|100|1|1|true");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT seqstart::text||'|'||seqincrement::text||'|'||seqmax::text||'|'||seqmin::text||'|'||seqcache::text||'|'||seqcycle::text FROM pg_sequence"
+        ),
+        "5|2|100|1|1|true"
+    );
 }
 
 /// v7.37 — `jsonb @? jsonpath` existence operator (= jsonb_path_exists). PG18.4-verified.
 #[test]
 fn jsonb_path_exists_operator() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), Value::Bool(b)=>format!("{b}"), Value::Null=>"".into(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
-    assert_eq!(q(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb @? '$.a')::text"), "true");
-    assert_eq!(q(&mut e, "SELECT ('{\"a\":1}'::jsonb @? '$.c')::text"), "false");
-    assert_eq!(q(&mut e, "SELECT ('{\"x\":{\"y\":5}}'::jsonb @? '$.x.y')::text"), "true");
-    assert_eq!(q(&mut e, "SELECT ('{\"a\":[1,2,3]}'::jsonb @? '$.a[*]')::text"), "true");
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                Value::Bool(b) => format!("{b}"),
+                Value::Null => "".into(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    assert_eq!(
+        q(&mut e, "SELECT ('{\"a\":1,\"b\":2}'::jsonb @? '$.a')::text"),
+        "true"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT ('{\"a\":1}'::jsonb @? '$.c')::text"),
+        "false"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT ('{\"x\":{\"y\":5}}'::jsonb @? '$.x.y')::text"
+        ),
+        "true"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT ('{\"a\":[1,2,3]}'::jsonb @? '$.a[*]')::text"
+        ),
+        "true"
+    );
 }
 
 /// v7.37 D.57 — to_char `TH`/`th` ordinal suffix + trailing `%` literal. PG18.4-verified.
 #[test]
 fn to_char_ordinal_and_percent() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
-    assert_eq!(q(&mut e, "SELECT to_char(1,'FM9th')||'|'||to_char(2,'FM9th')||'|'||to_char(3,'FM9th')||'|'||to_char(4,'FM9th')||'|'||to_char(11,'FM99th')||'|'||to_char(21,'FM99th')||'|'||to_char(5,'FM9TH')||'|'||to_char(0.5,'FM90%')"),
-        "1st|2nd|3rd|4th|11th|21st|5TH|1%");
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(1,'FM9th')||'|'||to_char(2,'FM9th')||'|'||to_char(3,'FM9th')||'|'||to_char(4,'FM9th')||'|'||to_char(11,'FM99th')||'|'||to_char(21,'FM99th')||'|'||to_char(5,'FM9TH')||'|'||to_char(0.5,'FM90%')"
+        ),
+        "1st|2nd|3rd|4th|11th|21st|5TH|1%"
+    );
     // no regression on the common patterns
-    assert_eq!(q(&mut e, "SELECT to_char(1234567.891, 'FM999,999,999.00')"), "1,234,567.89");
-    assert_eq!(q(&mut e, "SELECT to_char(-1234.5, 'FM999,990.00PR')"), "<1,234.50>");
+    assert_eq!(
+        q(&mut e, "SELECT to_char(1234567.891, 'FM999,999,999.00')"),
+        "1,234,567.89"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_char(-1234.5, 'FM999,990.00PR')"),
+        "<1,234.50>"
+    );
 }
 
 /// v7.37 D.58 — to_char timestamp SSSS (seconds-of-day) + FF1-FF6 fractional. PG18.4-verified.
 #[test]
 fn to_char_ts_ssss_and_ff() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // PG18.4: SSSS=52245, FF3=14:30:45.123, FF6=...123456, FF1=...1
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'SSSS')"), "52245");
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'HH24:MI:SS.FF3')"), "14:30:45.123");
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF6')"), "123456");
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF1')"), "1");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'SSSS')"
+        ),
+        "52245"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'HH24:MI:SS.FF3')"
+        ),
+        "14:30:45.123"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF6')"
+        ),
+        "123456"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45.123456', 'FF1')"
+        ),
+        "1"
+    );
     // no regression: plain SS still works
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', 'HH24:MI:SS')"), "14:30:45");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', 'HH24:MI:SS')"
+        ),
+        "14:30:45"
+    );
     // midnight SSSS=0
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-05 00:00:00', 'SSSS')"), "0");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-05 00:00:00', 'SSSS')"
+        ),
+        "0"
+    );
 }
 
 /// v7.37 D.59 — to_char Y,YYY comma-year + IDDD ISO day-of-year. PG18.4-verified.
 #[test]
 fn to_char_ts_yyyy_comma_and_iddd() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
-    macro_rules! p { ($f:expr) => { q(&mut e, &format!("SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', '{}')", $f)) } }
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
+    macro_rules! p {
+        ($f:expr) => {
+            q(
+                &mut e,
+                &format!("SELECT to_char(TIMESTAMP '2026-03-05 14:30:45', '{}')", $f),
+            )
+        };
+    }
     assert_eq!(p!("Y,YYY"), "2,026");
     assert_eq!(p!("IDDD"), "067");
     // no regression: ID (iso dow) + DD (day) still independent
@@ -2729,7 +4820,13 @@ fn to_char_ts_yyyy_comma_and_iddd() {
     assert_eq!(p!("DD"), "05");
     assert_eq!(p!("YYYY"), "2026");
     // IDDD on ISO-year day 1 (2026 ISO year starts Mon 2025-12-29)
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2025-12-29 00:00:00', 'IDDD')"), "001");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2025-12-29 00:00:00', 'IDDD')"
+        ),
+        "001"
+    );
 }
 
 /// v7.37 D.60 — to_char timestamp era (AD/BC/dotted) + dotted meridiem + real
@@ -2737,18 +4834,48 @@ fn to_char_ts_yyyy_comma_and_iddd() {
 #[test]
 fn to_char_ts_era_meridiem_ordinal() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(_)=>"OK".into(), Err(er)=>format!("ERR:{:.10}", format!("{er:?}")) } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(_) => "OK".into(),
+            Err(er) => format!("ERR:{:.10}", format!("{er:?}")),
+        }
+    };
     let ts = "TIMESTAMP '2026-03-05 14:30:45.123456'";
-    let codes = ["AM","PM","A.M.","am","pm","a.m.","BC","AD","B.C.","bc","MMth","HH12th","DDth","DDTH"];
-    let pg =    ["PM","PM","P.M.","pm","pm","p.m.","AD","AD","A.D.","ad","03rd","02nd","05th","05TH"];
+    let codes = [
+        "AM", "PM", "A.M.", "am", "pm", "a.m.", "BC", "AD", "B.C.", "bc", "MMth", "HH12th", "DDth",
+        "DDTH",
+    ];
+    let pg = [
+        "PM", "PM", "P.M.", "pm", "pm", "p.m.", "AD", "AD", "A.D.", "ad", "03rd", "02nd", "05th",
+        "05TH",
+    ];
     let mut diffs: Vec<String> = Vec::new();
-    for (i,c) in codes.iter().enumerate() {
+    for (i, c) in codes.iter().enumerate() {
         let got = q(&mut e, &format!("SELECT to_char({ts}, '{c}')"));
-        if got != pg[i] { diffs.push(format!("{c}[{got}!={}]", pg[i])); }
+        if got != pg[i] {
+            diffs.push(format!("{c}[{got}!={}]", pg[i]));
+        }
     }
     // ordinal edges + BC date, PG18.4-verified
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-21 14:00:00','DDth')"), "21st");
-    assert_eq!(q(&mut e, "SELECT to_char(TIMESTAMP '2026-03-01 00:00:00','DDth')"), "01st");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-21 14:00:00','DDth')"
+        ),
+        "21st"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2026-03-01 00:00:00','DDth')"
+        ),
+        "01st"
+    );
     assert!(diffs.is_empty(), "DIVERGENCES: {}", diffs.join(" "));
 }
 
@@ -2756,24 +4883,34 @@ fn to_char_ts_era_meridiem_ordinal() {
 #[test]
 fn to_char_num_trailing_sign() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     let cases = [
-        ("-1234.5","9999.99MI","1234.50-"),
-        ("1234.5","9999.99PL"," 1234.50+"),
-        ("1234.5","9999.99S","1234.50+"),
-        ("-1234.5","9999.99SG","1234.50-"),
-        ("-1234.5","S9999.99","-1234.50"),
-        ("1234.5","9999.99$"," 1234.50$"),
-        ("-5","FM9MI","5-"),
-        ("5","FM9PL","5+"),
-        ("-1234.5","9999.99PR","<1234.50>"),
-        ("1234.5","9999.99"," 1234.50"),
-        ("5","FM9th","5th"),
+        ("-1234.5", "9999.99MI", "1234.50-"),
+        ("1234.5", "9999.99PL", " 1234.50+"),
+        ("1234.5", "9999.99S", "1234.50+"),
+        ("-1234.5", "9999.99SG", "1234.50-"),
+        ("-1234.5", "S9999.99", "-1234.50"),
+        ("1234.5", "9999.99$", " 1234.50$"),
+        ("-5", "FM9MI", "5-"),
+        ("5", "FM9PL", "5+"),
+        ("-1234.5", "9999.99PR", "<1234.50>"),
+        ("1234.5", "9999.99", " 1234.50"),
+        ("5", "FM9th", "5th"),
     ];
     let mut bad = Vec::new();
-    for (n,f,pg) in &cases {
+    for (n, f, pg) in &cases {
         let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
-        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+        if &got != pg {
+            bad.push(format!("[{f}@{n}]{got}!={pg}"));
+        }
     }
     assert!(bad.is_empty(), "FAIL: {}", bad.join("  "));
 }
@@ -2782,57 +4919,128 @@ fn to_char_num_trailing_sign() {
 #[test]
 fn interval_clock_literal_and_tochar() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // clock-time interval literals, PG18.4-verified
     assert_eq!(q(&mut e, "SELECT (INTERVAL '14:30:45')::text"), "14:30:45");
-    assert_eq!(q(&mut e, "SELECT (INTERVAL '3 days 14:30:45')::text"), "3 days 14:30:45");
-    assert_eq!(q(&mut e, "SELECT (INTERVAL '1 day 05:00')::text"), "1 day 05:00:00");
-    assert_eq!(q(&mut e, "SELECT (INTERVAL '14:30:45.123456')::text"), "14:30:45.123456");
+    assert_eq!(
+        q(&mut e, "SELECT (INTERVAL '3 days 14:30:45')::text"),
+        "3 days 14:30:45"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT (INTERVAL '1 day 05:00')::text"),
+        "1 day 05:00:00"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT (INTERVAL '14:30:45.123456')::text"),
+        "14:30:45.123456"
+    );
     // no regression on worded form
-    assert_eq!(q(&mut e, "SELECT (INTERVAL '2 days 3 hours')::text"), "2 days 03:00:00");
+    assert_eq!(
+        q(&mut e, "SELECT (INTERVAL '2 days 3 hours')::text"),
+        "2 days 03:00:00"
+    );
     // interval to_char now works end to end (walker was fine; literal blocked it)
-    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'HH24:MI:SS')"), "14:30:45");
-    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'SSSS')"), "52245");
-    assert_eq!(q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'DD HH24:MI')"), "03 14:30");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(INTERVAL '3 days 14:30:45', 'HH24:MI:SS')"
+        ),
+        "14:30:45"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_char(INTERVAL '3 days 14:30:45', 'SSSS')"),
+        "52245"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_char(INTERVAL '3 days 14:30:45', 'DD HH24:MI')"
+        ),
+        "03 14:30"
+    );
 }
 
 /// v7.37 D.63 — to_timestamp/to_date DDD day-of-year parsing. PG18.4-verified.
 #[test]
 fn to_timestamp_ddd_day_of_year() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     // DDD=064 → March 5 (Jan 31 + Feb 28 + 5)
-    assert_eq!(q(&mut e, "SELECT to_date('2026-064','YYYY-DDD')::text"), "2026-03-05");
+    assert_eq!(
+        q(&mut e, "SELECT to_date('2026-064','YYYY-DDD')::text"),
+        "2026-03-05"
+    );
     // year after DDD
-    assert_eq!(q(&mut e, "SELECT to_date('064 2026','DDD YYYY')::text"), "2026-03-05");
+    assert_eq!(
+        q(&mut e, "SELECT to_date('064 2026','DDD YYYY')::text"),
+        "2026-03-05"
+    );
     // day 1 and day 365
-    assert_eq!(q(&mut e, "SELECT to_date('2026-001','YYYY-DDD')::text"), "2026-01-01");
-    assert_eq!(q(&mut e, "SELECT to_date('2024-060','YYYY-DDD')::text"), "2024-02-29"); // leap
+    assert_eq!(
+        q(&mut e, "SELECT to_date('2026-001','YYYY-DDD')::text"),
+        "2026-01-01"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_date('2024-060','YYYY-DDD')::text"),
+        "2024-02-29"
+    ); // leap
     // no regression on the plain forms
-    assert_eq!(q(&mut e, "SELECT to_date('2026-03-05','YYYY-MM-DD')::text"), "2026-03-05");
-    assert_eq!(q(&mut e, "SELECT to_date('05/03/2026','DD/MM/YYYY')::text"), "2026-03-05");
+    assert_eq!(
+        q(&mut e, "SELECT to_date('2026-03-05','YYYY-MM-DD')::text"),
+        "2026-03-05"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_date('05/03/2026','DD/MM/YYYY')::text"),
+        "2026-03-05"
+    );
 }
 
 /// v7.37 D.64 — to_char EEEE scientific notation. PG18.4-verified.
 #[test]
 fn to_char_eeee_scientific() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     let cases = [
-        ("1234.567","9.9EEEE"," 1.2e+03"),
-        ("1234.567","9.99EEEE"," 1.23e+03"),
-        ("1234.567","9EEEE"," 1e+03"),
-        ("-1234.567","9.9EEEE","-1.2e+03"),
-        ("0","9.9EEEE"," 0.0e+00"),
-        ("0.001234","9.99EEEE"," 1.23e-03"),
-        ("9.99","9.9EEEE"," 10.0e+00"),
-        ("1000000","9.999EEEE"," 1.000e+06"),
-        ("5","9.9EEEE"," 5.0e+00"),
+        ("1234.567", "9.9EEEE", " 1.2e+03"),
+        ("1234.567", "9.99EEEE", " 1.23e+03"),
+        ("1234.567", "9EEEE", " 1e+03"),
+        ("-1234.567", "9.9EEEE", "-1.2e+03"),
+        ("0", "9.9EEEE", " 0.0e+00"),
+        ("0.001234", "9.99EEEE", " 1.23e-03"),
+        ("9.99", "9.9EEEE", " 10.0e+00"),
+        ("1000000", "9.999EEEE", " 1.000e+06"),
+        ("5", "9.9EEEE", " 5.0e+00"),
     ];
     let mut bad = Vec::new();
-    for (n,f,pg) in &cases {
+    for (n, f, pg) in &cases {
         let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
-        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+        if &got != pg {
+            bad.push(format!("[{f}@{n}]{got}!={pg}"));
+        }
     }
     // no regression on ordinary numeric to_char
     assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
@@ -2843,23 +5051,33 @@ fn to_char_eeee_scientific() {
 #[test]
 fn to_char_v_scale() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     let cases = [
-        ("1.5","9V9"," 15"),
-        ("1.23","9V99"," 123"),
-        ("12.345","99V99"," 1235"),
-        ("1.5","FM9V9","15"),
-        ("0.5","9V99","  50"),
-        ("-1.5","9V9","-15"),
-        ("1.234","9V999"," 1234"),
-        ("5","9V99"," 500"),
-        ("1.5","99V9","  15"),
-        ("2","99V9","  20"),
+        ("1.5", "9V9", " 15"),
+        ("1.23", "9V99", " 123"),
+        ("12.345", "99V99", " 1235"),
+        ("1.5", "FM9V9", "15"),
+        ("0.5", "9V99", "  50"),
+        ("-1.5", "9V9", "-15"),
+        ("1.234", "9V999", " 1234"),
+        ("5", "9V99", " 500"),
+        ("1.5", "99V9", "  15"),
+        ("2", "99V9", "  20"),
     ];
     let mut bad = Vec::new();
-    for (n,f,pg) in &cases {
+    for (n, f, pg) in &cases {
         let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
-        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+        if &got != pg {
+            bad.push(format!("[{f}@{n}]{got}!={pg}"));
+        }
     }
     // no regression on ordinary + EEEE
     assert_eq!(q(&mut e, "SELECT to_char(1234.567,'FM9999.99')"), "1234.57");
@@ -2871,20 +5089,30 @@ fn to_char_v_scale() {
 #[test]
 fn to_char_l_currency() {
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] { Value::Text(s)=>s.to_string(), o=>format!("{o:?}") }, o=>format!("{o:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
+                Value::Text(s) => s.to_string(),
+                o => format!("{o:?}"),
+            },
+            o => format!("{o:?}"),
+        }
+    };
     let cases = [
-        ("1234.5","L9999.99","$ 1234.50"),
-        ("1234.5","FML9999.99","$1234.5"),
-        ("1234.5","L99999.99","$  1234.50"),
-        ("-1234.5","L9999.99","$-1234.50"),
-        ("5","L9999","$    5"),
-        ("1234.5","FML99G999D99","$1,234.5"),
-        ("0","L9999.99","$     .00"),
+        ("1234.5", "L9999.99", "$ 1234.50"),
+        ("1234.5", "FML9999.99", "$1234.5"),
+        ("1234.5", "L99999.99", "$  1234.50"),
+        ("-1234.5", "L9999.99", "$-1234.50"),
+        ("5", "L9999", "$    5"),
+        ("1234.5", "FML99G999D99", "$1,234.5"),
+        ("0", "L9999.99", "$     .00"),
     ];
     let mut bad = Vec::new();
-    for (n,f,pg) in &cases {
+    for (n, f, pg) in &cases {
         let got = q(&mut e, &format!("SELECT to_char({n}, '{f}')"));
-        if &got != pg { bad.push(format!("[{f}@{n}]{got}!={pg}")); }
+        if &got != pg {
+            bad.push(format!("[{f}@{n}]{got}!={pg}"));
+        }
     }
     // no-regression: V, EEEE, trailing $, ordinary
     assert_eq!(q(&mut e, "SELECT to_char(1.5,'9V9')"), " 15");
@@ -2899,9 +5127,22 @@ fn numeric_concat_renders_exact_decimal() {
     // PG: concat / || / format coerce a numeric to its exact decimal text,
     // not a debug dump. Reachable today via explicit ::numeric.
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(o) => format!("OK:{o:?}"),
+            Err(er) => format!("ERR:{er:?}"),
+        }
+    };
     assert_eq!(q(&mut e, "SELECT concat('x', 2.5::numeric)"), "x2.5");
-    assert_eq!(q(&mut e, "SELECT concat_ws('-', 1.5::numeric, 2.5::numeric)"), "1.5-2.5");
+    assert_eq!(
+        q(&mut e, "SELECT concat_ws('-', 1.5::numeric, 2.5::numeric)"),
+        "1.5-2.5"
+    );
     assert_eq!(q(&mut e, "SELECT format('%s', 3.14::numeric)"), "3.14");
 }
 
@@ -2910,15 +5151,46 @@ fn concat_format_render_all_types_pg_faithful() {
     // PG concat / format / || / row coerce every type to its canonical text,
     // never a debug dump. Reachable today via typed literals / casts.
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
-    assert_eq!(q(&mut e, "SELECT concat('x', DATE '2020-01-15')"), "x2020-01-15");
-    assert_eq!(q(&mut e, "SELECT concat('x', TIMESTAMP '2020-01-15 10:30:00')"), "x2020-01-15 10:30:00");
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(o) => format!("OK:{o:?}"),
+            Err(er) => format!("ERR:{er:?}"),
+        }
+    };
+    assert_eq!(
+        q(&mut e, "SELECT concat('x', DATE '2020-01-15')"),
+        "x2020-01-15"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT concat('x', TIMESTAMP '2020-01-15 10:30:00')"
+        ),
+        "x2020-01-15 10:30:00"
+    );
     assert_eq!(q(&mut e, "SELECT concat('x', INTERVAL '1 day')"), "x1 day");
-    assert_eq!(q(&mut e, "SELECT concat('x', '{1,2,3}'::int[])"), "x{1,2,3}");
+    assert_eq!(
+        q(&mut e, "SELECT concat('x', '{1,2,3}'::int[])"),
+        "x{1,2,3}"
+    );
     assert_eq!(q(&mut e, "SELECT concat('x', '{a,b}'::text[])"), "x{a,b}");
     assert_eq!(q(&mut e, "SELECT concat('x', '\\x41'::bytea)"), "x\\x41");
-    assert_eq!(q(&mut e, "SELECT concat('x', 'a1b2c3d4-e5f6-7788-9900-aabbccddeeff'::uuid)"), "xa1b2c3d4-e5f6-7788-9900-aabbccddeeff");
-    assert_eq!(q(&mut e, "SELECT format('%s', DATE '2020-01-15')"), "2020-01-15");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT concat('x', 'a1b2c3d4-e5f6-7788-9900-aabbccddeeff'::uuid)"
+        ),
+        "xa1b2c3d4-e5f6-7788-9900-aabbccddeeff"
+    );
+    assert_eq!(
+        q(&mut e, "SELECT format('%s', DATE '2020-01-15')"),
+        "2020-01-15"
+    );
     assert_eq!(q(&mut e, "SELECT format('%s', '{1,2}'::int[])"), "{1,2}");
 }
 
@@ -2927,14 +5199,42 @@ fn to_json_renders_temporal_types_pg_faithful() {
     // PG to_json/to_jsonb stringify Date/Timestamp/Interval to their text-out
     // form (timestamp uses the ISO `T` separator), never a Rust debug dump.
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
-    assert_eq!(q(&mut e, "SELECT to_json(DATE '2020-01-15')::text"), "\"2020-01-15\"");
-    assert_eq!(q(&mut e, "SELECT to_json(TIMESTAMP '2020-01-15 10:30:00')::text"), "\"2020-01-15T10:30:00\"");
-    assert_eq!(q(&mut e, "SELECT to_json(INTERVAL '1 day')::text"), "\"1 day\"");
-    assert_eq!(q(&mut e, "SELECT to_jsonb(DATE '2020-01-15')::text"), "\"2020-01-15\"");
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(o) => format!("OK:{o:?}"),
+            Err(er) => format!("ERR:{er:?}"),
+        }
+    };
+    assert_eq!(
+        q(&mut e, "SELECT to_json(DATE '2020-01-15')::text"),
+        "\"2020-01-15\""
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT to_json(TIMESTAMP '2020-01-15 10:30:00')::text"
+        ),
+        "\"2020-01-15T10:30:00\""
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_json(INTERVAL '1 day')::text"),
+        "\"1 day\""
+    );
+    assert_eq!(
+        q(&mut e, "SELECT to_jsonb(DATE '2020-01-15')::text"),
+        "\"2020-01-15\""
+    );
     // regression guard on the already-correct scalars
     assert_eq!(q(&mut e, "SELECT to_json(2.5::numeric)::text"), "2.5");
-    assert_eq!(q(&mut e, "SELECT to_json('hi\"there'::text)::text"), "\"hi\\\"there\"");
+    assert_eq!(
+        q(&mut e, "SELECT to_json('hi\"there'::text)::text"),
+        "\"hi\\\"there\""
+    );
 }
 
 #[test]
@@ -2942,12 +5242,46 @@ fn array_agg_temporal_elements_pg_faithful() {
     // array_agg of Date/Numeric/Interval renders each element via canonical
     // text (TextArray quoting matches PG), never a Rust debug dump.
     let mut e = Engine::new();
-    let q = |e: &mut Engine, sql: &str| -> String { match e.execute(sql) { Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r|&r.values[0]) { Some(Value::Text(s))=>s.to_string(), Some(o)=>format!("{o:?}"), None=>"E".into() }, Ok(o)=>format!("OK:{o:?}"), Err(er)=>format!("ERR:{er:?}") } };
-    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (DATE '2020-01-15'),(DATE '2020-02-01')) t(x)"), "{2020-01-15,2020-02-01}");
-    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (2.5::numeric),(3.5::numeric)) t(x)"), "{2.5,3.5}");
-    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (INTERVAL '1 day'),(INTERVAL '2 hours')) t(x)"), "{\"1 day\",02:00:00}");
+    let q = |e: &mut Engine, sql: &str| -> String {
+        match e.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
+                Some(Value::Text(s)) => s.to_string(),
+                Some(o) => format!("{o:?}"),
+                None => "E".into(),
+            },
+            Ok(o) => format!("OK:{o:?}"),
+            Err(er) => format!("ERR:{er:?}"),
+        }
+    };
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT array_agg(x)::text FROM (VALUES (DATE '2020-01-15'),(DATE '2020-02-01')) t(x)"
+        ),
+        "{2020-01-15,2020-02-01}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT array_agg(x)::text FROM (VALUES (2.5::numeric),(3.5::numeric)) t(x)"
+        ),
+        "{2.5,3.5}"
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT array_agg(x)::text FROM (VALUES (INTERVAL '1 day'),(INTERVAL '2 hours')) t(x)"
+        ),
+        "{\"1 day\",02:00:00}"
+    );
     // int/bigint arrays keep their fast-path typing (regression guard)
-    assert_eq!(q(&mut e, "SELECT array_agg(x)::text FROM (VALUES (1),(2),(3)) t(x)"), "{1,2,3}");
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT array_agg(x)::text FROM (VALUES (1),(2),(3)) t(x)"
+        ),
+        "{1,2,3}"
+    );
 }
 
 #[test]

@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -47,19 +49,24 @@ fn make_interval_components() {
     let mut e = Engine::new();
     // 1 year, 2 months, 1 week, 3 days, 4 hours, 5 mins, 6 secs.
     match first(&mut e, "SELECT make_interval(1, 2, 1, 3, 4, 5, 6)") {
-        spg_storage::Value::Interval { months, days, micros } => {
+        spg_storage::Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
             assert_eq!(months, 14); // 12 + 2
             assert_eq!(days, 10); // 7 + 3
-            assert_eq!(
-                micros,
-                4 * 3_600_000_000i64 + 5 * 60_000_000 + 6_000_000
-            );
+            assert_eq!(micros, 4 * 3_600_000_000i64 + 5 * 60_000_000 + 6_000_000);
         }
         other => panic!("got {other:?}"),
     }
     // Zero args → zero interval.
     match first(&mut e, "SELECT make_interval()") {
-        spg_storage::Value::Interval { months: 0, days: 0, micros: 0 } => {}
+        spg_storage::Value::Interval {
+            months: 0,
+            days: 0,
+            micros: 0,
+        } => {}
         other => panic!("got {other:?}"),
     }
 }

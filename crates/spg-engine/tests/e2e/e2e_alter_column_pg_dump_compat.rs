@@ -13,7 +13,8 @@ use spg_engine::Engine;
 
 fn fresh() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     e
 }
 
@@ -56,12 +57,8 @@ fn alter_constraint_deferrable_accepted() {
     .unwrap();
     // PG dumps may emit ALTER CONSTRAINT to toggle deferral.
     // SPG enforces immediately; accept-and-no-op.
-    e.execute(
-        "ALTER TABLE c ALTER CONSTRAINT c_pid_fk DEFERRABLE INITIALLY DEFERRED",
-    )
-    .unwrap();
-    e.execute(
-        "ALTER TABLE c ALTER CONSTRAINT c_pid_fk NOT DEFERRABLE",
-    )
-    .unwrap();
+    e.execute("ALTER TABLE c ALTER CONSTRAINT c_pid_fk DEFERRABLE INITIALLY DEFERRED")
+        .unwrap();
+    e.execute("ALTER TABLE c ALTER CONSTRAINT c_pid_fk NOT DEFERRABLE")
+        .unwrap();
 }

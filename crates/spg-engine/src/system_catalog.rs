@@ -112,9 +112,12 @@ fn referenced_columns(t: &spg_storage::Table, check: &str) -> Vec<String> {
 /// `{table}_{col}_check`; a multi-column / table-level check is
 /// `{table}_check`. Collisions get PG's `1`, `2`, … suffix. Shared so
 /// every synth view and pg_get_constraintdef agree.
-pub(crate) fn pg_check_connames(t: &spg_storage::Table, tname: &str, checks: &[String]) -> Vec<String> {
-    let mut seen: alloc::collections::BTreeMap<String, usize> =
-        alloc::collections::BTreeMap::new();
+pub(crate) fn pg_check_connames(
+    t: &spg_storage::Table,
+    tname: &str,
+    checks: &[String],
+) -> Vec<String> {
+    let mut seen: alloc::collections::BTreeMap<String, usize> = alloc::collections::BTreeMap::new();
     let mut out = Vec::with_capacity(checks.len());
     for chk in checks {
         let cols = referenced_columns(t, chk);
@@ -262,18 +265,17 @@ pub(crate) fn synth_information_schema_columns(
             } else {
                 Value::Null
             };
-            let (num_prec, num_scale): (Value<'static>, Value<'static>) =
-                match col.ty {
-                    DataType::SmallInt => (Value::Int(16), Value::Int(0)),
-                    DataType::Int => (Value::Int(32), Value::Int(0)),
-                    DataType::BigInt => (Value::Int(64), Value::Int(0)),
-                    DataType::Float => (Value::Int(53), Value::Null),
-                    DataType::Numeric { precision, scale } => (
-                        Value::Int(i32::from(precision)),
-                        Value::Int(i32::from(scale)),
-                    ),
-                    _ => (Value::Null, Value::Null),
-                };
+            let (num_prec, num_scale): (Value<'static>, Value<'static>) = match col.ty {
+                DataType::SmallInt => (Value::Int(16), Value::Int(0)),
+                DataType::Int => (Value::Int(32), Value::Int(0)),
+                DataType::BigInt => (Value::Int(64), Value::Int(0)),
+                DataType::Float => (Value::Int(53), Value::Null),
+                DataType::Numeric { precision, scale } => (
+                    Value::Int(i32::from(precision)),
+                    Value::Int(i32::from(scale)),
+                ),
+                _ => (Value::Null, Value::Null),
+            };
             // udt_name is PG's internal typname (int4, not integer).
             let udt: &str = match col.ty {
                 DataType::SmallInt => "int2",
@@ -419,8 +421,8 @@ pub(crate) fn synth_information_schema_views(
                 Value::text(v.name.clone()),
                 Value::text(v.body.clone()),
                 Value::text("NONE"),
-                Value::text("NO"),  // is_updatable — view-update lands in 19.13
-                Value::text("NO"),  // is_insertable_into
+                Value::text("NO"), // is_updatable — view-update lands in 19.13
+                Value::text("NO"), // is_insertable_into
                 Value::text("NO"),
                 Value::text("NO"),
                 Value::text("NO"),
@@ -645,12 +647,16 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
             continue;
         };
         for (i, col) in t.schema().columns.iter().enumerate() {
-            let Some(txt) = &col.default_text else { continue };
+            let Some(txt) = &col.default_text else {
+                continue;
+            };
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             let adnum = (i + 1) as i16;
             // Synthetic row OID: table OID × 1000 + column position. Distinct
             // per default, in a band that won't collide with table OIDs.
-            let row_oid = table_oid.saturating_mul(1000).saturating_add(i64::from(adnum));
+            let row_oid = table_oid
+                .saturating_mul(1000)
+                .saturating_add(i64::from(adnum));
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(row_oid),
                 Value::BigInt(table_oid),
@@ -976,9 +982,7 @@ pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
 ///   * sent_lsn / write_lsn / flush_lsn / replay_lsn (Text, PG LSN format)
 ///   * sync_state (Text) — 'async' / 'potential' / 'sync' / 'quorum'
 ///   * reply_time (TIMESTAMPTZ)
-pub(crate) fn synth_pg_stat_replication(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_stat_replication(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("pid", DataType::Int, false),
         ColumnSchema::new("usename", DataType::Text, true),
@@ -1273,17 +1277,17 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
             Value::BigInt(relid),
             Value::text("public"),
             Value::Text(alloc::borrow::Cow::Owned(name)),
-            Value::BigInt(0),       // seq_scan
-            Value::BigInt(0),       // seq_tup_read
-            Value::BigInt(0),       // idx_scan
-            Value::BigInt(0),       // idx_tup_fetch
-            Value::BigInt(0),       // n_tup_ins
-            Value::BigInt(0),       // n_tup_upd
-            Value::BigInt(0),       // n_tup_del
+            Value::BigInt(0), // seq_scan
+            Value::BigInt(0), // seq_tup_read
+            Value::BigInt(0), // idx_scan
+            Value::BigInt(0), // idx_tup_fetch
+            Value::BigInt(0), // n_tup_ins
+            Value::BigInt(0), // n_tup_upd
+            Value::BigInt(0), // n_tup_del
             Value::BigInt(live_rows),
-            Value::BigInt(0),       // n_dead_tup (vacuum tracks; 0 until 15.16)
-            Value::Null,            // last_vacuum
-            Value::Null,            // last_analyze
+            Value::BigInt(0), // n_dead_tup (vacuum tracks; 0 until 15.16)
+            Value::Null,      // last_vacuum
+            Value::Null,      // last_analyze
         ]));
         relid = relid.saturating_add(1);
     }
@@ -1352,22 +1356,22 @@ pub(crate) fn synth_pg_stat_database(
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
         Value::text("spg"),
-        Value::Int(0),         // numbackends — wired from server crate
-        Value::BigInt(0),      // xact_commit
-        Value::BigInt(0),      // xact_rollback
-        Value::BigInt(0),      // blks_read
-        Value::BigInt(0),      // blks_hit
-        Value::BigInt(0),      // tup_returned
-        Value::BigInt(0),      // tup_fetched
+        Value::Int(0),    // numbackends — wired from server crate
+        Value::BigInt(0), // xact_commit
+        Value::BigInt(0), // xact_rollback
+        Value::BigInt(0), // blks_read
+        Value::BigInt(0), // blks_hit
+        Value::BigInt(0), // tup_returned
+        Value::BigInt(0), // tup_fetched
         Value::BigInt(i64::try_from(tup_inserted).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_updated).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_deleted).unwrap_or(i64::MAX)),
-        Value::BigInt(0),      // conflicts (PG: replication-conflict count)
-        Value::BigInt(0),      // deadlocks (SPG single-writer; always 0)
-        Value::BigInt(0),      // temp_files (spill; pending 19.15)
-        Value::BigInt(0),      // temp_bytes
-        Value::Float(0.0),     // blk_read_time
-        Value::Float(0.0),     // blk_write_time
+        Value::BigInt(0),  // conflicts (PG: replication-conflict count)
+        Value::BigInt(0),  // deadlocks (SPG single-writer; always 0)
+        Value::BigInt(0),  // temp_files (spill; pending 19.15)
+        Value::BigInt(0),  // temp_bytes
+        Value::Float(0.0), // blk_read_time
+        Value::Float(0.0), // blk_write_time
     ])];
     (schema, rows)
 }
@@ -1421,13 +1425,13 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
             Value::BigInt(oid),
             Value::BigInt(16384), // subdbid (SPG single-db OID)
             Value::text(name.clone()),
-            Value::BigInt(10),    // subowner
+            Value::BigInt(10), // subowner
             Value::Bool(sub.enabled),
             Value::text("[redacted]"), // subconninfo
             Value::Null,               // subslotname
             Value::text(pubs),
-            Value::Bool(false),        // subbinary
-            Value::Bool(false),        // substream
+            Value::Bool(false), // subbinary
+            Value::Bool(false), // substream
         ]));
     }
     (schema, rows)
@@ -1512,9 +1516,7 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 ///   * confirmed_flush_lsn (Text)
 ///   * wal_status (Text) — `reserved` / `extended` / `unreserved` / `lost`
 ///   * safe_wal_size (BigInt) — bytes before the slot's WAL is reclaimed
-pub(crate) fn synth_pg_replication_slots(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_replication_slots(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("slot_name", DataType::Text, false),
         ColumnSchema::new("plugin", DataType::Text, true),
@@ -1851,7 +1853,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         let schema_ref = t.schema();
         let relkind: &'static str = match &schema_ref.partition_role {
             Some(PartitionRole::Parent { .. }) => "p", // partitioned table
-            _ => "r",                                   // regular table
+            _ => "r",                                  // regular table
         };
         let is_partition = matches!(
             &schema_ref.partition_role,
@@ -1875,30 +1877,30 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text(tname.clone()),
-            Value::BigInt(2200), // public namespace
-            Value::BigInt(0),    // reltype (composite type OID; SPG no composite)
-            Value::BigInt(0),    // reloftype
-            Value::BigInt(10),   // relowner — PG postgres superuser OID
-            Value::BigInt(0),    // relam (table AM; 0 == default heap)
-            Value::BigInt(oid),  // relfilenode shares oid in SPG (no separate fork)
-            Value::BigInt(0),    // reltablespace (0 == default)
+            Value::BigInt(2200),  // public namespace
+            Value::BigInt(0),     // reltype (composite type OID; SPG no composite)
+            Value::BigInt(0),     // reloftype
+            Value::BigInt(10),    // relowner — PG postgres superuser OID
+            Value::BigInt(0),     // relam (table AM; 0 == default heap)
+            Value::BigInt(oid),   // relfilenode shares oid in SPG (no separate fork)
+            Value::BigInt(0),     // reltablespace (0 == default)
             Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
-            Value::Int(0),       // relallvisible — visibility map lands in 15.17
-            Value::BigInt(0),    // reltoastrelid (SPG no TOAST)
+            Value::Int(0),    // relallvisible — visibility map lands in 15.17
+            Value::BigInt(0), // reltoastrelid (SPG no TOAST)
             Value::Bool(has_index),
-            Value::Bool(false),  // relisshared
-            Value::text("p"),    // relpersistence — 'p' permanent
+            Value::Bool(false), // relisshared
+            Value::text("p"),   // relpersistence — 'p' permanent
             Value::text(relkind),
             Value::SmallInt(relnatts),
             Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
-            Value::Bool(false),  // relhasrules — SPG has no rule system
+            Value::Bool(false), // relhasrules — SPG has no rule system
             Value::Bool(has_triggers),
-            Value::Bool(false),  // relhassubclass
-            Value::Bool(false),  // relrowsecurity
-            Value::Bool(false),  // relforcerowsecurity
-            Value::Bool(true),   // relispopulated
-            Value::text("d"),    // relreplident — 'd' default
+            Value::Bool(false), // relhassubclass
+            Value::Bool(false), // relrowsecurity
+            Value::Bool(false), // relforcerowsecurity
+            Value::Bool(true),  // relispopulated
+            Value::text("d"),   // relreplident — 'd' default
             Value::Bool(is_partition),
         ]));
         oid = oid.saturating_add(1);
@@ -1950,7 +1952,10 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 DataType::Bool => 1,
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
-                DataType::BigInt | DataType::Float | DataType::Timestamp | DataType::Timestamptz => 8,
+                DataType::BigInt
+                | DataType::Float
+                | DataType::Timestamp
+                | DataType::Timestamptz => 8,
                 DataType::Date => 4,
                 _ => -1,
             };
@@ -1993,11 +1998,11 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::BigInt(attrelid),
                 Value::text(col.name.clone()),
                 Value::BigInt(pg_type_oid(col.ty)),
-                Value::Int(-1),         // attstattarget — -1 = use system default
+                Value::Int(-1), // attstattarget — -1 = use system default
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
                 Value::Int(attndims),
-                Value::Int(-1),         // atttypmod — -1 = no modifier
+                Value::Int(-1), // atttypmod — -1 = no modifier
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(attstorage),
                 Value::text(attalign),
@@ -2006,11 +2011,15 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::text(attidentity),
                 // v7.38 (read01 P6.41) — 's' for a STORED generated column
                 // (SPG stores generated columns as STORED), '' otherwise.
-                Value::text(if col.generated_stored_expr.is_some() { "s" } else { "" }),
-                Value::Bool(false),     // attisdropped
-                Value::Bool(true),      // attislocal — true (not inherited)
-                Value::Int(0),          // attinhcount
-                Value::BigInt(0),       // attcollation — 0 (default)
+                Value::text(if col.generated_stored_expr.is_some() {
+                    "s"
+                } else {
+                    ""
+                }),
+                Value::Bool(false), // attisdropped
+                Value::Bool(true),  // attislocal — true (not inherited)
+                Value::Int(0),      // attinhcount
+                Value::BigInt(0),   // attcollation — 0 (default)
             ]));
         }
         attrelid = attrelid.saturating_add(1);
@@ -2459,21 +2468,21 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
-            Value::BigInt(11),         // pronamespace = pg_catalog
-            Value::BigInt(10),         // proowner
-            Value::BigInt(12),         // prolang = internal
-            Value::Float(1.0),         // procost
+            Value::BigInt(11), // pronamespace = pg_catalog
+            Value::BigInt(10), // proowner
+            Value::BigInt(12), // prolang = internal
+            Value::Float(1.0), // procost
             Value::Float(prorows),
-            Value::BigInt(0),          // provariadic
+            Value::BigInt(0), // provariadic
             Value::text::<String>(kind.into()),
-            Value::Bool(false),        // prosecdef
-            Value::Bool(false),        // proleakproof
-            Value::Bool(true),         // proisstrict
-            Value::Bool(kind == "w"),  // proretset — window funcs return per-row sets
+            Value::Bool(false),       // prosecdef
+            Value::Bool(false),       // proleakproof
+            Value::Bool(true),        // proisstrict
+            Value::Bool(kind == "w"), // proretset — window funcs return per-row sets
             Value::text::<String>(provolatile.into()),
             Value::text::<String>("s".into()), // proparallel = safe
             Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
-            Value::SmallInt(0),        // pronargdefaults
+            Value::SmallInt(0), // pronargdefaults
             Value::BigInt(rettype),
             Value::text(argtypes),
             Value::text::<String>(name.into()), // prosrc
@@ -2594,10 +2603,11 @@ pub(crate) fn synth_info_constraint_column_usage(
             // FK rows reference the PARENT table's columns.
             if let Some(parent) = cat.get(&fk.parent_table) {
                 for &p in &fk.parent_columns {
-                    let pname = parent.schema().columns.get(p).map_or_else(
-                        || alloc::format!("col{p}"),
-                        |c| c.name.clone(),
-                    );
+                    let pname = parent
+                        .schema()
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone());
                     push(&fk.parent_table, pname, conname.clone());
                 }
             }
@@ -2631,10 +2641,7 @@ pub(crate) fn synth_info_triggers(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(event.clone()),
                 Value::text("public"),
                 Value::text(trg.table.clone()),
-                Value::text(alloc::format!(
-                    "EXECUTE FUNCTION {}()",
-                    trg.function
-                )),
+                Value::text(alloc::format!("EXECUTE FUNCTION {}()", trg.function)),
                 Value::text(trg.for_each.clone()),
                 Value::text(trg.timing.clone()),
             ]));
@@ -3004,8 +3011,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             let kind = if uc.is_primary_key { "p" } else { "u" };
             let conname = pg_unique_conname(t, uc, &tname);
             let conkey = conkey_vec(&uc.columns);
-            let conkey_names: Vec<String> =
-                uc.columns.iter().map(|&p| col_name_at(p)).collect();
+            let conkey_names: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
             // Hybrid: PG's `conkey` is int2vector; expose the
             // int2vector form so the canonical PG query path
             // works, but include the names as a comma list in
@@ -3013,8 +3019,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             // existing SPG dashboards that depended on the name
             // form still read sensibly. Pure-int form lands
             // when SPG ships proper int2vector support.
-            let conkey_display =
-                alloc::format!("{conkey} [{}]", conkey_names.join(","));
+            let conkey_display = alloc::format!("{conkey} [{}]", conkey_names.join(","));
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
@@ -3024,16 +3029,16 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(false), // condeferred
                 Value::Bool(true),  // convalidated
                 Value::BigInt(conrelid),
-                Value::BigInt(0),   // contypid
-                Value::BigInt(0),   // conindid — pending UC↔index plumb-through
-                Value::BigInt(0),   // conparentid
-                Value::BigInt(0),   // confrelid (not an FK)
-                Value::text(" "),   // confupdtype
-                Value::text(" "),   // confdeltype
-                Value::text(" "),   // confmatchtype
-                Value::Bool(true),  // conislocal
-                Value::Int(0),      // coninhcount
-                Value::Bool(true),  // connoinherit
+                Value::BigInt(0),  // contypid
+                Value::BigInt(0),  // conindid — pending UC↔index plumb-through
+                Value::BigInt(0),  // conparentid
+                Value::BigInt(0),  // confrelid (not an FK)
+                Value::text(" "),  // confupdtype
+                Value::text(" "),  // confdeltype
+                Value::text(" "),  // confmatchtype
+                Value::Bool(true), // conislocal
+                Value::Int(0),     // coninhcount
+                Value::Bool(true), // connoinherit
                 Value::text(conkey_display),
                 Value::text(String::new()),
             ]));
@@ -3340,38 +3345,217 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
 /// annotated (not inferred) because SPG stores memory / duration settings
 /// in human form ("4MB") where inference would read "string" — PG
 /// classifies work_mem as integer.
-pub(crate) fn canonical_gucs() -> &'static [(&'static str, &'static str, &'static str, &'static str, &'static str)]
-{
+pub(crate) fn canonical_gucs() -> &'static [(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+)] {
     &[
-        ("server_version", "18.4 (spg)", "Preset Options", "string", "internal"),
-        ("server_version_num", "180004", "Preset Options", "integer", "internal"),
-        ("server_encoding", "UTF8", "Client Connection Defaults", "string", "internal"),
-        ("client_encoding", "UTF8", "Client Connection Defaults", "string", "user"),
-        ("DateStyle", "ISO, MDY", "Client Connection Defaults", "string", "user"),
-        ("TimeZone", "UTC", "Client Connection Defaults", "string", "user"),
-        ("IntervalStyle", "postgres", "Client Connection Defaults", "enum", "user"),
-        ("extra_float_digits", "1", "Client Connection Defaults", "integer", "user"),
-        ("bytea_output", "hex", "Client Connection Defaults", "enum", "user"),
-        ("standard_conforming_strings", "on", "Compatibility", "bool", "user"),
-        ("integer_datetimes", "on", "Compatibility", "bool", "internal"),
-        ("max_connections", "100", "Connections and Authentication", "integer", "postmaster"),
-        ("lock_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("idle_in_transaction_session_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("transaction_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("statement_timeout", "0", "Client Connection Defaults", "integer", "user"),
-        ("client_min_messages", "notice", "Client Connection Defaults", "enum", "user"),
-        ("default_tablespace", "", "Client Connection Defaults", "string", "user"),
-        ("default_table_access_method", "heap", "Client Connection Defaults", "string", "user"),
-        ("row_security", "on", "Client Connection Defaults", "bool", "user"),
-        ("check_function_bodies", "on", "Client Connection Defaults", "bool", "user"),
-        ("xmloption", "content", "Client Connection Defaults", "enum", "user"),
-        ("work_mem", "4MB", "Resource Usage / Memory", "integer", "user"),
-        ("maintenance_work_mem", "64MB", "Resource Usage / Memory", "integer", "user"),
-        ("shared_buffers", "128MB", "Resource Usage / Memory", "integer", "postmaster"),
-        ("effective_cache_size", "4GB", "Query Tuning / Planner Cost Constants", "integer", "user"),
-        ("search_path", "\"$user\", public", "Client Connection Defaults", "string", "user"),
-        ("application_name", "", "Reporting and Logging", "string", "user"),
-        ("default_transaction_isolation", "read committed", "Client Connection Defaults", "enum", "user"),
+        (
+            "server_version",
+            "18.4 (spg)",
+            "Preset Options",
+            "string",
+            "internal",
+        ),
+        (
+            "server_version_num",
+            "180004",
+            "Preset Options",
+            "integer",
+            "internal",
+        ),
+        (
+            "server_encoding",
+            "UTF8",
+            "Client Connection Defaults",
+            "string",
+            "internal",
+        ),
+        (
+            "client_encoding",
+            "UTF8",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "DateStyle",
+            "ISO, MDY",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "TimeZone",
+            "UTC",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "IntervalStyle",
+            "postgres",
+            "Client Connection Defaults",
+            "enum",
+            "user",
+        ),
+        (
+            "extra_float_digits",
+            "1",
+            "Client Connection Defaults",
+            "integer",
+            "user",
+        ),
+        (
+            "bytea_output",
+            "hex",
+            "Client Connection Defaults",
+            "enum",
+            "user",
+        ),
+        (
+            "standard_conforming_strings",
+            "on",
+            "Compatibility",
+            "bool",
+            "user",
+        ),
+        (
+            "integer_datetimes",
+            "on",
+            "Compatibility",
+            "bool",
+            "internal",
+        ),
+        (
+            "max_connections",
+            "100",
+            "Connections and Authentication",
+            "integer",
+            "postmaster",
+        ),
+        (
+            "lock_timeout",
+            "0",
+            "Client Connection Defaults",
+            "integer",
+            "user",
+        ),
+        (
+            "idle_in_transaction_session_timeout",
+            "0",
+            "Client Connection Defaults",
+            "integer",
+            "user",
+        ),
+        (
+            "transaction_timeout",
+            "0",
+            "Client Connection Defaults",
+            "integer",
+            "user",
+        ),
+        (
+            "statement_timeout",
+            "0",
+            "Client Connection Defaults",
+            "integer",
+            "user",
+        ),
+        (
+            "client_min_messages",
+            "notice",
+            "Client Connection Defaults",
+            "enum",
+            "user",
+        ),
+        (
+            "default_tablespace",
+            "",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "default_table_access_method",
+            "heap",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "row_security",
+            "on",
+            "Client Connection Defaults",
+            "bool",
+            "user",
+        ),
+        (
+            "check_function_bodies",
+            "on",
+            "Client Connection Defaults",
+            "bool",
+            "user",
+        ),
+        (
+            "xmloption",
+            "content",
+            "Client Connection Defaults",
+            "enum",
+            "user",
+        ),
+        (
+            "work_mem",
+            "4MB",
+            "Resource Usage / Memory",
+            "integer",
+            "user",
+        ),
+        (
+            "maintenance_work_mem",
+            "64MB",
+            "Resource Usage / Memory",
+            "integer",
+            "user",
+        ),
+        (
+            "shared_buffers",
+            "128MB",
+            "Resource Usage / Memory",
+            "integer",
+            "postmaster",
+        ),
+        (
+            "effective_cache_size",
+            "4GB",
+            "Query Tuning / Planner Cost Constants",
+            "integer",
+            "user",
+        ),
+        (
+            "search_path",
+            "\"$user\", public",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
+            "application_name",
+            "",
+            "Reporting and Logging",
+            "string",
+            "user",
+        ),
+        (
+            "default_transaction_isolation",
+            "read committed",
+            "Client Connection Defaults",
+            "enum",
+            "user",
+        ),
     ]
 }
 
@@ -3414,26 +3598,30 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone());
-        let source = if overridden.is_some() { "session" } else { "default" };
+        let source = if overridden.is_some() {
+            "session"
+        } else {
+            "default"
+        };
         let setting = overridden.unwrap_or_else(|| boot.into());
         rows.push(Row::new(alloc::vec![
             Value::text::<String>(name.into()),
             Value::text(setting),
-            Value::Null,                              // unit (setting is self-describing)
+            Value::Null, // unit (setting is self-describing)
             Value::text::<String>(cat.into()),
-            Value::Null,                              // short_desc
-            Value::Null,                              // extra_desc
+            Value::Null, // short_desc
+            Value::Null, // extra_desc
             Value::text::<String>(context.into()),
             Value::text::<String>(vartype.into()),
             Value::text::<String>(source.into()),
-            Value::Null,                              // min_val
-            Value::Null,                              // max_val
-            Value::Null,                              // enumvals
+            Value::Null, // min_val
+            Value::Null, // max_val
+            Value::Null, // enumvals
             Value::text::<String>(boot.into()),
-            Value::text::<String>(boot.into()),       // reset_val = boot_val
-            Value::Null,                              // sourcefile
-            Value::Null,                              // sourceline
-            Value::Bool(false),                       // pending_restart
+            Value::text::<String>(boot.into()), // reset_val = boot_val
+            Value::Null,                        // sourcefile
+            Value::Null,                        // sourceline
+            Value::Bool(false),                 // pending_restart
         ]));
     };
     for &(name, val, cat, vartype, context) in defaults {
@@ -3510,7 +3698,11 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
             };
             let mut positions = alloc::vec![idx.column_position];
             positions.extend(idx.extra_column_positions.iter().copied());
-            let cols = positions.iter().map(|&p| col_at(p)).collect::<Vec<_>>().join(", ");
+            let cols = positions
+                .iter()
+                .map(|&p| col_at(p))
+                .collect::<Vec<_>>()
+                .join(", ");
             // An index backs a PK / UNIQUE constraint when its column set
             // equals a uniqueness constraint's — PG reports those as
             // `CREATE UNIQUE INDEX` even though SPG enforces uniqueness
@@ -3773,7 +3965,11 @@ pub(crate) fn collect_meta_view_names(
             }
             Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk_expr(expr, into),
             Expr::FunctionCall { args, .. } => args.iter().for_each(|a| walk_expr(a, into)),
-            Expr::Case { operand, branches, else_branch } => {
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
                 if let Some(o) = operand {
                     walk_expr(o, into);
                 }

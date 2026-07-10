@@ -17,12 +17,18 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn querytree_returns_indexable_part() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT querytree('a & b'::tsquery)"), "'a' & 'b'");
+    assert_eq!(
+        text(&mut e, "SELECT querytree('a & b'::tsquery)"),
+        "'a' & 'b'"
+    );
     // AND with a NOT side keeps only the indexable side.
     assert_eq!(text(&mut e, "SELECT querytree('a & !b'::tsquery)"), "'a'");
     // A bare NOT is not indexable at all.
     assert_eq!(text(&mut e, "SELECT querytree('!a'::tsquery)"), "T");
-    assert_eq!(text(&mut e, "SELECT querytree('a | b'::tsquery)"), "'a' | 'b'");
+    assert_eq!(
+        text(&mut e, "SELECT querytree('a | b'::tsquery)"),
+        "'a' | 'b'"
+    );
     // OR with a NOT side is entirely non-indexable.
     assert_eq!(text(&mut e, "SELECT querytree('a | !b'::tsquery)"), "T");
 }

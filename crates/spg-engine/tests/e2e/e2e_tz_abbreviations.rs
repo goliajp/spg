@@ -21,11 +21,32 @@ fn at_time_zone_fixed_abbreviations() {
     let base = "timestamp '2024-06-15 12:00:00'";
     // The stored UTC micros match PG; ::text omits the +00 (a separate render
     // residual), so assert the naive form.
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'EST')::text")), "2024-06-15 17:00:00");
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'PST')::text")), "2024-06-15 20:00:00");
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'JST')::text")), "2024-06-15 03:00:00");
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'CET')::text")), "2024-06-15 11:00:00");
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'UTC')::text")), "2024-06-15 12:00:00");
+    assert_eq!(
+        text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'EST')::text")),
+        "2024-06-15 17:00:00"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'PST')::text")),
+        "2024-06-15 20:00:00"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'JST')::text")),
+        "2024-06-15 03:00:00"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'CET')::text")),
+        "2024-06-15 11:00:00"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT ({base} AT TIME ZONE 'UTC')::text")),
+        "2024-06-15 12:00:00"
+    );
     // A numeric offset still works.
-    assert_eq!(text(&mut e, &format!("SELECT ({base} AT TIME ZONE '+05:00')::text")), "2024-06-15 17:00:00");
+    assert_eq!(
+        text(
+            &mut e,
+            &format!("SELECT ({base} AT TIME ZONE '+05:00')::text")
+        ),
+        "2024-06-15 17:00:00"
+    );
 }

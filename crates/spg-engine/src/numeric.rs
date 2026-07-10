@@ -23,7 +23,11 @@ pub(crate) fn numeric_from_integer(
         ))
     })?;
     check_precision(scaled, precision, col_name)?;
-    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+    Ok(Value::Numeric {
+        scaled,
+        scale,
+        kind: spg_storage::NumericKind::Finite,
+    })
 }
 
 /// Float → NUMERIC. Uses round-half-away-from-zero on `x * 10^scale`,
@@ -63,7 +67,11 @@ pub(crate) fn numeric_from_float(
     }
     let scaled = biased as i128;
     check_precision(scaled, precision, col_name)?;
-    Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite })
+    Ok(Value::Numeric {
+        scaled,
+        scale,
+        kind: spg_storage::NumericKind::Finite,
+    })
 }
 
 /// v7.17.0 Phase 3.P0-67 — parse PG-canonical decimal text into
@@ -98,10 +106,7 @@ pub(crate) fn strip_digit_underscores(s: &str) -> Option<alloc::borrow::Cow<'_, 
     let b = s.as_bytes();
     for (i, &c) in b.iter().enumerate() {
         if c == b'_'
-            && !(i > 0
-                && i + 1 < b.len()
-                && b[i - 1].is_ascii_digit()
-                && b[i + 1].is_ascii_digit())
+            && !(i > 0 && i + 1 < b.len() && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit())
         {
             return None;
         }
@@ -214,7 +219,8 @@ pub(crate) fn numeric_rescale(
     Ok(Value::Numeric {
         scaled: new_scaled,
         scale: dst_scale,
-     kind: spg_storage::NumericKind::Finite })
+        kind: spg_storage::NumericKind::Finite,
+    })
 }
 
 /// Drop the fractional part of a scaled integer, returning the integer
@@ -241,11 +247,7 @@ pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u8) -> i128 {
     let q = abs / factor;
     let r = abs % factor;
     let mag = if 2 * r >= factor { q + 1 } else { q };
-    if neg {
-        -mag
-    } else {
-        mag
-    }
+    if neg { -mag } else { mag }
 }
 
 /// Verify a scaled NUMERIC value fits the column's declared precision.
@@ -345,7 +347,12 @@ fn pow10_checked(p: u32) -> Option<i128> {
 /// way to land on PG's exact scale. `base10000_weight_firstdigit` gives
 /// each operand's leading-group index and digit. The 1000 cap is PG's
 /// display-scale ceiling; SPG then clamps to its `u8` scale field.
-fn division_display_scale(dividend: i128, dividend_scale: u8, divisor: i128, divisor_scale: u8) -> u8 {
+fn division_display_scale(
+    dividend: i128,
+    dividend_scale: u8,
+    divisor: i128,
+    divisor_scale: u8,
+) -> u8 {
     let dwf = base10000_weight_firstdigit(dividend, dividend_scale);
     let vwf = base10000_weight_firstdigit(divisor, divisor_scale);
     division_display_scale_from_wf(dwf, dividend_scale, vwf)

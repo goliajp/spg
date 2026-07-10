@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -41,10 +43,7 @@ fn values_with_column_aliases() {
 fn default_column_names_are_pg_columnn() {
     let mut e = Engine::new();
     // Without a column list, PG names the columns column1..columnN.
-    let got = rows(
-        &mut e,
-        "SELECT column2 FROM (VALUES (1, 'x')) t",
-    );
+    let got = rows(&mut e, "SELECT column2 FROM (VALUES (1, 'x')) t");
     assert_eq!(got.len(), 1);
     assert!(matches!(&got[0][0], spg_storage::Value::Text(s) if s == "x"));
 }

@@ -5,7 +5,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) -> bool {
-    matches!(e.execute(sql), Ok(QueryResult::CommandOk { .. } | QueryResult::Rows { .. }))
+    matches!(
+        e.execute(sql),
+        Ok(QueryResult::CommandOk { .. } | QueryResult::Rows { .. })
+    )
 }
 
 #[test]
@@ -35,9 +38,12 @@ fn with_data_trailer_still_works() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE src (x INT)").unwrap();
     e.execute("INSERT INTO src VALUES (1), (2)").unwrap();
-    e.execute("CREATE TABLE dst AS SELECT x FROM src WITH NO DATA").unwrap();
+    e.execute("CREATE TABLE dst AS SELECT x FROM src WITH NO DATA")
+        .unwrap();
     match e.execute("SELECT count(*) FROM dst").unwrap() {
-        QueryResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], spg_storage::Value::BigInt(0)),
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_storage::Value::BigInt(0))
+        }
         _ => panic!(),
     }
 }

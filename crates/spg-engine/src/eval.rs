@@ -40,7 +40,9 @@ mod textsearch;
 pub(crate) mod values;
 
 pub use crate::conversions::format_money_array;
-pub(crate) use binop::{add_interval_to_micros, and_3vl, apply_binary_by_ref, apply_binary_interval};
+pub(crate) use binop::{
+    add_interval_to_micros, and_3vl, apply_binary_by_ref, apply_binary_interval,
+};
 use binop::{apply_binary, apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
@@ -52,13 +54,11 @@ use datetime::{
 use encoding::{decode_text, encode_text};
 pub use format::{
     days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
-    format_date, format_date_array, format_float, format_float_array, format_int_array, format_real,
-    format_interval,
-    format_interval_array, format_money, format_numeric, format_numeric_array, format_numeric_kind,
-    format_smallint_array, format_text_array, format_time, format_timestamp,
-    format_timestamp_array, format_timestamptz, format_timestamptz_at, format_timetz,
-    format_uuid_array,
-    parse_date_literal, parse_timestamp_literal,
+    format_date, format_date_array, format_float, format_float_array, format_int_array,
+    format_interval, format_interval_array, format_money, format_numeric, format_numeric_array,
+    format_numeric_kind, format_real, format_smallint_array, format_text_array, format_time,
+    format_timestamp, format_timestamp_array, format_timestamptz, format_timestamptz_at,
+    format_timetz, format_uuid_array, parse_date_literal, parse_timestamp_literal,
 };
 use functions::apply_function;
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};
@@ -66,8 +66,8 @@ pub(crate) use math::{f64_ceil, f64_floor, f64_sqrt};
 use math::{
     f64_exp, f64_ln, f64_powi, f64_round_half_away, f64_trunc, prng_next_f64, prng_next_u64,
 };
-use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
 pub(crate) use regexp::regexp_matches_rows;
+use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
 use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
     is_owned_compare_value, resolve_column, resolve_column_borrowed, text_prefix_chars,
@@ -87,8 +87,8 @@ use textsearch::{
 };
 pub use values::gen_random_uuid_bytes;
 use values::{
-    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64,
-    value_to_text, values_equal_for_nullif,
+    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64, value_to_text,
+    values_equal_for_nullif,
 };
 
 /// Resolution context for evaluating a single row. `table_alias` is the alias
@@ -357,9 +357,9 @@ impl core::fmt::Display for EvalError {
                 f,
                 "parameter ${n} referenced but only {bound} bound by client"
             ),
-            Self::StackDepthExceeded => f.write_str(
-                "stack depth limit exceeded (expression nested too deeply)",
-            ),
+            Self::StackDepthExceeded => {
+                f.write_str("stack depth limit exceeded (expression nested too deeply)")
+            }
         }
     }
 }
@@ -757,11 +757,9 @@ pub fn eval_expr(
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
         | Expr::RowInSubquery { .. }
-        | Expr::RowCmpSubquery { .. } => {
-            Err(EvalError::TypeMismatch {
-                detail: "subquery reached row eval — engine resolver bug".into(),
-            })
-        }
+        | Expr::RowCmpSubquery { .. } => Err(EvalError::TypeMismatch {
+            detail: "subquery reached row eval — engine resolver bug".into(),
+        }),
         // v7.30.2 (mailrs round-25) — flat `expr [NOT] IN (a, b, …)`.
         // Iterative scan with PG three-valued logic: TRUE on the first
         // Eq match; if nothing matched, NULL when the needle is NULL or
@@ -866,8 +864,12 @@ pub fn eval_expr(
                             .into(),
                     });
                 }
-                let any_text = materialised.iter().any(|v| matches!(v, Value::TextArray(_)));
-                let any_big = materialised.iter().any(|v| matches!(v, Value::BigIntArray(_)));
+                let any_text = materialised
+                    .iter()
+                    .any(|v| matches!(v, Value::TextArray(_)));
+                let any_big = materialised
+                    .iter()
+                    .any(|v| matches!(v, Value::BigIntArray(_)));
                 if any_text {
                     let rows: Vec<Vec<Option<String>>> = materialised
                         .into_iter()
@@ -889,9 +891,7 @@ pub fn eval_expr(
                         .into_iter()
                         .map(|v| match v {
                             Value::BigIntArray(r) => r,
-                            Value::IntArray(r) => {
-                                r.into_iter().map(|c| c.map(i64::from)).collect()
-                            }
+                            Value::IntArray(r) => r.into_iter().map(|c| c.map(i64::from)).collect(),
                             _ => unreachable!(),
                         })
                         .collect();
@@ -920,7 +920,10 @@ pub fn eval_expr(
                     Value::Null => {}
                     Value::Int(_) | Value::SmallInt(_) => has_int = true,
                     Value::BigInt(_) => has_bigint = true,
-                    Value::Numeric { kind: spg_storage::NumericKind::Finite, .. } => {
+                    Value::Numeric {
+                        kind: spg_storage::NumericKind::Finite,
+                        ..
+                    } => {
                         has_numeric = true;
                     }
                     Value::Numeric { .. } => {
@@ -1104,10 +1107,7 @@ pub fn eval_expr(
                     Ok(Value::BigIntArray(items[s..e].to_vec()))
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "slice target must be an array, got {:?}",
-                        other.data_type()
-                    ),
+                    detail: format!("slice target must be an array, got {:?}", other.data_type()),
                 }),
             }
         }
@@ -1345,7 +1345,10 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) 
         return v;
     }
     let target = if matches!(common, spg_storage::DataType::Numeric { .. }) {
-        spg_storage::DataType::Numeric { precision: 0, scale: 0 }
+        spg_storage::DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        }
     } else {
         common.clone()
     };
@@ -1358,7 +1361,10 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) 
 /// Widen `v` to the PG common type of the sibling `types`, or leave it as-is
 /// when the types don't resolve to a single widening type. See
 /// [`widen_value_to`] and [`crate::describe::common_type`].
-pub(crate) fn widen_to_common(v: Value<'static>, types: &[spg_storage::DataType]) -> Value<'static> {
+pub(crate) fn widen_to_common(
+    v: Value<'static>,
+    types: &[spg_storage::DataType],
+) -> Value<'static> {
     match crate::describe::common_type(types) {
         Some(common) => widen_value_to(v, &common),
         None => v,
@@ -1384,7 +1390,11 @@ fn value_to_text_for_array(v: &Value) -> String {
         Value::Real(x) => format::format_real(*x),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
-        Value::Numeric { scaled, scale, kind } => format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => format_numeric_kind(*kind, *scaled, *scale),
         _ => format!("{v:?}"),
     }
 }
@@ -1628,7 +1638,11 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
             }
         }
         Literal::Float(x) => Value::Float(*x),
-        Literal::Numeric { unscaled, scale } => Value::Numeric { scaled: *unscaled, scale: *scale , kind: spg_storage::NumericKind::Finite },
+        Literal::Numeric { unscaled, scale } => Value::Numeric {
+            scaled: *unscaled,
+            scale: *scale,
+            kind: spg_storage::NumericKind::Finite,
+        },
         Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Vector(v) => Value::vector(v.clone()),
@@ -1692,7 +1706,8 @@ mod tests {
             Value::Numeric {
                 scaled: 30,
                 scale: 1,
-             kind: spg_storage::NumericKind::Finite },
+                kind: spg_storage::NumericKind::Finite,
+            },
             Value::Interval {
                 months: 0,
                 days: 0,

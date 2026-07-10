@@ -20,7 +20,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn numeric_integer_power() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT (2.0^10)::text"), "1024.0000000000000");
-    assert_eq!(text(&mut e, "SELECT (power(2.0,3))::text"), "8.0000000000000000");
+    assert_eq!(
+        text(&mut e, "SELECT (power(2.0,3))::text"),
+        "8.0000000000000000"
+    );
     assert_eq!(text(&mut e, "SELECT (10.0^5)::text"), "100000.00000000000");
     assert_eq!(text(&mut e, "SELECT (3.0^4)::text"), "81.000000000000000");
     assert_eq!(text(&mut e, "SELECT (2.5^2)::text"), "6.2500000000000000");
@@ -28,7 +31,10 @@ fn numeric_integer_power() {
     assert_eq!(text(&mut e, "SELECT (2.0^20)::text"), "1048576.0000000000");
     assert_eq!(text(&mut e, "SELECT (0.5^3)::text"), "0.1250000000000000");
     assert_eq!(text(&mut e, "SELECT (2.0^0)::text"), "1.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT (power(123.0,2))::text"), "15129.000000000000");
+    assert_eq!(
+        text(&mut e, "SELECT (power(123.0,2))::text"),
+        "15129.000000000000"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(2.0^10)"), "numeric");
     // Integer base stays double precision (matching PG).
     assert_eq!(text(&mut e, "SELECT (2^10)::text"), "1024");

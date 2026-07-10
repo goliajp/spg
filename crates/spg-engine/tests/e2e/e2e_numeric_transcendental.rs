@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
             other => panic!("expected text, got {other:?}"),
@@ -21,9 +24,15 @@ fn ln_numeric_is_exact() {
     assert_eq!(text(&mut e, "SELECT ln(2.0)::text"), "0.6931471805599453");
     assert_eq!(text(&mut e, "SELECT ln(10.0)::text"), "2.3025850929940457");
     // Display scale shrinks as the integer part grows (17 - int_digits).
-    assert_eq!(text(&mut e, "SELECT ln(999999.0)::text"), "13.815509557963774");
+    assert_eq!(
+        text(&mut e, "SELECT ln(999999.0)::text"),
+        "13.815509557963774"
+    );
     assert_eq!(text(&mut e, "SELECT ln(1.5)::text"), "0.4054651081081644");
-    assert_eq!(text(&mut e, "SELECT ln(0.001)::text"), "-6.9077552789821371");
+    assert_eq!(
+        text(&mut e, "SELECT ln(0.001)::text"),
+        "-6.9077552789821371"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(ln(2.0))::text"), "numeric");
     // A non-positive argument errors.
     assert!(e.execute("SELECT ln(0.0)").is_err());
@@ -46,10 +55,22 @@ fn fractional_and_negative_power_is_exact_numeric() {
     // This is the case that motivated the work: 2.0^0.5 used to be typed
     // NUMERIC but carry a Float value. Now it is exact numeric.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (2.0 ^ 0.5)::text"), "1.4142135623730950");
-    assert_eq!(text(&mut e, "SELECT (10.0 ^ 0.5)::text"), "3.1622776601683793");
-    assert_eq!(text(&mut e, "SELECT (2.0 ^ (-1))::text"), "0.5000000000000000");
-    assert_eq!(text(&mut e, "SELECT power(2.0, 0.5)::text"), "1.4142135623730950");
+    assert_eq!(
+        text(&mut e, "SELECT (2.0 ^ 0.5)::text"),
+        "1.4142135623730950"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (10.0 ^ 0.5)::text"),
+        "3.1622776601683793"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (2.0 ^ (-1))::text"),
+        "0.5000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT power(2.0, 0.5)::text"),
+        "1.4142135623730950"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(2.0 ^ 0.5)::text"), "numeric");
     // Non-negative integer exponent stays exact (existing path); an integer
     // base is double in PG, so 2^0.5 (int base) is unaffected here.
@@ -63,8 +84,14 @@ fn fractional_and_negative_power_is_exact_numeric() {
 fn float_arguments_keep_the_double_overload() {
     // ln/exp of a float8 stay double precision (PG overload resolution).
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ln(2.0::float8))::text"), "double precision");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(exp(1.0::float8))::text"), "double precision");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(ln(2.0::float8))::text"),
+        "double precision"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(exp(1.0::float8))::text"),
+        "double precision"
+    );
 }
 
 // v7.38 (read01) — PG's `^` / power() are numeric whenever either operand is
@@ -77,14 +104,29 @@ fn int_base_with_numeric_exponent_is_numeric() {
     assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 0.5)::text"), "numeric");
     assert_eq!(text(&mut e, "SELECT (2 ^ 0.5)::text"), "1.4142135623730950");
     assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 3.0)::text"), "numeric");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(power(2, 0.5))::text"), "numeric");
-    assert_eq!(text(&mut e, "SELECT (power(2, 0.5))::text"), "1.4142135623730950");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(power(2, 0.5))::text"),
+        "numeric"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (power(2, 0.5))::text"),
+        "1.4142135623730950"
+    );
     // A numeric base keeps the exact numeric scale even for a negative exp.
-    assert_eq!(text(&mut e, "SELECT (2.0 ^ (-1))::text"), "0.5000000000000000");
+    assert_eq!(
+        text(&mut e, "SELECT (2.0 ^ (-1))::text"),
+        "0.5000000000000000"
+    );
     // Both-integer stays double precision (PG `2 ^ 10` → double, `2 ^ (-1)` → 0.5).
     assert_eq!(text(&mut e, "SELECT (2 ^ (-1))::text"), "0.5");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(2 ^ 10)::text"), "double precision");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(2 ^ 10)::text"),
+        "double precision"
+    );
     assert_eq!(text(&mut e, "SELECT (2 ^ 10)::text"), "1024");
     // power() of two integers is double.
-    assert_eq!(text(&mut e, "SELECT pg_typeof(power(2, 3))::text"), "double precision");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(power(2, 3))::text"),
+        "double precision"
+    );
 }

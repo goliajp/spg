@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -60,11 +62,15 @@ fn json_object_escapes_quotes() {
 #[test]
 fn json_object_odd_length_errors() {
     let mut e = Engine::new();
-    assert!(e.execute("SELECT json_object(ARRAY['a', '1', 'b'])").is_err());
+    assert!(
+        e.execute("SELECT json_object(ARRAY['a', '1', 'b'])")
+            .is_err()
+    );
     // Length mismatch on 2-array form.
-    assert!(e
-        .execute("SELECT json_object(ARRAY['a'], ARRAY['1', '2'])")
-        .is_err());
+    assert!(
+        e.execute("SELECT json_object(ARRAY['a'], ARRAY['1', '2'])")
+            .is_err()
+    );
 }
 
 #[test]

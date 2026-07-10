@@ -266,7 +266,11 @@ pub(crate) fn value_to_text(v: &Value) -> String {
             let cells: Vec<String> = h.to_f32_vec().iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))
         }
-        Value::Numeric { scaled, scale, kind } => format_numeric_kind(*kind, *scaled, *scale),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => format_numeric_kind(*kind, *scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Interval {
@@ -391,7 +395,9 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
     use alloc::borrow::Cow;
     macro_rules! nth {
         ($items:expr, $map:expr) => {
-            $items.get(pos).map(|e| e.as_ref().map_or(Value::Null, $map))
+            $items
+                .get(pos)
+                .map(|e| e.as_ref().map_or(Value::Null, $map))
         };
     }
     match v {
@@ -407,7 +413,11 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         Value::BoolArray(items) => nth!(items, |b| Value::Bool(*b)),
         Value::FloatArray(items) => nth!(items, |f| Value::Float(*f)),
         Value::NumericArray(items) => {
-            nth!(items, |t: &(i128, u8)| Value::Numeric { scaled: t.0, scale: t.1 , kind: spg_storage::NumericKind::Finite })
+            nth!(items, |t: &(i128, u8)| Value::Numeric {
+                scaled: t.0,
+                scale: t.1,
+                kind: spg_storage::NumericKind::Finite
+            })
         }
         Value::DateArray(items) => nth!(items, |d| Value::Date(*d)),
         Value::TimestampArray(items) | Value::TimestamptzArray(items) => {

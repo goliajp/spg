@@ -9,7 +9,8 @@ fn unique_nulls_not_distinct_rejects_second_null() {
     let mut e = Engine::new();
 
     // Column-inline NULLS NOT DISTINCT — a second NULL collides.
-    e.execute("CREATE TABLE c(x int UNIQUE NULLS NOT DISTINCT)").unwrap();
+    e.execute("CREATE TABLE c(x int UNIQUE NULLS NOT DISTINCT)")
+        .unwrap();
     e.execute("INSERT INTO c VALUES (NULL)").unwrap();
     assert!(e.execute("INSERT INTO c VALUES (NULL)").is_err());
     // Non-null uniqueness still holds.
@@ -17,7 +18,8 @@ fn unique_nulls_not_distinct_rejects_second_null() {
     assert!(e.execute("INSERT INTO c VALUES (5)").is_err());
 
     // Table-level NULLS NOT DISTINCT behaves the same.
-    e.execute("CREATE TABLE t(x int, UNIQUE NULLS NOT DISTINCT (x))").unwrap();
+    e.execute("CREATE TABLE t(x int, UNIQUE NULLS NOT DISTINCT (x))")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (NULL)").unwrap();
     assert!(e.execute("INSERT INTO t VALUES (NULL)").is_err());
 }
@@ -30,7 +32,8 @@ fn unique_default_nulls_distinct_allows_many_nulls() {
     e.execute("INSERT INTO d VALUES (NULL)").unwrap();
     e.execute("INSERT INTO d VALUES (NULL)").unwrap();
 
-    e.execute("CREATE TABLE d2(x int UNIQUE NULLS DISTINCT)").unwrap();
+    e.execute("CREATE TABLE d2(x int UNIQUE NULLS DISTINCT)")
+        .unwrap();
     e.execute("INSERT INTO d2 VALUES (NULL)").unwrap();
     e.execute("INSERT INTO d2 VALUES (NULL)").unwrap();
 }

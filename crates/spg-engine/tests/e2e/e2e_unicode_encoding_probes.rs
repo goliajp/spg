@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -35,7 +37,10 @@ fn unicode_version_returns_15() {
 fn pg_encoding_max_length_utf8() {
     let mut e = Engine::new();
     // UTF-8 = 4 bytes max per codepoint.
-    assert_eq!(as_int(&first(&mut e, "SELECT pg_encoding_max_length(6)")), 4);
+    assert_eq!(
+        as_int(&first(&mut e, "SELECT pg_encoding_max_length(6)")),
+        4
+    );
 }
 
 #[test]

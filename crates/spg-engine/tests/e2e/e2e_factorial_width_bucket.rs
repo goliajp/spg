@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -28,9 +30,15 @@ fn factorial_known_values() {
         (10, "3628800"),
         (20, "2432902008176640000"),
     ] {
-        assert_eq!(text(&mut e, &format!("SELECT (factorial({n}))::text")), expected);
+        assert_eq!(
+            text(&mut e, &format!("SELECT (factorial({n}))::text")),
+            expected
+        );
     }
-    assert_eq!(text(&mut e, "SELECT pg_typeof(factorial(5))::text"), "numeric");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(factorial(5))::text"),
+        "numeric"
+    );
 }
 
 #[test]
@@ -95,9 +103,15 @@ fn width_bucket_array_form() {
     };
     assert_eq!(bucket(&mut e, "SELECT width_bucket(5, ARRAY[1,3,7,10])"), 2);
     assert_eq!(bucket(&mut e, "SELECT width_bucket(0, ARRAY[1,3,7,10])"), 0);
-    assert_eq!(bucket(&mut e, "SELECT width_bucket(20, ARRAY[1,3,7,10])"), 4);
+    assert_eq!(
+        bucket(&mut e, "SELECT width_bucket(20, ARRAY[1,3,7,10])"),
+        4
+    );
     assert_eq!(bucket(&mut e, "SELECT width_bucket(3, ARRAY[1,3,7,10])"), 2);
-    assert_eq!(bucket(&mut e, "SELECT width_bucket(2.5, ARRAY[1.0,3.0,7.0])"), 1);
+    assert_eq!(
+        bucket(&mut e, "SELECT width_bucket(2.5, ARRAY[1.0,3.0,7.0])"),
+        1
+    );
     // The 4-arg range form still works.
     assert_eq!(bucket(&mut e, "SELECT width_bucket(5.0, 0.0, 10.0, 5)"), 3);
 }

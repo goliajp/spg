@@ -62,7 +62,10 @@ fn cell(v: &Value) -> String {
 /// Run `sql` and return its rows as strings. Panics (with the SQL) if
 /// the statement did not yield a row set.
 fn sel(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("exec `{sql}` failed: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("exec `{sql}` failed: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| r.values.iter().map(cell).collect())

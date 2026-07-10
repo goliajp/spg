@@ -83,11 +83,21 @@ fn bool_cast_accepts_pg_prefixes() {
             _ => panic!(),
         }
     };
-    for t in ["t", "tr", "tru", "true", "y", "ye", "yes", "on", "1", "  TRUE "] {
-        assert!(b(&mut e, &format!("SELECT '{t}'::bool")), "{t} should be true");
+    for t in [
+        "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1", "  TRUE ",
+    ] {
+        assert!(
+            b(&mut e, &format!("SELECT '{t}'::bool")),
+            "{t} should be true"
+        );
     }
-    for f in ["f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0"] {
-        assert!(!b(&mut e, &format!("SELECT '{f}'::bool")), "{f} should be false");
+    for f in [
+        "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0",
+    ] {
+        assert!(
+            !b(&mut e, &format!("SELECT '{f}'::bool")),
+            "{f} should be false"
+        );
     }
     // Ambiguous / garbage rejected.
     assert!(e.execute("SELECT 'o'::bool").is_err(), "'o' is ambiguous");

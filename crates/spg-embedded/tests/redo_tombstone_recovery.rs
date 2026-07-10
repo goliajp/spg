@@ -150,7 +150,10 @@ fn gate_on_delete_tombstone_survives_real_crash_recovery() {
     // Fidelity: recovery reproduces the exact gate-on state (visible set +
     // count, count included so a future closure of the aggregate-visibility
     // gap keeps this test honest).
-    assert_eq!(ids, pre_visible, "visible set must survive replay unchanged");
+    assert_eq!(
+        ids, pre_visible,
+        "visible set must survive replay unchanged"
+    );
     assert_eq!(
         scalar_count(&mut db, "SELECT count(*) FROM t"),
         pre_count,
@@ -228,7 +231,11 @@ fn gate_on_update_supersede_survives_real_crash_recovery() {
             .collect::<Vec<_>>();
         pre_ids = ordered_ids(&mut db, "SELECT id FROM t ORDER BY id");
         pre_count = scalar_count(&mut db, "SELECT count(*) FROM t");
-        assert_eq!(pre_v2, vec!["B".to_string()], "in-process: only new value visible");
+        assert_eq!(
+            pre_v2,
+            vec!["B".to_string()],
+            "in-process: only new value visible"
+        );
         assert_eq!(pre_ids, vec![1, 2, 3], "in-process: three visible rows");
 
         std::mem::forget(db);

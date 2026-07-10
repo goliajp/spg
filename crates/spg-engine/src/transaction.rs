@@ -193,7 +193,11 @@ impl Engine {
         // v7.38 (read01 P3.19) — undo any SET LOCAL made after this
         // savepoint (they roll back with the subtransaction), and drop the
         // marks nested under it.
-        if let Some(mpos) = self.savepoint_guc_marks.iter().rposition(|(n, _)| n == name) {
+        if let Some(mpos) = self
+            .savepoint_guc_marks
+            .iter()
+            .rposition(|(n, _)| n == name)
+        {
             let floor = self.savepoint_guc_marks[mpos].1;
             self.savepoint_guc_marks.truncate(mpos + 1);
             self.restore_local_gucs_to(floor);
@@ -225,7 +229,11 @@ impl Engine {
         state.savepoints.truncate(pos);
         // v7.38 (read01 P3.19) — RELEASE keeps the SET LOCAL changes (they
         // survive to the outer transaction), only the bookmarks go.
-        if let Some(mpos) = self.savepoint_guc_marks.iter().rposition(|(n, _)| n == name) {
+        if let Some(mpos) = self
+            .savepoint_guc_marks
+            .iter()
+            .rposition(|(n, _)| n == name)
+        {
             self.savepoint_guc_marks.truncate(mpos);
         }
         Ok(QueryResult::CommandOk {

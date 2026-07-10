@@ -286,11 +286,12 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // through the existing `coerce_value` text-decoder for
             // every v7.37.5 γ/δ/ε/ζ-A type that already speaks
             // Text→typed via codec.
-            let dt = crate::conversions::type_name_to_data_type(&resolve_name).ok_or_else(|| {
-                EvalError::TypeMismatch {
-                    detail: alloc::format!("unsupported cast target `::{name}`"),
-                }
-            })?;
+            let dt =
+                crate::conversions::type_name_to_data_type(&resolve_name).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!("unsupported cast target `::{name}`"),
+                    }
+                })?;
             // PG semantics: any value casts to varchar(n) / char(n) through
             // its text representation (`99::char(2)` → '99'), and an EXPLICIT
             // cast truncates to n characters — only column assignment errors on
@@ -304,10 +305,7 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     Value::Text(s) => Value::Text(s),
                     other => Value::text(value_to_text(&other)),
                 },
-                (
-                    spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n),
-                    v,
-                ) => {
+                (spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n), v) => {
                     // v7.37 D.36 — previously only `Value::Text` was handled, so
                     // `99::char(2)` reached coerce_value as an INT and hit a
                     // CHAR/INT storage type-mismatch.
@@ -316,7 +314,9 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                         other => value_to_text(&other),
                     };
                     let s = if *n > 0 && s.chars().count() > *n as usize {
-                        s.chars().take(*n as usize).collect::<alloc::string::String>()
+                        s.chars()
+                            .take(*n as usize)
+                            .collect::<alloc::string::String>()
                     } else {
                         s
                     };
@@ -324,9 +324,11 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 }
                 (_, v) => v,
             };
-            let coerced = crate::conversions::coerce_value(v, dt, &resolve_name, 0)
-                .map_err(|e| EvalError::TypeMismatch {
-                    detail: alloc::format!("{e}"),
+            let coerced =
+                crate::conversions::coerce_value(v, dt, &resolve_name, 0).map_err(|e| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!("{e}"),
+                    }
                 })?;
             Ok(match temporal_prec {
                 Some(prec) => round_temporal_to_precision(coerced, prec),
@@ -361,7 +363,7 @@ fn int_to_bit_string(v: Value<'static>, width: u32) -> Result<Value<'static>, Ev
         _ => {
             return Err(EvalError::TypeMismatch {
                 detail: "int_to_bit_string: non-integer source".into(),
-            })
+            });
         }
     };
     let w = width as usize;
@@ -392,7 +394,11 @@ fn temporal_typmod(name: &str) -> Option<u8> {
     ) {
         return None;
     }
-    let digits: alloc::string::String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: alloc::string::String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse::<u8>().ok()
 }
 
@@ -764,9 +770,9 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
         // PG `bit`/`varbit` → int is the MSB-first bit value.
         #[allow(clippy::cast_possible_truncation)]
-        Value::BitString { nbits, bytes } => {
-            Ok(Value::Int(crate::conversions::bit_string_to_i64(nbits, &bytes) as i32))
-        }
+        Value::BitString { nbits, bytes } => Ok(Value::Int(crate::conversions::bit_string_to_i64(
+            nbits, &bytes,
+        ) as i32)),
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to int", other.data_type()),
         }),
@@ -782,7 +788,9 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         #[allow(clippy::cast_possible_truncation)]
         Value::Float(x) => {
             let r = f64_round_half_even(x);
-            if !r.is_finite() || r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_775_808.0
+            if !r.is_finite()
+                || r < -9_223_372_036_854_775_808.0
+                || r >= 9_223_372_036_854_775_808.0
             {
                 return Err(EvalError::TypeMismatch {
                     detail: "bigint out of range".into(),
@@ -805,9 +813,9 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
             }),
         Value::Bool(b) => Ok(Value::BigInt(i64::from(b))),
         // PG `bit`/`varbit` → bigint is the MSB-first bit value.
-        Value::BitString { nbits, bytes } => {
-            Ok(Value::BigInt(crate::conversions::bit_string_to_i64(nbits, &bytes)))
-        }
+        Value::BitString { nbits, bytes } => Ok(Value::BigInt(
+            crate::conversions::bit_string_to_i64(nbits, &bytes),
+        )),
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to bigint", other.data_type()),
         }),
@@ -824,9 +832,9 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
         // `Value::Numeric` (from `::numeric`, a numeric column, or
         // numeric arithmetic) must convert to f64, not error.
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale, .. } => {
-            Ok(Value::Float((scaled as f64) / f64_powi(10.0, i32::from(scale))))
-        }
+        Value::Numeric { scaled, scale, .. } => Ok(Value::Float(
+            (scaled as f64) / f64_powi(10.0, i32::from(scale)),
+        )),
         Value::Text(s) => {
             let t = s.trim();
             // Unparseable → invalid syntax; parseable-but-out-of-range (overflow
@@ -838,11 +846,11 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
                     detail: format!("cannot parse {s:?} as float"),
                 });
             }
-            crate::conversions::parse_float8(t).map(Value::Float).ok_or_else(|| {
-                EvalError::TypeMismatch {
+            crate::conversions::parse_float8(t)
+                .map(Value::Float)
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: format!("\"{t}\" is out of range for type double precision"),
-                }
-            })
+                })
         }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to float", other.data_type()),

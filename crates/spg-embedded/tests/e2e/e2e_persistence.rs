@@ -139,7 +139,8 @@ fn snapshot_round_trips_numeric_specials() {
     let db_path = unique_tmpfile("numspecial");
     {
         let mut db = Database::open_in_memory();
-        db.execute("CREATE TABLE n (id INT NOT NULL, v NUMERIC)").unwrap();
+        db.execute("CREATE TABLE n (id INT NOT NULL, v NUMERIC)")
+            .unwrap();
         db.execute("INSERT INTO n VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 3.14)")
             .unwrap();
         let bytes = db.snapshot();

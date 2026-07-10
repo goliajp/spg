@@ -23,12 +23,19 @@ fn alter_column_drop_identity() {
         .unwrap();
     // After dropping identity the column is plain — an explicit id inserts fine.
     e.execute("INSERT INTO t28(id, x) VALUES (5, 10)").unwrap();
-    assert_eq!(rows(&mut e, "SELECT id, x FROM t28"), vec![vec!["Int(5)", "Int(10)"]]);
+    assert_eq!(
+        rows(&mut e, "SELECT id, x FROM t28"),
+        vec![vec!["Int(5)", "Int(10)"]]
+    );
 
     // DROP IDENTITY on a non-identity column errors, but IF EXISTS is a no-op.
     e.execute("CREATE TABLE t28b(a int)").unwrap();
-    assert!(e.execute("ALTER TABLE t28b ALTER COLUMN a DROP IDENTITY").is_err());
-    assert!(e
-        .execute("ALTER TABLE t28b ALTER COLUMN a DROP IDENTITY IF EXISTS")
-        .is_ok());
+    assert!(
+        e.execute("ALTER TABLE t28b ALTER COLUMN a DROP IDENTITY")
+            .is_err()
+    );
+    assert!(
+        e.execute("ALTER TABLE t28b ALTER COLUMN a DROP IDENTITY IF EXISTS")
+            .is_ok()
+    );
 }

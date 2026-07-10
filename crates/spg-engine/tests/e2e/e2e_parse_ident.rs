@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -12,9 +14,10 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 
 fn parts(v: &spg_storage::Value<'_>) -> Vec<String> {
     match v {
-        spg_storage::Value::TextArray(items) => {
-            items.iter().map(|o| o.clone().unwrap_or_default()).collect()
-        }
+        spg_storage::Value::TextArray(items) => items
+            .iter()
+            .map(|o| o.clone().unwrap_or_default())
+            .collect(),
         other => panic!("expected TextArray, got {other:?}"),
     }
 }
@@ -22,7 +25,10 @@ fn parts(v: &spg_storage::Value<'_>) -> Vec<String> {
 #[test]
 fn parse_ident_bare_name() {
     let mut e = Engine::new();
-    assert_eq!(parts(&first(&mut e, "SELECT parse_ident('users')")), ["users"]);
+    assert_eq!(
+        parts(&first(&mut e, "SELECT parse_ident('users')")),
+        ["users"]
+    );
 }
 
 #[test]
@@ -43,7 +49,10 @@ fn parse_ident_case_folded() {
     let mut e = Engine::new();
     // Unquoted → downcased per PG.
     assert_eq!(
-        parts(&first(&mut e, "SELECT parse_ident('PublicSchema.MixedCase')")),
+        parts(&first(
+            &mut e,
+            "SELECT parse_ident('PublicSchema.MixedCase')"
+        )),
         ["publicschema", "mixedcase"]
     );
 }
@@ -52,7 +61,10 @@ fn parse_ident_case_folded() {
 fn parse_ident_quoted_preserves_case() {
     let mut e = Engine::new();
     assert_eq!(
-        parts(&first(&mut e, r#"SELECT parse_ident('"MixedCase"."WITH.dot"')"#)),
+        parts(&first(
+            &mut e,
+            r#"SELECT parse_ident('"MixedCase"."WITH.dot"')"#
+        )),
         ["MixedCase", "WITH.dot"]
     );
 }

@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -22,10 +24,8 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 #[test]
 fn sequences_view_lists_declared_bounds() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE SEQUENCE seq_a START WITH 5 INCREMENT BY 2 MAXVALUE 1000 CYCLE",
-    )
-    .unwrap();
+    e.execute("CREATE SEQUENCE seq_a START WITH 5 INCREMENT BY 2 MAXVALUE 1000 CYCLE")
+        .unwrap();
     e.execute("CREATE SEQUENCE seq_b").unwrap();
     let got = rows(
         &mut e,

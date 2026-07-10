@@ -29,7 +29,7 @@ fn float_result(e: &mut Engine, sql: &str) -> f64 {
         Value::Float(x) => *x,
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
-        Value::Numeric { scaled, scale , .. } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
+        Value::Numeric { scaled, scale, .. } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
         other => panic!("got {other:?}"),
     }
 }
@@ -79,7 +79,7 @@ fn trunc_integer_passthrough() {
         Value::Int(n) => assert_eq!(*n, 42),
         Value::BigInt(n) => assert_eq!(*n, 42),
         Value::Float(x) => assert_eq!(*x, 42.0),
-        Value::Numeric { scaled, scale , .. } => {
+        Value::Numeric { scaled, scale, .. } => {
             assert_eq!(*scaled, 42 * 10_i128.pow(u32::from(*scale)));
         }
         other => panic!("got {other:?}"),

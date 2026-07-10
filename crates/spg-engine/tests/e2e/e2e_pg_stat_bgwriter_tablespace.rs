@@ -38,20 +38,12 @@ fn pg_stat_bgwriter_returns_single_row_with_pg_columns() {
 #[test]
 fn pg_tablespace_returns_pg_default_and_pg_global() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_tablespace")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_tablespace").unwrap();
     let QueryResult::Rows { columns, rows } = r else {
         panic!("Rows");
     };
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-    for must in [
-        "oid",
-        "spcname",
-        "spcowner",
-        "spcacl",
-        "spcoptions",
-    ] {
+    for must in ["oid", "spcname", "spcowner", "spcacl", "spcoptions"] {
         assert!(
             names.contains(&must),
             "pg_tablespace missing {must}: {names:?}"
@@ -76,9 +68,7 @@ fn pg_tablespace_returns_pg_default_and_pg_global() {
 fn pg_tablespace_carries_pg_canonical_oids() {
     // PG hard-codes 1663 = pg_default, 1664 = pg_global.
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT * FROM pg_catalog.pg_tablespace")
-        .unwrap();
+    let r = e.execute("SELECT * FROM pg_catalog.pg_tablespace").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };

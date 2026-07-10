@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first_text(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };
@@ -33,8 +35,10 @@ fn current_role_matches_current_user() {
 #[test]
 fn current_catalog_role_composable_in_where() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT, db TEXT, role TEXT)").unwrap();
-    e.execute("INSERT INTO t VALUES (1, 'spg', 'admin')").unwrap();
+    e.execute("CREATE TABLE t (id INT, db TEXT, role TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 'spg', 'admin')")
+        .unwrap();
     let r = e
         .execute("SELECT id FROM t WHERE db = current_catalog AND role = current_role")
         .unwrap();

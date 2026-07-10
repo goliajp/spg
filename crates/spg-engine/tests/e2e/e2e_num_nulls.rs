@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -25,10 +27,7 @@ fn num_nulls_counts() {
         2
     );
     assert_eq!(as_int(&first(&mut e, "SELECT num_nulls(1, 2, 3)")), 0);
-    assert_eq!(
-        as_int(&first(&mut e, "SELECT num_nulls(NULL, NULL)")),
-        2
-    );
+    assert_eq!(as_int(&first(&mut e, "SELECT num_nulls(NULL, NULL)")), 2);
 }
 
 #[test]

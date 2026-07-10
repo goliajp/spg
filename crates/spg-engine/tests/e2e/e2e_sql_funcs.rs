@@ -31,7 +31,10 @@ fn encode_base64_round_trip() {
     let v = one_value(&mut eng, "SELECT encode('Hello, World!', 'base64')");
     assert_eq!(v, Value::text("SGVsbG8sIFdvcmxkIQ=="));
     let v2 = one_value(&mut eng, "SELECT decode('SGVsbG8sIFdvcmxkIQ==', 'base64')");
-    assert_eq!(v2, Value::Bytes(std::borrow::Cow::Owned(b"Hello, World!".to_vec())));
+    assert_eq!(
+        v2,
+        Value::Bytes(std::borrow::Cow::Owned(b"Hello, World!".to_vec()))
+    );
 }
 
 #[test]
@@ -112,14 +115,21 @@ fn encode_base64_wraps_at_76_like_pg() {
     // newline); decode ignores the whitespace on the way back. 60 bytes →
     // 80 base64 chars → 76 + '\n' + 4 = 81. Live-PG18.4-verified.
     let mut eng = Engine::new();
-    let wrapped = one_value(&mut eng, "SELECT encode(decode(repeat('61',60),'hex'),'base64')");
-    let spg_storage::Value::Text(s) = &wrapped else { panic!("expected Text, got {wrapped:?}") };
+    let wrapped = one_value(
+        &mut eng,
+        "SELECT encode(decode(repeat('61',60),'hex'),'base64')",
+    );
+    let spg_storage::Value::Text(s) = &wrapped else {
+        panic!("expected Text, got {wrapped:?}")
+    };
     assert_eq!(s.len(), 81, "{s:?}");
     assert!(s.contains('\n'));
     assert!(!s.ends_with('\n'));
     // Short bodies (<=76) stay single-line.
     let short = one_value(&mut eng, "SELECT encode('abc'::bytea,'base64')");
-    let spg_storage::Value::Text(s) = &short else { panic!() };
+    let spg_storage::Value::Text(s) = &short else {
+        panic!()
+    };
     assert_eq!(s.as_ref(), "YWJj");
     // Round-trips: decode tolerates the embedded newlines.
     let rt = one_value(

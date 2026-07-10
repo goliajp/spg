@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -39,10 +41,7 @@ fn array_append_int_and_text() {
         [Some(1), Some(2), None]
     );
     assert_eq!(
-        as_text_array(&first(
-            &mut e,
-            "SELECT array_append(ARRAY['a', 'b'], 'c')"
-        )),
+        as_text_array(&first(&mut e, "SELECT array_append(ARRAY['a', 'b'], 'c')")),
         [
             Some("a".to_string()),
             Some("b".to_string()),
@@ -129,22 +128,12 @@ fn trim_array_basic_and_errors() {
         [Some("a".to_string())]
     );
     // n out of range errors like PG.
-    let err = e
-        .execute("SELECT trim_array(ARRAY[1, 2], 3)")
-        .unwrap_err();
+    let err = e.execute("SELECT trim_array(ARRAY[1, 2], 3)").unwrap_err();
     let msg = format!("{err:?}");
-    assert!(
-        msg.contains("between 0 and 2"),
-        "unexpected error: {msg}"
-    );
-    let err = e
-        .execute("SELECT trim_array(ARRAY[1, 2], -1)")
-        .unwrap_err();
+    assert!(msg.contains("between 0 and 2"), "unexpected error: {msg}");
+    let err = e.execute("SELECT trim_array(ARRAY[1, 2], -1)").unwrap_err();
     let msg = format!("{err:?}");
-    assert!(
-        msg.contains("between 0 and 2"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("between 0 and 2"), "unexpected error: {msg}");
 }
 
 #[test]

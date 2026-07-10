@@ -1373,7 +1373,10 @@ fn auto_analyze_threshold_honours_pg_50_row_base_on_small_table() {
             .unwrap();
     }
     // 50 mods vs threshold 50 + ceil(50/10) = 55 → no analyze yet.
-    assert!(e.tables_needing_analyze().is_empty(), "50 < base+scale threshold");
+    assert!(
+        e.tables_needing_analyze().is_empty(),
+        "50 < base+scale threshold"
+    );
     for i in 50..60 {
         e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
             .unwrap();
@@ -1742,7 +1745,11 @@ fn epic_p_panic_in_query_is_caught_and_engine_survives() {
     //     gone.
     match g.execute("SELECT id FROM inj_panic").unwrap() {
         QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows.len(), 1, "panicked tx write should have been rolled back");
+            assert_eq!(
+                rows.len(),
+                1,
+                "panicked tx write should have been rolled back"
+            );
             assert_eq!(rows[0].values[0], Value::Int(1));
         }
         other => panic!("expected Rows, got {other:?}"),
@@ -1952,7 +1959,8 @@ fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
 
     let mut e = crate::Engine::new();
     e.execute("CREATE TABLE inj_panic_stream (id INT)").unwrap();
-    e.execute("INSERT INTO inj_panic_stream VALUES (1)").unwrap();
+    e.execute("INSERT INTO inj_panic_stream VALUES (1)")
+        .unwrap();
 
     let sel = e
         .prepare_select_streaming("SELECT * FROM inj_panic_stream")
@@ -2061,7 +2069,10 @@ fn in_tx_sees_own_insert_through_gated_window_path() {
 #[test]
 fn mvcc_inplace_flag_defaults_off_and_toggles() {
     let mut e = Engine::new();
-    assert!(!e.mvcc_inplace(), "in-place MVCC write path must default OFF");
+    assert!(
+        !e.mvcc_inplace(),
+        "in-place MVCC write path must default OFF"
+    );
     e.set_mvcc_inplace(true);
     assert!(e.mvcc_inplace());
     e.set_mvcc_inplace(false);
@@ -2265,7 +2276,8 @@ fn mvcc_inplace_fk_parent_tombstone_fails_child_insert() {
     // and the FK insert must FAIL "no parent row" (PG agrees: a deleted
     // parent violates the FK).
     let setup = |e: &mut Engine| {
-        e.execute("CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+        e.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+            .unwrap();
         e.execute("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))")
             .unwrap();
         e.execute("INSERT INTO parent VALUES (1)").unwrap();
@@ -2322,13 +2334,12 @@ fn mvcc_inplace_on_conflict_tombstoned_row_inserts_not_updates() {
     // --- Gate ON: tombstoned row is not a conflict → INSERT arm ---
     let mut e = Engine::new();
     e.set_mvcc_inplace(true);
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (2, 100)").unwrap();
     e.execute("DELETE FROM t WHERE id = 2").unwrap();
-    e.execute(
-        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
-    )
-    .expect("ON CONFLICT over a tombstoned key must take the INSERT arm (gate-on)");
+    e.execute("INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999")
+        .expect("ON CONFLICT over a tombstoned key must take the INSERT arm (gate-on)");
     assert_eq!(
         visible_v(&e),
         vec![200],
@@ -2339,12 +2350,11 @@ fn mvcc_inplace_on_conflict_tombstoned_row_inserts_not_updates() {
     // --- Gate-ON positive control: a LIVE conflict still DO UPDATEs ---
     let mut u = Engine::new();
     u.set_mvcc_inplace(true);
-    u.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    u.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     u.execute("INSERT INTO t VALUES (2, 100)").unwrap();
-    u.execute(
-        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
-    )
-    .expect("ON CONFLICT over a live key must take the UPDATE arm (gate-on)");
+    u.execute("INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999")
+        .expect("ON CONFLICT over a live key must take the UPDATE arm (gate-on)");
     assert_eq!(
         visible_v(&u),
         vec![999],
@@ -2353,13 +2363,12 @@ fn mvcc_inplace_on_conflict_tombstoned_row_inserts_not_updates() {
 
     // --- Gate-OFF control: physical delete → INSERT arm too ---
     let mut c = Engine::new();
-    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     c.execute("INSERT INTO t VALUES (2, 100)").unwrap();
     c.execute("DELETE FROM t WHERE id = 2").unwrap();
-    c.execute(
-        "INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999",
-    )
-    .expect("ON CONFLICT after a physical delete must take the INSERT arm (gate-off)");
+    c.execute("INSERT INTO t VALUES (2, 200) ON CONFLICT (id) DO UPDATE SET v = 999")
+        .expect("ON CONFLICT after a physical delete must take the INSERT arm (gate-off)");
     assert_eq!(
         visible_v(&c),
         vec![200],
@@ -2403,8 +2412,7 @@ fn rollback_marks_writer_version_aborted() {
     // Snapshot the in-flight writer version the tx allocated, then
     // roll back and confirm the engine records it as Aborted (not
     // silently committed as the old shortcut did).
-    let active_before: alloc::vec::Vec<u64> =
-        e.active_writer_versions.iter().copied().collect();
+    let active_before: alloc::vec::Vec<u64> = e.active_writer_versions.iter().copied().collect();
     e.execute("ROLLBACK").unwrap();
     for v in active_before {
         assert_eq!(
@@ -2439,7 +2447,8 @@ fn select_values(e: &mut Engine, sql: &str) -> alloc::vec::Vec<alloc::vec::Vec<V
 fn v7_37_15_phase_d_engine_vacuum_reclaims_committed_tombstone_gate_on() {
     let mut e = Engine::new();
     e.set_mvcc_inplace(true);
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     e.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     e.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
@@ -2452,7 +2461,11 @@ fn v7_37_15_phase_d_engine_vacuum_reclaims_committed_tombstone_gate_on() {
     );
     // The deleted row is already invisible to SELECT (visibility gate).
     let before = select_values(&mut e, "SELECT id FROM t ORDER BY id");
-    assert_eq!(before.len(), 2, "SELECT hides the tombstoned row pre-vacuum");
+    assert_eq!(
+        before.len(),
+        2,
+        "SELECT hides the tombstoned row pre-vacuum"
+    );
 
     // Capture the survivors' stable RowIds before the compaction.
     let survivors_before: alloc::vec::Vec<spg_storage::row_header::RowId> = {
@@ -2460,7 +2473,10 @@ fn v7_37_15_phase_d_engine_vacuum_reclaims_committed_tombstone_gate_on() {
         (0..t.row_count())
             .filter(|&i| {
                 // survivors = rows still alive (xmax == XMAX_ALIVE)
-                t.headers().get(i).map(|h| h.xmax == spg_storage::row_header::XMAX_ALIVE).unwrap_or(false)
+                t.headers()
+                    .get(i)
+                    .map(|h| h.xmax == spg_storage::row_header::XMAX_ALIVE)
+                    .unwrap_or(false)
             })
             .filter_map(|i| t.rowids().get(i).copied())
             .collect()
@@ -2471,7 +2487,10 @@ fn v7_37_15_phase_d_engine_vacuum_reclaims_committed_tombstone_gate_on() {
     // flight, so oldest_active == current_version() > the delete's xmax
     // → the tombstone is reclaimable.
     let report = e.vacuum_pass(false);
-    assert_eq!(report.rows_reclaimed, 1, "the committed tombstone is reclaimed");
+    assert_eq!(
+        report.rows_reclaimed, 1,
+        "the committed tombstone is reclaimed"
+    );
 
     let t = e.catalog().get("t").unwrap();
     assert_eq!(t.row_count(), 2, "dead row is physically gone after vacuum");
@@ -2530,7 +2549,10 @@ fn v7_37_15_phase_d_engine_vacuum_spares_still_visible_tombstone() {
     // strictly above the delete's xmax → the row becomes reclaimable.
     e.commit_writer_version(w);
     let real = e.vacuum_pass(false);
-    assert_eq!(real.rows_reclaimed, 1, "reclaimable once the floor advances");
+    assert_eq!(
+        real.rows_reclaimed, 1,
+        "reclaimable once the floor advances"
+    );
     assert_eq!(e.catalog().get("t").unwrap().row_count(), 2);
 }
 
@@ -2553,8 +2575,14 @@ fn v7_37_15_phase_d_engine_vacuum_is_noop_gate_off() {
     );
 
     let report = e.vacuum_pass(false);
-    assert_eq!(report.rows_reclaimed, 0, "gate-off vacuum finds nothing to reclaim");
-    assert_eq!(report.rows_examined, 0, "gate-off vacuum does not walk tables");
+    assert_eq!(
+        report.rows_reclaimed, 0,
+        "gate-off vacuum finds nothing to reclaim"
+    );
+    assert_eq!(
+        report.rows_examined, 0,
+        "gate-off vacuum does not walk tables"
+    );
     assert_eq!(
         e.catalog().get("t").unwrap().row_count(),
         2,

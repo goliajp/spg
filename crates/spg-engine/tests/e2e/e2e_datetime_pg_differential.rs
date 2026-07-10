@@ -20,7 +20,9 @@ use spg_storage::Value;
 /// Render the first scalar of the first row as PG-comparable text.
 fn scalar(e: &mut Engine, sql: &str) -> String {
     use spg_engine::eval as f;
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -33,7 +35,11 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
         Value::Text(s) => s.to_string(),
         Value::Date(d) => f::format_date(*d),
         Value::Timestamp(t) => f::format_timestamp(*t),
-        Value::Interval { months, days, micros } => f::format_interval(*months, *days, *micros),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => f::format_interval(*months, *days, *micros),
         other => panic!("{sql}: unexpected {other:?}"),
     }
 }
@@ -42,26 +48,65 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
 fn extract_hour_from_interval_is_unbounded() {
     let mut e = Engine::new();
     // PG: extract(hour from interval '25 hours') = 25 (not 1).
-    assert_eq!(scalar(&mut e, "SELECT extract(hour FROM INTERVAL '25 hours')"), "25");
-    assert_eq!(scalar(&mut e, "SELECT extract(hour FROM INTERVAL '50 hours')"), "50");
+    assert_eq!(
+        scalar(&mut e, "SELECT extract(hour FROM INTERVAL '25 hours')"),
+        "25"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT extract(hour FROM INTERVAL '50 hours')"),
+        "50"
+    );
     // Days are a separate dimension — they never roll into hours.
-    assert_eq!(scalar(&mut e, "SELECT extract(hour FROM INTERVAL '1 day 25 hours')"), "25");
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT extract(hour FROM INTERVAL '1 day 25 hours')"
+        ),
+        "25"
+    );
     // MINUTE / SECOND still wrap mod 60 (HH:MM:SS keeps MM/SS < 60).
-    assert_eq!(scalar(&mut e, "SELECT extract(minute FROM INTERVAL '90 minutes')"), "30");
-    assert_eq!(scalar(&mut e, "SELECT extract(minute FROM INTERVAL '150 minutes')"), "30");
+    assert_eq!(
+        scalar(&mut e, "SELECT extract(minute FROM INTERVAL '90 minutes')"),
+        "30"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT extract(minute FROM INTERVAL '150 minutes')"),
+        "30"
+    );
 }
 
 #[test]
 fn interval_comparison_pg_canonical_span() {
     let mut e = Engine::new();
     // PG canonicalises month = 30 days, day = 24 h, year = 360 days.
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '1 month' = INTERVAL '30 days'"), "t");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '1 day' = INTERVAL '24 hours'"), "t");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '2 mons' = INTERVAL '60 days'"), "t");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '1 year' = INTERVAL '360 days'"), "t");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '1 month' = INTERVAL '31 days'"), "f");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '1 month' > INTERVAL '29 days'"), "t");
-    assert_eq!(scalar(&mut e, "SELECT INTERVAL '2 hours' < INTERVAL '1 day'"), "t");
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '1 month' = INTERVAL '30 days'"),
+        "t"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '1 day' = INTERVAL '24 hours'"),
+        "t"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '2 mons' = INTERVAL '60 days'"),
+        "t"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '1 year' = INTERVAL '360 days'"),
+        "t"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '1 month' = INTERVAL '31 days'"),
+        "f"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '1 month' > INTERVAL '29 days'"),
+        "t"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT INTERVAL '2 hours' < INTERVAL '1 day'"),
+        "t"
+    );
 }
 
 #[test]
@@ -188,16 +233,34 @@ fn to_char_interval_year_digit_forms() {
     // fell through as literal text.
     let mut e = Engine::new();
     assert_eq!(
-        scalar(&mut e, "SELECT to_char(INTERVAL '1 year 2 months', 'YY-MM')"),
+        scalar(
+            &mut e,
+            "SELECT to_char(INTERVAL '1 year 2 months', 'YY-MM')"
+        ),
         "01-02"
     );
-    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '1 year 2 months', 'YYY')"), "001");
-    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '1 year', 'Y')"), "1");
-    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '123 years', 'YY')"), "23");
-    // YYYY and the time codes are unaffected.
-    assert_eq!(scalar(&mut e, "SELECT to_char(INTERVAL '5 years', 'YYYY')"), "0005");
     assert_eq!(
-        scalar(&mut e, "SELECT to_char(INTERVAL '2 hours 30 minutes', 'HH24:MI')"),
+        scalar(&mut e, "SELECT to_char(INTERVAL '1 year 2 months', 'YYY')"),
+        "001"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT to_char(INTERVAL '1 year', 'Y')"),
+        "1"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT to_char(INTERVAL '123 years', 'YY')"),
+        "23"
+    );
+    // YYYY and the time codes are unaffected.
+    assert_eq!(
+        scalar(&mut e, "SELECT to_char(INTERVAL '5 years', 'YYYY')"),
+        "0005"
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT to_char(INTERVAL '2 hours 30 minutes', 'HH24:MI')"
+        ),
         "02:30"
     );
 }

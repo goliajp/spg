@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -34,9 +36,7 @@ fn min_scale_strips_trailing_zeroes() {
     e.execute("CREATE TABLE ns (v NUMERIC(10, 4))").unwrap();
     e.execute("INSERT INTO ns VALUES (3.1000), (2.5000), (7.0000)")
         .unwrap();
-    let r = e
-        .execute("SELECT min_scale(v) FROM ns ORDER BY v")
-        .unwrap();
+    let r = e.execute("SELECT min_scale(v) FROM ns ORDER BY v").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -61,7 +61,7 @@ fn trim_scale_removes_trailing_zeroes() {
         panic!("expected Rows");
     };
     match &rows[0].values[0] {
-        spg_storage::Value::Numeric { scaled, scale , .. } => {
+        spg_storage::Value::Numeric { scaled, scale, .. } => {
             assert_eq!(*scaled, 31);
             assert_eq!(*scale, 1);
         }
@@ -72,7 +72,11 @@ fn trim_scale_removes_trailing_zeroes() {
 #[test]
 fn scale_null_passthrough() {
     let mut e = Engine::new();
-    for f in &["scale(NULL::numeric)", "min_scale(NULL::numeric)", "trim_scale(NULL::numeric)"] {
+    for f in &[
+        "scale(NULL::numeric)",
+        "min_scale(NULL::numeric)",
+        "trim_scale(NULL::numeric)",
+    ] {
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),

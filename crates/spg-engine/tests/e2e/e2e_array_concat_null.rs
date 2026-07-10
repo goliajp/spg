@@ -6,7 +6,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
             spg_storage::Value::Null => "NULL".to_string(),
@@ -19,12 +22,21 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn array_concat_with_null_is_the_array() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT (ARRAY['a','b'] || NULL)::text"), "{a,b}");
+    assert_eq!(
+        one(&mut e, "SELECT (ARRAY['a','b'] || NULL)::text"),
+        "{a,b}"
+    );
     assert_eq!(one(&mut e, "SELECT (ARRAY[1,2] || NULL)::text"), "{1,2}");
     assert_eq!(one(&mut e, "SELECT (NULL || ARRAY[1,2])::text"), "{1,2}");
-    assert_eq!(one(&mut e, "SELECT (ARRAY[1,2] || NULL::int[])::text"), "{1,2}");
+    assert_eq!(
+        one(&mut e, "SELECT (ARRAY[1,2] || NULL::int[])::text"),
+        "{1,2}"
+    );
     // Ordinary array concat and element append are unaffected.
-    assert_eq!(one(&mut e, "SELECT (ARRAY[1,2] || ARRAY[3])::text"), "{1,2,3}");
+    assert_eq!(
+        one(&mut e, "SELECT (ARRAY[1,2] || ARRAY[3])::text"),
+        "{1,2,3}"
+    );
     assert_eq!(one(&mut e, "SELECT (ARRAY[1,2] || 3)::text"), "{1,2,3}");
 }
 

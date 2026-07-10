@@ -19,44 +19,72 @@ fn numeric_beyond_i128() {
     let mut e = Engine::new();
     // 38-digit × 20-digit = 58-digit product.
     assert_eq!(
-        t(&mut e, "SELECT (12345678901234567890123456789012345678 * 98765432109876543210)::text"),
+        t(
+            &mut e,
+            "SELECT (12345678901234567890123456789012345678 * 98765432109876543210)::text"
+        ),
         "1219326311370217952249657064224965706333485749112223746380"
     );
     // 39-digit × 2.
     assert_eq!(
-        t(&mut e, "SELECT (123456789012345678901234567890123456789::numeric * 2)::text"),
+        t(
+            &mut e,
+            "SELECT (123456789012345678901234567890123456789::numeric * 2)::text"
+        ),
         "246913578024691357802469135780246913578"
     );
     // Chained big op (product is big, then + 1) via a NumericBig operand.
     assert_eq!(
-        t(&mut e, "SELECT (99999999999999999999999999999999999999 * 99999999999999999999999999999999999999 + 1)::text"),
+        t(
+            &mut e,
+            "SELECT (99999999999999999999999999999999999999 * 99999999999999999999999999999999999999 + 1)::text"
+        ),
         "9999999999999999999999999999999999999800000000000000000000000000000000000002"
     );
     // A result that fits i128 again stays a normal Numeric.
-    assert_eq!(t(&mut e, "SELECT (10000000000000000000 * 2)::text"), "20000000000000000000");
+    assert_eq!(
+        t(&mut e, "SELECT (10000000000000000000 * 2)::text"),
+        "20000000000000000000"
+    );
     // A literal whose mantissa itself overflows i128 is now an exact NumericBig.
     assert_eq!(
-        t(&mut e, "SELECT (123456789012345678901234567890123456789012345)::text"),
+        t(
+            &mut e,
+            "SELECT (123456789012345678901234567890123456789012345)::text"
+        ),
         "123456789012345678901234567890123456789012345"
     );
     assert_eq!(
-        t(&mut e, "SELECT (99999999999999999999999999999999999999.5 + 0.5)::text"),
+        t(
+            &mut e,
+            "SELECT (99999999999999999999999999999999999999.5 + 0.5)::text"
+        ),
         "100000000000000000000000000000000000000.0"
     );
 }
 
-
 #[test]
 fn numeric_bignum_compare() {
     let mut e = Engine::new();
-    let b = |e: &mut Engine, sql: &str| matches!(
-        e.execute(sql).unwrap(),
-        QueryResult::Rows { ref rows, .. } if matches!(rows[0].values[0], spg_storage::Value::Bool(true))
-    );
+    let b = |e: &mut Engine, sql: &str| {
+        matches!(
+            e.execute(sql).unwrap(),
+            QueryResult::Rows { ref rows, .. } if matches!(rows[0].values[0], spg_storage::Value::Bool(true))
+        )
+    };
     // Big vs big (produced via arithmetic), and big vs a small int.
-    assert!(b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) > (99999999999999999999999999999999999999 * 1)"));
-    assert!(b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) = (99999999999999999999999999999999999999 + 99999999999999999999999999999999999999)"));
-    assert!(!b(&mut e, "SELECT (99999999999999999999999999999999999999 * 2) < 5"));
+    assert!(b(
+        &mut e,
+        "SELECT (99999999999999999999999999999999999999 * 2) > (99999999999999999999999999999999999999 * 1)"
+    ));
+    assert!(b(
+        &mut e,
+        "SELECT (99999999999999999999999999999999999999 * 2) = (99999999999999999999999999999999999999 + 99999999999999999999999999999999999999)"
+    ));
+    assert!(!b(
+        &mut e,
+        "SELECT (99999999999999999999999999999999999999 * 2) < 5"
+    ));
 }
 
 #[test]
@@ -67,28 +95,41 @@ fn numeric_bignum_divide() {
     let mut e = Engine::new();
     // 76-digit product / 3 (exact).
     assert_eq!(
-        t(&mut e, "SELECT (99999999999999999999999999999999999999 * 99999999999999999999999999999999999999 / 3)::text"),
+        t(
+            &mut e,
+            "SELECT (99999999999999999999999999999999999999 * 99999999999999999999999999999999999999 / 3)::text"
+        ),
         "3333333333333333333333333333333333333266666666666666666666666666666666666667"
     );
     // 45-digit / 7 — scale 0, rounds half away from zero (…620.71 → …621).
     assert_eq!(
-        t(&mut e, "SELECT (123456789012345678901234567890123456789012345 / 7)::text"),
+        t(
+            &mut e,
+            "SELECT (123456789012345678901234567890123456789012345 / 7)::text"
+        ),
         "17636684144620811271604938270017636684144621"
     );
     // Big / big that lands back inside i128 demotes to a normal Numeric.
     assert_eq!(
-        t(&mut e, "SELECT (99999999999999999999999999999999999999999 / 100000000000000000000)::text"),
+        t(
+            &mut e,
+            "SELECT (99999999999999999999999999999999999999999 / 100000000000000000000)::text"
+        ),
         "1000000000000000000000"
     );
     // Modulo of a big integer.
     assert_eq!(
-        t(&mut e, "SELECT (123456789012345678901234567890123456789012345 % 7)::text"),
+        t(
+            &mut e,
+            "SELECT (123456789012345678901234567890123456789012345 % 7)::text"
+        ),
         "5"
     );
     // Division by zero errors (matches PG).
-    assert!(e
-        .execute("SELECT 99999999999999999999999999999999999999 / 0")
-        .is_err());
+    assert!(
+        e.execute("SELECT 99999999999999999999999999999999999999 / 0")
+            .is_err()
+    );
 }
 
 #[test]
@@ -98,25 +139,46 @@ fn numeric_sqrt_stays_numeric() {
     // Oracle: live PG 18.4 — byte-identical text + numeric type.
     let mut e = Engine::new();
     // scale-0 args get 15 fractional digits; rounds like PG.
-    assert_eq!(t(&mut e, "SELECT sqrt(2::numeric)::text"), "1.414213562373095");
-    assert_eq!(t(&mut e, "SELECT sqrt(10::numeric)::text"), "3.162277660168379");
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(2::numeric)::text"),
+        "1.414213562373095"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(10::numeric)::text"),
+        "3.162277660168379"
+    );
     // Perfect square renders with the scale, all zeros after the point.
-    assert_eq!(t(&mut e, "SELECT sqrt(9::numeric)::text"), "3.000000000000000");
-    assert_eq!(t(&mut e, "SELECT sqrt(1000000::numeric)::text"), "1000.0000000000000");
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(9::numeric)::text"),
+        "3.000000000000000"
+    );
+    assert_eq!(
+        t(&mut e, "SELECT sqrt(1000000::numeric)::text"),
+        "1000.0000000000000"
+    );
     // A fractional arg floors the scale by its own; 2.25 = 1.5 exactly.
     assert_eq!(t(&mut e, "SELECT sqrt(2.25)::text"), "1.500000000000000");
     assert_eq!(t(&mut e, "SELECT sqrt(0.01)::text"), "0.10000000000000000");
     // Beyond i128: a 38-digit arg and an exact big perfect square.
     assert_eq!(
-        t(&mut e, "SELECT sqrt(99999999999999999999999999999999999999::numeric)::text"),
+        t(
+            &mut e,
+            "SELECT sqrt(99999999999999999999999999999999999999::numeric)::text"
+        ),
         "10000000000000000000"
     );
     assert_eq!(
-        t(&mut e, "SELECT sqrt(152415787532388367501905199875019052100::numeric)::text"),
+        t(
+            &mut e,
+            "SELECT sqrt(152415787532388367501905199875019052100::numeric)::text"
+        ),
         "12345678901234567890"
     );
     // Type is numeric, not double precision.
-    assert_eq!(t(&mut e, "SELECT pg_typeof(sqrt(2::numeric))::text"), "numeric");
+    assert_eq!(
+        t(&mut e, "SELECT pg_typeof(sqrt(2::numeric))::text"),
+        "numeric"
+    );
     // Negative arg errors (matches PG's domain error).
     assert!(e.execute("SELECT sqrt((-4)::numeric)").is_err());
 }

@@ -28,7 +28,10 @@ fn is_normalized_predicate() {
 fn normalized_still_usable_as_identifier() {
     // The predicate keyword must not steal "normalized" as a column name.
     let mut e = Engine::new();
-    match e.execute("SELECT normalized FROM (SELECT 1 AS normalized) t").unwrap() {
+    match e
+        .execute("SELECT normalized FROM (SELECT 1 AS normalized) t")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], spg_storage::Value::Int(1)),
         _ => panic!(),
     }

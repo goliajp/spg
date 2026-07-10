@@ -4,12 +4,14 @@
 use spg_engine::{Engine, QueryResult};
 
 fn numeric(e: &mut Engine, sql: &str) -> (i128, u8) {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
     match rows[0].values[0] {
-        spg_storage::Value::Numeric { scaled, scale , .. } => (scaled, scale),
+        spg_storage::Value::Numeric { scaled, scale, .. } => (scaled, scale),
         ref other => panic!("{sql}: expected Numeric, got {other:?}"),
     }
 }

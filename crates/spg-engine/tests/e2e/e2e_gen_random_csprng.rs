@@ -23,9 +23,15 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn gen_random_bytes_uses_injected_csprng() {
     let mut e = Engine::new().with_salt_fn(known_salt);
     // With the CSPRNG returning 0xAB repeatedly, the bytes are 0xABABABAB.
-    assert_eq!(text(&mut e, "SELECT encode(gen_random_bytes(4), 'hex')"), "abababab");
+    assert_eq!(
+        text(&mut e, "SELECT encode(gen_random_bytes(4), 'hex')"),
+        "abababab"
+    );
     // Length still honoured across multiple 16-byte draws.
-    let len = match e.execute("SELECT length(gen_random_bytes(40))::int").unwrap() {
+    let len = match e
+        .execute("SELECT length(gen_random_bytes(40))::int")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
         _ => panic!(),
     };
@@ -36,7 +42,10 @@ fn gen_random_bytes_uses_injected_csprng() {
 
     // Without a host CSPRNG the PRNG fallback still produces output.
     let mut e0 = Engine::new();
-    let n = match e0.execute("SELECT length(gen_random_bytes(8))::int").unwrap() {
+    let n = match e0
+        .execute("SELECT length(gen_random_bytes(8))::int")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
         _ => panic!(),
     };

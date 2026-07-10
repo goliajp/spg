@@ -3,7 +3,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -26,12 +28,14 @@ fn int_array_to_text_array() {
         ]
     );
     // bigint array too.
-    let spg_storage::Value::TextArray(items) =
-        one(&mut e, "SELECT ARRAY[10,20]::bigint[]::text[]")
+    let spg_storage::Value::TextArray(items) = one(&mut e, "SELECT ARRAY[10,20]::bigint[]::text[]")
     else {
         panic!("expected TextArray");
     };
-    assert_eq!(items, vec![Some(String::from("10")), Some(String::from("20"))]);
+    assert_eq!(
+        items,
+        vec![Some(String::from("10")), Some(String::from("20"))]
+    );
 }
 
 #[test]
@@ -53,7 +57,10 @@ fn time_plus_interval_wraps() {
     );
     // 10:20:30 - 11h wraps back to 23:20:30.
     assert_eq!(
-        time(one(&mut e, "SELECT '10:20:30'::time - '11 hours'::interval")),
+        time(one(
+            &mut e,
+            "SELECT '10:20:30'::time - '11 hours'::interval"
+        )),
         (23 * 3600 + 20 * 60 + 30) * 1_000_000
     );
 }

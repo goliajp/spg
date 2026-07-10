@@ -65,9 +65,10 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         }
         Expr::AggregateOrdered { .. } => true,
         Expr::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
-            contains_aggregate(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => contains_aggregate(expr),
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
         Expr::Extract { source, .. } => contains_aggregate(source),
         // v4.10 subqueries + v4.12 window functions / Literal /
@@ -301,9 +302,7 @@ fn classify_agg_name(name: &str) -> AggKind {
         "bit_or" => AggKind::BitOr,
         "bit_xor" => AggKind::BitXor,
         "json_agg" | "jsonb_agg" | "json_arrayagg" => AggKind::JsonAgg,
-        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => {
-            AggKind::JsonObjectAgg
-        }
+        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => AggKind::JsonObjectAgg,
         n if is_within_group_name(n) => AggKind::WithinGroup,
         n if is_regression_name(n) => AggKind::Regression,
         other => panic!("classify_agg_name: unknown aggregate {other}"),
@@ -1210,12 +1209,8 @@ fn accumulate_groups(
                     // exact NUMERIC (scale 0), matching PG (sum(bigint)/avg(bigint)
                     // → numeric) and defending the i64 sum against overflow.
                     Value::BigInt(n) => {
-                        let (s, sc) = crate::numeric::numeric_add(
-                            num_scaled,
-                            num_scale,
-                            i128::from(*n),
-                            0,
-                        );
+                        let (s, sc) =
+                            crate::numeric::numeric_add(num_scaled, num_scale, i128::from(*n), 0);
                         num_scaled = s;
                         num_scale = sc;
                         use_numeric = true;
@@ -1231,17 +1226,24 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale, kind } => {
-                        let (s, sc) = crate::numeric::numeric_add(
-                            num_scaled, num_scale, *scaled, *scale,
-                        );
+                    Value::Numeric {
+                        scaled,
+                        scale,
+                        kind,
+                    } => {
+                        let (s, sc) =
+                            crate::numeric::numeric_add(num_scaled, num_scale, *scaled, *scale);
                         num_scaled = s;
                         num_scale = sc;
                         num_kind = fold_sum_kind(num_kind, *kind);
                         use_numeric = true;
                         count += 1;
                     }
-                    Value::Interval { months, days, micros } => {
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
                         sum_iv_months += i64::from(*months);
                         sum_iv_days += i64::from(*days);
                         sum_iv_micros += i128::from(*micros);
@@ -1308,12 +1310,8 @@ fn accumulate_groups(
                     }
                     // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
                     Value::BigInt(n) => {
-                        let (s, sc) = crate::numeric::numeric_add(
-                            num_scaled,
-                            num_scale,
-                            i128::from(n),
-                            0,
-                        );
+                        let (s, sc) =
+                            crate::numeric::numeric_add(num_scaled, num_scale, i128::from(n), 0);
                         num_scaled = s;
                         num_scale = sc;
                         use_numeric = true;
@@ -1329,17 +1327,24 @@ fn accumulate_groups(
                         use_float = true;
                         count += 1;
                     }
-                    Value::Numeric { scaled, scale, kind } => {
-                        let (s, sc) = crate::numeric::numeric_add(
-                            num_scaled, num_scale, scaled, scale,
-                        );
+                    Value::Numeric {
+                        scaled,
+                        scale,
+                        kind,
+                    } => {
+                        let (s, sc) =
+                            crate::numeric::numeric_add(num_scaled, num_scale, scaled, scale);
                         num_scaled = s;
                         num_scale = sc;
                         num_kind = fold_sum_kind(num_kind, kind);
                         use_numeric = true;
                         count += 1;
                     }
-                    Value::Interval { months, days, micros } => {
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
                         sum_iv_months += i64::from(months);
                         sum_iv_days += i64::from(days);
                         sum_iv_micros += i128::from(micros);
@@ -2765,7 +2770,10 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(lhs, out);
             collect_aggregates(rhs, out);
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::FieldAccess { base: expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. } => {
             collect_aggregates(expr, out);
         }
         Expr::Like { expr, pattern, .. } => {
@@ -2912,7 +2920,11 @@ fn update_state(
                 }
                 // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
                 // scales on the running max; result stays exact.
-                Value::Numeric { scaled, scale, kind } => {
+                Value::Numeric {
+                    scaled,
+                    scale,
+                    kind,
+                } => {
                     st.use_numeric = true;
                     st.sum_num_kind = fold_sum_kind(st.sum_num_kind, *kind);
                     let (s, sc) = crate::numeric::numeric_add(
@@ -2924,7 +2936,11 @@ fn update_state(
                     st.sum_num_scaled = s;
                     st.sum_num_scale = sc;
                 }
-                Value::Interval { months, days, micros } => {
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
                     st.use_interval = true;
                     st.sum_iv_months += i64::from(*months);
                     st.sum_iv_days += i64::from(*days);
@@ -2976,10 +2992,7 @@ fn update_state(
             } = v
             else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "range_agg requires a range value, got {:?}",
-                        v.data_type()
-                    ),
+                    detail: format!("range_agg requires a range value, got {:?}", v.data_type()),
                 });
             };
             // Initialise the accumulator on first sight (even for
@@ -2990,9 +3003,7 @@ fn update_state(
                     ranges: alloc::vec::Vec::new(),
                 });
             }
-            if !empty
-                && let Some(Value::Multirange { ranges, .. }) = &mut st.extreme
-            {
+            if !empty && let Some(Value::Multirange { ranges, .. }) = &mut st.extreme {
                 ranges.push(spg_storage::RangeSpan {
                     lower: lower.clone(),
                     upper: upper.clone(),
@@ -3133,10 +3144,15 @@ fn update_state(
                 match crate::eval::binop::value_to_bignum(v) {
                     Some(b) => {
                         let sq = b.mul(&b);
-                        st.stddev_sum =
-                            Some(st.stddev_sum.as_ref().map_or_else(|| b.clone(), |s| s.add(&b)));
+                        st.stddev_sum = Some(
+                            st.stddev_sum
+                                .as_ref()
+                                .map_or_else(|| b.clone(), |s| s.add(&b)),
+                        );
                         st.stddev_sum_sq = Some(
-                            st.stddev_sum_sq.as_ref().map_or_else(|| sq.clone(), |s| s.add(&sq)),
+                            st.stddev_sum_sq
+                                .as_ref()
+                                .map_or_else(|| sq.clone(), |s| s.add(&sq)),
                         );
                     }
                     None => st.stddev_saw_float = true,
@@ -3258,7 +3274,11 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                         i128::from(st.sum_int),
                         0,
                     );
-                    Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                    Value::Numeric {
+                        scaled,
+                        scale,
+                        kind: spg_storage::NumericKind::Finite,
+                    }
                 }
             } else if st.use_float {
                 Value::Float(st.sum_float + (st.sum_int as f64))
@@ -3310,7 +3330,11 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     );
                     let (scaled, scale) =
                         crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
-                    Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                    Value::Numeric {
+                        scaled,
+                        scale,
+                        kind: spg_storage::NumericKind::Finite,
+                    }
                 }
             } else if st.use_float {
                 Value::Float((st.sum_float + (st.sum_int as f64)) / (st.count as f64))
@@ -3320,7 +3344,11 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 // scale. sum(int) is unaffected (it reads sum_int as BigInt).
                 let (scaled, scale) =
                     crate::numeric::numeric_avg(i128::from(st.sum_int), 0, i128::from(st.count));
-                Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+                Value::Numeric {
+                    scaled,
+                    scale,
+                    kind: spg_storage::NumericKind::Finite,
+                }
             }
         }
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
@@ -3337,7 +3365,11 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             // group_concat defaults to ',' (MySQL); xmlagg and a
             // separator-less string_agg join bare.
             let sep = st.separator.clone().unwrap_or_else(|| {
-                if name == "group_concat" { ",".into() } else { String::new() }
+                if name == "group_concat" {
+                    ",".into()
+                } else {
+                    String::new()
+                }
             });
             let mut out = String::new();
             for (i, item) in st.items.iter().enumerate() {
@@ -3650,7 +3682,11 @@ fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<f64>> {
         // element renderings; parse each back to f64.
         Value::TextArray(a) => Some(
             a.iter()
-                .map(|x| x.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))
+                .map(|x| {
+                    x.as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                })
                 .collect(),
         ),
         _ => None,
@@ -3806,8 +3842,7 @@ fn finalize_ordered_set(
                 }
             };
             if let Some(fracs) = percentile_fraction_array(fraction) {
-                let picked: Vec<Value> =
-                    fracs.iter().map(|f| items[idx_at(*f)].clone()).collect();
+                let picked: Vec<Value> = fracs.iter().map(|f| items[idx_at(*f)].clone()).collect();
                 return values_to_array(&picked);
             }
             let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0);
@@ -3895,7 +3930,10 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // (except regr_count) is floating point.
         // v7.38 (read01, T4.3) — PG stddev / variance return NUMERIC.
         "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
-            DataType::Numeric { precision: 0, scale: 0 }
+            DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            }
         }
         "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy"
         | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
@@ -3914,8 +3952,8 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // v7.32 (round-29) — hypothetical-set distribution functions.
         "percent_rank" | "cume_dist" => DataType::Float,
         // v7.32 (round-29) — JSON aggregates return JSON.
-        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
-        | "json_arrayagg" | "json_objectagg" => DataType::Json,
+        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" | "json_arrayagg"
+        | "json_objectagg" => DataType::Json,
         // min/max, percentile_disc, mode, and anything pass-through:
         // the argument's shape (for ordered-set aggs `spec.arg` is the
         // WITHIN GROUP value expression).
@@ -4148,12 +4186,18 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             subquery,
             negated,
         } => Expr::RowInSubquery {
-            row: row.iter().map(|el| rewrite_expr(el, group_exprs, aggs)).collect(),
+            row: row
+                .iter()
+                .map(|el| rewrite_expr(el, group_exprs, aggs))
+                .collect(),
             subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
             negated: *negated,
         },
         Expr::RowCmpSubquery { row, op, subquery } => Expr::RowCmpSubquery {
-            row: row.iter().map(|el| rewrite_expr(el, group_exprs, aggs)).collect(),
+            row: row
+                .iter()
+                .map(|el| rewrite_expr(el, group_exprs, aggs))
+                .collect(),
             op: *op,
             subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
         },
@@ -4547,8 +4591,18 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // Money (integer cents) — without this arm min/max(money) fell to the
         // `_ => Equal` fallback and kept whichever row arrived first.
         (Value::Money(x), Value::Money(y)) => x.cmp(y),
-        (Value::Interval { months: xm, days: xd, micros: xu },
-         Value::Interval { months: ym, days: yd, micros: yu }) => {
+        (
+            Value::Interval {
+                months: xm,
+                days: xd,
+                micros: xu,
+            },
+            Value::Interval {
+                months: ym,
+                days: yd,
+                micros: yu,
+            },
+        ) => {
             // Compare on total micros (a month = 30 days), matching PG ordering.
             let tot = |mo: i32, d: i32, u: i64| -> i128 {
                 i128::from(mo) * 30 * 86_400_000_000
@@ -4569,12 +4623,28 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
         (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
         (
-            Value::Inet { family: xf, bits: xb, addr: xa },
-            Value::Inet { family: yf, bits: yb, addr: ya },
+            Value::Inet {
+                family: xf,
+                bits: xb,
+                addr: xa,
+            },
+            Value::Inet {
+                family: yf,
+                bits: yb,
+                addr: ya,
+            },
         )
         | (
-            Value::Cidr { family: xf, bits: xb, addr: xa },
-            Value::Cidr { family: yf, bits: yb, addr: ya },
+            Value::Cidr {
+                family: xf,
+                bits: xb,
+                addr: xa,
+            },
+            Value::Cidr {
+                family: yf,
+                bits: yb,
+                addr: ya,
+            },
         ) => (xf, xa, xb).cmp(&(yf, ya, yb)),
         // Cross integer widths — min/max over a column whose cells
         // land in mixed integer variants (literal-seeded rows, casts).
@@ -4596,40 +4666,92 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // representations so 12.50 vs 5.25 orders correctly (the old
         // `_ => Equal` fallback made min/max(numeric) keep the first row).
         (
-            Value::Numeric { scaled: xs, scale: xsc , .. },
-            Value::Numeric { scaled: ys, scale: ysc , .. },
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
         ) => crate::orderby::cmp_numeric(*xs, *xsc, *ys, *ysc),
         // Mixed exact-decimal ↔ integer — promote the integer to a
         // NUMERIC at scale 0 and compare exactly (mirrors binop.rs
         // `numeric_or_widen`), so min/max over a mixed NUMERIC/int column
         // matches arithmetic + WHERE. The old `_ => Equal` fallback made
         // min/max keep whichever row happened to arrive first.
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::SmallInt(y)) => {
-            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::SmallInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Int(y)) => {
-            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::Int(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::BigInt(y)) => {
-            crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0)
-        }
-        (Value::BigInt(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc)
-        }
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::SmallInt(y),
+        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::SmallInt(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Int(y),
+        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::Int(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::BigInt(y),
+        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
+        (
+            Value::BigInt(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
         // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
         // `numeric op double precision`, so compare as f64.
-        (Value::Numeric { scaled: xs, scale: xsc , .. }, Value::Float(y)) => {
-            crate::orderby::numeric_to_f64(*xs, *xsc).partial_cmp(y).unwrap_or(Equal)
-        }
-        (Value::Float(x), Value::Numeric { scaled: ys, scale: ysc , .. }) => {
-            x.partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc)).unwrap_or(Equal)
-        }
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Float(y),
+        ) => crate::orderby::numeric_to_f64(*xs, *xsc)
+            .partial_cmp(y)
+            .unwrap_or(Equal),
+        (
+            Value::Float(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => x
+            .partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc))
+            .unwrap_or(Equal),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         // Temporal — stored as integral day / microsecond counts, so
@@ -4684,7 +4806,11 @@ mod value_cmp_mixed_numeric_tests {
     use spg_storage::Value;
 
     fn num(scaled: i128, scale: u8) -> Value<'static> {
-        Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        }
     }
 
     #[test]
@@ -4692,12 +4818,18 @@ mod value_cmp_mixed_numeric_tests {
         assert_eq!(value_cmp(&num(250, 2), &Value::Int(5)), Ordering::Less);
         assert_eq!(value_cmp(&Value::Int(5), &num(250, 2)), Ordering::Greater);
         // debug-string/Equal fallback bug: 1000 vs 9 must be Greater.
-        assert_eq!(value_cmp(&num(1000, 0), &Value::SmallInt(9)), Ordering::Greater);
+        assert_eq!(
+            value_cmp(&num(1000, 0), &Value::SmallInt(9)),
+            Ordering::Greater
+        );
         assert_eq!(value_cmp(&num(20, 1), &Value::BigInt(2)), Ordering::Equal);
         assert_eq!(value_cmp(&Value::BigInt(2), &num(20, 1)), Ordering::Equal);
         // NUMERIC↔float demotion.
         assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.5)), Ordering::Equal);
-        assert_eq!(value_cmp(&num(35, 1), &Value::Float(3.0)), Ordering::Greater);
+        assert_eq!(
+            value_cmp(&num(35, 1), &Value::Float(3.0)),
+            Ordering::Greater
+        );
         assert_eq!(value_cmp(&Value::Float(1.0), &num(25, 1)), Ordering::Less);
     }
 }

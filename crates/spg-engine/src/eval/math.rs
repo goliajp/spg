@@ -73,7 +73,8 @@ pub(super) fn uuidv7_monotonic(base_ms: u64) -> (u64, u16) {
             (last_ms + 1, 0)
         };
         let next = (ms << 12) | u64::from(ctr);
-        match UUIDV7_MONO.compare_exchange_weak(packed, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match UUIDV7_MONO.compare_exchange_weak(packed, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => return (ms, ctr),
             Err(seen) => packed = seen,
         }
@@ -89,7 +90,11 @@ pub(super) fn prng_seed(seed: f64) {
     // value in the range produces a distinct state. Force
     // non-zero so the xorshift doesn't get stuck.
     let bits = seed.to_bits();
-    let state = if bits == 0 { 0x2545_F491_4F6C_DD1D } else { bits };
+    let state = if bits == 0 {
+        0x2545_F491_4F6C_DD1D
+    } else {
+        bits
+    };
     PRNG_STATE.store(state, Ordering::Relaxed);
 }
 

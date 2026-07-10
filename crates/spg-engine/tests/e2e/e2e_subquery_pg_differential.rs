@@ -40,7 +40,9 @@ fn cell(v: &Value) -> String {
 
 /// Single-row single-column scalar result.
 fn s1(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -51,7 +53,9 @@ fn s1(e: &mut Engine, sql: &str) -> String {
 /// Every row rendered as pipe-joined columns, rows joined by comma —
 /// mirrors the PG `-tA` capture format used to record ground truth.
 fn grid(e: &mut Engine, sql: &str) -> String {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("{sql}: expected Rows");
     };
@@ -98,7 +102,10 @@ fn scalar_subquery_cardinality() {
     // >1 row → PG raises "more than one row returned by a subquery ...".
     err(&mut e, "SELECT (SELECT x FROM a)");
     // ORDER BY … LIMIT 1 collapses to one row deterministically.
-    assert_eq!(s1(&mut e, "SELECT (SELECT x FROM a ORDER BY id LIMIT 1)"), "100");
+    assert_eq!(
+        s1(&mut e, "SELECT (SELECT x FROM a ORDER BY id LIMIT 1)"),
+        "100"
+    );
 }
 
 #[test]
@@ -107,7 +114,10 @@ fn scalar_subquery_in_where_and_expr() {
     setup(&mut e);
     // Scalar subquery on the RHS of a WHERE comparison.
     assert_eq!(
-        s1(&mut e, "SELECT count(*) FROM a WHERE x = (SELECT x FROM a WHERE id=1)"),
+        s1(
+            &mut e,
+            "SELECT count(*) FROM a WHERE x = (SELECT x FROM a WHERE id=1)"
+        ),
         "1"
     );
     // Scalar subquery embedded inside an arithmetic expression.
@@ -124,26 +134,41 @@ fn correlated_scalar_subquery() {
     setup(&mut e);
     // count per correlated key; k=30 has no match in b → 0 (COUNT over empty).
     assert_eq!(
-        grid(&mut e, "SELECT id, (SELECT count(*) FROM b WHERE b.k=a.k) FROM a ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id, (SELECT count(*) FROM b WHERE b.k=a.k) FROM a ORDER BY id"
+        ),
         "1|2,2|1,3|1,4|0"
     );
     // correlated avg in WHERE: only id=1 (x=100 > avg(5,7)=6).
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x > (SELECT avg(y) FROM b WHERE b.k=a.k) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x > (SELECT avg(y) FROM b WHERE b.k=a.k) ORDER BY id"
+        ),
         "1"
     );
     // correlated aggregate over an empty partition → NULL (max/no COUNT).
     assert_eq!(
-        grid(&mut e, "SELECT id, (SELECT max(y) FROM b WHERE b.k=a.k AND false) FROM a ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id, (SELECT max(y) FROM b WHERE b.k=a.k AND false) FROM a ORDER BY id"
+        ),
         "1|<NULL>,2|<NULL>,3|<NULL>,4|<NULL>"
     );
     // correlated bare column returning 0 rows → NULL.
     assert_eq!(
-        grid(&mut e, "SELECT id, (SELECT y FROM b WHERE b.k=a.k AND b.id=99) FROM a ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id, (SELECT y FROM b WHERE b.k=a.k AND b.id=99) FROM a ORDER BY id"
+        ),
         "1|<NULL>,2|<NULL>,3|<NULL>,4|<NULL>"
     );
     // correlated bare column returning >1 row (k=10 matches two b rows) → error.
-    err(&mut e, "SELECT id, (SELECT y FROM b WHERE b.k=a.k) FROM a ORDER BY id");
+    err(
+        &mut e,
+        "SELECT id, (SELECT y FROM b WHERE b.k=a.k) FROM a ORDER BY id",
+    );
 }
 
 #[test]
@@ -168,25 +193,40 @@ fn exists_and_not_exists() {
     let mut e = Engine::new();
     setup(&mut e);
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k=a.k) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k=a.k) ORDER BY id"
+        ),
         "1,2,3"
     );
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k=a.k) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k=a.k) ORDER BY id"
+        ),
         "4"
     );
     // EXISTS only cares about row presence, not projected values.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE EXISTS (SELECT NULL FROM b WHERE b.k=a.k) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE EXISTS (SELECT NULL FROM b WHERE b.k=a.k) ORDER BY id"
+        ),
         "1,2,3"
     );
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE EXISTS (SELECT * FROM b WHERE b.k=a.k) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE EXISTS (SELECT * FROM b WHERE b.k=a.k) ORDER BY id"
+        ),
         "1,2,3"
     );
     // Empty inner → EXISTS false for every outer row.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE false) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE false) ORDER BY id"
+        ),
         ""
     );
 }
@@ -199,32 +239,50 @@ fn in_and_not_in_null_traps() {
     setup(&mut e);
     // plain IN over a subquery.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id"
+        ),
         "1,2,3"
     );
     // NOT IN where the inner set contains a NULL and no value matches →
     // result is NULL for every row → all excluded (the classic trap).
     assert_eq!(
-        grid(&mut e, "SELECT v FROM nomatch WHERE v NOT IN (SELECT v FROM nn) ORDER BY v"),
+        grid(
+            &mut e,
+            "SELECT v FROM nomatch WHERE v NOT IN (SELECT v FROM nn) ORDER BY v"
+        ),
         ""
     );
     // NOT IN over b.y (contains a NULL) → all outer rows excluded.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k NOT IN (SELECT y FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k NOT IN (SELECT y FROM b) ORDER BY id"
+        ),
         ""
     );
     // IN over a NULL-bearing set with no match → excluded (NULL, not true).
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x IN (SELECT y FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x IN (SELECT y FROM b) ORDER BY id"
+        ),
         ""
     );
     // Empty inner: NOT IN → all kept, IN → none.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k NOT IN (SELECT k FROM emp) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k NOT IN (SELECT k FROM emp) ORDER BY id"
+        ),
         "1,2,3,4"
     );
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k IN (SELECT k FROM emp) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k IN (SELECT k FROM emp) ORDER BY id"
+        ),
         ""
     );
 }
@@ -237,32 +295,50 @@ fn any_all_over_subquery() {
     setup(&mut e);
     // = ANY is IN.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k = ANY(SELECT k FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k = ANY(SELECT k FROM b) ORDER BY id"
+        ),
         "1,2,3"
     );
     // = ALL only holds if every inner value equals k — here none (mixed set).
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k = ALL(SELECT k FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k = ALL(SELECT k FROM b) ORDER BY id"
+        ),
         ""
     );
     // > ALL over the non-null y set {5,7,9}: 100/200/400 all pass, NULL drops.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x > ALL(SELECT y FROM b WHERE y IS NOT NULL) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x > ALL(SELECT y FROM b WHERE y IS NOT NULL) ORDER BY id"
+        ),
         "1,2,4"
     );
     // < ANY over y: no x is below any y → empty.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x < ANY(SELECT y FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x < ANY(SELECT y FROM b) ORDER BY id"
+        ),
         ""
     );
     // > ALL over a NULL-bearing set → NULL for the comparison → all excluded.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x > ALL(SELECT y FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x > ALL(SELECT y FROM b) ORDER BY id"
+        ),
         ""
     );
     // <> ALL is NOT IN → NULL in set → all excluded.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k <> ALL(SELECT y FROM b) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k <> ALL(SELECT y FROM b) ORDER BY id"
+        ),
         ""
     );
 }
@@ -273,18 +349,27 @@ fn any_all_over_empty_subquery() {
     setup(&mut e);
     // = ALL(empty) is vacuously true → every row kept.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k = ALL(SELECT k FROM emp) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k = ALL(SELECT k FROM emp) ORDER BY id"
+        ),
         "1,2,3,4"
     );
     // = ANY(empty) is false → none.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE k = ANY(SELECT k FROM emp) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE k = ANY(SELECT k FROM emp) ORDER BY id"
+        ),
         ""
     );
     // > ALL(empty) is true even for the NULL-x row (id=3). This was the
     // one divergence found in this sweep — SPG used to drop id=3.
     assert_eq!(
-        grid(&mut e, "SELECT id FROM a WHERE x > ALL(SELECT k FROM emp) ORDER BY id"),
+        grid(
+            &mut e,
+            "SELECT id FROM a WHERE x > ALL(SELECT k FROM emp) ORDER BY id"
+        ),
         "1,2,3,4"
     );
 }
@@ -296,17 +381,38 @@ fn any_all_over_empty_subquery() {
 fn null_lhs_empty_any_all_pg_semantics() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(s1(&mut e, "SELECT (NULL::int > ALL(SELECT k FROM emp))"), "t");
-    assert_eq!(s1(&mut e, "SELECT (NULL::int = ALL(SELECT k FROM emp))"), "t");
-    assert_eq!(s1(&mut e, "SELECT (NULL::int <> ALL(SELECT k FROM emp))"), "t");
-    assert_eq!(s1(&mut e, "SELECT (NULL::int = ANY(SELECT k FROM emp))"), "f");
-    assert_eq!(s1(&mut e, "SELECT (NULL::int > ANY(SELECT k FROM emp))"), "f");
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int > ALL(SELECT k FROM emp))"),
+        "t"
+    );
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int = ALL(SELECT k FROM emp))"),
+        "t"
+    );
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int <> ALL(SELECT k FROM emp))"),
+        "t"
+    );
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int = ANY(SELECT k FROM emp))"),
+        "f"
+    );
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int > ANY(SELECT k FROM emp))"),
+        "f"
+    );
     // Non-null LHS over empty already matched PG; pin it too.
     assert_eq!(s1(&mut e, "SELECT (5 > ALL(SELECT k FROM emp))"), "t");
     assert_eq!(s1(&mut e, "SELECT (5 = ANY(SELECT k FROM emp))"), "f");
     // Non-empty NULL LHS stays NULL (must not be broken by the empty fix).
-    assert_eq!(s1(&mut e, "SELECT (NULL::int = ANY(SELECT k FROM b))"), "<NULL>");
-    assert_eq!(s1(&mut e, "SELECT (NULL::int = ALL(SELECT k FROM b))"), "<NULL>");
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int = ANY(SELECT k FROM b))"),
+        "<NULL>"
+    );
+    assert_eq!(
+        s1(&mut e, "SELECT (NULL::int = ALL(SELECT k FROM b))"),
+        "<NULL>"
+    );
 }
 
 // ---- scalar aggregate subqueries -----------------------------------

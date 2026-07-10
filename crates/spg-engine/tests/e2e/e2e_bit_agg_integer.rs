@@ -18,10 +18,22 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn bit_aggregates_keep_input_int_type() {
     let mut e = Engine::new();
     let v = "FROM (VALUES(12),(10)) t(x)";
-    assert_eq!(text(&mut e, &format!("SELECT pg_typeof(bit_and(x)) {v}")), "integer");
+    assert_eq!(
+        text(&mut e, &format!("SELECT pg_typeof(bit_and(x)) {v}")),
+        "integer"
+    );
     assert_eq!(text(&mut e, &format!("SELECT (bit_and(x))::text {v}")), "8");
-    assert_eq!(text(&mut e, &format!("SELECT pg_typeof(bit_or(x)) {v}")), "integer");
-    assert_eq!(text(&mut e, &format!("SELECT pg_typeof(bit_xor(x)) {v}")), "integer");
+    assert_eq!(
+        text(&mut e, &format!("SELECT pg_typeof(bit_or(x)) {v}")),
+        "integer"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT pg_typeof(bit_xor(x)) {v}")),
+        "integer"
+    );
     // bigint input → bigint result.
-    assert_eq!(text(&mut e, &format!("SELECT pg_typeof(bit_or(x::bigint)) {v}")), "bigint");
+    assert_eq!(
+        text(&mut e, &format!("SELECT pg_typeof(bit_or(x::bigint)) {v}")),
+        "bigint"
+    );
 }

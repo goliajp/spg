@@ -4,7 +4,9 @@
 use spg_engine::{Engine, QueryResult};
 
 fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
@@ -46,8 +48,8 @@ fn uuid_v5_deterministic_and_known_vector() {
         "SELECT uuid_generate_v5(uuid_ns_dns(), 'www.example.com')",
     ));
     let expected: [u8; 16] = [
-        0x2e, 0xd6, 0x65, 0x7d, 0xe9, 0x27, 0x56, 0x8b,
-        0x95, 0xe1, 0x26, 0x65, 0xa8, 0xae, 0xa6, 0xa2,
+        0x2e, 0xd6, 0x65, 0x7d, 0xe9, 0x27, 0x56, 0x8b, 0x95, 0xe1, 0x26, 0x65, 0xa8, 0xae, 0xa6,
+        0xa2,
     ];
     assert_eq!(b, expected);
     // Deterministic across calls.
