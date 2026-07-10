@@ -2376,6 +2376,28 @@ impl Engine {
         if let Some(rewritten) = self.desugar_using_natural(stmt)? {
             return self.exec_bare_select_cancel(&rewritten, cancel);
         }
+        // v7.39 (RLS) Phase 1 — for a policy-subject (non-superuser) session,
+        // AND the RLS USING predicate into a single-table SELECT's WHERE.
+        // Superuser sessions and non-RLS tables get `None` (no clone, no
+        // change). Applied inline (shadowing `stmt`) rather than via re-entry
+        // so it can't re-inject on a recursive pass.
+        let rls_stmt;
+        let stmt = match self.rls_select_predicate(stmt)? {
+            Some(pred) => {
+                let mut s = stmt.clone();
+                s.where_ = Some(match s.where_.take() {
+                    Some(existing) => spg_sql::ast::Expr::Binary {
+                        lhs: alloc::boxed::Box::new(existing),
+                        op: spg_sql::ast::BinOp::And,
+                        rhs: alloc::boxed::Box::new(pred),
+                    },
+                    None => pred,
+                });
+                rls_stmt = s;
+                &rls_stmt
+            }
+            None => stmt,
+        };
         // v7.16.2 — same meta-view dispatch as
         // `exec_select_cancel`, applied here too because
         // `subquery_replacement` enters this function directly

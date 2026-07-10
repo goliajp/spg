@@ -146,6 +146,11 @@ pub enum Statement {
     CreateUser(CreateUserStatement),
     /// `DROP USER 'name'` (v4.1).
     DropUser(String),
+    /// v7.39 (RLS) — `SET ROLE { name | NONE | DEFAULT }` / `RESET ROLE`.
+    /// `Some(name)` switches the session's effective role (drives
+    /// `current_user` and RLS enforcement); `None` resets to the login
+    /// identity (the Admin superuser).
+    SetRole(Option<String>),
     /// v7.39 (RLS) — `CREATE POLICY name ON table …`.
     CreatePolicy(CreatePolicyStatement),
     /// v7.39 (RLS) — `ALTER POLICY name ON table …`.
@@ -3367,6 +3372,7 @@ impl Statement {
             | Statement::ReleaseSavepoint(_)
             | Statement::CreateUser(_)
             | Statement::DropUser(_)
+            | Statement::SetRole(_)
             | Statement::CreatePolicy(_)
             | Statement::AlterPolicy(_)
             | Statement::DropPolicy(_)
@@ -3571,6 +3577,8 @@ impl fmt::Display for Statement {
                 s.role
             ),
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
+            Self::SetRole(Some(r)) => write!(f, "SET ROLE {}", quote_ident(r)),
+            Self::SetRole(None) => f.write_str("RESET ROLE"),
             Self::CreatePolicy(s) => {
                 write!(
                     f,

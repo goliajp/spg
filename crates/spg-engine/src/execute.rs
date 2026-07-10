@@ -953,6 +953,23 @@ impl Engine {
             Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
+            Statement::SetRole(role) => {
+                match role {
+                    Some(name) => {
+                        self.session_params.insert(
+                            alloc::string::String::from(crate::session::CURRENT_ROLE_KEY),
+                            name,
+                        );
+                    }
+                    None => {
+                        self.session_params.remove(crate::session::CURRENT_ROLE_KEY);
+                    }
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::CreatePolicy(s) => self.exec_create_policy(s),
             Statement::AlterPolicy(s) => self.exec_alter_policy(s),
             Statement::DropPolicy(s) => self.exec_drop_policy(s),

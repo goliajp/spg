@@ -32,6 +32,18 @@ pub(super) fn apply_function_lower(
 
 /// v7.38 (read01) — PG's `gcd`/`lcm` keep the wider of their two integer
 /// argument widths (`gcd(int, int)` → integer, `gcd(bigint, int)` → bigint).
+/// v7.39 (RLS) — the effective session role from the eval context (the
+/// `SET ROLE` override in `session_gucs`, else the Admin login). Drives
+/// `current_user` / `current_role` / `user`.
+fn current_role_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
+    ctx.session_gucs
+        .and_then(|g| g.get(crate::session::CURRENT_ROLE_KEY))
+        .map_or_else(
+            || alloc::string::String::from("admin"),
+            alloc::string::String::clone,
+        )
+}
+
 fn int_width_result(v: i64, a: &Value<'_>, b: &Value<'_>) -> Value<'static> {
     let wide = matches!(a, Value::BigInt(_)) || matches!(b, Value::BigInt(_));
     match (wide, i32::try_from(v)) {
@@ -14178,7 +14190,10 @@ fn apply_function_dispatch(
         // mirror the wire-layer canned defaults.
         "current_database" | "database" => Ok(Value::text("spg")),
         "current_schema" => Ok(Value::text::<String>("public".into())),
-        "current_user" | "session_user" | "user" => Ok(Value::text::<String>("admin".into())),
+        // v7.39 (RLS) — current_user / user follow `SET ROLE`; session_user is
+        // the login identity (unaffected by SET ROLE). Both default to admin.
+        "current_user" | "user" => Ok(Value::text(current_role_from_ctx(ctx))),
+        "session_user" => Ok(Value::text::<String>("admin".into())),
         // v7.37.17 (17.6 siblings) — SQL:2003 spelling variants.
         // CURRENT_CATALOG is the SQL-standard synonym for
         // CURRENT_DATABASE; CURRENT_ROLE is the SQL-standard synonym
@@ -14188,7 +14203,7 @@ fn apply_function_dispatch(
         // CURRENT_USER so drivers that emit the SQL-standard names
         // don't get "unknown function" errors.
         "current_catalog" => Ok(Value::text("spg")),
-        "current_role" => Ok(Value::text::<String>("admin".into())),
+        "current_role" => Ok(Value::text(current_role_from_ctx(ctx))),
         // v7.37.43-T4 — PG advisory locks. SPG is single-writer +
         // single-process; the engine holds its own exclusive RwLock
         // on the write path, so there's no concurrent-writer race
