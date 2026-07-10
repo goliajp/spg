@@ -18,13 +18,6 @@ fn as_f64(v: &spg_storage::Value<'_>) -> f64 {
     }
 }
 
-fn as_bigint(v: &spg_storage::Value<'_>) -> i64 {
-    match v {
-        spg_storage::Value::BigInt(n) => *n,
-        other => panic!("expected BigInt, got {other:?}"),
-    }
-}
-
 fn approx(a: f64, b: f64, eps: f64) -> bool {
     (a - b).abs() < eps
 }
@@ -125,12 +118,18 @@ fn pi_returns_pi() {
 
 #[test]
 fn gcd_lcm_basic() {
+    // v7.38 (read01) — PG's gcd/lcm keep the wider integer argument width, so
+    // two int4 arguments give an integer (a bigint argument gives a bigint).
+    // Oracle: live PG18.4.
     let mut e = Engine::new();
-    assert_eq!(as_bigint(&first(&mut e, "SELECT gcd(12, 18)")), 6);
-    assert_eq!(as_bigint(&first(&mut e, "SELECT gcd(0, 5)")), 5);
-    assert_eq!(as_bigint(&first(&mut e, "SELECT gcd(-12, 18)")), 6);
-    assert_eq!(as_bigint(&first(&mut e, "SELECT lcm(4, 6)")), 12);
-    assert_eq!(as_bigint(&first(&mut e, "SELECT lcm(0, 5)")), 0);
+    assert_eq!(text(&mut e, "SELECT (gcd(12, 18))::text"), "6");
+    assert_eq!(text(&mut e, "SELECT (gcd(0, 5))::text"), "5");
+    assert_eq!(text(&mut e, "SELECT (gcd(-12, 18))::text"), "6");
+    assert_eq!(text(&mut e, "SELECT (lcm(4, 6))::text"), "12");
+    assert_eq!(text(&mut e, "SELECT (lcm(0, 5))::text"), "0");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(gcd(12, 18))::text"), "integer");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(lcm(4, 6))::text"), "integer");
+    assert_eq!(text(&mut e, "SELECT pg_typeof(gcd(12::bigint, 18))::text"), "bigint");
 }
 
 #[test]

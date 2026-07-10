@@ -10,23 +10,27 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
     rows[0].values[0].clone()
 }
 
+fn text(e: &mut Engine, sql: &str) -> String {
+    match first(e, sql) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        other => panic!("{sql}: expected Text, got {other:?}"),
+    }
+}
+
 #[test]
 fn factorial_known_values() {
+    // v7.38 (read01) — PG's factorial returns NUMERIC. Oracle: live PG18.4.
     let mut e = Engine::new();
-    let cases = [
-        (0i64, 1i64),
-        (1, 1),
-        (5, 120),
-        (10, 3628800),
-        (20, 2432902008176640000),
-    ];
-    for (n, expected) in cases {
-        let sql = format!("SELECT factorial({n})");
-        match first(&mut e, &sql) {
-            spg_storage::Value::BigInt(v) => assert_eq!(v, expected, "factorial({n})"),
-            other => panic!("factorial({n}): got {other:?}"),
-        }
+    for (n, expected) in [
+        (0, "1"),
+        (1, "1"),
+        (5, "120"),
+        (10, "3628800"),
+        (20, "2432902008176640000"),
+    ] {
+        assert_eq!(text(&mut e, &format!("SELECT (factorial({n}))::text")), expected);
     }
+    assert_eq!(text(&mut e, "SELECT pg_typeof(factorial(5))::text"), "numeric");
 }
 
 #[test]
@@ -36,9 +40,18 @@ fn factorial_negative_errors() {
 }
 
 #[test]
-fn factorial_overflow_errors() {
+fn factorial_is_exact_past_bigint() {
+    // v7.38 (read01) — being NUMERIC, factorial is exact well past `20!`, the
+    // last value that fits a bigint. It used to error there. Oracle: PG18.4.
     let mut e = Engine::new();
-    assert!(e.execute("SELECT factorial(21)").is_err());
+    assert_eq!(
+        text(&mut e, "SELECT (factorial(21))::text"),
+        "51090942171709440000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (factorial(30))::text"),
+        "265252859812191058636308480000000"
+    );
 }
 
 #[test]

@@ -30,6 +30,16 @@ pub(super) fn apply_function_lower(
     apply_function_dispatch(name_lower, args, ctx)
 }
 
+/// v7.38 (read01) — PG's `gcd`/`lcm` keep the wider of their two integer
+/// argument widths (`gcd(int, int)` → integer, `gcd(bigint, int)` → bigint).
+fn int_width_result(v: i64, a: &Value<'_>, b: &Value<'_>) -> Value<'static> {
+    let wide = matches!(a, Value::BigInt(_)) || matches!(b, Value::BigInt(_));
+    match (wide, i32::try_from(v)) {
+        (false, Ok(n)) => Value::Int(n),
+        _ => Value::BigInt(v),
+    }
+}
+
 /// v7.38 (read01) — reject a logarithm operand outside its domain with PG's
 /// own wording, so `log(0)` and `log(-1)` are distinguishable.
 fn check_log_domain(v: &spg_storage::bignum::BigNumeric) -> Result<(), EvalError> {
@@ -1875,19 +1885,18 @@ fn apply_function_dispatch(
             };
             if n < 0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("factorial(): {n} is negative"),
+                    detail: "factorial of a negative number is undefined".into(),
                 });
             }
-            if n > 20 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("factorial({n}): result overflows BIGINT"),
-                });
-            }
-            let mut r: i64 = 1;
+            // v7.38 (read01) — PG's factorial returns NUMERIC, so it is exact
+            // well past `20!` (the last value that fits a bigint). Accumulate
+            // the product in BigNumeric; the result demotes to a plain Numeric
+            // when it still fits i128.
+            let mut acc = spg_storage::bignum::BigNumeric::from_i128(1, 0);
             for k in 2..=n {
-                r = r.saturating_mul(k);
+                acc = acc.mul(&spg_storage::bignum::BigNumeric::from_i128(i128::from(k), 0));
             }
-            Ok(Value::BigInt(r))
+            Ok(crate::eval::binop::bignum_to_value(acc))
         }
         // v7.37.17 (17.6 siblings) — width_bucket(operand, low,
         // high, count) returns the bucket number that a value would
@@ -2488,7 +2497,7 @@ fn apply_function_dispatch(
                 b = a % b;
                 a = t;
             }
-            Ok(Value::BigInt(a as i64))
+            Ok(int_width_result(a as i64, &args[0], &args[1]))
         }
         "lcm" => {
             if args.len() != 2 {
@@ -2514,7 +2523,7 @@ fn apply_function_dispatch(
             let a = to_i64(&args[0])?.unsigned_abs();
             let b = to_i64(&args[1])?.unsigned_abs();
             if a == 0 || b == 0 {
-                return Ok(Value::BigInt(0));
+                return Ok(int_width_result(0, &args[0], &args[1]));
             }
             let mut x = a;
             let mut y = b;
@@ -2525,7 +2534,7 @@ fn apply_function_dispatch(
             }
             let g = x;
             let lcm = (a / g).saturating_mul(b);
-            Ok(Value::BigInt(lcm as i64))
+            Ok(int_width_result(lcm as i64, &args[0], &args[1]))
         }
         "radians" => {
             if args.len() != 1 {
@@ -8700,9 +8709,12 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(n) => Ok(Value::SmallInt(n.signum())),
-                Value::Int(n) => Ok(Value::Int(n.signum())),
-                Value::BigInt(n) => Ok(Value::BigInt(n.signum())),
+                // v7.38 (read01) — PG's sign over an integer resolves to the
+                // float8 overload (`pg_typeof(sign(-5))` = double precision).
+                Value::SmallInt(n) => Ok(Value::Float(f64::from(n.signum()))),
+                Value::Int(n) => Ok(Value::Float(f64::from(n.signum()))),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Ok(Value::Float(n.signum() as f64)),
                 Value::Float(x) => {
                     let s = if *x > 0.0 {
                         1.0
@@ -8713,13 +8725,13 @@ fn apply_function_dispatch(
                     };
                     Ok(Value::Float(s))
                 }
-                Value::Numeric { scaled, scale, .. } => {
-                    let s = scaled.signum();
-                    Ok(Value::Numeric {
-                        scaled: s * pow10_i128(*scale),
-                        scale: *scale,
-                     kind: spg_storage::NumericKind::Finite })
-                }
+                // PG `sign(numeric)` is scale 0 (`sign(-5.5)` renders `-1`, not
+                // `-1.0`), not the argument's own scale.
+                Value::Numeric { scaled, .. } => Ok(Value::Numeric {
+                    scaled: scaled.signum(),
+                    scale: 0,
+                    kind: spg_storage::NumericKind::Finite,
+                }),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("sign() needs numeric, got {:?}", other.data_type()),
                 }),
@@ -9806,9 +9818,12 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                    Ok(args[0].clone().into_owned())
-                }
+                // v7.38 (read01) — PG's ceil/floor over an integer resolve to
+                // the float8 overload (`pg_typeof(ceil(2))` = double precision).
+                Value::SmallInt(n) => Ok(Value::Float(f64::from(*n))),
+                Value::Int(n) => Ok(Value::Float(f64::from(*n))),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Ok(Value::Float(*n as f64)),
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
                 Value::Numeric { scaled, scale, .. } => {
                     let factor = pow10_i128(*scale);
@@ -9834,9 +9849,11 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                    Ok(args[0].clone().into_owned())
-                }
+                // v7.38 (read01) — see ceil: an integer argument is double in PG.
+                Value::SmallInt(n) => Ok(Value::Float(f64::from(*n))),
+                Value::Int(n) => Ok(Value::Float(f64::from(*n))),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Ok(Value::Float(*n as f64)),
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
                 Value::Numeric { scaled, scale, .. } => {
                     let factor = pow10_i128(*scale);
