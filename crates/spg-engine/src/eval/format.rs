@@ -260,17 +260,28 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
         }
         return Some(days_from_civil(y, m, d));
     }
-    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+    // v7.38 (read01) — year-first numeric form with `-`, `/` or `.` separators
+    // and non-zero-padded month/day (`2020-1-5`, `2020/01/5`, `2020.1.05`), all
+    // of which PG accepts. Requires exactly three all-digit fields, the first
+    // being the 4-digit year, so it stays unambiguous (no MDY/DMY guessing).
+    let mut parts = s.splitn(3, |c| c == '-' || c == '/' || c == '.');
+    let (ys, ms, ds) = (parts.next()?, parts.next()?, parts.next()?);
+    if ds.contains(['-', '/', '.', ' ']) {
+        return None; // trailing separator / extra field / garbage
+    }
+    if ys.len() != 4 || ms.is_empty() || ms.len() > 2 || ds.is_empty() || ds.len() > 2 {
         return None;
     }
-    let y: i32 = s[0..4].parse().ok()?;
-    let m: u32 = s[5..7].parse().ok()?;
-    let d: u32 = s[8..10].parse().ok()?;
-    // PG validates the day against the actual (leap-aware) month
-    // length: `'2024-02-30'::date` / `'2024-04-31'::date` /
-    // `'2023-02-29'::date` all raise "date/time field value out of
-    // range". Without this bound the fixed-position parser silently
-    // rolls the overflow forward (Feb 30 → Mar 1) and corrupts data.
+    if [ys, ms, ds].iter().any(|p| !p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let y: i32 = ys.parse().ok()?;
+    let m: u32 = ms.parse().ok()?;
+    let d: u32 = ds.parse().ok()?;
+    // PG validates the day against the actual (leap-aware) month length:
+    // `'2024-02-30'` / `'2024-04-31'` / `'2023-02-29'` all raise "date/time
+    // field value out of range". Without this the parser would silently roll
+    // the overflow forward (Feb 30 → Mar 1) and corrupt data.
     if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
         return None;
     }
