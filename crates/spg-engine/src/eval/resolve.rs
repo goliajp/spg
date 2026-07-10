@@ -273,8 +273,48 @@ pub(super) fn resolve_column(
         (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
             detail: alloc::format!("ambiguous column reference: {}", c.name),
         }),
-        _ => Err(EvalError::ColumnNotFound {
-            name: c.name.clone(),
-        }),
+        _ => {
+            // v7.38 (read01, T9) — whole-row reference: a bare name equal to
+            // the FROM alias (real table or subquery) with no matching column
+            // resolves to the composite record of every column, exactly as PG
+            // treats `row_to_json(e)` / `to_jsonb(e)` / a bare `SELECT e`.
+            // Column resolution above wins, so a real column named like the
+            // alias is unaffected.
+            if c.qualifier.is_none() && ctx.table_alias == Some(c.name.as_str()) {
+                return Ok(whole_row_composite(row, ctx, &c.name));
+            }
+            Err(EvalError::ColumnNotFound {
+                name: c.name.clone(),
+            })
+        }
     }
+}
+
+/// v7.38 (read01, T9) — build the whole-row `Value::Composite` for `alias`
+/// from the current row. In a single-table / subquery scan the schema column
+/// names are already bare, so every column becomes a field. In a joined
+/// schema the columns are `alias.col` composites; keep only this alias's and
+/// strip the prefix so the composite field names match PG's (the base column
+/// names).
+fn whole_row_composite(row: &Row<'_>, ctx: &EvalContext<'_>, alias: &str) -> Value<'static> {
+    let prefix = alloc::format!("{alias}.");
+    let joined: Vec<(usize, &str)> = ctx
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.name.strip_prefix(&prefix).map(|bare| (i, bare)))
+        .collect();
+    let fields: Vec<(String, Value<'static>)> = if joined.is_empty() {
+        ctx.columns
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.clone(), row.values[i].clone().into_owned()))
+            .collect()
+    } else {
+        joined
+            .into_iter()
+            .map(|(i, bare)| (bare.to_string(), row.values[i].clone().into_owned()))
+            .collect()
+    };
+    Value::Composite(fields)
 }
