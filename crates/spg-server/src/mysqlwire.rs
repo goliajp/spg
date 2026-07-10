@@ -631,6 +631,7 @@ fn handle_com_stmt_prepare(
                 inline_enum_variants: None,
                 inline_set_variants: None,
                 generated_stored_expr: None,
+                identity_always: false,
             };
             let buf = encode_column_def_41(&placeholder);
             write_packet(stream, seq, &buf)?;

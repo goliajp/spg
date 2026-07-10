@@ -1347,6 +1347,14 @@ pub struct ColumnSchema {
     /// Persisted in catalog FILE_VERSION 50+; older catalogs
     /// deserialise with None.
     pub generated_stored_expr: Option<String>,
+    /// v7.38 (read01) — `GENERATED ALWAYS AS IDENTITY`. Both identity
+    /// flavours set `auto_increment`; this additionally marks the ALWAYS
+    /// flavour, whose explicit INSERT value PG rejects ("cannot insert a
+    /// non-DEFAULT value into column …") unless `OVERRIDING SYSTEM VALUE`.
+    /// `false` (serial / `BY DEFAULT`) keeps the permissive path. In-memory
+    /// only for now — not yet in the catalog appendix, so a reloaded table
+    /// deserialises as `false` (the pre-existing permissive behaviour).
+    pub identity_always: bool,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -5626,6 +5634,7 @@ impl ColumnSchema {
             inline_enum_variants: None,
             inline_set_variants: None,
             generated_stored_expr: None,
+            identity_always: false,
         }
     }
 

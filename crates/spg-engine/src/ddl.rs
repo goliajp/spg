@@ -233,6 +233,9 @@ impl Engine {
             )));
         }
         table.schema_mut().columns[pos].auto_increment = false;
+        // v7.38 (read01) — a dropped identity is a plain column: clear the
+        // ALWAYS marker too so explicit INSERT values are accepted again.
+        table.schema_mut().columns[pos].identity_always = false;
         Ok(())
     }
 
@@ -3615,6 +3618,10 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     if let Some(gen_expr) = c.generated_stored_expr {
         schema.generated_stored_expr = Some(alloc::format!("{gen_expr}"));
     }
+    // v7.38 (read01) — GENERATED ALWAYS AS IDENTITY marker. The engine
+    // rejects an explicit non-DEFAULT INSERT value for such a column
+    // unless the statement carries OVERRIDING SYSTEM VALUE.
+    schema.identity_always = c.identity_always;
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to

@@ -55,6 +55,7 @@ pub(crate) fn deserialize_table(
             inline_enum_variants: None,
             inline_set_variants: None,
             generated_stored_expr: None,
+            identity_always: false,
         });
     }
     let n_cols = cols.len();
