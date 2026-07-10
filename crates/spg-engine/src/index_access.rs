@@ -525,6 +525,38 @@ fn try_range_seek<'a>(
     Some(out)
 }
 
+/// v7.38 (perf, exact-range count) — `count(*)` over a WHERE that is EXACTLY a
+/// two-sided indexed range: the visible in-range locators ARE the matching
+/// rows (`parse_range_bounds` only matches a pure two-sided range on the
+/// indexed column, so there's no residual predicate), so we tally them without
+/// materialising a single row or re-evaluating the WHERE. Returns None (→ the
+/// caller runs the general aggregate path) when the shape doesn't fit or a
+/// cold-tier locator is in range (its visibility needs the resolved row). No
+/// selectivity cap — counting is cheap and always ≤ a full scan.
+pub(crate) fn try_range_count(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+) -> Option<i64> {
+    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    let idx = table.index_on(col_pos)?;
+    let locators = idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), usize::MAX)?;
+    let mut count: i64 = 0;
+    for loc in &locators {
+        match *loc {
+            spg_storage::RowLocator::Hot(i) => {
+                if table.is_row_visible(i, snapshot) {
+                    count += 1;
+                }
+            }
+            spg_storage::RowLocator::Cold { .. } => return None,
+        }
+    }
+    Some(count)
+}
+
 pub(crate) fn try_index_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
