@@ -144,7 +144,7 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
         return distinct
             .iter()
             .max_by_key(|t| numeric_rank(t).unwrap_or(0))
-            .map(|t| (*t).clone());
+            .map(|t| *(*t));
     }
     let non_text: Vec<&DataType> = distinct
         .iter()
@@ -166,7 +166,7 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
         return Some(DataType::Timestamp);
     }
     if non_text.len() == 1 {
-        return Some(non_text[0].clone());
+        return Some(*non_text[0]);
     }
     None
 }
@@ -368,7 +368,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             })
         }
         // arr[lo:hi] — slice keeps the array type.
-        Expr::ArraySlice { target, .. } => return describe_expr(target, schema_cols),
+        Expr::ArraySlice { target, .. } => describe_expr(target, schema_cols),
         // v7.37.43-T4 — `$N` placeholders in a projection. Pre-T4 this
         // arm fell through to `_ => None`, which made
         // `describe_select_items` return an empty Vec, which made

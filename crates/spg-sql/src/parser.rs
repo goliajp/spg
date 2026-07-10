@@ -1213,7 +1213,7 @@ impl Parser {
                     {
                         self.advance();
                         self.consume_until_statement_boundary();
-                        return Ok(Statement::Empty);
+                        Ok(Statement::Empty)
                     }
                     Token::Publication => {
                         self.advance();
@@ -1555,10 +1555,10 @@ impl Parser {
             // walks Statement::Truncate.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("truncate") => {
                 self.advance();
-                // Optional TABLE noise word (PG accepts both).
-                if matches!(self.peek(), Token::Table) {
-                    self.advance();
-                } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table"))
+                // Optional TABLE noise word — PG accepts both the reserved
+                // token and the bare identifier spelling.
+                if matches!(self.peek(), Token::Table)
+                    || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table"))
                 {
                     self.advance();
                 }
@@ -6852,7 +6852,7 @@ impl Parser {
                     loop {
                         let key = self.expect_ident_like()?;
                         let n = match self.peek().clone() {
-                            Token::Integer(v) if v >= 0 && v <= i64::from(u32::MAX) => {
+                            Token::Integer(v) if u32::try_from(v).is_ok() => {
                                 self.advance();
                                 v as u32
                             }
@@ -8109,7 +8109,6 @@ impl Parser {
                 break;
             }
         }
-        let mut items = items;
         if !window_defs.is_empty()
             || items
                 .iter()
@@ -8518,7 +8517,7 @@ impl Parser {
                     loop {
                         let key = self.expect_ident_like()?;
                         let n = match self.peek().clone() {
-                            Token::Integer(v) if v >= 0 && v <= i64::from(u32::MAX) => {
+                            Token::Integer(v) if u32::try_from(v).is_ok() => {
                                 self.advance();
                                 v as u32
                             }
@@ -11430,8 +11429,8 @@ impl Parser {
             }
         };
         Ok(Some(crate::ast::OnConflictClause {
-            constraint_name,
             target_columns,
+            constraint_name,
             action,
         }))
     }

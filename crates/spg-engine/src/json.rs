@@ -306,7 +306,7 @@ fn locate_member<'a>(src: &'a str, key: &str) -> Option<&'a str> {
 
 /// Verbatim source slice of element `idx` in the array encoded at `src`.
 /// A negative index counts from the end, as in PG.
-fn locate_index<'a>(src: &'a str, idx: i64) -> Option<&'a str> {
+fn locate_index(src: &str, idx: i64) -> Option<&str> {
     let b = src.as_bytes();
     let mut i = skip_ws_at(b, 0);
     if b.get(i) != Some(&b'[') {

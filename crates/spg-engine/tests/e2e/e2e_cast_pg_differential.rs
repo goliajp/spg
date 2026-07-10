@@ -3963,7 +3963,7 @@ fn distinct_over_window() {
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
-                Value::Null => "".into(),
+                Value::Null => String::new(),
                 Value::Text(s) => s.to_string(),
                 o => format!("{o:?}"),
             },
@@ -4153,7 +4153,7 @@ fn range_partition_nontimestamp_key() {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
                 Some(Value::Text(s)) => s.to_string(),
-                Some(Value::Null) => "".into(),
+                Some(Value::Null) => String::new(),
                 _ => "?".into(),
             },
             o => format!("{o:?}"),
@@ -4243,7 +4243,7 @@ fn delete_on_partition_parent() {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
                 Some(Value::Text(s)) => s.to_string(),
-                Some(Value::Null) => "".into(),
+                Some(Value::Null) => String::new(),
                 _ => "?".into(),
             },
             o => format!("{o:?}"),
@@ -4306,7 +4306,7 @@ fn update_on_partition_parent_nonkey() {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
                 Some(Value::Text(s)) => s.to_string(),
-                Some(Value::Null) => "".into(),
+                Some(Value::Null) => String::new(),
                 _ => "?".into(),
             },
             o => format!("{o:?}"),
@@ -4363,7 +4363,7 @@ fn jsonb_array_length_text_arg() {
     let mut e = Engine::new();
     let q = |e: &mut Engine, sql: &str| -> String {
         match e.execute(sql) {
-            Ok(QueryResult::Rows { rows, .. }) => format!("{:?}", &rows[0].values[0]),
+            Ok(QueryResult::Rows { rows, .. }) => format!("{:?}", rows[0].values[0]),
             Ok(o) => format!("{o:?}"),
             Err(er) => format!("ERR:{:.30}", format!("{er:?}")),
         }
@@ -4392,7 +4392,7 @@ fn jsonb_typeof_strip_text_arg() {
         match e.execute(sql) {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
                 Value::Text(s) => s.to_string(),
-                Value::Null => "".into(),
+                Value::Null => String::new(),
                 o => format!("{o:?}"),
             },
             Ok(_) => "OK".into(),
@@ -4527,7 +4527,7 @@ fn in_subquery_null_three_valued_logic() {
             Ok(QueryResult::Rows { rows, .. }) => match rows.first().map(|r| &r.values[0]) {
                 Some(Value::Text(s)) => s.to_string(),
                 Some(Value::Bool(b)) => format!("{b}"),
-                Some(Value::Null) => "".into(),
+                Some(Value::Null) => String::new(),
                 Some(o) => format!("{o:?}"),
                 None => "E".into(),
             },
@@ -4671,7 +4671,7 @@ fn jsonb_path_exists_operator() {
             Ok(QueryResult::Rows { rows, .. }) => match &rows[0].values[0] {
                 Value::Text(s) => s.to_string(),
                 Value::Bool(b) => format!("{b}"),
-                Value::Null => "".into(),
+                Value::Null => String::new(),
                 o => format!("{o:?}"),
             },
             o => format!("{o:?}"),

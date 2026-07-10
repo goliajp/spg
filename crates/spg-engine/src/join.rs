@@ -1576,26 +1576,26 @@ impl Engine {
         // PG rejects RIGHT/FULL LATERAL, so a single NULL-outer
         // materialisation is the correct fixed set. Also handles the
         // empty-drive case (no left tuples → every peer row unmatched).
-        let lateral_fixed: Option<Vec<Row<'static>>> = if right_or_full && peer.lateral.is_some() {
-            let inner = peer.lateral.expect("lateral peer");
-            // Materialise the derived table directly (no outer-column
-            // substitution): a RIGHT/FULL peer must be non-correlated
-            // (PG rejects RIGHT/FULL LATERAL), so its rows are the same
-            // for every drive row and independent of the outer context.
-            // Use the union-aware entry: a multi-row `VALUES (…),(…)` is
-            // stored as a head SELECT + `stmt.unions` tails, so the bare
-            // (non-union) executor would return only the first row.
-            match self.exec_select_cancel(inner, cancel)? {
-                QueryResult::Rows { rows, .. } => Some(rows),
-                _ => {
-                    return Err(EngineError::Unsupported(
-                        "derived-table join operand must be a SELECT".into(),
-                    ));
+        let lateral_fixed: Option<Vec<Row<'static>>> =
+            if right_or_full && let Some(inner) = peer.lateral {
+                // Materialise the derived table directly (no outer-column
+                // substitution): a RIGHT/FULL peer must be non-correlated
+                // (PG rejects RIGHT/FULL LATERAL), so its rows are the same
+                // for every drive row and independent of the outer context.
+                // Use the union-aware entry: a multi-row `VALUES (…),(…)` is
+                // stored as a head SELECT + `stmt.unions` tails, so the bare
+                // (non-union) executor would return only the first row.
+                match self.exec_select_cancel(inner, cancel)? {
+                    QueryResult::Rows { rows, .. } => Some(rows),
+                    _ => {
+                        return Err(EngineError::Unsupported(
+                            "derived-table join operand must be a SELECT".into(),
+                        ));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         // A fixed peer-row index space exists for the non-lateral eager
         // path OR the just-materialised `lateral_fixed` set. Both let
         // RIGHT / FULL OUTER track which peer rows matched and emit the
@@ -2864,7 +2864,7 @@ fn is_constant_values_derived(s: &SelectStatement) -> bool {
             && p.having.is_none()
             && p.items.iter().all(|it| match it {
                 SelectItem::Expr { expr, .. } => expr_is_constant(expr),
-                _ => false,
+                SelectItem::Wildcard => false,
             })
     };
     peer_ok(s) && s.unions.iter().all(|(_, peer)| peer_ok(peer))

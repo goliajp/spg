@@ -1187,7 +1187,7 @@ fn scale_interval(iv: &Value<'static>, factor: f64) -> Result<Value<'static>, Ev
     let new_micros = (*micros as f64) * factor + (d - new_days) * 86_400_000_000.0;
     let months_ok = new_months >= f64::from(i32::MIN) && new_months <= f64::from(i32::MAX);
     let days_ok = new_days >= f64::from(i32::MIN) && new_days <= f64::from(i32::MAX);
-    let micros_ok = new_micros >= -9.3e18 && new_micros <= 9.3e18;
+    let micros_ok = (-9.3e18..=9.3e18).contains(&new_micros);
     if !(months_ok && days_ok && micros_ok) {
         return Err(EvalError::TypeMismatch {
             detail: "INTERVAL out of range after scaling".into(),
@@ -1455,9 +1455,9 @@ fn numeric_big_op(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value<'stati
             return Some(Err(EvalError::DivisionByZero));
         }
         let rscale = crate::numeric::division_display_scale_big(&a, &b);
-        return Some(Ok(match a.div(&b, rscale) {
-            Some(q) => bignum_to_value(q),
-            None => return None,
+        return Some(Ok({
+            let q = a.div(&b, rscale)?;
+            bignum_to_value(q)
         }));
     }
     // Modulo of two big integers (scale 0) via truncating integer div_rem;

@@ -1477,7 +1477,7 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
         };
         if let Some(radix) = radix {
             let mut j = 2;
-            let valid = |b: u8| -> bool { (b as char).to_digit(radix).is_some() || b == b'_' };
+            let valid = |b: u8| -> bool { (b as char).is_digit(radix) || b == b'_' };
             let start = j;
             while j < bytes.len() && valid(bytes[j]) {
                 j += 1;

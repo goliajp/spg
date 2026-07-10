@@ -10,7 +10,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<spg_storage::Value<'static>>> {
     let QueryResult::Rows { rows, .. } = r else {
         panic!("expected Rows");
     };
-    rows.iter().map(|row| row.values.to_vec()).collect()
+    rows.iter().map(|row| row.values.clone()).collect()
 }
 
 fn cols(e: &mut Engine, sql: &str) -> Vec<String> {

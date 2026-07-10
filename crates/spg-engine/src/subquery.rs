@@ -890,7 +890,7 @@ impl Engine {
                 let mut alts: Vec<Expr> = Vec::with_capacity(rows.len());
                 for r0 in rows {
                     let mut conj: Option<Expr> = None;
-                    for (lhs_el, v) in row.iter().zip(r0.values.into_iter()) {
+                    for (lhs_el, v) in row.iter().zip(r0.values) {
                         let eq = Expr::Binary {
                             lhs: Box::new(lhs_el.clone()),
                             op: BinOp::Eq,

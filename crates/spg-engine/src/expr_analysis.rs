@@ -115,11 +115,9 @@ pub(crate) fn collect_qualified_refs_expr(
         &mut |sub| subs.push(sub),
     );
     for c in cols {
-        match c.qualifier {
-            Some(q) => {
-                out.insert((q, c.name));
-            }
-            None => return None,
+        {
+            let q = c.qualifier?;
+            out.insert((q, c.name));
         }
     }
     for sub in subs {

@@ -305,7 +305,7 @@ pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, Eva
         [Value::Null] => return Ok(Value::Null),
         [Value::Text(s)] => {
             let bytes: Vec<u8> = s
-                .split(|c| c == ':' || c == '-')
+                .split([':', '-'])
                 .filter_map(|part| u8::from_str_radix(part, 16).ok())
                 .collect();
             <[u8; 8]>::try_from(bytes.as_slice()).map_err(|_| EvalError::TypeMismatch {

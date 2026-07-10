@@ -1114,7 +1114,7 @@ impl<'arena> Value<'arena> {
             Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(s))),
             Value::Json(s) => Value::Json(Cow::Borrowed(arena.alloc_str(s))),
             Value::Xml(s) => Value::Xml(Cow::Borrowed(arena.alloc_str(s))),
-            Value::BpChar(s) => Value::BpChar(Cow::Borrowed(arena.alloc_str(&s))),
+            Value::BpChar(s) => Value::BpChar(Cow::Borrowed(arena.alloc_str(s))),
             Value::Bytes(b) => {
                 let slot = arena.alloc_slice_copy::<u8>(b);
                 Value::Bytes(Cow::Borrowed(slot))

@@ -331,14 +331,8 @@ fn range_interval_offset_frame() {
     );
     // Honest errors: an INTERVAL offset is RANGE-only, and RANGE INTERVAL
     // needs a temporal ORDER BY key.
-    assert!(matches!(
-        e.execute("SELECT count(*) OVER (ORDER BY v ROWS BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf"),
-        Err(_)
-    ));
-    assert!(matches!(
-        e.execute("SELECT count(*) OVER (ORDER BY v RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf"),
-        Err(_)
-    ));
+    assert!(e.execute("SELECT count(*) OVER (ORDER BY v ROWS BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf").is_err());
+    assert!(e.execute("SELECT count(*) OVER (ORDER BY v RANGE BETWEEN '1 day'::interval PRECEDING AND CURRENT ROW) FROM wf").is_err());
 }
 
 #[test]

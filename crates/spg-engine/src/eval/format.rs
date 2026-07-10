@@ -271,7 +271,7 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     // and non-zero-padded month/day (`2020-1-5`, `2020/01/5`, `2020.1.05`), all
     // of which PG accepts. Requires exactly three all-digit fields, the first
     // being the 4-digit year, so it stays unambiguous (no MDY/DMY guessing).
-    let mut parts = s.splitn(3, |c| c == '-' || c == '/' || c == '.');
+    let mut parts = s.splitn(3, ['-', '/', '.']);
     let (ys, ms, ds) = (parts.next()?, parts.next()?, parts.next()?);
     if ds.contains(['-', '/', '.', ' ']) {
         return None; // trailing separator / extra field / garbage
@@ -305,10 +305,8 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
 /// numeric path. Returns `None` for anything ambiguous or malformed so the
 /// caller raises the same "invalid input" / "out of range" errors as PG.
 fn parse_month_name_date(s: &str) -> Option<i32> {
-    let tokens: alloc::vec::Vec<&str> = s
-        .split(|c: char| c == ' ' || c == ',' || c == '-')
-        .filter(|t| !t.is_empty())
-        .collect();
+    let tokens: alloc::vec::Vec<&str> =
+        s.split([' ', ',', '-']).filter(|t| !t.is_empty()).collect();
     if tokens.len() != 3 {
         return None;
     }

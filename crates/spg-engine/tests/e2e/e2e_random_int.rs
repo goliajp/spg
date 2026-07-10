@@ -24,7 +24,10 @@ fn random_int_in_range() {
     let mut e = Engine::new();
     for _ in 0..100 {
         let v = as_bigint(&first(&mut e, "SELECT random_int(10, 20)"));
-        assert!(v >= 10 && v <= 20, "random_int(10, 20) = {v} out of range");
+        assert!(
+            (10..=20).contains(&v),
+            "random_int(10, 20) = {v} out of range"
+        );
     }
 }
 
@@ -40,7 +43,7 @@ fn random_int_negative_range() {
     for _ in 0..50 {
         let v = as_bigint(&first(&mut e, "SELECT random_int(-10, 10)"));
         assert!(
-            v >= -10 && v <= 10,
+            (-10..=10).contains(&v),
             "random_int(-10, 10) = {v} out of range"
         );
     }
@@ -54,7 +57,7 @@ fn random_int_bigint_range() {
             &mut e,
             "SELECT random_int(0::bigint, 1000000000000::bigint)",
         ));
-        assert!(v >= 0 && v <= 1_000_000_000_000);
+        assert!((0..=1_000_000_000_000).contains(&v));
     }
 }
 

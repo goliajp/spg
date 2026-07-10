@@ -220,12 +220,18 @@ impl BigNumeric {
     }
 
     /// Signed comparison honoring sign + scale.
+    ///
+    /// Deliberately NOT `Ord`: this compares numeric VALUE (it aligns the two
+    /// scales first, so `1.5` and `1.50` are `Equal`), while the derived
+    /// `PartialEq` / `Eq` compare the representation field-wise and call those
+    /// two unequal. `Ord` requires `a == b` iff `a.cmp(b) == Equal`, so an
+    /// `Ord` impl here would be unsound-by-contract. Keep the inherent method.
+    #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         use core::cmp::Ordering;
-        match (self.is_zero(), other.is_zero()) {
-            (true, true) => return Ordering::Equal,
-            _ => {}
+        if let (true, true) = (self.is_zero(), other.is_zero()) {
+            return Ordering::Equal;
         }
         match (self.neg, other.neg) {
             (false, true) => return Ordering::Greater,
@@ -439,7 +445,6 @@ impl BigNumeric {
             rem.pop();
         }
         let (rem, _) = Self::div_rem_mag(&rem, &[d as u32]);
-        let mut q = q;
         while q.last() == Some(&0) {
             q.pop();
         }

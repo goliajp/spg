@@ -1107,10 +1107,9 @@ fn parse_size_arg(s: &str) -> Option<u64> {
         (rest, 1024 * 1024 * 1024)
     } else if let Some(rest) = s.strip_suffix(['M', 'm']) {
         (rest, 1024 * 1024)
-    } else if let Some(rest) = s.strip_suffix(['K', 'k']) {
-        (rest, 1024)
     } else {
-        return None;
+        let rest = s.strip_suffix(['K', 'k'])?;
+        (rest, 1024)
     };
     num_part
         .trim()
@@ -1181,7 +1180,7 @@ fn prune_pitr(
             size,
         });
     }
-    chunks.sort_by(|a, b| b.prefix_s.cmp(&a.prefix_s)); // newest first
+    chunks.sort_by_key(|c| core::cmp::Reverse(c.prefix_s)); // newest first
 
     let mut running_bytes: u64 = 0;
     let mut kept = 0u64;
@@ -1194,7 +1193,7 @@ fn prune_pitr(
         let keep_by_bytes = match retention_bytes {
             Some(budget) => {
                 let after = running_bytes.saturating_add(c.size);
-                if after <= budget { true } else { false }
+                after <= budget
             }
             None => false,
         };

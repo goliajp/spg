@@ -390,10 +390,10 @@ mod tests {
         qs.record("SELECT new_col FROM t", 1, QUERY_STATS_MAX as u64);
         assert_eq!(qs.len(), QUERY_STATS_MAX);
         assert!(
-            qs.entries.get("select c0 from t").is_none(),
+            !qs.entries.contains_key("select c0 from t"),
             "oldest evicted"
         );
-        assert!(qs.entries.get("select new_col from t").is_some());
+        assert!(qs.entries.contains_key("select new_col from t"));
     }
 
     #[test]
