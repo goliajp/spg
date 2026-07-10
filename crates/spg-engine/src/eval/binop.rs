@@ -493,12 +493,17 @@ pub(super) fn apply_binary(
         {
             return match op {
                 BinOp::Mul => Ok(range_intersect(
-                    *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
                 )),
-                BinOp::Add => {
-                    range_union(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
-                }
-                _ => range_difference(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be),
+                BinOp::Add => range_union(
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                ),
+                _ => range_difference(
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                ),
             };
         }
     }
@@ -603,9 +608,10 @@ pub(super) fn apply_binary(
                     lower_inc: bli,
                     upper_inc: bui,
                     empty: be,
-                } => {
-                    range_contains_range(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
-                }
+                } => range_contains_range(
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                ),
                 elem => range_contains_elem(*ak, al, au, *ali, *aui, *ae, elem),
             }))
         }
@@ -629,9 +635,10 @@ pub(super) fn apply_binary(
                     lower_inc: ali,
                     upper_inc: aui,
                     empty: ae,
-                } => {
-                    range_contains_range(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae)
-                }
+                } => range_contains_range(
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                ),
                 elem => range_contains_elem(*bk, bl, bu, *bli, *bui, *be, elem),
             }))
         }
@@ -689,7 +696,8 @@ pub(super) fn apply_binary(
                 unreachable!()
             };
             Ok(Value::Bool(range_overlaps(
-                *ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be,
+                RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
             )))
         }
         // Geometric `container @> point` / `point <@ container` for
@@ -801,9 +809,15 @@ pub(super) fn apply_binary(
             };
             // `a >> b` is `b << a`.
             let strictly_left = if matches!(op, BinOp::InetContainedBy) {
-                range_strictly_left(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be)
+                range_strictly_left(
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                )
             } else {
-                range_strictly_left(*bk, bl, bu, *bli, *bui, *be, *ak, al, au, *ali, *aui, *ae)
+                range_strictly_left(
+                    RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+                    RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                )
             };
             Ok(Value::Bool(strictly_left))
         }
@@ -2869,25 +2883,59 @@ fn upper_cmp(
         (Some(x), Some(y)) => bound_cmp(x, y).then(aui.cmp(&bui)), // inclusive(true) greater
     }
 }
+/// v7.38 — the six components of one range operand (kind, bounds, bound
+/// inclusivity, emptiness), bundled so the `range_*` family below takes two
+/// parameters instead of twelve.
+#[derive(Clone, Copy)]
+struct RangeParts<'v> {
+    kind: spg_storage::RangeKind,
+    lower: &'v Option<alloc::boxed::Box<Value<'static>>>,
+    upper: &'v Option<alloc::boxed::Box<Value<'static>>>,
+    lower_inc: bool,
+    upper_inc: bool,
+    empty: bool,
+}
+
+impl<'v> RangeParts<'v> {
+    fn new(
+        kind: spg_storage::RangeKind,
+        lower: &'v Option<alloc::boxed::Box<Value<'static>>>,
+        upper: &'v Option<alloc::boxed::Box<Value<'static>>>,
+        lower_inc: bool,
+        upper_inc: bool,
+        empty: bool,
+    ) -> Self {
+        Self {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        }
+    }
+}
 
 /// PG `range_cmp` total order: an empty range sorts first (two empties are
 /// equal), otherwise compare canonical lower bounds, then upper bounds. The
 /// `Equal` result subsumes range equality (canonical `[)` forms must match).
-#[allow(clippy::too_many_arguments)]
-fn range_cmp(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> core::cmp::Ordering {
+fn range_cmp(a: RangeParts<'_>, b: RangeParts<'_>) -> core::cmp::Ordering {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     use core::cmp::Ordering;
     if ae || be {
         return match (ae, be) {
@@ -3103,21 +3151,23 @@ fn range_point_le(
 
 /// Range `&&` overlap: the two ranges share at least one point. Empty
 /// overlaps nothing.
-#[allow(clippy::too_many_arguments)]
-fn range_overlaps(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> bool {
+fn range_overlaps(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     if ae || be {
         return false;
     }
@@ -3128,21 +3178,23 @@ fn range_overlaps(
 
 /// Range `@>` range: `a` contains `b`. Empty is contained in everything;
 /// only empty contains empty.
-#[allow(clippy::too_many_arguments)]
-fn range_contains_range(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> bool {
+fn range_contains_range(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     if be {
         return true;
     }
@@ -3190,21 +3242,23 @@ fn range_contains_elem(
 }
 
 /// Range `*` intersection: the overlapping sub-range (empty if disjoint).
-#[allow(clippy::too_many_arguments)]
-fn range_intersect(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> Value<'static> {
+fn range_intersect(a: RangeParts<'_>, b: RangeParts<'_>) -> Value<'static> {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     let _ = bk;
     let empty = Value::Range {
         kind: ak,
@@ -3259,21 +3313,23 @@ fn bounds_touch(
 
 /// Range `+` union: the two ranges must overlap or be adjacent, else PG
 /// errors "result of range union would not be contiguous".
-#[allow(clippy::too_many_arguments)]
-fn range_union(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> Result<Value<'static>, EvalError> {
+fn range_union(a: RangeParts<'_>, b: RangeParts<'_>) -> Result<Value<'static>, EvalError> {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     let mk = |k,
               lo: &Option<alloc::boxed::Box<Value<'static>>>,
               up: &Option<alloc::boxed::Box<Value<'static>>>,
@@ -3293,7 +3349,10 @@ fn range_union(
     if be {
         return Ok(mk(ak, al, au, ali, aui, ae));
     }
-    let overlap = range_overlaps(ak, al, au, ali, aui, ae, bk, bl, bu, bli, bui, be);
+    let overlap = range_overlaps(
+        RangeParts::new(ak, al, au, ali, aui, ae),
+        RangeParts::new(bk, bl, bu, bli, bui, be),
+    );
     let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
     let (bl2, bli2, bu2, bui2) = range_canonical(bk, bl, bu, bli, bui);
     let adjacent = bounds_touch(&au2, aui2, &bl2, bli2) || bounds_touch(&bu2, bui2, &al2, ali2);
@@ -3325,21 +3384,23 @@ fn range_union(
 
 /// Range `-` difference: the part of `a` not covered by `b`. PG errors when
 /// removing `b` would split `a` into two disjoint ranges.
-#[allow(clippy::too_many_arguments)]
-fn range_difference(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> Result<Value<'static>, EvalError> {
+fn range_difference(a: RangeParts<'_>, b: RangeParts<'_>) -> Result<Value<'static>, EvalError> {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     let empty = Value::Range {
         kind: ak,
         lower: None,
@@ -3370,7 +3431,12 @@ fn range_difference(
         upper_inc: aui,
         empty: ae,
     };
-    if be || !range_overlaps(ak, al, au, ali, aui, ae, bk, bl, bu, bli, bui, be) {
+    if be
+        || !range_overlaps(
+            RangeParts::new(ak, al, au, ali, aui, ae),
+            RangeParts::new(bk, bl, bu, bli, bui, be),
+        )
+    {
         return Ok(a_unchanged());
     }
     let (al2, ali2, au2, aui2) = range_canonical(ak, al, au, ali, aui);
@@ -3475,21 +3541,23 @@ fn money_arith(
 /// of `b`. True when `a`'s upper bound value is below `b`'s lower bound value;
 /// at an equal boundary they must not both be inclusive (else the shared point
 /// overlaps). Unbounded sides on the touching edges make it false.
-#[allow(clippy::too_many_arguments)]
-fn range_strictly_left(
-    ak: spg_storage::RangeKind,
-    al: &Option<alloc::boxed::Box<Value<'static>>>,
-    au: &Option<alloc::boxed::Box<Value<'static>>>,
-    ali: bool,
-    aui: bool,
-    ae: bool,
-    bk: spg_storage::RangeKind,
-    bl: &Option<alloc::boxed::Box<Value<'static>>>,
-    bu: &Option<alloc::boxed::Box<Value<'static>>>,
-    bli: bool,
-    bui: bool,
-    be: bool,
-) -> bool {
+fn range_strictly_left(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
+    let RangeParts {
+        kind: ak,
+        lower: al,
+        upper: au,
+        lower_inc: ali,
+        upper_inc: aui,
+        empty: ae,
+    } = a;
+    let RangeParts {
+        kind: bk,
+        lower: bl,
+        upper: bu,
+        lower_inc: bli,
+        upper_inc: bui,
+        empty: be,
+    } = b;
     use core::cmp::Ordering;
     if ae || be {
         return false;
@@ -4211,7 +4279,10 @@ pub(super) fn compare(
                 empty: be,
             },
         ) => {
-            let ord = range_cmp(*ak, al, au, *ali, *aui, *ae, *bk, bl, bu, *bli, *bui, *be);
+            let ord = range_cmp(
+                RangeParts::new(*ak, al, au, *ali, *aui, *ae),
+                RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
+            );
             return cmp_result(op, ord);
         }
         // v7.37 — MULTIRANGE comparison (=/<> and ordering). Normalise both
