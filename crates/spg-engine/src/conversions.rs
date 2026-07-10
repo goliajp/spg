@@ -792,6 +792,16 @@ pub fn format_text_2d_text_pub(
 /// inclusive upper bumps to exclusive upper+1 — so `[1,3]` becomes
 /// `[1,4)`. Continuous kinds (num/ts/tstz) keep their bounds. Returns
 /// the canonical `(lower, upper, lower_inc, upper_inc, empty)`, or
+/// v7.38 — the canonical `[)` form of a range's bounds:
+/// `(lower, upper, lower_inc, upper_inc, empty)`.
+pub(crate) type CanonRangeBounds = (
+    Option<Value<'static>>,
+    Option<Value<'static>>,
+    bool,
+    bool,
+    bool,
+);
+
 /// `None` if a discrete successor overflows the element type.
 pub(crate) fn canonicalize_range_bounds(
     kind: spg_storage::RangeKind,
@@ -799,13 +809,7 @@ pub(crate) fn canonicalize_range_bounds(
     upper: Option<Value<'static>>,
     lower_inc: bool,
     upper_inc: bool,
-) -> Option<(
-    Option<Value<'static>>,
-    Option<Value<'static>>,
-    bool,
-    bool,
-    bool,
-)> {
+) -> Option<CanonRangeBounds> {
     use spg_storage::RangeKind as K;
     // An infinite bound is always exclusive.
     let mut lower_inc = lower.is_some() && lower_inc;
@@ -2272,7 +2276,7 @@ pub(crate) fn check_unsigned_range(
 /// or the final type-mismatch to handle it).
 fn coerce_text_array_to(
     items: alloc::vec::Vec<Option<alloc::string::String>>,
-    target: &DataType,
+    target: DataType,
     col: &str,
 ) -> Result<Option<Value<'static>>, EngineError> {
     let elem_dt = match target {
@@ -3635,7 +3639,7 @@ pub(crate) fn coerce_value(
             | DataType::TimestampArray
             | DataType::TimestamptzArray
             | DataType::UuidArray),
-        ) => coerce_text_array_to(items, &dt, col_name)?,
+        ) => coerce_text_array_to(items, dt, col_name)?,
         (Value::TextArray(items), DataType::MoneyArray) if items.is_empty() => {
             Some(Value::MoneyArray(alloc::vec::Vec::new()))
         }

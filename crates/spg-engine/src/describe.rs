@@ -108,7 +108,7 @@ pub(crate) struct ExprShape {
 /// `real` (float4) is deliberately omitted: PG's preferred-type rules make
 /// some real mixes resolve to `real` and others to `double precision`, so a
 /// real-involving mix is left uncoerced rather than risk the wrong widening.
-pub(crate) fn numeric_rank(t: &DataType) -> Option<u8> {
+pub(crate) fn numeric_rank(t: DataType) -> Option<u8> {
     match t {
         DataType::SmallInt => Some(1),
         DataType::Int => Some(2),
@@ -140,10 +140,10 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
     if distinct.len() < 2 {
         return None;
     }
-    if distinct.iter().all(|t| numeric_rank(t).is_some()) {
+    if distinct.iter().all(|t| numeric_rank(**t).is_some()) {
         return distinct
             .iter()
-            .max_by_key(|t| numeric_rank(t).unwrap_or(0))
+            .max_by_key(|t| numeric_rank(***t).unwrap_or(0))
             .map(|t| *(*t));
     }
     let non_text: Vec<&DataType> = distinct

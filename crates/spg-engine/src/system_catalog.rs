@@ -3116,8 +3116,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             // confupdtype / confdeltype: 'a' no action, 'r' restrict,
             // 'c' cascade, 'n' set null, 'd' set default. SPG's
             // ForeignKey action enum already mirrors this.
-            let upd_action = fk_action_char(&fk.on_update);
-            let del_action = fk_action_char(&fk.on_delete);
+            let upd_action = fk_action_char(fk.on_update);
+            let del_action = fk_action_char(fk.on_delete);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
@@ -3214,7 +3214,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
 
 /// v7.37.24 (24.8b-3) — map SPG's FK ReferentialAction onto
 /// PG's `confupdtype` / `confdeltype` single-char encoding.
-fn fk_action_char(action: &spg_storage::FkAction) -> &'static str {
+fn fk_action_char(action: spg_storage::FkAction) -> &'static str {
     use spg_storage::FkAction as A;
     match action {
         A::NoAction => "a",

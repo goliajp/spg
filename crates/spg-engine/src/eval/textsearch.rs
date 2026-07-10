@@ -48,24 +48,21 @@ pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         }
     }
 }
+/// v7.38 — parsed `ts_rank*` arguments:
+/// `(weights, document lexemes, query, normalisation flags)`.
+type RankArgs = (
+    crate::fts::RankWeights,
+    Option<Vec<spg_storage::TsLexeme>>,
+    Option<spg_storage::TsQueryAst>,
+    i64,
+);
 
 /// v7.38 (read01, T12.1) — parse `ts_rank[_cd]([weights,] vec, query [, norm])`.
 /// A leading weight array (PG order `[D, C, B, A]`) and a trailing integer
 /// normalization flag are both optional. Custom weights are honored; the norm
 /// flag bits 1/2/8/16/32 are applied by `apply_rank_norm` (bit 4 is cover-density
 /// only, handled by the ts_rank_cd wrapper). Unknown bits error.
-fn parse_rank_args(
-    name: &str,
-    args: &[Value<'_>],
-) -> Result<
-    (
-        crate::fts::RankWeights,
-        Option<Vec<spg_storage::TsLexeme>>,
-        Option<spg_storage::TsQueryAst>,
-        i64,
-    ),
-    EvalError,
-> {
+fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError> {
     // Split off an optional leading weight array and an optional trailing norm.
     let mut rest = args;
     let mut weights = crate::fts::DEFAULT_RANK_WEIGHTS;

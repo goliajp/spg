@@ -30,6 +30,14 @@ use crate::ast::{
 };
 use crate::lexer::{self, LexError, Token};
 
+/// v7.38 — a `WINDOW w AS (…)` definition body:
+/// `(PARTITION BY exprs, ORDER BY (expr, desc, nulls_first), frame)`.
+type WindowDef = (
+    Vec<Expr>,
+    Vec<(Expr, bool, Option<bool>)>,
+    Option<WindowFrame>,
+);
+
 /// v7.14.0 — true when the leading keyword of a top-level
 /// statement is one of the dump-emitted DDL forms SPG accepts
 /// as a no-op (no behavioural effect on the single-schema /
@@ -8081,14 +8089,7 @@ impl Parser {
         // `WINDOW w AS ( <window-def> ) [, ...]` — named windows.
         // OVER w parsed to a marker above; inline each definition
         // into the referencing WindowFunction nodes.
-        let mut window_defs: Vec<(
-            String,
-            (
-                Vec<Expr>,
-                Vec<(Expr, bool, Option<bool>)>,
-                Option<WindowFrame>,
-            ),
-        )> = Vec::new();
+        let mut window_defs: Vec<(String, WindowDef)> = Vec::new();
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("window")) {
             self.advance();
             loop {

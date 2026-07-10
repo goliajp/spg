@@ -929,7 +929,7 @@ where
             }
             Step::CoerceCommon(target) => {
                 let v = stack.pop().unwrap_or(Value::Null).into_owned();
-                stack.push(super::widen_value_to(v, target));
+                stack.push(super::widen_value_to(v, *target));
             }
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }

@@ -1312,7 +1312,7 @@ fn coalesce_type_hint(e: &Expr) -> Option<CastTarget> {
 /// NUMERIC is scale-preserving: an existing exact-numeric keeps its own scale
 /// (PG renders `COALESCE(1.50, 2)` as `1.50`); only integers promote, to
 /// scale 0.
-pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) -> Value<'static> {
+pub(crate) fn widen_value_to(v: Value<'static>, common: spg_storage::DataType) -> Value<'static> {
     use spg_storage::DataType as DT;
     // Only widen numeric- and temporal-category results: these are the ones
     // whose type actually changes a downstream value (integer vs numeric
@@ -1336,7 +1336,7 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) 
     if matches!(v, Value::Null) {
         return v;
     }
-    if v.data_type().as_ref() == Some(common) {
+    if v.data_type() == Some(common) {
         return v;
     }
     if matches!(common, spg_storage::DataType::Numeric { .. })
@@ -1350,7 +1350,7 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: &spg_storage::DataType) 
             scale: 0,
         }
     } else {
-        *common
+        common
     };
     match crate::conversions::coerce_value(v.clone(), target, "", 0) {
         Ok(cv) => cv,
@@ -1366,7 +1366,7 @@ pub(crate) fn widen_to_common(
     types: &[spg_storage::DataType],
 ) -> Value<'static> {
     match crate::describe::common_type(types) {
-        Some(common) => widen_value_to(v, &common),
+        Some(common) => widen_value_to(v, common),
         None => v,
     }
 }

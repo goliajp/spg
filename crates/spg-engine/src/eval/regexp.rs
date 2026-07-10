@@ -1210,6 +1210,9 @@ fn max_group(node: &ReNode) -> usize {
 const CAP_MATCH_DEPTH_LIMIT: u32 = 300;
 
 type Caps = alloc::vec::Vec<Option<(usize, usize)>>;
+
+/// v7.38 — a match span `(start, end)` plus its capture groups.
+type MatchWithCaps = ((usize, usize), Caps);
 /// Undo log: `(group index, previous value)` recorded before each write, so a
 /// failed backtrack branch restores exactly the captures it overwrote.
 type CapJournal = alloc::vec::Vec<(usize, Option<(usize, usize)>)>;
@@ -1542,7 +1545,7 @@ fn re_find_caps(
     s: &[char],
     from: usize,
     ngroups: usize,
-) -> Result<Option<((usize, usize), Caps)>, EvalError> {
+) -> Result<Option<MatchWithCaps>, EvalError> {
     let mut steps: u64 = 0;
     let mut start = from;
     loop {
