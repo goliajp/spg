@@ -13969,7 +13969,15 @@ impl Parser {
                             )));
                         }
                         self.advance();
-                        return self.parse_row_comparison_tail(row);
+                        // A bare `(a, b, …)` row constructor can carry postfix
+                        // (`::text`, `.field`) just like `ROW(a, b, …)`; the
+                        // early return here skips parse_atom's tail postfix
+                        // pass, so fold casts in explicitly. For the
+                        // comparison / predicate forms nothing postfix follows,
+                        // so this is a no-op.
+                        return self
+                            .parse_row_comparison_tail(row)
+                            .and_then(|e| self.finish_postfix_casts(e));
                     }
                     match self.advance() {
                         Token::RParen => Ok(e),
@@ -14964,11 +14972,17 @@ impl Parser {
             Token::LtEq => BinOp::LtEq,
             Token::Gt => BinOp::Gt,
             Token::GtEq => BinOp::GtEq,
-            other => {
-                return Err(self.err(alloc::format!(
-                    "row constructor must be followed by a comparison \
-                     operator, [NOT] IN, or IS [NOT] NULL; got {other:?}"
-                )));
+            // v7.38 (read01, composite) — a bare `(a, b, …)` not followed by a
+            // comparison / [NOT] IN / IS [NOT] NULL / OVERLAPS is a row (record)
+            // constructor value, identical to the `ROW(a, b, …)` keyword form:
+            // `(1,'a')::text` → `(1,a)`, `SELECT (1,2,3)` → `(1,2,3)`. Postfix
+            // (`::text`, `.field`) applies at the caller just as it does for the
+            // ROW(...) node. All the comparison / predicate forms returned above.
+            _ => {
+                return Ok(Expr::FunctionCall {
+                    name: String::from("row"),
+                    args: row,
+                });
             }
         };
         self.advance();

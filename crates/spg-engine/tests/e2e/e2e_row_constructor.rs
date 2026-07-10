@@ -13,6 +13,42 @@ fn one(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
     rows[0].values[0].clone()
 }
 
+fn text(e: &mut Engine, sql: &str) -> String {
+    match one(e, sql) {
+        spg_storage::Value::Text(s) => s.to_string(),
+        v => panic!("{sql}: expected Text, got {v:?}"),
+    }
+}
+
+#[test]
+fn bare_paren_row_constructor_is_a_value() {
+    // read01 (composite) — a bare `(a, b, …)` not followed by a comparison /
+    // [NOT] IN / IS [NOT] NULL is a row constructor value, identical to the
+    // `ROW(a, b, …)` keyword form: it renders as PG record text and takes
+    // postfix `::text` / `.field`. Values live-PG18.4.
+    let mut e = Engine::new();
+    assert_eq!(text(&mut e, "SELECT (1,'a')::text"), "(1,a)");
+    assert_eq!(text(&mut e, "SELECT (1,2,3)::text"), "(1,2,3)");
+    // Bare (no cast) still evaluates to a composite that renders as record text
+    // through a whole-row JSON round-trip.
+    assert_eq!(
+        text(&mut e, "SELECT row_to_json((1,'a'))::text"),
+        "{\"f1\":1,\"f2\":\"a\"}"
+    );
+    // Field access on the parenthesised composite (SPG's `(expr).field`).
+    assert_eq!(one(&mut e, "SELECT (1,'a').f1"), spg_storage::Value::Int(1));
+
+    // Regression: the row-comparison / predicate forms are untouched — they
+    // still return before the constructor path.
+    assert!(survives(&mut e, "(1,2) = (1,2)"));
+    assert!(survives(&mut e, "(1,2) IN ((1,2),(3,4))"));
+    assert!(survives(&mut e, "(1,2) < (1,3)"));
+    assert!(!survives(&mut e, "(1,2) IS NULL"));
+    // A single-element paren stays a plain expression, not a 1-tuple.
+    assert_eq!(one(&mut e, "SELECT (5)"), spg_storage::Value::Int(5));
+    assert_eq!(one(&mut e, "SELECT (1+2)*3"), spg_storage::Value::Int(9));
+}
+
 fn survives(e: &mut Engine, cond: &str) -> bool {
     let sql = alloc_sql(cond);
     let r = e
