@@ -27,7 +27,7 @@ fn set_lax_non_null_behaves_like_set() {
             &mut e,
             r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', '2')"#
         )),
-        r#"{"a":2}"#
+        r#"{"a": 2}"#  // v7.38: jsonb_set_lax canonicalises like jsonb_set (live PG18.4)
     );
 }
 
@@ -39,7 +39,7 @@ fn set_lax_null_default_uses_json_null() {
             &mut e,
             r#"SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL)"#
         )),
-        r#"{"a":null}"#
+        r#"{"a": null}"#  // v7.38: spaced jsonb, live PG18.4
     );
 }
 

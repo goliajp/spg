@@ -10867,7 +10867,8 @@ fn apply_function_dispatch(
             }
             if !matches!(args[2], Value::Null) {
                 // Non-NULL new_value — plain jsonb_set.
-                return crate::json::set(&args[..args.len().min(4)]);
+                return crate::json::set(&args[..args.len().min(4)])
+                    .map(crate::json::canonicalize_value);
             }
             let treatment = match args.get(4) {
                 None | Some(Value::Null) => "use_json_null",
@@ -10881,6 +10882,8 @@ fn apply_function_dispatch(
                     });
                 }
             };
+            // Every jsonb_set_lax result is jsonb, so canonicalise it to PG's
+            // spaced form (`{"a": 1, "b": null}`), like jsonb_set does.
             match treatment {
                 "use_json_null" => {
                     let mut adjusted: alloc::vec::Vec<Value<'_>> =
@@ -10891,18 +10894,25 @@ fn apply_function_dispatch(
                     }
                     crate::json::set(&adjusted)
                 }
-                "raise_exception" => Err(EvalError::TypeMismatch {
-                    detail: "jsonb_set_lax(): JSON value must not be null"
-                        .into(),
+                "raise_exception" => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "jsonb_set_lax(): JSON value must not be null".into(),
+                    });
+                }
+                "return_target" => Ok(match &args[0] {
+                    Value::Text(s) => Value::json(s.as_ref()),
+                    other => other.clone().into_owned(),
                 }),
-                "return_target" => Ok(args[0].clone().into_owned()),
                 "delete_key" => crate::json::delete_path(&args[..2]),
-                other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "jsonb_set_lax(): invalid null_value_treatment {other:?}"
-                    ),
-                }),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_set_lax(): invalid null_value_treatment {other:?}"
+                        ),
+                    });
+                }
             }
+            .map(crate::json::canonicalize_value)
         }
         // json_to_tsvector / jsonb_to_tsvector — reduce a JSON doc
         // to a tsvector using a filter: '"all"' or an array of
