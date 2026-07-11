@@ -431,6 +431,57 @@ impl Engine {
                 }
             }
         }
+        // v7.37.17 (Phase E4) — FK re-validation against the catalog
+        // about to install. A child row this tx inserted references a
+        // parent that a CONCURRENTLY-COMMITTED tx deleted: the tx's
+        // insert-time FK check passed (the parent was alive in its
+        // view) and the parent's delete-time reverse check passed (the
+        // child was invisible in the base) — so without this final
+        // check the commit would install an orphan (caught by the E4
+        // matrix). PG serializes via the child's FOR KEY SHARE row
+        // lock and fails the DELETE with 23503; SPG's between-
+        // statements model can't retroactively fail that committed
+        // DELETE, so the LOSER is this tx — first-committer-wins,
+        // consistent with the update-update delta — and integrity
+        // holds. RC txs are already rebased; RR/SER just merged.
+        if self.mvcc_inplace
+            && let Some(st) = self.tx_catalogs.get(&tx_id)
+            && !st.rebase_poisoned
+            && !st.touched_tables.is_empty()
+            && let Some(&v) = self.tx_writer_versions.get(&tx_id)
+        {
+            let mut fk_conflict: Option<String> = None;
+            'fk: for tname in &st.touched_tables {
+                let Some(t) = st.catalog.get(tname) else {
+                    continue;
+                };
+                let fks = t.schema().foreign_keys.clone();
+                if fks.is_empty() {
+                    continue;
+                }
+                let ws = t.extract_tx_writeset(v);
+                if ws.inserted.is_empty() {
+                    continue;
+                }
+                let rows: Vec<Vec<spg_storage::Value<'static>>> =
+                    ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
+                if let Err(e) =
+                    crate::constraints::enforce_fk_inserts(&st.catalog, tname, &fks, &rows)
+                {
+                    fk_conflict = Some(alloc::format!("{e}"));
+                    break 'fk;
+                }
+            }
+            if let Some(detail) = fk_conflict {
+                self.tx_catalogs.remove(&tx_id);
+                if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+                    self.abort_writer_version(v);
+                    self.release_tx_locks(v);
+                }
+                self.restore_all_local_gucs();
+                return Err(EngineError::SerializationFailure(detail));
+            }
+        }
         let state = self
             .tx_catalogs
             .remove(&tx_id)

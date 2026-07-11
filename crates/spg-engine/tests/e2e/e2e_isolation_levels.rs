@@ -252,3 +252,114 @@ fn rr_concurrent_update_update_raises_serialization_failure() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], spg_storage::Value::Int(20));
 }
+
+// ── v7.37.17 Phase E4 round 2 — savepoint/multi-table/FK/reinsert ──
+
+#[test]
+fn savepoint_rollback_interleaves_with_rebase() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (x INT NOT NULL)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO t VALUES (1)", tx).unwrap();
+    e.execute_in("SAVEPOINT s", tx).unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", tx).unwrap();
+    e.execute_in("INSERT INTO t VALUES (100)", IMPLICIT_TX).unwrap();
+    assert_eq!(count(&mut e, tx), 3, "own 1,2 + concurrent 100");
+    e.execute_in("ROLLBACK TO SAVEPOINT s", tx).unwrap();
+    assert_eq!(
+        count(&mut e, tx),
+        2,
+        "post-rollback: 1 kept, 2 undone, 100 still visible via rebase"
+    );
+    e.execute_in("COMMIT", tx).unwrap();
+    assert_eq!(count(&mut e, IMPLICIT_TX), 2, "committed = 1 and 100");
+}
+
+#[test]
+fn fk_child_insert_vs_concurrent_parent_delete_keeps_integrity() {
+    // E4 matrix catch #2: the tx's child insert is invisible to the
+    // base, so a concurrent parent DELETE passes its reverse-FK check;
+    // the tx's insert-time FK check passed too (parent alive in its
+    // view). Without the commit-time FK re-validation the commit
+    // installed an ORPHAN child. PG serializes via FOR KEY SHARE and
+    // fails the DELETE (23503, child wins); SPG can't retroactively
+    // fail a committed autocommit DELETE, so the tx loses with 40001
+    // (first-committer-wins) and integrity holds either way.
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE c (pid INT REFERENCES p(id))").unwrap();
+    e.execute("INSERT INTO p VALUES (1)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO c VALUES (1)", tx).unwrap();
+    e.execute_in("DELETE FROM p WHERE id = 1", IMPLICIT_TX).unwrap();
+    let err = e.execute_in("COMMIT", tx).unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
+        "orphaning commit must fail with 40001, got {err:?}"
+    );
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT pid FROM c", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert!(rows.is_empty(), "no orphan child row");
+}
+
+#[test]
+fn multi_table_tx_rebases_every_touched_table() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE a (x INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE b (y INT NOT NULL)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO a VALUES (1)", tx).unwrap();
+    e.execute_in("INSERT INTO b VALUES (10)", tx).unwrap();
+    e.execute_in("INSERT INTO a VALUES (2)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO b VALUES (20)", IMPLICIT_TX).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    let n = |e: &mut Engine, sql: &str| -> usize {
+        match e.execute_in(sql, IMPLICIT_TX) {
+            Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(n(&mut e, "SELECT x FROM a"), 2, "a keeps both writers");
+    assert_eq!(n(&mut e, "SELECT y FROM b"), 2, "b keeps both writers");
+}
+
+#[test]
+fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("DELETE FROM t WHERE id = 1", tx).unwrap();
+    e.execute_in("INSERT INTO t VALUES (1, 11)", tx).unwrap();
+    e.execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT id, v FROM t", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1, "reinserted row survives");
+    assert_eq!(rows[0].values[1], spg_storage::Value::Int(11));
+}
