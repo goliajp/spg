@@ -261,6 +261,51 @@ impl Table {
         Ok(())
     }
 
+    /// v7.37.16 — batch form of [`Table::mark_row_deleted`]: stamp `xmax`
+    /// on every alive, in-bounds position and record ONE
+    /// `RowChange::Tombstone` carrying all affected `RowId`s (the codec
+    /// and replay already handle multi-rowid records). The per-row form
+    /// paid one redo record — a Vec alloc plus a log push — PER ROW,
+    /// ~800 ns/row on a 10k-row gate-on DELETE (heavy_write del_10k).
+    /// Semantics match the single-row form: already-tombstoned keeps its
+    /// original xmax (first-deleter-wins), out-of-bounds is skipped.
+    /// Returns the number of rows NEWLY tombstoned.
+    pub fn mark_rows_deleted(&mut self, positions: &[usize], xmax: u64) -> usize {
+        let mut rowids: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
+        let capture = self.redo_log.is_some();
+        let mut newly = 0usize;
+        for &position in positions {
+            if position >= self.headers.len() {
+                continue;
+            }
+            let mut h = *self.headers.get(position).expect("position bounds-checked");
+            if h.xmax != crate::row_header::XMAX_ALIVE {
+                continue;
+            }
+            h.xmax = xmax;
+            if let Some(new_headers) = self.headers.set(position, h) {
+                self.headers = new_headers;
+            }
+            newly += 1;
+            if capture {
+                rowids.push(
+                    self.rowids()
+                        .get(position)
+                        .copied()
+                        .unwrap_or(crate::row_header::RowId::UNASSIGNED),
+                );
+            }
+        }
+        if capture && !rowids.is_empty() {
+            self.record_redo(move |table| RowChange::Tombstone {
+                table,
+                rowids,
+                xmax,
+            });
+        }
+        newly
+    }
+
     /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
     /// this table (engine call before a mutating statement when
     /// persistence is on). Idempotent; existing captured changes are kept.

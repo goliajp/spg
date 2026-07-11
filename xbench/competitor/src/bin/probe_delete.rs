@@ -94,6 +94,33 @@ fn main() {
     ] {
         println!("| {:<20} | {:>7.3} |", name, timed(&mut em, sql, 7));
     }
+    // Axis 6: MVCC gate-on WITH redo capture — the persistent-database
+    // shape (the redo-off axis above can't see the per-row vs batch
+    // Tombstone record cost at all).
+    let mut er = build(50_000, 2);
+    er.set_mvcc_inplace(true);
+    er.set_redo_capture(true);
+    for (name, sql) in [
+        ("del_500_MVCC_redo", "DELETE FROM h WHERE g = 50"),
+        (
+            "del_10k_MVCC_redo",
+            "DELETE FROM h WHERE v BETWEEN 20000 AND 40000",
+        ),
+    ] {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            er.execute("BEGIN").unwrap();
+            let t0 = Instant::now();
+            er.execute(sql).unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            er.execute("ROLLBACK").unwrap();
+            let _ = er.take_redo();
+            if ms < best {
+                best = ms;
+            }
+        }
+        println!("| {:<20} | {:>7.3} |", name, best);
+    }
     // Axis 4: autocommit (no explicit tx) — is BEGIN..ROLLBACK itself the tax?
     let mut ea = build(50_000, 2);
     let mut best = f64::MAX;
