@@ -611,6 +611,14 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 /// the builders emit, so NULLS FIRST/LAST placement is unchanged.
 #[derive(Clone, PartialEq)]
 pub(crate) enum OrderKey {
+    /// v7.37.16 — NULL sentinels. Historically NULL packed as `Num(±INF)`,
+    /// which (a) made a real float `+Inf` VALUE indistinguishable from NULL
+    /// and (b) left float NaN nowhere to go — PG orders
+    /// `finite < +Inf < NaN < NULL` (ASC, NULLS LAST). `NullBig` sorts above
+    /// everything including NaN; `NullSmall` below everything (the explicit
+    /// NULLS FIRST/LAST flip picks the side, exactly as ±INF did).
+    NullSmall,
+    NullBig,
     Num(f64),
     /// v7.38 (read01 U31) — EXACT integer key for the integer-valued types
     /// (SmallInt/Int/BigInt/Date/Year/Timestamp/Time/TimeTz/Money). An f64
@@ -647,7 +655,22 @@ pub(crate) enum OrderKey {
 fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a, b) {
-        (OrderKey::Num(x), OrderKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // v7.37.16 — NULL sentinels bracket every value (incl. NaN).
+        (OrderKey::NullBig, OrderKey::NullBig)
+        | (OrderKey::NullSmall, OrderKey::NullSmall) => Ordering::Equal,
+        (OrderKey::NullBig, _) => Ordering::Greater,
+        (_, OrderKey::NullBig) => Ordering::Less,
+        (OrderKey::NullSmall, _) => Ordering::Less,
+        (_, OrderKey::NullSmall) => Ordering::Greater,
+        // v7.37.16 — float keys use PG's float8 total order: NaN is the
+        // greatest value and equals itself (partial_cmp is total once
+        // both sides are non-NaN; -0 = 0 preserved).
+        (OrderKey::Num(x), OrderKey::Num(y)) => match (x.is_nan(), y.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        },
         // Exact same-type integer comparison — the load-bearing path that
         // U31 fixes (no f64 rounding).
         (OrderKey::Int(x), OrderKey::Int(y)) => x.cmp(y),
@@ -668,66 +691,39 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         // sentinel (`Num(±INF)`) or a degenerate heterogeneous ORDER BY, where
         // Json is placed after every finite scalar key deterministically.
         (OrderKey::Json(x), OrderKey::Json(y)) => crate::json::jsonb_compare(x, y),
-        (OrderKey::Json(_), OrderKey::Num(y)) => {
-            if *y == f64::INFINITY {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (OrderKey::Num(x), OrderKey::Json(_)) => {
-            if *x == f64::INFINITY {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
+        // (NULL sentinels are handled above, so a Num here is a real float
+        // value; the degenerate heterogeneous order puts Num before Json.)
+        (OrderKey::Json(_), OrderKey::Num(_)) => Ordering::Greater,
+        (OrderKey::Num(_), OrderKey::Json(_)) => Ordering::Less,
         (OrderKey::Json(_), OrderKey::Int(_) | OrderKey::Text(_) | OrderKey::Bytes(_)) => {
             Ordering::Greater
         }
         (OrderKey::Int(_) | OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Json(_)) => {
             Ordering::Less
         }
-        // Int vs Num: the only Num a value-typed Int meets is the ±INF NULL
-        // sentinel (rides to the far ends) or, in a genuinely heterogeneous
-        // ORDER BY expression, a finite float — compared via f64 widening
-        // (lossy only in that rare cross-type case, never same-type).
+        // Int vs Num: a mixed integer/float ORDER BY expression — compared
+        // via f64 widening (lossy only in that rare cross-type case, never
+        // same-type). NaN is greatest, per the float8 total order.
         #[allow(clippy::cast_precision_loss)]
         (OrderKey::Int(x), OrderKey::Num(y)) => {
-            if *y == f64::INFINITY {
+            if y.is_nan() {
                 Ordering::Less
-            } else if *y == f64::NEG_INFINITY {
-                Ordering::Greater
             } else {
                 (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
             }
         }
         #[allow(clippy::cast_precision_loss)]
         (OrderKey::Num(x), OrderKey::Int(y)) => {
-            if *x == f64::INFINITY {
+            if x.is_nan() {
                 Ordering::Greater
-            } else if *x == f64::NEG_INFINITY {
-                Ordering::Less
             } else {
                 x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
             }
         }
-        (OrderKey::Num(x), OrderKey::Text(_) | OrderKey::Bytes(_)) => {
-            // Finite Num sorts before Text/Bytes; the ±INF NULL sentinels ride
-            // to the far ends (`+INF` last, `-INF` first).
-            if *x == f64::INFINITY {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Num(y)) => {
-            if *y == f64::INFINITY {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
+        // A real Num value sorts before Text/Bytes in the degenerate
+        // heterogeneous case (NULLs are sentinel-handled above).
+        (OrderKey::Num(_), OrderKey::Text(_) | OrderKey::Bytes(_)) => Ordering::Less,
+        (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Num(_)) => Ordering::Greater,
         // A finite Int sorts before Text/Bytes, same as a finite Num.
         (OrderKey::Int(_), OrderKey::Text(_) | OrderKey::Bytes(_)) => Ordering::Less,
         (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Int(_)) => Ordering::Greater,
@@ -737,32 +733,18 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         // v7.38 (read01, U16) — an Array key meets a foreign key only via the
         // ±INF NULL sentinel (NULLs ride to the ends) or a degenerate
         // heterogeneous ORDER BY (Array placed after every scalar key).
-        (OrderKey::Array(_), OrderKey::Num(y)) => {
-            if *y == f64::NEG_INFINITY {
-                Ordering::Greater
-            } else if *y == f64::INFINITY {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (OrderKey::Num(x), OrderKey::Array(_)) => {
-            if *x == f64::NEG_INFINITY {
-                Ordering::Less
-            } else if *x == f64::INFINITY {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
+        // (NULLs sentinel-handled above; a real value keeps Array last
+        // among the scalar keys in the degenerate heterogeneous case.)
+        (OrderKey::Array(_), OrderKey::Num(_)) => Ordering::Greater,
+        (OrderKey::Num(_), OrderKey::Array(_)) => Ordering::Less,
         (OrderKey::Array(_), _) => Ordering::Greater,
         (_, OrderKey::Array(_)) => Ordering::Less,
         // v7.38 (read01, T3.C3) — bignum keys compare exactly; vs a finite
-        // scalar key a big value's sign orders it (its magnitude always exceeds
-        // i128). The ±INF NULL sentinels still ride to the far ends.
+        // scalar key a big value's sign orders it (its magnitude always
+        // exceeds i128). A real float ±Inf/NaN still outranks any bignum.
         (OrderKey::BigNum(x), OrderKey::BigNum(y)) => x.cmp(y),
         (OrderKey::BigNum(x), OrderKey::Num(y)) => {
-            if *y == f64::INFINITY {
+            if y.is_nan() || *y == f64::INFINITY {
                 Ordering::Less
             } else if *y == f64::NEG_INFINITY {
                 Ordering::Greater
@@ -773,7 +755,7 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
             }
         }
         (OrderKey::Num(x), OrderKey::BigNum(y)) => {
-            if *x == f64::INFINITY {
+            if x.is_nan() || *x == f64::INFINITY {
                 Ordering::Greater
             } else if *x == f64::NEG_INFINITY {
                 Ordering::Less
@@ -905,11 +887,11 @@ pub(crate) fn build_order_keys(
         // first), nf != desc → -INF (the explicit flips).
         if matches!(v, Value::Null) {
             let nf = o.nulls_first.unwrap_or(o.desc);
-            keys.push(OrderKey::Num(if nf == o.desc {
-                f64::INFINITY
+            keys.push(if nf == o.desc {
+                OrderKey::NullBig
             } else {
-                f64::NEG_INFINITY
-            }));
+                OrderKey::NullSmall
+            });
         } else if let Some(ord) = enum_order_ordinal(&o.expr, &v, ctx) {
             // Enum columns sort by declaration order (enumsortorder), not
             // the label text: `ORDER BY mood` puts 'sad' < 'ok' < 'happy'
