@@ -81,7 +81,12 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
             }
             TxStmtClass::Dml(t)
         }
-        S::Merge(m) => TxStmtClass::Dml(alloc::vec![m.target.clone()]),
+        // v7.37.17 (E4 r3) — MERGE's DELETE branch still physically
+        // removes rows even under the in-place gate (no tombstone), so
+        // its write-set is unextractable: a rebase would resurrect the
+        // merged-away rows. Poison until MERGE DELETE is inplace-ified
+        // (recorded residual).
+        S::Merge(_) => TxStmtClass::Other,
         S::ShowTables
         | S::ShowDatabases
         | S::ShowCreateTable { .. }
@@ -138,23 +143,30 @@ impl Engine {
     /// RR/SER never reach here and get serialization_failure at COMMIT
     /// instead (Phase E3). A touched table missing from the fresh base
     /// (concurrent DROP) aborts the rebase and keeps the frozen view.
-    pub(crate) fn maybe_rc_rebase(&mut self) {
+    /// Returns `Err(SerializationFailure)` when the tx's INSERTed
+    /// unique keys collide with a concurrently-committed writer (E4
+    /// round 3): the tx's insert already ran against its old view and
+    /// can't be un-run, so the statement (or COMMIT) fails with 40001
+    /// and the client retries — first-committer-wins, like the FK path.
+    pub(crate) fn maybe_rc_rebase(&mut self) -> Result<(), EngineError> {
         // Gate-off (legacy physical-delete) writes carry NO version
         // stamps, so the write-set is unextractable — a rebase would
         // silently lose the tx's own writes. Keep the frozen SI view,
         // which IS the legacy behaviour.
         if !self.mvcc_inplace {
-            return;
+            return Ok(());
         }
-        let Some(tx_id) = self.current_tx else { return };
+        let Some(tx_id) = self.current_tx else {
+            return Ok(());
+        };
         let Some(state) = self.tx_catalogs.get(&tx_id) else {
-            return;
+            return Ok(());
         };
         if state.cached_snapshot.is_some() || state.rebase_poisoned || state.stmts_run == 0 {
-            return;
+            return Ok(());
         }
         let Some(&v) = self.tx_writer_versions.get(&tx_id) else {
-            return;
+            return Ok(());
         };
         // Extract the write-sets from the OLD shadow first (immutable
         // borrows only), then build + install the fresh catalog.
@@ -179,7 +191,7 @@ impl Engine {
             let Some(new_t) = fresh.get_mut(tname) else {
                 // Concurrently dropped — a rebase would lose this tx's
                 // writes; keep the frozen shadow for this statement.
-                return;
+                return Ok(());
             };
             // v7.37.17 (Phase E4 fix) — RC conflict semantics with
             // UPDATE atomicity: a tombstone whose target was already
@@ -212,15 +224,72 @@ impl Engine {
                     ws.inserted.retain(|(rid, _)| !dropped_new.contains(rid));
                 }
             }
-            let leftover = new_t.replay_tx_writeset(ws, v);
+            // v7.37.17 (E4 r3) — TWO-PHASE replay. Tombstones land
+            // first so the tx's UPDATE old-versions are dead in
+            // `fresh` BEFORE the unique check (the enforcement
+            // helpers skip tombstoned rows) — otherwise an UPDATE's
+            // new version false-conflicts with its own old version.
+            // Own insert-then-delete tombstones ride in phase 2's
+            // writeset instead (their targets don't exist yet).
+            let (own_cycle, plain_tombs): (Vec<_>, Vec<_>) = ws
+                .tombstoned
+                .iter()
+                .copied()
+                .partition(|rid| own_inserted.contains(rid));
+            let phase1 = spg_storage::TxWriteSet {
+                inserted: Vec::new(),
+                tombstoned: plain_tombs,
+            };
+            let leftover = new_t.replay_tx_writeset(&phase1, v);
             debug_assert!(
                 leftover.is_empty(),
-                "conflicts were pre-filtered; replay must be clean"
+                "conflicts were pre-filtered; tombstone replay must be clean"
+            );
+            let _ = new_t;
+            // Unique pre-check for the inserts, against the base with
+            // this tx's tombstones applied. A concurrently-taken key
+            // fails the statement/COMMIT with 40001.
+            {
+                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> =
+                    ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
+                if !inserted_rows.is_empty()
+                    && let Some(t_ro) = fresh.get(tname.as_str())
+                {
+                    let ucs = t_ro.schema().uniqueness_constraints.clone();
+                    if let Err(e) = crate::constraints::enforce_uniqueness_inserts(
+                        &fresh,
+                        tname,
+                        &ucs,
+                        &inserted_rows,
+                    ) {
+                        return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
+                    }
+                    if let Err(e) = crate::constraints::enforce_unique_index_inserts(
+                        &fresh,
+                        tname,
+                        &inserted_rows,
+                    ) {
+                        return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
+                    }
+                }
+            }
+            let Some(new_t) = fresh.get_mut(tname) else {
+                return Ok(());
+            };
+            let phase2 = spg_storage::TxWriteSet {
+                inserted: core::mem::take(&mut ws.inserted),
+                tombstoned: own_cycle,
+            };
+            let leftover = new_t.replay_tx_writeset(&phase2, v);
+            debug_assert!(
+                leftover.is_empty(),
+                "insert replay must be clean"
             );
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
             st.catalog = fresh;
         }
+        Ok(())
     }
 
     /// v7.37.17 (Phase E4 fix) — record the (old → new) RowId pairs an
@@ -333,7 +402,19 @@ impl Engine {
         // (cached snapshot) and the legacy gate-off world skip this —
         // their commit-time merge/conflict story is Phase E3; the
         // frozen-view overwrite there is the honest pre-E2 behaviour.
-        self.maybe_rc_rebase();
+        // v7.37.17 (E4 r3) — a unique-key collision surfacing here
+        // fails the COMMIT with 40001, rolling the tx back (PG: a
+        // failed COMMIT ends the transaction).
+        if let Err(e) = self.maybe_rc_rebase() {
+            let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+            self.tx_catalogs.remove(&tx_id);
+            if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+                self.abort_writer_version(v);
+                self.release_tx_locks(v);
+            }
+            self.restore_all_local_gucs();
+            return Err(e);
+        }
         // v7.38 P0 元机制 A — fires at the commit barrier entry.
         // Represents "this thread is about to take the WAL group
         // commit leader slot" so tests can block here and let a
@@ -374,14 +455,51 @@ impl Engine {
             let mut fresh = self.catalog.clone();
             let mut conflict: Option<String> = None;
             'merge: for (tname, ws) in &wsets {
-                // Unique pre-check on the LATEST base: a key this tx
-                // inserted that a concurrently-committed tx also took.
+                let Some(new_t) = fresh.get_mut(tname) else {
+                    conflict = Some(alloc::format!("table {tname:?} was dropped concurrently"));
+                    break 'merge;
+                };
+                // v7.37.17 (E4 r3) — TWO-PHASE merge, mirroring the RC
+                // rebase: apply the tx's tombstones FIRST (a target
+                // already gone / re-tombstoned by another committed
+                // writer is a hard 40001 here — RR never skips), then
+                // check the inserts' unique keys against a base where
+                // the tx's own old versions are already dead (an
+                // UPDATE's new version must not false-conflict with
+                // its own old version), then land the inserts.
+                let own_inserted: alloc::collections::BTreeSet<
+                    spg_storage::row_header::RowId,
+                > = ws.inserted.iter().map(|(rid, _)| *rid).collect();
+                let hard: Vec<spg_storage::row_header::RowId> = new_t
+                    .tombstone_conflicts(&ws.tombstoned, v)
+                    .into_iter()
+                    .filter(|rid| !own_inserted.contains(rid))
+                    .collect();
+                if !hard.is_empty() {
+                    conflict = Some(alloc::format!(
+                        "{} row(s) in {tname:?} were deleted or updated by a concurrent transaction",
+                        hard.len()
+                    ));
+                    break 'merge;
+                }
+                let (own_cycle, plain_tombs): (Vec<_>, Vec<_>) = ws
+                    .tombstoned
+                    .iter()
+                    .copied()
+                    .partition(|rid| own_inserted.contains(rid));
+                let phase1 = spg_storage::TxWriteSet {
+                    inserted: Vec::new(),
+                    tombstoned: plain_tombs,
+                };
+                let leftover = new_t.replay_tx_writeset(&phase1, v);
+                debug_assert!(leftover.is_empty(), "hard conflicts pre-checked");
+                let _ = new_t;
                 let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> =
                     ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
                 if !inserted_rows.is_empty()
-                    && let Some(t) = fresh.get(tname)
+                    && let Some(t_ro) = fresh.get(tname)
                 {
-                    let ucs = t.schema().uniqueness_constraints.clone();
+                    let ucs = t_ro.schema().uniqueness_constraints.clone();
                     if let Err(e) = crate::constraints::enforce_uniqueness_inserts(
                         &fresh,
                         tname,
@@ -404,14 +522,12 @@ impl Engine {
                     conflict = Some(alloc::format!("table {tname:?} was dropped concurrently"));
                     break 'merge;
                 };
-                let unapplied = new_t.replay_tx_writeset(ws, v);
-                if !unapplied.is_empty() {
-                    conflict = Some(alloc::format!(
-                        "{} row(s) in {tname:?} were deleted or updated by a concurrent transaction",
-                        unapplied.len()
-                    ));
-                    break 'merge;
-                }
+                let phase2 = spg_storage::TxWriteSet {
+                    inserted: ws.inserted.clone(),
+                    tombstoned: own_cycle,
+                };
+                let leftover = new_t.replay_tx_writeset(&phase2, v);
+                debug_assert!(leftover.is_empty(), "insert replay must be clean");
             }
             match conflict {
                 Some(detail) => {

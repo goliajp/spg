@@ -232,3 +232,21 @@ fn attach_then_detach_round_trip_preserves_standalone_inserts() {
         "expected non-empty-child rejection on re-attach: {msg}"
     );
 }
+
+#[test]
+fn attach_succeeds_after_delete_empties_child() {
+    // In-place MVCC flip regression: DELETE tombstones rows instead of
+    // removing them physically; the empty-child gate must count
+    // visible rows, not physical slots.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE p (id INT, region TEXT) PARTITION BY LIST (region)")
+        .unwrap();
+    e.execute("CREATE TABLE c (id INT, region TEXT)").unwrap();
+    e.execute("INSERT INTO c VALUES (1, 'apac'), (2, 'apac')")
+        .unwrap();
+    e.execute("DELETE FROM c").unwrap();
+    e.execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('apac')")
+        .expect("child is visibly empty after DELETE — attach must pass");
+    e.execute("ALTER TABLE p DETACH PARTITION c")
+        .expect("attached child must detach");
+}
