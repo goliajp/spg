@@ -3123,6 +3123,15 @@ pub struct Table {
     /// redo reference can be detected rather than silently aliasing a
     /// later row that reused the slot.
     next_rowid: u64,
+    /// v7.37.16 (autovacuum) — live count of tombstoned-but-present hot
+    /// rows (`headers[i].xmax != XMAX_ALIVE`). Maintained incrementally:
+    /// `mark_row_deleted` / `mark_rows_deleted` increment (the only
+    /// tombstone producers), `delete_rows_no_index` recomputes over the
+    /// survivors (it is the compaction hub every physical removal —
+    /// including vacuum — flows through), and the v53 snapshot loader
+    /// recounts verbatim-restored headers. Drives the engine's
+    /// autovacuum threshold; not persisted (recomputed on load).
+    dead_rows: u64,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the

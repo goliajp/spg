@@ -514,6 +514,10 @@ pub struct Engine {
     /// `SPG_MVCC_INPLACE` and calls [`Self::set_mvcc_inplace`]. Off
     /// until the write path + PG18 differential tests are proven.
     mvcc_inplace: bool,
+    /// v7.37.16 — threshold-triggered synchronous vacuum at DML statement
+    /// exit (autovacuum-lite; see .claude/state/autovacuum-design.md).
+    /// Default ON; hosts may disable via `SPG_AUTOVACUUM=0`.
+    autovacuum: bool,
     /// v7.37.15 (Phase C) — TxId → writer version registry. When
     /// `exec_begin` opens an explicit transaction it allocates a
     /// fresh writer version (via [`Self::begin_writer_version`])
@@ -779,7 +783,8 @@ impl Engine {
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
             locks: crate::locks::LockTable::new(),
-            mvcc_inplace: cfg!(feature = "mvcc-inplace-on"),
+            mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
+            autovacuum: true,
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
@@ -1076,7 +1081,8 @@ impl Engine {
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
             locks: crate::locks::LockTable::new(),
-            mvcc_inplace: cfg!(feature = "mvcc-inplace-on"),
+            mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
+            autovacuum: true,
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
@@ -1162,7 +1168,8 @@ impl Engine {
                     active_writer_versions: BTreeSet::new(),
                     aborted_versions: BTreeSet::new(),
                     locks: crate::locks::LockTable::new(),
-                    mvcc_inplace: cfg!(feature = "mvcc-inplace-on"),
+                    mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
+            autovacuum: true,
                     tx_writer_versions: BTreeMap::new(),
                     stmt_writer_version: None,
                     clock: None,

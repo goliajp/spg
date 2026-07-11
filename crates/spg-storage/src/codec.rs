@@ -404,11 +404,17 @@ fn read_mvcc_header_appendix(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), 
     let mut headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
     let mut rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
     let mut max_id: u64 = 0;
+    // v7.37.16 (autovacuum) — recount dead rows while restoring;
+    // the incremental counter is not persisted.
+    let mut dead: u64 = 0;
     for _ in 0..count {
         let xmin = cur.read_u64()?;
         let xmax = cur.read_u64()?;
         let flags = cur.read_u8()?;
         let rowid = cur.read_u64()?;
+        if xmax != crate::row_header::XMAX_ALIVE {
+            dead += 1;
+        }
         // v7.38 — recover the process-global version cursor past every
         // persisted version, exactly as `next_rowid` is recovered past every
         // persisted RowId below. Without this a fresh process takes snapshots
@@ -426,6 +432,7 @@ fn read_mvcc_header_appendix(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), 
     let persisted_next_rowid = cur.read_u64()?;
     t.headers = headers;
     t.rowids = rowids;
+    t.set_dead_rows_on_load(dead);
     // Keep `next_rowid` strictly above every loaded id so a future alloc
     // can never collide with a restored row. Trust the persisted cursor,
     // but clamp up defensively: a corrupt image that under-states it must

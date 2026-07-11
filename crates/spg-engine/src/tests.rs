@@ -2067,15 +2067,15 @@ fn in_tx_sees_own_insert_through_gated_window_path() {
 }
 
 #[test]
-fn mvcc_inplace_flag_defaults_off_and_toggles() {
+fn mvcc_inplace_defaults_on_and_toggles() {
     let mut e = Engine::new();
-    // v7.37.16 — the default tracks the `mvcc-inplace-on` verification
-    // feature (OFF in production builds; the feature flips every engine
-    // so the whole suite can run gate-on).
+    // v7.37.16 — the in-place MVCC write path is ON by default (the
+    // v7.37.15 gate flipped); the `mvcc-inplace-off` feature builds the
+    // legacy-path regression matrix.
     assert_eq!(
         e.mvcc_inplace(),
-        cfg!(feature = "mvcc-inplace-on"),
-        "in-place MVCC default must track the mvcc-inplace-on feature"
+        !cfg!(feature = "mvcc-inplace-off"),
+        "in-place MVCC default must track the mvcc-inplace-off feature"
     );
     e.set_mvcc_inplace(true);
     assert!(e.mvcc_inplace());
@@ -2596,4 +2596,87 @@ fn v7_37_15_phase_d_engine_vacuum_is_noop_gate_off() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], Value::Int(1));
     assert_eq!(rows[1][0], Value::Int(3));
+}
+
+// ── v7.37.16 autovacuum-lite ────────────────────────────────────────
+
+#[test]
+fn autovacuum_reclaims_after_threshold() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE av (id INT NOT NULL, g INT NOT NULL)")
+        .unwrap();
+    for i in 0..5000 {
+        e.execute(&alloc::format!("INSERT INTO av VALUES ({i}, {})", i % 5))
+            .unwrap();
+    }
+    // 4000 dead (>= 1000 absolute floor, 4000*4 >= 1000 live) — the
+    // statement-exit trigger must vacuum synchronously.
+    e.execute("DELETE FROM av WHERE g != 0").unwrap();
+    let t = e.catalog().get("av").unwrap();
+    assert_eq!(
+        t.row_count(),
+        1000,
+        "autovacuum reclaims committed tombstones at statement exit"
+    );
+    assert_eq!(t.dead_rows(), 0, "meter re-based after compaction");
+}
+
+#[test]
+fn autovacuum_stays_quiet_below_threshold() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE av (id INT NOT NULL)").unwrap();
+    for i in 0..2000 {
+        e.execute(&alloc::format!("INSERT INTO av VALUES ({i})")).unwrap();
+    }
+    // 500 dead < 1000 absolute floor — rows stay physically present.
+    e.execute("DELETE FROM av WHERE id < 500").unwrap();
+    let t = e.catalog().get("av").unwrap();
+    assert_eq!(t.row_count(), 2000, "below threshold — no vacuum");
+    assert_eq!(t.dead_rows(), 500);
+}
+
+#[test]
+fn autovacuum_defers_inside_a_transaction() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.execute("CREATE TABLE av (id INT NOT NULL, g INT NOT NULL)")
+        .unwrap();
+    for i in 0..5000 {
+        e.execute(&alloc::format!("INSERT INTO av VALUES ({i}, {})", i % 5))
+            .unwrap();
+    }
+    e.execute("BEGIN").unwrap();
+    e.execute("DELETE FROM av WHERE g != 0").unwrap();
+    assert_eq!(
+        e.catalog().get("av").unwrap().row_count(),
+        5000,
+        "no vacuum inside an open tx (its tombstones aren't committed)"
+    );
+    e.execute("COMMIT").unwrap();
+    // The backlog is reclaimed by the NEXT autocommit DML on the table.
+    e.execute("DELETE FROM av WHERE id = 0").unwrap();
+    assert_eq!(
+        e.catalog().get("av").unwrap().row_count(),
+        999,
+        "post-commit backlog reclaimed by the next DML's trigger"
+    );
+}
+
+#[test]
+fn autovacuum_disabled_leaves_tombstones() {
+    let mut e = Engine::new();
+    e.set_mvcc_inplace(true);
+    e.set_autovacuum(false);
+    e.execute("CREATE TABLE av (id INT NOT NULL, g INT NOT NULL)")
+        .unwrap();
+    for i in 0..5000 {
+        e.execute(&alloc::format!("INSERT INTO av VALUES ({i}, {})", i % 5))
+            .unwrap();
+    }
+    e.execute("DELETE FROM av WHERE g != 0").unwrap();
+    let t = e.catalog().get("av").unwrap();
+    assert_eq!(t.row_count(), 5000, "autovacuum off — tombstones stay");
+    assert_eq!(t.dead_rows(), 4000);
 }

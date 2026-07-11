@@ -680,6 +680,12 @@ impl Engine {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
         }
+        // v7.37.16 — autovacuum trigger: an in-place UPDATE tombstones
+        // the pre-update versions; reclaim when the dead-row meter
+        // crosses the threshold (no-op gate-off / in-tx / below it).
+        if affected > 0 {
+            self.maybe_autovacuum(&stmt.table);
+        }
         // v7.9.4 — RETURNING projection.
         if let Some(items) = &stmt.returning {
             return self.build_returning_rows(&stmt.table, items, updated_for_returning);
@@ -1444,6 +1450,11 @@ impl Engine {
         if !self.in_transaction() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
+        }
+        // v7.37.16 — autovacuum trigger (no-op gate-off / in-tx /
+        // below the dead-row threshold).
+        if affected > 0 {
+            self.maybe_autovacuum(&stmt.table);
         }
         // v7.9.4 — RETURNING projection over the soon-to-be-gone
         // rows. `to_delete_rows` was snapshotted in stage 1 before
