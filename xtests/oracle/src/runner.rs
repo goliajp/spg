@@ -162,12 +162,16 @@ fn run_on_spg(fixture: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("fixture {} has no parent dir", fixture.display()))?;
 
     let mut engine = Engine::new();
-    // v7.37.15 (Phase C.3) — honour the in-place MVCC gate env so the
-    // live-PG differential can run gate-on (`SPG_MVCC_INPLACE=1`).
-    if std::env::var("SPG_MVCC_INPLACE").is_ok_and(|v| {
-        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-    }) {
-        engine.set_mvcc_inplace(true);
+    // v7.37.16 — two-way `SPG_MVCC_INPLACE` override (default is now
+    // ON; `=0` runs the differential on the legacy path).
+    match std::env::var("SPG_MVCC_INPLACE").ok().as_deref() {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") => {
+            engine.set_mvcc_inplace(false);
+        }
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") => {
+            engine.set_mvcc_inplace(true);
+        }
+        _ => {}
     }
     for depd in scan_depd_directives(&body) {
         let depd_path = corpus_dir.join(format!("{depd}.sql"));
