@@ -309,8 +309,12 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     // v7.37 D.36 — previously only `Value::Text` was handled, so
                     // `99::char(2)` reached coerce_value as an INT and hit a
                     // CHAR/INT storage type-mismatch.
+                    // v7.39 (bpchar epic) — a bpchar source enters through its
+                    // text cast (trailing blanks stripped): `::varchar` keeps
+                    // the stripped form, `::char(m)` re-pads in coerce_value.
                     let s = match v {
                         Value::Text(s) => s.into_owned(),
+                        Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
                         other => value_to_text(&other),
                     };
                     let s = if *n > 0 && s.chars().count() > *n as usize {

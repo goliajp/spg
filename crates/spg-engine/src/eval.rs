@@ -849,10 +849,12 @@ pub fn eval_expr(
             let v = eval_expr(expr, row, ctx)?;
             let p = eval_expr(pattern, row, ctx)?;
             // NULL on either side propagates to NULL — same as PG.
+            // v7.39 (bpchar epic) — LIKE matches bpchar on its PADDED
+            // stored form, per PG's bpchar pattern operators.
             let (text, pat) = match (v, p) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
-                (Value::Text(a), Value::Text(b)) => (a, b),
-                (Value::Text(_), other) | (other, _) => {
+                (Value::Text(a) | Value::BpChar(a), Value::Text(b) | Value::BpChar(b)) => (a, b),
+                (Value::Text(_) | Value::BpChar(_), other) | (other, _) => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!("LIKE requires text operands, got {:?}", other.data_type()),
                     });

@@ -82,7 +82,11 @@ fn update_set_where_changes_only_matched_rows() {
     }
     exec_ok(&mut s, "UPDATE t SET label = 'new' WHERE id = 2");
 
-    let labels = select_first_col(&mut s, "SELECT label FROM t");
+    // ORDER BY id: under in-place MVCC an UPDATE tombstones the old
+    // version and appends the new one, so bare-scan physical order moves
+    // the updated row last (PG's delete+insert UPDATE behaves the same;
+    // unordered SELECT never guaranteed a position).
+    let labels = select_first_col(&mut s, "SELECT label FROM t ORDER BY id");
     let texts: Vec<String> = labels
         .into_iter()
         .map(|v| match v {

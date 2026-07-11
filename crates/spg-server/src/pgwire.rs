@@ -3142,6 +3142,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // query: PG's 25001 ACTIVE_SQL_TRANSACTION.
         if msg.contains("must be called before any query") {
             "25001"
+        // v7.39 (bpchar epic) — CHAR(n)/VARCHAR(n) overflow is PG's 22001
+        // STRING_DATA_RIGHT_TRUNCATION.
+        } else if msg.contains("value too long for type") {
+            "22001"
         } else if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")) {
             "23505"
         } else if msg.contains("FOREIGN KEY violation") {
@@ -3900,6 +3904,8 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
+        // v7.39 (bpchar epic) — COPY emits the padded stored form.
+        Value::BpChar(s) => escape_copy_cell(s),
         Value::Numeric {
             scaled,
             scale,
@@ -4639,6 +4645,8 @@ fn encode_pg_text_cell(
         Value::Int(n) => return write_cell_int(out, i64::from(*n)),
         Value::BigInt(n) => return write_cell_int(out, *n),
         Value::Text(s) | Value::Json(s) => return write_cell_bytes(out, s.as_bytes()),
+        // v7.39 (bpchar epic) — padded stored form on the wire.
+        Value::BpChar(s) => return write_cell_bytes(out, s.as_bytes()),
         // v7.34.6 — Timestamp / Date / Timestamptz fast paths. The
         // mailrs `proj_25k` baseline emits one `internal_date`
         // Timestamp per row × 25 k rows = 25 k `format_timestamp`
@@ -5023,6 +5031,9 @@ fn value_to_pg_text<'a>(
         Value::BigInt(n) => display_into_arena(n),
         Value::Float(f) => display_into_arena(f),
         Value::Text(s) | Value::Json(s) => into_arena(s.as_ref()),
+        // v7.39 (bpchar epic) — bpchar's wire display is the PADDED
+        // stored form (PG bpcharout).
+        Value::BpChar(s) => into_arena(s.as_ref()),
         // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
         // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
         // must round-trip to a literal pg_dump would emit (i.e.
