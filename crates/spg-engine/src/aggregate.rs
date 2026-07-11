@@ -4325,9 +4325,15 @@ fn encode_one(out: &mut String, v: &Value) {
             let _ = write!(out, "B{n}|");
         }
         Value::Float(x) => {
+            // v7.37.16 — fold -0.0 into 0.0: PG's float8 equality (hash and
+            // btree opclasses) treats them as one value, so GROUP BY /
+            // DISTINCT must key them together (count(DISTINCT) differential).
+            // NaN needs no fold — every NaN renders "NaN" here already.
+            let x = if *x == 0.0 { 0.0 } else { *x };
             let _ = write!(out, "F{x}|");
         }
         Value::Real(x) => {
+            let x = if *x == 0.0 { 0.0 } else { *x };
             let _ = write!(out, "R{x}|");
         }
         Value::Bool(b) => {
