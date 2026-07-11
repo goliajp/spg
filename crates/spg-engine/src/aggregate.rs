@@ -850,6 +850,96 @@ fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
 /// tuple, and update per-group aggregate state. Returns the groups in
 /// insertion order. See `run` for the bind-once fast path rationale.
 #[allow(clippy::too_many_lines, clippy::type_complexity)]
+/// v7.37.16 — per-spec accumulator for the fused multi-spec fast path.
+/// Field-for-field the same running state the single-spec sum/avg fast
+/// path keeps in locals; finalized into `AggState` identically.
+#[derive(Default)]
+struct FusedAcc {
+    sum_int: i64,
+    sum_float: f64,
+    use_float: bool,
+    num_scaled: i128,
+    num_kind: spg_storage::NumericKind,
+    num_scale: u8,
+    use_numeric: bool,
+    sum_iv_months: i64,
+    sum_iv_days: i64,
+    sum_iv_micros: i128,
+    use_interval: bool,
+    sum_money: i128,
+    use_money: bool,
+    count: i64,
+}
+
+/// One sum/avg accumulation step — the same variant arms (and the same
+/// error text) as the single-spec fast path's inline match.
+#[inline]
+fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
+    match v {
+        Value::Null => {}
+        Value::SmallInt(n) => {
+            a.sum_int += i64::from(*n);
+            a.count += 1;
+        }
+        Value::Int(n) => {
+            a.sum_int += i64::from(*n);
+            a.count += 1;
+        }
+        // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
+        Value::BigInt(n) => {
+            let (s, sc) = crate::numeric::numeric_add(a.num_scaled, a.num_scale, i128::from(*n), 0);
+            a.num_scaled = s;
+            a.num_scale = sc;
+            a.use_numeric = true;
+            a.count += 1;
+        }
+        Value::Float(x) => {
+            a.sum_float += *x;
+            a.use_float = true;
+            a.count += 1;
+        }
+        Value::Real(x) => {
+            a.sum_float += f64::from(*x);
+            a.use_float = true;
+            a.count += 1;
+        }
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => {
+            let (s, sc) = crate::numeric::numeric_add(a.num_scaled, a.num_scale, *scaled, *scale);
+            a.num_scaled = s;
+            a.num_scale = sc;
+            a.num_kind = fold_sum_kind(a.num_kind, *kind);
+            a.use_numeric = true;
+            a.count += 1;
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            a.sum_iv_months += i64::from(*months);
+            a.sum_iv_days += i64::from(*days);
+            a.sum_iv_micros += i128::from(*micros);
+            a.use_interval = true;
+            a.count += 1;
+        }
+        Value::Money(c) => {
+            a.sum_money += i128::from(*c);
+            a.use_money = true;
+            a.count += 1;
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn accumulate_groups(
     rows: &[RowRef<'_>],
     group_exprs: &[Expr],
@@ -879,6 +969,8 @@ fn accumulate_groups(
     // permit it. `null_group_idx` collects NULL group rows (SQL groups
     // all NULLs into one bucket).
     let mut groups_text: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    // v7.37.16 — raw-i64 group map for the single-INT GROUP BY fast path.
+    let mut groups_int: hashbrown::HashMap<i64, usize> = hashbrown::HashMap::new();
     let mut null_group_idx: Option<usize> = None;
     // When there are no GROUP BY exprs *and* there is at least one aggregate,
     // every row collapses into a single anonymous group keyed by "".
@@ -926,6 +1018,23 @@ fn accumulate_groups(
             schema_cols
                 .get(p)
                 .is_some_and(|c| matches!(c.ty, spg_storage::DataType::Text))
+        });
+    // v7.37.16 (heavy.rs group_500k 1.12× loss) — single-col GROUP BY on
+    // an INTEGER-typed column keys the map by the raw i64 instead of the
+    // canonical-string encode ("I{n}|" write! + String-keyed hash probe
+    // was ~25-40 ns of the 42 ns/row 500k GROUP BY budget). Mirrors the
+    // single-Text fast path; NULLs share `null_group_idx`; a non-integer
+    // cell (coercion edge) falls back to the encoded path.
+    let single_int_group_col: bool = group_pos.len() == 1
+        && group_pos[0].is_some_and(|p| {
+            schema_cols.get(p).is_some_and(|c| {
+                matches!(
+                    c.ty,
+                    spg_storage::DataType::SmallInt
+                        | spg_storage::DataType::Int
+                        | spg_storage::DataType::BigInt
+                )
+            })
         });
     let arg_pos: Vec<Option<usize>> = agg_specs
         .iter()
@@ -1139,6 +1248,111 @@ fn accumulate_groups(
     {
         let state = &mut order[0].1[0];
         state.count = rows.len() as i64;
+        return Ok(order);
+    }
+    // v7.37.16 (heavy.rs agg_500k 1.6× loss) — fused streaming accumulator
+    // for ANY number of count(*)/count(col)/sum(col)/avg(col) specs over
+    // BOUND columns (no FILTER/DISTINCT/arg2/ORDER). The generic per-row
+    // spec loop paid arg dispatch + union-typed update_state per spec per
+    // row (~10 ns/spec/row); PG's parallel agg runs the 500k 3-spec shape
+    // at ~18 ns/row effective. Three cuts:
+    // - count(*) never enters the row loop — it IS rows.len();
+    // - sum/avg over the SAME column share one accumulator (identical
+    //   running state), so `count(*), sum(v), avg(v)` does ONE cell read
+    //   and one accumulate per row;
+    // - remaining ops run in one tight pass, no update_state.
+    // Finalize writes the same AggState fields as the single-spec path.
+    if single_anon_group
+        && !agg_specs.is_empty()
+        && agg_specs.iter().enumerate().all(|(i, s)| {
+            s.filter.is_none()
+                && s.arg2.is_none()
+                && s.order_by.is_empty()
+                && !s.distinct
+                && !s.first_ordered
+                && match s.name.as_str() {
+                    "count_star" => s.arg.is_none(),
+                    "count" | "sum" | "avg" => arg_pos[i].is_some(),
+                    _ => false,
+                }
+        })
+    {
+        enum FusedOp {
+            CountCol(usize),
+            AccCol(usize),
+        }
+        // spec_src[i]: None = count(*) (finalize from rows.len());
+        // Some(slot) = unique_ops[slot]'s accumulator.
+        let mut unique_ops: Vec<FusedOp> = Vec::new();
+        let spec_src: Vec<Option<usize>> = agg_specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match s.name.as_str() {
+                "count_star" => None,
+                "count" => {
+                    let p = arg_pos[i].expect("gated bound");
+                    let slot = unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::CountCol(q) if *q == p))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::CountCol(p));
+                            unique_ops.len() - 1
+                        });
+                    Some(slot)
+                }
+                _ => {
+                    let p = arg_pos[i].expect("gated bound");
+                    let slot = unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::AccCol(q) if *q == p))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::AccCol(p));
+                            unique_ops.len() - 1
+                        });
+                    Some(slot)
+                }
+            })
+            .collect();
+        let mut accs: Vec<FusedAcc> = (0..unique_ops.len()).map(|_| FusedAcc::default()).collect();
+        if !unique_ops.is_empty() {
+            for row in rows {
+                for (si, op) in unique_ops.iter().enumerate() {
+                    match op {
+                        FusedOp::CountCol(p) => {
+                            if !matches!(row.get(*p), Some(Value::Null) | None) {
+                                accs[si].count += 1;
+                            }
+                        }
+                        FusedOp::AccCol(p) => {
+                            fused_acc_cell(&mut accs[si], row.get(*p).unwrap_or(&Value::Null))?;
+                        }
+                    }
+                }
+            }
+        }
+        for (i, src) in spec_src.iter().enumerate() {
+            let state = &mut order[0].1[i];
+            match src {
+                None => state.count = rows.len() as i64,
+                Some(slot) => {
+                    let a = &accs[*slot];
+                    state.count = a.count;
+                    state.sum_int = a.sum_int;
+                    state.sum_float = a.sum_float;
+                    state.use_float = a.use_float;
+                    state.sum_num_scaled = a.num_scaled;
+                    state.sum_num_kind = a.num_kind;
+                    state.sum_num_scale = a.num_scale;
+                    state.use_numeric = a.use_numeric;
+                    state.sum_iv_months = a.sum_iv_months;
+                    state.sum_iv_days = a.sum_iv_days;
+                    state.sum_iv_micros = a.sum_iv_micros;
+                    state.use_interval = a.use_interval;
+                    state.sum_money = a.sum_money;
+                    state.use_money = a.use_money;
+                }
+            }
+        }
         return Ok(order);
     }
     // v7.36 (perf — mailrs Phase 1) — `COUNT(<bound col>)` (non-`*`)
@@ -1754,6 +1968,57 @@ fn accumulate_groups(
                         // (coercion edge case). Fall back to the encoded
                         // path for correctness — same logic as the
                         // non-single-Text branch below.
+                        refs.clear();
+                        refs.push(v);
+                        encode_key_refs_into(&refs, &mut keybuf_s);
+                        match groups.get(keybuf_s.as_str()) {
+                            Some(&i) => i,
+                            None => {
+                                let i = order.len();
+                                let init: Vec<AggState> =
+                                    (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                                order.push((alloc::vec![v.clone().into_owned()], init));
+                                groups.insert(keybuf_s.clone(), i);
+                                i
+                            }
+                        }
+                    }
+                }
+            } else if single_int_group_col {
+                // v7.37.16 — raw-i64 keying (see single_int_group_col).
+                let v = row.get(group_pos[0].unwrap()).unwrap_or(&Value::Null);
+                let key: Option<i64> = match v {
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                };
+                match (key, v) {
+                    (Some(k), _) => match groups_int.get(&k) {
+                        Some(&i) => i,
+                        None => {
+                            let i = order.len();
+                            let init: Vec<AggState> =
+                                (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                            order.push((alloc::vec![v.clone().into_owned()], init));
+                            groups_int.insert(k, i);
+                            i
+                        }
+                    },
+                    (None, Value::Null) => match null_group_idx {
+                        Some(i) => i,
+                        None => {
+                            let i = order.len();
+                            let init: Vec<AggState> =
+                                (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                            order.push((alloc::vec![Value::Null], init));
+                            null_group_idx = Some(i);
+                            i
+                        }
+                    },
+                    (None, _) => {
+                        // Non-integer cell under an integer schema
+                        // (coercion edge) — encoded-path fallback.
                         refs.clear();
                         refs.push(v);
                         encode_key_refs_into(&refs, &mut keybuf_s);
