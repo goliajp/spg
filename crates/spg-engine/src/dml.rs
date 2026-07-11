@@ -1227,6 +1227,13 @@ impl Engine {
         // v7.37.16 — snapshot for the DELETE target walk, taken BEFORE
         // the &mut table borrow below (current_snapshot needs &self).
         let scan_snapshot = self.current_snapshot();
+        // v7.37.16 — old-row snapshot need, decided before the &mut
+        // borrow too (reads the catalog): FK children, row triggers, or
+        // RETURNING are the only consumers of `to_delete_rows`.
+        let need_old_rows = !before_delete_triggers.is_empty()
+            || !after_delete_triggers.is_empty()
+            || stmt.returning.is_some()
+            || crate::constraints::any_fk_child_references(self.active_catalog(), &stmt.table);
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1242,6 +1249,10 @@ impl Engine {
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can
         // run after the mut borrow drops.
+        // v7.37.16 — only when `need_old_rows` (see above): a plain
+        // DELETE on an unreferenced, trigger-free table skips ~1 ms of
+        // per-row clones on a 10k-row delete; plan_fk_parent_deletions
+        // early-returns on the empty rows slice.
         let mut to_delete_rows: Vec<Vec<Value<'static>>> = Vec::new();
         // v7.20 P4 — index seek (same shape as exec_update_cancel):
         // an equality WHERE on an indexed column narrows the walk
@@ -1282,7 +1293,9 @@ impl Engine {
             };
             if !keep {
                 positions.push(i);
-                to_delete_rows.push(row.values.clone());
+                if need_old_rows {
+                    to_delete_rows.push(row.values.clone());
+                }
             }
         }
         // v7.6.3 / v7.6.4 — Stage 2: FK enforcement on the immutable

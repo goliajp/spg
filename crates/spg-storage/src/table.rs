@@ -275,16 +275,15 @@ impl Table {
         let capture = self.redo_log.is_some();
         let mut newly = 0usize;
         for &position in positions {
-            if position >= self.headers.len() {
-                continue;
-            }
-            let mut h = *self.headers.get(position).expect("position bounds-checked");
-            if h.xmax != crate::row_header::XMAX_ALIVE {
-                continue;
-            }
-            h.xmax = xmax;
-            if let Some(new_headers) = self.headers.set(position, h) {
-                self.headers = new_headers;
+            // v7.37.16 — `get_mut` (transient in-place edit when the
+            // headers trie is uniquely owned) instead of the `set`
+            // path-copy: a 10k-row tombstone pass was spending ~3 ms in
+            // per-row spine copies.
+            match self.headers.get_mut(position) {
+                Some(h) if h.xmax == crate::row_header::XMAX_ALIVE => {
+                    h.xmax = xmax;
+                }
+                _ => continue, // out-of-bounds or already tombstoned
             }
             newly += 1;
             if capture {
