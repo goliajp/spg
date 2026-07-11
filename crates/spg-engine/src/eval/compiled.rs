@@ -17,7 +17,7 @@ use spg_storage::{Row, Value};
 
 use super::{
     EvalContext, EvalError, apply_binary, apply_unary, column_collation, composite_eq, eval_expr,
-    like_match_inner, literal_to_value,
+    like_match_str, literal_to_value,
 };
 
 pub(crate) enum Step {
@@ -789,16 +789,23 @@ where
                 negated,
                 case_insensitive,
             } => {
-                let v = stack.pop().unwrap_or(Value::Null).into_owned();
+                // v7.37.16 — borrow the popped operand and run the
+                // zero-alloc &str matcher. The old body paid
+                // `.into_owned()` (a String clone of the S2 borrowed
+                // push) plus a `Vec<char>` collect PER ROW — ~90 ns/row
+                // of allocator traffic on a LIKE table scan (heavy.rs
+                // like_filter 2.8× loss vs PG18). ILIKE still lowercases
+                // (Unicode fold needs an owned buffer); plain LIKE is
+                // allocation-free.
+                let v = stack.pop().unwrap_or(Value::Null);
                 match v {
                     Value::Null => stack.push(Value::Null),
                     Value::Text(t) => {
-                        let text: Vec<char> = if *case_insensitive {
-                            t.to_lowercase().chars().collect()
+                        let m = if *case_insensitive {
+                            like_match_str(&t.to_lowercase(), pattern, 0)
                         } else {
-                            t.chars().collect()
+                            like_match_str(t.as_ref(), pattern, 0)
                         };
-                        let m = like_match_inner(&text, 0, pattern, 0);
                         stack.push(Value::Bool(if *negated { !m } else { m }));
                     }
                     other => {

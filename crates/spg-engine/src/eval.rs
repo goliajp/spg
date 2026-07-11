@@ -1491,12 +1491,19 @@ fn value_to_text_for_array(v: &Value) -> String {
 /// literal `%`. Matches the whole input — no implicit anchoring needed
 /// since SQL `LIKE` is always full-string.
 fn like_match(text: &str, pattern: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
     let pat: Vec<char> = pattern.chars().collect();
-    like_match_inner(&text, 0, &pat, 0)
+    like_match_str(text, &pat, 0)
 }
 
-fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -> bool {
+/// v7.37.16 — zero-allocation LIKE core: the text side walks a `&str`
+/// cursor (char-semantic — `_` consumes one CHARACTER, `%` backtracks
+/// only at char boundaries) instead of collecting a `Vec<char>` per
+/// call. The old per-row collect was ~50 ns/row of pure allocator
+/// traffic on a 50 k-row `WHERE s LIKE '%…%'` scan (the heavy.rs
+/// like_filter 2.8× loss); the pattern side stays a compile-once
+/// `&[char]` (see `Step::Like`).
+pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> bool {
+    let mut t = text;
     while pi < pat.len() {
         match pat[pi] {
             '%' => {
@@ -1507,38 +1514,44 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
                 if pi == pat.len() {
                     return true;
                 }
-                for k in ti..=text.len() {
-                    if like_match_inner(text, k, pat, pi) {
+                let mut rest = t;
+                loop {
+                    if like_match_str(rest, pat, pi) {
                         return true;
                     }
+                    match rest.chars().next() {
+                        Some(c) => rest = &rest[c.len_utf8()..],
+                        None => return false,
+                    }
                 }
-                return false;
             }
-            '_' => {
-                if ti >= text.len() {
-                    return false;
+            '_' => match t.chars().next() {
+                Some(c) => {
+                    t = &t[c.len_utf8()..];
+                    pi += 1;
                 }
-                ti += 1;
-                pi += 1;
-            }
+                None => return false,
+            },
             '\\' if pi + 1 < pat.len() => {
                 let want = pat[pi + 1];
-                if ti >= text.len() || text[ti] != want {
-                    return false;
+                match t.chars().next() {
+                    Some(c) if c == want => {
+                        t = &t[c.len_utf8()..];
+                        pi += 2;
+                    }
+                    _ => return false,
                 }
-                ti += 1;
-                pi += 2;
             }
-            c => {
-                if ti >= text.len() || text[ti] != c {
-                    return false;
+            c => match t.chars().next() {
+                Some(tc) if tc == c => {
+                    t = &t[c.len_utf8()..];
+                    pi += 1;
                 }
-                ti += 1;
-                pi += 1;
-            }
+                _ => return false,
+            },
         }
     }
-    ti == text.len()
+    t.is_empty()
 }
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
