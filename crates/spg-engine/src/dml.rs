@@ -402,12 +402,23 @@ impl Engine {
             Some(list) => list.clone(),
             None => (0..table.row_count()).collect(),
         };
+        // v7.37.16 (gate-on inventory) — MVCC visibility gate for the
+        // UPDATE target scan. Without it, a tombstoned old version
+        // matched the WHERE again and entered `planned` alongside its
+        // live successor — the whole gate-on UPDATE e2e fail cluster
+        // (double-apply → spurious UNIQUE violations, double triggers,
+        // doubled affected counts / redo). A no-op under the default
+        // gate-off: every hot row is visible.
+        let scan_snapshot = self.current_snapshot();
         for (loop_n, &i) in candidate_positions.iter().enumerate() {
             // v4.5: cooperative cancel checkpoint every 256 rows so
             // a runaway UPDATE without WHERE doesn't drag past the
             // server's query-timeout watchdog.
             if loop_n.is_multiple_of(256) {
                 cancel.check()?;
+            }
+            if !table.is_row_visible(i, &scan_snapshot) {
+                continue;
             }
             let Some(row) = table.rows().get(i) else {
                 continue;
@@ -1189,10 +1200,17 @@ impl Engine {
             let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
             let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
                 .with_default_text_search_config(ts_cfg.as_deref());
+            // v7.37.16 (gate-on inventory) — visibility gate, same as
+            // the main walk below: a tombstoned version must not be
+            // re-targeted. No-op under gate-off.
+            let snap = self.current_snapshot();
             let mut hits: Vec<usize> = Vec::new();
             for i in 0..table.row_count() {
                 if i.is_multiple_of(256) {
                     cancel.check()?;
+                }
+                if !table.is_row_visible(i, &snap) {
+                    continue;
                 }
                 let Some(row) = table.rows().get(i) else {
                     continue;
@@ -1206,6 +1224,9 @@ impl Engine {
         } else {
             None
         };
+        // v7.37.16 — snapshot for the DELETE target walk, taken BEFORE
+        // the &mut table borrow below (current_snapshot needs &self).
+        let scan_snapshot = self.current_snapshot();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1241,6 +1262,12 @@ impl Engine {
         for (loop_n, &i) in candidate_positions.iter().enumerate() {
             if loop_n.is_multiple_of(256) {
                 cancel.check()?;
+            }
+            // v7.37.16 (gate-on inventory) — a DELETE must not re-target
+            // a tombstoned version (double-delete / doubled affected
+            // counts under gate-on). No-op under gate-off.
+            if !table.is_row_visible(i, &scan_snapshot) {
+                continue;
             }
             let Some(row) = table.rows().get(i) else {
                 continue;

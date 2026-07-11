@@ -2069,9 +2069,13 @@ fn in_tx_sees_own_insert_through_gated_window_path() {
 #[test]
 fn mvcc_inplace_flag_defaults_off_and_toggles() {
     let mut e = Engine::new();
-    assert!(
-        !e.mvcc_inplace(),
-        "in-place MVCC write path must default OFF"
+    // v7.37.16 — the default tracks the `mvcc-inplace-on` verification
+    // feature (OFF in production builds; the feature flips every engine
+    // so the whole suite can run gate-on).
+    assert_eq!(
+        e.mvcc_inplace(),
+        cfg!(feature = "mvcc-inplace-on"),
+        "in-place MVCC default must track the mvcc-inplace-on feature"
     );
     e.set_mvcc_inplace(true);
     assert!(e.mvcc_inplace());
@@ -2558,7 +2562,9 @@ fn v7_37_15_phase_d_engine_vacuum_spares_still_visible_tombstone() {
 #[test]
 fn v7_37_15_phase_d_engine_vacuum_is_noop_gate_off() {
     let mut e = Engine::new();
-    // gate stays OFF (default).
+    // This test pins the GATE-OFF contract; under the mvcc-inplace-on
+    // verification feature the default is ON, so force it off.
+    e.set_mvcc_inplace(false);
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     e.execute("INSERT INTO t VALUES (2)").unwrap();

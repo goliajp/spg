@@ -133,8 +133,18 @@ fn redo_carries_real_autocommit_writer_version() {
 
     e.execute("UPDATE u SET n = 99 WHERE k = 'a'").unwrap();
     let upd = e.take_redo();
-    assert_eq!(upd.len(), 1);
+    // Under the mvcc-inplace-on verification feature an UPDATE is
+    // tombstone(old) + insert(new) — two changes, one shared version.
+    let expect_upd = if cfg!(feature = "mvcc-inplace-on") { 2 } else { 1 };
+    assert_eq!(upd.len(), expect_upd);
     let v_upd = writer_version(&upd[0]);
+    for c in &upd {
+        assert_eq!(
+            writer_version(c),
+            v_upd,
+            "all changes from one UPDATE share its writer version"
+        );
+    }
     assert!(v_upd > v_ins, "later statement → strictly greater version");
 
     e.execute("DELETE FROM u WHERE k = 'b'").unwrap();

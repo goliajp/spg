@@ -51,6 +51,14 @@ unicode-normalization = { version = "0.1", default-features = false }
 default = ["std"]
 std     = []
 
+# v7.37.15 (Phase C.3) — build with the in-place MVCC write path ON by
+# default (equivalent to `set_mvcc_inplace(true)` on every engine).
+# Verification-matrix feature: lets CI / the mini testbed run the ENTIRE
+# suite gate-on (`cargo test -p spg-engine --features mvcc-inplace-on`)
+# to inventory default-on blockers. Not for production until the
+# gate-flip checklist closes.
+mvcc-inplace-on = []
+
 # v7.38 P0 元机制 A — injection_points framework.
 #
 # Default OFF for release builds: every `injection_point!()` macro

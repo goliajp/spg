@@ -57,16 +57,25 @@ fn case_when_in_update_set_expression() {
         "UPDATE msgs SET message_id = CASE WHEN message_id = '' THEN 'generated' ELSE message_id END",
     )
     .unwrap();
-    let table = eng.catalog().get("msgs").expect("table present");
-    let r0 = &table.rows().get(0).unwrap().values[1];
-    let r1 = &table.rows().get(1).unwrap().values[1];
+    // Read back through SQL, not physical row slots — under the
+    // mvcc-inplace-on verification feature an UPDATE tombstones the old
+    // version and appends the new one, so slot 0 is the dead version.
+    let spg_engine::QueryResult::Rows { rows, .. } = eng
+        .execute("SELECT message_id FROM msgs ORDER BY id")
+        .unwrap()
+    else {
+        panic!("rows");
+    };
+    assert_eq!(rows.len(), 2);
     assert!(
-        matches!(r0, spg_storage::Value::Text(s) if s == "generated"),
-        "row 0 should have generated id, got {r0:?}"
+        matches!(&rows[0].values[0], spg_storage::Value::Text(s) if s == "generated"),
+        "row id=1 should have generated id, got {:?}",
+        rows[0].values[0]
     );
     assert!(
-        matches!(r1, spg_storage::Value::Text(s) if s == "real-id"),
-        "row 1 should keep its id, got {r1:?}"
+        matches!(&rows[1].values[0], spg_storage::Value::Text(s) if s == "real-id"),
+        "row id=2 should keep its id, got {:?}",
+        rows[1].values[0]
     );
 }
 
