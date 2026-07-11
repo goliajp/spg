@@ -279,9 +279,13 @@ fn update_promotes_cold_row_to_hot_tier() {
     // version), cold tier still holds the *unchanged* original
     // body for id=100 (compaction reclaims it later), and the
     // engine's PK lookup must surface the new value.
+    // Under the mvcc-inplace-on verification feature the UPDATE
+    // additionally keeps the tombstoned pre-update version in the
+    // hot tier (physical 2, visible 1) until vacuum.
+    let expect_hot = if cfg!(feature = "mvcc-inplace-on") { 2 } else { 1 };
     assert_eq!(
         engine.catalog().get("users").unwrap().row_count(),
-        1,
+        expect_hot,
         "promoted row landed in hot tier"
     );
     assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("IVY"));
@@ -333,10 +337,13 @@ fn update_on_hot_pk_still_works_after_promote_hook_added() {
         .expect("UPDATE runs");
     assert_eq!(count_by_id(&mut engine, 1), 1);
     assert_eq!(select_name_by_id(&mut engine, 1).as_deref(), Some("ALICE"));
+    // (Physical count: mvcc-inplace-on keeps the tombstoned old
+    // version until vacuum; the VISIBLE count above is the contract.)
+    let expect_hot = if cfg!(feature = "mvcc-inplace-on") { 2 } else { 1 };
     assert_eq!(
         engine.catalog().get("users").unwrap().row_count(),
-        1,
-        "still one hot row — no accidental duplicate from promote"
+        expect_hot,
+        "still one visible hot row — no accidental duplicate from promote"
     );
 }
 
