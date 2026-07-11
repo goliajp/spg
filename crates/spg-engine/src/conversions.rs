@@ -1970,7 +1970,11 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "bigint" | "int8" => DataType::BigInt,
         "text" => DataType::Text,
         "varchar" | "character varying" => DataType::Varchar(0),
-        "bpchar" | "character" => DataType::Char(0),
+        // v7.39 (bpchar epic) — bare `char` / `character` is char(1) (SQL
+        // standard, `'xyz'::char` = 'x'); bare `bpchar` is PG's unlimited
+        // blank-trimmed type.
+        "char" | "character" => DataType::Char(1),
+        "bpchar" => DataType::Char(0),
         "bool" | "boolean" => DataType::Bool,
         "date" => DataType::Date,
         "timestamp" | "timestamp without time zone" => DataType::Timestamp,
@@ -3836,19 +3840,33 @@ pub(crate) fn coerce_value(
         ) if v.len() == dim as usize => Some(Value::HalfVector(
             spg_storage::halfvec::HalfVector::from_f32_slice(&v),
         )),
-        // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
-        // is already longer we reject (PG truncates trailing-space-only;
-        // staying strict for v1).
+        // CHAR(n) right-pads with U+0020 to exactly n chars. Overflow that
+        // is only trailing blanks is trimmed to fit (PG: 'abcd  ' fits
+        // CHAR(5)); real overflow is 22001.
         (Value::Text(s), DataType::Char(size)) => {
-            let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
-            if len > size {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "value for CHAR({size}) column `{col_name}` exceeds length: \
-                     {len} chars"
+            // v7.39 (bpchar epic) — bare `bpchar` (no length) is PG's
+            // unlimited blank-trimmed character type: store stripped,
+            // no pad, no length check.
+            if size == 0 {
+                return Ok(Value::BpChar(alloc::borrow::Cow::Owned(
+                    s.trim_end_matches(' ').to_string(),
                 )));
             }
-            let need = (size - len) as usize;
-            let mut padded = s.into_owned();
+            let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
+            let body = if len > size {
+                let trimmed = s.trim_end_matches(' ');
+                let tlen = u32::try_from(trimmed.chars().count()).unwrap_or(u32::MAX);
+                if tlen > size {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "value too long for type character({size})"
+                    )));
+                }
+                trimmed.to_string()
+            } else {
+                s.into_owned()
+            };
+            let need = (size as usize) - body.chars().count();
+            let mut padded = body;
             padded.reserve(need);
             for _ in 0..need {
                 padded.push(' ');

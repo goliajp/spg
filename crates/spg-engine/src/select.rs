@@ -4952,6 +4952,12 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     if let Value::Text(s) = v {
         return Ok(OrderKey::Text(s.as_ref().into()));
     }
+    // v7.39 (bpchar epic) — bpchar sorts by its blank-stripped form then
+    // byte order (PG bpcharcmp under C collation), so mixed-pad values of
+    // the same logical string order equal.
+    if let Value::BpChar(s) = v {
+        return Ok(OrderKey::Text(s.trim_end_matches(' ').into()));
+    }
     // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order, so
     // carry the parsed value and compare it structurally (see
     // `order_key_elem_cmp`). Unparseable text falls back to a Text key.

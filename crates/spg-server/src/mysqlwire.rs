@@ -972,6 +972,11 @@ fn encode_binary_value(out: &mut Vec<u8>, v: &Value, declared: Option<DataType>)
         Value::Text(s) | Value::Json(s) => {
             encode_lenenc_string(out, s.as_bytes());
         }
+        // v7.39 (bpchar epic) — MySQL strips CHAR(n) trailing pad on
+        // retrieval (opposite of PG's padded display).
+        Value::BpChar(s) => {
+            encode_lenenc_string(out, s.trim_end_matches(' ').as_bytes());
+        }
         Value::Date(days) => encode_binary_date(out, *days),
         Value::Timestamp(us) => {
             let is_tz = matches!(declared, Some(DataType::Timestamptz));
@@ -1381,6 +1386,8 @@ fn value_to_mysql_text(v: &Value) -> String {
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
         Value::Text(s) | Value::Json(s) => s.to_string(),
+        // v7.39 (bpchar epic) — MySQL strips CHAR(n) trailing pad on retrieval.
+        Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
         Value::Date(days) => format_date_mysql(*days),
         Value::Timestamp(us) => format_timestamp_mysql(*us),
         // Other types fall through to engine's canonical text

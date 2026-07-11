@@ -170,11 +170,41 @@ fn querytree_indexable(ast: &spg_storage::TsQueryAst) -> Option<spg_storage::TsQ
     }
 }
 
+/// bpchar functions that operate on the PADDED stored form. Everything
+/// else sees bpchar through its text cast (trailing blanks stripped) —
+/// PG resolves those calls to the text-argument builtin via an implicit
+/// bpchar→text coercion, and that cast strips.
+const BPCHAR_PADDED_FNS: &[&str] = &[
+    "octet_length",
+    "bit_length",
+    "concat",
+    "concat_ws",
+    // Type introspection must see the bpchar value itself, not its
+    // text-cast image.
+    "pg_typeof",
+];
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (bpchar epic) — normalise bpchar arguments to stripped text
+    // before dispatch so every text builtin (upper / substring / position /
+    // length / …) accepts CHAR(n) without a per-function arm. The padded
+    // whitelist keeps the stored form where PG does.
+    if args.iter().any(|a| matches!(a, Value::BpChar(_)))
+        && !BPCHAR_PADDED_FNS.contains(&name)
+    {
+        let stripped: alloc::vec::Vec<Value<'_>> = args
+            .iter()
+            .map(|a| match a {
+                Value::BpChar(s) => Value::text(s.trim_end_matches(' ').to_string()),
+                other => other.clone(),
+            })
+            .collect();
+        return apply_function_dispatch(name, &stripped, ctx);
+    }
     // v7.38 (read01 sweep) — PG resolves an unknown-type string literal in a
     // numeric function's argument to numeric (`abs('-7')`, `sqrt('16')`,
     // `round('3.567', 2)`). For the single-numeric-first-argument math
@@ -439,6 +469,12 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => {
+                    let n = i32::try_from(s.len()).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                // v7.39 (bpchar epic) — octet_length counts the PADDED
+                // stored form (octet_length('ab'::char(5)) = 5).
+                Value::BpChar(s) => {
                     let n = i32::try_from(s.len()).unwrap_or(i32::MAX);
                     Ok(Value::Int(n))
                 }
@@ -3393,7 +3429,9 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => {
+                // v7.39 (bpchar epic) — bit_length = octet_length × 8, on
+                // the PADDED stored form for bpchar.
+                Value::Text(s) | Value::BpChar(s) => {
                     let bytes = s.len();
                     let bits = bytes.saturating_mul(8);
                     let n = i32::try_from(bits).unwrap_or(i32::MAX);

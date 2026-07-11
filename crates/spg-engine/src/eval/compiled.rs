@@ -800,7 +800,11 @@ where
                 let v = stack.pop().unwrap_or(Value::Null);
                 match v {
                     Value::Null => stack.push(Value::Null),
-                    Value::Text(t) => {
+                    // v7.39 (bpchar epic) — LIKE matches bpchar on its
+                    // PADDED stored form ('ab'::char(5) LIKE 'ab' is
+                    // false, LIKE 'ab   ' is true), per PG's bpchar
+                    // pattern operators.
+                    Value::Text(t) | Value::BpChar(t) => {
                         let m = if *case_insensitive {
                             like_match_str(&t.to_lowercase(), pattern, 0)
                         } else {
@@ -834,6 +838,17 @@ where
                         };
                         Value::Int(n)
                     }
+                    // v7.39 (bpchar epic) — length(bpchar) counts with the
+                    // trailing blanks stripped (length('ab'::char(5)) = 2).
+                    Value::BpChar(s) => {
+                        let t = s.trim_end_matches(' ');
+                        let n = if t.is_ascii() {
+                            i32::try_from(t.len()).unwrap_or(i32::MAX)
+                        } else {
+                            i32::try_from(t.chars().count()).unwrap_or(i32::MAX)
+                        };
+                        Value::Int(n)
+                    }
                     Value::Bytes(b) => Value::Int(i32::try_from(b.len()).unwrap_or(i32::MAX)),
                     other => {
                         return Err(EvalError::TypeMismatch {
@@ -850,7 +865,11 @@ where
                 let v = row.get(*pos).unwrap_or(&Value::Null);
                 let pushed = match v {
                     Value::Null => Value::Null,
-                    Value::Text(s) => Value::Int(i32::try_from(s.len()).unwrap_or(i32::MAX)),
+                    // v7.39 (bpchar epic) — octet_length(bpchar) counts the
+                    // PADDED stored form.
+                    Value::Text(s) | Value::BpChar(s) => {
+                        Value::Int(i32::try_from(s.len()).unwrap_or(i32::MAX))
+                    }
                     Value::Bytes(b) => Value::Int(i32::try_from(b.len()).unwrap_or(i32::MAX)),
                     other => {
                         return Err(EvalError::TypeMismatch {
