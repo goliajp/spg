@@ -2737,12 +2737,19 @@ pub(crate) fn coerce_value(
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
         (Value::BigInt(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::Float(x), DataType::Real) => Some(Value::Real(x as f32)),
-        (Value::Numeric { scaled, scale, .. }, DataType::Real) => {
-            let mut div = 1.0f64;
-            for _ in 0..scale {
-                div *= 10.0;
-            }
-            Some(Value::Real((scaled as f64 / div) as f32))
+        (Value::Numeric { scaled, scale, kind }, DataType::Real) => {
+            Some(Value::Real(match kind {
+                spg_storage::NumericKind::NaN => f32::NAN,
+                spg_storage::NumericKind::PosInf => f32::INFINITY,
+                spg_storage::NumericKind::NegInf => f32::NEG_INFINITY,
+                spg_storage::NumericKind::Finite => {
+                    let mut div = 1.0f64;
+                    for _ in 0..scale {
+                        div *= 10.0;
+                    }
+                    (scaled as f64 / div) as f32
+                }
+            }))
         }
         (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
         (Value::Text(s), DataType::Real) => s.trim().parse::<f32>().ok().map(Value::Real),

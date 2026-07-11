@@ -67,3 +67,36 @@ fn values_join_and_aggregate() {
     let got = rows(&mut e, "SELECT SUM(x) FROM (VALUES (1), (2), (3)) t(x)");
     assert_eq!(as_i64(&got[0][0]), 6);
 }
+
+// ── v7.37.16 — VALUES/UNION common-type resolution, live-PG18.4 anchors ──
+
+/// `count(DISTINCT)` over a float8 ∪ numeric ∪ unknown-text VALUES
+/// column: PG resolves every branch to float8, so NaN dedups with NaN
+/// and -0 with 0 → 4. Requires resolve_union_common_type to resolve a
+/// MULTI-concrete + text mix by resolving the concrete set first.
+#[test]
+fn values_mixed_family_column_unifies_like_pg() {
+    let mut e = Engine::new();
+    let r = e
+        .execute(
+            "SELECT count(DISTINCT x) FROM (VALUES ('NaN'::float8),(1.0),('NaN'),(2.0),('-0'::float8),(0.0)) t(x)",
+        )
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("rows")
+    };
+    assert_eq!(
+        rows[0].values[0],
+        spg_storage::Value::BigInt(4),
+        "PG18: column resolves to float8; NaN=NaN, -0=0 → 4 distinct"
+    );
+    // The unified cells really are float8: the numeric literal rows
+    // compare equal to float8 rows carrying the same value.
+    let r = e
+        .execute("SELECT count(*) FROM (VALUES ('1'::float8),(1.0),(1)) t(x) WHERE x = 1.0")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("rows")
+    };
+    assert_eq!(rows[0].values[0], spg_storage::Value::BigInt(3));
+}
