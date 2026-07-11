@@ -85,6 +85,7 @@ mod system_catalog;
 mod table_access;
 pub mod testkit;
 mod transaction;
+pub(crate) use transaction::{TxStmtClass, classify_stmt_for_tx};
 pub mod triggers;
 pub mod users;
 mod window;
@@ -386,6 +387,20 @@ struct TxState {
     /// `None` for READ COMMITTED (default): each statement gets a
     /// fresh snapshot via `current_snapshot()`.
     cached_snapshot: Option<spg_storage::snapshot::Snapshot>,
+    /// v7.37.17 (Phase E2 — RC rebase) — tables this tx has run DML
+    /// against. The per-statement rebase extracts/replays write-sets
+    /// only for these (see `maybe_rc_rebase`).
+    touched_tables: alloc::collections::BTreeSet<String>,
+    /// v7.37.17 — the tx executed a statement whose effect on the
+    /// shadow catalog can't be expressed as a versioned row write-set
+    /// (DDL, COPY, anything unclassified). The rebase would lose it,
+    /// so the tx degrades to its frozen BEGIN-time view (SI) for the
+    /// rest of its life — the pre-E2 behaviour, honestly kept.
+    rebase_poisoned: bool,
+    /// v7.37.17 — statements successfully run inside this tx. The
+    /// first statement sees the BEGIN-time clone unchanged (it IS the
+    /// latest base at that point); rebasing starts from the second.
+    stmts_run: u32,
 }
 
 /// v7.11.0 — frozen read-only view of the engine's committed state.

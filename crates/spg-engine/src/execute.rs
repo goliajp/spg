@@ -804,7 +804,19 @@ impl Engine {
             }
         }
         let is_rollback_to_savepoint = matches!(stmt, Statement::RollbackToSavepoint(_));
+        // v7.37.17 (Phase E2) — READ COMMITTED per-statement visibility:
+        // classify (the statement moves into dispatch below), rebase the
+        // open RC tx's shadow onto the latest committed catalog, then
+        // record the statement's targets afterwards. Both calls are
+        // no-ops outside an explicit transaction.
+        let tx_class = crate::classify_stmt_for_tx(&stmt);
+        if !matches!(tx_class, crate::TxStmtClass::TxControl) {
+            self.maybe_rc_rebase();
+        }
         let result = self.dispatch_stmt_inner(stmt, cancel);
+        if result.is_ok() {
+            self.record_tx_stmt(&tx_class);
+        }
         if !self.in_transaction() {
             // The tx ended (COMMIT / ROLLBACK) or we were in autocommit;
             // either way there is no aborted block to remember.
@@ -1073,6 +1085,29 @@ impl Engine {
             // of READ UNCOMMITTED).
             Statement::SetTransaction { isolation } => {
                 self.current_isolation_level = isolation;
+                // v7.37.17 (Phase E2) — inside an open tx, switching to
+                // RR/SER BEFORE the first query freezes the tx's view by
+                // caching a snapshot now (PG allows the switch until the
+                // first query; the RC rebase keys off cached_snapshot).
+                // Switching (back) to RC/RU clears it so the rebase
+                // resumes. After the first query PG errors; SPG applies
+                // the switch to the REMAINING statements — recorded
+                // residual, not silently wrong for the pre-query case.
+                if let Some(tx_id) = self.current_tx
+                    && self.tx_catalogs.contains_key(&tx_id)
+                {
+                    let cache = match isolation {
+                        spg_sql::ast::IsolationLevel::RepeatableRead
+                        | spg_sql::ast::IsolationLevel::Serializable => {
+                            Some(self.current_snapshot())
+                        }
+                        spg_sql::ast::IsolationLevel::ReadUncommitted
+                        | spg_sql::ast::IsolationLevel::ReadCommitted => None,
+                    };
+                    if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+                        st.cached_snapshot = cache;
+                    }
+                }
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: false,

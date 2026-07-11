@@ -1963,10 +1963,19 @@ fn concurrent_tx_isolation() {
     );
     assert!(e.is_tx_open(tx1) && e.is_tx_open(tx2), "both tx open");
     e.execute_in("COMMIT", tx1).unwrap();
+    // v7.37.17 (Phase E2) — under the default in-place MVCC gate the
+    // default READ COMMITTED tx sees the concurrently-committed row on
+    // its NEXT statement (PG semantics, per-statement rebase); the
+    // legacy gate-off matrix keeps the old frozen-SI view.
+    let expected_after_commit = if e.mvcc_inplace() {
+        "BigInt(1)"
+    } else {
+        "BigInt(0)"
+    };
     assert_eq!(
         cnt(&mut e, tx2),
-        "BigInt(0)",
-        "tx2 keeps its snapshot after tx1 commits (SI)"
+        expected_after_commit,
+        "READ COMMITTED tx2 sees tx1's commit on its next statement (gate-on)"
     );
     assert_eq!(
         cnt(&mut e, IMPLICIT_TX),

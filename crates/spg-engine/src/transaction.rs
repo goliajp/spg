@@ -9,6 +9,94 @@ use alloc::vec::Vec;
 
 use crate::{Engine, EngineError, QueryResult, TxState};
 
+/// v7.37.17 (Phase E2 — RC rebase) — how a statement interacts with an
+/// open transaction's shadow catalog, decided BEFORE dispatch (the
+/// statement is moved into the executor). Conservative by default:
+/// anything unclassified is `Other`, which degrades the tx to its
+/// frozen SI view rather than risking a lossy rebase.
+pub(crate) enum TxStmtClass {
+    /// BEGIN / COMMIT / ROLLBACK / savepoints / SET TRANSACTION —
+    /// transaction plumbing; neither rebases nor records.
+    TxControl,
+    /// Reads and session-local settings: safe to rebase before, no
+    /// write-set impact.
+    ReadOnly,
+    /// Row DML against one named table (writable CTEs surface every
+    /// CTE target too).
+    Dml(Vec<String>),
+    /// Everything else (DDL, COPY, unclassified) — poisons the rebase.
+    Other,
+}
+
+/// Classify for the RC rebase. SELECTs with data-modifying CTEs count
+/// as DML against each CTE target (PG runs them in the same tx).
+pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClass {
+    use spg_sql::ast::{CteBody, Statement as S};
+    let cte_targets = |ctes: &[spg_sql::ast::Cte]| -> Option<Vec<String>> {
+        let mut targets = Vec::new();
+        for c in ctes {
+            match &c.body {
+                CteBody::Select(_) => {}
+                CteBody::Insert(i) => targets.push(i.table.clone()),
+                CteBody::Update(u) => targets.push(u.table.clone()),
+                CteBody::Delete(d) => targets.push(d.table.clone()),
+            }
+        }
+        Some(targets)
+    };
+    match stmt {
+        S::Begin
+        | S::Commit
+        | S::Rollback
+        | S::Savepoint(_)
+        | S::RollbackToSavepoint(_)
+        | S::ReleaseSavepoint(_)
+        | S::SetTransaction { .. } => TxStmtClass::TxControl,
+        S::Select(sel) => match cte_targets(&sel.ctes) {
+            Some(t) if t.is_empty() => TxStmtClass::ReadOnly,
+            Some(t) => TxStmtClass::Dml(t),
+            None => TxStmtClass::Other,
+        },
+        S::Insert(i) => {
+            let mut t = alloc::vec![i.table.clone()];
+            match cte_targets(&i.ctes) {
+                Some(more) => t.extend(more),
+                None => return TxStmtClass::Other,
+            }
+            TxStmtClass::Dml(t)
+        }
+        S::Update(u) => {
+            let mut t = alloc::vec![u.table.clone()];
+            match cte_targets(&u.ctes) {
+                Some(more) => t.extend(more),
+                None => return TxStmtClass::Other,
+            }
+            TxStmtClass::Dml(t)
+        }
+        S::Delete(d) => {
+            let mut t = alloc::vec![d.table.clone()];
+            match cte_targets(&d.ctes) {
+                Some(more) => t.extend(more),
+                None => return TxStmtClass::Other,
+            }
+            TxStmtClass::Dml(t)
+        }
+        S::Merge(m) => TxStmtClass::Dml(alloc::vec![m.target.clone()]),
+        S::ShowTables
+        | S::ShowDatabases
+        | S::ShowCreateTable { .. }
+        | S::ShowIndexes { .. }
+        | S::ShowStatus
+        | S::ShowVariables { .. }
+        | S::ShowProcesslist
+        | S::ShowColumns { .. }
+        | S::ShowUsers
+        | S::Explain { .. }
+        | S::Empty => TxStmtClass::ReadOnly,
+        _ => TxStmtClass::Other,
+    }
+}
+
 impl Engine {
     /// v7.38 (read01 P3.19) — replay the `SET LOCAL` undo log down to
     /// `floor`, reverting each transaction-local GUC to the value it held
@@ -35,6 +123,98 @@ impl Engine {
     pub(crate) fn restore_all_local_gucs(&mut self) {
         self.restore_local_gucs_to(0);
         self.savepoint_guc_marks.clear();
+    }
+
+    /// v7.37.17 (Phase E2) — READ COMMITTED per-statement rebase: move
+    /// the open RC tx's shadow onto the LATEST committed catalog and
+    /// replay the tx's own write-set (identified by its writer version —
+    /// see phase-e-read-committed-design.md route α). Runs before every
+    /// non-tx-control statement; no-op unless: an explicit tx is open,
+    /// its isolation caches no snapshot (RC/RU — RR/SER keep their
+    /// frozen view), no DDL poisoned it, and at least one statement
+    /// already ran (the BEGIN-time clone IS the latest base for the
+    /// first). Replay conflicts (a row this tx tombstoned that another
+    /// committed tx already removed) are skipped — PG's RC semantics;
+    /// RR/SER never reach here and get serialization_failure at COMMIT
+    /// instead (Phase E3). A touched table missing from the fresh base
+    /// (concurrent DROP) aborts the rebase and keeps the frozen view.
+    pub(crate) fn maybe_rc_rebase(&mut self) {
+        // Gate-off (legacy physical-delete) writes carry NO version
+        // stamps, so the write-set is unextractable — a rebase would
+        // silently lose the tx's own writes. Keep the frozen SI view,
+        // which IS the legacy behaviour.
+        if !self.mvcc_inplace {
+            return;
+        }
+        let Some(tx_id) = self.current_tx else { return };
+        let Some(state) = self.tx_catalogs.get(&tx_id) else {
+            return;
+        };
+        if state.cached_snapshot.is_some() || state.rebase_poisoned || state.stmts_run == 0 {
+            return;
+        }
+        let Some(&v) = self.tx_writer_versions.get(&tx_id) else {
+            return;
+        };
+        // Extract the write-sets from the OLD shadow first (immutable
+        // borrows only), then build + install the fresh catalog.
+        let mut wsets: Vec<(String, spg_storage::TxWriteSet)> = Vec::new();
+        for tname in &state.touched_tables {
+            if let Some(old_t) = state.catalog.get(tname) {
+                let ws = old_t.extract_tx_writeset(v);
+                if !ws.is_empty() {
+                    wsets.push((tname.clone(), ws));
+                }
+            }
+        }
+        let mut fresh = self.catalog.clone();
+        for (tname, ws) in &wsets {
+            let Some(new_t) = fresh.get_mut(tname) else {
+                // Concurrently dropped — a rebase would lose this tx's
+                // writes; keep the frozen shadow for this statement.
+                return;
+            };
+            let _rc_skipped_conflicts = new_t.replay_tx_writeset(ws, v);
+        }
+        if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+            st.catalog = fresh;
+        }
+    }
+
+    /// v7.37.17 (Phase E2) — post-dispatch bookkeeping for the RC
+    /// rebase: count the statement and record its DML targets (or the
+    /// DDL poison flag) on the open tx.
+    pub(crate) fn record_tx_stmt(&mut self, class: &TxStmtClass) {
+        let Some(tx_id) = self.current_tx else { return };
+        let Some(st) = self.tx_catalogs.get_mut(&tx_id) else {
+            return;
+        };
+        match class {
+            TxStmtClass::TxControl => {}
+            TxStmtClass::ReadOnly => st.stmts_run = st.stmts_run.saturating_add(1),
+            TxStmtClass::Dml(tables) => {
+                st.stmts_run = st.stmts_run.saturating_add(1);
+                for t in tables {
+                    st.touched_tables.insert(t.clone());
+                }
+            }
+            TxStmtClass::Other => {
+                st.stmts_run = st.stmts_run.saturating_add(1);
+                st.rebase_poisoned = true;
+            }
+        }
+    }
+
+    /// v7.37.17 (Phase E2) — poison the open tx's rebase from inside an
+    /// executor: used by writes whose shadow effect is NOT expressible
+    /// as a versioned row write-set (today: the cold-tier locator
+    /// shadow a PK-targeted DELETE performs). The tx keeps its frozen
+    /// SI view for the rest of its life — never silently loses a write.
+    pub(crate) fn poison_tx_rebase(&mut self) {
+        let Some(tx_id) = self.current_tx else { return };
+        if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+            st.rebase_poisoned = true;
+        }
     }
 
     pub(crate) fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {
@@ -69,6 +249,9 @@ impl Engine {
                 catalog: self.catalog.clone(),
                 savepoints: Vec::new(),
                 cached_snapshot,
+                touched_tables: alloc::collections::BTreeSet::new(),
+                rebase_poisoned: false,
+                stmts_run: 0,
             },
         );
         Ok(QueryResult::CommandOk {
@@ -78,6 +261,15 @@ impl Engine {
     }
 
     pub(crate) fn exec_commit(&mut self) -> Result<QueryResult, EngineError> {
+        // v7.37.17 (Phase E2) — final rebase before the shadow is
+        // installed: COMMIT replaces the whole committed catalog with
+        // the shadow, so anything committed concurrently AFTER this
+        // tx's last statement would be silently overwritten (lost
+        // update). The RC rebase folds those commits in first. RR/SER
+        // (cached snapshot) and the legacy gate-off world skip this —
+        // their commit-time merge/conflict story is Phase E3; the
+        // frozen-view overwrite there is the honest pre-E2 behaviour.
+        self.maybe_rc_rebase();
         // v7.38 P0 元机制 A — fires at the commit barrier entry.
         // Represents "this thread is about to take the WAL group
         // commit leader slot" so tests can block here and let a
