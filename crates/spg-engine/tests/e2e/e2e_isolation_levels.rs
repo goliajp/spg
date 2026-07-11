@@ -108,3 +108,87 @@ fn rc_delete_conflict_is_skipped_like_pg() {
     e.execute_in("COMMIT", tx).unwrap();
     assert_eq!(count(&mut e, IMPLICIT_TX), 1, "row deleted exactly once");
 }
+
+// ── v7.37.17 Phase E3 — RR/SER commit-merge + serialization failure ──
+
+#[test]
+fn rr_commit_merges_concurrent_inserts_instead_of_overwriting() {
+    if !Engine::new().mvcc_inplace() {
+        return; // legacy matrix keeps the wholesale-install behaviour
+    }
+    let mut e = boot();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", tx).unwrap();
+    // Concurrent autocommit insert AFTER the tx's last statement —
+    // the old wholesale install would have silently dropped it.
+    e.execute_in("INSERT INTO t VALUES (3)", IMPLICIT_TX).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    assert_eq!(
+        count(&mut e, IMPLICIT_TX),
+        3,
+        "RR commit merges its write-set onto the latest base"
+    );
+}
+
+#[test]
+fn rr_commit_conflict_raises_serialization_failure() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = boot();
+    e.execute("INSERT INTO t VALUES (5)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
+    // A concurrent committed delete wins (first-committer-wins).
+    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX).unwrap();
+    let err = e.execute_in("COMMIT", tx).unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
+        "expected 40001, got {err:?}"
+    );
+    assert!(!e.is_tx_open(tx), "failed COMMIT ends the transaction");
+    assert_eq!(count(&mut e, IMPLICIT_TX), 1, "base state intact");
+}
+
+#[test]
+fn rr_commit_unique_conflict_raises_serialization_failure() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE u (x INT UNIQUE)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
+    // Concurrent committed insert takes the key first.
+    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX).unwrap();
+    let err = e.execute_in("COMMIT", tx).unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
+        "expected 40001 on duplicate-key merge, got {err:?}"
+    );
+}
+
+#[test]
+fn set_transaction_after_first_query_errors() {
+    let mut e = boot();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    assert_eq!(count(&mut e, tx), 1); // first query
+    let err = e
+        .execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("must be called before any query"),
+        "PG 25001 shape, got {err:?}"
+    );
+    e.execute_in("ROLLBACK", tx).unwrap();
+}

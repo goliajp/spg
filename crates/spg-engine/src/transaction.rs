@@ -277,6 +277,96 @@ impl Engine {
         // fires once the slot is taken — see below).
         crate::injection_point!("tx_commit_walgroup_leader_switch", &self.current_tx);
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        // v7.37.17 (Phase E3) — RR/SER commit-merge + write-write
+        // conflict detection. A frozen-view tx COMMIT used to install
+        // its shadow over the committed catalog wholesale, silently
+        // overwriting everything committed since BEGIN (lost update).
+        // Under the in-place gate the tx's writes are identified by its
+        // writer version, so instead: extract the write-set, check it
+        // against the LATEST base (a tombstone target already gone /
+        // re-tombstoned, or an inserted unique key already taken, means
+        // a concurrent writer won — PG's first-committer-wins), and on
+        // success replay onto a fresh base clone which then installs.
+        // A conflict rolls the tx back and raises
+        // SerializationFailure (SQLSTATE 40001), matching PG's retry
+        // contract. RC txs were already rebased before this call;
+        // poisoned / legacy txs keep the wholesale install (recorded).
+        if self.mvcc_inplace
+            && let Some(st) = self.tx_catalogs.get(&tx_id)
+            && st.cached_snapshot.is_some()
+            && !st.rebase_poisoned
+            && !st.touched_tables.is_empty()
+            && let Some(&v) = self.tx_writer_versions.get(&tx_id)
+        {
+            let mut wsets: Vec<(String, spg_storage::TxWriteSet)> = Vec::new();
+            for tname in &st.touched_tables {
+                if let Some(old_t) = st.catalog.get(tname) {
+                    let ws = old_t.extract_tx_writeset(v);
+                    if !ws.is_empty() {
+                        wsets.push((tname.clone(), ws));
+                    }
+                }
+            }
+            let mut fresh = self.catalog.clone();
+            let mut conflict: Option<String> = None;
+            'merge: for (tname, ws) in &wsets {
+                // Unique pre-check on the LATEST base: a key this tx
+                // inserted that a concurrently-committed tx also took.
+                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> =
+                    ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
+                if !inserted_rows.is_empty()
+                    && let Some(t) = fresh.get(tname)
+                {
+                    let ucs = t.schema().uniqueness_constraints.clone();
+                    if let Err(e) = crate::constraints::enforce_uniqueness_inserts(
+                        &fresh,
+                        tname,
+                        &ucs,
+                        &inserted_rows,
+                    ) {
+                        conflict = Some(alloc::format!("{e}"));
+                        break 'merge;
+                    }
+                    if let Err(e) = crate::constraints::enforce_unique_index_inserts(
+                        &fresh,
+                        tname,
+                        &inserted_rows,
+                    ) {
+                        conflict = Some(alloc::format!("{e}"));
+                        break 'merge;
+                    }
+                }
+                let Some(new_t) = fresh.get_mut(tname) else {
+                    conflict = Some(alloc::format!("table {tname:?} was dropped concurrently"));
+                    break 'merge;
+                };
+                let unapplied = new_t.replay_tx_writeset(ws, v);
+                if !unapplied.is_empty() {
+                    conflict = Some(alloc::format!(
+                        "{} row(s) in {tname:?} were deleted or updated by a concurrent transaction",
+                        unapplied.len()
+                    ));
+                    break 'merge;
+                }
+            }
+            match conflict {
+                Some(detail) => {
+                    // Roll the tx back (PG: a failed COMMIT ends the tx).
+                    self.tx_catalogs.remove(&tx_id);
+                    if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
+                        self.abort_writer_version(v);
+                        self.release_tx_locks(v);
+                    }
+                    self.restore_all_local_gucs();
+                    return Err(EngineError::SerializationFailure(detail));
+                }
+                None => {
+                    if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+                        st.catalog = fresh;
+                    }
+                }
+            }
+        }
         let state = self
             .tx_catalogs
             .remove(&tx_id)
