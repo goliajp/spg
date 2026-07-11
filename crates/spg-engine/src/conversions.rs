@@ -3806,11 +3806,21 @@ pub(crate) fn coerce_value(
             if max == 0 || u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
                 Some(Value::text(s))
             } else {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "value for VARCHAR({max}) column `{col_name}` exceeds length: \
-                     {} chars",
-                    s.chars().count()
-                )));
+                // v7.39 (bpchar epic) — overflow that is only trailing
+                // blanks is cut AT the limit (PG keeps 'abcd ' from
+                // 'abcd  ' in varchar(5) — not a full strip); anything
+                // else is 22001 with PG's phrasing.
+                let excess_all_blanks =
+                    s.chars().skip(max as usize).all(|c| c == ' ');
+                if excess_all_blanks {
+                    Some(Value::text(
+                        s.chars().take(max as usize).collect::<alloc::string::String>(),
+                    ))
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "value too long for type character varying({max})"
+                    )));
+                }
             }
         }
         // v6.0.1: f32 → SQ8 INSERT-time quantisation. Triggered

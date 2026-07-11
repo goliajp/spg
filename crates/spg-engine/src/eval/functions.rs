@@ -179,6 +179,9 @@ const BPCHAR_PADDED_FNS: &[&str] = &[
     "bit_length",
     "concat",
     "concat_ws",
+    // format('%s', …) renders via the output function, keeping the pad
+    // (differential-verified; quote_literal/replace/lpad/md5/… strip).
+    "format",
     // Type introspection must see the bpchar value itself, not its
     // text-cast image.
     "pg_typeof",

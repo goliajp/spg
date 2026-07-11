@@ -202,6 +202,8 @@ fn render_cell(v: &Value, ty: char) -> String {
             }
         }
         Value::Bool(b) => (if *b { "1" } else { "0" }).into(),
+        // v7.39 (bpchar epic) — padded stored form, like the pgwire display.
+        Value::BpChar(s) => s.to_string(),
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format_real(f64::from(*x))).collect();
             format!("[{}]", cells.join(", "))
