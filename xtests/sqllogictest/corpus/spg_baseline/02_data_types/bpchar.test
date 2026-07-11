@@ -1,0 +1,98 @@
+# CHAR(n) / bpchar semantics (v7.39 epic; oracle: live PG 18.4).
+# Padded storage, stripped comparisons/functions, padded LIKE/octet_length.
+
+statement ok
+CREATE TABLE c (a CHAR(5))
+
+statement ok
+INSERT INTO c VALUES ('ab')
+
+# Wire display is the padded stored form.
+query T
+SELECT '[' || a || ']' FROM c
+----
+[ab]
+
+# length strips; octet_length counts the pad.
+query III
+SELECT length(a), char_length(a), octet_length(a) FROM c
+----
+2
+2
+5
+
+# Comparison is trailing-blank-insensitive.
+query B
+SELECT a = 'ab   ' FROM c
+----
+1
+
+query I
+SELECT count(*) FROM c WHERE a = 'ab'
+----
+1
+
+# LIKE matches the PADDED form.
+query BBB
+SELECT a LIKE 'ab', a LIKE 'ab%', a LIKE 'ab   ' FROM c
+----
+0
+1
+1
+
+# Text functions see the stripped form; concat keeps the pad.
+query TI
+SELECT upper(a), length(upper(a)) FROM c
+----
+AB
+2
+
+query T
+SELECT concat(a, 'x') FROM c
+----
+ab   x
+
+# ::varchar strips.
+query T
+SELECT '[' || a::varchar || ']' FROM c
+----
+[ab]
+
+# ORDER BY sorts by the stripped form.
+statement ok
+CREATE TABLE o (a CHAR(5), tag INT)
+
+statement ok
+INSERT INTO o VALUES ('b', 1), ('a', 2), ('ab', 3)
+
+query I
+SELECT tag FROM o ORDER BY a
+----
+2
+3
+1
+
+# Trailing-blank overflow fits; real overflow errors.
+statement ok
+INSERT INTO c VALUES ('abcd  ')
+
+statement error
+INSERT INTO c VALUES ('abcdef')
+
+# DISTINCT is pad-insensitive.
+statement ok
+CREATE TABLE d (a CHAR(5))
+
+statement ok
+INSERT INTO d VALUES ('ab'), ('ab   '), ('ab ')
+
+query I
+SELECT count(DISTINCT a) FROM d
+----
+1
+
+# Bare char is char(1).
+query T
+SELECT 'xyz'::char
+----
+x

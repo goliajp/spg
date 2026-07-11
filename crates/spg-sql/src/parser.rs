@@ -10298,7 +10298,15 @@ impl Parser {
             "text" => ColumnTypeName::Text,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
-            "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
+            // v7.39 (bpchar epic) — bare `char` = char(1), same as bare
+            // `character` below (SQL standard).
+            "char" => {
+                if matches!(self.peek(), Token::LParen) {
+                    ColumnTypeName::Char(self.parse_paren_size("CHAR")?)
+                } else {
+                    ColumnTypeName::Char(1)
+                }
+            }
             // pg_dump's canonical spellings: `character varying(n)` = varchar,
             // `character(n)` = char, bare `character` = char(1). Unbounded
             // `character varying` maps to text.

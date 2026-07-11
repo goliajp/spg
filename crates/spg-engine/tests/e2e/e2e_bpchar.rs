@@ -146,3 +146,48 @@ fn bare_char_cast_is_char_1() {
     assert_eq!(one(&mut e, "SELECT 'xyz'::char"), "x");
     assert_eq!(one(&mut e, "SELECT length('xyz'::char)"), "1");
 }
+
+#[test]
+fn bpchar_format_keeps_pad_quote_literal_strips() {
+    let mut e = Engine::new();
+    // format renders via the output function (padded) —
+    // differential-verified vs PG18.
+    assert_eq!(one(&mut e, "SELECT format('<%s>', 'ab'::char(5))"), "<ab   >");
+    assert_eq!(one(&mut e, "SELECT quote_literal('ab'::char(5))"), "'ab'");
+    assert_eq!(one(&mut e, "SELECT replace('ab'::char(5), 'b', 'X')"), "aX");
+}
+
+#[test]
+fn varchar_overflow_cuts_blanks_at_limit_else_22001() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE vc (v VARCHAR(5))").unwrap();
+    // PG keeps 'abcd ' (cut AT the limit, not a full strip).
+    e.execute("INSERT INTO vc VALUES ('abcd  ')")
+        .expect("blank-only overflow must fit");
+    assert_eq!(one(&mut e, "SELECT '<' || v || '>' FROM vc"), "<abcd >");
+    assert_eq!(one(&mut e, "SELECT length(v) FROM vc"), "5");
+    let err = e
+        .execute("INSERT INTO vc VALUES ('abcdef')")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("value too long for type character varying(5)"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn bare_char_column_is_char_1() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE bc (a CHAR, b CHARACTER)").unwrap();
+    e.execute("INSERT INTO bc VALUES ('x', 'y')").unwrap();
+    assert_eq!(one(&mut e, "SELECT a FROM bc"), "x");
+    let err = e
+        .execute("INSERT INTO bc VALUES ('xx', 'y')")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("value too long for type character(1)"),
+        "got: {err}"
+    );
+}
