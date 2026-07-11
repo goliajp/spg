@@ -3646,6 +3646,15 @@ impl Engine {
         } else {
             None
         };
+        // v7.37.16 — streaming DISTINCT seen-set: norm-hash → indices of
+        // kept rows in `tagged`. Probing on the PROJECTED row as soon as
+        // it is built means a duplicate costs neither a build_order_keys
+        // eval (the dominant per-row cost of `DISTINCT … ORDER BY`) nor
+        // a tagged slot, and the sort below runs over u survivors, not
+        // n input rows — PG's hash-distinct-then-sort plan shape.
+        let mut seen_distinct: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+            hashbrown::HashMap::new();
+        let distinct_hb = hashbrown::DefaultHashBuilder::default();
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
@@ -3665,12 +3674,19 @@ impl Engine {
                     return Ok(());
                 }
             }
-            let order_keys = if stmt.order_by.is_empty() {
+            // Under DISTINCT the keys are built AFTER the dup probe
+            // (survivors only); the non-distinct order is unchanged.
+            let order_keys = if stmt.order_by.is_empty() || stmt.distinct {
                 Vec::new()
             } else {
                 build_order_keys(&stmt.order_by, row, &ctx)?
             };
             if let Some(srf_idx) = srf_position {
+                let order_keys = if stmt.distinct && !stmt.order_by.is_empty() {
+                    build_order_keys(&stmt.order_by, row, &ctx)?
+                } else {
+                    order_keys
+                };
                 let elements = top_level_srf_output(&projection[srf_idx].expr, row, &ctx)?;
                 for elem in elements {
                     let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
@@ -3682,6 +3698,15 @@ impl Engine {
                         }
                     }
                     let out = Row::new(values);
+                    if stmt.distinct {
+                        let bucket = seen_distinct
+                            .entry(norm_hash_row(&out, &distinct_hb))
+                            .or_default();
+                        if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out)) {
+                            continue;
+                        }
+                        bucket.push(tagged.len());
+                    }
                     budget.charge(approx_row_bytes(&out))?;
                     tagged.push((order_keys.clone(), out));
                 }
@@ -3717,6 +3742,20 @@ impl Engine {
                     );
                 }
                 let out = Row::new(values);
+                if stmt.distinct {
+                    let bucket = seen_distinct
+                        .entry(norm_hash_row(&out, &distinct_hb))
+                        .or_default();
+                    if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out)) {
+                        return Ok(());
+                    }
+                    bucket.push(tagged.len());
+                }
+                let order_keys = if stmt.distinct && !stmt.order_by.is_empty() {
+                    build_order_keys(&stmt.order_by, row, &ctx)?
+                } else {
+                    order_keys
+                };
                 budget.charge(approx_row_bytes(&out))?;
                 tagged.push((order_keys, out));
             }
@@ -3780,16 +3819,17 @@ impl Engine {
             }
         }
 
+        // (DISTINCT already de-duped STREAMING inside process_row, so the
+        // sort below only sees the u survivors and the partial-sort
+        // budget applies to DISTINCT too.)
         if !stmt.order_by.is_empty() {
             // Partial-sort fast path: when LIMIT is small relative to
             // the row count, select_nth_unstable + sort just the
-            // prefix is O(n + k log k) instead of O(n log n). DISTINCT
-            // requires the full sort because de-dup happens after.
-            // WITH TIES likewise needs the full sort so the tie
-            // extension can scan past `limit` to find rows that
-            // share the last-kept row's key.
-            let keep = if stmt.distinct
-                || stmt.limit_with_ties
+            // prefix is O(n + k log k) instead of O(n log n).
+            // WITH TIES needs the full sort so the tie extension can
+            // scan past `limit` to find rows that share the last-kept
+            // row's key.
+            let keep = if stmt.limit_with_ties
                 // v7.38 元机制 D acceptor — `SPG_TEST_DISABLE_TOPK=1`
                 // forces the full-sort fallback by suppressing the
                 // partial-sort `keep` budget. See
@@ -3823,10 +3863,8 @@ impl Engine {
             );
             tagged.into_iter().map(|(_, r)| r).collect()
         } else {
+            // DISTINCT already de-duped pre-sort above.
             let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
-            if stmt.distinct {
-                output_rows = dedup_rows(output_rows);
-            }
             apply_offset_and_limit(
                 &mut output_rows,
                 stmt.offset_literal(),
@@ -4199,6 +4237,10 @@ impl Engine {
         } else {
             None
         };
+        // v7.37.16 — streaming DISTINCT seen-set (see scan-path twin).
+        let mut seen_distinct: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+            hashbrown::HashMap::new();
+        let distinct_hb = hashbrown::DefaultHashBuilder::default();
         for surv_i in 0..n_surv {
             let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
             let row = &refs[surv_i];
@@ -4249,13 +4291,25 @@ impl Engine {
                     )?);
                 }
             }
+            let out_row = Row::new(values);
+            // v7.37.16 — streaming DISTINCT (see the scan-path twin):
+            // probe on the projected row; duplicates skip the
+            // build_order_keys eval and never enter `tagged`.
+            if stmt.distinct {
+                let bucket = seen_distinct
+                    .entry(norm_hash_row(&out_row, &distinct_hb))
+                    .or_default();
+                if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out_row)) {
+                    continue;
+                }
+                bucket.push(tagged.len());
+            }
             let order_keys = if stmt.order_by.is_empty() {
                 Vec::new()
             } else {
                 let mrow = materialised.as_deref().expect("materialised for order by");
                 build_order_keys(&stmt.order_by, mrow, &ctx)?
             };
-            let out_row = Row::new(values);
             budget.charge(approx_row_bytes(&out_row))?;
             tagged.push((order_keys, out_row));
             if let Some((k, descs)) = &topk_stream {
@@ -4263,10 +4317,8 @@ impl Engine {
             }
         }
         if !stmt.order_by.is_empty() {
-            let keep = if stmt.distinct
-                // v7.38 元机制 D acceptor — see other call site above.
-                || self.env_cfg().disable_topk
-            {
+            // v7.38 元机制 D acceptor — see other call site above.
+            let keep = if self.env_cfg().disable_topk {
                 None
             } else {
                 stmt.limit_literal()
@@ -4276,9 +4328,6 @@ impl Engine {
             partial_sort_tagged(&mut tagged, keep, &descs);
         }
         let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
-        if stmt.distinct {
-            output_rows = dedup_rows(output_rows);
-        }
         apply_offset_and_limit(
             &mut output_rows,
             stmt.offset_literal(),
@@ -4633,13 +4682,250 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
 }
 
 fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
-    let mut out: Vec<Row<'static>> = Vec::with_capacity(rows.len());
-    for r in rows {
-        if !out.iter().any(|seen| row_eq_norm(seen, &r)) {
-            out.push(r);
+    dedup_by_row(rows, |r| r)
+}
+
+/// v7.37.16 — hash-bucketed DISTINCT. The old `out.iter().any(row_eq_norm)`
+/// was O(n·u) — `SELECT DISTINCT v` over 50 k rows with ~39 k unique values
+/// ran 4 SECONDS (80 µs/row) vs PG's ~5 ms. Bucket rows by `norm_hash_row`
+/// and run the exact `row_eq_norm` only within a bucket: first-occurrence
+/// order is preserved, and correctness needs only the one-way guarantee
+/// "row_eq_norm-Equal ⇒ equal hash" (collisions are re-checked exactly).
+/// Small inputs keep the linear scan — no hasher setup for a 10-row page.
+fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>) -> Vec<T> {
+    if items.len() <= 32 {
+        let mut out: Vec<T> = Vec::with_capacity(items.len());
+        for it in items {
+            if !out
+                .iter()
+                .any(|seen| row_eq_norm(row_of(seen), row_of(&it)))
+            {
+                out.push(it);
+            }
+        }
+        return out;
+    }
+    // ONE BuildHasher instance for the whole pass — the default builder
+    // is randomly seeded PER INSTANCE, so a fresh one per row would give
+    // equal rows different hashes and never dedup.
+    let bh = hashbrown::DefaultHashBuilder::default();
+    let mut out: Vec<T> = Vec::with_capacity(items.len().min(1024));
+    let mut buckets: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+        hashbrown::HashMap::with_capacity(items.len());
+    for it in items {
+        let h = norm_hash_row(row_of(&it), &bh);
+        let bucket = buckets.entry(h).or_default();
+        if !bucket
+            .iter()
+            .any(|&i| row_eq_norm(row_of(&out[i]), row_of(&it)))
+        {
+            bucket.push(out.len());
+            out.push(it);
         }
     }
     out
+}
+
+/// Hash companion to [`row_eq_norm`]. Guarantees only the direction dedup
+/// needs: rows that `row_eq_norm` deems Equal hash identically; DISTINCT
+/// rows may collide (buckets are re-checked with the exact comparator).
+///
+/// Domain design mirrors `value_cmp`'s equivalence classes:
+/// - The numeric family (SmallInt/Int/BigInt/Float/Numeric/NumericBig)
+///   shares one domain: a value that is an integer fitting i64 hashes the
+///   i64 (so `Int(1)`, `BigInt(1)`, `Float(1.0)`, `Numeric(1.00)` agree);
+///   anything else hashes the f64 approximation computed by THE SAME
+///   formula the value_cmp float arms use (`numeric_to_f64`), so
+///   `Numeric(0.5) == Float(0.5)` agree bit-for-bit. NaN (any family)
+///   hashes a constant; ±Inf hash their f64 bits; -0.0 folds into 0.0.
+///   Known un-closable corner: an integer in [2^53, 2^63) can compare
+///   Equal to a float via value_cmp's lossy f64 arm while hashing in the
+///   exact-i64 domain — mixed int/float rows at that magnitude may miss a
+///   dedup (PG itself compares int8↔float8 in the lossy float8 domain).
+/// - Text and BpChar share a trailing-blank-trimmed byte domain (value_cmp
+///   compares them blank-insensitively; plain Text pairs that differ only
+///   in trailing blanks merely collide and are separated exactly).
+/// - Families value_cmp compares exactly (Bool/Date/Time/Timestamp/…)
+///   hash their fields under a distinct tag.
+/// - Everything value_cmp falls back to debug-format ordering for
+///   (Json, arrays, vectors, geometry, ranges, …) shares one constant
+///   bucket — degrades to the exact linear scan, never wrong.
+fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder) -> u64 {
+    use core::hash::{BuildHasher, Hasher};
+    let mut h = bh.build_hasher();
+    for v in &row.values {
+        norm_hash_value(v, &mut h);
+    }
+    h.finish()
+}
+
+fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
+    const TAG_NULL: u8 = 0;
+    const TAG_BOOL: u8 = 1;
+    const TAG_NUM_I64: u8 = 2;
+    const TAG_NUM_F64: u8 = 3;
+    const TAG_TEXT: u8 = 4;
+    const TAG_REAL: u8 = 5;
+    const TAG_DATE: u8 = 6;
+    const TAG_TIME: u8 = 7;
+    const TAG_TIMESTAMP: u8 = 8;
+    const TAG_TIMETZ: u8 = 10;
+    const TAG_UUID: u8 = 11;
+    const TAG_MONEY: u8 = 12;
+    const TAG_BYTES: u8 = 13;
+    const TAG_INTERVAL: u8 = 14;
+    const TAG_CHAR1: u8 = 15;
+    const TAG_OPAQUE: u8 = 255;
+    // One shared writer for the numeric family: an integer value
+    // representable as i64 goes exact (round-trip probe — no_std, so no
+    // f64::trunc); otherwise the f64 approximation. -0.0 round-trips
+    // through 0i64, folding it into 0.0 as value_cmp requires.
+    let num_f64 = |h: &mut H, x: f64| {
+        if x.is_nan() {
+            h.write_u8(TAG_NUM_F64);
+            h.write_u64(0x7ff8_dead_beef_0001); // one bucket for every NaN
+            return;
+        }
+        const TWO63: f64 = 9_223_372_036_854_775_808.0;
+        if x >= -TWO63 && x < TWO63 {
+            #[allow(clippy::cast_possible_truncation)]
+            let n = x as i64;
+            #[allow(clippy::cast_precision_loss)]
+            if (n as f64) == x {
+                h.write_u8(TAG_NUM_I64);
+                h.write_i64(n);
+                return;
+            }
+        }
+        h.write_u8(TAG_NUM_F64);
+        h.write_u64(x.to_bits());
+    };
+    match v {
+        Value::Null => h.write_u8(TAG_NULL),
+        Value::Bool(b) => {
+            h.write_u8(TAG_BOOL);
+            h.write_u8(u8::from(*b));
+        }
+        Value::SmallInt(n) => {
+            h.write_u8(TAG_NUM_I64);
+            h.write_i64(i64::from(*n));
+        }
+        Value::Int(n) => {
+            h.write_u8(TAG_NUM_I64);
+            h.write_i64(i64::from(*n));
+        }
+        Value::BigInt(n) => {
+            h.write_u8(TAG_NUM_I64);
+            h.write_i64(*n);
+        }
+        Value::Float(x) => num_f64(h, *x),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => match kind {
+            spg_storage::NumericKind::NaN => num_f64(h, f64::NAN),
+            spg_storage::NumericKind::PosInf => num_f64(h, f64::INFINITY),
+            spg_storage::NumericKind::NegInf => num_f64(h, f64::NEG_INFINITY),
+            spg_storage::NumericKind::Finite => {
+                // Reduce trailing fractional zeros so 1.50 and 1.5 share a
+                // representation, then: exact integers fitting i64 go to the
+                // i64 domain; everything else uses numeric_to_f64 — the SAME
+                // formula value_cmp's Numeric↔Float arm compares with.
+                let (mut s, mut sc) = (*scaled, *scale);
+                while sc > 0 && s % 10 == 0 {
+                    s /= 10;
+                    sc -= 1;
+                }
+                if sc == 0 {
+                    if let Ok(n) = i64::try_from(s) {
+                        h.write_u8(TAG_NUM_I64);
+                        h.write_i64(n);
+                    } else {
+                        num_f64(h, crate::orderby::numeric_to_f64(s, 0));
+                    }
+                } else {
+                    num_f64(h, crate::orderby::numeric_to_f64(s, sc));
+                }
+            }
+        },
+        // Beyond-i128 NUMERIC compares exactly via numeric_bignum_cmp; a
+        // value that also fits i128 reuses the Numeric path above so
+        // Big(5) and Numeric(5) agree. A genuinely huge one can't equal
+        // any i128-representable value — constant bucket is safe.
+        Value::NumericBig(b) => match b.to_i128() {
+            Some(s) => norm_hash_value(
+                &Value::Numeric {
+                    scaled: s,
+                    scale: b.scale(),
+                    kind: spg_storage::NumericKind::Finite,
+                },
+                h,
+            ),
+            None => h.write_u8(TAG_OPAQUE),
+        },
+        // value_cmp compares Text↔BpChar blank-insensitively (both sides
+        // trimmed), so both hash the trimmed bytes. Text pairs differing
+        // only in trailing blanks collide and are split exactly in-bucket.
+        Value::Text(s) | Value::BpChar(s) => {
+            h.write_u8(TAG_TEXT);
+            h.write(s.trim_end_matches(' ').as_bytes());
+        }
+        Value::Char1(c) => {
+            h.write_u8(TAG_CHAR1);
+            h.write_u8(*c);
+        }
+        Value::Date(d) => {
+            h.write_u8(TAG_DATE);
+            h.write_i32(*d);
+        }
+        Value::Time(t) => {
+            h.write_u8(TAG_TIME);
+            h.write_i64(*t);
+        }
+        Value::Timestamp(t) => {
+            h.write_u8(TAG_TIMESTAMP);
+            h.write_i64(*t);
+        }
+        Value::TimeTz { us, offset_secs } => {
+            h.write_u8(TAG_TIMETZ);
+            h.write_i64(*us);
+            h.write_i32(*offset_secs);
+        }
+        Value::Uuid(u) => {
+            h.write_u8(TAG_UUID);
+            h.write(u);
+        }
+        Value::Money(c) => {
+            h.write_u8(TAG_MONEY);
+            h.write_i64(*c);
+        }
+        Value::Bytes(b) => {
+            h.write_u8(TAG_BYTES);
+            h.write(b.as_ref());
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            h.write_u8(TAG_INTERVAL);
+            h.write_i32(*months);
+            h.write_i32(*days);
+            h.write_i64(*micros);
+        }
+        Value::Real(x) => {
+            // No cross-family value_cmp arm (falls back to debug format):
+            // Real≡Real ⇔ identical rendering. NaNs all render "NaN" —
+            // one bucket; -0.0 renders distinct from 0.0 — keep the bits.
+            h.write_u8(TAG_REAL);
+            h.write_u32(if x.is_nan() { 0x7fc0_0001 } else { x.to_bits() });
+        }
+        // Json (structural equality), vector families (float rendering),
+        // arrays / geometry / net / ranges / composites (debug-format
+        // fallback): one constant bucket — exact linear within.
+        _ => h.write_u8(TAG_OPAQUE),
+    }
 }
 
 /// v7.38 (read01) — row equality for DISTINCT / UNION / INTERSECT / EXCEPT that
