@@ -400,3 +400,52 @@ fn cold_delete_rollback_restores_the_row() {
     );
     assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
 }
+
+/// v7.37.16 — cold-tier DELETE inside a transaction: the three-way
+/// visibility characterization the flip checklist left open. The cold
+/// "shadow" (index-locator retirement) happens inside the tx's COW
+/// shadow catalog, so it must behave like any other in-tx write:
+/// self-visible, isolated from concurrent transactions, and published
+/// at COMMIT. (SPG's open-tx snapshot is SI-style — a concurrent tx
+/// keeps its BEGIN-time view even after the deleter commits; PG's
+/// default READ COMMITTED would see the committed delete on its next
+/// statement. That delta is Phase E isolation-levels work, pinned
+/// here as-is.)
+#[test]
+fn cold_delete_in_tx_is_self_visible_isolated_and_published() {
+    use spg_engine::IMPLICIT_TX;
+    let mut engine = boot_engine_with_users();
+    register_cold_users(&mut engine, &[(100, "ivy"), (200, "joe")]);
+    let tx1 = engine.alloc_tx_id();
+    let tx2 = engine.alloc_tx_id();
+    engine.execute_in("BEGIN", tx1).unwrap();
+    engine.execute_in("BEGIN", tx2).unwrap();
+    engine
+        .execute_in("DELETE FROM users WHERE id = 200", tx1)
+        .unwrap();
+    let probe = |e: &mut Engine, tx: spg_engine::TxId| -> usize {
+        match e.execute_in("SELECT name FROM users WHERE id = 200", tx) {
+            Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+            other => panic!("probe: {other:?}"),
+        }
+    };
+    assert_eq!(
+        probe(&mut engine, tx1),
+        0,
+        "deleter sees its own uncommitted cold delete"
+    );
+    assert_eq!(
+        probe(&mut engine, tx2),
+        1,
+        "concurrent tx must NOT see the uncommitted cold delete"
+    );
+    engine.execute_in("COMMIT", tx1).unwrap();
+    assert_eq!(
+        probe(&mut engine, IMPLICIT_TX),
+        0,
+        "committed cold delete is published to new statements"
+    );
+    engine.execute_in("ROLLBACK", tx2).unwrap();
+    // The other cold row is untouched throughout.
+    assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
+}
