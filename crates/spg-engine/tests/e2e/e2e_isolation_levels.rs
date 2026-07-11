@@ -460,3 +460,127 @@ fn rr_plain_update_commit_does_not_false_conflict() {
     };
     assert_eq!(rows[0].values[0], spg_storage::Value::Int(5));
 }
+
+// ── v7.37.17 Phase E4 round 4 — trigger / RETURNING / savepoint × rebase ──
+
+#[test]
+fn trigger_writes_to_second_table_survive_rebase() {
+    // The trigger's embedded INSERT dispatches through
+    // execute_stmt_with_cancel, so `log` lands in touched_tables and
+    // its write-set replays across the rebase like any direct write.
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE main (id INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE log (id INT NOT NULL)").unwrap();
+    e.execute(
+        "CREATE FUNCTION audit() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO log VALUES (NEW.id);
+  RETURN NEW;
+END;
+$$",
+    )
+    .unwrap();
+    e.execute("CREATE TRIGGER tg AFTER INSERT ON main FOR EACH ROW EXECUTE FUNCTION audit()")
+        .unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO main VALUES (1)", tx).unwrap();
+    e.execute_in("INSERT INTO main VALUES (2)", IMPLICIT_TX)
+        .unwrap();
+    // Rebase happens on this statement, then commit merges.
+    e.execute_in("SELECT count(*) FROM main", tx).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    for (table, ctx) in [("main", "main"), ("log", "trigger-written log")] {
+        let QueryResult::Rows { rows, .. } = e
+            .execute_in(&format!("SELECT id FROM {table} ORDER BY id"), IMPLICIT_TX)
+            .unwrap()
+        else {
+            panic!("rows")
+        };
+        let got: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![spg_storage::Value::Int(1), spg_storage::Value::Int(2)],
+            "{ctx} must hold both the tx row and the concurrent row"
+        );
+    }
+}
+
+#[test]
+fn update_returning_survives_rebase() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT NOT NULL, n INT NOT NULL)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n", tx)
+        .unwrap()
+    else {
+        panic!("RETURNING rows")
+    };
+    assert_eq!(rows[0].values[0], spg_storage::Value::Int(11));
+    e.execute_in("UPDATE t SET n = n + 100 WHERE id = 2", IMPLICIT_TX)
+        .unwrap();
+    e.execute_in("SELECT count(*) FROM t", tx).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT n FROM t ORDER BY id", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    let got: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
+    assert_eq!(
+        got,
+        vec![spg_storage::Value::Int(11), spg_storage::Value::Int(120)],
+        "both the RETURNING update and the concurrent update must land"
+    );
+}
+
+#[test]
+fn rr_savepoint_rollback_excludes_rows_from_merge() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT NOT NULL, n INT NOT NULL)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("UPDATE t SET n = 11 WHERE id = 1", tx).unwrap();
+    e.execute_in("SAVEPOINT s1", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 22 WHERE id = 2", tx).unwrap();
+    e.execute_in("ROLLBACK TO SAVEPOINT s1", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 33 WHERE id = 3", IMPLICIT_TX)
+        .unwrap();
+    e.execute_in("COMMIT", tx)
+        .expect("no overlap with the concurrent write — merge must pass");
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT n FROM t ORDER BY id", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    let got: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
+    assert_eq!(
+        got,
+        vec![
+            spg_storage::Value::Int(11),
+            spg_storage::Value::Int(20),
+            spg_storage::Value::Int(33)
+        ],
+        "kept update lands, savepoint-rolled-back update does not, concurrent write survives"
+    );
+}
