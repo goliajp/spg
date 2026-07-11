@@ -60,6 +60,18 @@ pub(crate) enum Step {
         negated: bool,
         case_insensitive: bool,
     },
+    /// v7.39 (perf — like_filter tied 1.04×) — unanchored substring
+    /// LIKE: `%[k×_]literal[m×_]%`. Instead of the generic matcher's
+    /// try-every-suffix backtracking (per-position `_`+literal walk),
+    /// scan with `str::find` (two-way, sublinear) over the literal and
+    /// verify the `k` leading / `m` trailing wildcard chars have room.
+    LikeSubstring {
+        needle: alloc::string::String,
+        k_before: usize,
+        m_after: usize,
+        negated: bool,
+        case_insensitive: bool,
+    },
     /// v7.36 (perf — mailrs Ask 1) — pure scalar function call
     /// (LENGTH, COALESCE, UPPER, etc.) on already-pushed args.
     /// Pops `n_args` values, calls `apply_function(name, args, ctx)`,
@@ -280,6 +292,18 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 } else {
                     pat.chars().collect()
                 };
+                // v7.39 — `%[k×_]lit[m×_]%` runs on the substring fast
+                // path (see Step::LikeSubstring).
+                if let Some((k, needle, m)) = like_substring_shape(&chars) {
+                    steps.push(Step::LikeSubstring {
+                        needle,
+                        k_before: k,
+                        m_after: m,
+                        negated: *negated,
+                        case_insensitive: *case_insensitive,
+                    });
+                    return;
+                }
                 steps.push(Step::Like {
                     pattern: chars,
                     negated: *negated,
@@ -378,6 +402,60 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
 }
 
 /// Literal text pattern behind a LIKE/ILIKE, if any.
+/// v7.39 — recognise `%[k×_]literal[m×_]%` (any number of leading /
+/// trailing `%`; literal free of `%` / `_` / `\`). Returns
+/// `(k, literal, m)` when the pattern fits the substring fast path.
+fn like_substring_shape(pat: &[char]) -> Option<(usize, alloc::string::String, usize)> {
+    let mut lo = 0;
+    while lo < pat.len() && pat[lo] == '%' {
+        lo += 1;
+    }
+    if lo == 0 {
+        return None; // not %-anchored at the front
+    }
+    let mut hi = pat.len();
+    while hi > lo && pat[hi - 1] == '%' {
+        hi -= 1;
+    }
+    if hi == pat.len() {
+        return None; // not %-anchored at the back
+    }
+    let inner = &pat[lo..hi];
+    let mut i = 0;
+    while i < inner.len() && inner[i] == '_' {
+        i += 1;
+    }
+    let mut j = inner.len();
+    while j > i && inner[j - 1] == '_' {
+        j -= 1;
+    }
+    let lit = &inner[i..j];
+    if lit.is_empty() || lit.iter().any(|&c| c == '%' || c == '_' || c == '\\') {
+        return None;
+    }
+    Some((i, lit.iter().collect(), inner.len() - j))
+}
+
+/// v7.39 — `%[k×_]needle[m×_]%` matcher: walk `str::find` hits of the
+/// literal and accept one with ≥k chars before it and ≥m chars after.
+fn like_substring_match(hay: &str, needle: &str, k: usize, m: usize) -> bool {
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find(needle) {
+        let off = start + rel;
+        let before_ok = k == 0 || hay[..off].chars().take(k).count() == k;
+        let after_ok = m == 0 || hay[off + needle.len()..].chars().take(m).count() == m;
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance one char past this hit's start and retry.
+        match hay[off..].chars().next() {
+            Some(c) => start = off + c.len_utf8(),
+            None => return false,
+        }
+    }
+    false
+}
+
 fn literal_text_pattern(pattern: &Expr) -> Option<&str> {
     match pattern {
         Expr::Literal(Literal::String(s)) => Some(s.as_str()),
@@ -822,6 +900,39 @@ where
                     }
                 }
             }
+            Step::LikeSubstring {
+                needle,
+                k_before,
+                m_after,
+                negated,
+                case_insensitive,
+            } => {
+                // v7.39 — `%[k×_]lit[m×_]%`: two-way substring search
+                // over the literal, then verify the wildcard chars fit.
+                let v = stack.pop().unwrap_or(Value::Null);
+                match v {
+                    Value::Null => stack.push(Value::Null),
+                    Value::Text(t) | Value::BpChar(t) => {
+                        let lowered;
+                        let hay: &str = if *case_insensitive {
+                            lowered = t.to_lowercase();
+                            &lowered
+                        } else {
+                            t.as_ref()
+                        };
+                        let m = like_substring_match(hay, needle, *k_before, *m_after);
+                        stack.push(Value::Bool(if *negated { !m } else { m }));
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "LIKE requires text operands, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            }
             Step::ColumnLength { pos } => {
                 // v7.36 — zero-copy LENGTH on a column. Read the
                 // cell by reference; compute char count without
@@ -1017,3 +1128,49 @@ pub static STEP_VM_COLUMN_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod like_substring_tests {
+    use super::{like_substring_match, like_substring_shape};
+
+    fn shape(p: &str) -> Option<(usize, alloc::string::String, usize)> {
+        let chars: alloc::vec::Vec<char> = p.chars().collect();
+        like_substring_shape(&chars)
+    }
+
+    #[test]
+    fn shape_recognition() {
+        assert_eq!(shape("%_05%"), Some((1, "05".into(), 0)));
+        assert_eq!(shape("%abc%"), Some((0, "abc".into(), 0)));
+        assert_eq!(shape("%ab_%"), Some((0, "ab".into(), 1)));
+        assert_eq!(shape("%%x%%"), Some((0, "x".into(), 0)));
+        assert_eq!(shape("%__a__%"), Some((2, "a".into(), 2)));
+        // Not eligible: missing anchors, inner %, escapes, empty literal.
+        assert_eq!(shape("ab%"), None);
+        assert_eq!(shape("%ab"), None);
+        assert_eq!(shape("%a%b%"), None);
+        assert_eq!(shape("%___%"), None);
+        assert_eq!(shape("%a\\%b%"), None);
+        assert_eq!(shape("%"), None);
+    }
+
+    #[test]
+    fn matcher_semantics() {
+        // %_05% — needs one char before "05".
+        assert!(like_substring_match("x05", "05", 1, 0));
+        assert!(!like_substring_match("05", "05", 1, 0));
+        assert!(like_substring_match("ab05cd", "05", 1, 0));
+        // Overlapping / repeated hits: first hit fails the k-check,
+        // a later one passes.
+        assert!(like_substring_match("05x05", "05", 1, 0));
+        // Trailing underscore needs one char after.
+        assert!(like_substring_match("abz", "ab", 0, 1));
+        assert!(!like_substring_match("ab", "ab", 0, 1));
+        // Plain substring.
+        assert!(like_substring_match("hello", "ell", 0, 0));
+        assert!(!like_substring_match("hello", "xyz", 0, 0));
+        // Multi-byte chars count as single wildcard chars.
+        assert!(like_substring_match("é05", "05", 1, 0));
+        assert!(!like_substring_match("é5", "05", 1, 0));
+    }
+}
