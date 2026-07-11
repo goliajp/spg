@@ -1153,15 +1153,25 @@ fn run(
         engine = engine.with_max_query_bytes(n);
     }
 
-    // v7.37.15 (Phase C.3) — host-side wiring for the in-place MVCC
-    // write-path gate (`SPG_MVCC_INPLACE=1|true|on`); the no_std engine
-    // can't read the environment itself. Off by default until the
-    // gate-flip checklist closes. Survives the provider-rebuild swap
-    // below (the flag rides the moved engine).
-    if std::env::var("SPG_MVCC_INPLACE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+    // v7.37.16 — the in-place MVCC write path defaults ON; the env is a
+    // two-way override (`SPG_MVCC_INPLACE=0|false|off` reverts to the
+    // legacy physical delete). Survives the provider-rebuild swap below
+    // (the flag rides the moved engine).
+    match std::env::var("SPG_MVCC_INPLACE").ok().as_deref() {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") => {
+            engine.set_mvcc_inplace(false);
+        }
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") => {
+            engine.set_mvcc_inplace(true);
+        }
+        _ => {}
+    }
+    // v7.37.16 — autovacuum defaults ON; `SPG_AUTOVACUUM=0|false|off`
+    // disables (operators running their own vacuum cadence).
+    if std::env::var("SPG_AUTOVACUUM")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
     {
-        engine.set_mvcc_inplace(true);
+        engine.set_autovacuum(false);
     }
 
     let audit_log = match &audit_path {

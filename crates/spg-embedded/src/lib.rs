@@ -361,22 +361,36 @@ fn engine_with_query_byte_budget(engine: Engine) -> Engine {
         Some(n) => engine.with_max_query_bytes(n),
         None => engine.with_max_query_bytes(DEFAULT_MAX_QUERY_BYTES),
     };
-    // v7.37.15 (Phase C.3) — host-side wiring for the in-place MVCC
-    // write-path gate; the no_std engine can't read the environment
-    // itself. Off unless explicitly enabled (`SPG_MVCC_INPLACE=1`).
-    if mvcc_inplace_env_on() {
-        engine.set_mvcc_inplace(true);
+    // v7.37.16 — the in-place MVCC write path defaults ON; the env is
+    // now a two-way override (the no_std engine can't read it itself):
+    // `SPG_MVCC_INPLACE=0|false|off` reverts to the legacy physical
+    // delete, `=1|true|on` forces on (redundant but harmless).
+    match mvcc_inplace_env() {
+        Some(on) => engine.set_mvcc_inplace(on),
+        None => {}
+    }
+    // v7.37.16 — autovacuum defaults ON; `SPG_AUTOVACUUM=0|false|off`
+    // disables (operators running their own vacuum cadence).
+    if std::env::var("SPG_AUTOVACUUM")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+    {
+        engine.set_autovacuum(false);
     }
     engine
 }
 
-/// `SPG_MVCC_INPLACE=1|true|on` — opt into the v7.37.15 in-place MVCC
-/// write path (tombstone DELETE / tombstone+append UPDATE). Default off
-/// until the gate-flip checklist closes.
-fn mvcc_inplace_env_on() -> bool {
-    std::env::var("SPG_MVCC_INPLACE").is_ok_and(|v| {
-        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-    })
+/// `SPG_MVCC_INPLACE` — two-way override for the in-place MVCC write
+/// path (default ON since v7.37.16). `0|false|off` → legacy physical
+/// delete; `1|true|on` → force on; unset/other → engine default.
+fn mvcc_inplace_env() -> Option<bool> {
+    let v = std::env::var("SPG_MVCC_INPLACE").ok()?;
+    if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+        Some(false)
+    } else if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// v7.1 — encode one v3 `auto_commit_sql` record. Layout:
