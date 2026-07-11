@@ -5422,6 +5422,23 @@ fn unify_union_columns(columns: &mut [ColumnSchema], rows: &mut [Row<'static>]) 
                 }
             }
         }
+        // v7.37.16 — a single concrete runtime type under a TEXT-typed
+        // column means the column type came off a NULL (or unknown-text)
+        // branch: NULL literals describe as TEXT (`L::Null → Text`), so
+        // `VALUES (NULL),(1.5)` left the column "text" while every
+        // non-NULL cell is numeric. Adopt the concrete type — schema
+        // only, no cell changes. tstz-safe by construction: a real
+        // timestamptz column's schema type is Timestamptz, not Text, so
+        // the coarser runtime type (Value::Timestamp) can't downgrade it
+        // through this arm; and a real text column's non-NULL cells are
+        // Text, which keeps seen == [Text] and skips it.
+        if seen.len() == 1
+            && matches!(columns[col_idx].ty, DataType::Text)
+            && !matches!(seen[0], DataType::Text)
+        {
+            columns[col_idx].ty = seen[0];
+            continue;
+        }
         let Some(target) = resolve_union_common_type(&seen) else {
             continue;
         };

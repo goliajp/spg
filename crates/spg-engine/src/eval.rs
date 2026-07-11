@@ -791,6 +791,24 @@ pub fn eval_expr(
                     "timestamp with time zone".into(),
                 ));
             }
+            // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
+            // static type when it has one (PG: `VALUES (NULL),(1.5)`
+            // types the column numeric and its NULL row's pg_typeof says
+            // numeric, not unknown). TEXT is excluded because a NULL
+            // literal *describes* as TEXT (the unknown stand-in), so a
+            // bare `pg_typeof(NULL)` keeps reporting "unknown". Known
+            // residual: a genuine text column's NULL cell therefore also
+            // reports unknown (needs a real Unknown type to fix).
+            if args.len() == 1 && name.eq_ignore_ascii_case("pg_typeof") {
+                let v = eval_expr(&args[0], row, ctx)?;
+                if matches!(v, Value::Null)
+                    && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
+                    && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
+                {
+                    return Ok(Value::text(n));
+                }
+                return apply_function(name, &[v], ctx);
+            }
             // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
             // common type of its branches, so a typed sibling (`NULL::time`,
             // `col::time`) makes the whole expression that type and an untyped
@@ -1493,6 +1511,31 @@ fn value_to_text_for_array(v: &Value) -> String {
 fn like_match(text: &str, pattern: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     like_match_str(text, &pat, 0)
+}
+
+/// v7.37.16 — pg_typeof spelling for a STATIC column type (the
+/// NULL-cell fallback; the value-level table is `pg_typeof_name`).
+/// TEXT maps to None because a NULL literal describes as TEXT — the
+/// unknown stand-in — and pg_typeof(NULL) must stay "unknown"; every
+/// type not listed also returns None (caller keeps the value answer).
+fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'static str> {
+    use spg_storage::DataType as D;
+    Some(match t {
+        D::SmallInt => "smallint",
+        D::Int => "integer",
+        D::BigInt => "bigint",
+        D::Float => "double precision",
+        D::Real => "real",
+        D::Numeric { .. } => "numeric",
+        D::Bool => "boolean",
+        D::Date => "date",
+        D::Time => "time without time zone",
+        D::Timestamp => "timestamp without time zone",
+        D::Timestamptz => "timestamp with time zone",
+        D::Uuid => "uuid",
+        D::Interval => "interval",
+        _ => return None,
+    })
 }
 
 /// v7.37.16 — zero-allocation LIKE core: the text side walks a `&str`
