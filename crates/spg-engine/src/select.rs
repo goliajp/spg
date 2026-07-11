@@ -4765,7 +4765,6 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
     const TAG_NUM_I64: u8 = 2;
     const TAG_NUM_F64: u8 = 3;
     const TAG_TEXT: u8 = 4;
-    const TAG_REAL: u8 = 5;
     const TAG_DATE: u8 = 6;
     const TAG_TIME: u8 = 7;
     const TAG_TIMESTAMP: u8 = 8;
@@ -4914,13 +4913,11 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
             h.write_i32(*days);
             h.write_i64(*micros);
         }
-        Value::Real(x) => {
-            // No cross-family value_cmp arm (falls back to debug format):
-            // Real≡Real ⇔ identical rendering. NaNs all render "NaN" —
-            // one bucket; -0.0 renders distinct from 0.0 — keep the bits.
-            h.write_u8(TAG_REAL);
-            h.write_u32(if x.is_nan() { 0x7fc0_0001 } else { x.to_bits() });
-        }
+        // v7.37.16 — REAL joined the numeric value_cmp family (widened
+        // to f64, same formulas as the arms), so it hashes in the shared
+        // numeric domain: Real(1.5) must agree with Float(1.5)/Int/…
+        // f32→f64 is exact, so equal-under-cmp implies equal bits here.
+        Value::Real(x) => num_f64(h, f64::from(*x)),
         // Json (structural equality), vector families (float rendering),
         // arrays / geometry / net / ranges / composites (debug-format
         // fallback): one constant bucket — exact linear within.
@@ -5101,6 +5098,9 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             (*scaled as f64) / divisor
         }
         Value::Float(x) => *x,
+        // v7.37.16 — REAL sorts by its exact f64 widening (it had no
+        // arm and fell through to the unsupported error).
+        Value::Real(x) => f64::from(*x),
         Value::Bool(b) => {
             if *b {
                 1.0

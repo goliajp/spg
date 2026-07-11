@@ -124,6 +124,19 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
                 } else {
                     NK::Finite
                 }),
+                // v7.37.16 — REAL (f32) joins the same rank: it had NO
+                // value_cmp arm at all and fell to the debug-string
+                // fallback, which ordered "Infinity" above "NaN" (wrong
+                // vs PG) and only equated bit-identical payloads.
+                Value::Real(x) => Some(if x.is_nan() {
+                    NK::NaN
+                } else if *x == f32::INFINITY {
+                    NK::PosInf
+                } else if *x == f32::NEG_INFINITY {
+                    NK::NegInf
+                } else {
+                    NK::Finite
+                }),
                 _ => None,
             }
         };
@@ -172,6 +185,57 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         },
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // v7.37.16 — REAL finite arms (specials were ranked above).
+        // Cross-family compares widen to f64, PG's float4↔float8/int
+        // promotion (`1.5::float4 = 1.5::float8` and `2 = 2.0::float4`
+        // are both true).
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Real(x), Value::Float(y)) => {
+            f64::from(*x).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Real(y)) => {
+            x.partial_cmp(&f64::from(*y)).unwrap_or(Ordering::Equal)
+        }
+        (Value::SmallInt(n), Value::Real(x)) => f64::from(*n)
+            .partial_cmp(&f64::from(*x))
+            .unwrap_or(Ordering::Equal),
+        (Value::Real(x), Value::SmallInt(n)) => f64::from(*x)
+            .partial_cmp(&f64::from(*n))
+            .unwrap_or(Ordering::Equal),
+        (Value::Int(n), Value::Real(x)) => f64::from(*n)
+            .partial_cmp(&f64::from(*x))
+            .unwrap_or(Ordering::Equal),
+        (Value::Real(x), Value::Int(n)) => f64::from(*x)
+            .partial_cmp(&f64::from(*n))
+            .unwrap_or(Ordering::Equal),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::BigInt(n), Value::Real(x)) => (*n as f64)
+            .partial_cmp(&f64::from(*x))
+            .unwrap_or(Ordering::Equal),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Real(x), Value::BigInt(n)) => f64::from(*x)
+            .partial_cmp(&(*n as f64))
+            .unwrap_or(Ordering::Equal),
+        (
+            Value::Numeric {
+                scaled: xs,
+                scale: xsc,
+                ..
+            },
+            Value::Real(y),
+        ) => numeric_to_f64(*xs, *xsc)
+            .partial_cmp(&f64::from(*y))
+            .unwrap_or(Ordering::Equal),
+        (
+            Value::Real(x),
+            Value::Numeric {
+                scaled: ys,
+                scale: ysc,
+                ..
+            },
+        ) => f64::from(*x)
+            .partial_cmp(&numeric_to_f64(*ys, *ysc))
+            .unwrap_or(Ordering::Equal),
         // Mixed integer / float — widen the integer to f64.
         (Value::SmallInt(n), Value::Float(x)) => {
             f64::from(*n).partial_cmp(x).unwrap_or(Ordering::Equal)

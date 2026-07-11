@@ -18,6 +18,9 @@ fn main() {
         "SELECT DISTINCT x FROM (VALUES ('NaN'::float8),(1.0),('NaN')) t(x)",
         "SELECT count(DISTINCT x) FROM (VALUES ('-0'::float8),(0.0)) t(x)",
         "SELECT x FROM (VALUES ('-0'::float8),(0.0)) t(x)",
+        "SELECT x FROM (VALUES ('NaN'::float4),(1.5::float4),('Infinity'::float4),('-Infinity'::float4),('-0'::float4),(0.0::float4)) t(x) ORDER BY x",
+        "SELECT count(DISTINCT x) FROM (VALUES ('NaN'::float4),('NaN'::float4),('-0'::float4),(0.0::float4)) t(x)",
+        "SELECT 1.5::float4 = 1.5::float8, 2 = 2.0::float4",
     ] {
         match eng.execute(sql) {
             Ok(spg_engine::QueryResult::Rows { rows, .. }) => {

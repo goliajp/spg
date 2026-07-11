@@ -100,3 +100,40 @@ fn values_mixed_family_column_unifies_like_pg() {
     };
     assert_eq!(rows[0].values[0], spg_storage::Value::BigInt(3));
 }
+
+/// v7.37.16 — REAL (f32) joins the numeric comparison family. It
+/// previously had NO value_cmp arm (debug-string fallback: "Infinity"
+/// sorted above "NaN") and no ORDER-BY key arm at all. PG18 anchors:
+/// ORDER BY float4 gives -Inf < -0 = 0 < 1.5 < Inf < NaN;
+/// count(DISTINCT {NaN,NaN,-0,0}) = 2; float4 = float8 / int compares
+/// in the widened f64 domain.
+#[test]
+fn real_orders_and_dedups_like_pg() {
+    let mut e = Engine::new();
+    let got = rows(
+        &mut e,
+        "SELECT x::text FROM (VALUES ('NaN'::float4),(1.5::float4),('Infinity'::float4),\
+         ('-Infinity'::float4),('-0'::float4),(0.0::float4)) t(x) ORDER BY x",
+    );
+    let texts: Vec<&str> = got
+        .iter()
+        .map(|r| match &r[0] {
+            spg_storage::Value::Text(s) => s.as_ref(),
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        ["-Infinity", "-0", "0", "1.5", "Infinity", "NaN"],
+        "PG float4 total order"
+    );
+    let got = rows(
+        &mut e,
+        "SELECT count(DISTINCT x) FROM (VALUES ('NaN'::float4),('NaN'::float4),\
+         ('-0'::float4),(0.0::float4)) t(x)",
+    );
+    assert_eq!(got[0][0], spg_storage::Value::BigInt(2));
+    let got = rows(&mut e, "SELECT 1.5::float4 = 1.5::float8, 2 = 2.0::float4");
+    assert_eq!(got[0][0], spg_storage::Value::Bool(true));
+    assert_eq!(got[0][1], spg_storage::Value::Bool(true));
+}
