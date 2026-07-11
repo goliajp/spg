@@ -3463,6 +3463,26 @@ pub fn format_uuid(b: &[u8; 16]) -> String {
 /// is a named CHECK-constrained alias over a built-in type;
 /// columns bound to it inherit the base type plus the CHECK
 /// predicates + NOT NULL + DEFAULT at INSERT/UPDATE time.
+/// v7.37.17 (Phase E RC rebase) — the write-set one writer version left
+/// on a table, addressed by stable [`row_header::RowId`]s so it can be
+/// replayed onto a fresher clone of the relation whose physical slots
+/// differ. Produced by [`Table::extract_tx_writeset`], consumed by
+/// [`Table::replay_tx_writeset`].
+#[derive(Debug, Clone, Default)]
+pub struct TxWriteSet {
+    /// INSERTs and UPDATE-new-versions (`header.xmin == v`).
+    pub inserted: Vec<(row_header::RowId, Row<'static>)>,
+    /// DELETE / UPDATE-old-version targets (`header.xmax == v`).
+    pub tombstoned: Vec<row_header::RowId>,
+}
+
+impl TxWriteSet {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inserted.is_empty() && self.tombstoned.is_empty()
+    }
+}
+
 /// `default` / `checks` are stored as Display-form source so
 /// `spg-storage` stays free of `spg-sql` dependency — same
 /// pattern as FunctionDef / ViewDef.

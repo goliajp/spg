@@ -4962,3 +4962,112 @@ fn v54_snapshot_crc_detects_corruption() {
         "expected a corruption error, got {err:?}"
     );
 }
+
+// ── v7.37.17 Phase E — tx write-set extract/replay (RC rebase primitive) ──
+
+mod tx_writeset {
+    use crate::row_header::{RowId, XMAX_ALIVE};
+    use crate::{ColumnSchema, DataType, Row, Table, TableSchema, Value};
+
+    fn table() -> Table {
+        Table::new(TableSchema::new(
+            alloc::string::String::from("t"),
+            alloc::vec![ColumnSchema::new(
+                alloc::string::String::from("x"),
+                DataType::Int,
+                false
+            )],
+        ))
+    }
+
+    fn row(x: i32) -> Row<'static> {
+        Row::new(alloc::vec![Value::Int(x)])
+    }
+
+    #[test]
+    fn extract_and_replay_round_trip_onto_fresher_clone() {
+        // "Old" clone: base rows 1,2 then tx v=77 inserts 3 and deletes 1.
+        let mut old = table();
+        old.insert(row(1)).unwrap();
+        old.insert(row(2)).unwrap();
+        old.insert_with_xmin(row(3), 77).unwrap();
+        let rid1 = old.rowids().get(0).copied().unwrap();
+        old.mark_rows_deleted(&[0], 77);
+        let ws = old.extract_tx_writeset(77);
+        assert_eq!(ws.inserted.len(), 1);
+        assert_eq!(ws.tombstoned, alloc::vec![rid1]);
+        let inserted_rid = ws.inserted[0].0;
+
+        // "Fresh" base: same rows 1,2 (same RowIds by construction —
+        // both tables allocate 1,2) plus a concurrently-committed 9.
+        let mut fresh = table();
+        fresh.insert(row(1)).unwrap();
+        fresh.insert(row(2)).unwrap();
+        fresh.insert(row(9)).unwrap();
+        let conflicts = fresh.replay_tx_writeset(&ws, 77);
+        assert!(conflicts.is_empty(), "clean replay: {conflicts:?}");
+        // Row 3 exists with xmin=77 and its ORIGINAL RowId; row 1 is
+        // tombstoned with xmax=77; rows 2 and 9 untouched.
+        let pos3 = (0..fresh.rows().len())
+            .find(|&i| fresh.rows().get(i).unwrap().values[0] == Value::Int(3))
+            .expect("replayed insert present");
+        assert_eq!(fresh.headers().get(pos3).unwrap().xmin, 77);
+        assert_eq!(fresh.rowids().get(pos3).copied(), Some(inserted_rid));
+        assert_eq!(fresh.headers().get(0).unwrap().xmax, 77);
+        assert_eq!(fresh.headers().get(1).unwrap().xmax, XMAX_ALIVE);
+        assert_eq!(fresh.dead_rows(), 1);
+    }
+
+    #[test]
+    fn replay_tombstone_survives_slot_shift() {
+        let mut old = table();
+        old.insert(row(1)).unwrap();
+        old.insert(row(2)).unwrap();
+        old.insert(row(3)).unwrap();
+        let rid3 = old.rowids().get(2).copied().unwrap();
+        old.mark_rows_deleted(&[2], 55);
+        let ws = old.extract_tx_writeset(55);
+
+        // Fresh clone where row 1 was physically removed — row 3's
+        // slot shifted from 2 to 1; the RowId still resolves it.
+        let mut fresh = table();
+        fresh.insert(row(1)).unwrap();
+        fresh.insert(row(2)).unwrap();
+        fresh.insert(row(3)).unwrap();
+        assert_eq!(fresh.rowids().get(2).copied(), Some(rid3));
+        fresh.delete_rows_no_index(&[0]);
+        let conflicts = fresh.replay_tx_writeset(&ws, 55);
+        assert!(conflicts.is_empty());
+        let pos3 = (0..fresh.rowids().len())
+            .find(|&i| fresh.rowids().get(i) == Some(&rid3))
+            .expect("row 3 present");
+        assert_eq!(fresh.headers().get(pos3).unwrap().xmax, 55);
+    }
+
+    #[test]
+    fn replay_reports_conflicts_and_is_idempotent() {
+        let mut old = table();
+        old.insert(row(1)).unwrap();
+        old.insert(row(2)).unwrap();
+        let rid1 = old.rowids().get(0).copied().unwrap();
+        let rid2 = old.rowids().get(1).copied().unwrap();
+        old.mark_rows_deleted(&[0, 1], 88);
+        let ws = old.extract_tx_writeset(88);
+
+        // Fresh: row 1 tombstoned by ANOTHER version, row 2 gone.
+        let mut fresh = table();
+        fresh.insert(row(1)).unwrap();
+        fresh.mark_rows_deleted(&[0], 99);
+        let conflicts = fresh.replay_tx_writeset(&ws, 88);
+        assert_eq!(conflicts, alloc::vec![rid1, rid2], "both targets conflict");
+        // Re-replaying our OWN prior tombstone is silent (idempotent).
+        let mut fresh2 = table();
+        fresh2.insert(row(1)).unwrap();
+        fresh2.mark_rows_deleted(&[0], 88);
+        let ws1 = crate::TxWriteSet {
+            inserted: alloc::vec::Vec::new(),
+            tombstoned: alloc::vec![RowId(1)],
+        };
+        assert!(fresh2.replay_tx_writeset(&ws1, 88).is_empty());
+    }
+}

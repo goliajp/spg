@@ -321,6 +321,94 @@ impl Table {
         newly
     }
 
+    /// v7.37.17 (Phase E RC rebase) — extract the write-set one writer
+    /// version left on this table, expressed against stable [`RowId`]s
+    /// so it can be replayed onto a FRESHER catalog clone whose
+    /// physical slots differ. `inserted` carries INSERT rows and the
+    /// new versions of UPDATEs (`xmin == v`); `tombstoned` carries the
+    /// ids DELETE / UPDATE-old-version stamped (`xmax == v`). A row
+    /// both inserted and tombstoned by the same version appears in
+    /// both lists; replay applies inserts first, tombstones second —
+    /// net effect identical.
+    #[must_use]
+    pub fn extract_tx_writeset(&self, v: u64) -> crate::TxWriteSet {
+        let mut inserted: alloc::vec::Vec<(crate::row_header::RowId, Row<'static>)> =
+            alloc::vec::Vec::new();
+        let mut tombstoned: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
+        for (i, h) in self.headers.iter().enumerate() {
+            let rid = self
+                .rowids
+                .get(i)
+                .copied()
+                .unwrap_or(crate::row_header::RowId::UNASSIGNED);
+            if h.xmin == v
+                && let Some(row) = self.rows.get(i)
+            {
+                inserted.push((rid, row.clone()));
+            }
+            if h.xmax == v {
+                tombstoned.push(rid);
+            }
+        }
+        crate::TxWriteSet {
+            inserted,
+            tombstoned,
+        }
+    }
+
+    /// v7.37.17 (Phase E RC rebase) — replay a write-set extracted from
+    /// an OLDER clone of this relation onto this (fresher) one, keeping
+    /// the original RowIds. Deliberately does NOT capture redo: a
+    /// replay re-expresses writes the transaction already made, it is
+    /// not a new mutation (the redo story rides the eventual COMMIT).
+    /// Returns the ids whose tombstone could not be applied because the
+    /// row is gone or already tombstoned by a DIFFERENT version — the
+    /// write-write conflict surface (RC skips them per PG semantics;
+    /// RR/SER turn them into serialization_failure — Phase E3).
+    pub fn replay_tx_writeset(
+        &mut self,
+        ws: &crate::TxWriteSet,
+        v: u64,
+    ) -> alloc::vec::Vec<crate::row_header::RowId> {
+        for (rid, row) in &ws.inserted {
+            // Full insert (validation + index maintenance + fresh
+            // header/rowid), then re-stamp the header's xmin and put
+            // the ORIGINAL RowId back. The allocator id the insert
+            // burned is simply never used — ids are never recycled, so
+            // a gap is harmless. Insert can only fail on schema
+            // mismatch, impossible for a row this same relation
+            // already accepted; a debug_assert documents that.
+            let res = self.insert(row.clone());
+            debug_assert!(res.is_ok(), "writeset replay re-inserts a validated row");
+            if res.is_err() {
+                continue;
+            }
+            let last = self.rows.len() - 1;
+            if let Some(h) = self.headers.get_mut(last) {
+                h.xmin = v;
+            }
+            if let Some(slot) = self.rowids.get_mut(last) {
+                *slot = *rid;
+            }
+        }
+        let mut conflicts: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
+        for rid in &ws.tombstoned {
+            let pos = (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid));
+            match pos {
+                Some(i) => match self.headers.get_mut(i) {
+                    Some(h) if h.xmax == crate::row_header::XMAX_ALIVE => {
+                        h.xmax = v;
+                        self.dead_rows += 1;
+                    }
+                    Some(h) if h.xmax == v => {} // already ours (idempotent)
+                    _ => conflicts.push(*rid),
+                },
+                None => conflicts.push(*rid),
+            }
+        }
+        conflicts
+    }
+
     /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
     /// this table (engine call before a mutating statement when
     /// persistence is on). Idempotent; existing captured changes are kept.
