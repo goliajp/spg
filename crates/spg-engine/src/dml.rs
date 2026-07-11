@@ -1180,6 +1180,13 @@ impl Engine {
             }
         }
 
+        // v7.37.17 (Phase E2) — a cold-tier shadow is a PHYSICAL index
+        // edit inside the tx's shadow catalog, not a versioned row
+        // write; the RC rebase cannot re-express it. Poison the rebase
+        // so this tx keeps its frozen view (never loses the shadow).
+        if cold_shadow_count > 0 && self.in_transaction() {
+            self.poison_tx_rebase();
+        }
         // v7.12.1 — cache the session FTS config as an owned
         // String before the mutable table borrow below; the
         // ctx-builder then references it via `as_deref` so the
