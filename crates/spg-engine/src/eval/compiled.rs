@@ -518,20 +518,43 @@ pub(crate) fn eval_compiled(
     c: &CompiledExpr,
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
-    _stack: &mut Vec<Value<'static>>,
+    stack: &mut Vec<Value<'static>>,
 ) -> Result<Value<'static>, EvalError> {
-    // v7.37.9 T3 S2 — the public eval_compiled keeps its
-    // `Vec<Value<'static>>` API for callers (post-group projection
-    // path at aggregate.rs:702), but internally drops the borrowed
-    // stack into a local one because the borrow lifetime of the
-    // caller's stack can't bridge the row-borrow `'row` constraint
-    // that eval_compiled_ref needs after S2. This callsite fires
-    // ~50 × per query (LIMIT 50 surviving groups), so the per-call
-    // Vec alloc is negligible compared to the per-row hot path.
+    // v7.37.16 — reuse the caller's stack allocation across rows.
+    // v7.37.9 T3 S2 had severed this: `eval_compiled_ref` pushes
+    // `Value<'val>` where `'val` is the per-call RowRef borrow, and
+    // `Vec<Value<'val>>` is invariant in `'val`, so the caller's
+    // `Vec<Value<'static>>` could not be lent in-place and every call
+    // allocated a fresh local Vec. That was sized for the ~50×/query
+    // post-group projection path, but the aggregate/scan WHERE filter
+    // loops (select.rs) call this once PER ROW — 50 k allocs/query on
+    // a 50 k-row filter (the heavy.rs filter_agg 1.5×-vs-PG18 loss).
+    // Instead: MOVE the caller's Vec in (covariant shrink 'static →
+    // 'val, safe), run, then hand the emptied allocation back via
+    // `recycle_stack`. Zero per-row alloc; the borrowed-push (S2/S3)
+    // zero-clone Text path is untouched.
     let rowref = crate::join::RowRef::Owned(row);
-    let mut local_stack: Vec<Value<'_>> = Vec::with_capacity(16);
-    let result = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)?;
-    Ok(result.into_owned())
+    let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
+    let result = eval_compiled_ref(c, &rowref, ctx, &mut local_stack);
+    let owned = result.map(Value::into_owned);
+    *stack = recycle_stack(local_stack);
+    owned
+}
+
+/// Return an emptied stack's allocation with its value lifetime reset.
+/// This is the standard "recycle" pattern (cf. the `recycle_vec` crate):
+/// an EMPTY `Vec<Value<'a>>` holds no values, only a raw allocation, so
+/// re-labelling its element lifetime cannot dangle.
+#[allow(unsafe_code)] // empty-Vec lifetime relabel; isolated (see SAFETY).
+fn recycle_stack(mut v: Vec<Value<'_>>) -> Vec<Value<'static>> {
+    v.clear();
+    debug_assert!(v.is_empty());
+    // SAFETY: `v` is empty (cleared above) — there are no `Value<'_>`s
+    // whose lifetime could be unsoundly extended; `Vec<Value<'a>>` and
+    // `Vec<Value<'static>>` are the same type constructor differing only
+    // in a lifetime parameter, so they have identical size/align/layout
+    // (lifetimes are erased before layout is computed).
+    unsafe { core::mem::transmute::<Vec<Value<'_>>, Vec<Value<'static>>>(v) }
 }
 
 /// v7.32 (P4 borrow channel, increment 2) — the RowRef-borrowing form of
