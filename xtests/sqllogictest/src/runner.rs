@@ -206,7 +206,7 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::BpChar(s) => s.to_string(),
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format_real(f64::from(*x))).collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         // v6.0.1: SQ8 cells render dequantised, matching the
         // pgvector wire shape that the corpora assert.
@@ -215,7 +215,7 @@ fn render_cell(v: &Value, ty: char) -> String {
                 .iter()
                 .map(|x| format_real(f64::from(*x)))
                 .collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         // v6.0.3: HalfVector cells also render dequantised on the
         // sqllogictest grid.
@@ -225,7 +225,7 @@ fn render_cell(v: &Value, ty: char) -> String {
                 .iter()
                 .map(|x| format_real(f64::from(*x)))
                 .collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         Value::Numeric { scaled, scale, .. } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
@@ -277,7 +277,12 @@ fn render_cell(v: &Value, ty: char) -> String {
 
 /// SQLite sqllogictest renders real numbers to three decimal places.
 fn format_real(x: f64) -> String {
-    format!("{x:.3}")
+    // v7.39 (corpus reconcile) — render float8 exactly as PG's float8out
+    // (and SPG's pgwire) does. The old SQLite-style fixed "{x:.3}" made
+    // the grid disagree with every psql-derived expected value, which
+    // seeded fixtures with three-decimal artefacts ("20.000") that then
+    // masked real engine wins as failures.
+    spg_engine::eval::format_float(x)
 }
 
 #[cfg(test)]

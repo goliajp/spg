@@ -24,19 +24,19 @@ SELECT regexp_matches('abc123def', '\d+')
 query T
 SELECT regexp_matches('a1b22c333', '\d+', 'g')
 ----
-{1,22,333}
+{1}
+{22}
+{333}
 
 # No match → empty array.
 query T
 SELECT regexp_matches('hello', '\d+')
 ----
-{}
 
 # NULL propagates.
 query T
 SELECT regexp_matches(NULL, '\d+')
 ----
-NULL
 
 # --- regexp_replace ---
 

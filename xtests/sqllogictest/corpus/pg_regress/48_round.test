@@ -7,44 +7,44 @@
 query R
 SELECT round(0.5)
 ----
-1.000
+1
 
 query R
 SELECT round(1.5)
 ----
-2.000
+2
 
 query R
 SELECT round(2.5)
 ----
-3.000
+3
 
 query R
 SELECT round(-0.5)
 ----
--1.000
+-1
 
 query R
 SELECT round(-1.5)
 ----
--2.000
+-2
 
 # Quarter steps.
 query R
 SELECT round(0.4)
 ----
-0.000
+0
 
 query R
 SELECT round(0.6)
 ----
-1.000
+1
 
 # Two-arg form.
 query R
 SELECT round(1.2345, 2)
 ----
-1.230
+1.23
 
 query R
 SELECT round(1.23456, 3)
@@ -54,18 +54,18 @@ SELECT round(1.23456, 3)
 query R
 SELECT round(2.55, 1)
 ----
-2.600
+2.6
 
 # Negative scale (round to tens/hundreds).
 query R
 SELECT round(15, -1)
 ----
-20.000
+20
 
 query R
 SELECT round(150, -2)
 ----
-200.000
+200
 
 # Integer passthrough.
 query I

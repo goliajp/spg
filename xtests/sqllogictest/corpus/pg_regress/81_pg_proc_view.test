@@ -19,11 +19,25 @@ SELECT prokind FROM pg_catalog.pg_proc WHERE proname = 'count' AND pronargs = 0
 a
 
 # JOIN with pg_type to resolve length's return type.
-query TT
+query TT rowsort
 SELECT p.proname, t.typname
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_type t ON p.prorettype = t.oid
 WHERE p.proname = 'length'
 ----
+length
+float8
+length
+float8
+length
+int4
+length
+int4
+length
+int4
+length
+int4
+length
+int4
 length
 int4

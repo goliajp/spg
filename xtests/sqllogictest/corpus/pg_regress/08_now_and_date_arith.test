@@ -46,11 +46,11 @@ SELECT '2025-01-01'::DATE - '2024-01-01'::DATE
 ----
 366
 
-# TIMESTAMP - TIMESTAMP returns BIGINT microseconds.
-query I nosort
+# TIMESTAMP - TIMESTAMP returns an INTERVAL (PG semantics).
+query T nosort
 SELECT '2024-01-01 00:00:01'::TIMESTAMP - '2024-01-01 00:00:00'::TIMESTAMP
 ----
-1000000
+00:00:01
 
 # Commutative integer + DATE.
 query T nosort

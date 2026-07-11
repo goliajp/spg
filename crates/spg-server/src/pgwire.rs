@@ -3926,7 +3926,7 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
         } => spg_engine::eval::format_interval(*months, *days, *micros),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
-            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+            escape_copy_cell(&format!("[{}]", parts.join(",")))
         }
         // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column —
         // dequantise to f32 so the COPY text stream stays
@@ -3936,7 +3936,7 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();
-            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+            escape_copy_cell(&format!("[{}]", parts.join(",")))
         }
         // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact
         // dequantise to f32.
@@ -3946,7 +3946,7 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();
-            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+            escape_copy_cell(&format!("[{}]", parts.join(",")))
         }
         // v7.5.0 — Value is #[non_exhaustive].
         _ => escape_copy_cell(&format!("{v:?}")),
@@ -5066,7 +5066,8 @@ fn value_to_pg_text<'a>(
             let mut first = true;
             for x in vec.iter() {
                 if !first {
-                    buf.push_str(", ");
+                    // pgvector's vector_out emits no spaces: [1,2,3].
+                    buf.push_str(",");
                 }
                 first = false;
                 use core::fmt::Write;
@@ -5085,7 +5086,7 @@ fn value_to_pg_text<'a>(
             let mut first = true;
             for x in dequant.iter() {
                 if !first {
-                    buf.push_str(", ");
+                    buf.push_str(",");
                 }
                 first = false;
                 use core::fmt::Write;
@@ -5102,7 +5103,7 @@ fn value_to_pg_text<'a>(
             let mut first = true;
             for x in halfs.iter() {
                 if !first {
-                    buf.push_str(", ");
+                    buf.push_str(",");
                 }
                 first = false;
                 use core::fmt::Write;

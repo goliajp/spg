@@ -247,7 +247,7 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         }
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         // v6.0.1: render SQ8 cells dequantised, so SELECT output
         // matches the pgvector wire shape clients expect. The
@@ -258,13 +258,13 @@ pub(crate) fn value_to_text(v: &Value) -> String {
                 .iter()
                 .map(|x| format!("{x}"))
                 .collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         // v6.0.3: HalfVector cells dequantise bit-exactly to f32
         // for SELECT output.
         Value::HalfVector(h) => {
             let cells: Vec<String> = h.to_f32_vec().iter().map(|x| format!("{x}")).collect();
-            format!("[{}]", cells.join(", "))
+            format!("[{}]", cells.join(","))
         }
         Value::Numeric {
             scaled,

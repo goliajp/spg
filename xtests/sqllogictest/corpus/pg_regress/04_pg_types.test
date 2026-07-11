@@ -79,7 +79,7 @@ INSERT INTO fixed VALUES ('ab')
 query I rowsort
 SELECT length(code) FROM fixed
 ----
-4
+2
 
 # CHAR(n) rejects values longer than n.
 statement error

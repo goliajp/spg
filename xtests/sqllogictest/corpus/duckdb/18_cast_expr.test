@@ -14,7 +14,7 @@ SELECT a::TEXT FROM t
 query R nosort
 SELECT a::FLOAT FROM t
 ----
-42.000
+42
 
 query I nosort
 SELECT '7'::INT

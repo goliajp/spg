@@ -2436,7 +2436,18 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // pg_proc.dat for the common subset.
     let funcs: &[(i64, &str, &str, i32, i64)] = &[
         // Scalar functions.
+        // PG ships eight length() overloads; mirror the full set so
+        // catalog joins see the same rows (1317 text, 1318 bpchar,
+        // 1530/1531 lseg/path -> float8, 1681 bit, 1713 length(bytea,
+        // name) [2 args], 2010 bytea, 3711 tsvector).
+        (1317, "length", "f", 1, 23),
         (1318, "length", "f", 1, 23),
+        (1530, "length", "f", 1, 701),
+        (1531, "length", "f", 1, 701),
+        (1681, "length", "f", 1, 23),
+        (1713, "length", "f", 2, 23),
+        (2010, "length", "f", 1, 23),
+        (3711, "length", "f", 1, 23),
         (871, "upper", "f", 1, 25),
         (870, "lower", "f", 1, 25),
         (936, "substring", "f", 3, 25),
@@ -2488,8 +2499,9 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         (3253, "gen_random_uuid", "f", 0, 2950),
         (3252, "uuid_generate_v4", "f", 0, 2950),
         // Aggregates.
-        (2147, "count", "a", 0, 20),
-        (2803, "count", "a", -1, 20),
+        // PG: 2147 = count(any) [1 arg], 2803 = count(*) [0 args].
+        (2147, "count", "a", 1, 20),
+        (2803, "count", "a", 0, 20),
         (2116, "max", "a", 1, 23),
         (2132, "min", "a", 1, 23),
         (2108, "sum", "a", 1, 20),
@@ -3088,32 +3100,24 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             cols.get(pos)
                 .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
         };
-        // Helper to build PG's int2vector `conkey` body
-        // (1-based, space-separated attnums).
+        // PG's `conkey` / `confkey` are smallint[] — render the array
+        // literal form psql shows (`{1,2}`, 1-based attnums).
         let conkey_vec = |positions: &[usize]| -> String {
-            let mut s = String::new();
+            let mut s = String::from("{");
             for (i, p) in positions.iter().enumerate() {
                 if i > 0 {
-                    s.push(' ');
+                    s.push(',');
                 }
                 s.push_str(&alloc::format!("{}", p + 1));
             }
+            s.push('}');
             s
         };
         // Uniqueness constraints.
         for uc in t.schema().uniqueness_constraints.iter() {
             let kind = if uc.is_primary_key { "p" } else { "u" };
             let conname = pg_unique_conname(t, uc, tname);
-            let conkey = conkey_vec(&uc.columns);
-            let conkey_names: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
-            // Hybrid: PG's `conkey` is int2vector; expose the
-            // int2vector form so the canonical PG query path
-            // works, but include the names as a comma list in
-            // the same string (`"1 2 [name1,name2]"`) so the
-            // existing SPG dashboards that depended on the name
-            // form still read sensibly. Pure-int form lands
-            // when SPG ships proper int2vector support.
-            let conkey_display = alloc::format!("{conkey} [{}]", conkey_names.join(","));
+            let conkey_display = conkey_vec(&uc.columns);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
@@ -3153,9 +3157,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             let is_primary = idx.name.ends_with("_pkey");
             let kind = if is_primary { "p" } else { "u" };
             let positions = alloc::vec![idx.column_position];
-            let conkey = conkey_vec(&positions);
-            let col_name = col_name_at(idx.column_position);
-            let conkey_display = alloc::format!("{conkey} [{col_name}]");
+            let conkey_display = conkey_vec(&positions);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(idx.name.clone()),
@@ -3188,25 +3190,6 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             let confrelid = by_table.get(&fk.parent_table).copied().unwrap_or(0);
             let conkey = conkey_vec(&fk.local_columns);
             let confkey = conkey_vec(&fk.parent_columns);
-            let conkey_names: Vec<String> =
-                fk.local_columns.iter().map(|&p| col_name_at(p)).collect();
-            let confkey_names: Vec<String> = if let Some(parent) = cat.get(&fk.parent_table) {
-                fk.parent_columns
-                    .iter()
-                    .map(|&p| {
-                        parent
-                            .schema()
-                            .columns
-                            .get(p)
-                            .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
-                    })
-                    .collect()
-            } else {
-                fk.parent_columns
-                    .iter()
-                    .map(|p| alloc::format!("col{p}"))
-                    .collect()
-            };
             // confupdtype / confdeltype: 'a' no action, 'r' restrict,
             // 'c' cascade, 'n' set null, 'd' set default. SPG's
             // ForeignKey action enum already mirrors this.
@@ -3231,8 +3214,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::text(alloc::format!("{conkey} [{}]", conkey_names.join(","))),
-                Value::text(alloc::format!("{confkey} [{}]", confkey_names.join(","))),
+                Value::text(conkey),
+                Value::text(confkey),
             ]));
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously

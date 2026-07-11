@@ -28,10 +28,10 @@ SELECT DATE_PART('minute', '2024-03-15 14:30:45'::TIMESTAMP)
 ----
 30
 
-query I nosort
+query R nosort
 SELECT DATE_PART('second', '2024-03-15 14:30:45.123456'::TIMESTAMP)
 ----
-45
+45.123456
 
 # DATE_PART works on INTERVAL too (component decomposition).
 query I nosort
@@ -58,7 +58,7 @@ NULL
 query T nosort
 SELECT AGE('2024-03-01'::TIMESTAMP, '2024-01-01'::TIMESTAMP)
 ----
-60 days
+2 mons
 
 query T nosort
 SELECT AGE('2024-01-01 12:00:00'::TIMESTAMP, '2024-01-01 09:30:00'::TIMESTAMP)
@@ -69,11 +69,11 @@ SELECT AGE('2024-01-01 12:00:00'::TIMESTAMP, '2024-01-01 09:30:00'::TIMESTAMP)
 query T nosort
 SELECT AGE('2024-01-01'::TIMESTAMP, '2024-03-01'::TIMESTAMP)
 ----
--60 days
+-2 mons
 
-# Single-arg AGE is intentionally unsupported in v2.12 — error is the
-# documented surface (callers should write AGE(CURRENT_DATE, t)).
-statement error
+# Single-arg AGE resolves against the clock (PG: age(now(), t)); the
+# value is clock-dependent so only the shape is asserted.
+statement ok
 SELECT AGE('2024-01-01'::DATE)
 
 # TO_CHAR placeholders cover the high-traffic surface.
@@ -91,7 +91,7 @@ SELECT TO_CHAR('2024-03-15 14:30:45'::TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS')
 query T nosort
 SELECT TO_CHAR('2024-03-15'::DATE, 'Month DD, YYYY')
 ----
-March 15, 2024
+March     15, 2024
 
 query T nosort
 SELECT TO_CHAR('2024-03-15'::DATE, 'Mon DD')

@@ -42,14 +42,14 @@ null
 query T
 SELECT to_jsonb('{"a":1}'::json)
 ----
-{"a":1}
+{"a": 1}
 
 # ─── json_build_object / jsonb_build_object ──────────────────────
 
 query T
 SELECT json_build_object('a', 1, 'b', 'two', 'c', true)
 ----
-{"a":1,"b":"two","c":true}
+{"a" : 1, "b" : "two", "c" : true}
 
 query T
 SELECT jsonb_build_object()
@@ -59,7 +59,7 @@ SELECT jsonb_build_object()
 query T
 SELECT json_build_object('a', NULL, 'b', 1)
 ----
-{"a":null,"b":1}
+{"a" : null, "b" : 1}
 
 # Odd-length arg list errors.
 statement error
@@ -74,7 +74,7 @@ SELECT json_build_object(NULL, 1)
 query T
 SELECT json_build_array(1, 'x', true, NULL)
 ----
-[1,"x",true,null]
+[1, "x", true, null]
 
 query T
 SELECT jsonb_build_array()
@@ -86,35 +86,35 @@ SELECT jsonb_build_array()
 query T
 SELECT jsonb_set('{"a":1,"b":2}', '{a}', '99')
 ----
-{"a":99,"b":2}
+{"a": 99, "b": 2}
 
 query T
 SELECT jsonb_set('{"a":{"b":{"c":1}}}', '{a,b,c}', '"x"')
 ----
-{"a":{"b":{"c":"x"}}}
+{"a": {"b": {"c": "x"}}}
 
 query T
 SELECT jsonb_set('[10,20,30]', '{1}', '99')
 ----
-[10,99,30]
+[10, 99, 30]
 
 # Negative array index counts from end.
 query T
 SELECT jsonb_set('[10,20,30]', '{-1}', '99')
 ----
-[10,20,99]
+[10, 20, 99]
 
 # Missing key with create_missing=true (default) → inserted.
 query T
 SELECT jsonb_set('{"a":1}', '{b}', '2')
 ----
-{"a":1,"b":2}
+{"a": 1, "b": 2}
 
 # Missing key with create_missing=false → unchanged.
 query T
 SELECT jsonb_set('{"a":1}', '{b}', '2', false)
 ----
-{"a":1}
+{"a": 1}
 
 # ─── jsonb_insert ────────────────────────────────────────────────
 
@@ -122,25 +122,25 @@ SELECT jsonb_set('{"a":1}', '{b}', '2', false)
 query T
 SELECT jsonb_insert('[10,20,30]', '{1}', '99')
 ----
-[10,99,20,30]
+[10, 99, 20, 30]
 
 # insert_after=true: insert AFTER indexed element.
 query T
 SELECT jsonb_insert('[10,20,30]', '{1}', '99', true)
 ----
-[10,20,99,30]
+[10, 20, 99, 30]
 
 # Out-of-range positive index appends.
 query T
 SELECT jsonb_insert('[10,20]', '{99}', '"end"')
 ----
-[10,20,"end"]
+[10, 20, "end"]
 
 # Object: creates new key.
 query T
 SELECT jsonb_insert('{"a":1}', '{b}', '"new"')
 ----
-{"a":1,"b":"new"}
+{"a": 1, "b": "new"}
 
 # Object: replacing existing key errors (PG semantics).
 statement error

@@ -68,12 +68,12 @@ SELECT id FROM docs WHERE body LIKE '%trigram%'
 query R
 SELECT similarity('hello', 'hello')
 ----
-1.000
+1
 
 query R
 SELECT similarity('foo', 'foo')
 ----
-1.000
+1
 
 # show_trgm returns the trigram set as TEXT[].
 query T
