@@ -5908,7 +5908,8 @@ fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
     {
         return Some(SrfKind::ArrayElements { as_text: true });
     }
-    if n == 2 && name_is(name, &["jsonb_path_query", "json_path_query"]) {
+    // v7.39 (jsonpath depth) — 3rd arg = vars, 4th = silent.
+    if (2..=4).contains(&n) && name_is(name, &["jsonb_path_query", "json_path_query"]) {
         return Some(SrfKind::PathQuery);
     }
     if (2..=3).contains(&n) && name.eq_ignore_ascii_case("regexp_matches") {
@@ -6012,7 +6013,17 @@ fn top_level_srf_output(
         SrfKind::PathQuery => {
             let doc = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
             let path = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
-            match crate::json::path_query(&doc, &path).map_err(EngineError::Eval)? {
+            // v7.39 — optional vars document (3rd arg).
+            let vars = match args.get(2) {
+                Some(a) => {
+                    let v = eval::eval_expr(a, row, ctx).map_err(EngineError::Eval)?;
+                    crate::json::parse_path_vars(&v).map_err(EngineError::Eval)?
+                }
+                None => None,
+            };
+            match crate::json::path_query_vars(&doc, &path, vars.as_ref())
+                .map_err(EngineError::Eval)?
+            {
                 Value::Null => Ok(Vec::new()),
                 Value::TextArray(items) => Ok(items
                     .into_iter()

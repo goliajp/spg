@@ -11209,7 +11209,11 @@ fn apply_function_dispatch(
             if args[..2].iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            let q = crate::json::path_query(&args[0], &args[1])?;
+            let vars = match args.get(2) {
+                Some(v) => crate::json::parse_path_vars(v)?,
+                None => None,
+            };
+            let q = crate::json::path_query_vars(&args[0], &args[1], vars.as_ref())?;
             match q {
                 Value::TextArray(items) => Ok(Value::Bool(!items.is_empty())),
                 Value::Null => Ok(Value::Null),
@@ -11228,12 +11232,18 @@ fn apply_function_dispatch(
             if args[..2].iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            let vars = match args.get(2) {
+                Some(v) => crate::json::parse_path_vars(v)?,
+                None => None,
+            };
             // v7.38 (read01, T8) — a top-level predicate (`$.a > 3`) evaluates
             // to a real boolean; other paths fall back to any-match.
-            if let Some(b) = crate::json::path_predicate(&args[0], &args[1])? {
+            if let Some(b) =
+                crate::json::path_predicate_vars(&args[0], &args[1], vars.as_ref())?
+            {
                 return Ok(Value::Bool(b));
             }
-            let q = crate::json::path_query(&args[0], &args[1])?;
+            let q = crate::json::path_query_vars(&args[0], &args[1], vars.as_ref())?;
             match q {
                 Value::TextArray(items) => {
                     // If the first match is a boolean literal, use it;
@@ -11249,35 +11259,54 @@ fn apply_function_dispatch(
                 _ => Ok(Value::Bool(true)),
             }
         }
+        // v7.39 (jsonpath depth) — the jsonb_path_* family takes
+        // (doc, path[, vars[, silent]]). vars is a jsonb object whose
+        // keys resolve `$name` references; silent only suppresses
+        // structural errors (our lax evaluator already does).
         "jsonb_path_query" | "json_path_query" => {
-            if args.len() != 2 {
+            if args.len() < 2 || args.len() > 4 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("jsonb_path_query() takes 2 args, got {}", args.len()),
+                    detail: alloc::format!(
+                        "jsonb_path_query() takes 2-4 args, got {}",
+                        args.len()
+                    ),
                 });
             }
-            crate::json::path_query(&args[0], &args[1])
+            let vars = match args.get(2) {
+                Some(v) => crate::json::parse_path_vars(v)?,
+                None => None,
+            };
+            crate::json::path_query_vars(&args[0], &args[1], vars.as_ref())
         }
         "jsonb_path_query_first" | "json_path_query_first" => {
-            if args.len() != 2 {
+            if args.len() < 2 || args.len() > 4 {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "jsonb_path_query_first() takes 2 args, got {}",
+                        "jsonb_path_query_first() takes 2-4 args, got {}",
                         args.len()
                     ),
                 });
             }
-            crate::json::path_query_first(&args[0], &args[1])
+            let vars = match args.get(2) {
+                Some(v) => crate::json::parse_path_vars(v)?,
+                None => None,
+            };
+            crate::json::path_query_first_vars(&args[0], &args[1], vars.as_ref())
         }
         "jsonb_path_query_array" | "json_path_query_array" => {
-            if args.len() != 2 {
+            if args.len() < 2 || args.len() > 4 {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "jsonb_path_query_array() takes 2 args, got {}",
+                        "jsonb_path_query_array() takes 2-4 args, got {}",
                         args.len()
                     ),
                 });
             }
-            crate::json::path_query_array(&args[0], &args[1])
+            let vars = match args.get(2) {
+                Some(v) => crate::json::parse_path_vars(v)?,
+                None => None,
+            };
+            crate::json::path_query_array_vars(&args[0], &args[1], vars.as_ref())
         }
         // v7.17.0 Phase 7 — INET / CIDR network helpers.
         "host" => inet_host(args),

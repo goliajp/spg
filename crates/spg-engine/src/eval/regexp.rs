@@ -1652,6 +1652,15 @@ fn flags_have_i(args: &[Value<'_>], idx: usize) -> Result<bool, EvalError> {
     }
 }
 
+/// v7.39 (jsonpath like_regex) — bare "does `pat` match anywhere in
+/// `text`" entry over the engine's POSIX regex core.
+pub(crate) fn regex_is_match(pat: &str, text: &str) -> Result<bool, EvalError> {
+    let node = re_compile(pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let ngroups = max_group(&node);
+    Ok(re_find_caps(&node, &chars, 0, ngroups)?.is_some())
+}
+
 pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let (text, pat, all_matches) = match args.len() {
         2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),

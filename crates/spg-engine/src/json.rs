@@ -1324,14 +1324,41 @@ fn parse_number(bytes: &[u8], p: &mut usize) -> Result<JsonValue, ParseError> {
 //   * Functions `keyvalue()`, `size()`, etc.
 //   * Path variables `$varname`
 
+/// v7.39 (jsonpath depth) — an array subscript bound: a plain index or
+/// `last - N` (offset back from the final element).
+#[derive(Debug, Clone, Copy)]
+enum IdxBound {
+    At(usize),
+    FromLast(usize),
+}
+
+impl IdxBound {
+    /// Resolve against an array of `len` items; `None` = out of range.
+    fn resolve(self, len: usize) -> Option<usize> {
+        match self {
+            Self::At(n) => (n < len).then_some(n),
+            Self::FromLast(off) => len.checked_sub(1 + off),
+        }
+    }
+}
+
+/// v7.39 (jsonpath depth) — numeric item methods.
+#[derive(Debug, Clone, Copy)]
+enum NumMethod {
+    Abs,
+    Floor,
+    Ceiling,
+    Double,
+}
+
 #[derive(Debug, Clone)]
 enum PathStep {
     Field(String),
-    Index(usize),
+    Index(IdxBound),
     Wildcard,
     // v7.38 (read01, T8) — SQL/JSON path filter sublanguage.
-    /// `[N to M]` — an inclusive array-index range.
-    Range(usize, usize),
+    /// `[N to M]` — an inclusive array-index range (bounds may be `last - k`).
+    Range(IdxBound, IdxBound),
     /// `? (<predicate>)` — keep the current items whose accessor expression
     /// satisfies the (possibly `&&`/`||`-combined) predicate.
     Filter(FilterExpr),
@@ -1339,6 +1366,10 @@ enum PathStep {
     Size,
     /// `.type()` — the JSON type name of the current item.
     TypeOf,
+    /// v7.39 — `.abs()` / `.floor()` / `.ceiling()` / `.double()`.
+    Num(NumMethod),
+    /// v7.39 — `.**` recursive descent: the item plus every descendant.
+    RecursiveAll,
 }
 
 #[derive(Debug, Clone)]
@@ -1365,6 +1396,10 @@ enum FilterOp {
     Le,
     Eq,
     Ne,
+    /// v7.39 — `starts with "prefix"` (string operand only).
+    StartsWith,
+    /// v7.39 — `like_regex "pattern"` (POSIX search, unanchored).
+    LikeRegex,
 }
 
 #[derive(Debug, Clone)]
@@ -1372,6 +1407,11 @@ enum FilterVal {
     Num(f64),
     Str(String),
     Bool(bool),
+    /// v7.39 — the `null` literal (`@ == null` matches JSON null only).
+    Null,
+    /// v7.39 — a `$name` variable reference, resolved from the `vars`
+    /// document at evaluation time.
+    Var(String),
 }
 
 fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
@@ -1388,6 +1428,13 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
         match chars[i] {
             '.' => {
                 i += 1;
+                // v7.39 — `.**` recursive descent (visits the item and
+                // every descendant; a following `.field` then selects).
+                if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+                    i += 2;
+                    steps.push(PathStep::RecursiveAll);
+                    continue;
+                }
                 if i < chars.len() && chars[i] == '"' {
                     i += 1;
                     let start = i;
@@ -1432,6 +1479,11 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                         match name.as_str() {
                             "size" => steps.push(PathStep::Size),
                             "type" => steps.push(PathStep::TypeOf),
+                            // v7.39 — numeric item methods.
+                            "abs" => steps.push(PathStep::Num(NumMethod::Abs)),
+                            "floor" => steps.push(PathStep::Num(NumMethod::Floor)),
+                            "ceiling" => steps.push(PathStep::Num(NumMethod::Ceiling)),
+                            "double" => steps.push(PathStep::Num(NumMethod::Double)),
                             other => {
                                 return Err(EvalError::TypeMismatch {
                                     detail: alloc::format!(
@@ -1464,46 +1516,58 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                     i += 1;
                     steps.push(PathStep::Wildcard);
                 } else {
-                    let start = i;
-                    while i < chars.len() && chars[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    if start == i {
-                        return Err(EvalError::TypeMismatch {
-                            detail:
-                                "jsonpath: only `[N]` (non-negative) or `[*]` supported in v7.17"
+                    // v7.39 — a bound is `N` or `last[ - K]`.
+                    let mut parse_bound = |i: &mut usize| -> Result<IdxBound, EvalError> {
+                        jp_skip_ws(&chars, i);
+                        if chars[*i..].starts_with(&['l', 'a', 's', 't']) {
+                            *i += 4;
+                            jp_skip_ws(&chars, i);
+                            if *i < chars.len() && chars[*i] == '-' {
+                                *i += 1;
+                                jp_skip_ws(&chars, i);
+                                let s = *i;
+                                while *i < chars.len() && chars[*i].is_ascii_digit() {
+                                    *i += 1;
+                                }
+                                let off: usize = chars[s..*i]
+                                    .iter()
+                                    .collect::<String>()
+                                    .parse()
+                                    .map_err(|_| EvalError::TypeMismatch {
+                                        detail: "jsonpath: invalid `last - N` offset".into(),
+                                    })?;
+                                return Ok(IdxBound::FromLast(off));
+                            }
+                            return Ok(IdxBound::FromLast(0));
+                        }
+                        let s = *i;
+                        while *i < chars.len() && chars[*i].is_ascii_digit() {
+                            *i += 1;
+                        }
+                        if s == *i {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "jsonpath: expected `N`, `last[ - K]` or `*` subscript"
                                     .into(),
-                        });
-                    }
-                    let idx: usize =
-                        chars[start..i]
-                            .iter()
-                            .collect::<String>()
-                            .parse()
-                            .map_err(|_| EvalError::TypeMismatch {
-                                detail: "jsonpath: invalid array index".into(),
-                            })?;
+                            });
+                        }
+                        Ok(IdxBound::At(
+                            chars[s..*i]
+                                .iter()
+                                .collect::<String>()
+                                .parse()
+                                .map_err(|_| EvalError::TypeMismatch {
+                                    detail: "jsonpath: invalid array index".into(),
+                                })?,
+                        ))
+                    };
+                    let idx = parse_bound(&mut i)?;
                     // v7.38 (read01, T8) — `[N to M]` inclusive range.
                     while i < chars.len() && chars[i].is_whitespace() {
                         i += 1;
                     }
                     if i + 1 < chars.len() && chars[i] == 't' && chars[i + 1] == 'o' {
                         i += 2;
-                        while i < chars.len() && chars[i].is_whitespace() {
-                            i += 1;
-                        }
-                        let s2 = i;
-                        while i < chars.len() && chars[i].is_ascii_digit() {
-                            i += 1;
-                        }
-                        let hi: usize =
-                            chars[s2..i]
-                                .iter()
-                                .collect::<String>()
-                                .parse()
-                                .map_err(|_| EvalError::TypeMismatch {
-                                    detail: "jsonpath: invalid range upper bound".into(),
-                                })?;
+                        let hi = parse_bound(&mut i)?;
                         while i < chars.len() && chars[i].is_whitespace() {
                             i += 1;
                         }
@@ -1648,6 +1712,10 @@ fn parse_cmp_and_literal(
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
     }
+    let kw = |i: usize, w: &str| -> bool {
+        let wc: Vec<char> = w.chars().collect();
+        chars[i..].starts_with(&wc)
+    };
     let op = if i + 1 < chars.len() && chars[i] == '>' && chars[i + 1] == '=' {
         i += 2;
         FilterOp::Ge
@@ -1666,8 +1734,24 @@ fn parse_cmp_and_literal(
     } else if i < chars.len() && chars[i] == '<' {
         i += 1;
         FilterOp::Lt
+    // v7.39 — `starts with "prefix"` / `like_regex "pattern"`.
+    } else if kw(i, "starts") {
+        i += 6;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if !kw(i, "with") {
+            return Err(err("expected `with` after `starts`"));
+        }
+        i += 4;
+        FilterOp::StartsWith
+    } else if kw(i, "like_regex") {
+        i += 10;
+        FilterOp::LikeRegex
     } else {
-        return Err(err("expected a comparison operator (> < >= <= == !=)"));
+        return Err(err(
+            "expected a comparison operator (> < >= <= == != starts with like_regex)",
+        ));
     };
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
@@ -1690,6 +1774,20 @@ fn parse_cmp_and_literal(
     } else if chars[i..].starts_with(&['f', 'a', 'l', 's', 'e']) {
         i += 5;
         FilterVal::Bool(false)
+    // v7.39 — `null` literal and `$name` variable references.
+    } else if chars[i..].starts_with(&['n', 'u', 'l', 'l']) {
+        i += 4;
+        FilterVal::Null
+    } else if i < chars.len() && chars[i] == '$' {
+        i += 1;
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if start == i {
+            return Err(err("expected a variable name after '$'"));
+        }
+        FilterVal::Var(chars[start..i].iter().collect())
     } else {
         let start = i;
         if i < chars.len() && (chars[i] == '-' || chars[i] == '+') {
@@ -1743,12 +1841,39 @@ fn resolve_accessor<'a>(node: &'a JsonValue, path: &[String]) -> Option<&'a Json
     Some(cur)
 }
 
-/// Evaluate a filter predicate against the current item.
-fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
+/// Evaluate a filter predicate against the current item. `vars` is the
+/// jsonb `vars` document (third argument of the jsonb_path_* family);
+/// `$name` operands resolve against its top-level keys.
+fn filter_matches(node: &JsonValue, pred: &FilterPred, vars: Option<&JsonValue>) -> bool {
     let Some(target) = resolve_accessor(node, &pred.path) else {
         return false;
     };
-    match &pred.val {
+    // v7.39 — a `$name` operand becomes the literal it refers to.
+    let resolved;
+    let val = match &pred.val {
+        FilterVal::Var(name) => {
+            let Some(JsonValue::Object(entries)) = vars else {
+                return false;
+            };
+            let Some((_, v)) = entries.iter().find(|(k, _)| k == name) else {
+                return false;
+            };
+            resolved = match v {
+                JsonValue::Number(n) => FilterVal::Num(*n),
+                JsonValue::NumberText(s) => match s.parse::<f64>() {
+                    Ok(n) => FilterVal::Num(n),
+                    Err(_) => return false,
+                },
+                JsonValue::String(s) => FilterVal::Str(s.clone()),
+                JsonValue::Bool(b) => FilterVal::Bool(*b),
+                JsonValue::Null => FilterVal::Null,
+                _ => return false,
+            };
+            &resolved
+        }
+        other => other,
+    };
+    match val {
         FilterVal::Num(rhs) => match json_num(target) {
             Some(lhs) => match pred.op {
                 FilterOp::Gt => lhs > *rhs,
@@ -1757,6 +1882,7 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
                 FilterOp::Le => lhs <= *rhs,
                 FilterOp::Eq => lhs == *rhs,
                 FilterOp::Ne => lhs != *rhs,
+                FilterOp::StartsWith | FilterOp::LikeRegex => false,
             },
             None => false,
         },
@@ -1768,6 +1894,11 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
                 FilterOp::Lt => lhs.as_str() < rhs.as_str(),
                 FilterOp::Ge => lhs.as_str() >= rhs.as_str(),
                 FilterOp::Le => lhs.as_str() <= rhs.as_str(),
+                // v7.39 — string pattern predicates.
+                FilterOp::StartsWith => lhs.starts_with(rhs.as_str()),
+                FilterOp::LikeRegex => {
+                    crate::eval::regex_is_match(rhs, lhs).unwrap_or(false)
+                }
             },
             _ => false,
         },
@@ -1779,19 +1910,34 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred) -> bool {
             },
             _ => false,
         },
+        // v7.39 — `== null` matches JSON null only; `!= null` any non-null.
+        FilterVal::Null => match pred.op {
+            FilterOp::Eq => matches!(target, JsonValue::Null),
+            FilterOp::Ne => !matches!(target, JsonValue::Null),
+            _ => false,
+        },
+        FilterVal::Var(_) => false, // resolved above
     }
 }
 
 /// Evaluate a (possibly `&&`/`||`-combined) filter predicate tree.
-fn filter_expr_matches(node: &JsonValue, expr: &FilterExpr) -> bool {
+fn filter_expr_matches(node: &JsonValue, expr: &FilterExpr, vars: Option<&JsonValue>) -> bool {
     match expr {
-        FilterExpr::Cmp(pred) => filter_matches(node, pred),
-        FilterExpr::And(a, b) => filter_expr_matches(node, a) && filter_expr_matches(node, b),
-        FilterExpr::Or(a, b) => filter_expr_matches(node, a) || filter_expr_matches(node, b),
+        FilterExpr::Cmp(pred) => filter_matches(node, pred, vars),
+        FilterExpr::And(a, b) => {
+            filter_expr_matches(node, a, vars) && filter_expr_matches(node, b, vars)
+        }
+        FilterExpr::Or(a, b) => {
+            filter_expr_matches(node, a, vars) || filter_expr_matches(node, b, vars)
+        }
     }
 }
 
-fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
+fn apply_jsonpath(
+    root: &JsonValue,
+    steps: &[PathStep],
+    vars: Option<&JsonValue>,
+) -> Vec<JsonValue> {
     let mut cur: Vec<JsonValue> = alloc::vec![root.clone()];
     for step in steps {
         let mut next: Vec<JsonValue> = Vec::new();
@@ -1803,7 +1949,9 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
                     }
                 }
                 (PathStep::Index(idx), JsonValue::Array(items)) => {
-                    if let Some(v) = items.get(*idx) {
+                    if let Some(pos) = idx.resolve(items.len())
+                        && let Some(v) = items.get(pos)
+                    {
                         next.push(v.clone());
                     }
                 }
@@ -1812,14 +1960,18 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
                 }
                 // v7.38 (read01, T8) — range / filter / methods.
                 (PathStep::Range(lo, hi), JsonValue::Array(items)) => {
-                    for idx in *lo..=*hi {
-                        if let Some(v) = items.get(idx) {
-                            next.push(v.clone());
+                    if let (Some(a), Some(b)) =
+                        (lo.resolve(items.len()), hi.resolve(items.len()))
+                    {
+                        for idx in a..=b {
+                            if let Some(v) = items.get(idx) {
+                                next.push(v.clone());
+                            }
                         }
                     }
                 }
                 (PathStep::Filter(expr), node) => {
-                    if filter_expr_matches(node, expr) {
+                    if filter_expr_matches(node, expr, vars) {
                         next.push(node.clone());
                     }
                 }
@@ -1830,6 +1982,47 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
                 (PathStep::Size, _) => next.push(JsonValue::Number(1.0)),
                 (PathStep::TypeOf, node) => {
                     next.push(JsonValue::String(json_type_name(node).into()));
+                }
+                // v7.39 — `.**`: the item itself plus all descendants,
+                // document order.
+                (PathStep::RecursiveAll, node) => {
+                    fn descend(v: &JsonValue, out: &mut Vec<JsonValue>) {
+                        out.push(v.clone());
+                        match v {
+                            JsonValue::Object(entries) => {
+                                for (_, child) in entries {
+                                    descend(child, out);
+                                }
+                            }
+                            JsonValue::Array(items) => {
+                                for child in items {
+                                    descend(child, out);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    descend(node, &mut next);
+                }
+                // v7.39 — numeric item methods (lax: non-numbers drop out).
+                (PathStep::Num(m), node) => {
+                    let n = match m {
+                        // `.double()` also accepts numeric strings.
+                        NumMethod::Double => match node {
+                            JsonValue::String(s) => s.parse::<f64>().ok(),
+                            other => json_num(other),
+                        },
+                        _ => json_num(node),
+                    };
+                    if let Some(x) = n {
+                        let out = match m {
+                            NumMethod::Abs => x.abs(),
+                            NumMethod::Floor => x.floor(),
+                            NumMethod::Ceiling => x.ceil(),
+                            NumMethod::Double => x,
+                        };
+                        next.push(JsonValue::Number(out));
+                    }
                 }
                 _ => {} // no match at this branch
             }
@@ -1847,11 +2040,34 @@ fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
 /// `Some(bool)` when the path is a top-level comparison, or `None` to let the
 /// caller fall back to the ordinary path-query match (`$.a ? (...)` etc.).
 pub fn path_predicate(doc: &Value, path: &Value) -> Result<Option<bool>, EvalError> {
+    path_predicate_vars(doc, path, None)
+}
+
+/// v7.39 — `path_predicate` with a jsonb `vars` document.
+pub fn path_predicate_vars(
+    doc: &Value,
+    path: &Value,
+    vars: Option<&JsonValue>,
+) -> Result<Option<bool>, EvalError> {
     let (src, ptext) = match (doc, path) {
         (Value::Null, _) | (_, Value::Null) => return Ok(None),
         (Value::Json(s) | Value::Text(s), Value::Text(p) | Value::Json(p)) => (s, p),
         _ => return Ok(None),
     };
+    // v7.39 — top-level `exists(<path>)` predicate form.
+    let trimmed = ptext.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("exists")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let steps = parse_jsonpath(inner.trim())?;
+        let root = parse(src).map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("{e}"),
+        })?;
+        return Ok(Some(!apply_jsonpath(&root, &steps, vars).is_empty()));
+    }
     let chars: Vec<char> = ptext.chars().collect();
     // Find a top-level comparison operator — depth 0, outside quotes, so a `>`
     // inside a `? (...)` filter or `[...]` does not count.
@@ -1883,19 +2099,52 @@ pub fn path_predicate(doc: &Value, path: &Value) -> Result<Option<bool>, EvalErr
     let root = parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("{e}"),
     })?;
-    let results = apply_jsonpath(&root, &steps);
+    let results = apply_jsonpath(&root, &steps, vars);
     let pred = FilterPred {
         path: Vec::new(),
         op,
         val,
     };
-    Ok(Some(results.iter().any(|v| filter_matches(v, &pred))))
+    Ok(Some(
+        results.iter().any(|v| filter_matches(v, &pred, vars)),
+    ))
 }
 
 /// v7.17.0 Phase 3.9 — `jsonb_path_query(doc, path)` — returns the
 /// matched JSON values as a TextArray (each element is the JSON
 /// encoding of one match).
 pub fn path_query(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
+    path_query_vars(doc, path, None)
+}
+
+/// v7.39 — parse the `vars` argument of the jsonb_path_* family into a
+/// JsonValue object (NULL → no vars).
+pub fn parse_path_vars(v: &Value) -> Result<Option<JsonValue>, EvalError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Json(s) | Value::Text(s) => {
+            let parsed = parse(s).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("invalid jsonpath vars document: {e}"),
+            })?;
+            if !matches!(parsed, JsonValue::Object(_)) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "jsonpath vars must be a JSON object".into(),
+                });
+            }
+            Ok(Some(parsed))
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("jsonpath vars must be jsonb, got {:?}", other.data_type()),
+        }),
+    }
+}
+
+/// v7.39 — `path_query` with a jsonb `vars` document ($name references).
+pub fn path_query_vars(
+    doc: &Value,
+    path: &Value,
+    vars: Option<&JsonValue>,
+) -> Result<Value<'static>, EvalError> {
     let (src, path_text) = match (doc, path) {
         (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
         (Value::Json(s) | Value::Text(s), Value::Text(p) | Value::Json(p)) => (s, p),
@@ -1908,8 +2157,22 @@ pub fn path_query(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError
     let root = parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON for jsonb_path_query: {e}"),
     })?;
+    // v7.39 — a top-level `exists(...)` path yields a single boolean.
+    let trimmed = path_text.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("exists")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let steps = parse_jsonpath(inner.trim())?;
+        let hit = !apply_jsonpath(&root, &steps, vars).is_empty();
+        return Ok(Value::TextArray(alloc::vec![Some(
+            if hit { "true" } else { "false" }.into()
+        )]));
+    }
     let steps = parse_jsonpath(path_text)?;
-    let matches = apply_jsonpath(&root, &steps);
+    let matches = apply_jsonpath(&root, &steps, vars);
     let arr: Vec<Option<String>> = matches
         .into_iter()
         .map(|v| Some(json_canonical_string(&v)))
@@ -1920,7 +2183,16 @@ pub fn path_query(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError
 /// v7.17.0 Phase 3.9 — `jsonb_path_query_first(doc, path)` returns
 /// the first matched JSON value as a Json, or NULL on no match.
 pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
-    let q = path_query(doc, path)?;
+    path_query_first_vars(doc, path, None)
+}
+
+/// v7.39 — `path_query_first` with a jsonb `vars` document.
+pub fn path_query_first_vars(
+    doc: &Value,
+    path: &Value,
+    vars: Option<&JsonValue>,
+) -> Result<Value<'static>, EvalError> {
+    let q = path_query_vars(doc, path, vars)?;
     match q {
         Value::TextArray(items) => {
             if let Some(Some(first)) = items.into_iter().next() {
@@ -1936,7 +2208,16 @@ pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value<'static>, Eva
 /// v7.17.0 Phase 3.9 — `jsonb_path_query_array(doc, path)` returns
 /// the matched values wrapped as a single JSON array.
 pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value<'static>, EvalError> {
-    let q = path_query(doc, path)?;
+    path_query_array_vars(doc, path, None)
+}
+
+/// v7.39 — `path_query_array` with a jsonb `vars` document.
+pub fn path_query_array_vars(
+    doc: &Value,
+    path: &Value,
+    vars: Option<&JsonValue>,
+) -> Result<Value<'static>, EvalError> {
+    let q = path_query_vars(doc, path, vars)?;
     let arr = match q {
         Value::TextArray(items) => {
             let mut buf = String::from("[");
