@@ -58,8 +58,9 @@ fn pg_proc_emits_pg_canonical_columns() {
 fn pg_proc_provolatile_v_for_now_random_current_timestamp() {
     let mut e = Engine::new();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_proc");
-    // Position: 1=proname, 13=provolatile.
-    let volatile_names = ["now", "random", "current_timestamp", "gen_random_uuid"];
+    // Position: 1=proname, 13=provolatile. (current_timestamp is a
+    // parser keyword in PG, not a pg_proc row.)
+    let volatile_names = ["now", "random", "gen_random_uuid"];
     for name in &volatile_names {
         let row = rs
             .iter()
