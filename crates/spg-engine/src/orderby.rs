@@ -98,12 +98,32 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     // v7.38 (read01, T6.P3) — a NUMERIC special orders by the total order
     // -Inf < finite < +Inf < NaN (NaN == NaN), ahead of the finite arms which
     // would read a special's canonical 0 as the number 0.
+    //
+    // v7.37.16 — FLOAT specials ride the same rank. The float arms below used
+    // `partial_cmp().unwrap_or(Equal)`, so a float NaN compared Equal to EVERY
+    // number: ORDER BY interleaved NaNs mid-stream and DISTINCT swallowed
+    // every float that followed a NaN (a non-transitive "equality"). PG's
+    // float8 total order is -Inf < finite < +Inf < NaN with NaN = NaN (and
+    // -0 = 0, which partial_cmp already gives on the finite path). Routing
+    // float NaN/±Inf through the NumericKind rank fixes both, and also closes
+    // the `Float(0.0) == Numeric-NaN` hole (the special's canonical scaled=0
+    // used to reach the Numeric↔Float f64 arm). Every float arm below is now
+    // reached only with both sides finite, where partial_cmp is total.
     {
         use spg_storage::NumericKind as NK;
         let kind = |v: &Value| -> Option<NK> {
             match v {
                 Value::Numeric { kind, .. } => Some(*kind),
                 Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) => Some(NK::Finite),
+                Value::Float(x) => Some(if x.is_nan() {
+                    NK::NaN
+                } else if *x == f64::INFINITY {
+                    NK::PosInf
+                } else if *x == f64::NEG_INFINITY {
+                    NK::NegInf
+                } else {
+                    NK::Finite
+                }),
                 _ => None,
             }
         };
