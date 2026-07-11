@@ -4988,7 +4988,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     // shorter-first (PG: `{1} < {1,2} < {2} < {10}`). Each element carries its
     // own OrderKey so integer arrays sort numerically; a NULL element rides to
     // the end via the +INF sentinel.
-    let inf = || OrderKey::Num(f64::INFINITY);
+    let inf = || OrderKey::NullBig;
     let arr = match v {
         Value::IntArray(a) => Some(
             a.iter()
@@ -5018,7 +5018,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         #[allow(clippy::cast_precision_loss)]
         Value::FloatArray(a) => Some(
             a.iter()
-                .map(|o| OrderKey::Num(o.unwrap_or(f64::INFINITY)))
+                .map(|o| o.map_or(OrderKey::NullBig, OrderKey::Num))
                 .collect(),
         ),
         Value::NumericArray(a) => Some(
@@ -5065,7 +5065,9 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         _ => {}
     }
     let num = match v {
-        Value::Null => f64::INFINITY,
+        // Callers without NULLS FIRST/LAST context (array elements,
+        // histogram sampling) put NULL last, as before.
+        Value::Null => return Ok(OrderKey::NullBig),
         // v7.17.0 Phase 3.P0-38 — range ordering is not supported
         // in v7.17.0 (needs lex-then-inclusivity tiebreak).
         Value::Range { .. } => {
