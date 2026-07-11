@@ -46,7 +46,8 @@ pub(crate) use binop::{
 use binop::{apply_binary, apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
-    CompiledExpr, compile_expr, eval_compiled, eval_compiled_ref, fully_compilable,
+    CompiledExpr, compile_column_pos, compile_expr, eval_compiled, eval_compiled_ref,
+    fully_compilable,
 };
 use datetime::{
     age, date_format_mysql, date_part, date_trunc, extract_field, from_unixtime, unix_timestamp_of,
