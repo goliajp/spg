@@ -5351,6 +5351,13 @@ fn numeric_rank(t: DataType) -> Option<u8> {
 /// Returns `None` for anything ambiguous, so the caller leaves the
 /// column untouched rather than risk a wrong or failing coercion.
 fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
+    // NB: types are collected from RUNTIME values, which are coarser
+    // than the schema (e.g. a timestamptz cell is Value::Timestamp), so
+    // a single-concrete-type fast path must NOT overwrite the column
+    // type — it would downgrade tstz to ts. NULL-only unification (PG:
+    // `VALUES (NULL),(1.5)` types the column numeric even on the NULL
+    // row's pg_typeof) needs schema-level resolution — recorded, not
+    // attempted here.
     if types.len() < 2 {
         return None;
     }
@@ -5385,6 +5392,17 @@ fn resolve_union_common_type(types: &[DataType]) -> Option<DataType> {
     // A single concrete non-TEXT type mixed with TEXT literals.
     if non_text.len() == 1 {
         return Some(*non_text[0]);
+    }
+    // v7.37.16 — SEVERAL concrete types mixed with TEXT literals
+    // (`VALUES ('NaN'::float8),(1.0),('NaN')` → float8 ∪ numeric ∪
+    // text): resolve the concrete set first (PG treats the unknown-
+    // typed string literals as castable to whatever the knowns
+    // resolve to), then the TEXT cells parse into that target — the
+    // caller's coercion dry-run still abandons the column if any
+    // literal doesn't parse.
+    if !non_text.is_empty() && non_text.len() < types.len() {
+        let concrete: Vec<DataType> = non_text.iter().map(|t| **t).collect();
+        return resolve_union_common_type(&concrete);
     }
     None
 }
