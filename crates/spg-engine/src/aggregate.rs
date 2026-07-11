@@ -900,12 +900,18 @@ fn accumulate_groups(
     // walk, no owned-Value clone out of resolve_column. Anything
     // more complex keeps the eval path.
     let col_pos = |e: &Expr| -> Option<usize> {
-        // Qualified references only: the bare-name resolver carries
-        // alias/ambiguity logic the bind-once path must not fork.
-        if let Expr::Column(c) = e
-            && c.qualifier.is_some()
-        {
-            eval::find_column_pos(c, &ctx)
+        // v7.37.16 — bind bare names too, via the compiled-WHERE
+        // resolver: `compile_column_pos` mirrors resolve_column's
+        // happy layers exactly (composite → prefix/alias gate → bare
+        // exact → unique suffix) and returns None on anything that
+        // would reach an ambiguity / whole-row / error path, so the
+        // eval fallback keeps identical semantics. Previously only
+        // qualified refs bound (via the looser find_column_pos), so
+        // single-table `GROUP BY g` / `avg(v)` ran the per-row
+        // eval_expr tree-walk + Vec + encode_key String alloc — the
+        // heavy.rs group_by / filter_agg residual loss vs PG18.
+        if let Expr::Column(c) = e {
+            eval::compile_column_pos(c, &ctx)
         } else {
             None
         }

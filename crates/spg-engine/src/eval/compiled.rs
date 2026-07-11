@@ -151,7 +151,11 @@ impl CompiledExpr {
 /// path, an ambiguity, or a miss returns None so the node falls
 /// back to the interpreter (identical runtime error / NULL
 /// semantics).
-fn compile_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<usize> {
+///
+/// v7.37.16 — pub(crate): the aggregate bind-once fast path
+/// (aggregate.rs `col_pos`) uses this as its resolver so bare-name
+/// group/arg columns bind exactly like compiled-WHERE columns do.
+pub(crate) fn compile_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<usize> {
     if let Some(q) = &c.qualifier {
         if let Some(pos) = ctx
             .columns
