@@ -159,6 +159,10 @@ impl Engine {
         // Extract the write-sets from the OLD shadow first (immutable
         // borrows only), then build + install the fresh catalog.
         let mut wsets: Vec<(String, spg_storage::TxWriteSet)> = Vec::new();
+        let mut pairs: alloc::collections::BTreeMap<
+            String,
+            Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>,
+        > = alloc::collections::BTreeMap::new();
         for tname in &state.touched_tables {
             if let Some(old_t) = state.catalog.get(tname) {
                 let ws = old_t.extract_tx_writeset(v);
@@ -166,18 +170,77 @@ impl Engine {
                     wsets.push((tname.clone(), ws));
                 }
             }
+            if let Some(p) = state.update_pairs.get(tname) {
+                pairs.insert(tname.clone(), p.clone());
+            }
         }
         let mut fresh = self.catalog.clone();
-        for (tname, ws) in &wsets {
+        for (tname, ws) in &mut wsets {
             let Some(new_t) = fresh.get_mut(tname) else {
                 // Concurrently dropped — a rebase would lose this tx's
                 // writes; keep the frozen shadow for this statement.
                 return;
             };
-            let _rc_skipped_conflicts = new_t.replay_tx_writeset(ws, v);
+            // v7.37.17 (Phase E4 fix) — RC conflict semantics with
+            // UPDATE atomicity: a tombstone whose target was already
+            // updated/deleted by a concurrently-committed tx is
+            // SKIPPED, and if it was the old half of one of this tx's
+            // UPDATEs, the paired new-version insert is dropped too —
+            // otherwise the row duplicates. (First-committer-wins
+            // approximation of PG's EvalPlanQual re-check: the tx's
+            // UPDATE ends up matching zero rows. Recorded delta: PG
+            // re-applies the update to the winner's new version.)
+            // A tombstone target absent from the fresh base is NOT a
+            // conflict when this same tx inserted it (insert-then-delete
+            // in one tx): the replay inserts it first and tombstones it
+            // right after, which is exactly PG's "never visible".
+            let own_inserted: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
+                ws.inserted.iter().map(|(rid, _)| *rid).collect();
+            let conflicted: Vec<spg_storage::row_header::RowId> = new_t
+                .tombstone_conflicts(&ws.tombstoned, v)
+                .into_iter()
+                .filter(|rid| !own_inserted.contains(rid))
+                .collect();
+            if !conflicted.is_empty() {
+                ws.tombstoned.retain(|rid| !conflicted.contains(rid));
+                if let Some(tp) = pairs.get(tname.as_str()) {
+                    let dropped_new: Vec<spg_storage::row_header::RowId> = tp
+                        .iter()
+                        .filter(|(old, _)| conflicted.contains(old))
+                        .map(|(_, new)| *new)
+                        .collect();
+                    ws.inserted.retain(|(rid, _)| !dropped_new.contains(rid));
+                }
+            }
+            let leftover = new_t.replay_tx_writeset(ws, v);
+            debug_assert!(
+                leftover.is_empty(),
+                "conflicts were pre-filtered; replay must be clean"
+            );
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
             st.catalog = fresh;
+        }
+    }
+
+    /// v7.37.17 (Phase E4 fix) — record the (old → new) RowId pairs an
+    /// in-place UPDATE produced, so the RC rebase can keep the
+    /// tombstone+insert halves atomic under write-write conflicts.
+    /// No-op outside an explicit transaction.
+    pub(crate) fn record_update_pairs(
+        &mut self,
+        table: &str,
+        new_pairs: Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>,
+    ) {
+        if new_pairs.is_empty() {
+            return;
+        }
+        let Some(tx_id) = self.current_tx else { return };
+        if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+            st.update_pairs
+                .entry(String::from(table))
+                .or_default()
+                .extend(new_pairs);
         }
     }
 
@@ -252,6 +315,7 @@ impl Engine {
                 touched_tables: alloc::collections::BTreeSet::new(),
                 rebase_poisoned: false,
                 stmts_run: 0,
+                update_pairs: alloc::collections::BTreeMap::new(),
             },
         );
         Ok(QueryResult::CommandOk {

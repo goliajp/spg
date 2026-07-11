@@ -192,3 +192,63 @@ fn set_transaction_after_first_query_errors() {
     );
     e.execute_in("ROLLBACK", tx).unwrap();
 }
+
+// ── v7.37.17 Phase E4 — isolation scenario matrix additions ──
+
+#[test]
+fn rc_concurrent_update_update_keeps_one_row() {
+    // E4 matrix catch: the tx's UPDATE write-set is tombstone(old) +
+    // insert(new); before the pairing fix a conflicting tombstone was
+    // skipped while the paired insert still replayed — DUPLICATING the
+    // row. SPG resolves update-update as first-committer-wins (the
+    // tx's UPDATE ends up matching zero rows). Recorded delta: PG's
+    // EvalPlanQual re-applies the loser's update to the winner's row
+    // (one row, x=10); SPG keeps the winner (one row, x=20).
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = boot();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("UPDATE t SET x = 10 WHERE x = 1", tx).unwrap();
+    e.execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
+        .unwrap();
+    assert_eq!(count(&mut e, tx), 1, "no duplicated row after rebase");
+    e.execute_in("COMMIT", tx).unwrap();
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT x FROM t ORDER BY x", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1, "exactly one surviving version");
+    assert_eq!(rows[0].values[0], spg_storage::Value::Int(20));
+}
+
+#[test]
+fn rr_concurrent_update_update_raises_serialization_failure() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = boot();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("UPDATE t SET x = 10 WHERE x = 1", tx).unwrap();
+    e.execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
+        .unwrap();
+    let err = e.execute_in("COMMIT", tx).unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
+        "RR update-update is first-committer-wins with 40001, got {err:?}"
+    );
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT x FROM t", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], spg_storage::Value::Int(20));
+}

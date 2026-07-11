@@ -640,15 +640,29 @@ impl Engine {
         // Apply, then fire AFTER triggers per row. AFTER runs read-
         // only against the freshly-written row; v7.12.4-shape
         // assignment errors with a clear message.
+        // v7.37.17 (Phase E4 fix) — collect (old, new) RowId pairs for
+        // the in-place UPDATEs so the RC rebase keeps each UPDATE's
+        // tombstone+insert atomic under write-write conflicts.
+        let mut update_rid_pairs: Vec<(
+            spg_storage::row_header::RowId,
+            spg_storage::row_header::RowId,
+        )> = Vec::new();
         for (pos, new_row, old_row) in applied_after_before {
             if inplace {
                 // MVCC: tombstone the old version (xmax = v) + append the
                 // new version (xmin = v). Appending does not shift earlier
                 // physical positions, so later `pos` values stay valid.
+                let old_rid = table.rowids().get(pos).copied();
                 let _ = table.mark_row_deleted(pos, v);
                 table
                     .insert_with_xmin(Row::new(new_row.values.clone()), v)
                     .map_err(EngineError::Storage)?;
+                if let (Some(o), Some(n)) = (
+                    old_rid,
+                    table.rowids().get(table.rowids().len().wrapping_sub(1)).copied(),
+                ) {
+                    update_rid_pairs.push((o, n));
+                }
             } else {
                 table.update_row(pos, new_row.values.clone())?;
             }
@@ -673,6 +687,9 @@ impl Engine {
             }
         }
         let _ = table;
+        // v7.37.17 (Phase E4 fix) — persist the UPDATE pairs on the
+        // open tx (no-op in autocommit).
+        self.record_update_pairs(&stmt.table, update_rid_pairs);
         // v7.12.7 — drain trigger-emitted embedded SQL for this UPDATE.
         self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
