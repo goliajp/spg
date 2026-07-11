@@ -1084,15 +1084,28 @@ impl Engine {
             // effective READ COMMITTED (same as PG's silent upgrade
             // of READ UNCOMMITTED).
             Statement::SetTransaction { isolation } => {
+                // v7.37.17 (Phase E3) — PG rejects an isolation switch
+                // after the transaction's first query (SQLSTATE 25001);
+                // silently applying it to the remaining statements would
+                // give a tx that is half one level, half another.
+                if let Some(tx_id) = self.current_tx
+                    && self
+                        .tx_catalogs
+                        .get(&tx_id)
+                        .is_some_and(|st| st.stmts_run > 0)
+                {
+                    return Err(EngineError::Unsupported(
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+                            .into(),
+                    ));
+                }
                 self.current_isolation_level = isolation;
                 // v7.37.17 (Phase E2) — inside an open tx, switching to
                 // RR/SER BEFORE the first query freezes the tx's view by
                 // caching a snapshot now (PG allows the switch until the
                 // first query; the RC rebase keys off cached_snapshot).
                 // Switching (back) to RC/RU clears it so the rebase
-                // resumes. After the first query PG errors; SPG applies
-                // the switch to the REMAINING statements — recorded
-                // residual, not silently wrong for the pre-query case.
+                // resumes.
                 if let Some(tx_id) = self.current_tx
                     && self.tx_catalogs.contains_key(&tx_id)
                 {

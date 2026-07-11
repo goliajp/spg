@@ -3125,6 +3125,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::CardinalityViolation = e {
         return ("21000", e.to_string());
     }
+    // v7.37.17 (Phase E3) — a RR/SER commit that hit a write-write
+    // conflict is PG's 40001 SERIALIZATION_FAILURE (clients retry).
+    if let EngineError::SerializationFailure(_) = e {
+        return ("40001", e.to_string());
+    }
     let msg = e.to_string();
     // Map constraint violations to their PG SQLSTATE class-23 codes so
     // clients can branch on them (23505 for a duplicate key, 23502 for a
@@ -3133,7 +3138,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // "violation" / "NOT NULL column" qualifiers keep DDL errors that merely
     // mention a constraint kind from being misclassified.
     let code =
-        if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")) {
+        // v7.37.17 (Phase E3) — isolation switch after the tx's first
+        // query: PG's 25001 ACTIVE_SQL_TRANSACTION.
+        if msg.contains("must be called before any query") {
+            "25001"
+        } else if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")) {
             "23505"
         } else if msg.contains("FOREIGN KEY violation") {
             "23503"

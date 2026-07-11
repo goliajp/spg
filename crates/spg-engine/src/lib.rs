@@ -225,6 +225,13 @@ pub enum EngineError {
     /// expression returned more than one row. PG raises this as
     /// SQLSTATE 21000 (CARDINALITY_VIOLATION) with a fixed message.
     CardinalityViolation,
+    /// v7.37.17 (Phase E3) — a REPEATABLE READ / SERIALIZABLE commit
+    /// found a write-write conflict with a concurrently-committed
+    /// transaction (a row this tx wrote was deleted/updated by another
+    /// committed writer, or a unique key this tx inserted was taken).
+    /// PG raises SQLSTATE 40001; the client retries the transaction.
+    /// The failing COMMIT rolls the transaction back, like PG.
+    SerializationFailure(String),
     /// v4.0 sentinel: `execute_readonly` got a statement that
     /// mutates engine state (INSERT / CREATE / BEGIN / COMMIT / …).
     /// The caller should retake the write lock and dispatch through
@@ -273,6 +280,12 @@ impl fmt::Display for EngineError {
             ),
             Self::CardinalityViolation => {
                 f.write_str("more than one row returned by a subquery used as an expression")
+            }
+            Self::SerializationFailure(detail) => {
+                write!(
+                    f,
+                    "could not serialize access due to concurrent update: {detail}"
+                )
             }
             Self::WriteRequired => {
                 f.write_str("statement requires a write lock (use execute, not execute_readonly)")
