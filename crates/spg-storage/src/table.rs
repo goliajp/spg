@@ -18,6 +18,7 @@ impl Table {
             headers: PersistentVec::new(),
             rowids: PersistentVec::new(),
             next_rowid: 1,
+            dead_rows: 0,
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
@@ -79,6 +80,19 @@ impl Table {
             self.rowids.len(),
             "rowids must stay in lock-step with rows after assign_dense_rowids"
         );
+    }
+
+    /// v7.37.16 (autovacuum) — number of tombstoned-but-present hot rows.
+    /// Incrementally maintained; drives the engine's autovacuum threshold.
+    #[must_use]
+    pub fn dead_rows(&self) -> u64 {
+        self.dead_rows
+    }
+
+    /// v7.37.16 (autovacuum) — loader-side rebase of the dead-row
+    /// counter (the v53 MVCC appendix restores headers verbatim).
+    pub(crate) fn set_dead_rows_on_load(&mut self, dead: u64) {
+        self.dead_rows = dead;
     }
 
     /// v7.37.15 (Phase A.2) — read-only access to the per-row
@@ -233,6 +247,7 @@ impl Table {
         if let Some(new_headers) = self.headers.set(position, h) {
             self.headers = new_headers;
         }
+        self.dead_rows += 1;
         // v7.37.15 (Epic W durable-tombstone slice) — capture the
         // in-place tombstone as row-level redo so a gate-on
         // (`SPG_MVCC_INPLACE`) DELETE / UPDATE-old-version /
@@ -285,6 +300,7 @@ impl Table {
                 }
                 _ => continue, // out-of-bounds or already tombstoned
             }
+            self.dead_rows += 1;
             newly += 1;
             if capture {
                 rowids.push(
@@ -1628,6 +1644,10 @@ impl Table {
         // naming the same row while its physical slot shifts down.
         let mut new_rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
         let mut removed_bytes: u64 = 0;
+        // v7.37.16 (autovacuum) — recount dead survivors: this rebuild
+        // is the compaction hub (vacuum and physical delete both land
+        // here), so the incremental counter re-bases exactly.
+        let mut surviving_dead: u64 = 0;
         for (i, row) in self.rows.iter().enumerate() {
             if to_remove[i] {
                 removed_bytes =
@@ -1640,6 +1660,9 @@ impl Table {
                 // A.2 keeps physical-delete semantics so
                 // serialisation + WAL paths stay identical.
                 if let Some(h) = self.headers.get(i) {
+                    if h.xmax != crate::row_header::XMAX_ALIVE {
+                        surviving_dead += 1;
+                    }
                     new_headers.push_mut(*h);
                 } else {
                     new_headers.push_mut(crate::row_header::RowHeader::frozen());
@@ -1660,6 +1683,7 @@ impl Table {
         self.headers = new_headers;
         self.rowids = new_rowids;
         self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
+        self.dead_rows = surviving_dead;
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
@@ -1709,6 +1733,8 @@ impl Table {
         self.headers = new_headers;
         self.rowids = new_rowids;
         self.hot_bytes = new_hot_bytes;
+        // All-frozen replacement headers → no dead rows by construction.
+        self.dead_rows = 0;
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),

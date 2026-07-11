@@ -1098,6 +1098,46 @@ impl Engine {
     /// lock, mirroring how it drives [`Self::autoanalyze_pass`]. Noted
     /// as a follow-up, not built in this slice.
     ///
+    /// v7.37.16 — enable/disable the threshold-triggered autovacuum
+    /// (default ON). Hosts wire `SPG_AUTOVACUUM=0|false|off` to this.
+    pub fn set_autovacuum(&mut self, on: bool) {
+        self.autovacuum = on;
+    }
+
+    /// v7.37.16 (autovacuum-lite, see .claude/state/autovacuum-design.md)
+    /// — threshold check + single-table synchronous vacuum, called at the
+    /// exit of an in-place DML statement. Fires only when: autovacuum is
+    /// on, the in-place gate is on (gate-off produces no tombstones — the
+    /// counter stays 0 and this returns immediately), NO explicit tx is
+    /// open (an open tx's tombstones aren't committed and its rollback
+    /// needs the xmax intact; the backlog is picked up by the next
+    /// autocommit DML on the table), and the table's dead-row meter
+    /// crosses the PG-inspired threshold: `dead >= 1000 && dead*4 >=
+    /// live` (absolute floor keeps small tables from thrashing). The
+    /// vacuum floor (`vacuum_oldest_active`) is conservative, so rows a
+    /// held snapshot can still see survive and re-trigger later.
+    pub(crate) fn maybe_autovacuum(&mut self, table_name: &str) {
+        // NB: `in_transaction()` (an EXPLICIT tx has a shadow catalog),
+        // not `current_tx.is_some()` — the execute path pins an
+        // IMPLICIT_TX marker for every autocommit statement too.
+        if !self.autovacuum || !self.mvcc_inplace || self.in_transaction() {
+            return;
+        }
+        let Some(t) = self.active_catalog().get(table_name) else {
+            return;
+        };
+        let dead = t.dead_rows();
+        let live = (t.row_count() as u64).saturating_sub(dead);
+        if dead < 1000 || dead * 4 < live {
+            return;
+        }
+        let oldest_active = self.vacuum_oldest_active();
+        if let Some(t) = self.active_catalog_mut().get_mut(table_name) {
+            let _report = t.vacuum(oldest_active, false);
+            crate::bump_counter!(AUTOVACUUM_FIRE_COUNT);
+        }
+    }
+
     /// `dry_run = true` counts the reclaimable rows without mutating.
     pub fn vacuum_pass(&mut self, dry_run: bool) -> spg_storage::vacuum::VacuumReport {
         // Gate-off: physical delete leaves no tombstones. Provable
@@ -1148,3 +1188,8 @@ impl Engine {
         floor
     }
 }
+
+/// v7.37.16 — autovacuum trigger counter (counter-first observability;
+/// same read-only diagnostic model as the Step-VM counters).
+pub static AUTOVACUUM_FIRE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
