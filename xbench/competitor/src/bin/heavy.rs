@@ -29,6 +29,7 @@ use sqlx::any::AnyPoolOptions;
 use std::time::Instant;
 
 const N: i64 = 50_000;
+const N5: i64 = 500_000;
 const WARMUP: usize = 3;
 const RUNS: usize = 31; // odd → clean median
 
@@ -86,6 +87,37 @@ const SHAPES: &[(&str, &str)] = &[
     (
         "distinct_proj",
         "SELECT DISTINCT g FROM h ORDER BY g",
+    ),
+    // ---- loss-hunt round 3 (v7.37.16): TEXT-heavy / correlated
+    // subquery / 500k scale. `ht` = 50k rows with a TEXT tag column
+    // (1000 uniques); `h5` = 500k-row copy of the h shape.
+    (
+        "text_group",
+        "SELECT s, count(*) FROM ht GROUP BY s ORDER BY s LIMIT 10",
+    ),
+    (
+        "like_filter",
+        "SELECT count(*) FROM ht WHERE s LIKE '%_05%'",
+    ),
+    (
+        "text_distinct",
+        "SELECT count(DISTINCT s) FROM ht",
+    ),
+    (
+        "corr_subq",
+        "SELECT count(*) FROM d WHERE g < (SELECT avg(h.v) FROM h WHERE h.g = d.g)",
+    ),
+    (
+        "agg_500k",
+        "SELECT count(*), sum(v), avg(v)::float8 FROM h5",
+    ),
+    (
+        "range_500k",
+        "SELECT count(*) FROM h5 WHERE v BETWEEN 20000 AND 40000",
+    ),
+    (
+        "group_500k",
+        "SELECT g, count(*), sum(v) FROM h5 GROUP BY g ORDER BY g",
     ),
 ];
 
@@ -165,6 +197,21 @@ fn bench_spg_embedded() -> Vec<f64> {
         eng.execute(&format!("INSERT INTO d VALUES ({g}, 'grp_{g:03}')"))
             .unwrap();
     }
+    eng.execute("CREATE TABLE ht (id INT NOT NULL, s TEXT NOT NULL)")
+        .unwrap();
+    for i in 1..=N {
+        let tag = i % 1000;
+        eng.execute(&format!("INSERT INTO ht VALUES ({i}, 'user_{tag:04}')"))
+            .unwrap();
+    }
+    eng.execute("CREATE TABLE h5 (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)")
+        .unwrap();
+    eng.execute("CREATE INDEX h5_v_idx ON h5 (v)").unwrap();
+    for i in 1..=N5 {
+        let (g, v) = (i % 100, val_for(i));
+        eng.execute(&format!("INSERT INTO h5 VALUES ({i}, {g}, {v})"))
+            .unwrap();
+    }
     SHAPES
         .iter()
         .map(|(_, sql)| {
@@ -210,8 +257,33 @@ async fn bench_pg(pool: &AnyPool) -> Result<Vec<f64>, sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    sqlx::query("DROP TABLE IF EXISTS ht").execute(pool).await?;
+    sqlx::query("CREATE TABLE ht (id INT NOT NULL, s TEXT NOT NULL)")
+        .execute(pool)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO ht SELECT i, 'user_' || lpad((i % 1000)::text, 4, '0') \
+         FROM generate_series(1, {N}) i"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query("DROP TABLE IF EXISTS h5").execute(pool).await?;
+    sqlx::query("CREATE TABLE h5 (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)")
+        .execute(pool)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO h5 SELECT i, (i % 100)::int, \
+         ((i::bigint * 2654435761) % 100000)::int FROM generate_series(1, {N5}) i"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX h5_v_idx ON h5 (v)")
+        .execute(pool)
+        .await?;
     sqlx::query("ANALYZE h").execute(pool).await?;
     sqlx::query("ANALYZE d").execute(pool).await?;
+    sqlx::query("ANALYZE ht").execute(pool).await?;
+    sqlx::query("ANALYZE h5").execute(pool).await?;
 
     let mut out = Vec::with_capacity(SHAPES.len());
     for (_, sql) in SHAPES {
