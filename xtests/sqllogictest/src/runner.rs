@@ -48,13 +48,20 @@ impl Default for Runner {
 
 impl Runner {
     pub fn new() -> Self {
-        Self {
-            // Inject a deterministic clock so corpus tests that touch
-            // `NOW()` / `CURRENT_DATE` get a stable value across runs.
-            // The fixed value is 2025-06-15T12:00:00.000000Z =
-            // 1_749_988_800_000_000 microseconds since epoch.
-            engine: Engine::new().with_clock(fixed_test_clock),
+        // Inject a deterministic clock so corpus tests that touch
+        // `NOW()` / `CURRENT_DATE` get a stable value across runs.
+        // The fixed value is 2025-06-15T12:00:00.000000Z =
+        // 1_749_988_800_000_000 microseconds since epoch.
+        let mut engine = Engine::new().with_clock(fixed_test_clock);
+        // v7.37.15 (Phase C.3) — honour the in-place MVCC gate env so
+        // `SPG_MVCC_INPLACE=1 gate.sh` really runs the corpus gate-on
+        // (the no_std engine can't read the environment itself).
+        if std::env::var("SPG_MVCC_INPLACE").is_ok_and(|v| {
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }) {
+            engine.set_mvcc_inplace(true);
         }
+        Self { engine }
     }
 
     /// Run a parsed `.test` file's records against a fresh engine and tally.
