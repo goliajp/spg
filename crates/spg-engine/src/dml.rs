@@ -1806,7 +1806,7 @@ impl Engine {
             })?;
         // Stage 3 — insert the surviving rows + fire row triggers under
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
-        let (returning_rows, deferred_embedded, affected) = insert_parsed_rows(
+        let (returning_rows, deferred_embedded, affected, oc_pairs) = insert_parsed_rows(
             table,
             xmin_for_stmt,
             inplace_for_stmt,
@@ -1826,6 +1826,9 @@ impl Engine {
         // stmt may UPDATE / INSERT / DELETE the same (or another)
         // table — including, in principle, this one.
         let _ = table;
+        // v7.37.17 (E4 r3) — persist ON CONFLICT update pairs on the tx
+        // (after the table borrow drops).
+        self.record_update_pairs(&stmt.table, oc_pairs);
         self.execute_deferred_trigger_stmts(deferred_embedded, CancelToken::none())?;
         // v7.9.4/v7.9.9 — RETURNING streams the rows that ended
         // up in the table after this statement (insert or
@@ -2879,10 +2882,21 @@ fn insert_parsed_rows(
         Vec<Vec<Value<'static>>>,
         Vec<triggers::DeferredEmbeddedStmt>,
         usize,
+        // v7.37.17 (E4 r3) — (old, new) RowId pairs from the
+        // ON CONFLICT DO UPDATE tombstone+insert branch, for the
+        // RC rebase's pair-atomic conflict handling.
+        Vec<(
+            spg_storage::row_header::RowId,
+            spg_storage::row_header::RowId,
+        )>,
     ),
     EngineError,
 > {
     let mut affected = 0usize;
+    let mut oc_pairs: Vec<(
+        spg_storage::row_header::RowId,
+        spg_storage::row_header::RowId,
+    )> = Vec::new();
     // v7.9.4 — keep RETURNING projection rows separate per
     // INSERT and per UPDATE branch so DO UPDATE pushes the new
     // post-update state, not the incoming-only values.
@@ -2955,14 +2969,24 @@ fn insert_parsed_rows(
         if inplace {
             // MVCC: tombstone the conflicting old version (xmax = xmin)
             // + append the DO UPDATE result as a new version (xmin).
+            let old_rid = table.rowids().get(pos).copied();
             let _ = table.mark_row_deleted(pos, xmin);
             table
                 .insert_with_xmin(Row::new(new_row), xmin)
                 .map_err(EngineError::Storage)?;
+            if let (Some(o), Some(n)) = (
+                old_rid,
+                table
+                    .rowids()
+                    .get(table.rowids().len().wrapping_sub(1))
+                    .copied(),
+            ) {
+                oc_pairs.push((o, n));
+            }
         } else {
             table.update_row(pos, new_row)?;
         }
         affected += 1;
     }
-    Ok((returning_rows, deferred_embedded, affected))
+    Ok((returning_rows, deferred_embedded, affected, oc_pairs))
 }

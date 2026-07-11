@@ -811,7 +811,13 @@ impl Engine {
         // no-ops outside an explicit transaction.
         let tx_class = crate::classify_stmt_for_tx(&stmt);
         if !matches!(tx_class, crate::TxStmtClass::TxControl) {
-            self.maybe_rc_rebase();
+            // v7.37.17 (E4 r3) — a unique-key collision found while
+            // rebasing fails THIS statement with 40001 (the tx aborts
+            // via the standard failed-statement path below, like PG's
+            // in-statement 23505 after the lock wait).
+            if let Err(e) = self.maybe_rc_rebase() {
+                return Err(e);
+            }
         }
         let result = self.dispatch_stmt_inner(stmt, cancel);
         if result.is_ok() {

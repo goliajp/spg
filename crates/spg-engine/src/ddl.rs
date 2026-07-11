@@ -589,10 +589,14 @@ impl Engine {
         // a fresh empty child. This matches PG's safest behaviour
         // (PG actually scans the rows; our scan path lands in
         // 16.3.b). Match the spirit, not the letter.
+        // Count *visible* rows: under in-place MVCC a DELETE leaves a
+        // tombstoned physical row behind, which must not fail the
+        // empty-child gate (legacy path removed it physically).
+        let snap = self.current_snapshot();
         let child_row_count = self
             .active_catalog()
             .get(&child_name)
-            .map(|t| t.rows().len())
+            .map(|t| t.scan_visible(&snap).count())
             .unwrap_or(0);
         if child_row_count > 0 {
             return Err(EngineError::Unsupported(alloc::format!(

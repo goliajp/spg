@@ -363,3 +363,100 @@ fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
     assert_eq!(rows.len(), 1, "reinserted row survives");
     assert_eq!(rows[0].values[1], spg_storage::Value::Int(11));
 }
+
+// ── v7.37.17 Phase E4 round 3 — unique-key collisions under rebase ──
+
+#[test]
+fn rc_insert_insert_unique_collision_raises_40001() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE u (x INT UNIQUE)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX).unwrap();
+    // The next tx statement rebases and hits the taken key.
+    let err = e
+        .execute_in("SELECT count(*) FROM u", tx)
+        .unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
+        "insert-insert collision -> 40001, got {err:?}"
+    );
+    e.execute_in("ROLLBACK", tx).unwrap();
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT x FROM u", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1, "exactly one 7 — no duplicate installed");
+}
+
+#[test]
+fn on_conflict_vs_concurrent_on_conflict_stays_single_row() {
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE u (x INT PRIMARY KEY, n INT NOT NULL)")
+        .unwrap();
+    e.execute("INSERT INTO u VALUES (1, 0)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in(
+        "INSERT INTO u VALUES (1, 0) ON CONFLICT (x) DO UPDATE SET n = u.n + 10",
+        tx,
+    )
+    .unwrap();
+    e.execute_in(
+        "INSERT INTO u VALUES (1, 0) ON CONFLICT (x) DO UPDATE SET n = u.n + 100",
+        IMPLICIT_TX,
+    )
+    .unwrap();
+    // With update-pair atomicity the tx's ON CONFLICT (which is an
+    // UPDATE against the old version) loses silently under RC —
+    // first-committer-wins, exactly like plain update-update. PG
+    // waits on the row lock and applies both (n = 110); SPG keeps
+    // the winner (n = 100) — recorded delta, retry converges.
+    e.execute_in("COMMIT", tx)
+        .expect("RC on-conflict loser commits cleanly (its update skipped)");
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT x, n FROM u", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows.len(), 1, "exactly one row — no duplicate");
+    assert_eq!(rows[0].values[1], spg_storage::Value::Int(100));
+}
+
+#[test]
+fn rr_plain_update_commit_does_not_false_conflict() {
+    // Regression guard for the two-phase merge: an UPDATE's new
+    // version must not unique-collide with its OWN old version
+    // (tombstoned in phase 1 before the check).
+    if !Engine::new().mvcc_inplace() {
+        return;
+    }
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE u (x INT PRIMARY KEY, n INT NOT NULL)")
+        .unwrap();
+    e.execute("INSERT INTO u VALUES (1, 0)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
+        .unwrap();
+    e.execute_in("UPDATE u SET n = 5 WHERE x = 1", tx).unwrap();
+    e.execute_in("COMMIT", tx)
+        .expect("uncontended RR UPDATE commit must succeed");
+    let QueryResult::Rows { rows, .. } = e
+        .execute_in("SELECT n FROM u WHERE x = 1", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    assert_eq!(rows[0].values[0], spg_storage::Value::Int(5));
+}
