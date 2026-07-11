@@ -137,3 +137,19 @@ fn real_orders_and_dedups_like_pg() {
     assert_eq!(got[0][0], spg_storage::Value::Bool(true));
     assert_eq!(got[0][1], spg_storage::Value::Bool(true));
 }
+
+/// v7.37.16 — a VALUES column typed only by NULL branches adopts the
+/// concrete branch's type (PG: `VALUES (NULL),(1.5)` → numeric, and
+/// the NULL row's pg_typeof reports numeric); a bare pg_typeof(NULL)
+/// still reports unknown.
+#[test]
+fn null_branch_column_adopts_concrete_type() {
+    let mut e = Engine::new();
+    let got = rows(
+        &mut e,
+        "SELECT pg_typeof(x) FROM (VALUES (NULL),(1.5)) t(x) LIMIT 1",
+    );
+    assert_eq!(got[0][0], spg_storage::Value::text("numeric"));
+    let got = rows(&mut e, "SELECT pg_typeof(NULL)");
+    assert_eq!(got[0][0], spg_storage::Value::text("unknown"));
+}
