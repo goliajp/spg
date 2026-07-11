@@ -354,6 +354,34 @@ pub(crate) fn try_index_seek_positions(
     table: &Table,
     table_alias: &str,
 ) -> Option<Vec<usize>> {
+    // v7.37.16 — two-sided range (BETWEEN) position seek, mirroring the
+    // SELECT path's try_range_seek (same parse, same rows/4 selectivity
+    // cap so a wide range still seq-scans). Must run BEFORE the AND
+    // recursion: a BETWEEN desugars to `col>=a AND col<=b`, whose halves
+    // alone are one-sided and would fall through to a full scan. The
+    // caller re-applies the full WHERE per candidate and sorts, exactly
+    // as for the equality seek. A cold locator falls through to the
+    // legacy paths (the mutation walk operates on hot rows only).
+    if let Some((col_pos, lo, hi)) = parse_range_bounds(where_expr, schema_cols, table_alias)
+        && let Some(idx) = table.index_on(col_pos)
+        && let Some(locators) =
+            idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), table.rows().len() / 4)
+    {
+        let mut out = Vec::with_capacity(locators.len());
+        let mut all_hot = true;
+        for loc in &locators {
+            match *loc {
+                spg_storage::RowLocator::Hot(i) => out.push(i),
+                spg_storage::RowLocator::Cold { .. } => {
+                    all_hot = false;
+                    break;
+                }
+            }
+        }
+        if all_hot {
+            return Some(out);
+        }
+    }
     if let Expr::Binary {
         lhs,
         op: BinOp::And,

@@ -1599,6 +1599,18 @@ pub(crate) enum FkChildAction {
 ///
 /// SET NULL / SET DEFAULT do NOT cascade further — the child row
 /// stays; only one of its columns mutates.
+/// v7.37.16 — does ANY table in the catalog declare a foreign key whose
+/// parent is `table_name`? Cheap per-statement pre-check that lets the
+/// DELETE path skip snapshotting old-row values when no FK enforcement
+/// (and no trigger / RETURNING) will ever read them.
+pub(crate) fn any_fk_child_references(catalog: &Catalog, table_name: &str) -> bool {
+    catalog.table_names().into_iter().any(|child_name| {
+        catalog
+            .get(&child_name)
+            .is_some_and(|c| c.schema().foreign_keys.iter().any(|fk| fk.parent_table == table_name))
+    })
+}
+
 pub(crate) fn plan_fk_parent_deletions(
     catalog: &Catalog,
     parent_table_name: &str,
