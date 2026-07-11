@@ -12,8 +12,9 @@ INSERT INTO t VALUES (2, NULL, NULL)
 statement ok
 INSERT INTO t VALUES (-3, 'with negatives', -2.5)
 
-# Arity mismatch.
-statement error
+# Fewer values than columns is legal in PG: trailing columns get
+# NULL/default (an error only when a NOT NULL column is left out).
+statement ok
 INSERT INTO t VALUES (1)
 
 # Type mismatch.
@@ -29,6 +30,7 @@ query I nosort
 SELECT a FROM t ORDER BY a
 ----
 -3
+1
 1
 2
 10

@@ -20,7 +20,7 @@ SELECT length(v) FROM t
 query I rowsort
 SELECT length(c) FROM t
 ----
-4
+2
 
 # VARCHAR(8) rejects overflow.
 statement error

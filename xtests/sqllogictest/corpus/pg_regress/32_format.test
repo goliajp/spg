@@ -28,7 +28,7 @@ SELECT format('= %L', NULL)
 query T
 SELECT format('SELECT FROM %I', 'mytable')
 ----
-SELECT FROM "mytable"
+SELECT FROM mytable
 
 # `%%` literal percent.
 query T
@@ -46,7 +46,7 @@ first last
 query T
 SELECT format('INSERT INTO %I (%I) VALUES (%L)', 'users', 'name', 'alice')
 ----
-INSERT INTO "users" ("name") VALUES ('alice')
+INSERT INTO users (name) VALUES ('alice')
 
 # NULL format string propagates.
 query T

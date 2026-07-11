@@ -67,7 +67,7 @@ query R
 SELECT SUM(emps.salary) OVER (PARTITION BY depts.id)
 FROM emps JOIN depts ON emps.dept_id = depts.id WHERE depts.id = 1 LIMIT 1
 ----
-280.000
+280
 
 # LEFT JOIN keeps the NULL-extended row for an empty department.
 statement ok

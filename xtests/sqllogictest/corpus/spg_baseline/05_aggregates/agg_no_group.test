@@ -19,4 +19,4 @@ SELECT SUM(v) FROM t
 query R rowsort
 SELECT AVG(v) FROM t
 ----
-2.500
+2.5000000000000000

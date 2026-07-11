@@ -6,37 +6,37 @@
 query R
 SELECT power(2, 8)
 ----
-256.000
+256
 
 query R
 SELECT power(5, 2)
 ----
-25.000
+25
 
 query R
 SELECT power(5, 0)
 ----
-1.000
+1
 
 query R
 SELECT power(1, 100)
 ----
-1.000
+1
 
 query R
 SELECT power(0, 5)
 ----
-0.000
+0
 
 query R
 SELECT power(-2, 4)
 ----
-16.000
+16
 
 query R
 SELECT power(-2, 3)
 ----
--8.000
+-8
 
 query R
 SELECT power(2, -3)
@@ -47,13 +47,13 @@ SELECT power(2, -3)
 query R
 SELECT power(4, 0.5)
 ----
-2.000
+2.0000000000000000
 
 # pow alias.
 query R
 SELECT pow(3, 4)
 ----
-81.000
+81
 
 # NULL.
 query I

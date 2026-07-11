@@ -31,7 +31,7 @@ SELECT i4 FROM bookings WHERE id = 1
 query T
 SELECT i4 FROM bookings WHERE id = 2
 ----
-[1,10]
+[1,11)
 
 # Unbounded lower.
 query T
@@ -72,7 +72,7 @@ SELECT d FROM bookings WHERE id = 1
 query T
 SELECT ts FROM bookings WHERE id = 1
 ----
-[2025-06-01 09:00:00,2025-06-01 10:00:00)
+["2025-06-01 09:00:00","2025-06-01 10:00:00")
 
 # Malformed range → hard error.
 statement error

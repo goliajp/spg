@@ -78,7 +78,7 @@
         { "file": "16_info_schema_mysql.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1338, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1339, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -92,7 +92,7 @@
           "fail_reasons": [] },
         { "file": "06_date_time.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "07_date_functions.test", "pass": 13, "fail": 0, "skip": 0,
+        { "file": "07_date_functions.test", "pass": 14, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "08_now_and_date_arith.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -311,13 +311,15 @@
         { "file": "values_constructor.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "spg_baseline/02_data_types", "pass": 78, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/02_data_types", "pass": 97, "fail": 0, "skip": 0,
       "files": [
         { "file": "array_ops.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "array_scalar.test", "pass": 4, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "bool.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "bpchar.test", "pass": 19, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "bytea.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] },

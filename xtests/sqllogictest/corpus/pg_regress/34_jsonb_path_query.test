@@ -4,40 +4,41 @@
 query T
 SELECT jsonb_path_query('{"k":1}'::JSONB, '$.k')
 ----
-{1}
+1
 
 query T
 SELECT jsonb_path_query('{"user":{"name":"bob"}}'::JSONB, '$.user.name')
 ----
-{"\"bob\""}
+"bob"
 
 query T
 SELECT jsonb_path_query('{"items":[10,20,30]}'::JSONB, '$.items[1]')
 ----
-{20}
+20
 
 query T
 SELECT jsonb_path_query('{"items":[1,2,3]}'::JSONB, '$.items[*]')
 ----
-{1,2,3}
+1
+2
+3
 
 # Wildcard then field — "find all .name values".
 query T
 SELECT jsonb_path_query('{"users":[{"name":"a"},{"name":"b"}]}'::JSONB, '$.users[*].name')
 ----
-{"\"a\"","\"b\""}
+"a"
+"b"
 
 # Missing field — empty array.
 query T
 SELECT jsonb_path_query('{"k":1}'::JSONB, '$.missing')
 ----
-{}
 
 # NULL doc → NULL result.
 query T
 SELECT jsonb_path_query(NULL::JSONB, '$.k')
 ----
-NULL
 
 # jsonb_path_query_first returns single value as Json.
 query T
@@ -54,7 +55,7 @@ NULL
 query T
 SELECT jsonb_path_query_array('{"items":[10,20,30]}'::JSONB, '$.items[*]')
 ----
-[10,20,30]
+[10, 20, 30]
 
 # Invalid path — error.
 statement error

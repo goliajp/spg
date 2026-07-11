@@ -7,21 +7,27 @@ statement ok
 CREATE TABLE children (id INT NOT NULL, parent_id INT NOT NULL,
     FOREIGN KEY (parent_id) REFERENCES parents (id))
 
-# Primary key on parents.
+# Primary key on parents (oid-independent: resolve the relation by
+# name through pg_class — bare `conrelid = 'text'` is not valid PG).
 query TT
-SELECT contype, conkey FROM pg_catalog.pg_constraint
-WHERE conrelid = 'parents' AND contype = 'p'
+SELECT c.contype, c.conkey
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_class r ON c.conrelid = r.oid
+WHERE r.relname = 'parents' AND c.contype = 'p'
 ----
 p
-id
+{1}
 
 # Foreign key on children referencing parents.
 query TTTTT
-SELECT contype, conrelid, confrelid, conkey, confkey
-FROM pg_catalog.pg_constraint WHERE contype = 'f'
+SELECT c.contype, r1.relname, r2.relname, c.conkey, c.confkey
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_class r1 ON c.conrelid = r1.oid
+JOIN pg_catalog.pg_class r2 ON c.confrelid = r2.oid
+WHERE c.contype = 'f'
 ----
 f
 children
 parents
-parent_id
-id
+{2}
+{1}
