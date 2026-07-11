@@ -371,3 +371,32 @@ fn delete_with_non_pk_where_does_not_touch_cold_rows() {
     // Cold row still there.
     assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
 }
+
+#[test]
+fn cold_delete_rollback_restores_the_row() {
+    // v7.37.16 — blocker-8 characterization for the MVCC default-flip:
+    // a PK-targeted DELETE of a COLD row retires its index locator
+    // physically (remove_cold_locators_for_key). Inside an explicit
+    // transaction that is ROLLED BACK, the row must still resolve
+    // afterwards — whatever mechanism (catalog snapshot restore on the
+    // legacy path, abort-aware oracle + snapshot on the gate-on path)
+    // is responsible. Runs in BOTH gate modes: with mvcc-inplace-on
+    // this pins the gate-on behaviour, without it the legacy one.
+    let mut engine = boot_engine_with_users();
+    register_cold_users(&mut engine, &[(100, "ivy"), (200, "joe")]);
+    engine.execute("BEGIN").expect("begin");
+    let r = engine
+        .execute("DELETE FROM users WHERE id = 200")
+        .expect("DELETE runs");
+    match r {
+        QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),
+        _ => panic!("DELETE returns CommandOk"),
+    }
+    engine.execute("ROLLBACK").expect("rollback");
+    assert_eq!(
+        select_name_by_id(&mut engine, 200).as_deref(),
+        Some("joe"),
+        "rolled-back cold DELETE must restore the row"
+    );
+    assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
+}
