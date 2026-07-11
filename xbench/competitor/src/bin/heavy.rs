@@ -54,6 +54,39 @@ const SHAPES: &[(&str, &str)] = &[
         "filter_agg",
         "SELECT g, avg(v)::float8 FROM h WHERE v > 50000 GROUP BY g ORDER BY g",
     ),
+    // ---- extended loss-hunt shapes (v7.37.16): join / subquery /
+    // sort-page / big IN / DISTINCT projection. `d` is a 100-row
+    // dimension table (g -> label).
+    (
+        "join_agg",
+        "SELECT d.label, count(*), sum(h.v) FROM h JOIN d ON h.g = d.g \
+         GROUP BY d.label ORDER BY d.label",
+    ),
+    (
+        "scalar_subq",
+        "SELECT count(*) FROM h WHERE v > (SELECT avg(v) FROM h)",
+    ),
+    (
+        "in_subq",
+        "SELECT count(*) FROM h WHERE g IN (SELECT g FROM d WHERE g < 50)",
+    ),
+    // Forces a real sort of the full table (top-N heap can't shortcut a
+    // mid-table OFFSET) while keeping the fetched page small so the PG
+    // leg isn't dominated by 50k-row wire transfer.
+    (
+        "sort_page",
+        "SELECT v FROM h ORDER BY v LIMIT 100 OFFSET 25000",
+    ),
+    (
+        "big_in",
+        "SELECT count(*) FROM h WHERE g IN (1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,\
+         31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,\
+         81,83,85,87,89,91,93,95,97,99)",
+    ),
+    (
+        "distinct_proj",
+        "SELECT DISTINCT g FROM h ORDER BY g",
+    ),
 ];
 
 fn val_for(i: i64) -> i64 {
@@ -126,6 +159,12 @@ fn bench_spg_embedded() -> Vec<f64> {
         eng.execute(&format!("INSERT INTO h VALUES ({i}, {g}, {v})"))
             .unwrap();
     }
+    eng.execute("CREATE TABLE d (g INT NOT NULL, label TEXT NOT NULL)")
+        .unwrap();
+    for g in 0..100 {
+        eng.execute(&format!("INSERT INTO d VALUES ({g}, 'grp_{g:03}')"))
+            .unwrap();
+    }
     SHAPES
         .iter()
         .map(|(_, sql)| {
@@ -161,7 +200,18 @@ async fn bench_pg(pool: &AnyPool) -> Result<Vec<f64>, sqlx::Error> {
     sqlx::query("CREATE INDEX h_g_idx ON h (g)")
         .execute(pool)
         .await?;
+    sqlx::query("DROP TABLE IF EXISTS d").execute(pool).await?;
+    sqlx::query("CREATE TABLE d (g INT NOT NULL, label TEXT NOT NULL)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO d SELECT g, 'grp_' || lpad(g::text, 3, '0') \
+         FROM generate_series(0, 99) g",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query("ANALYZE h").execute(pool).await?;
+    sqlx::query("ANALYZE d").execute(pool).await?;
 
     let mut out = Vec::with_capacity(SHAPES.len());
     for (_, sql) in SHAPES {
