@@ -133,3 +133,133 @@ fn jsonpath_filter_and_or() {
         "[2, 6]"
     );
 }
+
+// ── v7.39 jsonpath depth — differential-locked vs PG18.4 ──
+
+#[test]
+fn jsonpath_last_subscript() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('[1,2,3]', '$[last]')::text"),
+        "3"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('[1,2,3]', '$[last - 1]')::text"),
+        "2"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_array('[1,2,3,4]', '$[1 to last]')::text"
+        ),
+        "[2, 3, 4]"
+    );
+}
+
+#[test]
+fn jsonpath_numeric_item_methods() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('{\"n\":-5}', '$.n.abs()')::text"),
+        "5"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('{\"x\":4.7}', '$.x.floor()')::text"),
+        "4"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('{\"x\":4.2}', '$.x.ceiling()')::text"),
+        "5"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"s\":\"1.5\"}', '$.s.double()')::text"
+        ),
+        "1.5"
+    );
+}
+
+#[test]
+fn jsonpath_string_predicates() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"s\":\"abc\"}', '$.s ? (@ starts with \"ab\")')::text"
+        ),
+        "\"abc\""
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"s\":\"a1\"}', '$.s ? (@ like_regex \"[a-z]\\d\")')::text"
+        ),
+        "\"a1\""
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_exists('{\"s\":\"zz\"}', '$.s ? (@ starts with \"ab\")')"
+        ),
+        "false"
+    );
+}
+
+#[test]
+fn jsonpath_null_comparison_and_exists() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"a\":[1,null]}', '$.a[*] ? (@ == null)')::text"
+        ),
+        "null"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.a)')::text"),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.b)')::text"),
+        "false"
+    );
+}
+
+#[test]
+fn jsonpath_recursive_descent() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"a\":{\"b\":{\"c\":1}}}', '$.**.c')::text"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn jsonpath_vars_third_argument() {
+    let mut e = Engine::new();
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"a\":2}', '$.a ? (@ > $min)', '{\"min\":1}')::text"
+        ),
+        "2"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_exists('{\"a\":2}', '$.a ? (@ > $min)', '{\"min\":5}')"
+        ),
+        "false"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT jsonb_path_match('{\"a\":5}', '$.a > $lim', '{\"lim\":3}')"
+        ),
+        "true"
+    );
+}
