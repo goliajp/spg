@@ -356,6 +356,32 @@ impl Table {
         }
     }
 
+    /// v7.37.17 (Phase E4 fix) — read-only conflict probe for a
+    /// write-set's tombstones against THIS (fresher) relation: a target
+    /// RowId that is gone, or already tombstoned by a DIFFERENT
+    /// version, is a write-write conflict. Callers use this BEFORE
+    /// `replay_tx_writeset` so a conflicting UPDATE can drop its
+    /// paired insert too (atomicity of tombstone+insert pairs).
+    #[must_use]
+    pub fn tombstone_conflicts(
+        &self,
+        rids: &[crate::row_header::RowId],
+        v: u64,
+    ) -> alloc::vec::Vec<crate::row_header::RowId> {
+        rids.iter()
+            .filter(|rid| {
+                match (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid)) {
+                    Some(i) => self
+                        .headers
+                        .get(i)
+                        .is_some_and(|h| h.xmax != crate::row_header::XMAX_ALIVE && h.xmax != v),
+                    None => true,
+                }
+            })
+            .copied()
+            .collect()
+    }
+
     /// v7.37.17 (Phase E RC rebase) — replay a write-set extracted from
     /// an OLDER clone of this relation onto this (fresher) one, keeping
     /// the original RowIds. Deliberately does NOT capture redo: a

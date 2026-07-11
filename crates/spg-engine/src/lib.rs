@@ -414,6 +414,15 @@ struct TxState {
     /// first statement sees the BEGIN-time clone unchanged (it IS the
     /// latest base at that point); rebasing starts from the second.
     stmts_run: u32,
+    /// v7.37.17 (Phase E4 fix) — (old RowId → new RowId) pairs recorded
+    /// by every in-place UPDATE this tx ran, keyed by table (RowIds are
+    /// per-relation). An UPDATE's write-set is tombstone(old) +
+    /// insert(new); when a rebase skips a CONFLICTING tombstone (the
+    /// row was updated/deleted by a concurrently-committed tx), the
+    /// paired insert must be dropped too — otherwise the row
+    /// DUPLICATES (caught by the E4 isolation matrix).
+    update_pairs:
+        alloc::collections::BTreeMap<String, Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>>,
 }
 
 /// v7.11.0 — frozen read-only view of the engine's committed state.
