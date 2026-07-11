@@ -353,14 +353,30 @@ fn default_checkpoint_time_threshold() -> Option<core::time::Duration> {
 /// never fail on a tuning knob.
 fn engine_with_query_byte_budget(engine: Engine) -> Engine {
     const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
-    match std::env::var("SPG_MAX_QUERY_BYTES")
+    let mut engine = match std::env::var("SPG_MAX_QUERY_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
     {
         Some(0) => engine,
         Some(n) => engine.with_max_query_bytes(n),
         None => engine.with_max_query_bytes(DEFAULT_MAX_QUERY_BYTES),
+    };
+    // v7.37.15 (Phase C.3) — host-side wiring for the in-place MVCC
+    // write-path gate; the no_std engine can't read the environment
+    // itself. Off unless explicitly enabled (`SPG_MVCC_INPLACE=1`).
+    if mvcc_inplace_env_on() {
+        engine.set_mvcc_inplace(true);
     }
+    engine
+}
+
+/// `SPG_MVCC_INPLACE=1|true|on` — opt into the v7.37.15 in-place MVCC
+/// write path (tombstone DELETE / tombstone+append UPDATE). Default off
+/// until the gate-flip checklist closes.
+fn mvcc_inplace_env_on() -> bool {
+    std::env::var("SPG_MVCC_INPLACE").is_ok_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+    })
 }
 
 /// v7.1 — encode one v3 `auto_commit_sql` record. Layout:

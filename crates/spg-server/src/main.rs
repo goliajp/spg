@@ -1153,6 +1153,17 @@ fn run(
         engine = engine.with_max_query_bytes(n);
     }
 
+    // v7.37.15 (Phase C.3) — host-side wiring for the in-place MVCC
+    // write-path gate (`SPG_MVCC_INPLACE=1|true|on`); the no_std engine
+    // can't read the environment itself. Off by default until the
+    // gate-flip checklist closes. Survives the provider-rebuild swap
+    // below (the flag rides the moved engine).
+    if std::env::var("SPG_MVCC_INPLACE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+    {
+        engine.set_mvcc_inplace(true);
+    }
+
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
