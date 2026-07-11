@@ -1384,28 +1384,18 @@ impl Engine {
             })?;
         let affected = if inplace {
             // v7.37.15 (Epic W durable-tombstone slice) — stamp xmax
-            // ONLY on the in-place path. `mark_row_deleted` now records
-            // a `RowChange::Tombstone` for durability; the gate-off
-            // path below removes the rows via `delete_rows` (which
-            // records `RowChange::Delete`), so calling `mark_row_deleted`
-            // there too would double-log the deletion. The gate-off
-            // xmax stamp was already dead work (the row is physically
-            // removed immediately after), so scoping it here changes
-            // nothing observable for the default path.
-            for &pos in &positions {
-                // Errors here mean the position is out of bounds —
-                // already verified above; the subsequent no-op is
-                // silent (mark_row_deleted no-ops on bad positions).
-                let _ = table.mark_row_deleted(pos, xmax);
-            }
-            // Tombstone-only: rows stay in `table.rows()` with xmax set;
-            // count the distinct positions we tombstoned (the WHERE scan
-            // that produced `positions` is itself gated, so every
-            // position is a live, visible row).
-            let mut uniq: Vec<usize> = positions.clone();
-            uniq.sort_unstable();
-            uniq.dedup();
-            uniq.len() + cold_shadow_count
+            // ONLY on the in-place path; the gate-off path below removes
+            // the rows via `delete_rows` (which records
+            // `RowChange::Delete`), so tombstoning there too would
+            // double-log the deletion.
+            // v7.37.16 — BATCH tombstone: one pass, ONE multi-rowid
+            // `RowChange::Tombstone` redo record instead of one per row
+            // (~800 ns/row on a 10k-row DELETE). The return value counts
+            // rows NEWLY tombstoned — positions come from the
+            // visibility-gated WHERE scan above, so every entry is a
+            // live, visible row and the count equals the distinct
+            // position count the per-row loop used to compute.
+            table.mark_rows_deleted(&positions, xmax) + cold_shadow_count
         } else {
             table.delete_rows(&positions) + cold_shadow_count
         };
