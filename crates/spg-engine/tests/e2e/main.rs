@@ -322,6 +322,7 @@ mod e2e_sequence_last_value;
 mod e2e_session_identity_probes;
 mod e2e_session_probes;
 mod e2e_session_state_pg_dump_compat;
+mod e2e_bc_dates;
 mod e2e_pg_stat_counters;
 mod e2e_set_config_unified;
 mod e2e_set_constraints_pg_dump_compat;

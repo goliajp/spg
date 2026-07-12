@@ -186,7 +186,16 @@ pub(super) fn extract_field(
         _ => {}
     }
     let result = match field {
-        F::Year => i64::from(y),
+        // v7.39 (GUC knife 6, BC) — PG reports the era year: there is
+        // no year 0, so astronomical year <= 0 is BC year 1-y,
+        // reported negative (0044-03-15 BC -> -44, not -43).
+        F::Year => {
+            if y <= 0 {
+                i64::from(y) - 1
+            } else {
+                i64::from(y)
+            }
+        }
         F::Month => i64::from(m),
         F::Day => i64::from(d),
         F::Hour => hh,
@@ -201,7 +210,11 @@ pub(super) fn extract_field(
         F::Isodow => i64::from((days + 3).rem_euclid(7)) + 1,
         F::Doy => i64::from(days - days_from_civil(y, 1, 1)) + 1,
         F::Week => iso_week_and_year(days, y).0,
-        F::Isoyear => iso_week_and_year(days, y).1,
+        F::Isoyear => {
+            let iso = iso_week_and_year(days, y).1;
+            // Same no-year-zero reporting as F::Year.
+            if iso <= 0 { iso - 1 } else { iso }
+        }
         F::Quarter => i64::from((m - 1) / 3) + 1,
         F::Decade => i64::from(y).div_euclid(10),
         F::Century => era_bucket(y, 100),

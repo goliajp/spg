@@ -5226,13 +5226,19 @@ fn encode_pg_text_cell(
         // `write_cell_timestamp_matches_engine_format` below.
         // v7.39 (GUC knife 3) — the stack fast paths spell ISO; a
         // non-ISO DateStyle drops to the styled formatter below.
+        // v7.39 (GUC knife 6, BC) — so does a BC value (astronomical
+        // year <= 0, i.e. any day before 0001-01-01 = day -719162).
         Value::Timestamp(micros)
-            if style.date_style == spg_engine::eval::DateStyleKind::Iso =>
+            if style.date_style == spg_engine::eval::DateStyleKind::Iso
+                && *micros >= AD_FLOOR_DAYS * 86_400_000_000 =>
         {
             let with_tz = matches!(ty, Some(DataType::Timestamptz));
             return write_cell_timestamp(out, *micros, with_tz);
         }
-        Value::Date(days) if style.date_style == spg_engine::eval::DateStyleKind::Iso => {
+        Value::Date(days)
+            if style.date_style == spg_engine::eval::DateStyleKind::Iso
+                && i64::from(*days) >= AD_FLOOR_DAYS =>
+        {
             return write_cell_date(out, *days);
         }
         _ => {}
@@ -5305,6 +5311,11 @@ fn write_pad6(buf: &mut [u8], p: &mut usize, n: u32) {
 // engine formatter for out-of-range years (< 0 or > 9999) — those
 // hit pg_dump regression corpora, not the per-row PROJ hot path,
 // so the slow path is fine there.
+/// v7.39 (GUC knife 6, BC) — days-since-epoch of 0001-01-01; anything
+/// below is a BC value the stack fast paths don't spell (they have no
+/// " BC" suffix logic) — those cells fall back to the engine formatter.
+const AD_FLOOR_DAYS: i64 = -719_162;
+
 fn write_cell_timestamp(out: &mut Vec<u8>, micros: i64, with_tz: bool) -> std::io::Result<()> {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     let days = micros.div_euclid(MICROS_PER_DAY);
