@@ -182,6 +182,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn bench_spg_embedded() -> Vec<f64> {
     use spg_engine::Engine;
     let mut eng = Engine::new();
+    // v7.39 (parallel-agg) — a real embedded customer goes through
+    // spg_embedded::Database, which injects the std parallel runner;
+    // the bench builds a bare Engine, so mirror that injection here
+    // (same SPG_PARALLEL opt-out) or the panel silently measures the
+    // serial path forever.
+    if !std::env::var("SPG_PARALLEL")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+    {
+        struct R;
+        impl spg_engine::ParallelRunner for R {
+            fn run_shards(
+                &self,
+                n: usize,
+                f: &(dyn Fn(usize) -> Box<dyn core::any::Any + Send> + Sync),
+            ) -> Vec<Box<dyn core::any::Any + Send>> {
+                std::thread::scope(|s| {
+                    let hs: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            }
+        }
+        eng.set_parallel_runner(std::sync::Arc::new(R));
+    }
     eng.execute("CREATE TABLE h (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)")
         .unwrap();
     eng.execute("CREATE INDEX h_v_idx ON h (v)").unwrap();
