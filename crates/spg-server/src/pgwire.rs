@@ -483,7 +483,13 @@ fn handle_pg_simple_query(
     // v7.17.0 Phase 2.3 — resolve per-statement deadline
     // from the session `statement_timeout` GUC (default
     // `0` → `CancelToken::none()`, hot path unchanged).
-    let cancel = statement_cancel(settings);
+    // v7.39 (query cancel) — arm this statement with the session's
+    // CancelRequest flag (cleared first: an idle-time cancel must not
+    // kill the NEXT statement, matching PG).
+    conn_state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = statement_cancel(settings, &conn_state.cancel_flag);
     // v7.37.x (SPGS PROJ wire encode tax) — streaming simple-query
     // SELECT. When the SQL is a pure read (first word == SELECT, no
     // sequence-mutating function), bypass the materialising
@@ -744,7 +750,7 @@ fn handle_pg_simple_query(
                 // recover; truncate the partial frames and surface as
                 // a wire error so the client doesn't see a torn row.
                 wbuf.truncate(pre_len);
-                let (sqlstate, msg) = engine_error_to_wire(&e);
+                let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
                 send_error(wbuf, sqlstate, &msg)?;
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
@@ -815,7 +821,7 @@ fn handle_pg_simple_query(
             // SQLSTATE `57014` so PG client libraries
             // surface it as a statement-timeout, not a
             // generic `42000` syntax / access error.
-            let (sqlstate, msg) = engine_error_to_wire(&e);
+            let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
             send_error(wbuf, sqlstate, &msg)?;
             // After an error inside a TX, PG goes to 'E'
             // and stays there until ROLLBACK. We track
@@ -941,7 +947,13 @@ fn handle_pg_simple_query_one_into_wbuf(
         send_canned(wbuf, &canned)?;
         return Ok(());
     }
-    let cancel = statement_cancel(settings);
+    // v7.39 (query cancel) — arm this statement with the session's
+    // CancelRequest flag (cleared first: an idle-time cancel must not
+    // kill the NEXT statement, matching PG).
+    conn_state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = statement_cancel(settings, &conn_state.cancel_flag);
     conn_state
         .wait_event
         .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -974,7 +986,7 @@ fn handle_pg_simple_query_one_into_wbuf(
             };
         }
         Err(e) => {
-            let (sqlstate, msg) = engine_error_to_wire(&e);
+            let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
             send_error(wbuf, sqlstate, &msg)?;
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                 b'E'
@@ -1065,6 +1077,24 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 stream.read_exact(&mut hdr)?;
                 stream.write_all(b"N")?;
             }
+            // v7.39 (query cancel) — CancelRequest: 16 bytes total
+            // (len, code, pid, secret). Trip the target session's
+            // cancel flag when the secret matches, then close with
+            // no response (PG replies nothing on this connection).
+            Some(80877102) => {
+                let mut pkt = [0u8; 16];
+                stream.read_exact(&mut pkt)?;
+                let pid = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
+                let secret = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+                if let Ok(conns) = state.connections.read()
+                    && let Some(c) = conns.iter().find(|c| c.pid == pid)
+                    && c.cancel_secret == secret
+                {
+                    c.cancel_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             _ => return run_pg_session(&mut stream, state, false),
         }
     }
@@ -1148,6 +1178,8 @@ fn run_pg_session(
         last_query_start_us: std::sync::atomic::AtomicI64::new(0),
         in_transaction: std::sync::atomic::AtomicBool::new(false),
         application_name: std::sync::RwLock::new(startup_app_name.clone()),
+        cancel_secret: new_cancel_secret(),
+        cancel_flag: std::sync::atomic::AtomicBool::new(false),
     });
     if let Ok(mut conns) = state.connections.write() {
         conns.push(Arc::clone(&conn_state));
@@ -1212,11 +1244,12 @@ fn run_pg_session(
     send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
     send_parameter_status(stream, "integer_datetimes", "on")?;
     send_parameter_status(stream, "standard_conforming_strings", "on")?;
-    // BackendKeyData — required by spec but we don't support cancel,
-    // so the keys are bogus. Most clients ignore.
+    // v7.39 (query cancel) — BackendKeyData carries the REAL
+    // (pid, secret) pair; a CancelRequest connection echoing them
+    // trips this session's cancel flag mid-statement.
     let mut bkd = Vec::with_capacity(8);
-    bkd.extend_from_slice(&std::process::id().to_be_bytes());
-    bkd.extend_from_slice(&0u32.to_be_bytes());
+    bkd.extend_from_slice(&conn_state.pid.to_be_bytes());
+    bkd.extend_from_slice(&conn_state.cancel_secret.to_be_bytes());
     send_msg(stream, b'K', &bkd)?;
     send_ready_for_query(stream, b'I')?;
 
@@ -1437,6 +1470,7 @@ fn run_pg_session(
                     state,
                     role,
                     &mut tx_state,
+                    &conn_state,
                 ) {
                     send_error(&mut wbuf, sqlstate, &msg)?;
                 }
@@ -2529,6 +2563,7 @@ fn handle_execute(
     state: &Arc<ServerState>,
     role: Role,
     tx_state: &mut u8,
+    conn_state: &Arc<crate::ConnState>,
 ) -> Result<(), (&'static str, String)> {
     // v7.37 (SPGS proj_25k bar) — `out` was `&mut dyn Write`
     // pre-7.37; the simple-query Q path already wrote DataRow
@@ -2566,7 +2601,13 @@ fn handle_execute(
     // taking the engine lock so the lock-hold window matches the
     // simple-query path; the cancel token rides into
     // `execute_prepared_with_cancel`.
-    let cancel = statement_cancel(settings);
+    // v7.39 (query cancel) — arm this statement with the session's
+    // CancelRequest flag (cleared first: an idle-time cancel must not
+    // kill the NEXT statement, matching PG).
+    conn_state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = statement_cancel(settings, &conn_state.cancel_flag);
     // v6.1.1: dispatch through `Engine::execute_prepared` — the
     // AST is reused from Parse; only the substitute walk + dispatch
     // happen here. No SQL re-parse, no canned-response check (the
@@ -2618,7 +2659,7 @@ fn handle_execute(
         let row_count = match stream_emit_result {
             Ok(n) => n,
             Err(e) => {
-                let (sqlstate, msg) = engine_error_to_wire(&e);
+                let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
                 return Err((sqlstate, msg));
             }
         };
@@ -2690,7 +2731,7 @@ fn handle_execute(
             };
         }
         Err(e) => {
-            let (sqlstate, msg) = engine_error_to_wire(&e);
+            let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
             return Err((sqlstate, msg));
         }
         // v7.5.0 — QueryResult is #[non_exhaustive].
@@ -2928,20 +2969,42 @@ fn parse_timeout_ms(s: &str) -> Option<u64> {
 /// hot path (default SLO load) elides the deadline check entirely
 /// — costing only one predicted-not-taken branch in
 /// `CancelToken::is_cancelled`.
-fn statement_cancel(settings: &std::collections::HashMap<String, String>) -> CancelToken<'static> {
+fn statement_cancel<'a>(
+    settings: &std::collections::HashMap<String, String>,
+    // v7.39 (query cancel) — the session's CancelRequest flag; every
+    // statement token carries it (reset by the caller at statement
+    // start so an idle-time cancel is a no-op, like PG).
+    flag: &'a std::sync::atomic::AtomicBool,
+) -> CancelToken<'a> {
+    let base = CancelToken::from_flag(flag);
     let raw = settings
         .get("statement_timeout")
         .map(String::as_str)
         .unwrap_or("0");
     let Some(ms) = parse_timeout_ms(raw) else {
-        return CancelToken::none();
+        return base;
     };
     if ms == 0 {
-        return CancelToken::none();
+        return base;
     }
     let now_fn: MonotonicNowFn = monotonic_now_us;
     let deadline_us = monotonic_now_us().saturating_add(ms.saturating_mul(1_000));
-    CancelToken::none().with_deadline(now_fn, deadline_us)
+    base.with_deadline(now_fn, deadline_us)
+}
+
+/// v7.39 — a per-connection cancel secret. Not cryptographic (PG's
+/// is a plain 32-bit value too); mixed from the thread-unique
+/// RandomState hasher so parallel connections don't collide.
+fn new_cancel_secret() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    (h.finish() >> 16) as u32
 }
 
 /// Map an `EngineError` to (SQLSTATE, wire message). v7.17.0
@@ -2950,6 +3013,27 @@ fn statement_cancel(settings: &std::collections::HashMap<String, String>) -> Can
 /// statement due to statement timeout" text driver libraries grep
 /// for. Everything else stays on the legacy `42000` to preserve
 /// existing client-side error parsing.
+/// v7.39 (query cancel) — like [`engine_error_to_wire`], but a
+/// `Cancelled` raised while the session's CancelRequest flag is set
+/// reports PG's "user request" text instead of the timeout text
+/// (drivers grep both forms).
+fn engine_error_to_wire_conn(
+    e: &EngineError,
+    conn_state: &crate::ConnState,
+) -> (&'static str, String) {
+    if matches!(e, EngineError::Cancelled)
+        && conn_state
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return (
+            "57014",
+            "canceling statement due to user request".to_string(),
+        );
+    }
+    engine_error_to_wire(e)
+}
+
 fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::Cancelled = e {
         return (
