@@ -344,8 +344,9 @@ fn ts_rank_returns_positive_float_when_matched() {
                          to_tsquery('english', 'fox & quick'))",
     );
     match v {
-        Value::Float(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
-        other => panic!("expected float, got {other:?}"),
+        // v7.39 — ts_rank returns float4 (Real), matching PG.
+        Value::Real(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
+        other => panic!("expected float4, got {other:?}"),
     }
 }
 
@@ -358,8 +359,8 @@ fn ts_rank_zero_when_no_match() {
                          to_tsquery('english', 'badger'))",
     );
     match v {
-        Value::Float(x) => assert_eq!(x, 0.0),
-        other => panic!("expected float, got {other:?}"),
+        Value::Real(x) => assert_eq!(x, 0.0),
+        other => panic!("expected float4, got {other:?}"),
     }
 }
 
@@ -372,8 +373,8 @@ fn ts_rank_cd_returns_positive_when_matched() {
                             to_tsquery('english', 'fox & quick'))",
     );
     match v {
-        Value::Float(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
-        other => panic!("expected float, got {other:?}"),
+        Value::Real(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
+        other => panic!("expected float4, got {other:?}"),
     }
 }
 

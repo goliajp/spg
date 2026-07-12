@@ -969,6 +969,8 @@ fn encode_binary_value(out: &mut Vec<u8>, v: &Value, declared: Option<DataType>)
         Value::Int(n) => out.extend_from_slice(&n.to_le_bytes()),
         Value::BigInt(n) => out.extend_from_slice(&n.to_le_bytes()),
         Value::Float(f) => out.extend_from_slice(&f.to_le_bytes()),
+        // v7.39 — REAL is a MySQL FLOAT (4-byte little-endian).
+        Value::Real(x) => out.extend_from_slice(&x.to_le_bytes()),
         Value::Text(s) | Value::Json(s) => {
             encode_lenenc_string(out, s.as_bytes());
         }
@@ -1385,6 +1387,7 @@ fn value_to_mysql_text(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
+        Value::Real(x) => spg_engine::eval::format_real(*x),
         Value::Text(s) | Value::Json(s) => s.to_string(),
         // v7.39 (bpchar epic) — MySQL strips CHAR(n) trailing pad on retrieval.
         Value::BpChar(s) => s.trim_end_matches(' ').to_string(),

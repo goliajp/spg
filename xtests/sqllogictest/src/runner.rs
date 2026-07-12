@@ -190,6 +190,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
+        // v7.39 — REAL renders float4out shortest form.
+        Value::Real(x) => spg_engine::eval::format_real(*x),
         Value::Float(x) => match ty {
             'I' => (*x as i64).to_string(),
             _ => format_real(*x),
