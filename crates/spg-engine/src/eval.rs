@@ -65,6 +65,7 @@ pub use format::{
 pub use format::{
     DateOrder, DateStyleKind, IntervalStyleKind, RenderStyle, format_date_array_styled,
     format_date_styled, format_float_array_styled, format_float_styled,
+    parse_date_literal_ordered, parse_timestamp_literal_ordered,
     format_interval_array_styled, format_interval_styled, format_real_styled,
     format_timestamp_array_styled, format_timestamp_styled, format_timestamptz_styled,
 };
@@ -755,6 +756,30 @@ pub fn eval_expr(
                     *t,
                     ctx.session_tz_offset(),
                 )));
+            }
+            // v7.39 (GUC knife 5) — text INPUT to date/timestamp under a
+            // non-MDY DateOrder disambiguates by the session order
+            // (`'01/02/2024'::date` is Feb 1 under DMY). The default MDY
+            // order flows through cast_value's parse_date_literal.
+            if ctx.render_style.date_order != format::DateOrder::Mdy {
+                match (&target, &v) {
+                    (CastTarget::Date, Value::Text(s)) => {
+                        if let Some(d) =
+                            format::parse_date_literal_ordered(s, ctx.render_style.date_order)
+                        {
+                            return Ok(Value::Date(d));
+                        }
+                    }
+                    (CastTarget::Timestamp | CastTarget::Timestamptz, Value::Text(s)) => {
+                        if let Some(t) = format::parse_timestamp_literal_ordered(
+                            s,
+                            ctx.render_style.date_order,
+                        ) {
+                            return Ok(Value::Timestamp(t));
+                        }
+                    }
+                    _ => {}
+                }
             }
             // v7.39 (GUC knife 3) — the out-function casts honour the
             // session render style, like PG's date_out/interval_out/

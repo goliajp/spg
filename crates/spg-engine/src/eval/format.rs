@@ -709,6 +709,19 @@ pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
 /// `None` on shape / numeric failure; the engine surfaces that as a
 /// `TypeMismatch` with the original text included.
 pub fn parse_date_literal(s: &str) -> Option<i32> {
+    parse_date_literal_ordered(s, DateOrder::Mdy)
+}
+
+/// v7.39 (GUC knife 5) — DateOrder-aware date input. PG disambiguates
+/// a three-field numeric date (`01/02/2024`, `02.01.2024`, `1/2/24`)
+/// by the DateStyle field order: MDY reads month first (the default —
+/// so `'01/02/2024'` is Jan 2 even with no SET), DMY day first, YMD
+/// year first (`'24/01/02'`, and `'1/2/24'` is 2001-02-24!). A
+/// two-digit year is < 70 → 20xx, >= 70 → 19xx. Field values that
+/// don't fit the order error (MDY `'13/02/2024'` is out of range —
+/// PG does NOT auto-swap). ISO year-first four-digit forms parse the
+/// same under every order.
+pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
     let s = s.trim();
     // PG special date values.
     if s.eq_ignore_ascii_case("epoch") {
@@ -743,26 +756,53 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     // of which PG accepts. Requires exactly three all-digit fields, the first
     // being the 4-digit year, so it stays unambiguous (no MDY/DMY guessing).
     let mut parts = s.splitn(3, ['-', '/', '.']);
-    let (ys, ms, ds) = (parts.next()?, parts.next()?, parts.next()?);
-    if ds.contains(['-', '/', '.', ' ']) {
+    let (fa, fb, fc) = (parts.next()?, parts.next()?, parts.next()?);
+    if fc.contains(['-', '/', '.', ' ']) {
         return None; // trailing separator / extra field / garbage
     }
-    if ys.len() != 4 || ms.is_empty() || ms.len() > 2 || ds.is_empty() || ds.len() > 2 {
-        return None;
-    }
-    if [ys, ms, ds]
+    if [fa, fb, fc]
         .iter()
-        .any(|p| !p.bytes().all(|b| b.is_ascii_digit()))
+        .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
     {
         return None;
     }
-    let y: i32 = ys.parse().ok()?;
+    // Year-first with an unambiguous 4-digit year parses identically
+    // under every order (`2020-1-5`, `2020/01/5`, `2020.1.05`).
+    if fa.len() == 4 && fb.len() <= 2 && fc.len() <= 2 {
+        let y: i32 = fa.parse().ok()?;
+        let m: u32 = fb.parse().ok()?;
+        let d: u32 = fc.parse().ok()?;
+        // PG validates the day against the actual (leap-aware) month
+        // length: `'2024-02-30'` raises "date/time field value out of
+        // range" rather than rolling forward into March.
+        if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
+            return None;
+        }
+        return Some(days_from_civil(y, m, d));
+    }
+    // Order-disambiguated short forms.
+    let expand_year = |t: &str| -> Option<i32> {
+        match t.len() {
+            4 => t.parse().ok(),
+            // PG's two-digit-year window.
+            1 | 2 => {
+                let n: i32 = t.parse().ok()?;
+                Some(if n < 70 { 2000 + n } else { 1900 + n })
+            }
+            _ => None,
+        }
+    };
+    let (ys, ms, ds) = match order {
+        DateOrder::Mdy => (fc, fa, fb),
+        DateOrder::Dmy => (fc, fb, fa),
+        DateOrder::Ymd => (fa, fb, fc),
+    };
+    if ms.len() > 2 || ds.len() > 2 {
+        return None;
+    }
+    let y = expand_year(ys)?;
     let m: u32 = ms.parse().ok()?;
     let d: u32 = ds.parse().ok()?;
-    // PG validates the day against the actual (leap-aware) month length:
-    // `'2024-02-30'` / `'2024-04-31'` / `'2023-02-29'` all raise "date/time
-    // field value out of range". Without this the parser would silently roll
-    // the overflow forward (Feb 30 → Mar 1) and corrupt data.
     if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
         return None;
     }
@@ -817,6 +857,34 @@ fn parse_month_name_date(s: &str) -> Option<i32> {
 /// missing → midnight. The fractional portion accepts 1–6 digits and
 /// pads with zeros to microseconds.
 pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
+    parse_timestamp_literal_ordered(s, DateOrder::Mdy)
+}
+
+/// v7.39 (GUC knife 5) — true when `s` tokenises as a numeric date shape
+/// (three digit fields, or the 8-digit compact form) whose FIELDS parse but
+/// whose values fail the calendar range checks — PG reports these as
+/// `date/time field value out of range` (with a DateStyle hint), while
+/// non-date-shaped text gets `invalid input syntax for type date`.
+pub fn date_text_is_field_shaped(s: &str) -> bool {
+    let s = s.trim();
+    let date_part = match s.find([' ', 'T']) {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    let b = date_part.as_bytes();
+    if b.len() == 8 && b.iter().all(u8::is_ascii_digit) {
+        return true;
+    }
+    let fields: alloc::vec::Vec<&str> = date_part.split(['-', '/', '.']).collect();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|f| !f.is_empty() && f.len() <= 4 && f.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// v7.39 (GUC knife 5) — DateOrder-aware timestamp input; the date
+/// part follows `parse_date_literal_ordered`'s disambiguation.
+pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64> {
     let trimmed = s.trim();
     // PG special timestamp values. `infinity` / `-infinity` use the i64
     // sentinels (they compare greater/less than every finite timestamp).
@@ -833,7 +901,7 @@ pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
         Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
         None => (trimmed, None),
     };
-    let days = parse_date_literal(date_part)?;
+    let days = parse_date_literal_ordered(date_part, order)?;
     let (day_micros, tz_offset_micros) = match time_part {
         None => (0, 0),
         Some(t) => parse_time_of_day_micros(t)?,

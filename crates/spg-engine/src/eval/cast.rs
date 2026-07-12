@@ -700,8 +700,19 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
                         detail: "timestamp out of DATE range".into(),
                     });
             }
+            // PG error split: numeric-shaped input whose field values
+            // fail the calendar checks is "out of range" (plus PG's
+            // DateStyle hint); anything else is an input-syntax error.
+            if super::format::date_text_is_field_shaped(&s) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "date/time field value out of range: {s:?}\n\
+                         HINT:  Perhaps you need a different \"DateStyle\" setting."
+                    ),
+                });
+            }
             Err(EvalError::TypeMismatch {
-                detail: format!("cannot parse {s:?} as DATE (expected YYYY-MM-DD)"),
+                detail: format!("invalid input syntax for type date: {s:?}"),
             })
         }
         other => Err(EvalError::TypeMismatch {
