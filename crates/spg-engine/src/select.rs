@@ -5400,6 +5400,9 @@ pub(crate) fn infer_column_types(
                 Value::SmallIntArray(_) => DataType::SmallIntArray,
                 Value::FloatArray(_) => DataType::FloatArray,
                 Value::BoolArray(_) => DataType::BoolArray,
+                // v7.39 (GUC knife 2) — an interval projection describes
+                // as INTERVAL (typed drivers read the RowDescription OID).
+                Value::Interval { .. } => DataType::Interval,
                 _ => DataType::Text,
             };
             all_null = false;

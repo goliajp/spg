@@ -37,19 +37,25 @@ fn pg_settings_has_all_widened_defaults() {
 }
 
 #[test]
-fn pg_settings_lock_timeout_matches_show() {
+fn pg_settings_lock_timeout_is_bare_ms_with_unit() {
     let mut e = Engine::new();
-    // Setting via SET overrides both surfaces.
+    // v7.39 (GUC knife 2) — PG18 reports ms-unit time GUCs in
+    // pg_settings as the bare millisecond count with unit = 'ms'
+    // ("250ms" -> 250 | ms), NOT the SHOW rendering. Verified against
+    // the live oracle.
     e.execute("SET lock_timeout = '250ms'").unwrap();
     let r = e
-        .execute("SELECT setting FROM pg_settings WHERE name = 'lock_timeout'")
+        .execute("SELECT setting, unit FROM pg_settings WHERE name = 'lock_timeout'")
         .unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!("Rows");
     };
     assert_eq!(rows.len(), 1);
-    match &rows[0].values[0] {
-        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "250ms"),
+    match (&rows[0].values[0], &rows[0].values[1]) {
+        (spg_storage::Value::Text(s), spg_storage::Value::Text(u)) => {
+            assert_eq!(s.as_ref(), "250");
+            assert_eq!(u.as_ref(), "ms");
+        }
         other => panic!("got {other:?}"),
     }
 }

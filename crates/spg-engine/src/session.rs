@@ -53,7 +53,14 @@ impl Engine {
             spg_sql::ast::SetValue::String(s) => s,
             spg_sql::ast::SetValue::Ident(s) => s,
             spg_sql::ast::SetValue::Number(s) => s,
-            spg_sql::ast::SetValue::Default => String::new(),
+            // v7.39 (GUC) — `SET name = DEFAULT` / `SET TIME ZONE
+            // LOCAL` restore the default, i.e. drop the session
+            // override (storing "" would make SHOW render an empty
+            // string instead of the default).
+            spg_sql::ast::SetValue::Default => {
+                self.session_params.remove(&name.to_ascii_lowercase());
+                return;
+            }
         };
         let key = name.to_ascii_lowercase();
         // v7.14.0 — mysqldump preamble emits
@@ -220,7 +227,7 @@ impl Engine {
 ///
 /// Returns `None` on parse failure (callers treat None as "GUC not
 /// set / default applies").
-fn parse_pg_duration_ms(raw: &str) -> Option<u64> {
+pub(crate) fn parse_pg_duration_ms(raw: &str) -> Option<u64> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
