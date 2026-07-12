@@ -142,3 +142,70 @@ fn ts_rank_returns_float4_and_accepts_text_weights() {
     );
     assert!((w - 0.060_792_71).abs() < 1e-6, "got {w}");
 }
+
+// v7.39 (FTS mark_hl_fragments 研读轮) — the MaxFragments selector
+// follows PG's cover/greedy/stretch/shrink algorithm; every expected
+// string below is the live PG18 oracle's output byte-for-byte.
+#[test]
+fn fragment_selector_matches_pg_algorithm() {
+    let mut e = Engine::new();
+    const DOC: &str = "The quick brown fox jumps over the lazy dog while the cat \
+watches the fox and the dog from a tall tree near the river bank where fish swim \
+under the old wooden bridge every sunny morning";
+    // Single-term: asymmetric stretch (left <= half the remainder,
+    // right takes the rest), bad endpoints shrunk.
+    let got = first_text(
+        &mut e,
+        &format!(
+            "SELECT ts_headline('english', '{DOC}', to_tsquery('english','fox'), \
+             'MinWords=2, MaxFragments=1, MaxWords=8')"
+        ),
+    );
+    assert_eq!(got, "quick brown <b>fox</b> jumps over the lazy");
+    // Two fragments in document order, greedy by interesting words.
+    let got = first_text(
+        &mut e,
+        &format!(
+            "SELECT ts_headline('english', '{DOC}', to_tsquery('english','fox'), \
+             'MinWords=2, MaxFragments=2, MaxWords=6')"
+        ),
+    );
+    assert_eq!(got, "quick brown <b>fox</b> jumps over ... watches the <b>fox</b>");
+    // AND cover spans both terms; split into <= MaxWords fragments.
+    let got = first_text(
+        &mut e,
+        &format!(
+            "SELECT ts_headline('english', '{DOC}', \
+             to_tsquery('english','fox & bridge'), \
+             'MinWords=2, MaxFragments=2, MaxWords=10')"
+        ),
+    );
+    assert_eq!(
+        got,
+        "watches the <b>fox</b> and the dog from a tall tree ... \
+under the old wooden <b>bridge</b> every sunny morning"
+    );
+    // ShortWord controls endpoint shrinking.
+    let got = first_text(
+        &mut e,
+        "SELECT ts_headline('english', 'one two three four five six seven eight \
+nine ten matchword eleven twelve thirteen fourteen fifteen', \
+         to_tsquery('simple','matchword'), \
+         'MinWords=2, MaxFragments=1, MaxWords=5, ShortWord=5')",
+    );
+    assert_eq!(got, "<b>matchword</b> eleven twelve thirteen fourteen");
+    // Unmatched LONG document: first MinWords words (fragment mode's
+    // only use of MinWords) — same in window mode.
+    let got = first_text(
+        &mut e,
+        "SELECT ts_headline('english', 'The quick brown fox jumps over the lazy dog', \
+         to_tsquery('english','absentterm'), 'MinWords=4, MaxFragments=2, MaxWords=6')",
+    );
+    assert_eq!(got, "The quick brown fox");
+    let got = first_text(
+        &mut e,
+        "SELECT ts_headline('english', 'The quick brown fox jumps over the lazy dog \
+while the cat watches', to_tsquery('english','absentterm'), 'MinWords=4, MaxWords=6')",
+    );
+    assert_eq!(got, "The quick brown fox");
+}
