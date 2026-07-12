@@ -352,6 +352,7 @@ mod e2e_pgbouncer_compat;
     unused_variables
 )]
 mod e2e_pgwire;
+mod e2e_query_cancel;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
