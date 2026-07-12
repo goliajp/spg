@@ -7709,7 +7709,7 @@ fn apply_function_dispatch(
                 None => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_size_bytes(): could not parse {trimmed:?}"
+                            "invalid size: \"{trimmed}\""
                         ),
                     });
                 }
@@ -7717,7 +7717,7 @@ fn apply_function_dispatch(
             let num: f64 = num_str.trim().parse().map_err(|_| {
                 EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "pg_size_bytes(): could not parse numeric part {num_str:?}"
+                        "invalid size: \"{num_str}\""
                     ),
                 }
             })?;
