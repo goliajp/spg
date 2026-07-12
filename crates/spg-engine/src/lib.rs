@@ -335,6 +335,58 @@ pub type ClockFn = fn() -> i64;
 /// `pg_stat_database.numbackends`.
 pub type BackendCountFn = fn() -> u32;
 
+/// v7.39 (tz epic) — host-injected IANA timezone lookups (the no_std
+/// engine can't read the system zoneinfo directory; spg-tzif is the
+/// std-side implementation). All instants are MICROSECONDS.
+/// UTC offset (µs east) of a zone at a UTC instant; None = unknown zone.
+pub type TzOffsetFn = fn(&str, i64) -> Option<i64>;
+/// Local wall-clock µs -> UTC µs with PG's DST disambiguation.
+pub type TzLocalizeFn = fn(&str, i64) -> Option<i64>;
+/// Canonical zone spelling ("asia/tokyo" -> "Asia/Tokyo").
+pub type TzCanonFn = fn(&str) -> Option<alloc::string::String>;
+/// Zone designation ("JST", "EDT") at a UTC instant.
+pub type TzAbbrevFn = fn(&str, i64) -> Option<alloc::string::String>;
+
+/// v7.39 (tz epic) — per-statement snapshot of the session TimeZone,
+/// consumed per-VALUE by the timestamptz renderers (a DST zone's
+/// offset depends on the instant being rendered).
+#[derive(Debug, Clone)]
+pub enum SessionTz {
+    Utc,
+    /// Fixed offset, µs east.
+    Fixed(i64),
+    /// IANA zone + the host lookups.
+    Named(alloc::string::String, TzOffsetFn, TzAbbrevFn),
+}
+
+impl SessionTz {
+    #[must_use]
+    pub fn is_utc(&self) -> bool {
+        matches!(self, Self::Utc) || matches!(self, Self::Fixed(0))
+    }
+
+    /// Offset (µs east) at a UTC instant.
+    #[must_use]
+    pub fn offset_at(&self, utc_micros: i64) -> i64 {
+        match self {
+            Self::Utc => 0,
+            Self::Fixed(off) => *off,
+            Self::Named(zone, f, _) => f(zone, utc_micros).unwrap_or(0),
+        }
+    }
+
+    /// Designation for the non-ISO DateStyle suffix: a named zone's
+    /// abbreviation at the instant; None for UTC/fixed (callers spell
+    /// "UTC" / "+09" themselves).
+    #[must_use]
+    pub fn abbrev_at(&self, utc_micros: i64) -> Option<alloc::string::String> {
+        match self {
+            Self::Named(zone, _, f) => f(zone, utc_micros),
+            _ => None,
+        }
+    }
+}
+
 /// Function pointer that produces 16 cryptographically random bytes.
 /// Like `ClockFn`, the engine is `no_std` and can't reach for /dev/urandom
 /// itself — host (`spg-server`) injects an OS-backed source. `None`
@@ -732,6 +784,12 @@ pub struct Engine {
     /// pg_stat_database.numbackends (ClockFn-style fn slot; the server
     /// wires its connection registry, embedded stays None -> 1).
     pub(crate) backend_count_fn: Option<BackendCountFn>,
+    /// v7.39 (tz epic) — injected IANA timezone lookups; None on a
+    /// host without zoneinfo (named zones then fail to SET, honestly).
+    pub(crate) tz_offset_fn: Option<TzOffsetFn>,
+    pub(crate) tz_localize_fn: Option<TzLocalizeFn>,
+    pub(crate) tz_canon_fn: Option<TzCanonFn>,
+    pub(crate) tz_abbrev_fn: Option<TzAbbrevFn>,
     pub(crate) stat_tup_inserted: u64,
     pub(crate) stat_tup_updated: u64,
     pub(crate) stat_tup_deleted: u64,
@@ -908,6 +966,10 @@ impl Engine {
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            tz_offset_fn: None,
+            tz_localize_fn: None,
+            tz_canon_fn: None,
+            tz_abbrev_fn: None,
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -1126,6 +1188,21 @@ impl Engine {
         self.backend_count_fn = Some(f);
     }
 
+    /// v7.39 (tz epic) — inject the host's IANA timezone lookups
+    /// (spg-tzif's fn family on std hosts).
+    pub fn set_tz_fns(
+        &mut self,
+        offset: TzOffsetFn,
+        localize: TzLocalizeFn,
+        canon: TzCanonFn,
+        abbrev: TzAbbrevFn,
+    ) {
+        self.tz_offset_fn = Some(offset);
+        self.tz_localize_fn = Some(localize);
+        self.tz_canon_fn = Some(canon);
+        self.tz_abbrev_fn = Some(abbrev);
+    }
+
     pub fn set_parallel_runner(&mut self, runner: alloc::sync::Arc<dyn ParallelRunner>) {
         self.parallel_runner = ParallelRunnerSlot(Some(runner));
     }
@@ -1223,6 +1300,10 @@ impl Engine {
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            tz_offset_fn: None,
+            tz_localize_fn: None,
+            tz_canon_fn: None,
+            tz_abbrev_fn: None,
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -1315,6 +1396,10 @@ impl Engine {
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            tz_offset_fn: None,
+            tz_localize_fn: None,
+            tz_canon_fn: None,
+            tz_abbrev_fn: None,
             stat_tup_inserted: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,

@@ -1196,6 +1196,13 @@ fn run(
     // v7.39 (pg_stat knife A) — pg_stat_database.numbackends reads the
     // live connection count.
     engine.set_backend_count_fn(live_backend_count);
+    // v7.39 (tz epic) — named-timezone lookups via the system zoneinfo.
+    engine.set_tz_fns(
+        spg_tzif::tz_offset_at,
+        spg_tzif::tz_local_to_utc,
+        spg_tzif::tz_canonical,
+        spg_tzif::tz_abbrev_at,
+    );
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {

@@ -184,8 +184,9 @@ fn implicit_serial_sequence_addressable_after_import() {
     }
 }
 
-/// Round-23a — a table whose sequence was NEVER addressed keeps the
-/// exact pre-7.29 max+1 behaviour.
+/// Round-23a (updated for real sequences) — BIGSERIAL draws from its
+/// sequence like PG: a DELETE never rewinds it, so the insert after
+/// deleting id 2 gets id 3 (the pre-7.29 max+1 refill is gone).
 #[test]
 fn unaddressed_serial_keeps_max_plus_one() {
     let mut db = spg_embedded::Database::open_in_memory();
@@ -197,7 +198,7 @@ fn unaddressed_serial_keeps_max_plus_one() {
     let r = db.execute("SELECT MAX(id) FROM t").unwrap();
     match r {
         spg_embedded::QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(2));
+            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(3));
         }
         other => panic!("{other:?}"),
     }
@@ -232,7 +233,8 @@ fn on_conflict_do_nothing_respects_nulls_not_distinct() {
         other => panic!("{other:?}"),
     }
     // Default NULLS DISTINCT stays NULL-permissive: two NULL-key
-    // rows coexist and ON CONFLICT never fires for them.
+    // rows coexist and ON CONFLICT never fires for them (PG18 counts
+    // exactly the two inserts — oracle-verified).
     db.execute("CREATE TABLE g2 (name TEXT NOT NULL, domain TEXT, UNIQUE (name, domain))")
         .unwrap();
     for _ in 0..2 {

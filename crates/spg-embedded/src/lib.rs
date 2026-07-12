@@ -384,6 +384,13 @@ fn engine_with_query_byte_budget(engine: Engine) -> Engine {
     {
         engine.set_parallel_runner(std::sync::Arc::new(ScopedThreadRunner));
     }
+    // v7.39 (tz epic) — named-timezone lookups via the system zoneinfo.
+    engine.set_tz_fns(
+        spg_tzif::tz_offset_at,
+        spg_tzif::tz_local_to_utc,
+        spg_tzif::tz_canonical,
+        spg_tzif::tz_abbrev_at,
+    );
     engine
 }
 

@@ -206,19 +206,21 @@ fn timestamptz_text_honours_session_timezone() {
         "2024-01-15 10:30:00+00"
     );
 
-    // AT TIME ZONE unchanged: numeric adds, named subtracts (PG's quirk).
+    // AT TIME ZONE: numeric adds, named subtracts (PG's quirk).
+    // v7.39 (tz epic) — naive AT ZONE types as timestamptz, so the
+    // UTC session renders +00 (both strings are PG18's own output).
     assert_eq!(
         t(
             &mut e,
             "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE '+09')::text"
         ),
-        "2024-01-15 19:30:00"
+        "2024-01-15 19:30:00+00"
     );
     assert_eq!(
         t(
             &mut e,
             "SELECT ('2024-01-15 10:30:00'::timestamp AT TIME ZONE 'JST')::text"
         ),
-        "2024-01-15 01:30:00"
+        "2024-01-15 01:30:00+00"
     );
 }

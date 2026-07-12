@@ -173,13 +173,41 @@ pub fn format_timestamp_styled(micros: i64, style: &RenderStyle) -> String {
 /// keeps the `+00` offset suffix; the other styles append the zone
 /// NAME (` UTC`), as PG does.
 pub fn format_timestamptz_styled(micros: i64, style: &RenderStyle) -> String {
+    format_timestamptz_tz(micros, style, 0, None)
+}
+
+/// v7.39 (tz epic) — the session-timezone-aware renderer: shift by the
+/// per-value offset; ISO appends the numeric offset (`+09`, `+05:45`),
+/// the other DateStyles append the zone designation — a named zone's
+/// abbreviation (`JST`, `EDT`), a fixed offset's numeric form, or
+/// `UTC` (all PG18-differential).
+pub fn format_timestamptz_tz(
+    micros: i64,
+    style: &RenderStyle,
+    offset_micros: i64,
+    abbr: Option<&str>,
+) -> String {
     if style.date_style == DateStyleKind::Iso {
-        return format_timestamptz_at(micros, 0);
+        return format_timestamptz_at(micros, offset_micros);
     }
     if micros == i64::MAX || micros == i64::MIN {
         return format_timestamp(micros);
     }
-    format!("{} UTC", format_timestamp_styled(micros, style))
+    let body = format_timestamp_styled(micros + offset_micros, style);
+    match abbr {
+        Some(a) => format!("{body} {a}"),
+        None if offset_micros == 0 => format!("{body} UTC"),
+        None => {
+            let total_min = (offset_micros / 60_000_000).abs();
+            let (h, m) = (total_min / 60, total_min % 60);
+            let sign = if offset_micros < 0 { '-' } else { '+' };
+            if m == 0 {
+                format!("{body} {sign}{h:02}")
+            } else {
+                format!("{body} {sign}{h:02}:{m:02}")
+            }
+        }
+    }
 }
 
 /// `H:MM:SS[.frac]` — the sql_standard time body (hour unpadded),
@@ -929,17 +957,26 @@ pub fn date_text_is_field_shaped(s: &str) -> bool {
 /// v7.39 (GUC knife 5) — DateOrder-aware timestamp input; the date
 /// part follows `parse_date_literal_ordered`'s disambiguation.
 pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64> {
+    parse_timestamp_literal_tz_ordered(s, order).map(|(us, _)| us)
+}
+
+/// v7.39 (tz epic) — like `parse_timestamp_literal_ordered` but also
+/// reports whether the literal carried an explicit offset. A naive
+/// literal's micros are the WALL clock (caller localises against the
+/// session zone for a timestamptz); an offset-bearing literal's are
+/// UTC already.
+pub fn parse_timestamp_literal_tz_ordered(s: &str, order: DateOrder) -> Option<(i64, bool)> {
     let trimmed = s.trim();
     // PG special timestamp values. `infinity` / `-infinity` use the i64
     // sentinels (they compare greater/less than every finite timestamp).
     if trimmed.eq_ignore_ascii_case("epoch") {
-        return Some(0);
+        return Some((0, true));
     }
     if trimmed.eq_ignore_ascii_case("infinity") || trimmed.eq_ignore_ascii_case("+infinity") {
-        return Some(i64::MAX);
+        return Some((i64::MAX, true));
     }
     if trimmed.eq_ignore_ascii_case("-infinity") {
-        return Some(i64::MIN);
+        return Some((i64::MIN, true));
     }
     // v7.39 (GUC knife 6, BC) — the era marker trails the TIME part
     // (`0044-03-15 10:20:30 BC`); strip it and re-map the parsed date.
@@ -968,10 +1005,12 @@ pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64>
         }
         days = days_from_civil(1 - y, m, d);
     }
-    let (day_micros, tz_offset_micros) = match time_part {
-        None => (0, 0),
-        Some(t) => parse_time_of_day_micros(t)?,
+    let (day_micros, tz_offset) = match time_part {
+        None => (0, None),
+        Some(t) => parse_time_of_day_micros_tz(t)?,
     };
+    let had_tz = tz_offset.is_some();
+    let tz_offset_micros = tz_offset.unwrap_or(0);
     // PG semantics: a TIMESTAMPTZ literal with an explicit offset
     // is normalised to UTC for storage. `'12:00:00+09'` means
     // 12:00:00 in a UTC+09 zone → 03:00:00 UTC → subtract the
@@ -981,7 +1020,10 @@ pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64>
     // round-trip then re-applies the session timezone on the
     // SELECT side when format_timestamp is asked for a TZ-aware
     // render.
-    Some(i64::from(days) * 86_400_000_000 + day_micros - tz_offset_micros)
+    Some((
+        i64::from(days) * 86_400_000_000 + day_micros - tz_offset_micros,
+        had_tz,
+    ))
 }
 
 /// v7.15.0 — Parse `HH:MM:SS[.frac][<tz>]` and return
@@ -997,6 +1039,14 @@ pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64>
 /// Anything else after the seconds = parse failure (the caller
 /// surfaces as "cannot parse … as TIMESTAMP").
 fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
+    parse_time_of_day_micros_tz(t).map(|(us, tz)| (us, tz.unwrap_or(0)))
+}
+
+/// v7.39 (tz epic) — like `parse_time_of_day_micros` but reports
+/// whether the literal carried an explicit offset (`None` = naive; a
+/// timestamptz cast then interprets the wall clock in the session
+/// zone, like PG).
+fn parse_time_of_day_micros_tz(t: &str) -> Option<(i64, Option<i64>)> {
     let t = t.trim();
     // Detect & strip optional TZ suffix. Anchor on the first
     // `+` / `-` AFTER position 8 (so the leading sign on a
@@ -1004,15 +1054,15 @@ fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
     // boundary if the time itself is somehow malformed).
     // ` UTC` and trailing `Z` also count as zero-offset TZ tags.
     let (core, tz_micros) = if let Some(rest) = t.strip_suffix('Z') {
-        (rest, 0i64)
+        (rest, Some(0i64))
     } else if let Some(rest) = t.strip_suffix(" UTC").or_else(|| t.strip_suffix("UTC")) {
-        (rest, 0i64)
+        (rest, Some(0i64))
     } else if let Some((idx, sign_byte)) = find_offset_sign(t) {
         let suffix = &t[idx..];
         let micros = parse_tz_offset_suffix(suffix, sign_byte == b'+')?;
-        (&t[..idx], micros)
+        (&t[..idx], Some(micros))
     } else {
-        (t, 0i64)
+        (t, None)
     };
     let (time, frac_str) = match core.split_once('.') {
         Some((a, b)) => (a, Some(b)),
@@ -1065,11 +1115,13 @@ fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
 /// confuse the scan.
 fn find_offset_sign(t: &str) -> Option<(usize, u8)> {
     let bytes = t.as_bytes();
-    // Start past `HH:MM:SS` (8 bytes).
-    if bytes.len() < 9 {
+    // Start past `HH:MM` (5 bytes) — the seconds-optional literal
+    // (`'2024-07-15 12:00+00'`) carries its offset at index 5; a
+    // time body itself never contains `+`/`-`.
+    if bytes.len() < 6 {
         return None;
     }
-    for i in 8..bytes.len() {
+    for i in 5..bytes.len() {
         match bytes[i] {
             b'+' | b'-' => return Some((i, bytes[i])),
             _ => {}
