@@ -817,12 +817,45 @@ pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
     // insensitive. Try this before the numeric split so a `Mon-D-Y` dashed
     // form isn't mistaken for a numeric field.
     if s.bytes().any(|b| b.is_ascii_alphabetic()) {
-        return parse_month_name_date(s);
+        // v7.39 (read01 utils/adt, datetime.c) — 'J2451545' is a Julian
+        // day number (JD of the Unix epoch is 2440588).
+        if let Some(jd) = s.strip_prefix(['J', 'j'])
+            && !jd.is_empty()
+            && jd.bytes().all(|b| b.is_ascii_digit())
+        {
+            let jd: i64 = jd.parse().ok()?;
+            return i32::try_from(jd - 2_440_588).ok();
+        }
+        return parse_month_name_date(s, order);
     }
     // v7.38 (read01) — year-first numeric form with `-`, `/` or `.` separators
     // and non-zero-padded month/day (`2020-1-5`, `2020/01/5`, `2020.1.05`), all
     // of which PG accepts. Requires exactly three all-digit fields, the first
     // being the 4-digit year, so it stays unambiguous (no MDY/DMY guessing).
+    // v7.39 (read01 utils/adt, datetime.c) — the day-of-year form:
+    // YEAR + exactly-three-digit ordinal ('2024-060' = Feb 29 2024).
+    {
+        let mut two = s.splitn(2, ['-', '/', '.']);
+        if let (Some(ya), Some(dd)) = (two.next(), two.next())
+            && ya.len() >= 3
+            && dd.len() == 3
+            && !dd.contains(['-', '/', '.', ' '])
+            && ya.bytes().all(|b| b.is_ascii_digit())
+            && dd.bytes().all(|b| b.is_ascii_digit())
+        {
+            let y: i32 = ya.parse().ok()?;
+            let doy: i64 = dd.parse().ok()?;
+            if y != 0 && (1..=366).contains(&doy) {
+                let jan1 = days_from_civil(y, 1, 1);
+                let days = jan1 + i32::try_from(doy).ok()? - 1;
+                let (yy, _, _) = civil_from_days(days);
+                if yy == y {
+                    return Some(days);
+                }
+                return None; // 366 in a non-leap year
+            }
+        }
+    }
     let mut parts = s.splitn(3, ['-', '/', '.']);
     let (fa, fb, fc) = (parts.next()?, parts.next()?, parts.next()?);
     if fc.contains(['-', '/', '.', ' ']) {
@@ -834,14 +867,18 @@ pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
     {
         return None;
     }
-    // Year-first with an unambiguous 4-digit year parses identically
-    // under every order (`2020-1-5`, `2020/01/5`, `2020.1.05`).
-    if fa.len() == 4 && fb.len() <= 2 && fc.len() <= 2 {
+    // Year-first: a 3-or-more-digit first field is unambiguously the
+    // year regardless of DateOrder (PG DecodeNumber's flen >= 3 rule:
+    // `2020-1-5`, `123-4-5` = 0123-04-05).
+    if fa.len() >= 3 && fb.len() <= 2 && fc.len() <= 2 {
         let y: i32 = fa.parse().ok()?;
         // No year zero in the Gregorian era notation (PG: out of range).
         if y == 0 {
             return None;
         }
+        // DOY form: exactly-three-digit second field after a year with
+        // no third field is handled below (two-field split); with three
+        // fields this is plain Y-M-D.
         let m: u32 = fb.parse().ok()?;
         let d: u32 = fc.parse().ok()?;
         // PG validates the day against the actual (leap-aware) month
@@ -887,7 +924,7 @@ pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
 /// both `Jan` and `January` spellings. Leap-aware day validation, like the
 /// numeric path. Returns `None` for anything ambiguous or malformed so the
 /// caller raises the same "invalid input" / "out of range" errors as PG.
-fn parse_month_name_date(s: &str) -> Option<i32> {
+fn parse_month_name_date(s: &str, order: DateOrder) -> Option<i32> {
     let tokens: alloc::vec::Vec<&str> =
         s.split([' ', ',', '-']).filter(|t| !t.is_empty()).collect();
     if tokens.len() != 3 {
@@ -901,23 +938,45 @@ fn parse_month_name_date(s: &str) -> Option<i32> {
             .or_else(|| MONTH_FULL.iter().position(|f| f.eq_ignore_ascii_case(&up)))
             .map(|i| i as u32 + 1)
     };
-    let (mut month, mut year, mut day) = (None, None, None);
+    let mut month: Option<u32> = None;
+    let mut nums: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
     for t in tokens {
         if let Some(m) = month_of(t) {
             if month.replace(m).is_some() {
                 return None; // two month names
             }
         } else if t.bytes().all(|b| b.is_ascii_digit()) {
-            match t.len() {
-                4 if year.is_none() => year = t.parse().ok(),
-                1 | 2 if day.is_none() => day = t.parse().ok(),
-                _ => return None,
-            }
+            nums.push(t);
         } else {
             return None; // a non-month alphabetic token (`Foo`)
         }
     }
-    let (m, y, d): (u32, i32, u32) = (month?, year?, day?);
+    let m = month?;
+    if nums.len() != 2 {
+        return None;
+    }
+    // v7.39 (read01 utils/adt, datetime.c DecodeNumber) — with a text
+    // month, a 3+-digit numeric field is the YEAR; two short fields
+    // disambiguate by DateOrder ('Jan-23-24' is day 23 / year 2024
+    // under MDY/DMY, year 2023 / day 24 under YMD). Two-digit years
+    // take PG's 1970-2069 window.
+    let (ys, ds) = match (nums[0].len() >= 3, nums[1].len() >= 3) {
+        (true, true) => return None,
+        (true, false) => (nums[0], nums[1]),
+        (false, true) => (nums[1], nums[0]),
+        (false, false) => {
+            if order == DateOrder::Ymd {
+                (nums[0], nums[1])
+            } else {
+                (nums[1], nums[0])
+            }
+        }
+    };
+    let mut y: i32 = ys.parse().ok()?;
+    if ys.len() <= 2 {
+        y += if y < 70 { 2000 } else { 1900 };
+    }
+    let d: u32 = ds.parse().ok()?;
     if !(1..=12).contains(&m) || d < 1 || d > super::days_in_month(y, m) {
         return None;
     }

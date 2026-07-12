@@ -829,6 +829,35 @@ pub fn eval_expr(
                     abbr.as_deref(),
                 )));
             }
+            // v7.39 (read01 utils/adt, datetime.c) — the relative
+            // reserved words resolve against the transaction clock:
+            // 'today'/'tomorrow'/'yesterday' are midnight dates, 'now'
+            // is the current instant ('now'::date = today). Clockless
+            // engines fall through to the parser (which rejects them).
+            if matches!(
+                target,
+                CastTarget::Date | CastTarget::Timestamp | CastTarget::Timestamptz
+            ) && let Value::Text(word) = &v
+                && let Some(clock) = ctx.clock
+            {
+                let w = word.trim().to_ascii_lowercase();
+                if matches!(w.as_str(), "today" | "tomorrow" | "yesterday" | "now") {
+                    let now_us = clock();
+                    let today = i32::try_from(now_us.div_euclid(86_400_000_000)).ok();
+                    if let Some(today) = today {
+                        let day = match w.as_str() {
+                            "tomorrow" => today + 1,
+                            "yesterday" => today - 1,
+                            _ => today,
+                        };
+                        return Ok(match (&target, w.as_str()) {
+                            (CastTarget::Date, _) => Value::Date(day),
+                            (_, "now") => Value::Timestamp(now_us),
+                            _ => Value::Timestamp(i64::from(day) * 86_400_000_000),
+                        });
+                    }
+                }
+            }
             // v7.39 (GUC knife 5) — text INPUT to date/timestamp under a
             // non-MDY DateOrder disambiguates by the session order
             // (`'01/02/2024'::date` is Feb 1 under DMY). The default MDY
