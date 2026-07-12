@@ -13581,30 +13581,19 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            match &args[0] {
-                Value::Null => Ok(Value::Null),
-                Value::Text(s) => {
-                    use unicode_normalization::UnicodeNormalization;
-                    let stripped: alloc::string::String = s
-                        .nfd()
-                        .filter(|c| {
-                            // Combining marks occupy U+0300..=U+036F
-                            // (plus extended blocks).
-                            !matches!(*c, '\u{0300}'..='\u{036F}'
-                                | '\u{1AB0}'..='\u{1AFF}'
-                                | '\u{1DC0}'..='\u{1DFF}'
-                                | '\u{20D0}'..='\u{20FF}')
-                        })
-                        .collect();
-                    Ok(Value::text(stripped))
-                }
-                other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "to_ascii() needs text, got {:?}",
-                        other.data_type()
-                    ),
-                }),
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
             }
+            // v7.39 (read01 utils/adt, ascii.c) — PG's to_ascii only
+            // converts FROM LATIN1/LATIN2/LATIN9/WIN1250; in a UTF8
+            // database (SPG serves UTF8 only) it raises 0A000. The old
+            // accent-stripping behaviour was an SPG invention PG never
+            // performs.
+            Err(EvalError::TypeMismatch {
+                detail: alloc::string::String::from(
+                    "encoding conversion from UTF8 to ASCII not supported",
+                ),
+            })
         }
         // cash_words(money) — spell out an amount in English words,
         // PG shape: 'One hundred fourteen dollars and six cents'.
