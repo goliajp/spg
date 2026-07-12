@@ -138,6 +138,14 @@ fn send_sync(s: &mut TcpStream) {
     send_msg(s, b'S', &[]);
 }
 
+fn send_describe_portal(s: &mut TcpStream, portal: &str) {
+    let mut body = Vec::new();
+    body.push(b'P');
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    send_msg(s, b'D', &body);
+}
+
 fn open(addr: &str) -> TcpStream {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -162,15 +170,19 @@ fn parameterless_prepared_select_round_trips() {
     send_query(&mut s, "INSERT INTO t VALUES (2)");
     let _ = read_until_ready(&mut s);
 
-    // Extended-query pipeline
+    // Extended-query pipeline. v7.39 — Execute no longer emits
+    // RowDescription (that belongs to Describe, per protocol); a
+    // Describe(portal) is pipelined in to keep asserting the T frame.
     send_parse(&mut s, "", "SELECT id FROM t");
     send_bind_text(&mut s, "", "", &[]);
+    send_describe_portal(&mut s, "");
     send_execute(&mut s, "");
     send_sync(&mut s);
 
     let msgs = read_until_ready(&mut s);
-    // Expected message sequence: ParseComplete (1), BindComplete (2),
-    // RowDescription (T), DataRow (D)*2, CommandComplete (C), ReadyForQuery (Z)
+    // Expected sequence: ParseComplete (1), BindComplete (2),
+    // RowDescription (T, from Describe), DataRow (D)*2,
+    // CommandComplete (C), ReadyForQuery (Z)
     let types: Vec<u8> = msgs.iter().map(|m| m.ty).collect();
     assert!(
         types.contains(&b'1'),
@@ -312,4 +324,95 @@ fn execute_max_rows_suspends_and_resumes_portal() {
     assert_eq!(rows, 5, "all rows across the three Executes");
     assert_eq!(suspends, 2, "first two batches suspend the portal");
     assert_eq!(completes, 1, "only the final Execute completes (SELECT 5)");
+}
+
+// ── v7.39 (binary results) — Bind result-format=binary honoured ──
+
+fn send_bind_binary_results(s: &mut TcpStream, portal: &str, stmt: &str) {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(stmt.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0u16.to_be_bytes()); // no param formats
+    body.extend_from_slice(&0u16.to_be_bytes()); // no params
+    // ONE result-format code = binary for every column.
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    send_msg(s, b'B', &body);
+}
+
+/// Split a DataRow body into per-cell payloads (None = SQL NULL).
+fn cells(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut cur = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = i32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
+        cur += 4;
+        if len < 0 {
+            out.push(None);
+        } else {
+            out.push(Some(body[cur..cur + len as usize].to_vec()));
+            cur += len as usize;
+        }
+    }
+    out
+}
+
+#[test]
+fn binary_result_format_encodes_pg_binary() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _guard = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    send_parse(
+        &mut s,
+        "b1",
+        "SELECT 7, 300000000000, true, 'hi', 1.5::float8, \
+         '2024-03-15'::date, '2024-03-15 12:00:00'::timestamp, \
+         12345.678::numeric(10,3), NULL::int",
+    );
+    send_bind_binary_results(&mut s, "bp1", "b1");
+    send_execute(&mut s, "bp1");
+    send_sync(&mut s);
+
+    let mut row: Option<Vec<Option<Vec<u8>>>> = None;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => row = Some(cells(&m.body)),
+            b'E' => panic!("error: {}", String::from_utf8_lossy(&m.body)),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    let row = row.expect("one data row");
+    // int4 7 — 4-byte BE.
+    assert_eq!(row[0].as_deref(), Some(&7i32.to_be_bytes()[..]));
+    // int8 — 8-byte BE.
+    assert_eq!(row[1].as_deref(), Some(&300000000000i64.to_be_bytes()[..]));
+    // bool true — single 0x01.
+    assert_eq!(row[2].as_deref(), Some(&[1u8][..]));
+    // text — raw UTF-8.
+    assert_eq!(row[3].as_deref(), Some(&b"hi"[..]));
+    // float8 — IEEE BE.
+    assert_eq!(row[4].as_deref(), Some(&1.5f64.to_be_bytes()[..]));
+    // date — days since 2000-01-01: 2024-03-15 = 8840.
+    assert_eq!(row[5].as_deref(), Some(&8840i32.to_be_bytes()[..]));
+    // timestamp — micros since 2000-01-01 midnight.
+    let expect_ts: i64 = (8840i64 * 86_400 + 12 * 3600) * 1_000_000;
+    assert_eq!(row[6].as_deref(), Some(&expect_ts.to_be_bytes()[..]));
+    // numeric 12345.678 — ndigits=3, weight=1, sign=0, dscale=3,
+    // digits [1, 2345, 6780] (base 10000).
+    let num = row[7].as_deref().expect("numeric non-null");
+    let words: Vec<u16> = num
+        .chunks(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(words, vec![3, 1, 0, 3, 1, 2345, 6780], "numeric wire words");
+    // NULL — len -1 (decoded as None).
+    assert_eq!(row[8], None);
 }

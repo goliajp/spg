@@ -2041,6 +2041,20 @@ struct Portal {
     /// resumes here instead of re-running the statement (JDBC
     /// setFetchSize / PortalSuspended protocol).
     suspended: Option<SuspendedRows>,
+    /// v7.39 (binary results) — the Bind message's result-format
+    /// codes: empty = all text, one entry = applies to every column,
+    /// N entries = per column (0 text / 1 binary).
+    result_formats: Vec<i16>,
+}
+
+/// v7.39 (binary results) — is result column `i` binary under the
+/// Bind's format-code list?
+fn col_is_binary(formats: &[i16], i: usize) -> bool {
+    match formats.len() {
+        0 => false,
+        1 => formats[0] == 1,
+        _ => formats.get(i).copied().unwrap_or(0) == 1,
+    }
 }
 
 /// v7.39 (cursors) — the materialised remainder of a suspended
@@ -2050,6 +2064,7 @@ struct SuspendedRows {
     columns: Vec<ColumnSchema>,
     rows: Vec<Row<'static>>,
     cursor: usize,
+    formats: Vec<i16>,
 }
 
 /// Parse a null-terminated C string starting at `pos` of `body`.
@@ -2122,7 +2137,7 @@ fn handle_parse(
     // executions of the same prepared statement (the sqlx hot
     // shape) every Execute now skips re-deriving the column shape
     // and re-encoding the protocol body.
-    let (_, columns) = eng.describe_prepared(&ast);
+    let (inferred_oids, columns) = eng.describe_prepared(&ast);
     drop(eng);
     let row_desc_body: Option<Vec<u8>> = if columns.is_empty() {
         None
@@ -2130,6 +2145,19 @@ fn handle_parse(
         Some(encode_row_description_body(&columns))
     };
     let placeholder_count = count_placeholders(&sql);
+    // v7.39 (binary results) — clients like tokio-postgres declare no
+    // param OIDs in Parse and rely on Describe's inference; fill the
+    // undeclared slots from the same inference so binary Bind values
+    // dispatch to the right decoder.
+    let mut param_type_oids = param_type_oids;
+    if param_type_oids.len() < inferred_oids.len() {
+        param_type_oids.resize(inferred_oids.len(), 0);
+    }
+    for (slot, inferred) in param_type_oids.iter_mut().zip(inferred_oids.iter()) {
+        if *slot == 0 {
+            *slot = *inferred;
+        }
+    }
     prepared.insert(
         name,
         PreparedStmt {
@@ -2250,14 +2278,26 @@ fn handle_bind(
         params.push(text_param_to_value(s));
         cur += len;
     }
-    // Trailing result-format-codes — we always return text on the
-    // wire, so ignore them here.
+    // v7.39 (binary results) — trailing result-format codes: count
+    // (u16) then that many i16 codes. Honoured per column at Execute.
+    let mut result_formats: Vec<i16> = Vec::new();
+    if cur + 2 <= body.len() {
+        let rf_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
+        cur += 2;
+        if cur + rf_count * 2 <= body.len() {
+            for _ in 0..rf_count {
+                result_formats.push(i16::from_be_bytes([body[cur], body[cur + 1]]));
+                cur += 2;
+            }
+        }
+    }
     Ok((
         portal_name,
         Portal {
             stmt_name,
             params,
             suspended: None,
+            result_formats,
         },
     ))
 }
@@ -2625,9 +2665,15 @@ fn handle_execute(
             (susp.cursor + max_rows).min(susp.rows.len())
         };
         let row_arena = bumpalo::Bump::new();
+        let any_binary = susp.formats.iter().any(|&f| f == 1);
         for row in &susp.rows[susp.cursor..end] {
-            encode_data_row(stream, &susp.columns, row, &row_arena)
-                .map_err(|e| proto(e.to_string()))?;
+            if any_binary {
+                encode_data_row_formats(stream, &susp.columns, row, &susp.formats, &row_arena)
+                    .map_err(|e| proto(e.to_string()))?;
+            } else {
+                encode_data_row(stream, &susp.columns, row, &row_arena)
+                    .map_err(|e| proto(e.to_string()))?;
+            }
         }
         susp.cursor = end;
         if end < susp.rows.len() {
@@ -2675,8 +2721,9 @@ fn handle_execute(
     // also skips the per-cell `.cloned()` and emits cell references
     // straight out of the source tables.
     let cached_row_desc = stmt.row_desc_body.clone();
-    if let (spg_sql::ast::Statement::Select(s), true, 0) =
-        (&stmt.ast, portal.params.is_empty(), max_rows)
+    let wants_binary = portal.result_formats.iter().any(|&f| f == 1);
+    if let (spg_sql::ast::Statement::Select(s), true, 0, false) =
+        (&stmt.ast, portal.params.is_empty(), max_rows, wants_binary)
     {
         let mut eng = state
             .engine
@@ -2696,13 +2743,12 @@ fn handle_execute(
         let stream_emit_result =
             eng.execute_prepared_select_streaming(s, cancel, |item| match item {
                 spg_engine::StreamItem::Header(cols) => {
+                    // v7.39 — Execute must not emit RowDescription
+                    // (Describe owns it); keep the columns for the
+                    // row encoder only.
                     cols_storage.extend_from_slice(cols);
-                    let io_res = if let Some(body) = cached_row_desc.as_deref() {
-                        send_row_description_cached(stream, body)
-                    } else {
-                        send_row_description(stream, cols)
-                    };
-                    io_res.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                    let _ = &cached_row_desc;
+                    Ok(())
                 }
                 spg_engine::StreamItem::Row(values) => {
                     encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena)
@@ -2750,14 +2796,11 @@ fn handle_execute(
     }
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
-            // v7.37 (SPGS small-query bar) — cached RowDescription
-            // from Parse-time describe; falls back to per-Execute
-            // encode when describe wasn't able to infer columns.
-            if let Some(body) = stmt.row_desc_body.as_deref() {
-                send_row_description_cached(stream, body).map_err(|e| proto(e.to_string()))?;
-            } else {
-                send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
-            }
+            // v7.39 (binary results / tokio-postgres) — PG's Execute
+            // response carries NO RowDescription (that belongs to
+            // Describe); strict clients treat a 'T' here as an
+            // unexpected message. The pre-7.39 behaviour of re-sending
+            // it per Execute broke tokio-postgres's query path.
             let n = rows.len();
             // v7.37.42-arena Phase 3 — per-Execute arena for the cell
             // text-format fallback payloads in the materialised
@@ -2765,9 +2808,18 @@ fn handle_execute(
             let row_arena = bumpalo::Bump::new();
             // v7.39 (cursors) — cap the batch and suspend the rest.
             let emit_end = if max_rows > 0 { max_rows.min(n) } else { n };
+            let formats = portals
+                .get(&portal_key)
+                .map(|p| p.result_formats.clone())
+                .unwrap_or_default();
             for row in &rows[..emit_end] {
-                encode_data_row(stream, &columns, row, &row_arena)
-                    .map_err(|e| proto(e.to_string()))?;
+                if wants_binary {
+                    encode_data_row_formats(stream, &columns, row, &formats, &row_arena)
+                        .map_err(|e| proto(e.to_string()))?;
+                } else {
+                    encode_data_row(stream, &columns, row, &row_arena)
+                        .map_err(|e| proto(e.to_string()))?;
+                }
             }
             if emit_end < n {
                 send_msg(stream, b's', &[]).map_err(|e| proto(e.to_string()))?;
@@ -2776,6 +2828,7 @@ fn handle_execute(
                         columns,
                         rows,
                         cursor: emit_end,
+                        formats,
                     });
                 }
             } else {
@@ -4639,6 +4692,182 @@ fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
         body.extend_from_slice(&0u16.to_be_bytes()); // format = text
     }
     body
+}
+
+/// v7.39 (binary results) — PG binary-format epoch shift: dates and
+/// timestamps are relative to 2000-01-01 on the wire, SPG stores them
+/// Unix-relative.
+const PG_EPOCH_DAYS: i32 = 10_957;
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
+/// v7.39 (binary results) — encode one cell in PG's binary send
+/// format: `[i32 len][payload]`, NULL = len -1. Types without a
+/// binary encoder yet return an error (an honest protocol failure
+/// beats bytes the client will mis-decode).
+fn encode_binary_cell(
+    out: &mut Vec<u8>,
+    v: &Value,
+    ty: DataType,
+) -> Result<(), String> {
+    let mut put = |payload: &[u8]| {
+        out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+    };
+    match v {
+        Value::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+        Value::Bool(b) => put(&[u8::from(*b)]),
+        Value::SmallInt(n) => put(&n.to_be_bytes()),
+        Value::Int(n) => put(&n.to_be_bytes()),
+        Value::BigInt(n) => put(&n.to_be_bytes()),
+        Value::Real(x) => put(&x.to_be_bytes()),
+        Value::Float(x) => put(&x.to_be_bytes()),
+        // Text-family binary format IS the UTF-8 payload.
+        Value::Text(s) | Value::BpChar(s) => put(s.as_bytes()),
+        Value::Json(s) => {
+            if matches!(ty, DataType::Jsonb) {
+                // jsonb binary: 1-byte version tag then the text.
+                let mut buf = Vec::with_capacity(s.len() + 1);
+                buf.push(1);
+                buf.extend_from_slice(s.as_bytes());
+                put(&buf);
+            } else {
+                put(s.as_bytes());
+            }
+        }
+        Value::Xml(s) => put(s.as_bytes()),
+        Value::Bytes(b) => put(b),
+        Value::Uuid(u) => put(&u[..]),
+        Value::Date(days) => put(&(days - PG_EPOCH_DAYS).to_be_bytes()),
+        Value::Timestamp(us) => put(&(us - PG_EPOCH_MICROS).to_be_bytes()),
+        Value::Time(us) => put(&us.to_be_bytes()),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            let mut buf = Vec::with_capacity(16);
+            buf.extend_from_slice(&micros.to_be_bytes());
+            buf.extend_from_slice(&days.to_be_bytes());
+            buf.extend_from_slice(&months.to_be_bytes());
+            put(&buf);
+        }
+        Value::Numeric { scaled, scale, .. } => {
+            put(&numeric_binary(*scaled, *scale));
+        }
+        Value::NumericBig(b) => {
+            // Route through the decimal string; big numerics are rare
+            // on hot paths and the digits fit the same wire shape.
+            let (scaled, scale) = decimal_str_to_scaled(&b.to_decimal_str())
+                .ok_or("binary numeric: value out of range")?;
+            put(&numeric_binary(scaled, scale));
+        }
+        other => {
+            return Err(format!(
+                "binary result format not implemented for {:?}",
+                other.data_type()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a plain decimal string into (scaled i128, scale) — the big
+/// numeric bridge for the binary encoder.
+fn decimal_str_to_scaled(s: &str) -> Option<(i128, u8)> {
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let digits: String = format!("{int_part}{frac_part}");
+    let scaled: i128 = digits.parse().ok()?;
+    Some((scaled, u8::try_from(frac_part.len()).ok()?))
+}
+
+/// v7.39 — PG `numeric` binary send format: base-10000 digit groups
+/// with a weight (exponent of the first group), sign word and
+/// display scale. Matches numeric_send in behaviour for finite
+/// values (SPG's Numeric kind NaN/Inf never reach the wire — they
+/// format as text through float paths).
+fn numeric_binary(scaled: i128, scale: u8) -> Vec<u8> {
+    let neg = scaled < 0;
+    let mut abs = scaled.unsigned_abs();
+    // Left-pad the fractional side to a whole number of 4-digit
+    // groups so group boundaries align with base-10000 positions.
+    let scale_usize = scale as usize;
+    let frac_pad = (4 - (scale_usize % 4)) % 4;
+    for _ in 0..frac_pad {
+        abs *= 10;
+    }
+    let frac_groups = (scale_usize + frac_pad) / 4;
+    // Collect base-10000 digits, least significant first.
+    let mut groups: Vec<u16> = Vec::new();
+    if abs == 0 {
+        groups.push(0);
+    }
+    while abs > 0 {
+        groups.push((abs % 10_000) as u16);
+        abs /= 10_000;
+    }
+    while groups.len() <= frac_groups {
+        groups.push(0); // ensure at least one integer-part group
+    }
+    // Trim trailing zero groups on the fractional end and leading
+    // zero groups on the integer end (PG sends a minimal digit list).
+    let mut lo = 0;
+    while lo < frac_groups && groups[lo] == 0 {
+        lo += 1;
+    }
+    let mut hi = groups.len();
+    while hi > frac_groups + 1 && groups[hi - 1] == 0 {
+        hi -= 1;
+    }
+    let digits: Vec<u16> = groups[lo..hi].iter().rev().copied().collect();
+    // weight = base-10000 exponent of the FIRST sent digit.
+    let weight = (hi - frac_groups) as i32 - 1;
+    let all_zero = digits.iter().all(|&d| d == 0);
+    let (digits, weight) = if all_zero {
+        (Vec::new(), 0)
+    } else {
+        (digits, weight)
+    };
+    let mut buf = Vec::with_capacity(8 + digits.len() * 2);
+    buf.extend_from_slice(&(digits.len() as i16).to_be_bytes());
+    buf.extend_from_slice(&(weight as i16).to_be_bytes());
+    buf.extend_from_slice(&(if neg { 0x4000u16 } else { 0 }).to_be_bytes());
+    buf.extend_from_slice(&u16::from(scale).to_be_bytes());
+    for d in &digits {
+        buf.extend_from_slice(&d.to_be_bytes());
+    }
+    buf
+}
+
+/// v7.39 (binary results) — DataRow with per-column format codes:
+/// binary columns ride encode_binary_cell, text columns the arena
+/// text path. Only used when the Bind requested any binary column.
+fn encode_data_row_formats(
+    out: &mut Vec<u8>,
+    cols: &[ColumnSchema],
+    row: &Row,
+    formats: &[i16],
+    arena: &bumpalo::Bump,
+) -> std::io::Result<()> {
+    let mut body: Vec<u8> = Vec::with_capacity(cols.len() * 12);
+    body.extend_from_slice(&(cols.len() as u16).to_be_bytes());
+    for (i, c) in cols.iter().enumerate() {
+        let v = row.values.get(i).unwrap_or(&Value::Null);
+        if col_is_binary(formats, i) {
+            encode_binary_cell(&mut body, v, c.ty).map_err(std::io::Error::other)?;
+        } else {
+            match value_to_pg_text(v, Some(c.ty), arena) {
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(s) => {
+                    body.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    body.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+    send_msg(out, b'D', &body)
 }
 
 fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
