@@ -1173,6 +1173,14 @@ fn run(
     {
         engine.set_autovacuum(false);
     }
+    // v7.39 — parallel aggregation defaults ON on the server (the
+    // no_std engine can't spawn threads; we inject the executor).
+    // `SPG_PARALLEL=0|false|off` reverts to single-threaded scans.
+    if !std::env::var("SPG_PARALLEL")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+    {
+        engine.set_parallel_runner(std::sync::Arc::new(ScopedThreadRunner));
+    }
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
@@ -2972,4 +2980,26 @@ fn load_manifest_and_preload_cold(
         m.wal_baseline_offset,
     );
     m.wal_baseline_offset
+}
+
+/// v7.39 (parallel-agg P0) — std-side ParallelRunner: scoped threads,
+/// one per shard. Shard counts are small (<= 8) and gated to scans of
+/// 100k+ rows, so per-query spawn cost (~10-20 us/thread) is noise
+/// next to the scan itself; a pooled runner is a P3 refinement.
+struct ScopedThreadRunner;
+
+impl spg_engine::ParallelRunner for ScopedThreadRunner {
+    fn run_shards(
+        &self,
+        n: usize,
+        f: &(dyn Fn(usize) -> Box<dyn core::any::Any + Send> + Sync),
+    ) -> Vec<Box<dyn core::any::Any + Send>> {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("shard panicked"))
+                .collect()
+        })
+    }
 }

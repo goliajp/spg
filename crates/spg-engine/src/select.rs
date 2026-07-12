@@ -2078,6 +2078,7 @@ impl Engine {
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
+                self.parallel_runner.0.as_deref(),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -2291,6 +2292,7 @@ impl Engine {
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
+                self.parallel_runner.0.as_deref(),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -2734,6 +2736,7 @@ impl Engine {
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
+                self.parallel_runner.0.as_deref(),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -2888,6 +2891,7 @@ impl Engine {
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
+                self.parallel_runner.0.as_deref(),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -3538,6 +3542,7 @@ impl Engine {
             schema_cols,
             Some(alias),
             Some(&agg_correlated),
+            self.parallel_runner.0.as_deref(),
         )?;
         self.finish_agg_result(agg, stmt, cancel)
     }
@@ -4175,7 +4180,14 @@ impl Engine {
                         },
                     })
             };
-            let agg = aggregate::run(stmt, &refs, combined_schema, None, Some(&agg_correlated))?;
+            let agg = aggregate::run(
+                stmt,
+                &refs,
+                combined_schema,
+                None,
+                Some(&agg_correlated),
+                self.parallel_runner.0.as_deref(),
+            )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
 

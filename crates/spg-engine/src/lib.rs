@@ -483,12 +483,57 @@ impl EngineSnapshot {
     }
 }
 
+/// v7.39 (parallel-agg P0) — host-injected parallel executor. The
+/// engine is `no_std` and cannot spawn threads; like `ClockFn` /
+/// `RandomFn`, the std-side host (spg-server / embedded-tokio)
+/// injects an implementation at startup. `None` (the default, and
+/// the only option in pure-`no_std` embeddings) keeps every code
+/// path single-threaded and byte-identical to pre-P0 behaviour.
+///
+/// The callback returns `Box<dyn Any + Send>` so one trait serves
+/// any shard-result type; call sites downcast what they produced.
+pub trait ParallelRunner: Send + Sync {
+    /// Run `f(0) .. f(n-1)`, possibly concurrently; return the
+    /// results in shard order. Every call completes before return.
+    fn run_shards(
+        &self,
+        n: usize,
+        f: &(dyn Fn(usize) -> alloc::boxed::Box<dyn core::any::Any + Send> + Sync),
+    ) -> alloc::vec::Vec<alloc::boxed::Box<dyn core::any::Any + Send>>;
+}
+
+/// Engine slot for the injected runner — a newtype so the `Engine`
+/// derive(Debug) keeps working over the non-Debug trait object.
+#[derive(Clone, Default)]
+pub struct ParallelRunnerSlot(pub(crate) Option<alloc::sync::Arc<dyn ParallelRunner>>);
+
+impl core::fmt::Debug for ParallelRunnerSlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ParallelRunner(<injected>)"
+        } else {
+            "ParallelRunner(none)"
+        })
+    }
+}
+
+/// v7.39 (parallel-agg P0) — below this many input rows a query
+/// never parallelises: thread spin-up beats the win on small scans.
+pub(crate) const PARALLEL_MIN_ROWS: usize = 100_000;
+
+/// v7.39 — diagnostic counter: how many aggregate scans took the
+/// sharded path (read by benches to ground-truth activation).
+pub static PARALLEL_AGG_FIRED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 // The engine carries several independent session/capture flags (dialect,
 // FK-checks, meta-view materialisation, redo capture); they're orthogonal
 // switches, not a state enum begging to be modelled.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct Engine {
+    /// v7.39 (parallel-agg P0) — see [`ParallelRunner`].
+    pub(crate) parallel_runner: ParallelRunnerSlot,
     /// Committed catalog — what survives `Engine::snapshot()` and what
     /// outside-TX `SELECT`s read.
     catalog: Catalog,
@@ -812,6 +857,7 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             catalog: Catalog::new(),
+            parallel_runner: ParallelRunnerSlot::default(),
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
@@ -1049,6 +1095,13 @@ impl Engine {
         self.mvcc_inplace = on;
     }
 
+    /// v7.39 (parallel-agg P0) — inject the host's parallel executor
+    /// (see [`ParallelRunner`]). Called once at host startup; the
+    /// engine stays single-threaded without it.
+    pub fn set_parallel_runner(&mut self, runner: alloc::sync::Arc<dyn ParallelRunner>) {
+        self.parallel_runner = ParallelRunnerSlot(Some(runner));
+    }
+
     /// v7.37.15 (Phase C) — allocate a fresh version number for
     /// the next write. Always strictly monotonic + process-wide
     /// shared so concurrent engines on the same process agree on
@@ -1110,6 +1163,7 @@ impl Engine {
     pub fn restore(catalog: Catalog) -> Self {
         Self {
             catalog,
+            parallel_runner: ParallelRunnerSlot::default(),
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
@@ -1197,6 +1251,7 @@ impl Engine {
                 };
                 Ok(Self {
                     catalog,
+                    parallel_runner: ParallelRunnerSlot::default(),
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
                     backslash_escapes: false,

@@ -546,6 +546,7 @@ mod e2e_order_by_multi;
 mod e2e_orderby_using_operator;
 mod e2e_overlaps;
 mod e2e_partial_index;
+mod e2e_parallel_agg;
 mod e2e_partition_attach_detach;
 mod e2e_partition_by_list_hash;
 mod e2e_partition_by_range;
