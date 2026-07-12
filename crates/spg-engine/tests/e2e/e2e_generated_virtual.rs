@@ -32,8 +32,14 @@ fn virtual_generated_column_computes_and_enforces_not_null() {
     // NOT NULL on a virtual column is checked against the computed value.
     e.execute("CREATE TABLE gn(id int, v int GENERATED ALWAYS AS (id * 2) VIRTUAL NOT NULL)")
         .unwrap();
-    assert!(matches!(
-        e.execute("INSERT INTO gn(id) VALUES (NULL)"),
-        Err(EngineError::Storage(_))
-    ));
+    // v7.39 — surfaces as PG's full 23502 form (relation-qualified),
+    // which the INSERT entry wraps out of the storage error.
+    let err = e
+        .execute("INSERT INTO gn(id) VALUES (NULL)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("violates not-null constraint") && err.contains("relation \"gn\""),
+        "got: {err}"
+    );
 }

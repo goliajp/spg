@@ -141,6 +141,16 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        let table = stmt.table.clone();
+        self.exec_update_cancel_inner(stmt, cancel)
+            .map_err(|e| enrich_not_null(e, &table))
+    }
+
+    fn exec_update_cancel_inner(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
@@ -1598,6 +1608,18 @@ impl Engine {
 
     pub(crate) fn exec_insert(
         &mut self,
+        stmt: InsertStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // v7.39 (SQLSTATE fidelity) — qualify a NOT NULL rejection
+        // with the relation, PG's full 23502 form (the storage layer
+        // that raises it has no table name).
+        let table = stmt.table.clone();
+        self.exec_insert_inner(stmt)
+            .map_err(|e| enrich_not_null(e, &table))
+    }
+
+    fn exec_insert_inner(
+        &mut self,
         mut stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
@@ -2989,4 +3011,19 @@ fn insert_parsed_rows(
         affected += 1;
     }
     Ok((returning_rows, deferred_embedded, affected, oc_pairs))
+}
+
+/// v7.39 (SQLSTATE fidelity) — PG's full 23502 message needs the
+/// relation name the storage error can't carry; DML entry points
+/// wrap their results through this.
+fn enrich_not_null(e: EngineError, table: &str) -> EngineError {
+    match e {
+        EngineError::Storage(spg_storage::StorageError::NullInNotNull { column }) => {
+            EngineError::Unsupported(alloc::format!(
+                "null value in column \"{column}\" of relation \"{table}\" \
+                 violates not-null constraint"
+            ))
+        }
+        other => other,
+    }
 }
