@@ -64,15 +64,16 @@ fn cash_words_negative_and_dollar_sign() {
 }
 
 #[test]
-fn to_ascii_strips_accents() {
+fn to_ascii_raises_pg_utf8_error() {
+    // v7.39 (read01 utils/adt, ascii.c) — PG's to_ascii only converts
+    // from LATIN1/2/9/WIN1250; in a UTF8 database it raises 0A000.
+    // The old accent-stripping assertions locked an SPG invention.
     let mut e = Engine::new();
-    assert_eq!(text(&first(&mut e, "SELECT to_ascii('Karél')")), "Karel");
-    assert_eq!(
-        text(&first(&mut e, "SELECT to_ascii('café naïve')")),
-        "cafe naive"
+    let err = e.execute("SELECT to_ascii('Karél')").unwrap_err();
+    assert!(
+        format!("{err}").contains("encoding conversion from UTF8 to ASCII not supported"),
+        "got {err}"
     );
-    // Plain ASCII unchanged.
-    assert_eq!(text(&first(&mut e, "SELECT to_ascii('plain')")), "plain");
 }
 
 #[test]
