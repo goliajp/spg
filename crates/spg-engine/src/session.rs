@@ -185,11 +185,64 @@ impl Engine {
     /// v7.12.1 — read a session parameter set via `SET`. Used by
     /// the FTS function dispatcher to resolve the default config
     /// for `to_tsvector(text)` / `plainto_tsquery(text)` etc.
+    /// v7.39 (tz epic) — validate + canonicalise a `SET timezone`
+    /// value: 'utc' -> 'UTC'; fixed offsets / abbreviations keep their
+    /// spelling; IANA names resolve through the host tzdb to their
+    /// canonical case. Unknown -> PG's invalid-parameter error.
+    pub(crate) fn canonicalize_timezone(
+        &self,
+        value: &str,
+    ) -> Result<String, crate::EngineError> {
+        let v = value.trim();
+        if v.eq_ignore_ascii_case("utc") || v.eq_ignore_ascii_case("gmt") {
+            return Ok(v.to_ascii_uppercase());
+        }
+        if crate::eval::datetime_resolve_zone_offset(v).is_some() {
+            return Ok(String::from(v));
+        }
+        match self.tz_canon_fn {
+            Some(f) => match f(v) {
+                Some(canon) => Ok(canon),
+                None => Err(crate::EngineError::Unsupported(alloc::format!(
+                    "invalid value for parameter \"TimeZone\": \"{v}\""
+                ))),
+            },
+            // No host tzdb (bare no_std embedding): keep the pre-epic
+            // accept-and-store behaviour — rendering degrades to UTC
+            // rather than rejecting a name we cannot verify.
+            None => Ok(String::from(v)),
+        }
+    }
+
     /// v7.39 (GUC knife 3) — the parsed session render style (wire /
     /// COPY renderers snapshot it once per statement).
     #[must_use]
     pub fn render_style(&self) -> crate::eval::RenderStyle {
         self.render_style
+    }
+
+    /// v7.39 (tz epic) — per-statement session TimeZone snapshot for
+    /// the timestamptz renderers. SET already validated the value, so
+    /// an unresolvable name here (host lost its tzdb) degrades to UTC.
+    #[must_use]
+    pub fn session_tz(&self) -> crate::SessionTz {
+        let Some(z) = self.session_param("timezone") else {
+            return crate::SessionTz::Utc;
+        };
+        if z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("gmt") {
+            return crate::SessionTz::Utc;
+        }
+        if let Some(off) = crate::eval::datetime_resolve_zone_offset(z) {
+            return if off == 0 {
+                crate::SessionTz::Utc
+            } else {
+                crate::SessionTz::Fixed(off)
+            };
+        }
+        match (self.tz_offset_fn, self.tz_abbrev_fn) {
+            (Some(of), Some(af)) => crate::SessionTz::Named(String::from(z), of, af),
+            _ => crate::SessionTz::Utc,
+        }
     }
 
     #[must_use]
@@ -235,6 +288,7 @@ impl Engine {
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
             .with_render_style(self.render_style)
+            .with_tz_fns(self.tz_offset_fn, self.tz_localize_fn, self.tz_abbrev_fn)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
             // Thread the session GUC map so current_setting resolves
             // custom `SET app.foo = …` settings (request-context / RLS).

@@ -87,6 +87,9 @@ perf-counters = []
 workspace = true
 
 [dev-dependencies]
+# v7.39 (tz epic) — the e2e suite injects the std-side tzdb the way
+# the server/embedded hosts do.
+spg-tzif = { workspace = true }
 criterion = { workspace = true }
 # v7.38 P0 元机制 A — dev-cycle `cargo test` automatically opts in
 # to the injection-points framework so unit / e2e tests can attach

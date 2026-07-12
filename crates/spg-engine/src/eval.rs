@@ -66,8 +66,10 @@ pub use format::{
     DateOrder, DateStyleKind, IntervalStyleKind, RenderStyle, format_date_array_styled,
     format_date_styled, format_float_array_styled, format_float_styled,
     parse_date_literal_ordered, parse_timestamp_literal_ordered,
+    parse_timestamp_literal_tz_ordered,
     format_interval_array_styled, format_interval_styled, format_real_styled,
     format_timestamp_array_styled, format_timestamp_styled, format_timestamptz_styled,
+    format_timestamptz_tz,
 };
 use functions::apply_function;
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};
@@ -95,6 +97,12 @@ use textsearch::{
     fts_websearch_to_tsquery, ts_match, tsvector_concat,
 };
 pub use values::gen_random_uuid_bytes;
+/// v7.39 (tz epic) — fixed-offset / abbreviation resolution, exposed
+/// for `SET timezone` validation (named zones go through the host tzdb).
+pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
+    datetime::resolve_zone_offset(z)
+}
+
 pub use values::value_to_text;
 pub use values::value_to_text_styled;
 use values::{
@@ -166,6 +174,11 @@ pub struct EvalContext<'a> {
     /// away from the session (per-shard scan filters, index probes)
     /// keep the default — they don't render text output.
     pub render_style: crate::eval::format::RenderStyle,
+    /// v7.39 (tz epic) — host IANA timezone lookups for named zones
+    /// (session rendering, AT TIME ZONE, literal zone suffixes).
+    pub tz_offset_fn: Option<crate::TzOffsetFn>,
+    pub tz_localize_fn: Option<crate::TzLocalizeFn>,
+    pub tz_abbrev_fn: Option<crate::TzAbbrevFn>,
     /// v7.38 (read01 P5.24) — host-provided CSPRNG (the server injects
     /// `/dev/urandom`). Cryptographic builtins (`gen_random_bytes`,
     /// `gen_salt`) draw from this instead of the process-static xorshift
@@ -240,6 +253,9 @@ impl<'a> EvalContext<'a> {
                 interval_style: crate::eval::format::IntervalStyleKind::Postgres,
                 extra_float_digits: 1,
             },
+            tz_offset_fn: None,
+            tz_localize_fn: None,
+            tz_abbrev_fn: None,
             salt_fn: None,
             clock: None,
             xact: None,
@@ -252,6 +268,65 @@ impl<'a> EvalContext<'a> {
     pub const fn with_render_style(mut self, style: crate::eval::format::RenderStyle) -> Self {
         self.render_style = style;
         self
+    }
+
+    /// v7.39 (tz epic) — attach the host timezone lookups.
+    #[must_use]
+    pub const fn with_tz_fns(
+        mut self,
+        offset: Option<crate::TzOffsetFn>,
+        localize: Option<crate::TzLocalizeFn>,
+        abbrev: Option<crate::TzAbbrevFn>,
+    ) -> Self {
+        self.tz_offset_fn = offset;
+        self.tz_localize_fn = localize;
+        self.tz_abbrev_fn = abbrev;
+        self
+    }
+
+    /// v7.39 (tz epic) — offset (µs east) of an arbitrary zone spec at
+    /// a UTC instant: fixed forms resolve statically, named zones
+    /// through the host tzdb. None = unknown zone.
+    #[must_use]
+    pub fn zone_offset_at(&self, zone: &str, utc_micros: i64) -> Option<i64> {
+        if let Some(off) = datetime::resolve_zone_offset(zone) {
+            return Some(off);
+        }
+        self.tz_offset_fn.and_then(|f| f(zone, utc_micros))
+    }
+
+    /// v7.39 (tz epic) — the SESSION zone's offset at a UTC instant
+    /// (per-value: DST zones vary within one statement).
+    #[must_use]
+    pub fn session_tz_offset_at(&self, utc_micros: i64) -> i64 {
+        let Some(zone) = self.session_gucs.and_then(|g| g.get("timezone")) else {
+            return 0;
+        };
+        self.zone_offset_at(zone, utc_micros).unwrap_or(0)
+    }
+
+    /// v7.39 (tz epic) — the session zone's designation at an instant
+    /// (named zones only; None lets renderers spell UTC / +HH).
+    #[must_use]
+    pub fn session_tz_abbrev_at(&self, utc_micros: i64) -> Option<alloc::string::String> {
+        let zone = self.session_gucs.and_then(|g| g.get("timezone"))?;
+        if datetime::resolve_zone_offset(zone).is_some()
+            || zone.eq_ignore_ascii_case("utc")
+            || zone.eq_ignore_ascii_case("gmt")
+        {
+            return None;
+        }
+        self.tz_abbrev_fn.and_then(|f| f(zone, utc_micros))
+    }
+
+    /// v7.39 (tz epic) — local wall micros in `zone` -> UTC micros
+    /// (PG's DST disambiguation for named zones).
+    #[must_use]
+    pub fn zone_local_to_utc(&self, zone: &str, local_micros: i64) -> Option<i64> {
+        if let Some(off) = datetime::resolve_zone_offset(zone) {
+            return Some(local_micros - off);
+        }
+        self.tz_localize_fn.and_then(|f| f(zone, local_micros))
     }
 
     /// v7.38 (read01 P5.24) — attach the host CSPRNG so cryptographic
@@ -742,19 +817,16 @@ pub fn eval_expr(
                 && crate::describe::describe_expr(expr, ctx.columns)
                     .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
             {
-                // v7.39 (GUC knife 3) — non-ISO DateStyles show the zone
-                // name for timestamptz; ISO keeps the offset suffix.
-                if ctx.render_style.date_style != crate::eval::format::DateStyleKind::Iso
-                    && ctx.session_tz_offset() == 0
-                {
-                    return Ok(Value::text(format::format_timestamptz_styled(
-                        *t,
-                        &ctx.render_style,
-                    )));
-                }
-                return Ok(Value::text(crate::eval::format_timestamptz_at(
+                // v7.39 (tz epic) — per-VALUE session offset (DST zones
+                // vary within a statement); non-ISO DateStyles carry the
+                // zone designation instead of the numeric offset.
+                let off = ctx.session_tz_offset_at(*t);
+                let abbr = ctx.session_tz_abbrev_at(*t);
+                return Ok(Value::text(format::format_timestamptz_tz(
                     *t,
-                    ctx.session_tz_offset(),
+                    &ctx.render_style,
+                    off,
+                    abbr.as_deref(),
                 )));
             }
             // v7.39 (GUC knife 5) — text INPUT to date/timestamp under a
@@ -770,7 +842,7 @@ pub fn eval_expr(
                             return Ok(Value::Date(d));
                         }
                     }
-                    (CastTarget::Timestamp | CastTarget::Timestamptz, Value::Text(s)) => {
+                    (CastTarget::Timestamp, Value::Text(s)) => {
                         if let Some(t) = format::parse_timestamp_literal_ordered(
                             s,
                             ctx.render_style.date_order,
@@ -779,6 +851,54 @@ pub fn eval_expr(
                         }
                     }
                     _ => {}
+                }
+            }
+            // v7.39 (tz epic) — timestamptz INPUT: an offset-less
+            // literal is a wall-clock reading in the session zone
+            // (PG); a trailing IANA zone name localises there. Both
+            // fall through to cast_value when nothing matches (its
+            // parse treats naive input as UTC — correct for a UTC
+            // session).
+            if matches!(target, CastTarget::Timestamptz)
+                && let Value::Text(txt) = &v
+            {
+                let order = ctx.render_style.date_order;
+                let sess_zone = ctx
+                    .session_gucs
+                    .and_then(|g| g.get("timezone"))
+                    .map(String::as_str);
+                // Trailing zone name: the last space-separated token,
+                // when it names a resolvable zone (contains a letter
+                // and isn't consumed by the plain parse).
+                if let Some(idx) = txt.trim_end().rfind(' ') {
+                    let (head, tail) = (txt[..idx].trim(), txt[idx + 1..].trim());
+                    let tail_is_zoneish = tail.len() > 1
+                        && tail.bytes().any(|b| b.is_ascii_alphabetic())
+                        && !tail.eq_ignore_ascii_case("bc")
+                        && !tail.eq_ignore_ascii_case("ad");
+                    if tail_is_zoneish
+                        && format::parse_timestamp_literal_tz_ordered(txt, order).is_none()
+                        && let Some((wall, false)) =
+                            format::parse_timestamp_literal_tz_ordered(head, order)
+                        && let Some(utc) = ctx.zone_local_to_utc(tail, wall)
+                    {
+                        return Ok(Value::Timestamp(utc));
+                    }
+                }
+                if let Some((wall, had_tz)) =
+                    format::parse_timestamp_literal_tz_ordered(txt, order)
+                {
+                    if had_tz {
+                        return Ok(Value::Timestamp(wall));
+                    }
+                    if let Some(zone) = sess_zone
+                        && !zone.eq_ignore_ascii_case("utc")
+                        && !zone.eq_ignore_ascii_case("gmt")
+                        && let Some(utc) = ctx.zone_local_to_utc(zone, wall)
+                    {
+                        return Ok(Value::Timestamp(utc));
+                    }
+                    return Ok(Value::Timestamp(wall));
                 }
             }
             // v7.39 (GUC knife 3) — the out-function casts honour the
@@ -874,6 +994,39 @@ pub fn eval_expr(
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
         Expr::FunctionCall { name, args } => {
+            // v7.39 (tz epic) — AT TIME ZONE (fn form: timezone(zone, ts))
+            // with a NAMED zone needs the host tzdb and the argument's
+            // static type for its two directions:
+            //   naive AT ZONE  -> that zone's wall clock -> UTC instant
+            //   tstz  AT ZONE  -> UTC instant -> that zone's wall clock
+            // Fixed offsets / abbreviations keep the legacy path below.
+            if args.len() == 2
+                && name.eq_ignore_ascii_case("timezone")
+                && let zone_v = eval_expr(&args[0], row, ctx)?
+                && let Value::Text(zone) = &zone_v
+                && datetime::resolve_zone_offset(zone.as_ref()).is_none()
+                && !zone.trim().eq_ignore_ascii_case("utc")
+                && !zone.trim().eq_ignore_ascii_case("gmt")
+                && zone.parse::<i64>().is_err()
+                && ctx.tz_offset_fn.is_some()
+            {
+                let zone = zone.trim();
+                let src_is_tstz = crate::describe::describe_expr(&args[1], ctx.columns)
+                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz));
+                let inner = eval_expr(&args[1], row, ctx)?;
+                if let Value::Timestamp(t) = inner {
+                    if src_is_tstz {
+                        if let Some(off) = ctx.zone_offset_at(zone, t) {
+                            return Ok(Value::Timestamp(t + off));
+                        }
+                    } else if let Some(utc) = ctx.zone_local_to_utc(zone, t) {
+                        return Ok(Value::Timestamp(utc));
+                    }
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("time zone \"{zone}\" not recognized"),
+                    });
+                }
+            }
             // v7.29 (round-22 phase 3) - prefix fast path: LEFT(col, n)
             // on a TEXT column borrows the cell and clones only the
             // prefix. The generic path clones the WHOLE cell first -
@@ -1000,6 +1153,26 @@ pub fn eval_expr(
         }
         Expr::Extract { field, source } => {
             let v = eval_expr(source, row, ctx)?;
+            // v7.39 (tz epic) — timezone[_hour|_minute] of a timestamptz
+            // reports the SESSION offset at that instant (PG: 32400 for
+            // Tokyo; -14400 for New York in July).
+            if matches!(
+                field,
+                spg_sql::ast::ExtractField::Timezone
+                    | spg_sql::ast::ExtractField::TimezoneHour
+                    | spg_sql::ast::ExtractField::TimezoneMinute
+            ) && let Value::Timestamp(t) = &v
+                && crate::describe::describe_expr(source, ctx.columns)
+                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+            {
+                let off_secs = ctx.session_tz_offset_at(*t) / 1_000_000;
+                let n = match field {
+                    spg_sql::ast::ExtractField::Timezone => off_secs,
+                    spg_sql::ast::ExtractField::TimezoneHour => off_secs / 3600,
+                    _ => (off_secs / 60) % 60,
+                };
+                return Ok(Value::BigInt(n));
+            }
             extract_field(*field, &v)
         }
         // v4.10: subquery nodes should have been resolved into

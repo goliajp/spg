@@ -1787,6 +1787,7 @@ dependencies = [
  "spg-engine",
  "spg-manifest",
  "spg-storage",
+ "spg-tzif",
  "tempfile",
 ]
 
@@ -1816,6 +1817,7 @@ dependencies = [
  "spg-engine",
  "spg-sql",
  "spg-storage",
+ "spg-tzif",
  "unicode-normalization",
 ]
 
@@ -1863,6 +1865,7 @@ dependencies = [
  "spg-manifest",
  "spg-sql",
  "spg-storage",
+ "spg-tzif",
  "spg-wire",
 ]
 
@@ -1913,6 +1916,10 @@ dependencies = [
  "criterion",
  "spg-crypto",
 ]
+
+[[package]]
+name = "spg-tzif"
+version = "7.37.12"
 
 [[package]]
 name = "spg-wire"

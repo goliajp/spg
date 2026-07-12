@@ -1124,6 +1124,38 @@ impl Engine {
                 | spg_sql::ast::SetValue::Number(s) = &value
                 {
                     validate_known_guc(&name, s)?;
+                    // v7.39 (tz epic) — timezone accepts UTC / fixed
+                    // offsets / abbreviations (resolve_zone_offset) and
+                    // IANA names (host tzdb); anything else is PG's
+                    // invalid-parameter error. Named zones store their
+                    // canonical spelling (SHOW returns 'Asia/Tokyo'
+                    // after SET 'asia/tokyo').
+                    if name.eq_ignore_ascii_case("timezone")
+                        || name.eq_ignore_ascii_case("time zone")
+                    {
+                        let canon = self.canonicalize_timezone(s)?;
+                        let local = local;
+                        if local {
+                            if self.in_transaction() {
+                                let prior =
+                                    self.session_param("timezone").map(String::from);
+                                self.local_guc_saves.push(("timezone".into(), prior));
+                                self.set_session_param(
+                                    "timezone".into(),
+                                    spg_sql::ast::SetValue::String(canon),
+                                );
+                            }
+                        } else {
+                            self.set_session_param(
+                                "timezone".into(),
+                                spg_sql::ast::SetValue::String(canon),
+                            );
+                        }
+                        return Ok(QueryResult::CommandOk {
+                            affected: 0,
+                            modified_catalog: false,
+                        });
+                    }
                 }
                 // v7.38 (read01 P3.19) — `SET LOCAL` scopes the change to
                 // the current transaction: record the prior value in the

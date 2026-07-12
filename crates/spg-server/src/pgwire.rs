@@ -562,6 +562,7 @@ fn handle_pg_simple_query(
         // v7.39 (GUC knife 3) — snapshot the session render style once
         // per statement for the row encoders.
         let wire_style = engine_lock.render_style();
+        let wire_tz = engine_lock.session_tz();
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
         let mut wrote_header = false;
         let mut first_row_size: Option<usize> = None;
@@ -630,11 +631,12 @@ fn handle_pg_simple_query(
                             values,
                             &wire_arena,
                             &wire_style,
+                            &wire_tz,
                         );
                         first_row_size = Some(wbuf.len() - before);
                         return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
                     }
-                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena, &wire_style)
+                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena, &wire_style, &wire_tz)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             }
@@ -714,7 +716,7 @@ fn handle_pg_simple_query(
                         header_written = true;
                     }
                     let before = wbuf.len();
-                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena, &wire_style)
+                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena, &wire_style, &wire_tz)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                     if first_row_size.is_none() {
                         first_row_size = Some(wbuf.len() - before);
@@ -748,7 +750,7 @@ fn handle_pg_simple_query(
                         wrote_header = true;
                         for row in &rows {
                             let before = wbuf.len();
-                            encode_data_row(wbuf, &cols_storage, row, &wire_arena, &wire_style)
+                            encode_data_row(wbuf, &cols_storage, row, &wire_arena, &wire_style, &wire_tz)
                                 .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                             if first_row_size.is_none() {
                                 first_row_size = Some(wbuf.len() - before);
@@ -834,20 +836,20 @@ fn handle_pg_simple_query(
             // also gets a per-SELECT arena for the cell text-format
             // fallback payloads. Dropped at end of branch.
             let mat_arena = bumpalo::Bump::new();
-            let wire_style = state
+            let (wire_style, wire_tz) = state
                 .engine
                 .read()
-                .map(|e| e.render_style())
-                .unwrap_or_default();
+                .map(|e| (e.render_style(), e.session_tz()))
+                .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
             if let Some((first, rest)) = rows.split_first() {
                 let before = wbuf.len();
-                encode_data_row(wbuf, &columns, first, &mat_arena, &wire_style)?;
+                encode_data_row(wbuf, &columns, first, &mat_arena, &wire_style, &wire_tz)?;
                 let first_size = wbuf.len() - before;
                 if rest.len() > 0 {
                     wbuf.reserve(first_size.saturating_mul(rest.len()).saturating_add(32));
                 }
                 for row in rest {
-                    encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style)?;
+                    encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style, &wire_tz)?;
                 }
             }
             send_command_complete_select_count(wbuf, n)?;
@@ -1053,13 +1055,13 @@ fn handle_pg_simple_query_one_into_wbuf(
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(wbuf, &columns)?;
             let mat_arena = bumpalo::Bump::new();
-            let wire_style = state
+            let (wire_style, wire_tz) = state
                 .engine
                 .read()
-                .map(|e| e.render_style())
-                .unwrap_or_default();
+                .map(|e| (e.render_style(), e.session_tz()))
+                .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
             for row in &rows {
-                encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style)?;
+                encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style, &wire_tz)?;
             }
             send_command_complete_select_count(wbuf, rows.len())?;
         }
@@ -2761,11 +2763,11 @@ fn handle_execute(
         };
         let row_arena = bumpalo::Bump::new();
         let any_binary = susp.formats.iter().any(|&f| f == 1);
-        let wire_style = state
+        let (wire_style, wire_tz) = state
             .engine
             .read()
-            .map(|e| e.render_style())
-            .unwrap_or_default();
+            .map(|e| (e.render_style(), e.session_tz()))
+            .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
         for row in &susp.rows[susp.cursor..end] {
             if any_binary {
                 encode_data_row_formats(
@@ -2775,10 +2777,11 @@ fn handle_execute(
                     &susp.formats,
                     &row_arena,
                     &wire_style,
+                    &wire_tz,
                 )
                 .map_err(|e| proto(e.to_string()))?;
             } else {
-                encode_data_row(stream, &susp.columns, row, &row_arena, &wire_style)
+                encode_data_row(stream, &susp.columns, row, &row_arena, &wire_style, &wire_tz)
                     .map_err(|e| proto(e.to_string()))?;
             }
         }
@@ -2844,6 +2847,7 @@ fn handle_execute(
         }
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
         let wire_style = eng.render_style();
+        let wire_tz = eng.session_tz();
         // v7.37.42-arena Phase 3 — per-Execute arena for cell
         // text-format fallback payloads in the extended-protocol
         // streaming path.
@@ -2859,7 +2863,7 @@ fn handle_execute(
                     Ok(())
                 }
                 spg_engine::StreamItem::Row(values) => {
-                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena, &wire_style)
+                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena, &wire_style, &wire_tz)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             });
@@ -2902,11 +2906,11 @@ fn handle_execute(
         persist_wire_write(state, &bind_ast.to_string(), &result)
             .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
     }
-    let wire_style = state
+    let (wire_style, wire_tz) = state
         .engine
         .read()
-        .map(|e| e.render_style())
-        .unwrap_or_default();
+        .map(|e| (e.render_style(), e.session_tz()))
+        .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
             // v7.39 (binary results / tokio-postgres) — PG's Execute
@@ -2934,10 +2938,11 @@ fn handle_execute(
                         &formats,
                         &row_arena,
                         &wire_style,
+                        &wire_tz,
                     )
                     .map_err(|e| proto(e.to_string()))?;
                 } else {
-                    encode_data_row(stream, &columns, row, &row_arena, &wire_style)
+                    encode_data_row(stream, &columns, row, &row_arena, &wire_style, &wire_tz)
                         .map_err(|e| proto(e.to_string()))?;
                 }
             }
@@ -3330,6 +3335,13 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("invalid input syntax for type timestamp")
         {
             "22007"
+        // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
+        // IntervalStyle / extra_float_digits range) are PG's 22023
+        // INVALID_PARAMETER_VALUE.
+        } else if msg.contains("invalid value for parameter")
+            || msg.contains("is outside the valid range for parameter")
+        {
+            "22023"
         } else if msg.contains("duplicate key value violates unique constraint")
             || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
         {
@@ -4114,18 +4126,23 @@ fn handle_copy_to_stdout(
     }
     send_msg(stream, b'H', &body)?;
     let n = rows.len();
-    let wire_style = state
+    let (wire_style, wire_tz) = state
         .engine
         .read()
-        .map(|e| e.render_style())
-        .unwrap_or_default();
+        .map(|e| (e.render_style(), e.session_tz()))
+        .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
     for row in &rows {
         let mut line = String::new();
         for (i, v) in row.values.iter().enumerate() {
             if i > 0 {
                 line.push('\t');
             }
-            line.push_str(&encode_copy_cell(v, columns.get(i).map(|c| c.ty), &wire_style));
+            line.push_str(&encode_copy_cell(
+                v,
+                columns.get(i).map(|c| c.ty),
+                &wire_style,
+                &wire_tz,
+            ));
         }
         line.push('\n');
         send_msg(stream, b'd', line.as_bytes())?;
@@ -4147,6 +4164,7 @@ fn encode_copy_cell(
     v: &spg_storage::Value,
     ty: Option<spg_storage::DataType>,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> String {
     use spg_storage::Value;
     match v {
@@ -4173,7 +4191,8 @@ fn encode_copy_cell(
         Value::Date(d) => spg_engine::eval::format_date_styled(*d, style),
         Value::Timestamp(t) => {
             if matches!(ty, Some(DataType::Timestamptz)) {
-                spg_engine::eval::format_timestamptz_styled(*t, style)
+                let abbr = tz.abbrev_at(*t);
+                spg_engine::eval::format_timestamptz_tz(*t, style, tz.offset_at(*t), abbr.as_deref())
             } else {
                 spg_engine::eval::format_timestamp_styled(*t, style)
             }
@@ -5063,6 +5082,7 @@ fn encode_data_row_formats(
     formats: &[i16],
     arena: &bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> std::io::Result<()> {
     let mut body: Vec<u8> = Vec::with_capacity(cols.len() * 12);
     body.extend_from_slice(&(cols.len() as u16).to_be_bytes());
@@ -5071,7 +5091,7 @@ fn encode_data_row_formats(
         if col_is_binary(formats, i) {
             encode_binary_cell(&mut body, v, c.ty).map_err(std::io::Error::other)?;
         } else {
-            match value_to_pg_text(v, Some(c.ty), arena, style) {
+            match value_to_pg_text(v, Some(c.ty), arena, style, tz) {
                 None => body.extend_from_slice(&(-1i32).to_be_bytes()),
                 Some(s) => {
                     body.extend_from_slice(&(s.len() as i32).to_be_bytes());
@@ -5097,8 +5117,9 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
     // Canned/catalog rows carry pre-rendered text cells; the default
     // render style is correct (and no engine lock is available here).
     let style = spg_engine::eval::RenderStyle::default();
+    let tz = spg_engine::SessionTz::Utc;
     for (i, v) in row.values.iter().enumerate() {
-        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty), &arena, &style)?;
+        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty), &arena, &style, &tz)?;
     }
     send_msg(stream, b'D', &body)
 }
@@ -5114,6 +5135,7 @@ fn encode_data_row_from_refs(
     values: &[&spg_storage::Value<'_>],
     arena: &bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -5122,7 +5144,7 @@ fn encode_data_row_from_refs(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style)?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style, tz)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -5148,8 +5170,9 @@ fn encode_data_row(
     row: &Row,
     arena: &bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> std::io::Result<()> {
-    encode_data_row_from_values(out, cols, &row.values, arena, style)
+    encode_data_row_from_values(out, cols, &row.values, arena, style, tz)
 }
 
 /// v7.37.42-arena Phase 2 — `&[Value]` variant of `encode_data_row`.
@@ -5165,6 +5188,7 @@ fn encode_data_row_from_values(
     values: &[Value<'_>],
     arena: &bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -5173,7 +5197,7 @@ fn encode_data_row_from_values(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style)?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style, tz)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -5200,6 +5224,7 @@ fn encode_pg_text_cell(
     ty: Option<DataType>,
     arena: &bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> std::io::Result<()> {
     match v {
         Value::Null => {
@@ -5230,7 +5255,8 @@ fn encode_pg_text_cell(
         // year <= 0, i.e. any day before 0001-01-01 = day -719162).
         Value::Timestamp(micros)
             if style.date_style == spg_engine::eval::DateStyleKind::Iso
-                && *micros >= AD_FLOOR_DAYS * 86_400_000_000 =>
+                && *micros >= AD_FLOOR_DAYS * 86_400_000_000
+                && (tz.is_utc() || !matches!(ty, Some(DataType::Timestamptz))) =>
         {
             let with_tz = matches!(ty, Some(DataType::Timestamptz));
             return write_cell_timestamp(out, *micros, with_tz);
@@ -5243,7 +5269,7 @@ fn encode_pg_text_cell(
         }
         _ => {}
     }
-    match value_to_pg_text(v, ty, arena, style) {
+    match value_to_pg_text(v, ty, arena, style, tz) {
         None => out.extend_from_slice(&(-1i32).to_be_bytes()),
         Some(s) => write_cell_bytes(out, s.as_bytes())?,
     }
@@ -5585,6 +5611,7 @@ fn value_to_pg_text<'a>(
     ty: Option<DataType>,
     arena: &'a bumpalo::Bump,
     style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
 ) -> Option<&'a str> {
     use bumpalo::collections::String as BumpString;
     use core::fmt::Write;
@@ -5632,7 +5659,16 @@ fn value_to_pg_text<'a>(
         // must round-trip to a literal pg_dump would emit (i.e.
         // include the `+00` UTC offset).
         Value::Timestamp(micros) if matches!(ty, Some(DataType::Timestamptz)) => {
-            into_arena(&spg_engine::eval::format_timestamptz_styled(*micros, style))
+            // v7.39 (tz epic) — per-VALUE offset: a DST zone renders
+            // -05 in January and -04 in July within one session.
+            let off = tz.offset_at(*micros);
+            let abbr = tz.abbrev_at(*micros);
+            into_arena(&spg_engine::eval::format_timestamptz_tz(
+                *micros,
+                style,
+                off,
+                abbr.as_deref(),
+            ))
         }
         Value::Timestamp(micros) => {
             into_arena(&spg_engine::eval::format_timestamp_styled(*micros, style))
@@ -5767,9 +5803,27 @@ fn value_to_pg_text<'a>(
             ))
         }
         Value::TimestamptzArray(items) => {
-            into_arena(&spg_engine::eval::format_timestamp_array_styled(
-                items, true, style,
-            ))
+            // Element-wise per-value offsets (see the scalar arm).
+            let mut out = String::from("{");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match item {
+                    None => out.push_str("NULL"),
+                    Some(t) => {
+                        let abbr = tz.abbrev_at(*t);
+                        out.push_str(&spg_engine::eval::format_timestamptz_tz(
+                            *t,
+                            style,
+                            tz.offset_at(*t),
+                            abbr.as_deref(),
+                        ));
+                    }
+                }
+            }
+            out.push('}');
+            into_arena(&out)
         }
         Value::UuidArray(items) => into_arena(&spg_engine::eval::format_uuid_array(items)),
         Value::IntervalArray(items) => {

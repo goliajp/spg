@@ -2622,6 +2622,9 @@ pub(crate) fn apply_generated_stored_columns(
                 sample_rng: None,
                 recursion_base: core::cell::Cell::new(0),
                 render_style: crate::eval::RenderStyle::default(),
+                tz_offset_fn: None,
+                tz_localize_fn: None,
+                tz_abbrev_fn: None,
                 // This DEFAULT-expression eval path has no engine handle;
                 // gen_random_bytes / uuidv7 aren't expected in a column
                 // DEFAULT, so the deterministic fallbacks are acceptable here.

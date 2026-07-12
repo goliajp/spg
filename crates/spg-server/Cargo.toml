@@ -41,6 +41,9 @@ spg-crypto   = { workspace = true }
 # v7.1 — manifest format extracted into a standalone crate so
 # spg-embedded can read + write the same bytes spg-server does.
 spg-manifest = { workspace = true }
+# v7.39 (tz epic) — IANA timezone lookups (RFC 8536 TZif reader over
+# the system zoneinfo; zero external dependencies).
+spg-tzif     = { workspace = true }
 # v4.33 ops three-pack uses POSIX FFI for:
 #   - signal(SIGTERM/SIGINT) to drive graceful shutdown
 #   - statvfs(2) to compute WAL volume free space for the disk water-mark

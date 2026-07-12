@@ -153,13 +153,23 @@ fn inline_primary_key_enforces_uniqueness() {
     db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)")
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    // v7.39 (SQLSTATE fidelity) — the engine speaks PG's 23505
+    // phrasing ("duplicate key value violates unique constraint").
     let err = db.execute("INSERT INTO t VALUES (1, 'dup')").unwrap_err();
-    assert!(err.to_string().contains("PRIMARY KEY violation"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates unique constraint"),
+        "{err}"
+    );
     // Batch-internal duplicates too.
     let err = db
         .execute("INSERT INTO t VALUES (7, 'x'), (7, 'y')")
         .unwrap_err();
-    assert!(err.to_string().contains("PRIMARY KEY violation"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates unique constraint"),
+        "{err}"
+    );
 }
 
 /// Round-15 — migrate-044's exact statement.

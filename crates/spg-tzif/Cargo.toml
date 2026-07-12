@@ -1,0 +1,14 @@
+[package]
+name         = "spg-tzif"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "IANA timezone database reader for SPG: RFC 8536 TZif v1/v2/v3 parser + POSIX TZ rule evaluation over the system zoneinfo directory. Zero external dependencies."
+repository   = { workspace = true }
+categories   = ["date-and-time", "database-implementations"]
+keywords     = ["spg", "timezone", "tzif", "iana", "zoneinfo"]
+
+[dependencies]
+
+[dev-dependencies]

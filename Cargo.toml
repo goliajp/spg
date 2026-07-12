@@ -10,6 +10,7 @@ members = [
     "crates/spg-embedded",
     "crates/spg-embedded-tokio",
     "crates/spg-manifest",
+    "crates/spg-tzif",
     "crates/spg-server",
     "crates/spg-sqlx",
     "crates/spgctl",
@@ -51,6 +52,7 @@ spg-sql      = { path = "crates/spg-sql", version = "7.34" }
 spg-storage  = { path = "crates/spg-storage", version = "7.34" }
 spg-audit    = { path = "crates/spg-audit", version = "7.34" }
 spg-manifest = { path = "crates/spg-manifest", version = "7.34" }
+spg-tzif     = { path = "crates/spg-tzif", version = "7.34" }
 spg-engine   = { path = "crates/spg-engine", version = "7.34" }
 spg-embedded = { path = "crates/spg-embedded", version = "7.34" }
 # v7.10.0 — tokio adapter for spg-embedded. Bumps the published

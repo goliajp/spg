@@ -439,6 +439,23 @@ fn function_return_shape(
         | "statement_timestamp"
         | "clock_timestamp" => (DataType::Timestamptz, false),
         "current_date" => (DataType::Date, false),
+        // v7.39 (tz epic) — AT TIME ZONE flips the flavour: a naive
+        // timestamp AT ZONE is a timestamptz, a timestamptz AT ZONE a
+        // naive timestamp (PG).
+        "timezone" if args.len() == 2 => {
+            let src_is_tstz = args
+                .get(1)
+                .and_then(|a| describe_expr(a, schema_cols))
+                .is_some_and(|s| matches!(s.ty, DataType::Timestamptz));
+            (
+                if src_is_tstz {
+                    DataType::Timestamp
+                } else {
+                    DataType::Timestamptz
+                },
+                true,
+            )
+        }
         "current_time" | "localtime" => (DataType::Timestamp, false), // approx — SPG lacks TIME
         // Text-returning library — every fn that produces a string.
         "concat"

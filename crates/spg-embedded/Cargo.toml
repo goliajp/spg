@@ -22,6 +22,9 @@ spg-crypto   = { workspace = true }
 # embedded process produces boots cleanly on the server (and
 # vice versa) even with cold-tier state.
 spg-manifest = { workspace = true }
+# v7.39 (tz epic) — IANA timezone lookups (RFC 8536 TZif reader over
+# the system zoneinfo; zero external dependencies).
+spg-tzif     = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
