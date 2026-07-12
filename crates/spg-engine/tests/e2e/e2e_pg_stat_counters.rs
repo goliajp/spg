@@ -141,3 +141,19 @@ fn stat_user_tables_reports_analyze_stamp_and_db_tup_counters() {
     );
     assert_eq!(r[0], spg_storage::Value::Bool(true), "tup_returned moved");
 }
+
+#[test]
+fn stat_database_blks_ratio_moves_with_tiers() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE bt(id INT PRIMARY KEY, v TEXT)").unwrap();
+    e.execute("INSERT INTO bt SELECT g, 'x' FROM generate_series(1,50) g")
+        .unwrap();
+    e.execute("SELECT count(*) FROM bt").unwrap();
+    // Hot-only workload: hits move, cold reads stay zero.
+    let r = one_row(
+        &mut e,
+        "SELECT blks_hit >= 50, blks_read FROM pg_stat_database",
+    );
+    assert_eq!(r[0], spg_storage::Value::Bool(true), "blks_hit moved");
+    assert_eq!(big(&r[1]), 0, "no cold tier -> no block reads");
+}

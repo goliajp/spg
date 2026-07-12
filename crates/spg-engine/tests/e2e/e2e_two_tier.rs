@@ -147,6 +147,17 @@ fn pk_lookup_finds_row_in_cold_only_table() {
         0,
         "hot tier should be empty"
     );
+    // v7.39 (pg_stat blks knife) — every one of those lookups was a
+    // cold-segment row resolution = one "block read".
+    let cold_reads = engine
+        .catalog()
+        .cold_read_stats
+        .cold_reads
+        .load(core::sync::atomic::Ordering::Relaxed);
+    assert!(
+        cold_reads >= cold.len() as u64,
+        "cold reads counted: {cold_reads}"
+    );
 }
 
 #[test]
