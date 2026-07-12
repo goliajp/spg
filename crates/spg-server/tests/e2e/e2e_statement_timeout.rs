@@ -245,10 +245,11 @@ fn statement_timeout_fires_57014_on_long_update() {
 
 #[test]
 fn statement_timeout_show_round_trip() {
-    // Regression: the GUC must still round-trip through SHOW
-    // (the local `settings` map is the source of truth, not
-    // engine session_params). Belt-and-suspenders against a
-    // refactor that loses the SET write.
+    // Regression: the GUC must still round-trip through SHOW.
+    // v7.39 (GUC) — the engine session store is consulted first and
+    // ms-unit time GUCs render PG-style in the largest whole unit:
+    // PG18 shows `SET statement_timeout = '2500'` back as "2500ms"
+    // (2500 % 1000 != 0), verified against the live oracle.
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -260,5 +261,5 @@ fn statement_timeout_show_round_trip() {
 
     send_query(&mut s, "SHOW statement_timeout");
     let msgs = drain_until_ready(&mut s);
-    assert_eq!(first_cell(&msgs), "2500");
+    assert_eq!(first_cell(&msgs), "2500ms");
 }

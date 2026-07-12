@@ -119,7 +119,16 @@ fn cancel_request_interrupts_running_statement() {
         std::thread::sleep(Duration::from_millis(300));
         send_cancel(&addr2, pid, secret);
     });
-    send_query(&mut s, "SELECT count(*) FROM generate_series(1, 200000000)");
+    // Workload choice: each side stays under generate_series's 10M
+    // materialisation cap while the nested-loop product (4e12) runs
+    // effectively forever — the cancel must win, deterministically,
+    // via the join loop's cancel checkpoints. (A single 200M series
+    // used to work here, but parallel aggregation now reaches the 10M
+    // cap error before a 300 ms cancel lands.)
+    send_query(
+        &mut s,
+        "SELECT count(*) FROM generate_series(1, 2000000) a, generate_series(1, 2000000) b",
+    );
     // Expect ErrorResponse with 57014 / "user request".
     let mut got_error = false;
     loop {
