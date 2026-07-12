@@ -3316,6 +3316,16 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // STRING_DATA_RIGHT_TRUNCATION.
         } else if msg.contains("value too long for type") {
             "22001"
+        // v7.39 (GUC knife 5) — PG's datetime input errors: field values
+        // that don't fit the calendar/DateStyle are 22008
+        // DATETIME_FIELD_OVERFLOW; malformed text is 22007
+        // INVALID_DATETIME_FORMAT.
+        } else if msg.contains("date/time field value out of range") {
+            "22008"
+        } else if msg.contains("invalid input syntax for type date")
+            || msg.contains("invalid input syntax for type timestamp")
+        {
+            "22007"
         } else if msg.contains("duplicate key value violates unique constraint")
             || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
         {
@@ -4736,6 +4746,12 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     body.push(b'C');
     body.extend_from_slice(sqlstate.as_bytes());
     body.push(0);
+    // v7.39 (GUC knife 5) — split a trailing "\nHINT:  ..." into its
+    // own H field, like PG (the DateStyle input hint rides this).
+    let (msg, hint) = match msg.split_once("\nHINT:  ") {
+        Some((m, h)) => (m, Some(h)),
+        None => (msg, None),
+    };
     // Split a trailing " DETAIL: ..." into its own D field, like PG.
     let (main, detail) = match msg.split_once(" DETAIL: ") {
         Some((m, d)) => (m, Some(d)),
@@ -4749,6 +4765,9 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     let main_msg: &str = if sqlstate != "42000" {
         main.strip_prefix("unsupported: ")
             .or_else(|| main.strip_prefix("storage: "))
+            // v7.39 (GUC knife 5) — typed datetime input errors ride
+            // EvalError::TypeMismatch; PG's message has no prefix.
+            .or_else(|| main.strip_prefix("eval: type mismatch: "))
             .unwrap_or(main)
     } else {
         main
@@ -4766,6 +4785,11 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     if let Some(d) = detail {
         body.push(b'D');
         body.extend_from_slice(d.as_bytes());
+        body.push(0);
+    }
+    if let Some(h) = hint {
+        body.push(b'H');
+        body.extend_from_slice(h.as_bytes());
         body.push(0);
     }
     let quoted_after = |marker: &str| -> Option<&str> {
