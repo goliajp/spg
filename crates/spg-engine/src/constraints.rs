@@ -651,24 +651,42 @@ pub(crate) fn enforce_uniqueness_inserts(
                 continue;
             }
             if !seen.insert(aggregate::encode_key(&key)) {
-                let kind = if uc.is_primary_key {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                };
-                let col_names: Vec<String> = uc
-                    .columns
-                    .iter()
-                    .map(|&i| table.schema().columns[i].name.clone())
-                    .collect();
+                // v7.39 (SQLSTATE fidelity) — PG's exact 23505 phrasing;
+                // ORMs regex the constraint name out of this message and
+                // the wire layer lifts it into the PG_DIAG fields.
+                let conname =
+                    crate::system_catalog::pg_unique_conname(table, uc, child_table);
+                let detail = unique_key_detail(
+                    &uc.columns
+                        .iter()
+                        .map(|&i| table.schema().columns[i].name.clone())
+                        .collect::<Vec<_>>(),
+                    &key,
+                );
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "{kind} violation on {child_table:?} columns {col_names:?}: \
-                     row #{batch_idx} duplicates an existing key"
+                    "duplicate key value violates unique constraint \"{conname}\" \
+                     on table \"{child_table}\"{detail}"
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// v7.39 (SQLSTATE fidelity) — PG's 23505 DETAIL body:
+/// ` DETAIL: Key (a, b)=(1, x) already exists.` Appended to the main
+/// message (the engine error is a single string; psql-style separate
+/// DETAIL packets are a wire-layer follow-up).
+fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
+    let vals = key
+        .iter()
+        .map(|v| match v {
+            Value::Text(s) => s.to_string(),
+            other => crate::eval::value_to_text(other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    alloc::format!(" DETAIL: Key ({})=({vals}) already exists.", cols.join(", "))
 }
 
 /// v7.17.0 Phase 3.P0-45 — return a key cell folded by its column's
@@ -892,9 +910,11 @@ pub(crate) fn enforce_unique_index_inserts(
                 continue;
             }
             if !seen.insert(aggregate::encode_key(&key)) {
+                // v7.39 (SQLSTATE fidelity) — a unique INDEX is a unique
+                // constraint to clients; same PG 23505 phrasing.
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} violation on {table_name:?}: \
-                     row #{batch_idx} duplicates an existing key",
+                    "duplicate key value violates unique constraint \"{}\" \
+                     on table \"{table_name}\"",
                     idx.name
                 )));
             }
@@ -1007,20 +1027,23 @@ pub(crate) fn enforce_unique_updates(
             }
             Ok(Some(aggregate::encode_key(&key)))
         };
-        let on_conflict = |pos: usize| -> EngineError {
-            let kind = if uc.is_primary_key {
-                "PRIMARY KEY"
+        let on_conflict = |_pos: usize| -> EngineError {
+            // v7.39 (SQLSTATE fidelity) — PG's 23505 phrasing (see the
+            // INSERT-path twin above).
+            let conname = if uc.is_primary_key {
+                alloc::format!("{table_name}_pkey")
             } else {
-                "UNIQUE"
+                let cols = uc
+                    .columns
+                    .iter()
+                    .map(|&i| schema.columns[i].name.clone())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                alloc::format!("{table_name}_{cols}_key")
             };
-            let col_names: Vec<String> = uc
-                .columns
-                .iter()
-                .map(|&i| schema.columns[i].name.clone())
-                .collect();
             EngineError::Unsupported(alloc::format!(
-                "{kind} violation on {table_name:?} columns {col_names:?}: \
-                 UPDATE of row #{pos} duplicates an existing key"
+                "duplicate key value violates unique constraint \"{conname}\" \
+                 on table \"{table_name}\""
             ))
         };
         replay(&key_str, &on_conflict)?;

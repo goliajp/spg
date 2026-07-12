@@ -32,7 +32,7 @@ fn unique_index_basic_blocks_dup() {
     ok(&mut eng, "CREATE UNIQUE INDEX uq_a ON t (a)");
     ok(&mut eng, "INSERT INTO t VALUES (1, 100)");
     ok(&mut eng, "INSERT INTO t VALUES (2, 200)");
-    err_contains(&mut eng, "INSERT INTO t VALUES (1, 999)", "UNIQUE");
+    err_contains(&mut eng, "INSERT INTO t VALUES (1, 999)", "unique constraint");
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn partial_unique_index_filters_by_predicate() {
     err_contains(
         &mut eng,
         "INSERT INTO email_templates VALUES ('a@x', 'd2', true)",
-        "UNIQUE",
+        "unique constraint",
     );
 }
 
@@ -136,13 +136,13 @@ fn partial_unique_caldav_master_instance() {
     err_contains(
         &mut eng,
         "INSERT INTO calendar_events VALUES (1, 'uid-a', NULL)",
-        "UNIQUE",
+        "unique constraint",
     );
     // Duplicate instance (same triple) — reject.
     err_contains(
         &mut eng,
         "INSERT INTO calendar_events VALUES (1, 'uid-a', '2026-01-01')",
-        "UNIQUE",
+        "unique constraint",
     );
 }
 
@@ -163,7 +163,7 @@ fn partial_unique_within_batch_dup() {
     err_contains(
         &mut eng,
         "INSERT INTO t VALUES (2, true), (2, true)",
-        "UNIQUE",
+        "unique constraint",
     );
 }
 
@@ -189,6 +189,6 @@ fn unique_index_persists_across_snapshot() {
     let bytes = eng.snapshot();
     // Re-open from the snapshot envelope — the is_unique flag must survive.
     let mut eng2 = Engine::restore_envelope(&bytes).expect("reload");
-    err_contains(&mut eng2, "INSERT INTO t VALUES (2)", "UNIQUE");
+    err_contains(&mut eng2, "INSERT INTO t VALUES (2)", "unique constraint");
     ok(&mut eng2, "INSERT INTO t VALUES (4)");
 }

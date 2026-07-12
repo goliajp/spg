@@ -33,7 +33,10 @@ fn composite_unique_rejects_full_duplicate() {
         "INSERT INTO messages (mailbox_id, uid) VALUES (1, 100)",
     ]);
     let r = eng.execute("INSERT INTO messages (mailbox_id, uid) VALUES (1, 100)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("UNIQUE violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("unique constraint")),
+        "PG 23505 phrasing"
+    );
     assert_eq!(count(&mut eng, "SELECT id FROM messages"), 1);
 }
 
@@ -60,7 +63,8 @@ fn composite_pk_implies_not_null_and_rejects_duplicate() {
     ]);
     let r = eng.execute("INSERT INTO snoozed VALUES ('t1', 'a@x.com')");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("PRIMARY KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("unique constraint")
+            && s.contains("_pkey"))
     );
 }
 
