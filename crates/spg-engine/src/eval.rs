@@ -61,6 +61,13 @@ pub use format::{
     format_timestamp, format_timestamp_array, format_timestamptz, format_timestamptz_at,
     format_timetz, format_uuid_array, parse_date_literal, parse_timestamp_literal,
 };
+// v7.39 (GUC knife 3) — session render styles + styled formatters.
+pub use format::{
+    DateOrder, DateStyleKind, IntervalStyleKind, RenderStyle, format_date_array_styled,
+    format_date_styled, format_float_array_styled, format_float_styled,
+    format_interval_array_styled, format_interval_styled, format_real_styled,
+    format_timestamp_array_styled, format_timestamp_styled, format_timestamptz_styled,
+};
 use functions::apply_function;
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};
 pub(crate) use math::{f64_ceil, f64_floor, f64_sqrt};
@@ -88,6 +95,7 @@ use textsearch::{
 };
 pub use values::gen_random_uuid_bytes;
 pub use values::value_to_text;
+pub use values::value_to_text_styled;
 use values::{
     array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64,
     values_equal_for_nullif,
@@ -151,6 +159,12 @@ pub struct EvalContext<'a> {
     /// process. Owned (not a borrowed cell) so it stays stack-local and
     /// never touches `Engine`'s `Sync` bound.
     pub recursion_base: core::cell::Cell<usize>,
+    /// v7.39 (GUC knife 3) — session render style (DateStyle /
+    /// IntervalStyle / extra_float_digits) for text output produced
+    /// inside expression evaluation (`::text` casts). Contexts built
+    /// away from the session (per-shard scan filters, index probes)
+    /// keep the default — they don't render text output.
+    pub render_style: crate::eval::format::RenderStyle,
     /// v7.38 (read01 P5.24) — host-provided CSPRNG (the server injects
     /// `/dev/urandom`). Cryptographic builtins (`gen_random_bytes`,
     /// `gen_salt`) draw from this instead of the process-static xorshift
@@ -219,11 +233,24 @@ impl<'a> EvalContext<'a> {
             session_gucs: None,
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
+            render_style: crate::eval::format::RenderStyle {
+                date_style: crate::eval::format::DateStyleKind::Iso,
+                date_order: crate::eval::format::DateOrder::Mdy,
+                interval_style: crate::eval::format::IntervalStyleKind::Postgres,
+                extra_float_digits: 1,
+            },
             salt_fn: None,
             clock: None,
             xact: None,
             assigned_xid: core::cell::Cell::new(None),
         }
+    }
+
+    /// v7.39 (GUC knife 3) — attach the session render style.
+    #[must_use]
+    pub const fn with_render_style(mut self, style: crate::eval::format::RenderStyle) -> Self {
+        self.render_style = style;
+        self
     }
 
     /// v7.38 (read01 P5.24) — attach the host CSPRNG so cryptographic
@@ -689,10 +716,61 @@ pub fn eval_expr(
                 && crate::describe::describe_expr(expr, ctx.columns)
                     .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
             {
+                // v7.39 (GUC knife 3) — non-ISO DateStyles show the zone
+                // name for timestamptz; ISO keeps the offset suffix.
+                if ctx.render_style.date_style != crate::eval::format::DateStyleKind::Iso
+                    && ctx.session_tz_offset() == 0
+                {
+                    return Ok(Value::text(format::format_timestamptz_styled(
+                        *t,
+                        &ctx.render_style,
+                    )));
+                }
                 return Ok(Value::text(crate::eval::format_timestamptz_at(
                     *t,
                     ctx.session_tz_offset(),
                 )));
+            }
+            // v7.39 (GUC knife 3) — the out-function casts honour the
+            // session render style, like PG's date_out/interval_out/
+            // float8out under DateStyle/IntervalStyle/extra_float_digits.
+            if matches!(target, CastTarget::Text) {
+                match &v {
+                    Value::Date(d) => {
+                        return Ok(Value::text(format::format_date_styled(
+                            *d,
+                            &ctx.render_style,
+                        )));
+                    }
+                    Value::Timestamp(t) => {
+                        return Ok(Value::text(format::format_timestamp_styled(
+                            *t,
+                            &ctx.render_style,
+                        )));
+                    }
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
+                        return Ok(Value::text(format::format_interval_styled(
+                            *months, *days, *micros, &ctx.render_style,
+                        )));
+                    }
+                    Value::Float(x) => {
+                        return Ok(Value::text(format::format_float_styled(
+                            *x,
+                            &ctx.render_style,
+                        )));
+                    }
+                    Value::Real(x) => {
+                        return Ok(Value::text(format::format_real_styled(
+                            *x,
+                            &ctx.render_style,
+                        )));
+                    }
+                    _ => {}
+                }
             }
             cast_value(v, target.clone())
         }
@@ -1070,7 +1148,7 @@ pub fn eval_expr(
                     .map(|v| match v {
                         Value::Null => None,
                         Value::Text(s) | Value::Json(s) => Some(s.into_owned()),
-                        other => Some(value_to_text_for_array(&other)),
+                        other => Some(value_to_text_for_array(&other, &ctx.render_style)),
                     })
                     .collect();
                 return Ok(Value::TextArray(out));
@@ -1479,7 +1557,7 @@ pub(crate) fn widen_to_common(
     }
 }
 
-fn value_to_text_for_array(v: &Value) -> String {
+fn value_to_text_for_array(v: &Value, style: &format::RenderStyle) -> String {
     match v {
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Int(n) => n.to_string(),
@@ -1494,10 +1572,10 @@ fn value_to_text_for_array(v: &Value) -> String {
                 "f".into()
             }
         }
-        Value::Float(x) => format::format_float(*x),
-        Value::Real(x) => format::format_real(*x),
-        Value::Date(d) => format_date(*d),
-        Value::Timestamp(t) => format_timestamp(*t),
+        Value::Float(x) => format::format_float_styled(*x, style),
+        Value::Real(x) => format::format_real_styled(*x, style),
+        Value::Date(d) => format::format_date_styled(*d, style),
+        Value::Timestamp(t) => format::format_timestamp_styled(*t, style),
         Value::Numeric {
             scaled,
             scale,
@@ -1506,7 +1584,7 @@ fn value_to_text_for_array(v: &Value) -> String {
         // v7.39 — everything else renders its canonical PG text (this
         // Debug fallback is how `ARRAY['\xff'::bytea]` printed
         // `{Bytes([255])}` on the wire).
-        _ => values::value_to_text(v),
+        _ => values::value_to_text_styled(v, style),
     }
 }
 

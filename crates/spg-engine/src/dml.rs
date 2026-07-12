@@ -2621,6 +2621,7 @@ pub(crate) fn apply_generated_stored_columns(
                 session_gucs: None,
                 sample_rng: None,
                 recursion_base: core::cell::Cell::new(0),
+                render_style: crate::eval::RenderStyle::default(),
                 // This DEFAULT-expression eval path has no engine handle;
                 // gen_random_bytes / uuidv7 aren't expected in a column
                 // DEFAULT, so the deterministic fallbacks are acceptable here.

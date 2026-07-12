@@ -118,6 +118,7 @@ impl Engine {
                 Some(v) => self.set_session_param(name, spg_sql::ast::SetValue::String(v)),
                 None => {
                     self.session_params.remove(&name.to_ascii_lowercase());
+                    self.refresh_render_style();
                 }
             }
         }

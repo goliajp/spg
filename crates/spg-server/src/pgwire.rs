@@ -559,6 +559,9 @@ fn handle_pg_simple_query(
             .read()
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
         let pre_len = wbuf.len();
+        // v7.39 (GUC knife 3) — snapshot the session render style once
+        // per statement for the row encoders.
+        let wire_style = engine_lock.render_style();
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
         let mut wrote_header = false;
         let mut first_row_size: Option<usize> = None;
@@ -621,11 +624,17 @@ fn handle_pg_simple_query(
                 spg_engine::StreamItem::Row(values) => {
                     if first_row_size.is_none() {
                         let before = wbuf.len();
-                        let r = encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena);
+                        let r = encode_data_row_from_refs(
+                            wbuf,
+                            &cols_storage,
+                            values,
+                            &wire_arena,
+                            &wire_style,
+                        );
                         first_row_size = Some(wbuf.len() - before);
                         return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
                     }
-                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena)
+                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena, &wire_style)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             }
@@ -705,7 +714,7 @@ fn handle_pg_simple_query(
                         header_written = true;
                     }
                     let before = wbuf.len();
-                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena)
+                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena, &wire_style)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                     if first_row_size.is_none() {
                         first_row_size = Some(wbuf.len() - before);
@@ -739,7 +748,7 @@ fn handle_pg_simple_query(
                         wrote_header = true;
                         for row in &rows {
                             let before = wbuf.len();
-                            encode_data_row(wbuf, &cols_storage, row, &wire_arena)
+                            encode_data_row(wbuf, &cols_storage, row, &wire_arena, &wire_style)
                                 .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                             if first_row_size.is_none() {
                                 first_row_size = Some(wbuf.len() - before);
@@ -825,15 +834,20 @@ fn handle_pg_simple_query(
             // also gets a per-SELECT arena for the cell text-format
             // fallback payloads. Dropped at end of branch.
             let mat_arena = bumpalo::Bump::new();
+            let wire_style = state
+                .engine
+                .read()
+                .map(|e| e.render_style())
+                .unwrap_or_default();
             if let Some((first, rest)) = rows.split_first() {
                 let before = wbuf.len();
-                encode_data_row(wbuf, &columns, first, &mat_arena)?;
+                encode_data_row(wbuf, &columns, first, &mat_arena, &wire_style)?;
                 let first_size = wbuf.len() - before;
                 if rest.len() > 0 {
                     wbuf.reserve(first_size.saturating_mul(rest.len()).saturating_add(32));
                 }
                 for row in rest {
-                    encode_data_row(wbuf, &columns, row, &mat_arena)?;
+                    encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style)?;
                 }
             }
             send_command_complete_select_count(wbuf, n)?;
@@ -1003,8 +1017,13 @@ fn handle_pg_simple_query_one_into_wbuf(
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(wbuf, &columns)?;
             let mat_arena = bumpalo::Bump::new();
+            let wire_style = state
+                .engine
+                .read()
+                .map(|e| e.render_style())
+                .unwrap_or_default();
             for row in &rows {
-                encode_data_row(wbuf, &columns, row, &mat_arena)?;
+                encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style)?;
             }
             send_command_complete_select_count(wbuf, rows.len())?;
         }
@@ -2702,12 +2721,24 @@ fn handle_execute(
         };
         let row_arena = bumpalo::Bump::new();
         let any_binary = susp.formats.iter().any(|&f| f == 1);
+        let wire_style = state
+            .engine
+            .read()
+            .map(|e| e.render_style())
+            .unwrap_or_default();
         for row in &susp.rows[susp.cursor..end] {
             if any_binary {
-                encode_data_row_formats(stream, &susp.columns, row, &susp.formats, &row_arena)
-                    .map_err(|e| proto(e.to_string()))?;
+                encode_data_row_formats(
+                    stream,
+                    &susp.columns,
+                    row,
+                    &susp.formats,
+                    &row_arena,
+                    &wire_style,
+                )
+                .map_err(|e| proto(e.to_string()))?;
             } else {
-                encode_data_row(stream, &susp.columns, row, &row_arena)
+                encode_data_row(stream, &susp.columns, row, &row_arena, &wire_style)
                     .map_err(|e| proto(e.to_string()))?;
             }
         }
@@ -2772,6 +2803,7 @@ fn handle_execute(
             let _ = needs_write;
         }
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
+        let wire_style = eng.render_style();
         // v7.37.42-arena Phase 3 — per-Execute arena for cell
         // text-format fallback payloads in the extended-protocol
         // streaming path.
@@ -2787,7 +2819,7 @@ fn handle_execute(
                     Ok(())
                 }
                 spg_engine::StreamItem::Row(values) => {
-                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena)
+                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena, &wire_style)
                         .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             });
@@ -2830,6 +2862,11 @@ fn handle_execute(
         persist_wire_write(state, &bind_ast.to_string(), &result)
             .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
     }
+    let wire_style = state
+        .engine
+        .read()
+        .map(|e| e.render_style())
+        .unwrap_or_default();
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
             // v7.39 (binary results / tokio-postgres) — PG's Execute
@@ -2850,10 +2887,17 @@ fn handle_execute(
                 .unwrap_or_default();
             for row in &rows[..emit_end] {
                 if wants_binary {
-                    encode_data_row_formats(stream, &columns, row, &formats, &row_arena)
-                        .map_err(|e| proto(e.to_string()))?;
+                    encode_data_row_formats(
+                        stream,
+                        &columns,
+                        row,
+                        &formats,
+                        &row_arena,
+                        &wire_style,
+                    )
+                    .map_err(|e| proto(e.to_string()))?;
                 } else {
-                    encode_data_row(stream, &columns, row, &row_arena)
+                    encode_data_row(stream, &columns, row, &row_arena, &wire_style)
                         .map_err(|e| proto(e.to_string()))?;
                 }
             }
@@ -4020,13 +4064,18 @@ fn handle_copy_to_stdout(
     }
     send_msg(stream, b'H', &body)?;
     let n = rows.len();
+    let wire_style = state
+        .engine
+        .read()
+        .map(|e| e.render_style())
+        .unwrap_or_default();
     for row in &rows {
         let mut line = String::new();
         for (i, v) in row.values.iter().enumerate() {
             if i > 0 {
                 line.push('\t');
             }
-            line.push_str(&encode_copy_cell(v, columns.get(i).map(|c| c.ty)));
+            line.push_str(&encode_copy_cell(v, columns.get(i).map(|c| c.ty), &wire_style));
         }
         line.push('\n');
         send_msg(stream, b'd', line.as_bytes())?;
@@ -4044,7 +4093,11 @@ fn handle_copy_to_stdout(
 /// to tell `timestamptz` from `timestamp`: PG's COPY renders the former with
 /// its offset (`2024-01-15 10:30:00+00`), the latter without. Every other
 /// value renders identically either way.
-fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -> String {
+fn encode_copy_cell(
+    v: &spg_storage::Value,
+    ty: Option<spg_storage::DataType>,
+    style: &spg_engine::eval::RenderStyle,
+) -> String {
     use spg_storage::Value;
     match v {
         Value::Null => "\\N".to_string(),
@@ -4052,8 +4105,8 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
-        Value::Float(x) => format!("{x}"),
-        Value::Real(x) => spg_engine::eval::format_real(*x),
+        Value::Float(x) => spg_engine::eval::format_float_styled(*x, style),
+        Value::Real(x) => spg_engine::eval::format_real_styled(*x, style),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
         // v7.39 (bpchar epic) — COPY emits the padded stored form.
         Value::BpChar(s) => escape_copy_cell(s),
@@ -4067,19 +4120,19 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
             scale,
             kind,
         } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
-        Value::Date(d) => spg_engine::eval::format_date(*d),
+        Value::Date(d) => spg_engine::eval::format_date_styled(*d, style),
         Value::Timestamp(t) => {
             if matches!(ty, Some(DataType::Timestamptz)) {
-                spg_engine::eval::format_timestamptz(*t)
+                spg_engine::eval::format_timestamptz_styled(*t, style)
             } else {
-                spg_engine::eval::format_timestamp(*t)
+                spg_engine::eval::format_timestamp_styled(*t, style)
             }
         }
         Value::Interval {
             months,
             days,
             micros,
-        } => spg_engine::eval::format_interval(*months, *days, *micros),
+        } => spg_engine::eval::format_interval_styled(*months, *days, *micros, style),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
             escape_copy_cell(&format!("[{}]", parts.join(",")))
@@ -4945,6 +4998,7 @@ fn encode_data_row_formats(
     row: &Row,
     formats: &[i16],
     arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> std::io::Result<()> {
     let mut body: Vec<u8> = Vec::with_capacity(cols.len() * 12);
     body.extend_from_slice(&(cols.len() as u16).to_be_bytes());
@@ -4953,7 +5007,7 @@ fn encode_data_row_formats(
         if col_is_binary(formats, i) {
             encode_binary_cell(&mut body, v, c.ty).map_err(std::io::Error::other)?;
         } else {
-            match value_to_pg_text(v, Some(c.ty), arena) {
+            match value_to_pg_text(v, Some(c.ty), arena, style) {
                 None => body.extend_from_slice(&(-1i32).to_be_bytes()),
                 Some(s) => {
                     body.extend_from_slice(&(s.len() as i32).to_be_bytes());
@@ -4976,8 +5030,11 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
     let mut body = Vec::with_capacity(2 + row.values.len() * 8);
     body.extend_from_slice(&n.to_be_bytes());
+    // Canned/catalog rows carry pre-rendered text cells; the default
+    // render style is correct (and no engine lock is available here).
+    let style = spg_engine::eval::RenderStyle::default();
     for (i, v) in row.values.iter().enumerate() {
-        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty), &arena)?;
+        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty), &arena, &style)?;
     }
     send_msg(stream, b'D', &body)
 }
@@ -4992,6 +5049,7 @@ fn encode_data_row_from_refs(
     cols: &[ColumnSchema],
     values: &[&spg_storage::Value<'_>],
     arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -5000,7 +5058,7 @@ fn encode_data_row_from_refs(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena)?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -5025,8 +5083,9 @@ fn encode_data_row(
     cols: &[ColumnSchema],
     row: &Row,
     arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> std::io::Result<()> {
-    encode_data_row_from_values(out, cols, &row.values, arena)
+    encode_data_row_from_values(out, cols, &row.values, arena, style)
 }
 
 /// v7.37.42-arena Phase 2 — `&[Value]` variant of `encode_data_row`.
@@ -5041,6 +5100,7 @@ fn encode_data_row_from_values(
     cols: &[ColumnSchema],
     values: &[Value<'_>],
     arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> std::io::Result<()> {
     let n = u16::try_from(values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
@@ -5049,7 +5109,7 @@ fn encode_data_row_from_values(
     out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
     out.extend_from_slice(&n.to_be_bytes());
     for (i, v) in values.iter().enumerate() {
-        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena)?;
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty), arena, style)?;
     }
     let body_plus_len_field = out.len() - frame_start - 1;
     let len = u32::try_from(body_plus_len_field)
@@ -5075,6 +5135,7 @@ fn encode_pg_text_cell(
     v: &Value<'_>,
     ty: Option<DataType>,
     arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> std::io::Result<()> {
     match v {
         Value::Null => {
@@ -5099,14 +5160,20 @@ fn encode_pg_text_cell(
         // matches `spg_engine::eval::format_timestamp` byte-for-byte
         // (incl. the `frac` trailing-zero trim) — see
         // `write_cell_timestamp_matches_engine_format` below.
-        Value::Timestamp(micros) => {
+        // v7.39 (GUC knife 3) — the stack fast paths spell ISO; a
+        // non-ISO DateStyle drops to the styled formatter below.
+        Value::Timestamp(micros)
+            if style.date_style == spg_engine::eval::DateStyleKind::Iso =>
+        {
             let with_tz = matches!(ty, Some(DataType::Timestamptz));
             return write_cell_timestamp(out, *micros, with_tz);
         }
-        Value::Date(days) => return write_cell_date(out, *days),
+        Value::Date(days) if style.date_style == spg_engine::eval::DateStyleKind::Iso => {
+            return write_cell_date(out, *days);
+        }
         _ => {}
     }
-    match value_to_pg_text(v, ty, arena) {
+    match value_to_pg_text(v, ty, arena, style) {
         None => out.extend_from_slice(&(-1i32).to_be_bytes()),
         Some(s) => write_cell_bytes(out, s.as_bytes())?,
     }
@@ -5442,6 +5509,7 @@ fn value_to_pg_text<'a>(
     v: &Value<'_>,
     ty: Option<DataType>,
     arena: &'a bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
 ) -> Option<&'a str> {
     use bumpalo::collections::String as BumpString;
     use core::fmt::Write;
@@ -5470,10 +5538,10 @@ fn value_to_pg_text<'a>(
         Value::SmallInt(n) => display_into_arena(n),
         Value::Int(n) => display_into_arena(n),
         Value::BigInt(n) => display_into_arena(n),
-        Value::Float(f) => display_into_arena(f),
+        Value::Float(f) => into_arena(&spg_engine::eval::format_float_styled(*f, style)),
         // v7.39 — REAL renders PG float4out shortest-round-trip (it
         // previously fell through to the Debug placeholder).
-        Value::Real(x) => into_arena(&spg_engine::eval::format_real(*x)),
+        Value::Real(x) => into_arena(&spg_engine::eval::format_real_styled(*x, style)),
         Value::Text(s) | Value::Json(s) => into_arena(s.as_ref()),
         // v7.39 (bpchar epic) — bpchar's wire display is the PADDED
         // stored form (PG bpcharout).
@@ -5489,10 +5557,12 @@ fn value_to_pg_text<'a>(
         // must round-trip to a literal pg_dump would emit (i.e.
         // include the `+00` UTC offset).
         Value::Timestamp(micros) if matches!(ty, Some(DataType::Timestamptz)) => {
-            into_arena(&spg_engine::eval::format_timestamptz(*micros))
+            into_arena(&spg_engine::eval::format_timestamptz_styled(*micros, style))
         }
-        Value::Timestamp(micros) => into_arena(&format_timestamp(*micros)),
-        Value::Date(days) => into_arena(&format_date(*days)),
+        Value::Timestamp(micros) => {
+            into_arena(&spg_engine::eval::format_timestamp_styled(*micros, style))
+        }
+        Value::Date(days) => into_arena(&spg_engine::eval::format_date_styled(*days, style)),
         // v7.39 (GUC knife 2) — this arm emitted the internal
         // `P{m}M{d}D{u}U` codec form on the wire for years; PG text
         // format is what clients parse.
@@ -5500,7 +5570,9 @@ fn value_to_pg_text<'a>(
             months,
             days,
             micros,
-        } => into_arena(&spg_engine::eval::format_interval(*months, *days, *micros)),
+        } => into_arena(&spg_engine::eval::format_interval_styled(
+            *months, *days, *micros, style,
+        )),
         Value::Numeric {
             scaled,
             scale,
@@ -5605,26 +5677,34 @@ fn value_to_pg_text<'a>(
         Value::SmallIntArray(items) => {
             into_arena(&spg_engine::eval::format_smallint_array(items))
         }
-        Value::FloatArray(items) => into_arena(&spg_engine::eval::format_float_array(items)),
+        Value::FloatArray(items) => {
+            into_arena(&spg_engine::eval::format_float_array_styled(items, style))
+        }
         Value::NumericArray(items) => {
             into_arena(&spg_engine::eval::format_numeric_array(items))
         }
-        Value::DateArray(items) => into_arena(&spg_engine::eval::format_date_array(items)),
+        Value::DateArray(items) => {
+            into_arena(&spg_engine::eval::format_date_array_styled(items, style))
+        }
         Value::TimestampArray(items) => {
-            into_arena(&spg_engine::eval::format_timestamp_array(items, false))
+            into_arena(&spg_engine::eval::format_timestamp_array_styled(
+                items, false, style,
+            ))
         }
         Value::TimestamptzArray(items) => {
-            into_arena(&spg_engine::eval::format_timestamp_array(items, true))
+            into_arena(&spg_engine::eval::format_timestamp_array_styled(
+                items, true, style,
+            ))
         }
         Value::UuidArray(items) => into_arena(&spg_engine::eval::format_uuid_array(items)),
         Value::IntervalArray(items) => {
-            into_arena(&spg_engine::eval::format_interval_array(items))
+            into_arena(&spg_engine::eval::format_interval_array_styled(items, style))
         }
         // v7.39 — every remaining variant renders its canonical PG
         // text via the engine's shared formatter (the old Debug
         // fallback leaked `Inet { .. }` / `Point(..)` / `BitString
         // { .. }` placeholders for sixteen types on the wire).
-        other => into_arena(&spg_engine::eval::value_to_text(other)),
+        other => into_arena(&spg_engine::eval::value_to_text_styled(other, style)),
     })
 }
 
