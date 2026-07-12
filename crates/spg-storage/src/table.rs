@@ -19,6 +19,9 @@ impl Table {
             rowids: PersistentVec::new(),
             next_rowid: 1,
             dead_rows: 0,
+            stat_tup_ins: 0,
+            stat_tup_upd: 0,
+            stat_tup_del: 0,
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
@@ -93,6 +96,20 @@ impl Table {
     /// counter (the v53 MVCC appendix restores headers verbatim).
     pub(crate) fn set_dead_rows_on_load(&mut self, dead: u64) {
         self.dead_rows = dead;
+    }
+
+    /// v7.39 (pg_stat knife A) — bump the volatile write counters the
+    /// engine's DML dispatcher reports per statement.
+    pub fn bump_write_stats(&mut self, ins: u64, upd: u64, del: u64) {
+        self.stat_tup_ins = self.stat_tup_ins.saturating_add(ins);
+        self.stat_tup_upd = self.stat_tup_upd.saturating_add(upd);
+        self.stat_tup_del = self.stat_tup_del.saturating_add(del);
+    }
+
+    /// `(n_tup_ins, n_tup_upd, n_tup_del)` for pg_stat_user_tables.
+    #[must_use]
+    pub fn write_stats(&self) -> (u64, u64, u64) {
+        (self.stat_tup_ins, self.stat_tup_upd, self.stat_tup_del)
     }
 
     /// v7.37.15 (Phase A.2) — read-only access to the per-row

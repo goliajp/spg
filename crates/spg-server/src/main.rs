@@ -1193,6 +1193,9 @@ fn run(
     {
         engine.set_parallel_runner(std::sync::Arc::new(ScopedThreadRunner));
     }
+    // v7.39 (pg_stat knife A) — pg_stat_database.numbackends reads the
+    // live connection count.
+    engine.set_backend_count_fn(live_backend_count);
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
@@ -1717,6 +1720,24 @@ fn install_shutdown_handlers() {
 /// returns `None` when the configured `max_connections` cap is
 /// already reached; otherwise it bumps the counter and the slot
 /// frees on drop.
+/// v7.39 (pg_stat knife A) — process-wide mirror of
+/// `ServerState.active_connections` for the engine's
+/// `BackendCountFn` slot (a plain fn pointer can't capture the Arc).
+/// Kept in lock-step by ConnectionGuard claim/drop.
+static BACKEND_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn live_backend_count() -> u32 {
+    BACKEND_COUNT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn backend_count_incr() {
+    BACKEND_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn backend_count_decr() {
+    BACKEND_COUNT.fetch_sub(1, Ordering::Relaxed);
+}
+
 struct ConnectionGuard {
     state: Arc<ServerState>,
 }
@@ -1736,6 +1757,7 @@ impl ConnectionGuard {
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                BACKEND_COUNT.fetch_add(1, Ordering::Relaxed);
                 return Some(Self {
                     state: Arc::clone(state),
                 });
@@ -1747,6 +1769,7 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+        BACKEND_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

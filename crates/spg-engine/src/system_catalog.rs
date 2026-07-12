@@ -1366,22 +1366,30 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
         let Some(t) = cat.get(&name) else {
             continue;
         };
-        let live_rows = t.rows().len() as i64;
+        // v7.39 (pg_stat knife A) — real counters: live = visible
+        // (physical minus tombstoned; counting `rows()` would include
+        // the flip's dead versions), dead = the autovacuum counter,
+        // writes = the per-table volatile stats the DML dispatcher
+        // bumps. seq/idx scan counters await the scan-path
+        // instrumentation knife.
+        let dead = i64::try_from(t.dead_rows()).unwrap_or(i64::MAX);
+        let live_rows = (t.rows().len() as i64).saturating_sub(dead);
+        let (ins, upd, del) = t.write_stats();
         rows.push(Row::new(alloc::vec![
             Value::BigInt(relid),
             Value::text("public"),
             Value::Text(alloc::borrow::Cow::Owned(name)),
-            Value::BigInt(0), // seq_scan
+            Value::BigInt(0), // seq_scan (scan-path knife)
             Value::BigInt(0), // seq_tup_read
             Value::BigInt(0), // idx_scan
             Value::BigInt(0), // idx_tup_fetch
-            Value::BigInt(0), // n_tup_ins
-            Value::BigInt(0), // n_tup_upd
-            Value::BigInt(0), // n_tup_del
+            Value::BigInt(i64::try_from(ins).unwrap_or(i64::MAX)),
+            Value::BigInt(i64::try_from(upd).unwrap_or(i64::MAX)),
+            Value::BigInt(i64::try_from(del).unwrap_or(i64::MAX)),
             Value::BigInt(live_rows),
-            Value::BigInt(0), // n_dead_tup (vacuum tracks; 0 until 15.16)
-            Value::Null,      // last_vacuum
-            Value::Null,      // last_analyze
+            Value::BigInt(dead),
+            Value::Null, // last_vacuum
+            Value::Null, // last_analyze
         ]));
         relid = relid.saturating_add(1);
     }
@@ -1419,7 +1427,7 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
 ///   * blk_read_time / blk_write_time (Float) — accumulated
 ///     I/O wait time (0 until per-statement timing lands)
 pub(crate) fn synth_pg_stat_database(
-    _cat: &Catalog,
+    eng: &Engine,
     tup_inserted: u64,
     tup_updated: u64,
     tup_deleted: u64,
@@ -1447,12 +1455,21 @@ pub(crate) fn synth_pg_stat_database(
     // Single-row, single-database; everything reads as 0 until
     // per-counter wiring lands (the shape is stable so monitoring
     // queries parse).
+    // v7.39 (pg_stat knife A) — real xact counters + the host's live
+    // backend count (embedded: no host slot -> 1, the calling session).
+    let commits = eng
+        .xact_commit
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let rollbacks = eng
+        .xact_rollback
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let backends = eng.backend_count_fn.map_or(1, |f| f());
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
         Value::text("spg"),
-        Value::Int(0),    // numbackends — wired from server crate
-        Value::BigInt(0), // xact_commit
-        Value::BigInt(0), // xact_rollback
+        Value::Int(i32::try_from(backends).unwrap_or(i32::MAX)),
+        Value::BigInt(i64::try_from(commits).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(rollbacks).unwrap_or(i64::MAX)),
         Value::BigInt(0), // blks_read
         Value::BigInt(0), // blks_hit
         Value::BigInt(0), // tup_returned

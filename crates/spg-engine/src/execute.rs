@@ -294,7 +294,22 @@ impl Engine {
         // `panic = "abort"` profile — the process aborts before any
         // unwind reaches here; active in dev/test (`panic = "unwind"`)
         // and once a later slice flips the release profile.
+        let pre_in_tx = self.in_transaction();
         let result = self.execute_inner_catching(sql, cancel);
+        // v7.39 (pg_stat knife A) — PG counts every statement outside a
+        // transaction block as one implicit xact (commit on success,
+        // rollback on error). Statements INSIDE a block are counted
+        // once, by exec_commit / exec_rollback; BEGIN itself (state
+        // flips outside -> inside) and the block-closers (inside ->
+        // outside, counted in their exec fns) are skipped here.
+        if !pre_in_tx && !self.in_transaction() {
+            let ctr = if result.is_ok() {
+                &self.xact_commit
+            } else {
+                &self.xact_rollback
+            };
+            ctr.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         if self.redo_capture {
             let mut drained = self.active_catalog_mut().drain_redo();
             if result.is_ok() {
@@ -930,10 +945,18 @@ impl Engine {
             Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => {
+                // v7.39 (pg_stat knife A) — per-table n_tup_ins. Charged
+                // to the statement's target (a partition-routed insert
+                // charges the parent; ON CONFLICT updates count here
+                // too — split is a recorded residual).
+                let stat_table = s.table.clone();
                 let r = self.exec_insert(s)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_inserted =
                         self.stat_tup_inserted.saturating_add(*affected as u64);
+                    if let Some(t) = self.active_catalog_mut().get_mut(&stat_table) {
+                        t.bump_write_stats(*affected as u64, 0, 0);
+                    }
                 }
                 Ok(r)
             }
@@ -952,6 +975,9 @@ impl Engine {
                 let r = self.exec_update_cancel(&s, cancel)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_updated = self.stat_tup_updated.saturating_add(*affected as u64);
+                    if let Some(t) = self.active_catalog_mut().get_mut(&s.table) {
+                        t.bump_write_stats(0, *affected as u64, 0);
+                    }
                 }
                 Ok(r)
             }
@@ -962,6 +988,9 @@ impl Engine {
                 let r = self.exec_delete_cancel(&s, cancel)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_deleted = self.stat_tup_deleted.saturating_add(*affected as u64);
+                    if let Some(t) = self.active_catalog_mut().get_mut(&s.table) {
+                        t.bump_write_stats(0, 0, *affected as u64);
+                    }
                 }
                 Ok(r)
             }

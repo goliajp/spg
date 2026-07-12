@@ -449,7 +449,7 @@ impl Engine {
                 // shape-stable 0 until wiring lands).
                 "__spg_pg_stat_database" => {
                     let (schema, rows) = crate::system_catalog::synth_pg_stat_database(
-                        self.active_catalog(),
+                        self,
                         self.stat_tup_inserted,
                         self.stat_tup_updated,
                         self.stat_tup_deleted,
