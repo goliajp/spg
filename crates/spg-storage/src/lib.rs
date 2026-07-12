@@ -3132,6 +3132,13 @@ pub struct Table {
     /// recounts verbatim-restored headers. Drives the engine's
     /// autovacuum threshold; not persisted (recomputed on load).
     dead_rows: u64,
+    /// v7.39 (pg_stat knife A) — volatile per-table write counters
+    /// backing `pg_stat_user_tables.n_tup_ins/upd/del`. Not persisted
+    /// (PG's cumulative stats are shared-memory-volatile too — a
+    /// restart zeroes them).
+    stat_tup_ins: u64,
+    stat_tup_upd: u64,
+    stat_tup_del: u64,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the

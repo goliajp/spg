@@ -1272,6 +1272,9 @@ fn run_pg_session(
     if let Ok(mut conns) = state.connections.write() {
         conns.push(Arc::clone(&conn_state));
     }
+    // v7.39 (pg_stat knife A) — pg_stat_database.numbackends mirror
+    // (pgwire sessions don't pass through main's ConnectionGuard).
+    crate::backend_count_incr();
     // RAII guard: drops the connection from the registry when this
     // function returns (normal exit or error).
     struct ConnGuard {
@@ -1283,6 +1286,7 @@ fn run_pg_session(
             if let Ok(mut conns) = self.state.connections.write() {
                 conns.retain(|x| !Arc::ptr_eq(x, &self.conn));
             }
+            crate::backend_count_decr();
         }
     }
     let _conn_guard = ConnGuard {

@@ -331,6 +331,10 @@ impl From<EvalError> for EngineError {
 /// `Unsupported`.
 pub type ClockFn = fn() -> i64;
 
+/// v7.39 (pg_stat knife A) — host-provided live connection count for
+/// `pg_stat_database.numbackends`.
+pub type BackendCountFn = fn() -> u32;
+
 /// Function pointer that produces 16 cryptographically random bytes.
 /// Like `ClockFn`, the engine is `no_std` and can't reach for /dev/urandom
 /// itself — host (`spg-server`) injects an OS-backed source. `None`
@@ -717,6 +721,17 @@ pub struct Engine {
     /// INSERT / UPDATE / DELETE statement. Per-Engine (so tests stay
     /// isolated); on the server's shared engine they read as the
     /// since-start database totals PG reports.
+    /// v7.39 (pg_stat knife A) — committed / rolled-back transaction
+    /// counters for pg_stat_database. Atomics so the read-only
+    /// autocommit path (&self) can count its implicit commit, matching
+    /// PG (every successful statement outside a tx block is one
+    /// xact_commit — SELECTs included).
+    pub(crate) xact_commit: core::sync::atomic::AtomicU64,
+    pub(crate) xact_rollback: core::sync::atomic::AtomicU64,
+    /// v7.39 (pg_stat knife A) — host-injected live backend count for
+    /// pg_stat_database.numbackends (ClockFn-style fn slot; the server
+    /// wires its connection registry, embedded stays None -> 1).
+    pub(crate) backend_count_fn: Option<BackendCountFn>,
     pub(crate) stat_tup_inserted: u64,
     pub(crate) stat_tup_updated: u64,
     pub(crate) stat_tup_deleted: u64,
@@ -890,6 +905,9 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            xact_commit: core::sync::atomic::AtomicU64::new(0),
+            xact_rollback: core::sync::atomic::AtomicU64::new(0),
+            backend_count_fn: None,
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -1103,6 +1121,11 @@ impl Engine {
     /// v7.39 (parallel-agg P0) — inject the host's parallel executor
     /// (see [`ParallelRunner`]). Called once at host startup; the
     /// engine stays single-threaded without it.
+    /// v7.39 (pg_stat knife A) — inject the host's live backend count.
+    pub fn set_backend_count_fn(&mut self, f: BackendCountFn) {
+        self.backend_count_fn = Some(f);
+    }
+
     pub fn set_parallel_runner(&mut self, runner: alloc::sync::Arc<dyn ParallelRunner>) {
         self.parallel_runner = ParallelRunnerSlot(Some(runner));
     }
@@ -1197,6 +1220,9 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            xact_commit: core::sync::atomic::AtomicU64::new(0),
+            xact_rollback: core::sync::atomic::AtomicU64::new(0),
+            backend_count_fn: None,
             stat_tup_inserted: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -1286,7 +1312,10 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
-                    stat_tup_inserted: 0,
+                    xact_commit: core::sync::atomic::AtomicU64::new(0),
+            xact_rollback: core::sync::atomic::AtomicU64::new(0),
+            backend_count_fn: None,
+            stat_tup_inserted: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
                     local_guc_saves: Vec::new(),

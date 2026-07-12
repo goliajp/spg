@@ -414,6 +414,9 @@ impl Engine {
                 self.release_tx_locks(v);
             }
             self.restore_all_local_gucs();
+            // v7.39 (pg_stat knife A) — a failed COMMIT rolls back.
+            self.xact_rollback
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return Err(e);
         }
         // v7.38 P0 元机制 A — fires at the commit barrier entry.
@@ -624,6 +627,9 @@ impl Engine {
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at the
         // transaction boundary, reverting to the pre-transaction values.
         self.restore_all_local_gucs();
+        // v7.39 (pg_stat knife A) — one committed transaction.
+        self.xact_commit
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -653,6 +659,10 @@ impl Engine {
         // savepoints discarded with the TxState
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at ROLLBACK too.
         self.restore_all_local_gucs();
+        // v7.39 (pg_stat knife A) — one rolled-back transaction (a
+        // COMMIT inside an aborted tx dispatches here too, like PG).
+        self.xact_rollback
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
