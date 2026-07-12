@@ -3002,6 +3002,30 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "23514"
         } else if msg.contains("violates not-null constraint") || msg.contains("NOT NULL column") {
             "23502"
+        // v7.39 (SQLSTATE fidelity) — file-access failures map like
+        // PG's errcode_for_file_access(): ENOSPC/EDQUOT -> 53100
+        // disk_full, ENOMEM -> 53200 out_of_memory, EACCES/EPERM ->
+        // 42501 insufficient_privilege, ENOENT -> 58P01
+        // undefined_file, anything else on the durability path ->
+        // 58030 io_error. Matched on the OS message the io::Error
+        // Display carries.
+        } else if msg.contains("durability append failed") || msg.contains("could not write") {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("no space left")
+                || lower.contains("quota")
+                || lower.contains("storage full")
+                || lower.contains("below water-mark")
+            {
+                "53100"
+            } else if lower.contains("out of memory") {
+                "53200"
+            } else if lower.contains("permission denied") {
+                "42501"
+            } else if lower.contains("no such file") {
+                "58P01"
+            } else {
+                "58030"
+            }
         } else {
             "42000"
         };
@@ -3058,6 +3082,27 @@ mod engine_error_sqlstate_tests {
             "42000"
         );
         assert_eq!(code("syntax error near \"FROM\""), "42000");
+        // v7.39 — errno family on the durability path.
+        assert_eq!(
+            code("durability append failed: No space left on device (os error 28)"),
+            "53100"
+        );
+        assert_eq!(
+            code("durability append failed: WAL append hit storage full"),
+            "53100"
+        );
+        assert_eq!(
+            code("durability append failed: Permission denied (os error 13)"),
+            "42501"
+        );
+        assert_eq!(
+            code("durability append failed: No such file or directory (os error 2)"),
+            "58P01"
+        );
+        assert_eq!(
+            code("durability append failed: broken pipe"),
+            "58030"
+        );
     }
 }
 
