@@ -1393,10 +1393,9 @@ fn value_to_mysql_text(v: &Value) -> String {
         Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
         Value::Date(days) => format_date_mysql(*days),
         Value::Timestamp(us) => format_timestamp_mysql(*us),
-        // Other types fall through to engine's canonical text
-        // renderer when SPG ships one; otherwise the Debug shape
-        // keeps the wire flow alive without losing the row.
-        other => format!("{other:?}"),
+        // v7.39 — every remaining variant renders the engine's
+        // canonical text (the Debug fallback leaked struct shapes).
+        other => spg_engine::eval::value_to_text(other),
     }
 }
 

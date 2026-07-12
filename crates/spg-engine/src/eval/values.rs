@@ -189,7 +189,7 @@ pub fn gen_random_uuid_bytes() -> [u8; 16] {
     out
 }
 
-pub(crate) fn value_to_text(v: &Value) -> String {
+pub fn value_to_text(v: &Value) -> String {
     match v {
         // v7.5.0 — Value is #[non_exhaustive]; any future variant
         // without explicit text rendering hits the Debug fallback

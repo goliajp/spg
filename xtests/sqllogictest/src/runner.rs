@@ -273,7 +273,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Macaddr8(m) => spg_engine::format_macaddr8(m),
         // v7.5.0 — Value is #[non_exhaustive]; Debug-form fallback
         // for any future variant.
-        _ => format!("{v:?}"),
+        // v7.39 — canonical PG text for every remaining variant.
+        _ => spg_engine::eval::value_to_text(v),
     }
 }
 
