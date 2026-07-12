@@ -13062,8 +13062,8 @@ fn apply_function_dispatch(
                         "tsquery" => 3615,
                         "int4range" => 3904,
                         "numrange" => 3906,
-                        "tstzrange" => 3908,
-                        "tsrange" => 3910,
+                        "tsrange" => 3908,
+                        "tstzrange" => 3910,
                         "daterange" => 3912,
                         "int8range" => 3926,
                         _ => {

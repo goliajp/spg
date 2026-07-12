@@ -7377,6 +7377,7 @@ impl Parser {
             "pg_statistic",
             "pg_statistic_ext",
             "pg_subscription",
+            "pg_tables",
             "pg_tablespace",
             "pg_trigger",
             "pg_type",

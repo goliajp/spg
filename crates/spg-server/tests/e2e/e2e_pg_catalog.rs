@@ -136,8 +136,10 @@ fn pg_namespace_returns_public() {
     let mut child = common::ChildGuard(raw);
     let mut s = connect_open(addrs.pgwire.as_ref().unwrap());
 
+    // v7.39 — the engine meta view serves pg_namespace (the canned
+    // wire response is gone): pg_catalog, public, information_schema.
     let (_msgs, n) = run_query_count_rows(&mut s, "SELECT * FROM pg_catalog.pg_namespace");
-    assert_eq!(n, 1, "expected single 'public' namespace row");
+    assert_eq!(n, 3, "expected pg_catalog / public / information_schema");
 }
 
 #[test]
