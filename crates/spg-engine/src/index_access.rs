@@ -379,6 +379,8 @@ pub(crate) fn try_index_seek_positions(
             }
         }
         if all_hot {
+            // v7.39 (pg_stat knife B) — one index scan.
+            table.note_index_scan(out.len() as u64);
             return Some(out);
         }
     }
@@ -413,6 +415,8 @@ pub(crate) fn try_index_seek_positions(
             spg_storage::RowLocator::Cold { .. } => return None,
         }
     }
+    // v7.39 (pg_stat knife B) — one index scan.
+    table.note_index_scan(out.len() as u64);
     Some(out)
 }
 
@@ -550,6 +554,8 @@ fn try_range_seek<'a>(
             spg_storage::RowLocator::Cold { .. } => return None,
         }
     }
+    // v7.39 (pg_stat knife B) — one index scan.
+    table.note_index_scan(out.len() as u64);
     Some(out)
 }
 
@@ -676,6 +682,8 @@ pub(crate) fn try_index_seek<'a>(
             }
         }
     }
+    // v7.39 (pg_stat knife B) — one index scan.
+    table.note_index_scan(out.len() as u64);
     Some(out)
 }
 
@@ -745,6 +753,8 @@ fn try_inlist_seek<'a>(
             }
         }
     }
+    // v7.39 (pg_stat knife B) — one index scan.
+    table.note_index_scan(out.len() as u64);
     Some(out)
 }
 
