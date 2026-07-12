@@ -104,22 +104,23 @@ pub fn format_date_styled(days: i32, style: &RenderStyle) -> String {
         return "-infinity".into();
     }
     let (y, m, d) = civil_from_days(days);
+    let (y, bc) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
     let dmy = style.date_order == DateOrder::Dmy;
     match style.date_style {
-        DateStyleKind::Iso => format!("{y:04}-{m:02}-{d:02}"),
-        DateStyleKind::German => format!("{d:02}.{m:02}.{y:04}"),
+        DateStyleKind::Iso => format!("{y:04}-{m:02}-{d:02}{bc}"),
+        DateStyleKind::German => format!("{d:02}.{m:02}.{y:04}{bc}"),
         DateStyleKind::Sql => {
             if dmy {
-                format!("{d:02}/{m:02}/{y:04}")
+                format!("{d:02}/{m:02}/{y:04}{bc}")
             } else {
-                format!("{m:02}/{d:02}/{y:04}")
+                format!("{m:02}/{d:02}/{y:04}{bc}")
             }
         }
         DateStyleKind::Postgres => {
             if dmy {
-                format!("{d:02}-{m:02}-{y:04}")
+                format!("{d:02}-{m:02}-{y:04}{bc}")
             } else {
-                format!("{m:02}-{d:02}-{y:04}")
+                format!("{m:02}-{d:02}-{y:04}{bc}")
             }
         }
     }
@@ -146,16 +147,23 @@ pub fn format_timestamp_styled(micros: i64, style: &RenderStyle) -> String {
     match style.date_style {
         DateStyleKind::Iso => unreachable!("handled above"),
         DateStyleKind::German | DateStyleKind::Sql => {
-            format!("{} {hms}", format_date_styled(day_i32, style))
+            // format_date_styled carries the BC suffix on the date part;
+            // move it after the time to match PG.
+            let d = format_date_styled(day_i32, style);
+            match d.strip_suffix(" BC") {
+                Some(base) => format!("{base} {hms} BC"),
+                None => format!("{d} {hms}"),
+            }
         }
         DateStyleKind::Postgres => {
             let (y, m, d) = civil_from_days(day_i32);
+            let (y, bc) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
             let mon = MONTH_ABBR[(m as usize).saturating_sub(1).min(11)];
             let dow = dow_abbr(day_i32);
             if style.date_order == DateOrder::Dmy {
-                format!("{dow} {d} {mon} {hms} {y:04}")
+                format!("{dow} {d} {mon} {hms} {y:04}{bc}")
             } else {
-                format!("{dow} {mon} {d} {hms} {y:04}")
+                format!("{dow} {mon} {d} {hms} {y:04}{bc}")
             }
         }
     }
@@ -496,6 +504,11 @@ pub fn format_date(days: i32) -> String {
         return "-infinity".into();
     }
     let (y, m, d) = civil_from_days(days);
+    // v7.39 (GUC knife 6, BC) — PG renders astronomical year <= 0 as
+    // the positive year + " BC" (1 BC is astronomical year 0).
+    if y <= 0 {
+        return format!("{:04}-{m:02}-{d:02} BC", 1 - y);
+    }
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -522,7 +535,13 @@ pub fn format_timestamptz_at(micros: i64, offset_micros: i64) -> String {
         return format_timestamp(micros);
     }
     let base = format_timestamp(micros + offset_micros);
-    let mut s = String::with_capacity(base.len() + 6);
+    // v7.39 (GUC knife 6, BC) — the offset suffix goes before " BC"
+    // (PG: `0044-03-15 10:20:30+00 BC`).
+    let (base, bc) = match base.strip_suffix(" BC") {
+        Some(b) => (String::from(b), " BC"),
+        None => (base, ""),
+    };
+    let mut s = String::with_capacity(base.len() + 9);
     s.push_str(&base);
     let total_min = (offset_micros / 60_000_000).abs();
     let (h, m) = (total_min / 60, total_min % 60);
@@ -532,6 +551,7 @@ pub fn format_timestamptz_at(micros: i64, offset_micros: i64) -> String {
         s.push(':');
         s.push_str(&alloc::format!("{m:02}"));
     }
+    s.push_str(bc);
     s
 }
 
@@ -673,18 +693,20 @@ pub fn format_timestamp(micros: i64) -> String {
     let day_micros = micros.rem_euclid(MICROS_PER_DAY);
     let day_i32 = i32::try_from(days).unwrap_or(i32::MAX);
     let (y, m, d) = civil_from_days(day_i32);
+    // v7.39 (GUC knife 6, BC) — " BC" trails the TIME part in PG.
+    let (y, bc) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
     let secs = day_micros / 1_000_000;
     let frac = day_micros % 1_000_000;
     let hh = secs / 3600;
     let mm = (secs / 60) % 60;
     let ss = secs % 60;
     if frac == 0 {
-        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}{bc}")
     } else {
         // Strip trailing zeros from the 6-digit fractional component.
         let raw = format!("{frac:06}");
         let trimmed = raw.trim_end_matches('0');
-        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{trimmed}")
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{trimmed}{bc}")
     }
 }
 
@@ -723,6 +745,24 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
 /// same under every order.
 pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
     let s = s.trim();
+    // v7.39 (GUC knife 6, BC) — a trailing era marker: `NNNN-MM-DD BC`
+    // maps year N to astronomical year 1-N (there is no year zero);
+    // an explicit AD is accepted and is the default.
+    if let Some(base) = s
+        .strip_suffix(" BC")
+        .or_else(|| s.strip_suffix(" bc"))
+        .or_else(|| s.strip_suffix(" Bc"))
+    {
+        let days = parse_date_literal_ordered(base, order)?;
+        let (y, m, d) = civil_from_days(days);
+        if y < 1 {
+            return None;
+        }
+        return Some(days_from_civil(1 - y, m, d));
+    }
+    if let Some(base) = s.strip_suffix(" AD").or_else(|| s.strip_suffix(" ad")) {
+        return parse_date_literal_ordered(base, order);
+    }
     // PG special date values.
     if s.eq_ignore_ascii_case("epoch") {
         return Some(days_from_civil(1970, 1, 1));
@@ -770,6 +810,10 @@ pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
     // under every order (`2020-1-5`, `2020/01/5`, `2020.1.05`).
     if fa.len() == 4 && fb.len() <= 2 && fc.len() <= 2 {
         let y: i32 = fa.parse().ok()?;
+        // No year zero in the Gregorian era notation (PG: out of range).
+        if y == 0 {
+            return None;
+        }
         let m: u32 = fb.parse().ok()?;
         let d: u32 = fc.parse().ok()?;
         // PG validates the day against the actual (leap-aware) month
@@ -897,11 +941,33 @@ pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64>
     if trimmed.eq_ignore_ascii_case("-infinity") {
         return Some(i64::MIN);
     }
+    // v7.39 (GUC knife 6, BC) — the era marker trails the TIME part
+    // (`0044-03-15 10:20:30 BC`); strip it and re-map the parsed date.
+    let (trimmed, era_bc) = match trimmed
+        .strip_suffix(" BC")
+        .or_else(|| trimmed.strip_suffix(" bc"))
+    {
+        Some(b) => (b.trim_end(), true),
+        None => (
+            trimmed
+                .strip_suffix(" AD")
+                .or_else(|| trimmed.strip_suffix(" ad"))
+                .map_or(trimmed, str::trim_end),
+            false,
+        ),
+    };
     let (date_part, time_part) = match trimmed.find([' ', 'T']) {
         Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
         None => (trimmed, None),
     };
-    let days = parse_date_literal_ordered(date_part, order)?;
+    let mut days = parse_date_literal_ordered(date_part, order)?;
+    if era_bc {
+        let (y, m, d) = civil_from_days(days);
+        if y < 1 {
+            return None;
+        }
+        days = days_from_civil(1 - y, m, d);
+    }
     let (day_micros, tz_offset_micros) = match time_part {
         None => (0, 0),
         Some(t) => parse_time_of_day_micros(t)?,
