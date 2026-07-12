@@ -1952,6 +1952,35 @@ impl Parser {
                     }
                     return Ok(Statement::Empty);
                 }
+                // v7.39 (GUC) — PG spells the timezone GUC as two
+                // keywords: `SET [LOCAL|SESSION] TIME ZONE <value>`,
+                // where <value> is a string/ident or the LOCAL /
+                // DEFAULT keyword (both mean "back to the default").
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+                {
+                    self.advance(); // TIME
+                    self.advance(); // ZONE
+                    let value = match self.peek().clone() {
+                        Token::Ident(s)
+                            if s.eq_ignore_ascii_case("local")
+                                || s.eq_ignore_ascii_case("default") =>
+                        {
+                            self.advance();
+                            crate::ast::SetValue::Default
+                        }
+                        Token::Default => {
+                            self.advance();
+                            crate::ast::SetValue::Default
+                        }
+                        _ => self.parse_set_value()?,
+                    };
+                    return Ok(Statement::SetParameter {
+                        name: "timezone".into(),
+                        value,
+                        local: set_local,
+                    });
+                }
                 // v7.14.0 — multi-assignment form
                 // `SET a = 1, b = 2, …`. Single-assignment is the
                 // 1-element case. Each LHS may be a regular ident

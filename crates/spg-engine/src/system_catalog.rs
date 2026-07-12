@@ -3704,10 +3704,27 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             "default"
         };
         let setting = overridden.unwrap_or_else(|| boot.into());
+        // v7.39 (GUC knife 2) — PG reports ms-unit time GUCs as the bare
+        // number in `setting` with `unit = 'ms'` ("7s" -> 7000 | ms).
+        let is_ms_guc = matches!(
+            name,
+            "statement_timeout"
+                | "lock_timeout"
+                | "idle_in_transaction_session_timeout"
+                | "idle_session_timeout"
+        );
+        let (setting, unit) = if is_ms_guc {
+            match crate::session::parse_pg_duration_ms(&setting) {
+                Some(ms) => (alloc::format!("{ms}"), Value::text("ms")),
+                None => (setting, Value::text("ms")),
+            }
+        } else {
+            (setting, Value::Null)
+        };
         rows.push(Row::new(alloc::vec![
             Value::text::<String>(name.into()),
             Value::text(setting),
-            Value::Null, // unit (setting is self-describing)
+            unit, // ms for time GUCs; else self-describing
             Value::text::<String>(cat.into()),
             Value::Null, // short_desc
             Value::Null, // extra_desc
@@ -3731,6 +3748,12 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
     // vartype is inferred from the value and source is always "session".
     for (k, v) in &engine.session_params {
         if defaults.iter().any(|(n, ..)| (*n).eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        // v7.39 (GUC knife 2) — customised (dotted) parameters are NOT
+        // rows of PG's pg_settings (only registered extension GUCs are);
+        // they remain readable via current_setting().
+        if k.contains('.') {
             continue;
         }
         let vartype = infer_guc_vartype(v);

@@ -5493,15 +5493,14 @@ fn value_to_pg_text<'a>(
         }
         Value::Timestamp(micros) => into_arena(&format_timestamp(*micros)),
         Value::Date(days) => into_arena(&format_date(*days)),
+        // v7.39 (GUC knife 2) — this arm emitted the internal
+        // `P{m}M{d}D{u}U` codec form on the wire for years; PG text
+        // format is what clients parse.
         Value::Interval {
             months,
             days,
             micros,
-        } => {
-            let mut buf = BumpString::new_in(arena);
-            let _ = write!(&mut buf, "P{months}M{days}D{micros}U");
-            buf.into_bump_str()
-        }
+        } => into_arena(&spg_engine::eval::format_interval(*months, *days, *micros)),
         Value::Numeric {
             scaled,
             scale,
