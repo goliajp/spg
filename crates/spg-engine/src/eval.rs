@@ -87,8 +87,9 @@ use textsearch::{
     fts_websearch_to_tsquery, ts_match, tsvector_concat,
 };
 pub use values::gen_random_uuid_bytes;
+pub use values::value_to_text;
 use values::{
-    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64, value_to_text,
+    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64,
     values_equal_for_nullif,
 };
 
@@ -1502,7 +1503,10 @@ fn value_to_text_for_array(v: &Value) -> String {
             scale,
             kind,
         } => format_numeric_kind(*kind, *scaled, *scale),
-        _ => format!("{v:?}"),
+        // v7.39 — everything else renders its canonical PG text (this
+        // Debug fallback is how `ARRAY['\xff'::bytea]` printed
+        // `{Bytes([255])}` on the wire).
+        _ => values::value_to_text(v),
     }
 }
 

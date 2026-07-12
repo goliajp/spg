@@ -3797,7 +3797,7 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
             escape_copy_cell(&format!("[{}]", parts.join(",")))
         }
         // v7.5.0 — Value is #[non_exhaustive].
-        _ => escape_copy_cell(&format!("{v:?}")),
+        other => escape_copy_cell(&spg_engine::eval::value_to_text(other)),
     }
 }
 
@@ -5028,12 +5028,11 @@ fn value_to_pg_text<'a>(
         Value::IntervalArray(items) => {
             into_arena(&spg_engine::eval::format_interval_array(items))
         }
-        // v7.5.0 — Value is #[non_exhaustive].
-        _ => {
-            let mut buf = BumpString::new_in(arena);
-            let _ = write!(&mut buf, "{v:?}");
-            buf.into_bump_str()
-        }
+        // v7.39 — every remaining variant renders its canonical PG
+        // text via the engine's shared formatter (the old Debug
+        // fallback leaked `Inet { .. }` / `Point(..)` / `BitString
+        // { .. }` placeholders for sixteen types on the wire).
+        other => into_arena(&spg_engine::eval::value_to_text(other)),
     })
 }
 

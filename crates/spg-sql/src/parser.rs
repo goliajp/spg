@@ -14284,6 +14284,16 @@ impl Parser {
                 }
             },
             Token::Interval => CastTarget::Interval,
+            // v7.39 — a quoted type name: `::"char"` is PG's 1-byte
+            // "char" (oid 18, SPG Char1 — distinct from bare `char`
+            // = char(1)); other quoted names resolve like idents.
+            Token::QuotedIdent(q) => {
+                if q.eq_ignore_ascii_case("char") {
+                    CastTarget::Named("char1".into())
+                } else {
+                    CastTarget::Named(q.to_ascii_lowercase())
+                }
+            }
             other => {
                 return Err(ParseError {
                     message: format!("expected type ident after `::`, got {other:?}"),
