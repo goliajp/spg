@@ -478,7 +478,10 @@ pub(super) fn pg_quote_literal(s: &str) -> String {
     out
 }
 
-pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn format_string(
+    args: &[Value<'_>],
+    style: &super::format::RenderStyle,
+) -> Result<Value<'static>, EvalError> {
     if args.is_empty() {
         return Err(EvalError::TypeMismatch {
             detail: "format() takes at least 1 arg (format string)".into(),
@@ -611,7 +614,7 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
         let converted: String = match spec {
             's' => match arg {
                 Value::Null => String::new(), // PG: NULL renders as empty for %s.
-                v => value_to_format_text(&v),
+                v => value_to_format_text_styled(&v, style),
             },
             'I' => match arg {
                 Value::Null => {
@@ -619,12 +622,12 @@ pub(super) fn format_string(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
                         detail: "format(): NULL is not a valid identifier (%I)".into(),
                     });
                 }
-                v => pg_quote_ident(&value_to_format_text(&v)),
+                v => pg_quote_ident(&value_to_format_text_styled(&v, style)),
             },
             'L' => match arg {
                 Value::Null => "NULL".into(),
                 v => {
-                    let s = value_to_format_text(&v);
+                    let s = value_to_format_text_styled(&v, style);
                     let mut q = String::with_capacity(s.len() + 2);
                     q.push('\'');
                     for ch in s.chars() {
@@ -762,12 +765,19 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
 }
 
 pub(super) fn value_to_format_text(v: &Value) -> String {
+    value_to_format_text_styled(v, &super::format::RenderStyle::default())
+}
+
+/// v7.39 (GUC knife 4) — the styled variant: concat / concat_ws /
+/// format(%s) textify via PG's out-functions, which honour DateStyle /
+/// IntervalStyle / extra_float_digits.
+pub(super) fn value_to_format_text_styled(v: &Value, style: &super::format::RenderStyle) -> String {
     match v {
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
-        Value::Float(x) => format!("{x}"),
+        Value::Float(x) => super::format::format_float_styled(*x, style),
         // PG renders numeric in concat/format/text-coercion as its exact
         // decimal (`x || 2.5::numeric` → `x2.5`), not a debug dump.
         Value::Numeric {
@@ -787,7 +797,7 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
         // UUID / Time / Money / Range / Hstore / 2D arrays / …) renders via
         // the canonical value→text renderer — the same PG-faithful form SELECT
         // and the wire layer emit — rather than leaking a Rust debug dump.
-        other => super::values::value_to_text(other),
+        other => super::values::value_to_text_styled(other, style),
     }
 }
 

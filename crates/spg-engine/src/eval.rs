@@ -662,6 +662,31 @@ pub fn eval_expr(
             // — the helper is a no-op outside Text-Text equality
             // and inequality.
             let (l, r) = collation_fold_for_compare(*op, lhs, rhs, l, r, ctx);
+            // v7.39 (GUC knife 4) — `date/interval/float || text` textifies
+            // through the out-functions, which honour the session render
+            // style. Pre-render the style-sensitive operand here (the
+            // orthodox home is an implicit-cast node at type resolution;
+            // until then this keeps apply_binary style-free). Default
+            // style short-circuits — text_concat's own value_to_text
+            // produces the identical bytes.
+            if matches!(op, spg_sql::ast::BinOp::Concat)
+                && ctx.render_style != format::RenderStyle::default()
+            {
+                let styled = |v: Value<'static>| -> Value<'static> {
+                    match &v {
+                        Value::Date(_)
+                        | Value::Timestamp(_)
+                        | Value::Interval { .. }
+                        | Value::Float(_)
+                        | Value::Real(_) => {
+                            Value::text(values::value_to_text_styled(&v, &ctx.render_style))
+                        }
+                        _ => v,
+                    }
+                };
+                let (sl, sr) = (styled(l), styled(r));
+                return apply_binary(*op, sl, sr);
+            }
             apply_binary(*op, l, r)
         }
         Expr::Cast { expr, target } => {
