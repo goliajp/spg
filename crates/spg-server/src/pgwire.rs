@@ -5267,6 +5267,7 @@ fn encode_pg_text_cell(
         Value::Timestamp(micros)
             if style.date_style == spg_engine::eval::DateStyleKind::Iso
                 && *micros >= AD_FLOOR_DAYS * 86_400_000_000
+                && *micros != i64::MAX
                 && (tz.is_utc() || !matches!(ty, Some(DataType::Timestamptz))) =>
         {
             let with_tz = matches!(ty, Some(DataType::Timestamptz));
@@ -5274,7 +5275,8 @@ fn encode_pg_text_cell(
         }
         Value::Date(days)
             if style.date_style == spg_engine::eval::DateStyleKind::Iso
-                && i64::from(*days) >= AD_FLOOR_DAYS =>
+                && i64::from(*days) >= AD_FLOOR_DAYS
+                && *days != i32::MAX =>
         {
             return write_cell_date(out, *days);
         }
