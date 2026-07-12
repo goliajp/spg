@@ -22,6 +22,7 @@ spg-sql            = { path = "../../crates/spg-sql", version = "7.32" }
 # + embed wrappers so the harness can stand up SpgPool and an
 # AsyncDatabase side-by-side with the wire-protocol PgPool.
 spg-embedded       = { workspace = true }
+tokio-postgres     = "0.7"
 spg-embedded-tokio = { workspace = true }
 spg-sqlx           = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = [

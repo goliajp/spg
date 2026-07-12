@@ -30,7 +30,7 @@ use spg_storage::{Catalog, ColumnSchema, DataType};
 /// Returns `(parameter_oids, output_columns)`. Empty `output_columns`
 /// means "no row description available" → pgwire sends NoData.
 pub fn describe_prepared(stmt: &Statement, catalog: &Catalog) -> (Vec<u32>, Vec<ColumnSchema>) {
-    let params = collect_parameter_oids(stmt);
+    let params = collect_parameter_oids(stmt, catalog);
     let columns = describe_output_columns(stmt, catalog);
     (params, columns)
 }
@@ -583,7 +583,7 @@ fn function_return_shape(
     })
 }
 
-fn collect_parameter_oids(stmt: &Statement) -> Vec<u32> {
+fn collect_parameter_oids(stmt: &Statement, catalog: &Catalog) -> Vec<u32> {
     let max = max_placeholder(stmt);
     if max == 0 {
         return Vec::new();
@@ -607,7 +607,143 @@ fn collect_parameter_oids(stmt: &Statement) -> Vec<u32> {
     // round-trip. The actual data type comes from the bound
     // value at Execute time; the text wire format makes the
     // type advisory rather than load-bearing.
-    alloc::vec![25u32; max as usize]
+    //
+    // v7.39 (binary results) — but binary-first clients
+    // (tokio-postgres, JDBC binary mode) VALIDATE the declared OID
+    // against the Rust/Java value they bind, so TEXT-for-everything
+    // rejects `WHERE i = $1` with an i32. Infer the real type where
+    // the context makes it unambiguous — `col <op> $N` picks the
+    // column's type, `INSERT INTO t (…) VALUES ($1, …)` / `UPDATE t
+    // SET col = $N` pick the target column — and keep TEXT for
+    // anything the walk can't pin (sqx's oid-0 recursion stays
+    // fixed because 25 remains the fallback, never 0).
+    let mut oids = alloc::vec![25u32; max as usize];
+    infer_placeholder_oids(stmt, catalog, &mut oids);
+    oids
+}
+
+/// v7.39 — PG type OID for a column DataType, for ParameterDescription.
+/// Only the families drivers actually bind; anything else keeps the
+/// TEXT fallback upstream.
+fn wire_oid_for(ty: DataType) -> u32 {
+    match ty {
+        DataType::Bool => 16,
+        DataType::SmallInt => 21,
+        DataType::Int => 23,
+        DataType::BigInt => 20,
+        DataType::Real => 700,
+        DataType::Float => 701,
+        DataType::Numeric { .. } => 1700,
+        DataType::Date => 1082,
+        DataType::Time => 1083,
+        DataType::Timestamp => 1114,
+        DataType::Timestamptz => 1184,
+        DataType::Uuid => 2950,
+        DataType::Bytes => 17,
+        DataType::Json => 114,
+        DataType::Jsonb => 3802,
+        _ => 25,
+    }
+}
+
+/// v7.39 — best-effort placeholder typing from column context.
+fn infer_placeholder_oids(stmt: &Statement, catalog: &Catalog, oids: &mut [u32]) {
+    let col_oid = |schema: &[ColumnSchema], name: &spg_sql::ast::ColumnName| -> Option<u32> {
+        schema
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&name.name))
+            .map(|c| wire_oid_for(c.ty))
+    };
+    let mut mark = |n: u16, oid: Option<u32>| {
+        if let Some(oid) = oid
+            && let Some(slot) = oids.get_mut((n as usize).saturating_sub(1))
+        {
+            *slot = oid;
+        }
+    };
+    match stmt {
+        Statement::Select(s) => {
+            let Some(from) = &s.from else { return };
+            if !from.joins.is_empty() {
+                return;
+            }
+            let Some(t) = catalog.get(&from.primary.name) else {
+                return;
+            };
+            let schema = t.schema().columns.clone();
+            if let Some(w) = &s.where_ {
+                walk_expr(w, &mut |e| {
+                    if let Expr::Binary { lhs, rhs, .. } = e {
+                        match (lhs.as_ref(), rhs.as_ref()) {
+                            (Expr::Column(c), Expr::Placeholder(n))
+                            | (Expr::Placeholder(n), Expr::Column(c)) => {
+                                mark(*n, col_oid(&schema, c));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        }
+        Statement::Insert(ins) => {
+            let Some(t) = catalog.get(&ins.table) else {
+                return;
+            };
+            let schema = t.schema().columns.clone();
+            // Column order: the explicit column list, else table order.
+            let order: alloc::vec::Vec<usize> = match &ins.columns {
+                Some(cols) if !cols.is_empty() => cols
+                    .iter()
+                    .map(|name| {
+                        schema
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(name))
+                            .unwrap_or(usize::MAX)
+                    })
+                    .collect(),
+                _ => (0..schema.len()).collect(),
+            };
+            for row in &ins.rows {
+                for (i, e) in row.iter().enumerate() {
+                    if let Expr::Placeholder(n) = e
+                        && let Some(&pos) = order.get(i)
+                        && let Some(c) = schema.get(pos)
+                    {
+                        mark(*n, Some(wire_oid_for(c.ty)));
+                    }
+                }
+            }
+        }
+        Statement::Update(u) => {
+            let Some(t) = catalog.get(&u.table) else {
+                return;
+            };
+            let schema = t.schema().columns.clone();
+            for (col, e) in &u.assignments {
+                if let Expr::Placeholder(n) = e
+                    && let Some(c) = schema
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(col))
+                {
+                    mark(*n, Some(wire_oid_for(c.ty)));
+                }
+            }
+            if let Some(w) = &u.where_ {
+                walk_expr(w, &mut |e| {
+                    if let Expr::Binary { lhs, rhs, .. } = e {
+                        match (lhs.as_ref(), rhs.as_ref()) {
+                            (Expr::Column(c), Expr::Placeholder(n))
+                            | (Expr::Placeholder(n), Expr::Column(c)) => {
+                                mark(*n, col_oid(&schema, c));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 fn max_placeholder(stmt: &Statement) -> u16 {
