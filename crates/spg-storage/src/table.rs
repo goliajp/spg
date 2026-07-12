@@ -22,6 +22,7 @@ impl Table {
             stat_tup_ins: 0,
             stat_tup_upd: 0,
             stat_tup_del: 0,
+            scan_stats: crate::ScanStats::default(),
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
@@ -110,6 +111,36 @@ impl Table {
     #[must_use]
     pub fn write_stats(&self) -> (u64, u64, u64) {
         (self.stat_tup_ins, self.stat_tup_upd, self.stat_tup_del)
+    }
+
+    /// v7.39 (pg_stat knife B) — the scan counters (read side of
+    /// pg_stat_user_tables).
+    #[must_use]
+    pub fn scan_stats(&self) -> &crate::ScanStats {
+        &self.scan_stats
+    }
+
+    /// v7.39 (pg_stat knife B) — one sequential scan over the visible
+    /// rows, reported by engine scan loops that walk headers directly
+    /// (parallel shards, the aggregate full scan) instead of
+    /// `scan_visible`.
+    pub fn note_seq_scan(&self) {
+        use core::sync::atomic::Ordering;
+        self.scan_stats.seq_scan.fetch_add(1, Ordering::Relaxed);
+        let visible = (self.rows.len() as u64).saturating_sub(self.dead_rows);
+        self.scan_stats
+            .seq_tup_read
+            .fetch_add(visible, Ordering::Relaxed);
+    }
+
+    /// v7.39 (pg_stat knife B) — one index scan returning `fetched`
+    /// rows (the engine's index-seek paths report here).
+    pub fn note_index_scan(&self, fetched: u64) {
+        use core::sync::atomic::Ordering;
+        self.scan_stats.idx_scan.fetch_add(1, Ordering::Relaxed);
+        self.scan_stats
+            .idx_tup_fetch
+            .fetch_add(fetched, Ordering::Relaxed);
     }
 
     /// v7.37.15 (Phase A.2) — read-only access to the per-row
@@ -649,6 +680,11 @@ impl Table {
     where
         'a: 'b,
     {
+        // v7.39 (pg_stat knife B) — one sequential scan; tup_read is
+        // the visible-row estimate (an early-terminating consumer —
+        // LIMIT — reads fewer; the lazy iterator can't report back).
+        // Two relaxed atomic adds per SCAN (not per row).
+        self.note_seq_scan();
         self.rows
             .iter()
             .enumerate()

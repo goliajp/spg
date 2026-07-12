@@ -1375,14 +1375,22 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
         let dead = i64::try_from(t.dead_rows()).unwrap_or(i64::MAX);
         let live_rows = (t.rows().len() as i64).saturating_sub(dead);
         let (ins, upd, del) = t.write_stats();
+        // v7.39 (pg_stat knife B) — scan counters (scan_visible +
+        // index-seek instrumentation). This synth query itself walks
+        // the catalog, not the user tables, so it doesn't self-count.
+        use core::sync::atomic::Ordering;
+        let sc = t.scan_stats();
+        let as_big = |a: &core::sync::atomic::AtomicU64| {
+            Value::BigInt(i64::try_from(a.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
+        };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(relid),
             Value::text("public"),
             Value::Text(alloc::borrow::Cow::Owned(name)),
-            Value::BigInt(0), // seq_scan (scan-path knife)
-            Value::BigInt(0), // seq_tup_read
-            Value::BigInt(0), // idx_scan
-            Value::BigInt(0), // idx_tup_fetch
+            as_big(&sc.seq_scan),
+            as_big(&sc.seq_tup_read),
+            as_big(&sc.idx_scan),
+            as_big(&sc.idx_tup_fetch),
             Value::BigInt(i64::try_from(ins).unwrap_or(i64::MAX)),
             Value::BigInt(i64::try_from(upd).unwrap_or(i64::MAX)),
             Value::BigInt(i64::try_from(del).unwrap_or(i64::MAX)),

@@ -3504,6 +3504,10 @@ impl Engine {
             // Cold-tier rows are frozen (visible) by definition — left
             // ungated, matching the plain-scan path.
             let scan_snapshot = self.current_snapshot();
+            // v7.39 (pg_stat knife B) — this full-scan branch walks
+            // headers directly (serial and sharded alike); count the
+            // sequential scan here.
+            table.note_seq_scan();
             // v7.39 (parallel-agg P2) — the visibility probe + WHERE
             // filter dominate the pre-aggregate wall time on big
             // scans (P1's ground truth: accumulation is only ~17%).

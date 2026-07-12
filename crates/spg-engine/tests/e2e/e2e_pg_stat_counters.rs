@@ -85,3 +85,25 @@ fn stat_database_counts_implicit_and_explicit_xacts() {
     let (_, r3) = read(&mut e);
     assert_eq!(r3, r2 + 1, "failed autocommit counted as rollback");
 }
+
+#[test]
+fn stat_user_tables_reports_scan_counters() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE sct(id INT PRIMARY KEY, v TEXT)").unwrap();
+    e.execute("INSERT INTO sct SELECT g, 'x' FROM generate_series(1,100) g")
+        .unwrap();
+    // A full-table aggregate and a non-indexed filter are sequential
+    // scans; an equality probe on the PK is an index scan.
+    e.execute("SELECT count(*) FROM sct").unwrap();
+    e.execute("SELECT v FROM sct WHERE v = 'x' LIMIT 1").unwrap();
+    e.execute("SELECT v FROM sct WHERE id = 7").unwrap();
+    let r = one_row(
+        &mut e,
+        "SELECT seq_scan, seq_tup_read, idx_scan, idx_tup_fetch \
+         FROM pg_stat_user_tables WHERE relname = 'sct'",
+    );
+    assert!(big(&r[0]) >= 1, "seq_scan: {:?}", r[0]);
+    assert!(big(&r[1]) >= 100, "seq_tup_read: {:?}", r[1]);
+    assert!(big(&r[2]) >= 1, "idx_scan: {:?}", r[2]);
+    assert!(big(&r[3]) >= 1, "idx_tup_fetch: {:?}", r[3]);
+}

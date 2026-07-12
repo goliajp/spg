@@ -3069,6 +3069,30 @@ pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
     Ok(changes)
 }
 
+/// v7.39 (pg_stat knife B) — per-table scan counters, bumped from
+/// `&self` read paths. Clone (tx shadow catalogs clone tables) copies
+/// the current values; the counters are volatile like PG's cumulative
+/// stats.
+#[derive(Debug, Default)]
+pub struct ScanStats {
+    pub seq_scan: core::sync::atomic::AtomicU64,
+    pub seq_tup_read: core::sync::atomic::AtomicU64,
+    pub idx_scan: core::sync::atomic::AtomicU64,
+    pub idx_tup_fetch: core::sync::atomic::AtomicU64,
+}
+
+impl Clone for ScanStats {
+    fn clone(&self) -> Self {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        Self {
+            seq_scan: AtomicU64::new(self.seq_scan.load(Ordering::Relaxed)),
+            seq_tup_read: AtomicU64::new(self.seq_tup_read.load(Ordering::Relaxed)),
+            idx_scan: AtomicU64::new(self.idx_scan.load(Ordering::Relaxed)),
+            idx_tup_fetch: AtomicU64::new(self.idx_tup_fetch.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
@@ -3139,6 +3163,10 @@ pub struct Table {
     stat_tup_ins: u64,
     stat_tup_upd: u64,
     stat_tup_del: u64,
+    /// v7.39 (pg_stat knife B) — volatile scan counters
+    /// (`seq_scan/seq_tup_read/idx_scan/idx_tup_fetch`). Atomics: the
+    /// read paths that bump them hold only `&Table`.
+    scan_stats: ScanStats,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the
