@@ -1355,7 +1355,9 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
         ColumnSchema::new("n_live_tup", DataType::BigInt, false),
         ColumnSchema::new("n_dead_tup", DataType::BigInt, false),
         ColumnSchema::new("last_vacuum", DataType::Timestamptz, true),
+        ColumnSchema::new("last_autovacuum", DataType::Timestamptz, true),
         ColumnSchema::new("last_analyze", DataType::Timestamptz, true),
+        ColumnSchema::new("last_autoanalyze", DataType::Timestamptz, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut relid: i64 = 16384; // PG user-relation OID floor
@@ -1396,8 +1398,17 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
             Value::BigInt(i64::try_from(del).unwrap_or(i64::MAX)),
             Value::BigInt(live_rows),
             Value::BigInt(dead),
+            // v7.39 (pg_stat knife C) — PG's four maintenance stamps.
+            // SPG has no manual-VACUUM statement and no autoanalyze
+            // daemon, so those two stay NULL.
             Value::Null, // last_vacuum
-            Value::Null, // last_analyze
+            t.maintenance_stamps()
+                .0
+                .map_or(Value::Null, Value::Timestamp),
+            t.maintenance_stamps()
+                .1
+                .map_or(Value::Null, Value::Timestamp),
+            Value::Null, // last_autoanalyze
         ]));
         relid = relid.saturating_add(1);
     }
@@ -1472,6 +1483,24 @@ pub(crate) fn synth_pg_stat_database(
         .xact_rollback
         .load(core::sync::atomic::Ordering::Relaxed);
     let backends = eng.backend_count_fn.map_or(1, |f| f());
+    // v7.39 (pg_stat knife C) — tup_returned/tup_fetched aggregate the
+    // per-table scan counters (returned ~ rows read by scans of either
+    // kind; fetched ~ rows fetched via index scans, PG's split).
+    let (mut tup_returned, mut tup_fetched) = (0u64, 0u64);
+    {
+        use core::sync::atomic::Ordering;
+        let cat = eng.active_catalog();
+        for name in cat.table_names() {
+            if let Some(t) = cat.get(&name) {
+                let sc = t.scan_stats();
+                tup_returned = tup_returned
+                    .saturating_add(sc.seq_tup_read.load(Ordering::Relaxed))
+                    .saturating_add(sc.idx_tup_fetch.load(Ordering::Relaxed));
+                tup_fetched =
+                    tup_fetched.saturating_add(sc.idx_tup_fetch.load(Ordering::Relaxed));
+            }
+        }
+    }
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
         Value::text("spg"),
@@ -1480,8 +1509,8 @@ pub(crate) fn synth_pg_stat_database(
         Value::BigInt(i64::try_from(rollbacks).unwrap_or(i64::MAX)),
         Value::BigInt(0), // blks_read
         Value::BigInt(0), // blks_hit
-        Value::BigInt(0), // tup_returned
-        Value::BigInt(0), // tup_fetched
+        Value::BigInt(i64::try_from(tup_returned).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(tup_fetched).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_inserted).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_updated).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_deleted).unwrap_or(i64::MAX)),

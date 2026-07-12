@@ -1132,8 +1132,14 @@ impl Engine {
             return;
         }
         let oldest_active = self.vacuum_oldest_active();
+        // v7.39 (pg_stat knife C) — stamp last_autovacuum (host clock;
+        // None on clockless embedded engines leaves the column NULL).
+        let now_us = self.clock.map(|f| f());
         if let Some(t) = self.active_catalog_mut().get_mut(table_name) {
             let _report = t.vacuum(oldest_active, false);
+            if let Some(us) = now_us {
+                t.stamp_autovacuum(us);
+            }
             crate::bump_counter!(AUTOVACUUM_FIRE_COUNT);
         }
     }

@@ -23,6 +23,8 @@ impl Table {
             stat_tup_upd: 0,
             stat_tup_del: 0,
             scan_stats: crate::ScanStats::default(),
+            last_autovacuum_us: None,
+            last_analyze_us: None,
             indices: Vec::new(),
             hot_bytes: 0,
             cold_row_count: 0,
@@ -111,6 +113,21 @@ impl Table {
     #[must_use]
     pub fn write_stats(&self) -> (u64, u64, u64) {
         (self.stat_tup_ins, self.stat_tup_upd, self.stat_tup_del)
+    }
+
+    /// v7.39 (pg_stat knife C) — maintenance stamps for
+    /// pg_stat_user_tables (`(last_autovacuum_us, last_analyze_us)`).
+    #[must_use]
+    pub fn maintenance_stamps(&self) -> (Option<i64>, Option<i64>) {
+        (self.last_autovacuum_us, self.last_analyze_us)
+    }
+
+    pub fn stamp_autovacuum(&mut self, unix_us: i64) {
+        self.last_autovacuum_us = Some(unix_us);
+    }
+
+    pub fn stamp_analyze(&mut self, unix_us: i64) {
+        self.last_analyze_us = Some(unix_us);
     }
 
     /// v7.39 (pg_stat knife B) — the scan counters (read side of
