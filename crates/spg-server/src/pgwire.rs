@@ -2988,7 +2988,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // STRING_DATA_RIGHT_TRUNCATION.
         } else if msg.contains("value too long for type") {
             "22001"
-        } else if msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")) {
+        } else if msg.contains("duplicate key value violates unique constraint")
+            || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
+        {
             "23505"
         } else if msg.contains("FOREIGN KEY violation") {
             "23503"
@@ -3013,6 +3015,15 @@ mod engine_error_sqlstate_tests {
 
     #[test]
     fn constraint_violations_map_to_class_23() {
+        // v7.39 (SQLSTATE fidelity) — the engine speaks PG's 23505
+        // phrasing now; the legacy phrasings stay classified too.
+        assert_eq!(
+            code(
+                "duplicate key value violates unique constraint \"t_pkey\" on table \"t\" \
+                 DETAIL: Key (id)=(1) already exists."
+            ),
+            "23505"
+        );
         assert_eq!(
             code(
                 "PRIMARY KEY violation on \"t\" columns [\"id\"]: row #0 duplicates an existing key"
@@ -4326,8 +4337,12 @@ fn send_command_complete_select_count(out: &mut Vec<u8>, n: usize) -> std::io::R
 
 fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
     // ErrorResponse: each field is `[fieldcode byte][value][\0]`,
-    // terminated by a single `\0`. Minimum useful set: S (severity),
-    // C (sqlstate), M (message).
+    // terminated by a single `\0`. Base set: S (severity), C
+    // (sqlstate), M (message). v7.39 (SQLSTATE fidelity) — when the
+    // engine message carries PG's constraint phrasing, lift the
+    // structured PG_DIAG fields ORMs branch on: n (constraint name),
+    // t (table name), D (detail), s (schema — SPG is single-schema
+    // `public`).
     let mut body = Vec::new();
     body.push(b'S');
     body.extend_from_slice(b"ERROR");
@@ -4335,9 +4350,61 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     body.push(b'C');
     body.extend_from_slice(sqlstate.as_bytes());
     body.push(0);
+    // Split a trailing " DETAIL: ..." into its own D field, like PG.
+    let (main, detail) = match msg.split_once(" DETAIL: ") {
+        Some((m, d)) => (m, Some(d)),
+        None => (msg, None),
+    };
+    // v7.39 — engine constraint errors ride EngineError::Unsupported,
+    // whose Display prefixes "unsupported: ". That prefix is only
+    // truthful for the generic 42000 class; a typed SQLSTATE means we
+    // understood the error precisely, so strip it from the client
+    // message (PG has no such prefix).
+    let main_msg: &str = if sqlstate != "42000" {
+        main.strip_prefix("unsupported: ").unwrap_or(main)
+    } else {
+        main
+    };
+    // PG's 23505 message carries no table suffix — the table lands in
+    // the PG_DIAG `t` field (extracted from `main` below, which keeps
+    // the suffix). ORMs regex the PG message shape exactly.
+    let main_msg: &str = match (sqlstate, main_msg.find(" on table \"")) {
+        ("23505", Some(cut)) => &main_msg[..cut],
+        _ => main_msg,
+    };
     body.push(b'M');
-    body.extend_from_slice(msg.as_bytes());
+    body.extend_from_slice(main_msg.as_bytes());
     body.push(0);
+    if let Some(d) = detail {
+        body.push(b'D');
+        body.extend_from_slice(d.as_bytes());
+        body.push(0);
+    }
+    let quoted_after = |marker: &str| -> Option<&str> {
+        let rest = &main[main.find(marker)? + marker.len()..];
+        rest.strip_prefix('"')?.split('"').next()
+    };
+    if let Some(con) = quoted_after("violates unique constraint ")
+        .or_else(|| quoted_after("violates foreign key constraint "))
+        .or_else(|| quoted_after("violates check constraint "))
+    {
+        body.push(b'n');
+        body.extend_from_slice(con.as_bytes());
+        body.push(0);
+    }
+    if let Some(t) = quoted_after("on table ").or_else(|| quoted_after("of relation ")) {
+        body.push(b't');
+        body.extend_from_slice(t.as_bytes());
+        body.push(0);
+        body.push(b's');
+        body.extend_from_slice(b"public");
+        body.push(0);
+    }
+    if let Some(c) = quoted_after("null value in column ") {
+        body.push(b'c');
+        body.extend_from_slice(c.as_bytes());
+        body.push(0);
+    }
     body.push(0);
     send_msg(stream, b'E', &body)
 }
