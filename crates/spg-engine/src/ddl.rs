@@ -871,6 +871,11 @@ impl Engine {
         // the existing value) and re-coerce to the new
         // type. Indices on the column get rebuilt.
         let new_data_type = column_type_to_data_type(new_type);
+        // v7.39 — under in-place MVCC the row store carries tombstoned
+        // versions; their dead values must not join the rewrite (an
+        // INT corpse under a TEXT conversion would abort the whole
+        // ALTER). Snapshot BEFORE the &mut borrow.
+        let scan_snapshot = self.current_snapshot();
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -901,9 +906,16 @@ impl Engine {
         }
         let schema_cols = table.schema().columns.clone();
         let ctx = eval::EvalContext::new(&schema_cols, None);
-        let mut new_values: alloc::vec::Vec<Value<'static>> =
+        // `None` = a tombstoned version: left untouched entirely (its
+        // slot is never rewritten, so the update_row type check on the
+        // NEW schema never sees the old-type corpse).
+        let mut new_values: alloc::vec::Vec<Option<Value<'static>>> =
             alloc::vec::Vec::with_capacity(table.row_count());
-        for row in table.rows().iter() {
+        for (ri, row) in table.rows().iter().enumerate() {
+            if !table.is_row_visible(ri, &scan_snapshot) {
+                new_values.push(None);
+                continue;
+            }
             let raw = match &using {
                 Some(expr) => eval::eval_expr(expr, row, &ctx).map_err(|e| {
                     EngineError::Unsupported(alloc::format!(
@@ -912,11 +924,44 @@ impl Engine {
                 })?,
                 None => row.values.get(col_pos).cloned().unwrap_or(Value::Null),
             };
-            let coerced = coerce_value(raw, new_data_type, &column, col_pos)?;
-            new_values.push(coerced);
+            // v7.39 — PG's ALTER TYPE without USING applies the
+            // assignment cast, which is wider than INSERT's strict
+            // coercion: any value casts to the text family through
+            // its output function (INT -> TEXT rewrites the column),
+            // while a narrowing like TEXT -> INT is refused with
+            // PG's phrasing + HINT. A USING expression bypasses this
+            // (its result must strictly coerce).
+            let coerced = match coerce_value(raw.clone(), new_data_type, &column, col_pos) {
+                Ok(v) => v,
+                Err(_)
+                    if using.is_none()
+                        && matches!(
+                            new_data_type,
+                            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                        ) =>
+                {
+                    coerce_value(
+                        Value::text(crate::eval::value_to_text(&raw)),
+                        new_data_type,
+                        &column,
+                        col_pos,
+                    )?
+                }
+                Err(e) => {
+                    if using.is_none() {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{column}\" cannot be cast automatically to type \
+                             {new_data_type:?}; You might need to specify a USING expression"
+                        )));
+                    }
+                    return Err(e);
+                }
+            };
+            new_values.push(Some(coerced));
         }
         table.schema_mut().columns[col_pos].ty = new_data_type;
         for (i, v) in new_values.into_iter().enumerate() {
+            let Some(v) = v else { continue };
             let mut row_values = table
                 .rows()
                 .get(i)
