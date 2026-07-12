@@ -857,7 +857,7 @@ fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
 /// v7.37.16 — per-spec accumulator for the fused multi-spec fast path.
 /// Field-for-field the same running state the single-spec sum/avg fast
 /// path keeps in locals; finalized into `AggState` identically.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct FusedAcc {
     sum_int: i64,
     sum_float: f64,
@@ -873,6 +873,73 @@ struct FusedAcc {
     sum_money: i128,
     use_money: bool,
     count: i64,
+}
+
+/// v7.39 (parallel-agg P3) — the fused-op layout shared by the
+/// single-group fast path and the parallel GROUP BY fast path.
+/// `spec_src[i]`: None = count(*) (finalize from the group row
+/// count); Some(slot) = unique_ops[slot]'s accumulator.
+enum FusedOp {
+    CountCol(usize),
+    AccCol(usize),
+}
+
+/// Returns the (spec_src, unique_ops) layout when EVERY aggregate
+/// spec is fused-eligible (count*/count/sum/avg over bound columns,
+/// no FILTER/DISTINCT/arg2/ORDER), else None.
+fn fused_layout(
+    agg_specs: &[AggSpec],
+    arg_pos: &[Option<usize>],
+) -> Option<(Vec<Option<usize>>, Vec<FusedOp>)> {
+    if agg_specs.is_empty() {
+        return None;
+    }
+    let eligible = agg_specs.iter().enumerate().all(|(i, s)| {
+        s.filter.is_none()
+            && s.arg2.is_none()
+            && s.order_by.is_empty()
+            && !s.distinct
+            && !s.first_ordered
+            && match s.name.as_str() {
+                "count_star" => s.arg.is_none(),
+                "count" | "sum" | "avg" => arg_pos[i].is_some(),
+                _ => false,
+            }
+    });
+    if !eligible {
+        return None;
+    }
+    let mut unique_ops: Vec<FusedOp> = Vec::new();
+    let spec_src: Vec<Option<usize>> = agg_specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| match s.name.as_str() {
+            "count_star" => None,
+            "count" => {
+                let p = arg_pos[i].expect("gated bound");
+                let slot = unique_ops
+                    .iter()
+                    .position(|o| matches!(o, FusedOp::CountCol(q) if *q == p))
+                    .unwrap_or_else(|| {
+                        unique_ops.push(FusedOp::CountCol(p));
+                        unique_ops.len() - 1
+                    });
+                Some(slot)
+            }
+            _ => {
+                let p = arg_pos[i].expect("gated bound");
+                let slot = unique_ops
+                    .iter()
+                    .position(|o| matches!(o, FusedOp::AccCol(q) if *q == p))
+                    .unwrap_or_else(|| {
+                        unique_ops.push(FusedOp::AccCol(p));
+                        unique_ops.len() - 1
+                    });
+                Some(slot)
+            }
+        })
+        .collect();
+    Some((spec_src, unique_ops))
 }
 
 /// v7.39 (parallel-agg P1) — fold shard accumulator `b` into `a`.
@@ -900,6 +967,40 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
     a.use_interval |= b.use_interval;
     a.sum_money += b.sum_money;
     a.use_money |= b.use_money;
+}
+
+/// v7.39 — write fused accumulators into the per-spec AggStates
+/// (shared by the single-group and parallel-GROUP-BY fast paths).
+/// `group_rows` finalizes count(*) specs.
+fn fill_states_from_fused(
+    states: &mut [AggState],
+    spec_src: &[Option<usize>],
+    accs: &[FusedAcc],
+    group_rows: i64,
+) {
+    for (i, src) in spec_src.iter().enumerate() {
+        let state = &mut states[i];
+        match src {
+            None => state.count = group_rows,
+            Some(slot) => {
+                let a = &accs[*slot];
+                state.count = a.count;
+                state.sum_int = a.sum_int;
+                state.sum_float = a.sum_float;
+                state.use_float = a.use_float;
+                state.sum_num_scaled = a.num_scaled;
+                state.sum_num_kind = a.num_kind;
+                state.sum_num_scale = a.num_scale;
+                state.use_numeric = a.use_numeric;
+                state.sum_iv_months = a.sum_iv_months;
+                state.sum_iv_days = a.sum_iv_days;
+                state.sum_iv_micros = a.sum_iv_micros;
+                state.use_interval = a.use_interval;
+                state.sum_money = a.sum_money;
+                state.use_money = a.use_money;
+            }
+        }
+    }
 }
 
 /// One sum/avg accumulation step — the same variant arms (and the same
@@ -1295,56 +1396,8 @@ fn accumulate_groups(
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
     if single_anon_group
-        && !agg_specs.is_empty()
-        && agg_specs.iter().enumerate().all(|(i, s)| {
-            s.filter.is_none()
-                && s.arg2.is_none()
-                && s.order_by.is_empty()
-                && !s.distinct
-                && !s.first_ordered
-                && match s.name.as_str() {
-                    "count_star" => s.arg.is_none(),
-                    "count" | "sum" | "avg" => arg_pos[i].is_some(),
-                    _ => false,
-                }
-        })
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos)
     {
-        enum FusedOp {
-            CountCol(usize),
-            AccCol(usize),
-        }
-        // spec_src[i]: None = count(*) (finalize from rows.len());
-        // Some(slot) = unique_ops[slot]'s accumulator.
-        let mut unique_ops: Vec<FusedOp> = Vec::new();
-        let spec_src: Vec<Option<usize>> = agg_specs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| match s.name.as_str() {
-                "count_star" => None,
-                "count" => {
-                    let p = arg_pos[i].expect("gated bound");
-                    let slot = unique_ops
-                        .iter()
-                        .position(|o| matches!(o, FusedOp::CountCol(q) if *q == p))
-                        .unwrap_or_else(|| {
-                            unique_ops.push(FusedOp::CountCol(p));
-                            unique_ops.len() - 1
-                        });
-                    Some(slot)
-                }
-                _ => {
-                    let p = arg_pos[i].expect("gated bound");
-                    let slot = unique_ops
-                        .iter()
-                        .position(|o| matches!(o, FusedOp::AccCol(q) if *q == p))
-                        .unwrap_or_else(|| {
-                            unique_ops.push(FusedOp::AccCol(p));
-                            unique_ops.len() - 1
-                        });
-                    Some(slot)
-                }
-            })
-            .collect();
         let mut accs: Vec<FusedAcc> = (0..unique_ops.len()).map(|_| FusedAcc::default()).collect();
         // v7.39 (parallel-agg P1) — shard the row scan across the
         // host-injected executor when the input is large enough.
@@ -1400,31 +1453,158 @@ fn accumulate_groups(
                 fused_scan(0..rows.len(), &mut accs)?;
             }
         }
-        for (i, src) in spec_src.iter().enumerate() {
-            let state = &mut order[0].1[i];
-            match src {
-                None => state.count = rows.len() as i64,
-                Some(slot) => {
-                    let a = &accs[*slot];
-                    state.count = a.count;
-                    state.sum_int = a.sum_int;
-                    state.sum_float = a.sum_float;
-                    state.use_float = a.use_float;
-                    state.sum_num_scaled = a.num_scaled;
-                    state.sum_num_kind = a.num_kind;
-                    state.sum_num_scale = a.num_scale;
-                    state.use_numeric = a.use_numeric;
-                    state.sum_iv_months = a.sum_iv_months;
-                    state.sum_iv_days = a.sum_iv_days;
-                    state.sum_iv_micros = a.sum_iv_micros;
-                    state.use_interval = a.use_interval;
-                    state.sum_money = a.sum_money;
-                    state.use_money = a.use_money;
-                }
-            }
-        }
+        fill_states_from_fused(&mut order[0].1, &spec_src, &accs, rows.len() as i64);
         return Ok(order);
     }
+    // v7.39 (parallel-agg P3) — parallel GROUP BY fast path: a single
+    // bound INT group column with every spec fused-eligible (the
+    // `GROUP BY g` + count/sum/avg panel shape). Shards build local
+    // i64-keyed maps of FusedAcc slots; the merge folds maps in shard
+    // order (first-seen group order across shards — SQL leaves GROUP
+    // BY output order unspecified). Any non-integer cell under the
+    // integer schema (coercion edge) aborts the shard and the whole
+    // scan falls back to the serial path below.
+    if single_int_group_col
+        && group_exprs.len() == 1
+        && rows.len() >= crate::PARALLEL_MIN_ROWS
+        && let Some(r) = runner
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos)
+        && !unique_ops.is_empty()
+    {
+        crate::PARALLEL_AGG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let gp = group_pos[0].expect("single_int_group_col implies bound");
+        struct ShardMap {
+            // first-seen order of keys within the shard.
+            keys: Vec<(i64, Value<'static>)>,
+            slots: hashbrown::HashMap<i64, Vec<FusedAcc>>,
+            null_slot: Option<Vec<FusedAcc>>,
+            null_rows: i64,
+            key_rows: hashbrown::HashMap<i64, i64>,
+        }
+        // Err(None) = coercion edge -> serial fallback; Err(Some(e)) = real error.
+        type ShardOut = Result<ShardMap, Option<EvalError>>;
+        let n_shards = (rows.len() / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
+        let chunk = rows.len().div_ceil(n_shards);
+        let ops = &unique_ops;
+        let results = r.run_shards(n_shards, &|si| {
+            let lo = si * chunk;
+            let hi = ((si + 1) * chunk).min(rows.len());
+            let mut m = ShardMap {
+                keys: Vec::new(),
+                slots: hashbrown::HashMap::new(),
+                null_slot: None,
+                null_rows: 0,
+                key_rows: hashbrown::HashMap::new(),
+            };
+            let out: ShardOut = (|| {
+                for row in &rows[lo..hi] {
+                    let v = row.get(gp).unwrap_or(&Value::Null);
+                    let key: Option<i64> = match v {
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        Value::Null => None,
+                        _ => return Err(None), // coercion edge -> serial
+                    };
+                    let slots = match key {
+                        Some(k) => {
+                            *m.key_rows.entry(k).or_insert(0) += 1;
+                            m.slots.entry(k).or_insert_with(|| {
+                                m.keys.push((k, v.clone().into_owned()));
+                                (0..ops.len()).map(|_| FusedAcc::default()).collect()
+                            })
+                        }
+                        None => {
+                            m.null_rows += 1;
+                            m.null_slot.get_or_insert_with(|| {
+                                (0..ops.len()).map(|_| FusedAcc::default()).collect()
+                            })
+                        }
+                    };
+                    for (oi, op) in ops.iter().enumerate() {
+                        match op {
+                            FusedOp::CountCol(p) => {
+                                if !matches!(row.get(*p), Some(Value::Null) | None) {
+                                    slots[oi].count += 1;
+                                }
+                            }
+                            FusedOp::AccCol(p) => {
+                                fused_acc_cell(&mut slots[oi], row.get(*p).unwrap_or(&Value::Null))
+                                    .map_err(Some)?;
+                            }
+                        }
+                    }
+                }
+                Ok(m)
+            })();
+            alloc::boxed::Box::new(out)
+        });
+        // Merge in shard order; a fallback sentinel drops to serial.
+        let mut merged_keys: Vec<(i64, Value<'static>)> = Vec::new();
+        let mut merged: hashbrown::HashMap<i64, (Vec<FusedAcc>, i64)> = hashbrown::HashMap::new();
+        let mut merged_null: Option<(Vec<FusedAcc>, i64)> = None;
+        let mut fallback = false;
+        let mut shard_err: Option<EvalError> = None;
+        for boxed in results {
+            let shard = boxed
+                .downcast::<ShardOut>()
+                .expect("runner echoes the closure's box");
+            match *shard {
+                Ok(m) => {
+                    for (k, kv) in m.keys {
+                        let accs = &m.slots[&k];
+                        let rows_k = m.key_rows[&k];
+                        match merged.get_mut(&k) {
+                            Some((dst, cnt)) => {
+                                for (i, b) in accs.iter().enumerate() {
+                                    merge_fused(&mut dst[i], b);
+                                }
+                                *cnt += rows_k;
+                            }
+                            None => {
+                                merged_keys.push((k, kv));
+                                merged.insert(k, (accs.clone(), rows_k));
+                            }
+                        }
+                    }
+                    if let Some(nb) = m.null_slot {
+                        match &mut merged_null {
+                            Some((dst, cnt)) => {
+                                for (i, b) in nb.iter().enumerate() {
+                                    merge_fused(&mut dst[i], b);
+                                }
+                                *cnt += m.null_rows;
+                            }
+                            None => merged_null = Some((nb, m.null_rows)),
+                        }
+                    }
+                }
+                Err(None) => fallback = true,
+                Err(Some(e)) => shard_err = Some(e),
+            }
+        }
+        if let Some(e) = shard_err {
+            return Err(e);
+        }
+        if !fallback {
+            for (k, kv) in merged_keys {
+                let (accs, group_rows) = merged.remove(&k).expect("key recorded");
+                let mut states: Vec<AggState> =
+                    (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                fill_states_from_fused(&mut states, &spec_src, &accs, group_rows);
+                order.push((alloc::vec![kv], states));
+            }
+            if let Some((accs, group_rows)) = merged_null {
+                let mut states: Vec<AggState> =
+                    (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                fill_states_from_fused(&mut states, &spec_src, &accs, group_rows);
+                order.push((alloc::vec![Value::Null], states));
+            }
+            return Ok(order);
+        }
+        // fallthrough: serial paths below handle the coercion edge.
+    }
+
     // v7.36 (perf — mailrs Phase 1) — `COUNT(<bound col>)` (non-`*`)
     // collapses to: read the cell, increment when not NULL. Skips
     // the per-row spec dispatch + `update_state("count", …)`.

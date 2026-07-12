@@ -33,17 +33,32 @@ fn build_pair() -> (Engine, Engine) {
     for e in [&mut serial, &mut parallel] {
         e.execute("CREATE TABLE t (v INT NOT NULL, f FLOAT NOT NULL, n NUMERIC(10,2) NOT NULL)")
             .unwrap();
+        e.execute("CREATE TABLE tg (g INT NOT NULL, v INT NOT NULL)")
+            .unwrap();
+        e.execute("CREATE TABLE tgn (gn INT, v INT NOT NULL)").unwrap();
         // 150 batches x 1000 rows.
         for b in 0..150 {
             let mut sql = String::from("INSERT INTO t VALUES ");
+            let mut sql_g = String::from("INSERT INTO tg VALUES ");
+            let mut sql_gn = String::from("INSERT INTO tgn VALUES ");
             for i in 0..1000 {
                 let k: i64 = i64::from(b) * 1000 + i;
                 if i > 0 {
                     sql.push(',');
+                    sql_g.push(',');
+                    sql_gn.push(',');
                 }
                 sql.push_str(&format!("({}, {}.5, {}.25)", k % 977, k % 31, k % 199));
+                sql_g.push_str(&format!("({}, {})", k % 97, k % 9973));
+                if k % 11 == 0 {
+                    sql_gn.push_str(&format!("(NULL, {})", k % 9973));
+                } else {
+                    sql_gn.push_str(&format!("({}, {})", k % 53, k % 9973));
+                }
             }
             e.execute(&sql).unwrap();
+            e.execute(&sql_g).unwrap();
+            e.execute(&sql_gn).unwrap();
         }
     }
     (serial, parallel)
@@ -84,6 +99,23 @@ fn parallel_fused_aggregates_match_serial() {
             ((x - y) / x).abs() < 1e-12,
             "float aggregate drifted: {x} vs {y}"
         );
+    }
+}
+
+#[test]
+fn parallel_group_by_matches_serial() {
+    let (mut serial, mut parallel) = build_pair();
+    for sql in [
+        // The panel shape: single INT group key, fused specs.
+        "SELECT g, count(*), sum(v) FROM tg GROUP BY g ORDER BY g",
+        "SELECT g, avg(v) FROM tg GROUP BY g ORDER BY g",
+        "SELECT g, count(*) FROM tg WHERE v % 3 = 0 GROUP BY g ORDER BY g",
+        // NULL group bucket.
+        "SELECT gn, count(*), sum(v) FROM tgn GROUP BY gn ORDER BY gn NULLS LAST",
+    ] {
+        let a = rows_of(&mut serial, sql);
+        let b = rows_of(&mut parallel, sql);
+        assert_eq!(a, b, "parallel differs from serial for {sql}");
     }
 }
 
