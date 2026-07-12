@@ -1891,6 +1891,57 @@ impl Table {
     /// hot_bytes)` pair via in-memory bookkeeping, then handed to
     /// this method ONCE for index regeneration. Replaces N per-
     /// record `rebuild_indices` calls with 1 per run.
+    /// v7.39 (flip crash-replay P0) — like
+    /// [`Self::set_rows_and_rebuild_indices`] but KEEPS the caller's
+    /// per-slot RowIds. Redo replay applies one WAL record per
+    /// statement; reassigning ids between records broke every later
+    /// record's tombstone targets (they name the ids the crashed
+    /// process allocated), resurrecting deleted rows. The id
+    /// allocator advances past every preserved id so post-replay
+    /// inserts never collide.
+    pub fn set_rows_and_rebuild_indices_with_rowids(
+        &mut self,
+        new_rows: PersistentVec<Row<'static>>,
+        new_hot_bytes: u64,
+        rowids: &[crate::row_header::RowId],
+        headers: &[crate::row_header::RowHeader],
+    ) {
+        debug_assert_eq!(new_rows.len(), rowids.len());
+        debug_assert_eq!(new_rows.len(), headers.len());
+        let mut new_headers: PersistentVec<crate::row_header::RowHeader> = PersistentVec::new();
+        let mut new_rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
+        let mut dead: u64 = 0;
+        for (rid, h) in rowids.iter().zip(headers) {
+            // Preserve the caller's header — an earlier replayed WAL
+            // record's tombstone stamp must survive this record's
+            // rebuild (per-statement replay re-freezing every header
+            // resurrected every previously-deleted row).
+            if h.xmax != crate::row_header::XMAX_ALIVE {
+                dead += 1;
+            }
+            new_headers.push_mut(*h);
+            let rid = if *rid == crate::row_header::RowId::UNASSIGNED {
+                let fresh = crate::row_header::RowId(self.next_rowid);
+                self.next_rowid += 1;
+                fresh
+            } else {
+                if rid.0 >= self.next_rowid {
+                    self.next_rowid = rid.0 + 1;
+                }
+                *rid
+            };
+            new_rowids.push_mut(rid);
+        }
+        self.rows = new_rows;
+        self.headers = new_headers;
+        self.rowids = new_rowids;
+        self.hot_bytes = new_hot_bytes;
+        self.dead_rows = dead;
+        debug_assert_eq!(self.rows.len(), self.headers.len());
+        debug_assert_eq!(self.rows.len(), self.rowids.len());
+        self.rebuild_indices();
+    }
+
     pub fn set_rows_and_rebuild_indices(
         &mut self,
         new_rows: PersistentVec<Row<'static>>,

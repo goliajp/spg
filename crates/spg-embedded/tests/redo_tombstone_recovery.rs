@@ -176,11 +176,11 @@ fn gate_off_delete_matches_gate_on_after_recovery() {
 
     {
         let mut db = Database::open_path(&db_path).unwrap();
-        // No set_mvcc_inplace → gate OFF (production default).
-        assert!(
-            !db.engine().mvcc_inplace(),
-            "gate must default OFF for the control"
-        );
+        // v7.39 — the flip made in-place MVCC the production default;
+        // this control group forces the LEGACY physical-delete path
+        // explicitly.
+        db.engine_mut().set_mvcc_inplace(false);
+        assert!(!db.engine().mvcc_inplace(), "control group is gate-off");
         db.execute("CREATE TABLE t (id INT)").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
         db.execute("DELETE FROM t WHERE id = 2").unwrap();
