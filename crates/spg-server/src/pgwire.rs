@@ -5002,6 +5002,32 @@ fn value_to_pg_text<'a>(
         Value::IntArray2D(rows) => into_arena(&spg_engine::format_int_2d_text_pub(rows)),
         Value::BigIntArray2D(rows) => into_arena(&spg_engine::format_bigint_2d_text_pub(rows)),
         Value::TextArray2D(rows) => into_arena(&spg_engine::format_text_2d_text_pub(rows)),
+        // v7.39 — the 1-D array family was MISSING here entirely and
+        // fell through to the Debug placeholder (found when
+        // array_agg over the wire printed `IntArray([Some(5), …])`).
+        // Canonical PG array text via the shared eval formatters.
+        Value::TextArray(items) => into_arena(&spg_engine::eval::format_text_array(items)),
+        Value::IntArray(items) => into_arena(&spg_engine::eval::format_int_array(items)),
+        Value::BigIntArray(items) => into_arena(&spg_engine::eval::format_bigint_array(items)),
+        Value::BoolArray(items) => into_arena(&spg_engine::eval::format_bool_array(items)),
+        Value::SmallIntArray(items) => {
+            into_arena(&spg_engine::eval::format_smallint_array(items))
+        }
+        Value::FloatArray(items) => into_arena(&spg_engine::eval::format_float_array(items)),
+        Value::NumericArray(items) => {
+            into_arena(&spg_engine::eval::format_numeric_array(items))
+        }
+        Value::DateArray(items) => into_arena(&spg_engine::eval::format_date_array(items)),
+        Value::TimestampArray(items) => {
+            into_arena(&spg_engine::eval::format_timestamp_array(items, false))
+        }
+        Value::TimestamptzArray(items) => {
+            into_arena(&spg_engine::eval::format_timestamp_array(items, true))
+        }
+        Value::UuidArray(items) => into_arena(&spg_engine::eval::format_uuid_array(items)),
+        Value::IntervalArray(items) => {
+            into_arena(&spg_engine::eval::format_interval_array(items))
+        }
         // v7.5.0 — Value is #[non_exhaustive].
         _ => {
             let mut buf = BumpString::new_in(arena);

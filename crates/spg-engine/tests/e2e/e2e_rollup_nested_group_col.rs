@@ -108,3 +108,25 @@ fn cube_and_grouping_sets_nested_keys() {
         set(&["a|2|0", "b|1|0", "x|3|1"])
     );
 }
+
+// ── v7.39 — multi-column GROUPING SETS with top-level ORDER BY ──
+
+#[test]
+fn grouping_sets_multi_column_order_by_resolves() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE gs (g INT, x INT)").unwrap();
+    e.execute("INSERT INTO gs VALUES (1,10),(1,20),(2,5)").unwrap();
+    // The head set drops `x` (NULL literal); its column name must
+    // survive so the ORDER BY on the union output still resolves.
+    let QueryResult::Rows { rows, .. } = e
+        .execute(
+            "SELECT g, x, count(*) FROM gs GROUP BY GROUPING SETS ((g),(x)) \
+             ORDER BY g NULLS LAST, x NULLS LAST",
+        )
+        .unwrap()
+    else {
+        panic!("rows")
+    };
+    // (g)-set: g=1(n=2), g=2(n=1) with x NULL; (x)-set: x=5,10,20 with g NULL.
+    assert_eq!(rows.len(), 5, "two g-groups + three x-groups");
+}

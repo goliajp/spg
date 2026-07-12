@@ -8497,8 +8497,17 @@ impl Parser {
                 peer.group_by = Some(set.clone());
                 let dropped_owned: Vec<Expr> = dropped.iter().map(|d| (*d).clone()).collect();
                 for item in &mut peer.items {
-                    if let SelectItem::Expr { expr, .. } = item {
+                    if let SelectItem::Expr { expr, alias } = item {
                         if dropped.iter().any(|d| *d == expr) {
+                            // v7.39 — keep the dropped key's name on the
+                            // NULL literal so the UNION output column
+                            // (and any top-level ORDER BY on it) still
+                            // resolves.
+                            if alias.is_none()
+                                && let Expr::Column(c) = &expr
+                            {
+                                *alias = Some(c.name.clone());
+                            }
                             *expr = Expr::Literal(Literal::Null);
                         } else {
                             Self::substitute_grouping_calls(expr, &dropped_owned);
@@ -8511,8 +8520,13 @@ impl Parser {
                 stmt.unions.push((UnionKind::All, peer));
             }
             for item in &mut stmt.items {
-                if let SelectItem::Expr { expr, .. } = item {
+                if let SelectItem::Expr { expr, alias } = item {
                     if head_dropped.iter().any(|d| d == expr) {
+                        if alias.is_none()
+                            && let Expr::Column(c) = &expr
+                        {
+                            *alias = Some(c.name.clone());
+                        }
                         *expr = Expr::Literal(Literal::Null);
                     } else {
                         Self::substitute_grouping_calls(expr, &head_dropped);
