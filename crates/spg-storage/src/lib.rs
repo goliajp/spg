@@ -2810,6 +2810,14 @@ const REDO_META_VERSION: u8 = 1;
 /// tombstones. Read via [`unresolved_tombstone_count`].
 static UNRESOLVED_TOMBSTONES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// v7.39 (flip crash-replay P0) — observability read for the replay
+/// tombstones that could not be resolved to a row (each one is a
+/// resurrected delete).
+#[must_use]
+pub fn unresolved_tombstones() -> u64 {
+    UNRESOLVED_TOMBSTONES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// v7.37.15 (Epic W durable-tombstone slice) — read the process-wide
 /// count of redo tombstones that could not be resolved to a row by
 /// `RowId` during `apply_redo`. See [`UNRESOLVED_TOMBSTONES`].
@@ -4276,6 +4284,17 @@ impl Catalog {
         let mut runs: alloc::vec::Vec<(String, alloc::vec::Vec<&RowChange>)> =
             alloc::vec::Vec::new();
         for change in changes {
+            // v7.39 (flip crash-replay P0) — a replayed tombstone carries
+            // the xmax the CRASHED process allocated, but this process's
+            // version cursor restarted; without advancing it past every
+            // replayed version, `Snapshot::visible`'s "deletion is in the
+            // future" branch (xmax > snapshot.version) resurrects every
+            // replayed delete. Same recovery contract as the snapshot
+            // loader (`observe_persisted_version`, the pg_control-style
+            // nextXid recovery).
+            if let RowChange::Tombstone { xmax, .. } = change {
+                row_header::observe_persisted_version(*xmax);
+            }
             let table = match change {
                 RowChange::Insert { table, .. }
                 | RowChange::Update { table, .. }
@@ -4339,11 +4358,15 @@ impl Catalog {
         // `Insert`'s carried `rowid`. Together they let a tombstone name
         // the exact row the writer stamped, independent of the ids the
         // finalizer will hand out. (When `!has_tomb`, both stay empty.)
-        let orig_rowids: alloc::vec::Vec<row_header::RowId> = if has_tomb {
-            table.rowids().iter().copied().collect()
-        } else {
-            alloc::vec::Vec::new()
-        };
+        // v7.39 (flip crash-replay P0) — ids are tracked UNCONDITIONALLY
+        // now: the finalizer preserves them so a later WAL record's
+        // tombstone can still name rows this record produced.
+        let orig_rowids: alloc::vec::Vec<row_header::RowId> =
+            table.rowids().iter().copied().collect();
+        // Headers snapshotted in lock-step: the finalizer preserves
+        // them so earlier records' tombstone stamps survive.
+        let orig_headers: alloc::vec::Vec<row_header::RowHeader> =
+            table.headers().iter().copied().collect();
         let mut tail_rowids: alloc::vec::Vec<row_header::RowId> = alloc::vec::Vec::new();
         // (RowId, xmax) of every row this run tombstones.
         let mut tomb_targets: alloc::vec::Vec<(row_header::RowId, u64)> = alloc::vec::Vec::new();
@@ -4387,12 +4410,10 @@ impl Catalog {
                         });
                     }
                     tail.push(row.clone());
-                    if has_tomb {
-                        // Keep the id lock-step with `tail` so a later
-                        // tombstone in this same run can find the row by
-                        // the id the writer captured for it.
-                        tail_rowids.push(*rowid);
-                    }
+                    // Keep the id lock-step with `tail` so a later
+                    // tombstone (this run or a later WAL record) can
+                    // find the row by the id the writer captured.
+                    tail_rowids.push(*rowid);
                 }
                 RowChange::Update { pos, new_row, .. } => {
                     if new_row.len() != table.schema().columns.len() {
@@ -4476,11 +4497,8 @@ impl Catalog {
                     to_flip_tail.dedup();
                     for off in to_flip_tail.into_iter().rev() {
                         tail.remove(off);
-                        if has_tomb {
-                            // Keep the id vector lock-step with `tail`
-                            // so a tombstone still resolves correctly
-                            // when a physical Delete precedes it in the
-                            // same run.
+                        {
+                            // Keep the id vector lock-step with `tail`.
                             tail_rowids.remove(off);
                         }
                         // Re-key tail-relative overlay entries that
@@ -4512,6 +4530,7 @@ impl Catalog {
         // of each row in its FINAL slot, so the post-pass can map a
         // tombstone target id → the slot to re-stamp `xmax` on.
         let mut final_rowids: alloc::vec::Vec<row_header::RowId> = alloc::vec::Vec::new();
+        let mut final_headers: alloc::vec::Vec<row_header::RowHeader> = alloc::vec::Vec::new();
         for (i, row) in original_rows.into_iter().enumerate() {
             if !live[i] {
                 continue;
@@ -4524,29 +4543,41 @@ impl Catalog {
             new_hot_bytes = new_hot_bytes
                 .saturating_add(row_body_encoded_len(&final_row, &schema_snapshot) as u64);
             new_rows.push_mut(final_row);
-            if has_tomb {
-                final_rowids.push(
-                    orig_rowids
-                        .get(i)
-                        .copied()
-                        .unwrap_or(row_header::RowId::UNASSIGNED),
-                );
-            }
+            final_rowids.push(
+                orig_rowids
+                    .get(i)
+                    .copied()
+                    .unwrap_or(row_header::RowId::UNASSIGNED),
+            );
+            final_headers.push(
+                orig_headers
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(row_header::RowHeader::frozen),
+            );
         }
         for (off, row) in tail.into_iter().enumerate() {
             new_hot_bytes =
                 new_hot_bytes.saturating_add(row_body_encoded_len(&row, &schema_snapshot) as u64);
             new_rows.push_mut(row);
-            if has_tomb {
-                final_rowids.push(
-                    tail_rowids
-                        .get(off)
-                        .copied()
-                        .unwrap_or(row_header::RowId::UNASSIGNED),
-                );
-            }
+            final_rowids.push(
+                tail_rowids
+                    .get(off)
+                    .copied()
+                    .unwrap_or(row_header::RowId::UNASSIGNED),
+            );
+            final_headers.push(row_header::RowHeader::frozen());
         }
-        table.set_rows_and_rebuild_indices(new_rows, new_hot_bytes);
+        // v7.39 (flip crash-replay P0) — id-preserving finalizer, so a
+        // LATER WAL record's tombstone still resolves rows this record
+        // produced (per-statement replay used to reassign ids between
+        // records, orphaning every cross-record tombstone target).
+        table.set_rows_and_rebuild_indices_with_rowids(
+            new_rows,
+            new_hot_bytes,
+            &final_rowids,
+            &final_headers,
+        );
         // v7.37.15 (Epic W durable-tombstone slice) — header-preserving
         // re-stamp. `set_rows_and_rebuild_indices` above froze every
         // header, so any row this run tombstoned is currently all-
