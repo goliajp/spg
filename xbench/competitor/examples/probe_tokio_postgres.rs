@@ -37,6 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let got: i32 = row.get(0);
     assert_eq!(got, 7);
+    // Array binary round-trip (array_agg -> Vec<i32>).
+    let row = client
+        .query_one("SELECT array_agg(i ORDER BY i) FROM tp", &[])
+        .await?;
+    let arr: Vec<i32> = row.get(0);
+    assert_eq!(arr, vec![7]);
     println!("tokio-postgres binary round-trip OK");
     Ok(())
 }
