@@ -934,6 +934,7 @@ pub(super) fn fts_ts_headline(
     let mut max_fragments: usize = 0;
     let mut frag_delim = String::from(" ... ");
     let mut highlight_all = false;
+    let mut short_word: usize = 3;
     if let Some(opts_v) = opts_arg {
         let opts = match opts_v {
             Value::Null => "",
@@ -958,6 +959,7 @@ pub(super) fn fts_ts_headline(
                 "maxwords" => max_words = v.parse().unwrap_or(35),
                 "minwords" => min_words = v.parse().unwrap_or(15),
                 "maxfragments" => max_fragments = v.parse().unwrap_or(0),
+                "shortword" => short_word = v.parse().unwrap_or(3),
                 "fragmentdelimiter" => frag_delim = v.to_string(),
                 "highlightall" => highlight_all = v.eq_ignore_ascii_case("true"),
                 _ => {}
@@ -991,6 +993,7 @@ pub(super) fn fts_ts_headline(
     // headline matches agree with @@.
     struct HlToken {
         word: String,
+        lex: String,
         sep_after: String,
         is_match: bool,
     }
@@ -1006,10 +1009,12 @@ pub(super) fn fts_ts_headline(
             crate::fts::TsConfig::Simple => lowered,
             crate::fts::TsConfig::English => crate::fts::porter_stem(&lowered),
         };
+        let is_match = terms.iter().any(|t| *t == lex);
         tokens.push(HlToken {
             word: core::mem::take(word),
+            lex,
             sep_after: String::new(),
-            is_match: terms.iter().any(|t| *t == lex),
+            is_match,
         });
     };
     for c in doc.chars() {
@@ -1049,9 +1054,9 @@ pub(super) fn fts_ts_headline(
         .enumerate()
         .filter_map(|(i, t)| t.is_match.then_some(i))
         .collect();
-    // HighlightAll / short or unmatched documents: whole text with
-    // its original separators (including the edges).
-    if highlight_all || match_pos.is_empty() || n <= min_words.max(1) {
+    // HighlightAll / short documents: whole text with its original
+    // separators (including the edges).
+    if highlight_all || n <= min_words.max(1) {
         let mut out = leading_sep;
         out.push_str(&render(0, n));
         if let Some(t) = tokens.last() {
@@ -1059,23 +1064,261 @@ pub(super) fn fts_ts_headline(
         }
         return Ok(Value::text(out));
     }
+    // v7.39 (FTS 研读轮) — an unmatched LONG document shows its first
+    // MinWords words in both selector modes (PG18 differential; the
+    // old whole-text answer was locked against short documents only).
+    if match_pos.is_empty() {
+        return Ok(Value::text(render(0, min_words.max(1).min(n))));
+    }
     if max_fragments > 0 {
-        // Fragment mode: one fragment per match, MaxWords wide with
-        // the match centred; overlapping fragments merge; first
-        // MaxFragments survive, joined by FragmentDelimiter.
-        let w = max_words.max(1);
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for &p in &match_pos {
-            let before = (w - 1) / 2;
-            let lo = p.saturating_sub(before);
-            let hi = (lo + w).min(n);
-            match spans.last_mut() {
-                Some((_, prev_hi)) if lo <= *prev_hi => *prev_hi = hi,
-                _ => spans.push((lo, hi)),
+        // v7.39 (FTS mark_hl_fragments 研读轮) — PG's MaxFragments
+        // selector, clean-room from the studied behaviour of
+        // wparser_def.c's mark_hl_fragments/hlCover/get_next_fragment
+        // (read01 dir-tsearch note + PG18 source study):
+        //   1. hlCover walks minimal windows that contain every
+        //      top-level AND branch of the query (an OR branch matches
+        //      at any of its terms' positions).
+        //   2. Each cover splits into fragments of at most MaxWords
+        //      whose both ends are query words.
+        //   3. Greedy pick: most interesting words, ties to fewer
+        //      words, MaxFragments times; each pick stretches — left
+        //      by at most (MaxWords - len) / 2, right with the whole
+        //      remainder — never crossing an already-chosen fragment,
+        //      then shrinks both ends off BAD endpoints (a short word
+        //      of <= ShortWord chars or an all-digit word, unless it
+        //      is itself a query word). Overlapping candidates are
+        //      excluded, chosen fragments render in document order.
+        //   4. No cover at all -> the first MinWords words (the only
+        //      place MinWords matters in fragment mode).
+        // SPG's token stream has no SPACE/TAG tokens (separators ride
+        // on the preceding word), so PG's NONWORDTOKEN skips collapse
+        // away and every token counts as one word.
+        let interesting: Vec<bool> = tokens.iter().map(|t| t.is_match).collect();
+        let is_bad_endpoint = |i: usize| -> bool {
+            if interesting[i] {
+                return false;
+            }
+            let w = &tokens[i].word;
+            w.chars().count() <= short_word || w.chars().all(|c| c.is_ascii_digit())
+        };
+        // Top-level AND groups; each group's positions are the union
+        // of its terms' matches.
+        fn and_groups(ast: &spg_storage::TsQueryAst, out: &mut Vec<Vec<String>>) {
+            match ast {
+                spg_storage::TsQueryAst::And(l, r) => {
+                    and_groups(l, out);
+                    and_groups(r, out);
+                }
+                spg_storage::TsQueryAst::Not(_) => {}
+                other => {
+                    let mut g = Vec::new();
+                    // reuse the positive-term collector on the branch
+                    fn collect(ast: &spg_storage::TsQueryAst, out: &mut Vec<String>) {
+                        match ast {
+                            spg_storage::TsQueryAst::Term { word, .. } => {
+                                if !word.is_empty() {
+                                    out.push(word.clone());
+                                }
+                            }
+                            spg_storage::TsQueryAst::And(l, r)
+                            | spg_storage::TsQueryAst::Or(l, r) => {
+                                collect(l, out);
+                                collect(r, out);
+                            }
+                            spg_storage::TsQueryAst::Not(_) => {}
+                            spg_storage::TsQueryAst::Phrase { left, right, .. } => {
+                                collect(left, out);
+                                collect(right, out);
+                            }
+                        }
+                    }
+                    collect(other, &mut g);
+                    if !g.is_empty() {
+                        out.push(g);
+                    }
+                }
             }
         }
-        spans.truncate(max_fragments);
-        let parts: Vec<String> = spans.iter().map(|&(lo, hi)| render(lo, hi)).collect();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        and_groups(&query, &mut groups);
+        let group_pos: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|g| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| g.iter().any(|term| *term == t.lex))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        // Candidate fragments: (startpos, endpos inclusive, words, interesting).
+        struct Cand {
+            st: usize,
+            en: usize,
+            curlen: usize,
+            poslen: usize,
+            chosen: bool,
+            excluded: bool,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        if !group_pos.is_empty() && group_pos.iter().all(|ps| !ps.is_empty()) {
+            let mut nextpos = 0usize;
+            loop {
+                // earliest window at/after nextpos containing one
+                // position from every group
+                let mut pose = 0usize;
+                let mut dead = false;
+                for ps in &group_pos {
+                    match ps.iter().find(|&&p| p >= nextpos) {
+                        Some(&p) => pose = pose.max(p),
+                        None => {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                if dead {
+                    break;
+                }
+                let mut posb = usize::MAX;
+                for ps in &group_pos {
+                    if let Some(&p) = ps.iter().rev().find(|&&p| p <= pose) {
+                        posb = posb.min(p);
+                    }
+                }
+                let posb = posb.max(nextpos);
+                // split [posb, pose] into fragments of <= MaxWords with
+                // query words at both ends
+                let (mut st, en_cover) = (posb, pose);
+                while st <= en_cover {
+                    // advance st to an interesting word
+                    let mut i = st;
+                    while i < en_cover && !interesting[i] {
+                        i += 1;
+                    }
+                    st = i;
+                    let mut curlen = 0usize;
+                    let mut poslen = 0usize;
+                    i = st;
+                    while i <= en_cover && curlen < max_words.max(1) {
+                        curlen += 1;
+                        if interesting[i] {
+                            poslen += 1;
+                        }
+                        i += 1;
+                    }
+                    // if the cover was cut, back the end up to a query word
+                    let mut en = i - 1;
+                    if en < en_cover {
+                        while en > st && !interesting[en] {
+                            curlen -= 1;
+                            en -= 1;
+                        }
+                    }
+                    cands.push(Cand {
+                        st,
+                        en,
+                        curlen,
+                        poslen,
+                        chosen: false,
+                        excluded: false,
+                    });
+                    st = en + 1;
+                }
+                nextpos = posb + 1;
+            }
+        }
+        // Greedy selection + stretch + overlap exclusion.
+        let mut in_frag: Vec<bool> = alloc::vec![false; n];
+        let mut picked = 0usize;
+        for _ in 0..max_fragments {
+            let mut best: Option<usize> = None;
+            for (i, c) in cands.iter().enumerate() {
+                if c.chosen || c.excluded {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some(b) => {
+                        c.poslen > cands[b].poslen
+                            || (c.poslen == cands[b].poslen && c.curlen < cands[b].curlen)
+                    }
+                };
+                if better {
+                    best = Some(i);
+                }
+            }
+            let Some(bi) = best else { break };
+            let (mut st, mut en, mut curlen) = (cands[bi].st, cands[bi].en, cands[bi].curlen);
+            if curlen < max_words {
+                // stretch left by at most half the remainder, never
+                // crossing an already-chosen fragment
+                let maxstretch = (max_words - curlen) / 2;
+                let mut stretch = 0usize;
+                let mut posmarker = st;
+                let mut i = st;
+                while i > 0 && stretch < maxstretch && !in_frag[i - 1] {
+                    i -= 1;
+                    curlen += 1;
+                    stretch += 1;
+                    posmarker = i;
+                }
+                // shrink back off bad endpoints
+                let mut i = posmarker;
+                while i < st && is_bad_endpoint(i) {
+                    curlen -= 1;
+                    i += 1;
+                }
+                st = i;
+                // stretch right with the whole remainder
+                let mut posmarker = en;
+                let mut i = en + 1;
+                while i < n && curlen < max_words && !in_frag[i] {
+                    curlen += 1;
+                    posmarker = i;
+                    i += 1;
+                }
+                // shrink back off bad endpoints
+                let mut i = posmarker;
+                while i > en && is_bad_endpoint(i) {
+                    curlen -= 1;
+                    i -= 1;
+                }
+                en = i;
+            }
+            cands[bi].st = st;
+            cands[bi].en = en;
+            cands[bi].curlen = curlen;
+            cands[bi].chosen = true;
+            for k in st..=en {
+                in_frag[k] = true;
+            }
+            picked += 1;
+            for (i, c) in cands.iter_mut().enumerate() {
+                if i != bi
+                    && ((c.st >= st && c.st <= en)
+                        || (c.en >= st && c.en <= en)
+                        || (c.st < st && c.en > en))
+                {
+                    c.excluded = true;
+                }
+            }
+        }
+        if picked == 0 {
+            let hi = min_words.max(1).min(n);
+            return Ok(Value::text(render(0, hi)));
+        }
+        let mut chosen: Vec<(usize, usize)> = cands
+            .iter()
+            .filter(|c| c.chosen)
+            .map(|c| (c.st, c.en))
+            .collect();
+        chosen.sort_unstable();
+        let parts: Vec<String> = chosen
+            .iter()
+            .map(|&(st, en)| render(st, en + 1))
+            .collect();
         return Ok(Value::text(parts.join(&frag_delim)));
     }
     // Window mode: the cover is the smallest span holding every
