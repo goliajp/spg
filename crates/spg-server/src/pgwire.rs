@@ -1463,7 +1463,7 @@ fn run_pg_session(
             b'E' => {
                 if let Err((sqlstate, msg)) = handle_execute(
                     body,
-                    &portals,
+                    &mut portals,
                     &prepared,
                     &settings,
                     &mut wbuf,
@@ -2036,6 +2036,20 @@ struct Portal {
     /// into typed `spg_storage::Value`s. Empty when the prepared
     /// statement has no `$N` placeholders.
     params: Vec<spg_storage::Value<'static>>,
+    /// v7.39 (cursors) — a partially-consumed result set left by an
+    /// Execute with max_rows: the next Execute on this portal
+    /// resumes here instead of re-running the statement (JDBC
+    /// setFetchSize / PortalSuspended protocol).
+    suspended: Option<SuspendedRows>,
+}
+
+/// v7.39 (cursors) — the materialised remainder of a suspended
+/// portal (RowDescription was already sent on the first Execute).
+#[derive(Debug, Clone)]
+struct SuspendedRows {
+    columns: Vec<ColumnSchema>,
+    rows: Vec<Row<'static>>,
+    cursor: usize,
 }
 
 /// Parse a null-terminated C string starting at `pos` of `body`.
@@ -2238,7 +2252,14 @@ fn handle_bind(
     }
     // Trailing result-format-codes — we always return text on the
     // wire, so ignore them here.
-    Ok((portal_name, Portal { stmt_name, params }))
+    Ok((
+        portal_name,
+        Portal {
+            stmt_name,
+            params,
+            suspended: None,
+        },
+    ))
 }
 
 /// v6.1.1 — convert a pgwire text-format bind parameter into a
@@ -2556,7 +2577,7 @@ fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
 #[allow(clippy::too_many_arguments)]
 fn handle_execute(
     body: &[u8],
-    portals: &std::collections::HashMap<String, Portal>,
+    portals: &mut std::collections::HashMap<String, Portal>,
     prepared: &std::collections::HashMap<String, PreparedStmt>,
     settings: &std::collections::HashMap<String, String>,
     out: &mut Vec<u8>,
@@ -2583,10 +2604,41 @@ fn handle_execute(
     let mut cur = 0;
     let portal_name = read_cstring(body, &mut cur)
         .ok_or_else(|| proto("Execute: portal name not UTF-8".to_string()))?;
-    // Max-rows (i32, 0 = unlimited). We always return everything;
-    // partial-cursor support is future work.
+    // v7.39 (cursors) — max-rows (i32, 0 = unlimited). A positive
+    // value caps this Execute's DataRows; a capped result leaves the
+    // remainder suspended on the portal and answers PortalSuspended.
     if cur + 4 > body.len() {
         return Err(proto("Execute: missing max-rows".to_string()));
+    }
+    let max_rows =
+        u32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]) as usize;
+    let portal_key = portal_name.to_string();
+    // Resume a suspended portal: emit the next batch from the cached
+    // remainder — the statement does NOT re-run (PG cursor semantics).
+    if let Some(p) = portals.get_mut(&portal_key)
+        && let Some(susp) = p.suspended.as_mut()
+    {
+        let stream: &mut Vec<u8> = out;
+        let end = if max_rows == 0 {
+            susp.rows.len()
+        } else {
+            (susp.cursor + max_rows).min(susp.rows.len())
+        };
+        let row_arena = bumpalo::Bump::new();
+        for row in &susp.rows[susp.cursor..end] {
+            encode_data_row(stream, &susp.columns, row, &row_arena)
+                .map_err(|e| proto(e.to_string()))?;
+        }
+        susp.cursor = end;
+        if end < susp.rows.len() {
+            send_msg(stream, b's', &[]).map_err(|e| proto(e.to_string()))?;
+        } else {
+            let n = susp.rows.len();
+            p.suspended = None;
+            send_command_complete(stream, &format!("SELECT {n}"))
+                .map_err(|e| proto(e.to_string()))?;
+        }
+        return Ok(());
     }
     let portal = portals
         .get(portal_name)
@@ -2623,7 +2675,9 @@ fn handle_execute(
     // also skips the per-cell `.cloned()` and emits cell references
     // straight out of the source tables.
     let cached_row_desc = stmt.row_desc_body.clone();
-    if let (spg_sql::ast::Statement::Select(s), true) = (&stmt.ast, portal.params.is_empty()) {
+    if let (spg_sql::ast::Statement::Select(s), true, 0) =
+        (&stmt.ast, portal.params.is_empty(), max_rows)
+    {
         let mut eng = state
             .engine
             .write()
@@ -2709,12 +2763,25 @@ fn handle_execute(
             // text-format fallback payloads in the materialised
             // extended-protocol path.
             let row_arena = bumpalo::Bump::new();
-            for row in &rows {
+            // v7.39 (cursors) — cap the batch and suspend the rest.
+            let emit_end = if max_rows > 0 { max_rows.min(n) } else { n };
+            for row in &rows[..emit_end] {
                 encode_data_row(stream, &columns, row, &row_arena)
                     .map_err(|e| proto(e.to_string()))?;
             }
-            send_command_complete(stream, &format!("SELECT {n}"))
-                .map_err(|e| proto(e.to_string()))?;
+            if emit_end < n {
+                send_msg(stream, b's', &[]).map_err(|e| proto(e.to_string()))?;
+                if let Some(p) = portals.get_mut(&portal_key) {
+                    p.suspended = Some(SuspendedRows {
+                        columns,
+                        rows,
+                        cursor: emit_end,
+                    });
+                }
+            } else {
+                send_command_complete(stream, &format!("SELECT {n}"))
+                    .map_err(|e| proto(e.to_string()))?;
+            }
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             // Synthesise a command tag from the statement kind so

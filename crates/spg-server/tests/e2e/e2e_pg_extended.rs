@@ -254,3 +254,62 @@ fn dml_via_extended_query() {
     let drs = msgs.iter().filter(|m| m.ty == b'D').count();
     assert_eq!(drs, 1, "expected one row after parametrized INSERT");
 }
+
+// ── v7.39 (cursors) — Execute max_rows + PortalSuspended ──
+
+fn send_execute_max(s: &mut TcpStream, portal: &str, max_rows: i32) {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&max_rows.to_be_bytes());
+    send_msg(s, b'E', &body);
+}
+
+#[test]
+fn execute_max_rows_suspends_and_resumes_portal() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _guard = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+    // 5-row table through the extended protocol.
+    send_parse(&mut s, "", "CREATE TABLE cur (v INT)");
+    send_bind_text(&mut s, "", "", &[]);
+    send_execute(&mut s, "");
+    send_sync(&mut s);
+    read_until_ready(&mut s);
+    send_parse(&mut s, "", "INSERT INTO cur VALUES (1),(2),(3),(4),(5)");
+    send_bind_text(&mut s, "", "", &[]);
+    send_execute(&mut s, "");
+    send_sync(&mut s);
+    read_until_ready(&mut s);
+
+    // Fetch in batches of 2: 2 rows + 's', 2 rows + 's', 1 row + 'C'.
+    send_parse(&mut s, "cst", "SELECT v FROM cur ORDER BY v");
+    send_bind_text(&mut s, "cpt", "cst", &[]);
+    send_execute_max(&mut s, "cpt", 2);
+    send_execute_max(&mut s, "cpt", 2);
+    send_execute_max(&mut s, "cpt", 2);
+    send_sync(&mut s);
+
+    let mut rows = 0usize;
+    let mut suspends = 0usize;
+    let mut completes = 0usize;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => rows += 1,
+            b's' => suspends += 1,
+            b'C' => completes += 1,
+            b'E' => panic!(
+                "unexpected error: {}",
+                String::from_utf8_lossy(&m.body)
+            ),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    assert_eq!(rows, 5, "all rows across the three Executes");
+    assert_eq!(suspends, 2, "first two batches suspend the portal");
+    assert_eq!(completes, 1, "only the final Execute completes (SELECT 5)");
+}
