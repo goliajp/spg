@@ -3340,8 +3340,13 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // INVALID_PARAMETER_VALUE.
         } else if msg.contains("invalid value for parameter")
             || msg.contains("is outside the valid range for parameter")
+            || msg.contains("sample size must be between")
         {
             "22023"
+        // v7.39 (read01 utils/adt) — PG's multidim-search refusal is
+        // 0A000 FEATURE_NOT_SUPPORTED.
+        } else if msg.contains("searching for elements in multidimensional arrays") {
+            "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")
             || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
         {

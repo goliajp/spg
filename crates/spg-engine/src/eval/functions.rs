@@ -3711,6 +3711,18 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            // PG refuses multidimensional search with its own text
+            // (no good way to report a position).
+            if matches!(
+                args[0],
+                Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_)
+            ) {
+                return Err(EvalError::TypeMismatch {
+                    detail: String::from(
+                        "searching for elements in multidimensional arrays is not supported",
+                    ),
+                });
+            }
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -3731,6 +3743,132 @@ fn apply_function_dispatch(
                 }
             }
             Ok(Value::Null)
+        }
+        // v7.39 (read01 utils/adt) — PG 17 array_reverse(arr): first
+        // dimension reversed, lbound kept (SPG arrays are lbound-1).
+        "array_reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_reverse() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::IntArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::IntArray(out))
+                }
+                Value::BigIntArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::BigIntArray(out))
+                }
+                Value::SmallIntArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::SmallIntArray(out))
+                }
+                Value::FloatArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::FloatArray(out))
+                }
+                Value::BoolArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::BoolArray(out))
+                }
+                Value::TextArray(items) => {
+                    let mut out = items.clone();
+                    out.reverse();
+                    Ok(Value::TextArray(out))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_reverse() needs array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.39 (read01 utils/adt) — PG 17 array_sort(arr [,desc
+        // [,nulls_first]]): first dimension, element default ordering;
+        // NULLS default LAST asc / FIRST desc (PG sort convention).
+        "array_sort" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_sort() takes 1-3 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let flag = |i: usize| -> Result<Option<bool>, EvalError> {
+                match args.get(i) {
+                    None => Ok(None),
+                    Some(Value::Null) => Ok(None),
+                    Some(Value::Bool(b)) => Ok(Some(*b)),
+                    Some(other) => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "array_sort() flag must be boolean, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            let descending = flag(1)?.unwrap_or(false);
+            let nulls_first = flag(2)?.unwrap_or(descending);
+            fn sort_opt<T: PartialOrd + Clone>(
+                items: &[Option<T>],
+                descending: bool,
+                nulls_first: bool,
+            ) -> alloc::vec::Vec<Option<T>> {
+                let mut vals: alloc::vec::Vec<T> =
+                    items.iter().filter_map(|v| v.clone()).collect();
+                let nulls = items.len() - vals.len();
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                if descending {
+                    vals.reverse();
+                }
+                let mut out = alloc::vec::Vec::with_capacity(items.len());
+                if nulls_first {
+                    out.extend(core::iter::repeat_n(None, nulls));
+                }
+                out.extend(vals.into_iter().map(Some));
+                if !nulls_first {
+                    out.extend(core::iter::repeat_n(None, nulls));
+                }
+                out
+            }
+            match &args[0] {
+                Value::IntArray(items) => {
+                    Ok(Value::IntArray(sort_opt(items, descending, nulls_first)))
+                }
+                Value::BigIntArray(items) => {
+                    Ok(Value::BigIntArray(sort_opt(items, descending, nulls_first)))
+                }
+                Value::SmallIntArray(items) => Ok(Value::SmallIntArray(sort_opt(
+                    items,
+                    descending,
+                    nulls_first,
+                ))),
+                Value::FloatArray(items) => {
+                    Ok(Value::FloatArray(sort_opt(items, descending, nulls_first)))
+                }
+                Value::BoolArray(items) => {
+                    Ok(Value::BoolArray(sort_opt(items, descending, nulls_first)))
+                }
+                Value::TextArray(items) => {
+                    Ok(Value::TextArray(sort_opt(items, descending, nulls_first)))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_sort() needs array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
         }
         // v7.37.17 (17.6 siblings) — PG 16+ array_shuffle(arr)
         // returns a randomly-permuted copy. Fisher-Yates using the
@@ -3816,6 +3954,14 @@ fn apply_function_dispatch(
                 });
             }
             let n = n as usize;
+            // PG: n outside 0..=len errors (22023), no clamping.
+            if let Some(len) = array_len(&args[0])
+                && n > len
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("sample size must be between 0 and {len}"),
+                });
+            }
             match &args[0] {
                 Value::IntArray(items) => {
                     let take = n.min(items.len());

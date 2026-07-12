@@ -63,13 +63,18 @@ fn array_sample_returns_n_items() {
 }
 
 #[test]
-fn array_sample_clamps_to_source_size() {
+fn array_sample_rejects_oversized_n() {
     let mut e = Engine::new();
-    // Ask for 100 from a 5-element array — should return 5.
-    match first(&mut e, "SELECT array_sample(ARRAY[1, 2, 3, 4, 5], 100)") {
-        spg_storage::Value::IntArray(items) => assert_eq!(items.len(), 5),
-        other => panic!("got {other:?}"),
-    }
+    // v7.39 (read01 utils/adt) — PG errors on n > len (22023), it
+    // does NOT clamp; the old clamp assertion locked SPG-only
+    // behaviour.
+    let err = e
+        .execute("SELECT array_sample(ARRAY[1, 2, 3, 4, 5], 100)")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("sample size must be between 0 and 5"),
+        "got {err}"
+    );
 }
 
 #[test]
