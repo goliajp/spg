@@ -2036,6 +2036,33 @@ mod tests {
     }
 
     #[test]
+    fn stack_depth_guard_trips_on_pathological_nesting() {
+        // Built directly as an AST — the parser's own budgets (256
+        // chained binary operators, 64 nesting levels) reject such SQL
+        // long before eval sees it, so this exercises the eval-side
+        // guard on its own. 30 000 frames overshoot the 768 KiB budget
+        // at any conceivable frame size; the guard errors at the byte
+        // budget, far below the worker stack, so deeper is safer.
+        let mut e = Expr::Literal(Literal::Bool(true));
+        for _ in 0..30_000 {
+            e = Expr::Binary {
+                lhs: alloc::boxed::Box::new(e),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(Expr::Literal(Literal::Bool(true))),
+            };
+        }
+        let r = Row::new(vec![]);
+        let cs: [ColumnSchema; 0] = [];
+        let c = ctx(&cs, None);
+        let err = eval_expr(&e, &r, &c).unwrap_err();
+        assert!(matches!(err, EvalError::StackDepthExceeded), "{err:?}");
+        // Dropping a 30 000-deep Box chain recurses in the drop glue —
+        // deeper than the eval guard allows the EVAL side to go — so
+        // leak it rather than gamble on the test thread's stack.
+        core::mem::forget(e);
+    }
+
+    #[test]
     fn and_three_valued_logic() {
         let r = Row::new(vec![]);
         let cs: [ColumnSchema; 0] = [];

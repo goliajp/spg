@@ -363,6 +363,10 @@ pub(crate) struct ConnState {
     /// Session-scoped per PG semantics; SET LOCAL is not honored
     /// because PG itself treats this GUC as session-only.
     pub(crate) application_name: RwLock<String>,
+    /// v7.39 (GUC) — the startup-packet `application_name`. RESET /
+    /// RESET ALL restore to this (PG's per-session default), not to
+    /// the compiled-in empty string.
+    pub(crate) startup_app_name: String,
     /// v7.39 (query cancel) — the secret half of BackendKeyData; a
     /// CancelRequest must echo it to trip `cancel_flag`.
     pub(crate) cancel_secret: u32,

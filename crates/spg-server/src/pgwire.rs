@@ -411,31 +411,63 @@ fn handle_pg_simple_query(
                 *g = value.clone();
             }
         }
-        let engine_affecting = matches!(
-            name_lc.as_str(),
-            "foreign_key_checks" | "session_replication_role" | "default_text_search_config"
-        );
-        // Detect multi-assignment from the LHS shape
-        // (contains '@' anywhere) or comma in the value
-        // portion (more than one assignment).
-        let is_multi = name_lc.contains('@')
-            || value.contains(',')
-            || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
-            || sql.to_ascii_lowercase().contains("foreign_key_checks =")
-            || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
-        if !engine_affecting && !is_multi {
-            send_command_complete(wbuf, "SET")?;
-            send_ready_for_query(wbuf, *tx_state)?;
-            stream.write_all(wbuf)?;
-            wbuf.clear();
-            return Ok(());
+        // v7.39 (GUC) — dual-write: the wire cache serves the hot
+        // statement_timeout lookup, and the statement ALWAYS falls
+        // through to the engine so session_params (the store
+        // current_setting()/engine features read) stays in sync.
+        // SET is rare; the extra engine write-lock is noise.
+        let _ = &value;
+    }
+    // v7.39 (GUC) — RESET name / RESET ALL: drop the wire-cache
+    // entry so SHOW stops serving the stale override, then fall
+    // through — the engine's ResetParameter clears session_params.
+    {
+        let t = sql.trim();
+        let b = t.as_bytes();
+        let restore_app_name =
+            |settings: &mut std::collections::HashMap<String, String>| {
+                if !conn_state.startup_app_name.is_empty() {
+                    settings.insert(
+                        "application_name".to_string(),
+                        conn_state.startup_app_name.clone(),
+                    );
+                }
+                if let Ok(mut g) = conn_state.application_name.write() {
+                    g.clone_from(&conn_state.startup_app_name);
+                }
+            };
+        if ci_eq(b, b"reset all") {
+            settings.clear();
+            restore_app_name(settings);
+        } else if ci_starts_with(b, b"reset ") {
+            let name = t[6..].trim().trim_end_matches(';').trim().to_ascii_lowercase();
+            settings.remove(&name);
+            if name == "application_name" {
+                restore_app_name(settings);
+            }
         }
-        // engine-affecting or multi-assignment:
-        // fall through to dispatch so the engine sees it.
     }
     // v4.19: SHOW name / SHOW ALL.
     if let Some(name) = parse_show_statement(sql) {
-        let resp = render_show(&name, settings);
+        // v7.39 (GUC) — the engine store wins: it sees SET LOCAL
+        // (tx-scoped undo) and engine-side writes the wire cache
+        // can't. Fall back to the cache + known defaults.
+        let engine_val: Option<String> = if name != "all" {
+            state
+                .engine
+                .read()
+                .ok()
+                .and_then(|e| e.session_param(&name).map(str::to_string))
+        } else {
+            None
+        };
+        let resp = match engine_val {
+            Some(v) => CannedResponse::Rows {
+                columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
+                rows: vec![Row::new(vec![Value::text(v)])],
+            },
+            None => render_show(&name, settings),
+        };
         send_canned(wbuf, &resp)?;
         send_ready_for_query(wbuf, *tx_state)?;
         stream.write_all(wbuf)?;
@@ -1178,6 +1210,7 @@ fn run_pg_session(
         last_query_start_us: std::sync::atomic::AtomicI64::new(0),
         in_transaction: std::sync::atomic::AtomicBool::new(false),
         application_name: std::sync::RwLock::new(startup_app_name.clone()),
+        startup_app_name: startup_app_name.clone(),
         cancel_secret: new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1578,6 +1611,9 @@ fn execute_with_role(
     if is_read {
         let b = sql.as_bytes();
         if ci_contains(b, b"setval(") || ci_contains(b, b"nextval(") || ci_contains(b, b"currval(")
+            // v7.39 (GUC) — set_config writes the session GUC store, so
+            // it needs the &mut engine path for the same reason.
+            || ci_contains(b, b"set_config(")
         {
             is_read = false;
         }
@@ -1804,9 +1840,6 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     {
         return Some(CannedResponse::Tag("DISCARD"));
     }
-    if ci_eq(b, b"reset all") || ci_starts_with(b, b"reset ") {
-        return Some(CannedResponse::Tag("RESET"));
-    }
     // v4.18: VACUUM / ANALYZE / CLUSTER / REINDEX — BI clients
     // (Metabase, DBeaver) run these defensively after schema
     // changes. SPG has no vacuum or analyze concept (rows are
@@ -1882,7 +1915,10 @@ fn sql_has_sequence_mutator(b: &[u8]) -> bool {
     if b.len() < 7 {
         return false;
     }
-    let needles: &[&[u8]] = &[b"setval(", b"nextval(", b"currval("];
+    // v7.39 (GUC) — set_config writes the session GUC store; like the
+    // sequence mutators it must reach the engine write lock so
+    // `try_exec_set_config` can fire.
+    let needles: &[&[u8]] = &[b"setval(", b"nextval(", b"currval(", b"set_config("];
     for i in 0..b.len() {
         let c = b[i] | 0x20;
         match c {
@@ -2911,11 +2947,14 @@ fn parse_set_statement(sql: &str) -> Option<(String, String)> {
     }
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("set ")?;
-    // Strip optional SESSION / LOCAL.
-    let rest = rest
-        .strip_prefix("session ")
-        .or_else(|| rest.strip_prefix("local "))
-        .unwrap_or(rest);
+    // v7.39 (GUC) — SET LOCAL is tx-scoped and owned by the engine's
+    // undo log; the wire cache must not shadow it (a COMMIT/ROLLBACK
+    // would leave the stale value visible to SHOW).
+    if rest.starts_with("local ") {
+        return None;
+    }
+    // Strip optional SESSION.
+    let rest = rest.strip_prefix("session ").unwrap_or(rest);
     // Find name + assign operator (= or TO).
     let (name, value_part) = if let Some(idx) = rest.find('=') {
         (rest[..idx].trim().to_string(), rest[idx + 1..].trim())
@@ -2940,6 +2979,10 @@ fn parse_show_statement(sql: &str) -> Option<String> {
     }
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("show ")?;
+    // PG spells the timezone GUC as two words in SHOW.
+    if rest.trim().trim_end_matches(';').trim() == "time zone" {
+        return Some("timezone".to_string());
+    }
     let name = rest.split_ascii_whitespace().next()?.to_string();
     Some(name)
 }
@@ -3002,6 +3045,7 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("search_path", "\"$user\", public"),
         ("server_encoding", "UTF8"),
         ("server_version", "18.4 (spg-4.19)"),
+        ("server_version_num", "180004"),
         ("standard_conforming_strings", "on"),
         ("statement_timeout", "0"),
         ("timezone", "UTC"),

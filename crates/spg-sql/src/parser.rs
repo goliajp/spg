@@ -1984,7 +1984,32 @@ impl Parser {
                             )));
                         }
                     }
-                    let value = self.parse_set_value()?;
+                    let mut value = self.parse_set_value()?;
+                    // v7.39 (GUC) — disambiguate the comma: `, name =` /
+                    // `, name TO` continues a MySQL-style multi-assign,
+                    // anything else is a PG list VALUE
+                    // (`SET search_path = myschema, public`) folded into
+                    // one comma-joined string.
+                    while matches!(self.peek(), Token::Comma) {
+                        let is_assign = matches!(
+                            self.tokens.get(self.pos + 1),
+                            Some(Token::Ident(_) | Token::QuotedIdent(_) | Token::SessionVar(_))
+                        ) && matches!(
+                            self.tokens.get(self.pos + 2),
+                            Some(Token::Eq | Token::To)
+                        );
+                        if is_assign {
+                            break;
+                        }
+                        self.advance(); // comma
+                        let next = self.parse_set_value()?;
+                        let joined = alloc::format!(
+                            "{}, {}",
+                            set_value_text(&value),
+                            set_value_text(&next)
+                        );
+                        value = crate::ast::SetValue::String(joined);
+                    }
                     pairs.push((lhs, value));
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
@@ -4747,6 +4772,10 @@ impl Parser {
     }
 
     fn parse_set_value(&mut self) -> Result<crate::ast::SetValue, ParseError> {
+        Self::parse_set_value_inner(self)
+    }
+
+    fn parse_set_value_inner(&mut self) -> Result<crate::ast::SetValue, ParseError> {
         match self.advance() {
             Token::String(s) => Ok(crate::ast::SetValue::String(s)),
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("default") => {
@@ -19372,5 +19401,15 @@ $$";
                 .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
             assert_eq!(s, again, "round-trip mismatch for {sql:?}");
         }
+    }
+}
+
+/// v7.39 (GUC) — the textual body of a SET value, for list joining.
+fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
+    match v {
+        crate::ast::SetValue::String(s)
+        | crate::ast::SetValue::Ident(s)
+        | crate::ast::SetValue::Number(s) => s.clone(),
+        crate::ast::SetValue::Default => "DEFAULT".into(),
     }
 }

@@ -109,6 +109,24 @@ impl Engine {
             self.backslash_escapes = flag;
             self.plan_cache.clear();
         }
+        // v7.39 (GUC) — PG stores ms-unit time GUCs as an integer and
+        // renders SHOW/current_setting in the largest whole unit
+        // ("250" → "250ms", "5000" → "5s"). Normalise at store time so
+        // every read surface agrees.
+        let normalised = if matches!(
+            key.as_str(),
+            "statement_timeout"
+                | "lock_timeout"
+                | "idle_in_transaction_session_timeout"
+                | "idle_session_timeout"
+        ) {
+            match parse_pg_duration_ms(&normalised) {
+                Some(ms) => render_pg_duration_ms(ms),
+                None => normalised,
+            }
+        } else {
+            normalised
+        };
         self.session_params.insert(key, normalised);
     }
 
@@ -227,6 +245,26 @@ fn parse_pg_duration_ms(raw: &str) -> Option<u64> {
     };
     let n: u64 = num_part.trim().parse().ok()?;
     n.checked_mul(multiplier_ms)
+}
+
+/// v7.39 (GUC) — render a millisecond count the way PG's SHOW does:
+/// the largest unit that divides it evenly; zero is unit-less.
+fn render_pg_duration_ms(ms: u64) -> String {
+    use alloc::format;
+    if ms == 0 {
+        return String::from("0");
+    }
+    if ms % 86_400_000 == 0 {
+        format!("{}d", ms / 86_400_000)
+    } else if ms % 3_600_000 == 0 {
+        format!("{}h", ms / 3_600_000)
+    } else if ms % 60_000 == 0 {
+        format!("{}min", ms / 60_000)
+    } else if ms % 1_000 == 0 {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 #[cfg(test)]
