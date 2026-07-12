@@ -7769,7 +7769,7 @@ fn apply_function_dispatch(
             };
             Ok(Value::text(out))
         }
-        "format" => format_string(args),
+        "format" => format_string(args, &ctx.render_style),
         // v7.37.17 (17.6 siblings) — MySQL NAME_CONST(name, value)
         // returns the value; the name only labels the output column
         // in MySQL (mysqlbinlog emits these).
@@ -7807,7 +7807,10 @@ fn apply_function_dispatch(
                 if matches!(v, Value::Null) {
                     continue;
                 }
-                out.push_str(&value_to_format_text(v));
+                out.push_str(&super::strings::value_to_format_text_styled(
+                    v,
+                    &ctx.render_style,
+                ));
             }
             Ok(Value::text(out))
         }
@@ -10219,7 +10222,7 @@ fn apply_function_dispatch(
             // NULL separator poisons the result.
             let sep = match &args[0] {
                 Value::Null => return Ok(Value::Null),
-                v => value_to_format_text(v),
+                v => super::strings::value_to_format_text_styled(v, &ctx.render_style),
             };
             let mut out = String::new();
             let mut first = true;
@@ -10232,7 +10235,10 @@ fn apply_function_dispatch(
                 } else {
                     out.push_str(&sep);
                 }
-                out.push_str(&value_to_format_text(v));
+                out.push_str(&super::strings::value_to_format_text_styled(
+                    v,
+                    &ctx.render_style,
+                ));
             }
             Ok(Value::text(out))
         }

@@ -951,7 +951,11 @@ fn handle_pg_simple_query_one_into_wbuf(
         send_command_complete(wbuf, "")?;
         return Ok(());
     }
-    // SET name=value — same dispatch as the single-stmt path.
+    // SET name=value — same dispatch as the single-stmt path (v7.39
+    // GUC: dual-write the wire cache and ALWAYS fall through to the
+    // engine so session_params stays in sync; the pre-7.39 early
+    // return here made multi-statement scripts' SETs invisible to
+    // the engine while the single-stmt path was already fixed).
     if let Some((name, value)) = parse_set_statement(sql) {
         let name_lc = name.to_ascii_lowercase();
         settings.insert(name_lc.clone(), value.clone());
@@ -960,23 +964,55 @@ fn handle_pg_simple_query_one_into_wbuf(
                 *g = value.clone();
             }
         }
-        let engine_affecting = matches!(
-            name_lc.as_str(),
-            "foreign_key_checks" | "session_replication_role" | "default_text_search_config"
-        );
-        let is_multi = name_lc.contains('@')
-            || value.contains(',')
-            || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
-            || sql.to_ascii_lowercase().contains("foreign_key_checks =")
-            || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
-        if !engine_affecting && !is_multi {
-            send_command_complete(wbuf, "SET")?;
-            return Ok(());
+    }
+    // RESET — keep the wire cache in sync and fall through (engine
+    // ResetParameter clears session_params). Same shape as the
+    // single-stmt path, including the startup application_name
+    // restore.
+    {
+        let t = sql.trim();
+        let b = t.as_bytes();
+        let restore_app_name =
+            |settings: &mut std::collections::HashMap<String, String>| {
+                if !conn_state.startup_app_name.is_empty() {
+                    settings.insert(
+                        "application_name".to_string(),
+                        conn_state.startup_app_name.clone(),
+                    );
+                }
+                if let Ok(mut g) = conn_state.application_name.write() {
+                    g.clone_from(&conn_state.startup_app_name);
+                }
+            };
+        if ci_eq(b, b"reset all") {
+            settings.clear();
+            restore_app_name(settings);
+        } else if ci_starts_with(b, b"reset ") {
+            let name = t[6..].trim().trim_end_matches(';').trim().to_ascii_lowercase();
+            settings.remove(&name);
+            if name == "application_name" {
+                restore_app_name(settings);
+            }
         }
-        // engine-affecting or multi-assignment: fall through.
     }
     if let Some(name) = parse_show_statement(sql) {
-        let resp = render_show(&name, settings);
+        // v7.39 (GUC) — engine store first, same as the single-stmt path.
+        let engine_val: Option<String> = if name != "all" {
+            state
+                .engine
+                .read()
+                .ok()
+                .and_then(|e| e.session_param(&name).map(str::to_string))
+        } else {
+            None
+        };
+        let resp = match engine_val {
+            Some(v) => CannedResponse::Rows {
+                columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
+                rows: vec![Row::new(vec![Value::text(v)])],
+            },
+            None => render_show(&name, settings),
+        };
         send_canned(wbuf, &resp)?;
         return Ok(());
     }
