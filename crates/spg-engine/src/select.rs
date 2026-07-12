@@ -3504,15 +3504,81 @@ impl Engine {
             // Cold-tier rows are frozen (visible) by definition — left
             // ungated, matching the plain-scan path.
             let scan_snapshot = self.current_snapshot();
-            for i in 0..table.row_count() {
-                if !table.is_row_visible(i, &scan_snapshot) {
-                    continue;
+            // v7.39 (parallel-agg P2) — the visibility probe + WHERE
+            // filter dominate the pre-aggregate wall time on big
+            // scans (P1's ground truth: accumulation is only ~17%).
+            // Shard THAT work when the host injected an executor and
+            // the WHERE is compiled (the compiled evaluator is pure
+            // over &row; the tree-walker fallback can hit correlated
+            // subqueries and stays serial). Shards return surviving
+            // ROW INDICES — &Row can't cross the Box<dyn Any>'s
+            // 'static bound — and the main thread only dereferences.
+            let n = table.row_count();
+            let par = self.parallel_runner.0.as_deref().filter(|_| {
+                n >= crate::PARALLEL_MIN_ROWS
+                    && (stmt.where_.is_none() || compiled_where.is_some())
+            });
+            if let Some(r) = par {
+                let n_shards = (n / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
+                let chunk = n.div_ceil(n_shards);
+                type ShardOut = Result<alloc::vec::Vec<usize>, EngineError>;
+                let cw = &compiled_where;
+                let snap_ref = &scan_snapshot;
+                let results = r.run_shards(n_shards, &|s| {
+                    let lo = s * chunk;
+                    let hi = ((s + 1) * chunk).min(n);
+                    let mut keep: alloc::vec::Vec<usize> =
+                        alloc::vec::Vec::with_capacity(hi - lo);
+                    // EvalContext carries Cells (sampler / row counters)
+                    // and is !Sync — each shard builds its own from the
+                    // same Sync inputs. The compiled WHERE is gated to
+                    // the pure-scalar whitelist, which reads none of the
+                    // session state the engine-built ctx would add
+                    // (TABLESAMPLE's __tsm_fract is not whitelisted, so
+                    // sampled scans never take this branch).
+                    let shard_ctx = EvalContext::new(schema_cols, Some(alias));
+                    let mut stack: Vec<Value<'static>> = Vec::new();
+                    let out: ShardOut = (|| {
+                        for i in lo..hi {
+                            if !table.is_row_visible(i, snap_ref) {
+                                continue;
+                            }
+                            let row = &table.rows()[i];
+                            let pass = match cw {
+                                Some(c) => matches!(
+                                    eval::eval_compiled(c, row, &shard_ctx, &mut stack)
+                                        .map_err(EngineError::Eval)?,
+                                    Value::Bool(true)
+                                ),
+                                None => true,
+                            };
+                            if pass {
+                                keep.push(i);
+                            }
+                        }
+                        Ok(keep)
+                    })();
+                    alloc::boxed::Box::new(out)
+                });
+                for boxed in results {
+                    let shard = boxed
+                        .downcast::<ShardOut>()
+                        .expect("runner echoes the closure's box");
+                    for i in (*shard)? {
+                        filtered.push(&table.rows()[i]);
+                    }
                 }
-                let row = &table.rows()[i];
-                if !row_passes_where(row, &mut eval_stack, &mut memo)? {
-                    continue;
+            } else {
+                for i in 0..n {
+                    if !table.is_row_visible(i, &scan_snapshot) {
+                        continue;
+                    }
+                    let row = &table.rows()[i];
+                    if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                        continue;
+                    }
+                    filtered.push(row);
                 }
-                filtered.push(row);
             }
             for row in &cold_rows_storage {
                 if !row_passes_where(row, &mut eval_stack, &mut memo)? {
