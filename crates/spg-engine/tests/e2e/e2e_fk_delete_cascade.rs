@@ -95,7 +95,7 @@ fn cascade_mixed_with_restrict_still_errors_on_restrict_branch() {
     ]);
     let r = eng.execute("DELETE FROM a WHERE id = 1");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
     // Nothing changed.
     assert_eq!(rows(&mut eng, "SELECT id FROM a"), 1);

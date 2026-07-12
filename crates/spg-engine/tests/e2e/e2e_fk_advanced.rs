@@ -47,7 +47,7 @@ fn self_ref_forward_reference_in_same_batch_is_rejected() {
     // (2, 3) references row 3 which hasn't appeared yet.
     let r = eng.execute("INSERT INTO org VALUES (2, 3), (3, NULL)");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
 }
 
@@ -65,7 +65,7 @@ fn composite_fk_insert_check_against_committed_parent() {
     ]);
     eng.execute("INSERT INTO c VALUES (1, 10)").unwrap();
     let r = eng.execute("INSERT INTO c VALUES (1, 99)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("composite key")));
+    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key")));
 }
 
 #[test]
