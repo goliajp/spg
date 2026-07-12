@@ -57,8 +57,15 @@ impl Engine {
                 .collect()
         };
         let mut analysed = 0usize;
+        let now_us = self.clock.map(|f| f());
         for table_name in &names {
             self.analyze_one_table(table_name)?;
+            // v7.39 (pg_stat knife C) — stamp last_analyze.
+            if let Some(us) = now_us
+                && let Some(t) = self.catalog.get_mut(table_name)
+            {
+                t.stamp_analyze(us);
+            }
             analysed += 1;
         }
         // v6.3.1 — plan cache invalidation. Bump stats version so

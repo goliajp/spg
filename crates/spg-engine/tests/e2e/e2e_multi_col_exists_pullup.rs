@@ -3,7 +3,10 @@
 //! IS NULL anti-join. Pin byte-equal result against the legacy
 //! batch-resolver path via the EXISTS_PULLUP_MULTICOL_DISABLE knob.
 
-use spg_engine::{EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE, Engine, QueryResult};
+use spg_engine::{
+    EXISTS_PULLUP_BAIL_MULTICOL_DISABLED, EXISTS_PULLUP_FIRE_COUNT,
+    EXISTS_PULLUP_MULTICOL_DISABLE, Engine, QueryResult,
+};
 use spg_storage::Value;
 use std::sync::atomic::Ordering;
 
@@ -87,14 +90,24 @@ fn multi_col_not_exists_pullup_byte_equal_to_batch_baseline() {
         fired_on >= 1,
         "pullup-on path must trigger ≥1 multi-col EXISTS pullup, got {fired_on}"
     );
+    // v7.39 (flaky repair) — the knob + fire counter are PROCESS
+    // globals; a concurrent e2e can fire a pullup inside the disable
+    // window (twice observed only under the full parallel suite), so
+    // `fired_off == 0` is not assertable. Prove the knob instead with
+    // a lower bound the same way `fired_on >= 1` is safe: the
+    // MULTICOL_DISABLED bail counter must move for OUR query, and the
+    // row-for-row comparison below still proves path equivalence.
+    // (A concurrent test whose multi-col pullup lands in the window
+    // just falls back to the equivalent batch path — no correctness
+    // impact.)
     EXISTS_PULLUP_MULTICOL_DISABLE.store(true, Ordering::Relaxed);
-    let fire_before = EXISTS_PULLUP_FIRE_COUNT.load(Ordering::Relaxed);
+    let bail_before = EXISTS_PULLUP_BAIL_MULTICOL_DISABLED.load(Ordering::Relaxed);
     let off = rows_of(&mut e_off, MAILRS_SQL);
-    let fired_off = EXISTS_PULLUP_FIRE_COUNT.load(Ordering::Relaxed) - fire_before;
+    let bailed = EXISTS_PULLUP_BAIL_MULTICOL_DISABLED.load(Ordering::Relaxed) - bail_before;
     EXISTS_PULLUP_MULTICOL_DISABLE.store(false, Ordering::Relaxed);
-    assert_eq!(
-        fired_off, 0,
-        "pullup-off knob must reject multi-col pullup, got {fired_off}"
+    assert!(
+        bailed >= 1,
+        "pullup-off knob must reject the multi-col pullup at least once, got {bailed}"
     );
     assert_eq!(
         on.len(),

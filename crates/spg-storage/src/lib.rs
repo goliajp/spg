@@ -3167,6 +3167,12 @@ pub struct Table {
     /// (`seq_scan/seq_tup_read/idx_scan/idx_tup_fetch`). Atomics: the
     /// read paths that bump them hold only `&Table`.
     scan_stats: ScanStats,
+    /// v7.39 (pg_stat knife C) — wall-clock stamps (unix µs, from the
+    /// host ClockFn) for pg_stat_user_tables' last_autovacuum /
+    /// last_analyze. Volatile, like PG's cumulative stats. SPG has no
+    /// manual-VACUUM statement semantics, so last_vacuum stays NULL.
+    last_autovacuum_us: Option<i64>,
+    last_analyze_us: Option<i64>,
     indices: Vec<Index>,
     hot_bytes: u64,
     /// v6.7.0 — cached count of rows currently materialised in the

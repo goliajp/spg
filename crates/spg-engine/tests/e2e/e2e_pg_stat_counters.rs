@@ -107,3 +107,37 @@ fn stat_user_tables_reports_scan_counters() {
     assert!(big(&r[2]) >= 1, "idx_scan: {:?}", r[2]);
     assert!(big(&r[3]) >= 1, "idx_tup_fetch: {:?}", r[3]);
 }
+
+#[test]
+fn stat_user_tables_reports_analyze_stamp_and_db_tup_counters() {
+    // The host clock drives the stamps; embedded tests inject a fixed one.
+    let mut e = Engine::new().with_clock(|| 1_700_000_000_000_000);
+    e.execute("CREATE TABLE mst(id INT PRIMARY KEY)").unwrap();
+    e.execute("INSERT INTO mst SELECT g FROM generate_series(1,50) g")
+        .unwrap();
+    // Before ANALYZE: all four maintenance stamps are NULL.
+    let r = one_row(
+        &mut e,
+        "SELECT last_vacuum IS NULL, last_autovacuum IS NULL, \
+                last_analyze IS NULL, last_autoanalyze IS NULL \
+         FROM pg_stat_user_tables WHERE relname = 'mst'",
+    );
+    for (i, v) in r.iter().enumerate() {
+        assert_eq!(*v, spg_storage::Value::Bool(true), "col {i}: {v:?}");
+    }
+    e.execute("ANALYZE mst").unwrap();
+    let r = one_row(
+        &mut e,
+        "SELECT last_analyze IS NOT NULL, last_vacuum IS NULL \
+         FROM pg_stat_user_tables WHERE relname = 'mst'",
+    );
+    assert_eq!(r[0], spg_storage::Value::Bool(true), "analyze stamped");
+    assert_eq!(r[1], spg_storage::Value::Bool(true), "manual vacuum stays NULL");
+    // tup_returned aggregates scan reads; a full scan of 50 rows moves it.
+    e.execute("SELECT count(*) FROM mst").unwrap();
+    let r = one_row(
+        &mut e,
+        "SELECT tup_returned >= 50 FROM pg_stat_database",
+    );
+    assert_eq!(r[0], spg_storage::Value::Bool(true), "tup_returned moved");
+}
