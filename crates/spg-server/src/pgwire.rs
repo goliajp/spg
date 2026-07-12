@@ -3335,6 +3335,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("invalid input syntax for type timestamp")
         {
             "22007"
+        // v7.39 (read01 utils/adt) — the generic bad-literal class
+        // (boolean, money, …) is 22P02 INVALID_TEXT_REPRESENTATION.
+        } else if msg.contains("invalid input syntax for type") {
+            "22P02"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.

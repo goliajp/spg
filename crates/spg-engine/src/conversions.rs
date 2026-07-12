@@ -1678,19 +1678,38 @@ pub(crate) fn format_range_element(v: &Value) -> alloc::string::String {
 /// Returns None on any parse failure — caller surfaces as hard
 /// SQL error.
 pub(crate) fn parse_money_str(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (neg, rest) = match s.strip_prefix('-') {
-        Some(r) => (true, r.trim_start()),
-        None => (false, s),
-    };
-    let rest = rest.strip_prefix('$').unwrap_or(rest).trim_start();
-    let (int_part, frac_part) = match rest.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (rest, None),
-    };
-    if int_part.is_empty() {
-        return None;
+    // v7.39 (read01 utils/adt, cash.c) — PG's cash_in accepts the sign
+    // and currency symbol before OR after the digits, accounting
+    // parentheses for negative, and rounds the first digit past the
+    // cent (C-locale: fpoint 2, '$', ',').
+    let mut rest = s.trim();
+    let mut neg = false;
+    // Leading currency symbol / sign / accounting paren, in any order
+    // with whitespace.
+    loop {
+        let before = rest;
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix('$') {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('-') {
+            neg = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('(') {
+            neg = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('+') {
+            rest = r;
+        }
+        if rest == before {
+            break;
+        }
     }
+    let (int_part, tail) = {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == ','))
+            .unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
     // Validate + strip commas from the integer portion.
     let mut int_digits = alloc::string::String::with_capacity(int_part.len());
     for b in int_part.bytes() {
@@ -1704,21 +1723,54 @@ pub(crate) fn parse_money_str(s: &str) -> Option<i64> {
         return None;
     }
     let dollars: i64 = int_digits.parse().ok()?;
-    let cents: i64 = match frac_part {
-        None => 0,
+    // Fractional part: first two digits are cents, the third rounds.
+    let (mut cents, tail) = match tail.strip_prefix('.') {
+        None => (0i64, tail),
         Some(f) => {
-            if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+            let end = f
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(f.len());
+            let (digits, rest_tail) = (&f[..end], &f[end..]);
+            if digits.is_empty() {
                 return None;
             }
-            let padded = if f.len() == 1 {
-                alloc::format!("{f}0")
-            } else {
-                f.to_string()
-            };
-            padded.parse().ok()?
+            let b = digits.as_bytes();
+            let mut c = i64::from(b[0] - b'0') * 10;
+            if b.len() >= 2 {
+                c += i64::from(b[1] - b'0');
+            }
+            if b.len() >= 3 && b[2] >= b'5' {
+                c += 1;
+            }
+            (c, rest_tail)
         }
     };
-    let total = dollars.checked_mul(100)?.checked_add(cents)?;
+    // Trailing whitespace / closing paren / sign / currency symbol.
+    let mut tail = tail;
+    while !tail.is_empty() {
+        let t = tail.trim_start();
+        if let Some(r) = t.strip_prefix(')') {
+            tail = r;
+        } else if let Some(r) = t.strip_prefix('-') {
+            neg = true;
+            tail = r;
+        } else if let Some(r) = t.strip_prefix('+') {
+            tail = r;
+        } else if let Some(r) = t.strip_prefix('$') {
+            tail = r;
+        } else if t.is_empty() {
+            break;
+        } else {
+            return None;
+        }
+    }
+    // cents rounding can carry into the dollar (0.995 -> 1.00).
+    let carry = cents / 100;
+    cents %= 100;
+    let total = dollars
+        .checked_add(carry)?
+        .checked_mul(100)?
+        .checked_add(cents)?;
     Some(if neg { -total } else { total })
 }
 
@@ -3060,8 +3112,22 @@ pub(crate) fn coerce_value(
             Some(Value::xml(s))
         }
         (Value::Text(s), DataType::Char1) => {
-            let b = s.bytes().next().unwrap_or(0);
-            Some(Value::Char1(b))
+            // v7.39 (read01 utils/adt, char.c) — charin accepts the
+            // `\ooo` octal form charout produces for high bytes
+            // ('\101'::"char" = 'A'); otherwise the FIRST byte, with
+            // any remainder silently discarded (PG's compatibility
+            // provision); empty = 0x00.
+            let bytes = s.as_bytes();
+            if bytes.len() == 4
+                && bytes[0] == b'\\'
+                && bytes[1..].iter().all(|b| (b'0'..=b'7').contains(b))
+            {
+                let v = ((bytes[1] - b'0') << 6) | ((bytes[2] - b'0') << 3) | (bytes[3] - b'0');
+                Some(Value::Char1(v))
+            } else {
+                let b = s.bytes().next().unwrap_or(0);
+                Some(Value::Char1(b))
+            }
         }
         // v7.37.5 ζ-A — inverse coerces.
         (Value::Inet { family, bits, addr }, DataType::Text) => {

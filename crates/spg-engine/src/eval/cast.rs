@@ -890,7 +890,7 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
                     Ok(Value::Bool(false))
                 }
                 _ => Err(EvalError::TypeMismatch {
-                    detail: format!("cannot parse {s:?} as bool"),
+                    detail: format!("invalid input syntax for type boolean: {:?}", s.trim()),
                 }),
             }
         }
