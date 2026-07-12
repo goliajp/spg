@@ -726,6 +726,48 @@ fn fk_violation_message(
     )
 }
 
+/// v7.39 (SQLSTATE fidelity) — PG's parent-side 23503 phrasing:
+/// `update or delete on table "p" violates foreign key constraint
+/// "c_col_fkey" on table "c"` with the still-referenced key DETAIL.
+fn fk_restrict_message(
+    catalog: &Catalog,
+    parent_name: &str,
+    child: &spg_storage::Table,
+    child_name: &str,
+    fk: &spg_storage::ForeignKeyConstraint,
+    parent_key: &[&Value<'_>],
+) -> String {
+    let conname = crate::system_catalog::pg_fk_conname(child, fk, child_name);
+    let pcols = match catalog.get(parent_name) {
+        Some(parent) => fk
+            .parent_columns
+            .iter()
+            .map(|&p| {
+                parent
+                    .schema()
+                    .columns
+                    .get(p)
+                    .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "?".into(),
+    };
+    let vals = parent_key
+        .iter()
+        .map(|v| match v {
+            Value::Text(s) => s.to_string(),
+            other => crate::eval::value_to_text(other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    alloc::format!(
+        "update or delete on table \"{parent_name}\" violates foreign key \
+         constraint \"{conname}\" on table \"{child_name}\" \
+         DETAIL: Key ({pcols})=({vals}) is still referenced from table \"{child_name}\"."
+    )
+}
+
 /// v7.17.0 Phase 3.P0-45 — return a key cell folded by its column's
 /// declared `Collation`. For `CaseInsensitive`, fold Text payloads to
 /// ASCII lowercase (matches Phase 2.5's `*_ci` semantics: ASCII case-
@@ -1777,10 +1819,14 @@ pub(crate) fn plan_fk_parent_deletions(
                     }
                     match fk.on_delete {
                         spg_storage::FkAction::Restrict | spg_storage::FkAction::NoAction => {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "FOREIGN KEY violation: DELETE on {cur_parent:?} is \
-                                 restricted by FK from {child_name:?}.{:?}",
-                                fk.local_columns,
+                            // v7.39 (SQLSTATE fidelity) — PG's exact phrasing.
+                            return Err(EngineError::Unsupported(fk_restrict_message(
+                                catalog,
+                                &cur_parent,
+                                child,
+                                &child_name,
+                                fk,
+                                &parent_key,
                             )));
                         }
                         spg_storage::FkAction::Cascade => {
@@ -1979,10 +2025,13 @@ pub(crate) fn plan_fk_parent_updates(
                     }
                     match fk.on_update {
                         spg_storage::FkAction::Restrict | spg_storage::FkAction::NoAction => {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "FOREIGN KEY violation: UPDATE on {parent_table_name:?} PK is \
-                                 restricted by FK from {child_name:?}.{:?}",
-                                fk.local_columns,
+                            return Err(EngineError::Unsupported(fk_restrict_message(
+                                catalog,
+                                parent_table_name,
+                                child,
+                                &child_name,
+                                fk,
+                                &old_key,
                             )));
                         }
                         spg_storage::FkAction::Cascade => {
