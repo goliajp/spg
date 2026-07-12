@@ -4761,6 +4761,29 @@ fn encode_binary_cell(
                 .ok_or("binary numeric: value out of range")?;
             put(&numeric_binary(scaled, scale));
         }
+        // v7.39 — 1-D array binary format: ndim, hasnull, element
+        // OID, (len, lower-bound=1), then per-element [len][payload].
+        Value::IntArray(items) => put(&binary_array(items, 23, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
+        Value::BigIntArray(items) => put(&binary_array(items, 20, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
+        Value::SmallIntArray(items) => put(&binary_array(items, 21, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
+        Value::FloatArray(items) => put(&binary_array(items, 701, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
+        Value::BoolArray(items) => put(&binary_array(items, 16, |v, b| {
+            b.push(u8::from(*v));
+        })),
+        Value::TextArray(items) => put(&binary_array(items, 25, |v, b| {
+            b.extend_from_slice(v.as_bytes());
+        })),
+        Value::UuidArray(items) => put(&binary_array(items, 2950, |v, b| {
+            b.extend_from_slice(&v[..]);
+        })),
         other => {
             return Err(format!(
                 "binary result format not implemented for {:?}",
@@ -4769,6 +4792,34 @@ fn encode_binary_cell(
         }
     }
     Ok(())
+}
+
+/// v7.39 — encode a 1-D array in PG's binary array format. `enc`
+/// writes one element's payload; NULL elements get len -1.
+fn binary_array<T>(
+    items: &[Option<T>],
+    elem_oid: u32,
+    enc: impl Fn(&T, &mut Vec<u8>),
+) -> Vec<u8> {
+    let has_null = items.iter().any(Option::is_none);
+    let mut buf = Vec::with_capacity(20 + items.len() * 8);
+    buf.extend_from_slice(&1i32.to_be_bytes()); // ndim
+    buf.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    buf.extend_from_slice(&elem_oid.to_be_bytes());
+    buf.extend_from_slice(&(items.len() as i32).to_be_bytes());
+    buf.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+    for it in items {
+        match it {
+            None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(v) => {
+                let mut payload = Vec::new();
+                enc(v, &mut payload);
+                buf.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+                buf.extend_from_slice(&payload);
+            }
+        }
+    }
+    buf
 }
 
 /// Parse a plain decimal string into (scaled i128, scale) — the big
