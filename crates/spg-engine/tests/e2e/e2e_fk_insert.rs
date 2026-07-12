@@ -43,7 +43,7 @@ fn insert_missing_parent_is_rejected() {
     ]);
     let r = eng.execute("INSERT INTO o VALUES (10, 99)");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
     // No row persisted.
     assert_eq!(count(&mut eng, "SELECT id FROM o"), 0);

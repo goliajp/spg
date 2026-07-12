@@ -5800,7 +5800,10 @@ impl fmt::Display for StorageError {
                 "type mismatch in column {column:?} (position {position}): expected {expected}, got {actual}"
             ),
             Self::NullInNotNull { column } => {
-                write!(f, "NULL value in NOT NULL column {column:?}")
+                // v7.39 (SQLSTATE fidelity) — PG's 23502 phrasing (the
+                // relation-qualified long form is added by engine call
+                // sites that know the table name).
+                write!(f, "null value in column \"{column}\" violates not-null constraint")
             }
             Self::DuplicateIndex { name } => write!(f, "index already exists: {name}"),
             Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),

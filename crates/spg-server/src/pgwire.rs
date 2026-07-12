@@ -2992,11 +2992,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
         {
             "23505"
-        } else if msg.contains("FOREIGN KEY violation") {
+        } else if msg.contains("violates foreign key constraint")
+            || msg.contains("FOREIGN KEY violation")
+        {
             "23503"
-        } else if msg.contains("CHECK constraint violation") {
+        } else if msg.contains("violates check constraint")
+            || msg.contains("CHECK constraint violation")
+        {
             "23514"
-        } else if msg.contains("NOT NULL column") {
+        } else if msg.contains("violates not-null constraint") || msg.contains("NOT NULL column") {
             "23502"
         } else {
             "42000"
@@ -4361,7 +4365,9 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     // understood the error precisely, so strip it from the client
     // message (PG has no such prefix).
     let main_msg: &str = if sqlstate != "42000" {
-        main.strip_prefix("unsupported: ").unwrap_or(main)
+        main.strip_prefix("unsupported: ")
+            .or_else(|| main.strip_prefix("storage: "))
+            .unwrap_or(main)
     } else {
         main
     };

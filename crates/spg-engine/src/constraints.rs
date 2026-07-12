@@ -689,6 +689,43 @@ fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
     alloc::format!(" DETAIL: Key ({})=({vals}) already exists.", cols.join(", "))
 }
 
+/// v7.39 (SQLSTATE fidelity) — PG's 23503 phrasing helper: the FK
+/// constraint name by PG convention plus the local-column key DETAIL.
+fn fk_violation_message(
+    child: &spg_storage::Table,
+    child_table: &str,
+    fk: &spg_storage::ForeignKeyConstraint,
+    key_vals: &[&Value<'_>],
+) -> String {
+    let conname = crate::system_catalog::pg_fk_conname(child, fk, child_table);
+    let cols = fk
+        .local_columns
+        .iter()
+        .map(|&p| {
+            child
+                .schema()
+                .columns
+                .get(p)
+                .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let vals = key_vals
+        .iter()
+        .map(|v| match v {
+            Value::Text(s) => s.to_string(),
+            other => crate::eval::value_to_text(other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    alloc::format!(
+        "insert or update on table \"{child_table}\" violates foreign key \
+         constraint \"{conname}\" DETAIL: Key ({cols})=({vals}) is not present \
+         in table \"{}\".",
+        fk.parent_table
+    )
+}
+
 /// v7.17.0 Phase 3.P0-45 — return a key cell folded by its column's
 /// declared `Collation`. For `CaseInsensitive`, fold Text payloads to
 /// ASCII lowercase (matches Phase 2.5's `*_ci` semantics: ASCII case-
@@ -1229,9 +1266,28 @@ pub(crate) fn enforce_check_constraints(
             })?;
             // PG: NULL passes (CHECK rejects on definite-false only).
             if matches!(v, spg_storage::Value::Bool(false)) {
+                // v7.39 (SQLSTATE fidelity) — PG's exact 23514 phrasing.
+                let names = crate::system_catalog::pg_check_connames(
+                    table,
+                    table_name,
+                    &schema.checks,
+                );
+                let conname = names
+                    .get(*i)
+                    .cloned()
+                    .unwrap_or_else(|| alloc::format!("{table_name}_check"));
+                let failing = row_values
+                    .iter()
+                    .map(|v| match v {
+                        spg_storage::Value::Null => "null".to_string(),
+                        spg_storage::Value::Text(s) => s.to_string(),
+                        other => crate::eval::value_to_text(other),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "CHECK constraint violation on {table_name:?} (row #{batch_idx}): {:?}",
-                    schema.checks[*i]
+                    "new row for relation \"{table_name}\" violates check constraint \
+                     \"{conname}\" DETAIL: Failing row contains ({failing})."
                 )));
             }
         }
@@ -1495,15 +1551,17 @@ pub(crate) fn enforce_fk_inserts(
                         .iter()
                         .any(|earlier| earlier.get(parent_col) == Some(v));
                 if !(present_committed || present_in_batch) {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "FOREIGN KEY violation: no parent row in {:?} where {} = {:?}",
-                        fk.parent_table,
-                        parent
-                            .schema()
-                            .columns
-                            .get(parent_col)
-                            .map_or("?", |c| c.name.as_str()),
-                        v,
+                    // v7.39 (SQLSTATE fidelity) — PG's exact 23503 phrasing.
+                    let child = catalog.get(child_table).ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: child_table.into(),
+                        })
+                    })?;
+                    return Err(EngineError::Unsupported(fk_violation_message(
+                        child,
+                        child_table,
+                        fk,
+                        &[v],
                     )));
                 }
             } else {
@@ -1566,9 +1624,16 @@ pub(crate) fn enforce_fk_inserts(
                             .all(|(i, &pi)| earlier.get(pi) == Some(local[i]))
                     });
                 if !(parent_match_committed || parent_match_in_batch) {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "FOREIGN KEY violation: no parent row in {:?} matching composite key",
-                        fk.parent_table,
+                    let child = catalog.get(child_table).ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: child_table.into(),
+                        })
+                    })?;
+                    return Err(EngineError::Unsupported(fk_violation_message(
+                        child,
+                        child_table,
+                        fk,
+                        &local,
                     )));
                 }
             }

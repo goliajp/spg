@@ -78,7 +78,7 @@ fn restored_engine_enforces_fk_identically() {
     // Restored engine: missing-parent INSERT must reject.
     let r = b.execute("INSERT INTO o VALUES (11, 99)");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
     // Existing-parent INSERT must accept.
     b.execute("INSERT INTO o VALUES (12, 2)").unwrap();

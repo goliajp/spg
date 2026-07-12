@@ -46,7 +46,7 @@ fn updating_child_fk_to_missing_parent_is_rejected() {
     ]);
     let r = eng.execute("UPDATE o SET uid = 99 WHERE id = 10");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
     // No change committed.
     assert_eq!(
@@ -66,7 +66,7 @@ fn updating_parent_pk_with_default_restrict_is_rejected_when_child_references() 
     ]);
     let r = eng.execute("UPDATE u SET id = 2 WHERE id = 1");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
 }
 

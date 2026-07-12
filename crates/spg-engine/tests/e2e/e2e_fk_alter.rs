@@ -27,7 +27,7 @@ fn add_constraint_on_compatible_existing_data_succeeds() {
     // Subsequent insert violating the new FK is rejected.
     let r = eng.execute("INSERT INTO o VALUES (12, 99)");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
 }
 
@@ -43,7 +43,7 @@ fn add_constraint_against_violating_existing_data_is_rejected() {
     ]);
     let r = eng.execute("ALTER TABLE o ADD CONSTRAINT fk_user FOREIGN KEY (uid) REFERENCES u(id)");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
 }
 

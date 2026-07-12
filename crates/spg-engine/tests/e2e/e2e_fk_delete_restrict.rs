@@ -32,7 +32,7 @@ fn delete_parent_with_child_reference_is_restricted() {
     ]);
     let r = eng.execute("DELETE FROM u WHERE id = 1");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")),
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key")),
         "got {r:?}"
     );
     // Parent unchanged.
@@ -109,7 +109,7 @@ fn self_referencing_delete_root_with_child_is_restricted() {
     ]);
     let r = eng.execute("DELETE FROM org WHERE id = 1");
     assert!(
-        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
     );
 }
 
