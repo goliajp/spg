@@ -1501,14 +1501,24 @@ pub(crate) fn synth_pg_stat_database(
             }
         }
     }
+    // v7.39 (pg_stat blks knife) — row-granular block statistics:
+    // blks_read = cold-segment row resolutions, blks_hit = hot row
+    // accesses (scan reads + index fetches minus the cold ones). The
+    // RATIO is what dashboards consume; SPG has no 8 KB page unit.
+    let blks_read = eng
+        .active_catalog()
+        .cold_read_stats
+        .cold_reads
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let blks_hit = tup_returned.saturating_sub(blks_read);
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
         Value::text("spg"),
         Value::Int(i32::try_from(backends).unwrap_or(i32::MAX)),
         Value::BigInt(i64::try_from(commits).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(rollbacks).unwrap_or(i64::MAX)),
-        Value::BigInt(0), // blks_read
-        Value::BigInt(0), // blks_hit
+        Value::BigInt(i64::try_from(blks_read).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(blks_hit).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_returned).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_fetched).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_inserted).unwrap_or(i64::MAX)),

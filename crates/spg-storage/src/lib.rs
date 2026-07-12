@@ -3224,8 +3224,30 @@ pub struct Table {
 /// when n is small). The sidecar shape preserves the insertion-order
 /// iteration the on-disk encoding relies on and keeps `last_mut`
 /// (used by the deserialize hot path) cheap.
+/// v7.39 (pg_stat blks knife) — catalog-wide cold-tier read counter
+/// backing pg_stat_database.blks_read. Row-granular (SPG has no 8 KB
+/// page notion): one cold-segment row resolution = one "block read",
+/// one hot row access = one "block hit" — the hit RATIO monitoring
+/// dashboards compute keeps its meaning. Volatile like PG's stats.
+#[derive(Debug, Default)]
+pub struct ColdReadStats {
+    pub cold_reads: core::sync::atomic::AtomicU64,
+}
+
+impl Clone for ColdReadStats {
+    fn clone(&self) -> Self {
+        Self {
+            cold_reads: core::sync::atomic::AtomicU64::new(
+                self.cold_reads.load(core::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
+    /// v7.39 (pg_stat blks knife) — see [`ColdReadStats`].
+    pub cold_read_stats: ColdReadStats,
     tables: Vec<Table>,
     /// `name → tables[index]`. Kept in lock-step with `tables`.
     /// `create_table` is the only write path.
@@ -3663,6 +3685,9 @@ impl Catalog {
 
     pub const fn new() -> Self {
         Self {
+            cold_read_stats: ColdReadStats {
+                cold_reads: core::sync::atomic::AtomicU64::new(0),
+            },
             tables: Vec::new(),
             by_name: BTreeMap::new(),
             next_rel_id: 0,
@@ -5090,6 +5115,10 @@ impl Catalog {
         let seg = self.cold_segments.get(segment_id as usize)?.as_ref()?;
         let payload = seg.lookup(u64_key)?;
         let (row, _) = decode_row_body_dense(&payload, &t.schema, seg.codec_version()).ok()?;
+        // v7.39 (pg_stat blks knife) — one cold-tier "block read".
+        self.cold_read_stats
+            .cold_reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some(row)
     }
 
