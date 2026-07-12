@@ -3745,9 +3745,15 @@ fn encode_copy_cell(v: &spg_storage::Value, ty: Option<spg_storage::DataType>) -
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
+        Value::Real(x) => spg_engine::eval::format_real(*x),
         Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
         // v7.39 (bpchar epic) — COPY emits the padded stored form.
         Value::BpChar(s) => escape_copy_cell(s),
+        // v7.39 (FTS) — canonical text forms for COPY too.
+        Value::TsVector(lexs) => {
+            escape_copy_cell(&spg_engine::eval::format_tsvector(lexs))
+        }
+        Value::TsQuery(ast) => escape_copy_cell(&spg_engine::eval::format_tsquery(ast)),
         Value::Numeric {
             scaled,
             scale,
@@ -4872,10 +4878,19 @@ fn value_to_pg_text<'a>(
         Value::Int(n) => display_into_arena(n),
         Value::BigInt(n) => display_into_arena(n),
         Value::Float(f) => display_into_arena(f),
+        // v7.39 — REAL renders PG float4out shortest-round-trip (it
+        // previously fell through to the Debug placeholder).
+        Value::Real(x) => into_arena(&spg_engine::eval::format_real(*x)),
         Value::Text(s) | Value::Json(s) => into_arena(s.as_ref()),
         // v7.39 (bpchar epic) — bpchar's wire display is the PADDED
         // stored form (PG bpcharout).
         Value::BpChar(s) => into_arena(s.as_ref()),
+        // v7.39 (FTS) — canonical tsvector/tsquery text (they fell
+        // through to the Debug placeholder).
+        Value::TsVector(lexs) => {
+            into_arena(&spg_engine::eval::format_tsvector(lexs))
+        }
+        Value::TsQuery(ast) => into_arena(&spg_engine::eval::format_tsquery(ast)),
         // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
         // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
         // must round-trip to a literal pg_dump would emit (i.e.

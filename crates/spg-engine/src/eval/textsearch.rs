@@ -26,7 +26,9 @@ pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
             // Flag 4 (cover-extent distance) is cover-density only — a no-op for
             // ts_rank, matching PG.
             let r = crate::fts::apply_rank_norm(crate::fts::ts_rank(&weights, &v, &q), norm, &v);
-            Ok(Value::Float(f64::from(r)))
+            // PG ts_rank returns float4 — keep f32 so the wire text is
+            // the shortest-round-trip real form ("0.09148999").
+            Ok(Value::Real(r))
         }
     }
 }
@@ -44,7 +46,7 @@ pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
         (None, _) | (_, None) => Ok(Value::Null),
         (Some(v), Some(q)) => {
             let r = crate::fts::apply_rank_norm(crate::fts::ts_rank_cd(&weights, &v, &q), norm, &v);
-            Ok(Value::Float(f64::from(r)))
+            Ok(Value::Real(r))
         }
     }
 }
@@ -76,6 +78,20 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
         )
     ) {
         weights = parse_weight_array(name, &rest[0])?;
+        rest = &rest[1..];
+    } else if args.len() >= 3
+        && let Some(Value::Text(s)) = rest.first()
+        && s.trim_start().starts_with('{')
+    {
+        // v7.39 — an untyped '{0.1, 0.2, 0.4, 1.0}' literal is PG's
+        // float4[] weight array via the unknown-literal cast.
+        let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+        let parsed: Result<Vec<f64>, _> =
+            inner.split(',').map(|x| x.trim().parse::<f64>()).collect();
+        let vals = parsed.map_err(|_| EvalError::TypeMismatch {
+            detail: format!("{name}(): invalid weight array literal {s:?}"),
+        })?;
+        weights = parse_weight_array(name, &Value::FloatArray(vals.into_iter().map(Some).collect()))?;
         rest = &rest[1..];
     }
     // A trailing integer is the normalization flag.
@@ -908,12 +924,16 @@ pub(super) fn fts_ts_headline(
             });
         }
     };
-    // StartSel / StopSel from the options string; other options
-    // (MaxWords, MinWords, ShortWord, HighlightAll, MaxFragments,
-    // FragmentDelimiter) are accepted and ignored — whole-document
-    // highlighting.
+    // v7.39 (FTS depth) — full option set: StartSel / StopSel /
+    // MaxWords / MinWords / MaxFragments / FragmentDelimiter /
+    // HighlightAll. PG defaults per textsearch docs.
     let mut start_sel = String::from("<b>");
     let mut stop_sel = String::from("</b>");
+    let mut max_words: usize = 35;
+    let mut min_words: usize = 15;
+    let mut max_fragments: usize = 0;
+    let mut frag_delim = String::from(" ... ");
+    let mut highlight_all = false;
     if let Some(opts_v) = opts_arg {
         let opts = match opts_v {
             Value::Null => "",
@@ -935,6 +955,11 @@ pub(super) fn fts_ts_headline(
             match k.trim().to_ascii_lowercase().as_str() {
                 "startsel" => start_sel = v.to_string(),
                 "stopsel" => stop_sel = v.to_string(),
+                "maxwords" => max_words = v.parse().unwrap_or(35),
+                "minwords" => min_words = v.parse().unwrap_or(15),
+                "maxfragments" => max_fragments = v.parse().unwrap_or(0),
+                "fragmentdelimiter" => frag_delim = v.to_string(),
+                "highlightall" => highlight_all = v.eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
@@ -960,12 +985,19 @@ pub(super) fn fts_ts_headline(
     }
     let mut terms: Vec<String> = Vec::new();
     collect_positive(&query, &mut terms);
-    // Scan the document, preserving the original text. Word runs
-    // follow the same alphanumeric-or-underscore rule as
-    // crate::fts::tokenize so headline matches agree with @@.
-    let mut out = String::with_capacity(doc.len() + 16);
+    // Tokenise the document into (word, trailing-separator) pairs,
+    // marking query matches. Word runs follow the same
+    // alphanumeric-or-underscore rule as crate::fts::tokenize so
+    // headline matches agree with @@.
+    struct HlToken {
+        word: String,
+        sep_after: String,
+        is_match: bool,
+    }
+    let mut tokens: Vec<HlToken> = Vec::new();
+    let mut leading_sep = String::new();
     let mut word = String::new();
-    let flush = |word: &mut String, out: &mut String| {
+    let mut push_word = |word: &mut String, tokens: &mut Vec<HlToken>| {
         if word.is_empty() {
             return;
         }
@@ -974,25 +1006,93 @@ pub(super) fn fts_ts_headline(
             crate::fts::TsConfig::Simple => lowered,
             crate::fts::TsConfig::English => crate::fts::porter_stem(&lowered),
         };
-        if terms.iter().any(|t| *t == lex) {
-            out.push_str(&start_sel);
-            out.push_str(word);
-            out.push_str(&stop_sel);
-        } else {
-            out.push_str(word);
-        }
-        word.clear();
+        tokens.push(HlToken {
+            word: core::mem::take(word),
+            sep_after: String::new(),
+            is_match: terms.iter().any(|t| *t == lex),
+        });
     };
     for c in doc.chars() {
         if c.is_alphanumeric() || c == '_' {
             word.push(c);
         } else {
-            flush(&mut word, &mut out);
-            out.push(c);
+            push_word(&mut word, &mut tokens);
+            match tokens.last_mut() {
+                Some(t) => t.sep_after.push(c),
+                None => leading_sep.push(c),
+            }
         }
     }
-    flush(&mut word, &mut out);
-    Ok(Value::text(out))
+    push_word(&mut word, &mut tokens);
+    // Render a [lo, hi) token window with highlighting; the final
+    // token's separator is dropped (window edges never carry
+    // trailing punctuation/whitespace).
+    let render = |lo: usize, hi: usize| -> String {
+        let mut out = String::new();
+        for (i, t) in tokens[lo..hi].iter().enumerate() {
+            if t.is_match {
+                out.push_str(&start_sel);
+                out.push_str(&t.word);
+                out.push_str(&stop_sel);
+            } else {
+                out.push_str(&t.word);
+            }
+            if lo + i + 1 < hi {
+                out.push_str(&t.sep_after);
+            }
+        }
+        out
+    };
+    let n = tokens.len();
+    let match_pos: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.is_match.then_some(i))
+        .collect();
+    // HighlightAll / short or unmatched documents: whole text with
+    // its original separators (including the edges).
+    if highlight_all || match_pos.is_empty() || n <= min_words.max(1) {
+        let mut out = leading_sep;
+        out.push_str(&render(0, n));
+        if let Some(t) = tokens.last() {
+            out.push_str(&t.sep_after);
+        }
+        return Ok(Value::text(out));
+    }
+    if max_fragments > 0 {
+        // Fragment mode: one fragment per match, MaxWords wide with
+        // the match centred; overlapping fragments merge; first
+        // MaxFragments survive, joined by FragmentDelimiter.
+        let w = max_words.max(1);
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for &p in &match_pos {
+            let before = (w - 1) / 2;
+            let lo = p.saturating_sub(before);
+            let hi = (lo + w).min(n);
+            match spans.last_mut() {
+                Some((_, prev_hi)) if lo <= *prev_hi => *prev_hi = hi,
+                _ => spans.push((lo, hi)),
+            }
+        }
+        spans.truncate(max_fragments);
+        let parts: Vec<String> = spans.iter().map(|&(lo, hi)| render(lo, hi)).collect();
+        return Ok(Value::text(parts.join(&frag_delim)));
+    }
+    // Window mode: the cover is the smallest span holding every
+    // matched position (capped at MaxWords from its start), then
+    // extended to MinWords — rightward first, leftward for the
+    // remainder (differential-locked against PG18).
+    let first = match_pos[0];
+    let last = *match_pos.last().expect("non-empty");
+    let mut lo = first;
+    let mut hi = (last + 1).min(lo + max_words.max(1)).min(n);
+    while hi - lo < min_words.max(1) && hi < n {
+        hi += 1;
+    }
+    while hi - lo < min_words.max(1) && lo > 0 {
+        lo -= 1;
+    }
+    Ok(Value::text(render(lo, hi)))
 }
 
 /// v7.37.17 (17.6 siblings) — `ts_rewrite(query, target,
