@@ -1721,9 +1721,10 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
             });
         }
     }
-    if ci_starts_with(b, b"select version()") || ci_eq(b, b"select version()") {
-        return Some(CannedResponse::single_text("version", "spg 4.6"));
-    }
+    // v7.39 — the version() canned response ("spg 4.6") is gone: it
+    // predated the engine's PG-compatible version() ("PostgreSQL 18.4
+    // (SPG-compat)"), and its starts_with match hijacked compound
+    // selects like `SELECT version(), now()`.
     if ci_starts_with(b, b"show transaction_isolation")
         || ci_starts_with(b, b"show transaction isolation level")
     {

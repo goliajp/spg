@@ -104,7 +104,7 @@ fn read_until_ready(s: &mut TcpStream) {
 // rejection) and tests/e2e_pg_catalog.rs (open mode no-auth).
 
 #[test]
-fn select_version_canned_response_works() {
+fn select_version_reports_pg_compatible_string() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
 
@@ -131,7 +131,12 @@ fn select_version_canned_response_works() {
     let len = i32::from_be_bytes([dr.body[2], dr.body[3], dr.body[4], dr.body[5]]);
     assert!(len > 0);
     let value = std::str::from_utf8(&dr.body[6..6 + len as usize]).unwrap();
-    assert!(value.contains("spg"), "got {value:?}");
+    // v7.39 — served by the engine's version() (the canned "spg 4.6"
+    // response is gone); drop-in clients sniff the PostgreSQL prefix.
+    assert!(
+        value.starts_with("PostgreSQL") && value.contains("SPG"),
+        "got {value:?}"
+    );
     let _ = read_message(&mut s); // C
     read_until_ready(&mut s);
 }
