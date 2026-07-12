@@ -324,6 +324,7 @@ mod e2e_session_probes;
 mod e2e_session_state_pg_dump_compat;
 mod e2e_array_pg17_funcs;
 mod e2e_bc_dates;
+mod e2e_make_date_bc;
 mod e2e_named_timezones;
 mod e2e_pg_stat_counters;
 mod e2e_set_config_unified;

@@ -6207,6 +6207,17 @@ fn apply_function_dispatch(
             let y = int_of(&args[0])?;
             let m = int_of(&args[1])?;
             let d = int_of(&args[2])?;
+            // v7.39 (read01 utils/adt, date.c) — a NEGATIVE year is the
+            // BC year (make_date(-44,3,15) = 0044-03-15 BC, astronomical
+            // year 1-44 = -43); year zero does not exist.
+            if y == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "date field value out of range: {y}-{m:02}-{d:02}"
+                    ),
+                });
+            }
+            let y = if y < 0 { y + 1 } else { y };
             // v7.38 (read01) — validate the day against the month's real length
             // so PG's error (not SPG's silent roll-over: `make_date(2024,2,30)`
             // must fail, not become 2024-03-01). Feb honours the leap year.
