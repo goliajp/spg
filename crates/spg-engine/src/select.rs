@@ -410,6 +410,13 @@ impl Engine {
                     let (schema, rows) = synth_pg_namespace(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 — pg_tables convenience view (was a pgwire
+                // canned response that ignored projections).
+                "__spg_pg_tables" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_tables(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.1) — pg_catalog.pg_enum (label list
                 // for ENUM types; sqlx / ORM enum codecs read this).
                 "__spg_pg_enum" => {

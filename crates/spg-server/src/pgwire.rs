@@ -1810,27 +1810,15 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
             return Some(CannedResponse::Tag("SET"));
         }
     }
-    // ---- v4.6 pg_catalog subset ----
-    // BI clients (Metabase, DBeaver, …) issue pg_catalog probes only
-    // on schema scans, not on hot mailrs queries, so the O(b·n) CI
-    // substring search here is acceptable in exchange for skipping
-    // a per-query whole-SQL lowercase allocation.
-    if mentions_pg_table(b, b"pg_class") {
-        return Some(pg_class_response(state));
-    }
-    if mentions_pg_table(b, b"pg_namespace") {
-        return Some(pg_namespace_response());
-    }
-    if mentions_pg_table(b, b"pg_database") {
-        return Some(pg_database_response());
-    }
-    if mentions_pg_table(b, b"pg_user") || mentions_pg_table(b, b"pg_roles") {
-        return Some(pg_user_response(state));
-    }
-    if mentions_pg_table(b, b"pg_tables") {
-        // The convenience view PG ships; columns: schemaname, tablename, tableowner.
-        return Some(pg_tables_response(state));
-    }
+    // v7.39 — the v4.6 canned pg_catalog subset (pg_class /
+    // pg_namespace / pg_database / pg_user / pg_roles / pg_tables) is
+    // GONE: it hijacked any SQL that merely mentioned those names and
+    // returned a fixed whole table, silently ignoring projections,
+    // WHERE clauses and JOINs (found when `SELECT oid, nspname FROM
+    // pg_namespace` came back with three columns). The engine has
+    // synthesised all six as real meta views for a while, so the
+    // regular parse/execute path now serves them with full query
+    // semantics.
     None
 }
 
@@ -1917,35 +1905,6 @@ fn sql_has_clock_function(b: &[u8]) -> bool {
     false
 }
 
-/// True when `sql_bytes` references the given pg_catalog table name,
-/// either bare (`pg_class`) or schema-qualified (`pg_catalog.pg_class`).
-/// Used to dispatch the canned synthesizer; intentionally permissive —
-/// any false-positive just gets a synthesized response with all rows,
-/// and the client filters client-side.
-fn mentions_pg_table(sql_bytes: &[u8], table: &[u8]) -> bool {
-    let mut from_bare = Vec::with_capacity(5 + table.len());
-    from_bare.extend_from_slice(b"from ");
-    from_bare.extend_from_slice(table);
-    if ci_contains(sql_bytes, &from_bare) {
-        return true;
-    }
-    let mut from_qual = Vec::with_capacity(17 + table.len());
-    from_qual.extend_from_slice(b"from pg_catalog.");
-    from_qual.extend_from_slice(table);
-    if ci_contains(sql_bytes, &from_qual) {
-        return true;
-    }
-    let mut join_bare = Vec::with_capacity(5 + table.len());
-    join_bare.extend_from_slice(b"join ");
-    join_bare.extend_from_slice(table);
-    if ci_contains(sql_bytes, &join_bare) {
-        return true;
-    }
-    let mut join_qual = Vec::with_capacity(17 + table.len());
-    join_qual.extend_from_slice(b"join pg_catalog.");
-    join_qual.extend_from_slice(table);
-    ci_contains(sql_bytes, &join_qual)
-}
 
 enum CannedResponse {
     Rows {
@@ -1994,124 +1953,6 @@ fn send_canned(stream: &mut dyn Write, c: &CannedResponse) -> std::io::Result<()
 // browser panels that issue plain `SELECT ... FROM pg_catalog.X`
 // queries do work.
 
-fn pg_class_response(state: &Arc<ServerState>) -> CannedResponse {
-    // Canonical-ish pg_class columns. We expose just oid / relname /
-    // relkind / relnamespace / relowner — the columns most simple
-    // clients project. SPG only has user tables (kind `r`) — no
-    // indexes/sequences/views in the pg_catalog sense.
-    let columns = vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("relname", DataType::Text, false),
-        ColumnSchema::new("relkind", DataType::Text, false),
-        ColumnSchema::new("relnamespace", DataType::BigInt, false),
-        ColumnSchema::new("relowner", DataType::BigInt, false),
-    ];
-    let rows = state
-        .engine
-        .read()
-        .map(|e| {
-            e.catalog()
-                .table_names()
-                .into_iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    Row::new(vec![
-                        Value::BigInt(16384 + i as i64), // synthetic oid (PG user oids start ~16384)
-                        Value::text(name),
-                        Value::text("r"),
-                        Value::BigInt(2200), // public schema oid
-                        Value::BigInt(10),   // owner oid (synthetic admin)
-                    ])
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    CannedResponse::Rows { columns, rows }
-}
-
-fn pg_namespace_response() -> CannedResponse {
-    let columns = vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("nspname", DataType::Text, false),
-        ColumnSchema::new("nspowner", DataType::BigInt, false),
-    ];
-    let rows = vec![Row::new(vec![
-        Value::BigInt(2200),
-        Value::text("public"),
-        Value::BigInt(10),
-    ])];
-    CannedResponse::Rows { columns, rows }
-}
-
-fn pg_database_response() -> CannedResponse {
-    let columns = vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("datname", DataType::Text, false),
-        ColumnSchema::new("datdba", DataType::BigInt, false),
-    ];
-    let rows = vec![Row::new(vec![
-        Value::BigInt(16384),
-        Value::text("spg"),
-        Value::BigInt(10),
-    ])];
-    CannedResponse::Rows { columns, rows }
-}
-
-fn pg_user_response(state: &Arc<ServerState>) -> CannedResponse {
-    let columns = vec![
-        ColumnSchema::new("usename", DataType::Text, false),
-        ColumnSchema::new("usesuper", DataType::Bool, false),
-    ];
-    let rows = state
-        .engine
-        .read()
-        .map(|e| {
-            if e.users().is_empty() {
-                vec![Row::new(vec![Value::text("admin"), Value::Bool(true)])]
-            } else {
-                e.users()
-                    .iter()
-                    .map(|(name, rec)| {
-                        Row::new(vec![
-                            Value::text(name.to_string()),
-                            Value::Bool(matches!(rec.role, spg_engine::Role::Admin)),
-                        ])
-                    })
-                    .collect()
-            }
-        })
-        .unwrap_or_default();
-    CannedResponse::Rows { columns, rows }
-}
-
-fn pg_tables_response(state: &Arc<ServerState>) -> CannedResponse {
-    let columns = vec![
-        ColumnSchema::new("schemaname", DataType::Text, false),
-        ColumnSchema::new("tablename", DataType::Text, false),
-        ColumnSchema::new("tableowner", DataType::Text, false),
-    ];
-    let rows = state
-        .engine
-        .read()
-        .map(|e| {
-            e.catalog()
-                .table_names()
-                .into_iter()
-                .map(|name| {
-                    Row::new(vec![
-                        Value::text("public"),
-                        Value::text(name),
-                        Value::text("admin"),
-                    ])
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    CannedResponse::Rows { columns, rows }
-}
-
-// ---- v4.7 extended-query protocol ----
-//
 // v6.1.1 — the Parse → Bind → Execute path now runs the engine's
 // real prepared-statement API: `Engine::prepare(sql)` parses the
 // SQL ONCE into a `Statement` AST (with clock rewrites + ORDER BY

@@ -2216,8 +2216,10 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         // bool
         (16, "bool", 1, "b", "B", 0, 1000),
         (17, "bytea", -1, "b", "U", 0, 1001),
-        (18, "char", 1, "b", "S", 0, 1002),
-        (19, "name", 64, "b", "S", 0, 1003),
+        // v7.39 (pg_type reconcile) — "char" is category Z (internal);
+        // name's element type is "char" (oid 18), per PG18.
+        (18, "char", 1, "b", "Z", 0, 1002),
+        (19, "name", 64, "b", "S", 18, 1003),
         (20, "int8", 8, "b", "N", 0, 1016),
         (21, "int2", 2, "b", "N", 0, 1005),
         (23, "int4", 4, "b", "N", 0, 1007),
@@ -2246,8 +2248,11 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         (3614, "tsvector", -1, "b", "U", 0, 3643),
         (3615, "tsquery", -1, "b", "U", 0, 3645),
         // hstore + range types — typcategory 'U' (user) / 'R' (range).
-        (3908, "tstzrange", -1, "r", "R", 0, 3909),
-        (3910, "tsrange", -1, "r", "R", 0, 3911),
+        // v7.39 (pg_type reconcile) — these two were transposed; PG18:
+        // 3908 = tsrange, 3910 = tstzrange (the wire layer already
+        // encoded them correctly, so only the catalog disagreed).
+        (3908, "tsrange", -1, "r", "R", 0, 3909),
+        (3910, "tstzrange", -1, "r", "R", 0, 3911),
         (3904, "int4range", -1, "r", "R", 0, 3905),
         (3926, "int8range", -1, "r", "R", 0, 3927),
         (3906, "numrange", -1, "r", "R", 0, 3907),
@@ -3774,6 +3779,39 @@ fn infer_guc_vartype(v: &str) -> &'static str {
 ///   * tablename (Text)
 ///   * indexname (Text)
 ///   * indexdef (Text) — best-effort CREATE INDEX DDL
+/// v7.39 — `pg_catalog.pg_tables` (the convenience view PG ships).
+/// One row per user table; replaces the pgwire canned response so
+/// projections / WHERE / JOINs work like any relation.
+pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("tableowner", DataType::Text, false),
+        ColumnSchema::new("tablespace", DataType::Text, true),
+        ColumnSchema::new("hasindexes", DataType::Bool, false),
+        ColumnSchema::new("hasrules", DataType::Bool, false),
+        ColumnSchema::new("hastriggers", DataType::Bool, false),
+        ColumnSchema::new("rowsecurity", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let has_indexes =
+            !t.indices().is_empty() || !t.schema().uniqueness_constraints.is_empty();
+        rows.push(Row::new(alloc::vec![
+            Value::text("public"),
+            Value::text(tname.clone()),
+            Value::text("admin"),
+            Value::Null,
+            Value::Bool(has_indexes),
+            Value::Bool(false),
+            Value::Bool(cat.triggers().iter().any(|tg| tg.table == tname)),
+            Value::Bool(t.schema().row_security),
+        ]));
+    }
+    (schema, rows)
+}
+
 pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
