@@ -614,6 +614,9 @@ pub(crate) fn run(
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
+    // v7.39 (parallel-agg P1) — host-injected executor; None = the
+    // single-threaded paths, byte-identical to pre-P1.
+    runner: Option<&dyn crate::ParallelRunner>,
 ) -> Result<AggResult, EvalError> {
     // v7.38 P0 元机制 A — fires at the top of the aggregate
     // executor with the number of input rows. Tests use this to
@@ -666,6 +669,7 @@ pub(crate) fn run(
         schema_cols,
         table_alias,
         correlated_eval,
+        runner,
     )?;
 
     // (2) Build the synthetic per-group schema and finalise each group's row.
@@ -871,6 +875,33 @@ struct FusedAcc {
     count: i64,
 }
 
+/// v7.39 (parallel-agg P1) — fold shard accumulator `b` into `a`.
+/// Every FusedAcc field is a running sum plus a type-witness flag, so
+/// the merge is field-wise addition with `numeric_add` aligning the
+/// decimal scales. Merging in shard order keeps float summation
+/// deterministic for a given shard count (PG's parallel aggregate
+/// makes the same no-serial-equivalence tradeoff for floats).
+fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
+    a.count += b.count;
+    a.sum_int += b.sum_int;
+    a.sum_float += b.sum_float;
+    a.use_float |= b.use_float;
+    if b.use_numeric {
+        let (s, sc) =
+            crate::numeric::numeric_add(a.num_scaled, a.num_scale, b.num_scaled, b.num_scale);
+        a.num_scaled = s;
+        a.num_scale = sc;
+        a.num_kind = fold_sum_kind(a.num_kind, b.num_kind);
+        a.use_numeric = true;
+    }
+    a.sum_iv_months += b.sum_iv_months;
+    a.sum_iv_days += b.sum_iv_days;
+    a.sum_iv_micros += b.sum_iv_micros;
+    a.use_interval |= b.use_interval;
+    a.sum_money += b.sum_money;
+    a.use_money |= b.use_money;
+}
+
 /// One sum/avg accumulation step — the same variant arms (and the same
 /// error text) as the single-spec fast path's inline match.
 #[inline]
@@ -947,6 +978,7 @@ fn accumulate_groups(
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
+    runner: Option<&dyn crate::ParallelRunner>,
 ) -> Result<Vec<(Vec<Value<'static>>, Vec<AggState>)>, EvalError> {
     let ctx = EvalContext::new(schema_cols, table_alias);
     // Map group key (vec of values, encoded as canonical string) -> group state.
@@ -1314,8 +1346,16 @@ fn accumulate_groups(
             })
             .collect();
         let mut accs: Vec<FusedAcc> = (0..unique_ops.len()).map(|_| FusedAcc::default()).collect();
-        if !unique_ops.is_empty() {
-            for row in rows {
+        // v7.39 (parallel-agg P1) — shard the row scan across the
+        // host-injected executor when the input is large enough.
+        // Each shard runs the same tight loop over its row range and
+        // returns its own Vec<FusedAcc>; the merge is field-wise
+        // (see merge_fused). Errors inside a shard surface as the
+        // shard result and re-raise after join.
+        let fused_scan = |range: core::ops::Range<usize>,
+                          accs: &mut Vec<FusedAcc>|
+         -> Result<(), EvalError> {
+            for row in &rows[range] {
                 for (si, op) in unique_ops.iter().enumerate() {
                     match op {
                         FusedOp::CountCol(p) => {
@@ -1328,6 +1368,36 @@ fn accumulate_groups(
                         }
                     }
                 }
+            }
+            Ok(())
+        };
+        if !unique_ops.is_empty() {
+            let par = runner.filter(|_| rows.len() >= crate::PARALLEL_MIN_ROWS);
+            if let Some(r) = par {
+                crate::PARALLEL_AGG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let n_shards = (rows.len() / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
+                let chunk = rows.len().div_ceil(n_shards);
+                type ShardOut = Result<Vec<FusedAcc>, EvalError>;
+                let ops = &unique_ops;
+                let results = r.run_shards(n_shards, &|i| {
+                    let lo = i * chunk;
+                    let hi = ((i + 1) * chunk).min(rows.len());
+                    let mut local: Vec<FusedAcc> =
+                        (0..ops.len()).map(|_| FusedAcc::default()).collect();
+                    let out: ShardOut = fused_scan(lo..hi, &mut local).map(|()| local);
+                    alloc::boxed::Box::new(out)
+                });
+                for boxed in results {
+                    let shard = boxed
+                        .downcast::<ShardOut>()
+                        .expect("runner echoes the closure's box");
+                    let shard_accs = (*shard)?;
+                    for (si, b) in shard_accs.iter().enumerate() {
+                        merge_fused(&mut accs[si], b);
+                    }
+                }
+            } else {
+                fused_scan(0..rows.len(), &mut accs)?;
             }
         }
         for (i, src) in spec_src.iter().enumerate() {
