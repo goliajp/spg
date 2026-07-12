@@ -17704,6 +17704,20 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
             return Some(iv);
         }
     }
+    // v7.39 (GUC knife 3, differential) — PG accepts a bare number as
+    // SECONDS: `INTERVAL '0'` = 00:00:00, `INTERVAL '5'` = 00:00:05,
+    // fractions kept to the microsecond (`'1.5'` = 00:00:01.5).
+    if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Some((0, 0, n.checked_mul(1_000_000)?));
+        }
+        if let Ok(f) = trimmed.parse::<f64>() {
+            if f.is_finite() {
+                #[allow(clippy::cast_possible_truncation)]
+                return Some((0, 0, (f * 1_000_000.0) as i64));
+            }
+        }
+    }
     let mut parts: Vec<&str> = s.split_whitespace().collect();
     // A bare clock-time token `HH:MM[:SS[.ffffff]]` carries the time-of-day
     // part (PG: `3 days 14:30:45`, or `14:30:45` alone). Extract it; whatever
@@ -19025,7 +19039,11 @@ mod tests {
         assert_eq!(parse_interval_text(""), None);
         assert_eq!(parse_interval_text("garbage"), None);
         assert_eq!(parse_interval_text("1 fortnight"), None);
-        assert_eq!(parse_interval_text("1"), None);
+        // v7.39 (GUC knife 3) — PG reads a bare number as SECONDS
+        // (`INTERVAL '1'` = 00:00:01), verified against the oracle.
+        assert_eq!(parse_interval_text("1"), Some((0, 0, 1_000_000)));
+        assert_eq!(parse_interval_text("0"), Some((0, 0, 0)));
+        assert_eq!(parse_interval_text("1.5"), Some((0, 0, 1_500_000)));
     }
 
     #[test]

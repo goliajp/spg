@@ -15,6 +15,477 @@ use alloc::vec::Vec;
 
 use super::{MONTH_ABBR, MONTH_FULL, civil_from_days};
 
+
+// ---- v7.39 (GUC knife 3) — render styles ----
+//
+// PG's DateStyle / IntervalStyle / extra_float_digits GUCs change the
+// TEXT of date/timestamp/interval/float output everywhere the out-
+// functions run (wire cells, COPY, ::text casts). The engine caches a
+// parsed `RenderStyle` per session; formatters take it by reference.
+// Every shape below is verified against live PG18 (knife-3 probe).
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DateOrder {
+    Mdy,
+    Dmy,
+    Ymd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DateStyleKind {
+    Iso,
+    German,
+    Sql,
+    Postgres,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntervalStyleKind {
+    Postgres,
+    SqlStandard,
+    Iso8601,
+    PostgresVerbose,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RenderStyle {
+    pub date_style: DateStyleKind,
+    pub date_order: DateOrder,
+    pub interval_style: IntervalStyleKind,
+    /// PG default 1: >= 1 means shortest-round-trip output; 0 and
+    /// negative trim to 15+n (float8) / 6+n (float4) significant digits.
+    pub extra_float_digits: i32,
+}
+
+impl Default for RenderStyle {
+    fn default() -> Self {
+        Self {
+            date_style: DateStyleKind::Iso,
+            date_order: DateOrder::Mdy,
+            interval_style: IntervalStyleKind::Postgres,
+            extra_float_digits: 1,
+        }
+    }
+}
+
+/// Day-of-week abbreviation. 1970-01-01 (day 0) was a Thursday.
+fn dow_abbr(days: i32) -> &'static str {
+    const DOW: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    DOW[((days.rem_euclid(7)) as usize + 3) % 7]
+}
+
+/// `HH:MM:SS[.frac]` with the 6-digit fraction's trailing zeros
+/// stripped — the intra-day part every timestamp style shares.
+fn hms_from_day_micros(day_micros: i64) -> String {
+    let secs = day_micros / 1_000_000;
+    let frac = day_micros % 1_000_000;
+    let hh = secs / 3600;
+    let mm = (secs / 60) % 60;
+    let ss = secs % 60;
+    if frac == 0 {
+        format!("{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{hh:02}:{mm:02}:{ss:02}.{trimmed}")
+    }
+}
+
+/// `format_date` under a DateStyle. PG18 shapes:
+/// ISO `2024-03-15` · German `15.03.2024` · SQL `03/15/2024` (DMY
+/// `15/03/2024`) · Postgres `03-15-2024` (DMY `15-03-2024`). YMD field
+/// order affects only ISO-irrelevant styles' INPUT; output falls back
+/// to the MDY arrangement (as PG does).
+pub fn format_date_styled(days: i32, style: &RenderStyle) -> String {
+    if days == i32::MAX {
+        return "infinity".into();
+    }
+    if days == i32::MIN {
+        return "-infinity".into();
+    }
+    let (y, m, d) = civil_from_days(days);
+    let dmy = style.date_order == DateOrder::Dmy;
+    match style.date_style {
+        DateStyleKind::Iso => format!("{y:04}-{m:02}-{d:02}"),
+        DateStyleKind::German => format!("{d:02}.{m:02}.{y:04}"),
+        DateStyleKind::Sql => {
+            if dmy {
+                format!("{d:02}/{m:02}/{y:04}")
+            } else {
+                format!("{m:02}/{d:02}/{y:04}")
+            }
+        }
+        DateStyleKind::Postgres => {
+            if dmy {
+                format!("{d:02}-{m:02}-{y:04}")
+            } else {
+                format!("{m:02}-{d:02}-{y:04}")
+            }
+        }
+    }
+}
+
+/// `format_timestamp` under a DateStyle. German/SQL prepend their date
+/// form; Postgres style is the asctime-like
+/// `Dow Mon DD HH:MM:SS[.f] YYYY` (DMY: `Dow DD Mon …`).
+pub fn format_timestamp_styled(micros: i64, style: &RenderStyle) -> String {
+    if micros == i64::MAX {
+        return "infinity".into();
+    }
+    if micros == i64::MIN {
+        return "-infinity".into();
+    }
+    if style.date_style == DateStyleKind::Iso {
+        return format_timestamp(micros);
+    }
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let day_micros = micros.rem_euclid(MICROS_PER_DAY);
+    let day_i32 = i32::try_from(days).unwrap_or(i32::MAX);
+    let hms = hms_from_day_micros(day_micros);
+    match style.date_style {
+        DateStyleKind::Iso => unreachable!("handled above"),
+        DateStyleKind::German | DateStyleKind::Sql => {
+            format!("{} {hms}", format_date_styled(day_i32, style))
+        }
+        DateStyleKind::Postgres => {
+            let (y, m, d) = civil_from_days(day_i32);
+            let mon = MONTH_ABBR[(m as usize).saturating_sub(1).min(11)];
+            let dow = dow_abbr(day_i32);
+            if style.date_order == DateOrder::Dmy {
+                format!("{dow} {d} {mon} {hms} {y:04}")
+            } else {
+                format!("{dow} {mon} {d} {hms} {y:04}")
+            }
+        }
+    }
+}
+
+/// `format_timestamptz` under a DateStyle for the UTC session: ISO
+/// keeps the `+00` offset suffix; the other styles append the zone
+/// NAME (` UTC`), as PG does.
+pub fn format_timestamptz_styled(micros: i64, style: &RenderStyle) -> String {
+    if style.date_style == DateStyleKind::Iso {
+        return format_timestamptz_at(micros, 0);
+    }
+    if micros == i64::MAX || micros == i64::MIN {
+        return format_timestamp(micros);
+    }
+    format!("{} UTC", format_timestamp_styled(micros, style))
+}
+
+/// `H:MM:SS[.frac]` — the sql_standard time body (hour unpadded),
+/// over non-negative micros.
+fn sql_std_time(abs_us: i64) -> String {
+    let secs = abs_us / 1_000_000;
+    let frac = abs_us % 1_000_000;
+    let h = secs / 3600;
+    let mm = (secs / 60) % 60;
+    let ss = secs % 60;
+    if frac == 0 {
+        format!("{h}:{mm:02}:{ss:02}")
+    } else {
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{h}:{mm:02}:{ss:02}.{trimmed}")
+    }
+}
+
+/// `SS[.frac]` seconds body for iso_8601 / verbose fields.
+fn secs_body(abs_us: i64) -> String {
+    let ss = abs_us / 1_000_000;
+    let frac = abs_us % 1_000_000;
+    if frac == 0 {
+        format!("{ss}")
+    } else {
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{ss}.{trimmed}")
+    }
+}
+
+/// `format_interval` under an IntervalStyle (PG18 differential truth):
+///
+/// - sql_standard — pure year-month `1-2` / `-1-2`; pure day-time
+///   `1 0:00:00` (sign on the leading field, time fields absolute;
+///   time-only `2:00:00` / `-0:00:01`); a mix of year-month and
+///   day-time classes (or mixed signs) is non-conforming and prints
+///   every part explicitly signed: `+1-2 +3 +4:05:06`, `+0-1 -1
+///   +0:00:00`; zero → `0`.
+/// - iso_8601 — `P[nY][nM][nD][T[nH][nM][nS]]`, each field
+///   individually signed, zero → `PT0S`.
+/// - postgres_verbose — `@ ` + `years/mons/days/hours/mins/secs`
+///   fields; when the interval compares below zero every field is
+///   negated and ` ago` is appended; zero → `@ 0`.
+pub fn format_interval_styled(months: i32, days: i32, micros: i64, style: &RenderStyle) -> String {
+    match style.interval_style {
+        IntervalStyleKind::Postgres => format_interval(months, days, micros),
+        IntervalStyleKind::SqlStandard => {
+            let has_ym = months != 0;
+            let has_dt = days != 0 || micros != 0;
+            if !has_ym && !has_dt {
+                return "0".into();
+            }
+            let y = months / 12;
+            let mo = (months % 12).abs();
+            // Sign coherence: every nonzero class must agree for the
+            // conforming shapes; a year-month + day-time mix is always
+            // the signed non-conforming shape.
+            let signs: Vec<i8> = [i64::from(months), i64::from(days), micros]
+                .iter()
+                .filter(|v| **v != 0)
+                .map(|v| if *v < 0 { -1i8 } else { 1 })
+                .collect();
+            let coherent = signs.windows(2).all(|w| w[0] == w[1]);
+            if has_ym && !has_dt && coherent {
+                return format!("{y}-{mo}");
+            }
+            if !has_ym && coherent {
+                let neg = days < 0 || micros < 0;
+                let time = sql_std_time(micros.abs());
+                if days == 0 {
+                    return format!("{}{time}", if neg { "-" } else { "" });
+                }
+                return format!("{days} {time}");
+            }
+            // Non-conforming: every part explicitly signed, absolute
+            // field bodies.
+            let sgn = |neg: bool| if neg { '-' } else { '+' };
+            format!(
+                "{}{}-{} {}{} {}{}",
+                sgn(months < 0),
+                y.abs(),
+                mo,
+                sgn(days < 0),
+                days.abs(),
+                sgn(micros < 0),
+                sql_std_time(micros.abs())
+            )
+        }
+        IntervalStyleKind::Iso8601 => {
+            if months == 0 && days == 0 && micros == 0 {
+                return "PT0S".into();
+            }
+            let y = months / 12;
+            let mo = months % 12;
+            let mut out = String::from("P");
+            if y != 0 {
+                out.push_str(&format!("{y}Y"));
+            }
+            if mo != 0 {
+                out.push_str(&format!("{mo}M"));
+            }
+            if days != 0 {
+                out.push_str(&format!("{days}D"));
+            }
+            if micros != 0 {
+                out.push('T');
+                let neg = micros < 0;
+                let abs = micros.abs();
+                let h = abs / 3_600_000_000;
+                let m = (abs / 60_000_000) % 60;
+                let s_us = abs % 60_000_000;
+                let sgn = if neg { "-" } else { "" };
+                if h != 0 {
+                    out.push_str(&format!("{sgn}{h}H"));
+                }
+                if m != 0 {
+                    out.push_str(&format!("{sgn}{m}M"));
+                }
+                if s_us != 0 {
+                    out.push_str(&format!("{sgn}{}S", secs_body(s_us)));
+                }
+            }
+            out
+        }
+        IntervalStyleKind::PostgresVerbose => {
+            if months == 0 && days == 0 && micros == 0 {
+                return "@ 0".into();
+            }
+            // PG's comparison convention (months at 30 days) decides
+            // the overall sign; a negative interval prints its fields
+            // negated with a trailing ` ago`.
+            let total = i128::from(months) * 30 * 86_400_000_000
+                + i128::from(days) * 86_400_000_000
+                + i128::from(micros);
+            let ago = total < 0;
+            let (months, days, micros) = if ago {
+                (-months, -days, -micros)
+            } else {
+                (months, days, micros)
+            };
+            let y = months / 12;
+            let mo = months % 12;
+            let neg_t = micros < 0;
+            let abs = micros.abs();
+            let h = abs / 3_600_000_000;
+            let m = (abs / 60_000_000) % 60;
+            let s_us = abs % 60_000_000;
+            let mut parts: Vec<String> = Vec::new();
+            let unit = |n: i64, singular: &'static str| -> String {
+                if n == 1 {
+                    singular.into()
+                } else {
+                    format!("{singular}s")
+                }
+            };
+            if y != 0 {
+                parts.push(format!("{y} {}", unit(i64::from(y), "year")));
+            }
+            if mo != 0 {
+                parts.push(format!("{mo} {}", unit(i64::from(mo), "mon")));
+            }
+            if days != 0 {
+                parts.push(format!("{days} {}", unit(i64::from(days), "day")));
+            }
+            let tsgn = if neg_t { "-" } else { "" };
+            if h != 0 {
+                parts.push(format!("{tsgn}{h} {}", unit(h, "hour")));
+            }
+            if m != 0 {
+                parts.push(format!("{tsgn}{m} {}", unit(m, "min")));
+            }
+            if s_us != 0 {
+                let body = secs_body(s_us);
+                let plural = body != "1";
+                parts.push(format!(
+                    "{tsgn}{body} {}",
+                    if plural { "secs" } else { "sec" }
+                ));
+            }
+            let mut out = String::from("@ ");
+            out.push_str(&parts.join(" "));
+            if ago {
+                out.push_str(" ago");
+            }
+            out
+        }
+    }
+}
+
+/// Styled array renderers — `{elem,…}` with per-element styled text.
+pub fn format_date_array_styled(items: &[Option<i32>], style: &RenderStyle) -> String {
+    array_styled(items, |d| format_date_styled(*d, style))
+}
+
+pub fn format_timestamp_array_styled(
+    items: &[Option<i64>],
+    with_tz: bool,
+    style: &RenderStyle,
+) -> String {
+    if with_tz {
+        array_styled(items, |t| format_timestamptz_styled(*t, style))
+    } else {
+        array_styled(items, |t| format_timestamp_styled(*t, style))
+    }
+}
+
+pub fn format_interval_array_styled(
+    items: &[Option<spg_storage::IntervalSpan>],
+    style: &RenderStyle,
+) -> String {
+    array_styled(items, |iv| {
+        format_interval_styled(iv.months, iv.days, iv.micros, style)
+    })
+}
+
+pub fn format_float_array_styled(items: &[Option<f64>], style: &RenderStyle) -> String {
+    array_styled(items, |f| format_float_styled(*f, style))
+}
+
+fn array_styled<T>(items: &[Option<T>], mut f: impl FnMut(&T) -> String) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 12);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(v) => out.push_str(&f(v)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// C `%.{prec}g` over an f64 — what PG's float8out/float4out emit when
+/// `extra_float_digits <= 0`: `prec` significant digits, fixed-point
+/// when the decimal exponent is in `-4..prec`, else scientific;
+/// trailing zeros trimmed in both shapes; exponent `e±NN`.
+fn format_g(x: f64, prec: usize) -> String {
+    let prec = prec.max(1);
+    // Round to `prec` significant digits via {:.*e} (exact decimal
+    // mantissa; handles the 9.99→10.0 exponent carry).
+    let sci = format!("{:.*e}", prec - 1, x);
+    let epos = sci.find('e').expect("{:e} always has an 'e'");
+    let exp_val: i32 = sci[epos + 1..].parse().unwrap_or(0);
+    let mant = &sci[..epos];
+    if exp_val >= -4 && (exp_val as i64) < prec as i64 {
+        // Fixed-point with prec-1-exp decimals, from the rounded value.
+        let decimals = usize::try_from(i64::try_from(prec).unwrap_or(1) - 1 - i64::from(exp_val))
+            .unwrap_or(0);
+        let rounded: f64 = sci.parse().unwrap_or(x);
+        let fixed = format!("{rounded:.decimals$}");
+        if fixed.contains('.') {
+            let t = fixed.trim_end_matches('0').trim_end_matches('.');
+            t.into()
+        } else {
+            fixed
+        }
+    } else {
+        let mant = if mant.contains('.') {
+            mant.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mant
+        };
+        let (sign, digits) = if exp_val < 0 {
+            ('-', format!("{}", -exp_val))
+        } else {
+            ('+', format!("{exp_val}"))
+        };
+        format!("{mant}e{sign}{digits:0>2}")
+    }
+}
+
+/// PG `float8out` under `extra_float_digits`: >= 1 → shortest
+/// round-trip (`format_float`); <= 0 → `%.{15+n}g`.
+pub fn format_float_styled(x: f64, style: &RenderStyle) -> String {
+    if style.extra_float_digits >= 1 {
+        return format_float(x);
+    }
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let prec = (15 + style.extra_float_digits).clamp(1, 17) as usize;
+    format_g(x, prec)
+}
+
+/// PG `float4out` under `extra_float_digits`: >= 1 → shortest
+/// round-trip (`format_real`); <= 0 → `%.{6+n}g`.
+pub fn format_real_styled(x: f32, style: &RenderStyle) -> String {
+    if style.extra_float_digits >= 1 {
+        return format_real(x);
+    }
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let prec = (6 + style.extra_float_digits).clamp(1, 9) as usize;
+    format_g(f64::from(x), prec)
+}
+
 /// Render a `Date` (days since epoch) as `YYYY-MM-DD`. Negative values
 /// for pre-1970 dates render with a leading `-` on the year.
 pub fn format_date(days: i32) -> String {
@@ -521,17 +992,30 @@ pub fn format_interval(months: i32, days: i32, micros: i64) -> String {
     let unit = |n: i64, singular: &'static str, plural: &'static str| -> &'static str {
         if n == 1 { singular } else { plural }
     };
+    // PG shows an explicit `+` on a positive field that follows a
+    // negative one (`-2 mons +3 days`), so mixed signs stay readable.
+    let mut prev_negative = false;
     if years != 0 {
         parts.push(format!(
             "{years} {}",
             unit(i64::from(years), "year", "years")
         ));
+        prev_negative = years < 0;
     }
     if mons != 0 {
-        parts.push(format!("{mons} {}", unit(i64::from(mons), "mon", "mons")));
+        let plus = if prev_negative && mons > 0 { "+" } else { "" };
+        parts.push(format!(
+            "{plus}{mons} {}",
+            unit(i64::from(mons), "mon", "mons")
+        ));
+        prev_negative = mons < 0;
     }
     if days != 0 {
-        parts.push(format!("{days} {}", unit(i64::from(days), "day", "days")));
+        let plus = if prev_negative && days > 0 { "+" } else { "" };
+        parts.push(format!(
+            "{plus}{days} {}",
+            unit(i64::from(days), "day", "days")
+        ));
     }
     let mut rem = micros;
     if rem != 0 {

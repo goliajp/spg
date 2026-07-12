@@ -92,6 +92,39 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
                 return Err(bad());
             }
         }
+        // v7.39 (GUC knife 3) — the render GUCs reject invalid values
+        // with PG's own texts (canonical-caps parameter names).
+        "datestyle" => {
+            if crate::session::parse_datestyle_parts(
+                value,
+                crate::eval::RenderStyle::default(),
+            )
+            .is_none()
+            {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "invalid value for parameter \"DateStyle\": \"{value}\""
+                )));
+            }
+        }
+        "intervalstyle" => {
+            if crate::session::parse_intervalstyle(value).is_none() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "invalid value for parameter \"IntervalStyle\": \"{value}\""
+                )));
+            }
+        }
+        "extra_float_digits" => {
+            match value.trim().parse::<i64>() {
+                Ok(n) if (-15..=3).contains(&n) => {}
+                Ok(n) => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "{n} is outside the valid range for parameter \
+                         \"extra_float_digits\" (-15 .. 3)"
+                    )));
+                }
+                Err(_) => return Err(bad()),
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -180,6 +213,7 @@ impl Engine {
             Value::Text(s) => s.into_owned(),
             Value::Null => {
                 self.session_params.remove(&pname.to_ascii_lowercase());
+                self.refresh_render_style();
                 return Ok(Some(single(Value::Null)));
             }
             _ => return Ok(None),
@@ -1301,6 +1335,7 @@ impl Engine {
                         self.session_params.remove(&name.to_ascii_lowercase());
                     }
                 }
+                self.refresh_render_style();
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: false,

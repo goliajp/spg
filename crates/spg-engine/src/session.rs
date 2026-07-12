@@ -59,6 +59,7 @@ impl Engine {
             // string instead of the default).
             spg_sql::ast::SetValue::Default => {
                 self.session_params.remove(&name.to_ascii_lowercase());
+                self.refresh_render_style();
                 return;
             }
         };
@@ -134,12 +135,63 @@ impl Engine {
         } else {
             normalised
         };
+        // v7.39 (GUC knife 3) — datestyle is sticky per category (a bare
+        // 'DMY' keeps the current style; 'German' forces DMY); PG stores
+        // and SHOWs the RESOLVED canonical pair. intervalstyle /
+        // extra_float_digits just refresh the cached RenderStyle.
+        let normalised = if key == "datestyle" {
+            match parse_datestyle_parts(&normalised, self.render_style) {
+                Some((st, ord)) => String::from(datestyle_canonical(st, ord)),
+                // Invalid values are rejected earlier (validate_known_guc);
+                // an unvalidated caller keeps the raw text.
+                None => normalised,
+            }
+        } else {
+            normalised
+        };
+        let is_render_guc = matches!(
+            key.as_str(),
+            "datestyle" | "intervalstyle" | "extra_float_digits"
+        );
         self.session_params.insert(key, normalised);
+        if is_render_guc {
+            self.refresh_render_style();
+        }
+    }
+
+    /// v7.39 (GUC knife 3) — recompute the cached `RenderStyle` from the
+    /// session store. Called after any write/removal of a render GUC.
+    pub(crate) fn refresh_render_style(&mut self) {
+        let mut style = crate::eval::RenderStyle::default();
+        if let Some(ds) = self.session_param("datestyle")
+            && let Some((st, ord)) = parse_datestyle_parts(ds, style)
+        {
+            style.date_style = st;
+            style.date_order = ord;
+        }
+        if let Some(is) = self.session_param("intervalstyle")
+            && let Some(k) = parse_intervalstyle(is)
+        {
+            style.interval_style = k;
+        }
+        if let Some(efd) = self.session_param("extra_float_digits")
+            && let Ok(n) = efd.trim().parse::<i32>()
+        {
+            style.extra_float_digits = n;
+        }
+        self.render_style = style;
     }
 
     /// v7.12.1 — read a session parameter set via `SET`. Used by
     /// the FTS function dispatcher to resolve the default config
     /// for `to_tsvector(text)` / `plainto_tsquery(text)` etc.
+    /// v7.39 (GUC knife 3) — the parsed session render style (wire /
+    /// COPY renderers snapshot it once per statement).
+    #[must_use]
+    pub fn render_style(&self) -> crate::eval::RenderStyle {
+        self.render_style
+    }
+
     #[must_use]
     pub fn session_param(&self, name: &str) -> Option<&str> {
         self.session_params
@@ -182,6 +234,7 @@ impl Engine {
         alias: Option<&'a str>,
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
+            .with_render_style(self.render_style)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
             // Thread the session GUC map so current_setting resolves
             // custom `SET app.foo = …` settings (request-context / RLS).
@@ -227,6 +280,72 @@ impl Engine {
 ///
 /// Returns `None` on parse failure (callers treat None as "GUC not
 /// set / default applies").
+/// v7.39 (GUC knife 3) — parse a DateStyle value ('ISO, MDY' / 'German'
+/// / 'DMY' / …) against the current style: keywords apply in order,
+/// each updating its own category (PG semantics; German implies DMY).
+/// Returns None on any unrecognised keyword.
+pub(crate) fn parse_datestyle_parts(
+    value: &str,
+    current: crate::eval::RenderStyle,
+) -> Option<(crate::eval::DateStyleKind, crate::eval::DateOrder)> {
+    use crate::eval::{DateOrder, DateStyleKind};
+    let mut st = current.date_style;
+    let mut ord = current.date_order;
+    let mut any = false;
+    for part in value.split(',') {
+        let p = part.trim().to_ascii_lowercase();
+        match p.as_str() {
+            "iso" => st = DateStyleKind::Iso,
+            "german" => {
+                st = DateStyleKind::German;
+                ord = DateOrder::Dmy;
+            }
+            "sql" => st = DateStyleKind::Sql,
+            "postgres" => st = DateStyleKind::Postgres,
+            "mdy" | "us" | "noneuro" | "noneuropean" => ord = DateOrder::Mdy,
+            "dmy" | "euro" | "european" => ord = DateOrder::Dmy,
+            "ymd" => ord = DateOrder::Ymd,
+            _ => return None,
+        }
+        any = true;
+    }
+    if any { Some((st, ord)) } else { None }
+}
+
+/// The canonical `SHOW datestyle` text for a resolved pair.
+pub(crate) fn datestyle_canonical(
+    st: crate::eval::DateStyleKind,
+    ord: crate::eval::DateOrder,
+) -> &'static str {
+    use crate::eval::{DateOrder, DateStyleKind};
+    match (st, ord) {
+        (DateStyleKind::Iso, DateOrder::Mdy) => "ISO, MDY",
+        (DateStyleKind::Iso, DateOrder::Dmy) => "ISO, DMY",
+        (DateStyleKind::Iso, DateOrder::Ymd) => "ISO, YMD",
+        (DateStyleKind::German, DateOrder::Mdy) => "German, MDY",
+        (DateStyleKind::German, DateOrder::Dmy) => "German, DMY",
+        (DateStyleKind::German, DateOrder::Ymd) => "German, YMD",
+        (DateStyleKind::Sql, DateOrder::Mdy) => "SQL, MDY",
+        (DateStyleKind::Sql, DateOrder::Dmy) => "SQL, DMY",
+        (DateStyleKind::Sql, DateOrder::Ymd) => "SQL, YMD",
+        (DateStyleKind::Postgres, DateOrder::Mdy) => "Postgres, MDY",
+        (DateStyleKind::Postgres, DateOrder::Dmy) => "Postgres, DMY",
+        (DateStyleKind::Postgres, DateOrder::Ymd) => "Postgres, YMD",
+    }
+}
+
+/// v7.39 (GUC knife 3) — IntervalStyle keyword → kind.
+pub(crate) fn parse_intervalstyle(value: &str) -> Option<crate::eval::IntervalStyleKind> {
+    use crate::eval::IntervalStyleKind as K;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "postgres" => Some(K::Postgres),
+        "sql_standard" => Some(K::SqlStandard),
+        "iso_8601" => Some(K::Iso8601),
+        "postgres_verbose" => Some(K::PostgresVerbose),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_pg_duration_ms(raw: &str) -> Option<u64> {
     let s = raw.trim();
     if s.is_empty() {

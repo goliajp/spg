@@ -190,6 +190,13 @@ pub fn gen_random_uuid_bytes() -> [u8; 16] {
 }
 
 pub fn value_to_text(v: &Value) -> String {
+    value_to_text_styled(v, &crate::eval::RenderStyle::default())
+}
+
+/// v7.39 (GUC knife 3) — the canonical renderer under a session
+/// `RenderStyle` (DateStyle / IntervalStyle / extra_float_digits).
+/// `value_to_text` is the default-style shorthand.
+pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> String {
     match v {
         // v7.5.0 — Value is #[non_exhaustive]; any future variant
         // without explicit text rendering hits the Debug fallback
@@ -200,9 +207,9 @@ pub fn value_to_text(v: &Value) -> String {
         // PG `float8out`: shortest round-trip, scientific notation past
         // the ±exponent thresholds, `Infinity` / `-Infinity` / `NaN` for
         // the non-finite values.
-        Value::Float(x) => crate::eval::format_float(*x),
+        Value::Float(x) => crate::eval::format_float_styled(*x, style),
         // v7.38 (read01, T-float4) — PG float4out (f32 shortest round-trip).
-        Value::Real(x) => crate::eval::format_real(*x),
+        Value::Real(x) => crate::eval::format_real_styled(*x, style),
         // v7.38 (read01, T11) — bpchar renders blank-padded (the stored form,
         // as PG's wire display). The ::text CAST strips (handled in cast.rs).
         Value::BpChar(s) => s.to_string(),
@@ -271,13 +278,13 @@ pub fn value_to_text(v: &Value) -> String {
             scale,
             kind,
         } => format_numeric_kind(*kind, *scaled, *scale),
-        Value::Date(d) => format_date(*d),
-        Value::Timestamp(t) => format_timestamp(*t),
+        Value::Date(d) => crate::eval::format_date_styled(*d, style),
+        Value::Timestamp(t) => crate::eval::format_timestamp_styled(*t, style),
         Value::Interval {
             months,
             days,
             micros,
-        } => format_interval(*months, *days, *micros),
+        } => crate::eval::format_interval_styled(*months, *days, *micros, style),
         Value::Null => "NULL".into(),
         // v7.10.4 — BYTEA renders as PG hex form.
         Value::Bytes(b) => format_bytea_hex(b),
@@ -313,15 +320,15 @@ pub fn value_to_text(v: &Value) -> String {
         // ζ-A/γ/δ/ε first-class types.
         Value::BoolArray(items) => crate::eval::format_bool_array(items),
         Value::SmallIntArray(items) => crate::eval::format_smallint_array(items),
-        Value::FloatArray(items) => crate::eval::format_float_array(items),
+        Value::FloatArray(items) => crate::eval::format_float_array_styled(items, style),
         Value::NumericArray(items) => crate::eval::format_numeric_array(items),
-        Value::DateArray(items) => crate::eval::format_date_array(items),
-        Value::TimestampArray(items) => crate::eval::format_timestamp_array(items, false),
-        Value::TimestamptzArray(items) => crate::eval::format_timestamp_array(items, true),
+        Value::DateArray(items) => crate::eval::format_date_array_styled(items, style),
+        Value::TimestampArray(items) => crate::eval::format_timestamp_array_styled(items, false, style),
+        Value::TimestamptzArray(items) => crate::eval::format_timestamp_array_styled(items, true, style),
         Value::UuidArray(items) => crate::eval::format_uuid_array(items),
         Value::JsonArray(items) | Value::JsonbArray(items) => crate::eval::format_text_array(items),
         Value::BytesArray(items) => crate::eval::format_bytea_array(items),
-        Value::IntervalArray(items) => crate::eval::format_interval_array(items),
+        Value::IntervalArray(items) => crate::eval::format_interval_array_styled(items, style),
         Value::MoneyArray(items) => crate::conversions::format_money_array(items),
         // v7.37.5 ε — geometry canonical PG text.
         Value::Point(p) => crate::conversions::format_point(*p),

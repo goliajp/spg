@@ -728,6 +728,10 @@ pub struct Engine {
     /// `savepoint_guc_marks` records the stack depth at each open
     /// savepoint so `ROLLBACK TO` can unwind just the later ones.
     pub(crate) local_guc_saves: Vec<(String, Option<String>)>,
+    /// v7.39 (GUC knife 3) — parsed DateStyle / IntervalStyle /
+    /// extra_float_digits, kept in lockstep with `session_params` so
+    /// renderers don't re-parse GUC text per cell.
+    pub(crate) render_style: crate::eval::RenderStyle,
     pub(crate) savepoint_guc_marks: Vec<(String, usize)>,
     /// v7.38 (read01 P3.26) — set when a statement fails inside an explicit
     /// transaction; while true every statement except COMMIT / ROLLBACK /
@@ -890,6 +894,7 @@ impl Engine {
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
+            render_style: crate::eval::RenderStyle::default(),
             savepoint_guc_marks: Vec::new(),
             tx_aborted: false,
             trigger_recursion_depth: 0,
@@ -1196,6 +1201,7 @@ impl Engine {
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
+            render_style: crate::eval::RenderStyle::default(),
             savepoint_guc_marks: Vec::new(),
             tx_aborted: false,
             trigger_recursion_depth: 0,
@@ -1284,6 +1290,7 @@ impl Engine {
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
                     local_guc_saves: Vec::new(),
+            render_style: crate::eval::RenderStyle::default(),
                     savepoint_guc_marks: Vec::new(),
                     tx_aborted: false,
                     trigger_recursion_depth: 0,
