@@ -510,9 +510,17 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
 
 fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
     let trimmed = s.trim();
+    // v7.39 (read01 jsonfuncs.c) — the json_to_record/populate desugar
+    // routes JSON array text ("[1,2]") through this cast; accept the
+    // bracket form alongside PG's brace form.
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|x| x.strip_suffix(']'))
+        })
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("INT[] literal {s:?} must be enclosed in '{{...}}'"),
         })?;
@@ -541,6 +549,11 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|x| x.strip_suffix(']'))
+        })
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("BIGINT[] literal {s:?} must be enclosed in '{{...}}'"),
         })?;
@@ -573,6 +586,11 @@ fn decode_text_array_external(s: &str) -> Result<Vec<Option<String>>, EvalError>
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|x| x.strip_suffix(']'))
+        })
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("TEXT[] literal {s:?} must be enclosed in '{{...}}'"),
         })?;

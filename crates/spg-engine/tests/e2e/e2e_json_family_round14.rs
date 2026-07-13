@@ -96,3 +96,56 @@ fn json_scalar_and_serialize() {
         vec!["42", "\"x\"", "{\"a\":1}"]
     );
 }
+
+// v7.39 (read01 jsonfuncs.c, part 2) — strip_in_arrays, the populate
+// family in FROM position, JSON-bracket array casts in the record
+// desugar, and the type-split error wordings. Byte-locked vs PG18.
+#[test]
+fn strip_nulls_two_arg_and_record_families() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row_of(
+            &mut e,
+            "SELECT json_strip_nulls('[null,1]'::json, true), \
+             json_strip_nulls('{\"a\":null,\"b\":[null]}'::json, true)"
+        ),
+        vec!["[1]", "{\"b\":[]}"]
+    );
+    // populate_record with an AS column list (record base carries type).
+    assert_eq!(
+        row_of(
+            &mut e,
+            "SELECT * FROM json_populate_record(NULL::record, '{\"x\":1}') AS t(x int)"
+        ),
+        vec!["1"]
+    );
+    // Array-typed columns in the record desugar accept the JSON form.
+    assert_eq!(
+        row_of(
+            &mut e,
+            "SELECT * FROM jsonb_to_record('{\"a\":1,\"b\":\"t\",\"c\":[1,2]}') \
+             AS t(a int, b text, c int[])"
+        ),
+        vec!["1", "t", "{1,2}"]
+    );
+}
+
+#[test]
+fn jsonfuncs_error_wordings() {
+    let mut e = Engine::new();
+    let err = |e: &mut Engine, sql: &str| -> String {
+        format!("{}", e.execute(sql).unwrap_err())
+    };
+    assert!(
+        err(&mut e, "SELECT json_array_length('{\"a\":1}'::json)")
+            .contains("cannot get array length of a non-array")
+    );
+    assert!(
+        err(&mut e, "SELECT json_array_length('1'::json)")
+            .contains("cannot get array length of a scalar")
+    );
+    assert!(
+        err(&mut e, "SELECT * FROM json_object_keys('[1,2]'::json)")
+            .contains("cannot call json_object_keys on an array")
+    );
+}

@@ -3434,6 +3434,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("ShortWord must be")
             || msg.contains("MaxFragments must be")
             || msg.contains("step size cannot equal zero")
+            || msg.contains("cannot get array length of")
+            || msg.contains("cannot call json_object_keys")
+            || msg.contains("cannot call jsonb_object_keys")
         {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is
