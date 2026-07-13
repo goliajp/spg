@@ -532,6 +532,27 @@ pub(super) fn apply_binary(
             _ => unreachable!(),
         };
     }
+    // v7.39 (read01 multirangetypes.c) — multirange set algebra:
+    // + union, - difference, * intersection.
+    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+        && matches!(l, Value::Multirange { .. })
+        && matches!(r, Value::Multirange { .. })
+    {
+        let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) =
+            (&l, &r)
+        else {
+            unreachable!()
+        };
+        let ranges = match op {
+            BinOp::Add => multirange_union(*kind, a, b),
+            BinOp::Sub => multirange_difference(*kind, a, b),
+            _ => multirange_intersection(*kind, a, b),
+        };
+        return Ok(Value::Multirange {
+            kind: *kind,
+            ranges,
+        });
+    }
     // MONEY arithmetic (integer cents) before the generic numeric path.
     if let Some(result) = money_arith(op, &l, &r) {
         return result;
@@ -824,6 +845,36 @@ pub(super) fn apply_binary(
         // v7.37 — RANGE operands claim @> / <@ / && ahead of the array /
         // JSON / inet interpretations. `range @> elem|range`, `<@` swapped,
         // `&&` overlap. Verified vs PG18.
+        // v7.39 (read01 multirangetypes.c) — multirange containment.
+        BinOp::JsonContains if matches!(l, Value::Multirange { .. }) => {
+            let Value::Multirange { kind, ranges } = &l else {
+                unreachable!()
+            };
+            match multirange_contains(*kind, ranges, &r) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Null),
+            }
+        }
+        BinOp::JsonContainedBy if matches!(r, Value::Multirange { .. }) => {
+            let Value::Multirange { kind, ranges } = &r else {
+                unreachable!()
+            };
+            match multirange_contains(*kind, ranges, &l) {
+                Some(b) => Ok(Value::Bool(b)),
+                None => Ok(Value::Null),
+            }
+        }
+        // Multirange overlap: non-empty intersection.
+        BinOp::InetOverlap
+            if matches!(l, Value::Multirange { .. }) && matches!(r, Value::Multirange { .. }) =>
+        {
+            let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) =
+                (&l, &r)
+            else {
+                unreachable!()
+            };
+            Ok(Value::Bool(!multirange_intersection(*kind, a, b).is_empty()))
+        }
         BinOp::JsonContains if matches!(l, Value::Range { .. }) => {
             let Value::Range {
                 kind: ak,
@@ -3352,6 +3403,174 @@ fn normalize_multirange(
 /// sort by lower bound, and merge overlapping/adjacent spans. This is
 /// what `multirange` constructors must store — `int4multirange(int4range
 /// (1,5), int4range(4,8))` is `{[1,8)}`, not two spans.
+/// v7.39 (read01 multirangetypes.c) — span -> RangeParts view.
+fn span_parts(
+    kind: spg_storage::RangeKind,
+    s: &spg_storage::RangeSpan,
+) -> RangeParts<'_> {
+    RangeParts::new(kind, &s.lower, &s.upper, s.lower_inc, s.upper_inc, s.empty)
+}
+
+/// Multirange contains: an element / a range is contained when SOME span
+/// contains it; a multirange is contained when EVERY span of it is
+/// contained in some span (canonical spans are disjoint + sorted, so the
+/// per-span check is exact).
+pub(crate) fn multirange_contains(
+    kind: spg_storage::RangeKind,
+    spans: &[spg_storage::RangeSpan],
+    rhs: &Value<'_>,
+) -> Option<bool> {
+    match rhs {
+        Value::Range {
+            kind: rk,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => {
+            if *rk != kind {
+                return None;
+            }
+            if *empty {
+                return Some(true);
+            }
+            let b = RangeParts::new(*rk, lower, upper, *lower_inc, *upper_inc, *empty);
+            Some(spans.iter().any(|s| range_contains_range(span_parts(kind, s), b)))
+        }
+        Value::Multirange { kind: rk, ranges } => {
+            if *rk != kind {
+                return None;
+            }
+            Some(ranges.iter().all(|r| {
+                spans
+                    .iter()
+                    .any(|s| range_contains_range(span_parts(kind, s), span_parts(kind, r)))
+            }))
+        }
+        Value::Null => None,
+        elem => Some(spans.iter().any(|s| {
+            range_contains_elem(kind, &s.lower, &s.upper, s.lower_inc, s.upper_inc, s.empty, elem)
+        })),
+    }
+}
+
+/// Multirange set algebra: union / difference / intersection, all
+/// returning canonical span lists.
+pub(crate) fn multirange_union(
+    kind: spg_storage::RangeKind,
+    a: &[spg_storage::RangeSpan],
+    b: &[spg_storage::RangeSpan],
+) -> alloc::vec::Vec<spg_storage::RangeSpan> {
+    let mut all: alloc::vec::Vec<spg_storage::RangeSpan> = a.to_vec();
+    all.extend_from_slice(b);
+    normalize_multirange_spans(kind, &all)
+}
+
+pub(crate) fn multirange_intersection(
+    kind: spg_storage::RangeKind,
+    a: &[spg_storage::RangeSpan],
+    b: &[spg_storage::RangeSpan],
+) -> alloc::vec::Vec<spg_storage::RangeSpan> {
+    let mut out: alloc::vec::Vec<spg_storage::RangeSpan> = alloc::vec::Vec::new();
+    for x in a {
+        for y in b {
+            if let Value::Range {
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+                ..
+            } = range_intersect(span_parts(kind, x), span_parts(kind, y))
+            {
+                if !empty {
+                    out.push(spg_storage::RangeSpan {
+                        lower,
+                        upper,
+                        lower_inc,
+                        upper_inc,
+                        empty: false,
+                    });
+                }
+            }
+        }
+    }
+    normalize_multirange_spans(kind, &out)
+}
+
+pub(crate) fn multirange_difference(
+    kind: spg_storage::RangeKind,
+    a: &[spg_storage::RangeSpan],
+    b: &[spg_storage::RangeSpan],
+) -> alloc::vec::Vec<spg_storage::RangeSpan> {
+    // Subtract every b-span from every surviving a-fragment. A cut can
+    // split a fragment in two: [frag.lower, cut.lower) + (cut.upper,
+    // frag.upper] — expressed through the bound flips.
+    let mut frags: alloc::vec::Vec<spg_storage::RangeSpan> = a.to_vec();
+    for cut in b {
+        let mut next: alloc::vec::Vec<spg_storage::RangeSpan> = alloc::vec::Vec::new();
+        for f in frags {
+            // No overlap -> keep whole.
+            let inter = range_intersect(span_parts(kind, &f), span_parts(kind, cut));
+            let overlap = matches!(&inter, Value::Range { empty: false, .. });
+            if !overlap {
+                next.push(f);
+                continue;
+            }
+            let Value::Range {
+                lower: il,
+                upper: iu,
+                lower_inc: ili,
+                upper_inc: iui,
+                ..
+            } = inter
+            else {
+                next.push(f);
+                continue;
+            };
+            // Left remainder: [f.lower, inter.lower)
+            let left = spg_storage::RangeSpan {
+                lower: f.lower.clone(),
+                upper: il.clone(),
+                lower_inc: f.lower_inc,
+                upper_inc: !ili,
+                empty: false,
+            };
+            if span_nonempty(kind, &left) {
+                next.push(left);
+            }
+            // Right remainder: (inter.upper, f.upper]
+            let right = spg_storage::RangeSpan {
+                lower: iu.clone(),
+                upper: f.upper.clone(),
+                lower_inc: !iui,
+                upper_inc: f.upper_inc,
+                empty: false,
+            };
+            if span_nonempty(kind, &right) {
+                next.push(right);
+            }
+        }
+        frags = next;
+    }
+    normalize_multirange_spans(kind, &frags)
+}
+
+/// A span is non-empty when lower < upper, or lower == upper with both
+/// bounds inclusive; open bounds (None) are infinite.
+fn span_nonempty(kind: spg_storage::RangeKind, s: &spg_storage::RangeSpan) -> bool {
+    let _ = kind;
+    match (&s.lower, &s.upper) {
+        (Some(l), Some(u)) => match crate::orderby::value_cmp(l, u) {
+            core::cmp::Ordering::Less => true,
+            core::cmp::Ordering::Equal => s.lower_inc && s.upper_inc,
+            core::cmp::Ordering::Greater => false,
+        },
+        _ => true,
+    }
+}
+
 pub(crate) fn normalize_multirange_spans(
     kind: spg_storage::RangeKind,
     spans: &[spg_storage::RangeSpan],

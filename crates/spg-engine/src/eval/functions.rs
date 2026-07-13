@@ -5367,6 +5367,12 @@ fn apply_function_dispatch(
                 } else {
                     upper.as_ref().map_or(Value::Null, |v| (**v).clone())
                 }),
+                // v7.39 (read01 multirangetypes.c) — upper(anymultirange):
+                // the last span's upper bound.
+                Value::Multirange { ranges, .. } => Ok(ranges
+                    .last()
+                    .and_then(|s| s.upper.as_ref())
+                    .map_or(Value::Null, |v| (**v).clone())),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("upper() needs text, got {:?}", other.data_type()),
                 }),
@@ -5388,6 +5394,12 @@ fn apply_function_dispatch(
                 } else {
                     lower.as_ref().map_or(Value::Null, |v| (**v).clone())
                 }),
+                // v7.39 (read01 multirangetypes.c) — lower(anymultirange):
+                // the first span's lower bound (canonical order).
+                Value::Multirange { ranges, .. } => Ok(ranges
+                    .first()
+                    .and_then(|s| s.lower.as_ref())
+                    .map_or(Value::Null, |v| (**v).clone())),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("lower() needs text, got {:?}", other.data_type()),
                 }),
@@ -7792,12 +7804,12 @@ fn apply_function_dispatch(
                     }
                     out.push(Some(piece));
                 } else {
-                    // Garbage char.
+                    // Garbage char — PG's single wording for every
+                    // parse_ident failure.
                     if strict {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "parse_ident(): unexpected character {:?} in {s:?}",
-                                bytes[i]
+                                "string is not a valid identifier: {s:?}"
                             ),
                         });
                     }
@@ -7809,11 +7821,23 @@ fn apply_function_dispatch(
                 }
                 if i < bytes.len() && bytes[i] == '.' {
                     i += 1;
+                    // v7.39 (read01 misc.c) — a trailing dot with nothing
+                    // after it is invalid ('a.b.').
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j >= bytes.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "string is not a valid identifier: {s:?}"
+                            ),
+                        });
+                    }
                 } else if strict && i < bytes.len() {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "parse_ident(): trailing garbage {:?}",
-                            &s[i..]
+                            "string is not a valid identifier: {s:?}"
                         ),
                     });
                 }
@@ -10727,6 +10751,48 @@ fn apply_function_dispatch(
             }
         }
         // v7.39 (read01 json.c) — SQL:2016 json_scalar / json_serialize.
+        // v7.39 (read01 misc.c) — pg_basetype(regtype): the innermost
+        // base type of a domain chain; a non-domain returns itself. SPG's
+        // regtype carries the type NAME.
+        "pg_basetype" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("pg_basetype() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let name = s.trim().to_ascii_lowercase();
+                    if let Some(dom) = ctx
+                        .catalog
+                        .and_then(|cat| cat.domain_types().get(name.as_str()))
+                    {
+                        // Domains store their resolved base DataType, so a
+                        // single hop reaches the innermost base.
+                        if let Some(n) =
+                            crate::eval::pg_typeof_name_for_datatype(dom.base_type)
+                        {
+                            return Ok(Value::text(n));
+                        }
+                    }
+                    // Non-domain: canonicalize the spelling like PG's
+                    // regtype output ('int4' -> 'integer').
+                    if let Some(dt) = crate::conversions::type_name_to_data_type(&name) {
+                        if let Some(n) = crate::eval::pg_typeof_name_for_datatype(dt) {
+                            return Ok(Value::text(n));
+                        }
+                    }
+                    Ok(Value::text(name))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "pg_basetype() needs regtype, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.39 (read01 like.c) — like_escape(pattern, esc): rewrite a
         // pattern that uses a custom escape into the default-backslash
         // convention (PG's ESCAPE-clause helper function).
@@ -14800,7 +14866,15 @@ fn apply_function_dispatch(
         // shortcuts only catch the bare top-level SELECT shape.
         // SPG is single-database + single-schema; the values
         // mirror the wire-layer canned defaults.
-        "current_database" | "database" => Ok(Value::text("spg")),
+        // v7.39 (read01 misc.c) — the connection's database name (the
+        // wire layer records it in the session GUC map at startup);
+        // "spg" stays the embedded default.
+        "current_database" | "database" => Ok(Value::text(
+            ctx.session_gucs
+                .and_then(|g| g.get("spg.database"))
+                .cloned()
+                .unwrap_or_else(|| String::from("spg")),
+        )),
         "current_schema" => Ok(Value::text::<String>("public".into())),
         // v7.39 (RLS) — current_user / user follow `SET ROLE`; session_user is
         // the login identity (unaffected by SET ROLE). Both default to admin.
@@ -14886,6 +14960,18 @@ fn apply_function_dispatch(
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Text(s) => s.trim(),
+                // v7.39 (read01 multirangetypes.c) — multirange predicates.
+                Value::Multirange { ranges, .. } => {
+                    let result = match name {
+                        "isempty" => ranges.is_empty(),
+                        "lower_inc" => ranges.first().is_some_and(|s| s.lower_inc && s.lower.is_some()),
+                        "upper_inc" => ranges.last().is_some_and(|s| s.upper_inc && s.upper.is_some()),
+                        "lower_inf" => ranges.first().is_some_and(|s| s.lower.is_none()),
+                        "upper_inf" => ranges.last().is_some_and(|s| s.upper.is_none()),
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Bool(result));
+                }
                 // Real Range values (from the constructor functions)
                 // answer directly off the bounds.
                 Value::Range {
@@ -14958,6 +15044,41 @@ fn apply_function_dispatch(
         // range_merge(a, b) — the smallest range containing both.
         // Numeric bounds compare numerically, others lexically.
         "range_merge" => {
+            // v7.39 (read01 multirangetypes.c) — range_merge(multirange):
+            // the smallest range spanning the whole multirange.
+            if args.len() == 1 {
+                return match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Multirange { kind, ranges } => {
+                        if ranges.is_empty() {
+                            return Ok(Value::Range {
+                                kind: *kind,
+                                lower: None,
+                                upper: None,
+                                lower_inc: false,
+                                upper_inc: false,
+                                empty: true,
+                            });
+                        }
+                        let first = &ranges[0];
+                        let last = &ranges[ranges.len() - 1];
+                        Ok(Value::Range {
+                            kind: *kind,
+                            lower: first.lower.clone(),
+                            upper: last.upper.clone(),
+                            lower_inc: first.lower_inc,
+                            upper_inc: last.upper_inc,
+                            empty: false,
+                        })
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "range_merge() single-argument form needs a multirange, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                };
+            }
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(

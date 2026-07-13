@@ -207,6 +207,7 @@ mod e2e_math_fn_string_coerce;
 mod e2e_math_funcs;
 mod e2e_more_privilege_probes;
 mod e2e_multirange_constructors;
+mod e2e_multirange_ops;
 mod e2e_mysql_base64_sha2;
 mod e2e_mysql_clock;
 mod e2e_mysql_component_fns;
