@@ -5248,6 +5248,29 @@ pub(super) fn compare(
             };
             return cmp_result(op, float_pg_cmp(area(aur, all), area(bur, bll)));
         }
+        // v7.39 (read01 rowtypes.c) — runtime composite comparison
+        // (PG record_cmp: pairwise field order). The ROW-literal syntax
+        // desugars earlier; this arm serves cast-produced composites.
+        (Value::Composite(x), Value::Composite(y)) => {
+            if x.len() != y.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "cannot compare record types with different numbers of columns: {} vs {}",
+                        x.len(),
+                        y.len()
+                    ),
+                });
+            }
+            let mut ord = core::cmp::Ordering::Equal;
+            for ((_, a), (_, b)) in x.iter().zip(y.iter()) {
+                let c = crate::orderby::value_cmp(a, b);
+                if c != core::cmp::Ordering::Equal {
+                    ord = c;
+                    break;
+                }
+            }
+            ord
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(

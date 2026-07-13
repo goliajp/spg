@@ -540,6 +540,151 @@ fn apply_domain_constraints<'a>(
 /// v7.38 (read01 P6.67) — validate a value cast to a user ENUM: a text label
 /// must be one of the enum's members (else error, as PG does); a NULL is a
 /// valid typed null. The stored representation stays the text label.
+/// v7.39 (read01 rowtypes.c) — cast into a user composite type: parse the
+/// `(v1,"v 2",)` record text (double-quote wrapping with doubled quotes,
+/// empty field = NULL) and coerce each field to the declared type; a ROW
+/// value re-labels positionally.
+fn apply_composite_cast(
+    v: Value<'static>,
+    comp: &spg_storage::CompositeDef,
+) -> Result<Value<'static>, EvalError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Composite(fields) => {
+            if fields.len() != comp.fields.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot cast a {}-field row to composite type \"{}\"",
+                        fields.len(),
+                        comp.name
+                    ),
+                });
+            }
+            Ok(Value::Composite(
+                comp.fields
+                    .iter()
+                    .zip(fields)
+                    .map(|((name, _), (_, val))| (name.clone(), val))
+                    .collect(),
+            ))
+        }
+        Value::Text(s) => {
+            let raw = parse_record_text(s.as_ref()).ok_or_else(|| EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "malformed record literal: \"{s}\""
+                ),
+            })?;
+            if raw.len() != comp.fields.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "malformed record literal: \"{s}\""
+                    ),
+                });
+            }
+            let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
+                alloc::vec::Vec::with_capacity(raw.len());
+            for ((fname, fty), field_text) in comp.fields.iter().zip(raw) {
+                let val = match field_text {
+                    None => Value::Null,
+                    Some(t) => crate::conversions::coerce_value(
+                        Value::text(t),
+                        *fty,
+                        fname,
+                        0,
+                    )
+                    .map_err(|e| EvalError::TypeMismatch {
+                        detail: alloc::format!("{e}"),
+                    })?,
+                };
+                out.push((fname.clone(), val));
+            }
+            Ok(Value::Composite(out))
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "cannot cast {:?} to composite type \"{}\"",
+                other.data_type(),
+                comp.name
+            ),
+        }),
+    }
+}
+
+/// Split PG's record text `(f1,f2,...)` into per-field raw strings
+/// (None = empty field = NULL). Double quotes wrap fields containing
+/// metacharacters; `""` inside is a literal quote; a backslash escapes
+/// the next character.
+fn parse_record_text(s: &str) -> Option<alloc::vec::Vec<Option<alloc::string::String>>> {
+    let t = s.trim();
+    let inner = t.strip_prefix('(')?.strip_suffix(')')?;
+    let mut out: alloc::vec::Vec<Option<alloc::string::String>> = alloc::vec::Vec::new();
+    let chars: alloc::vec::Vec<char> = inner.chars().collect();
+    let mut field = alloc::string::String::new();
+    let mut quoted_seen = false;
+    let mut i = 0usize;
+    let mut in_quotes = false;
+    loop {
+        if i >= chars.len() {
+            if in_quotes {
+                return None;
+            }
+            out.push(if field.is_empty() && !quoted_seen {
+                None
+            } else {
+                Some(field.clone())
+            });
+            break;
+        }
+        let c = chars[i];
+        if in_quotes {
+            match c {
+                '"' if chars.get(i + 1) == Some(&'"') => {
+                    field.push('"');
+                    i += 2;
+                }
+                '"' => {
+                    in_quotes = false;
+                    i += 1;
+                }
+                '\\' => {
+                    field.push(*chars.get(i + 1)?);
+                    i += 2;
+                }
+                _ => {
+                    field.push(c);
+                    i += 1;
+                }
+            }
+        } else {
+            match c {
+                '"' => {
+                    in_quotes = true;
+                    quoted_seen = true;
+                    i += 1;
+                }
+                ',' => {
+                    out.push(if field.is_empty() && !quoted_seen {
+                        None
+                    } else {
+                        Some(core::mem::take(&mut field))
+                    });
+                    quoted_seen = false;
+                    i += 1;
+                }
+                '\\' => {
+                    field.push(*chars.get(i + 1)?);
+                    i += 2;
+                }
+                _ => {
+                    field.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 fn apply_enum_cast<'a>(
     v: Value<'a>,
     en: &spg_storage::EnumDef,
@@ -848,6 +993,12 @@ fn eval_cast_arm(
         // PG). A typed NULL passes through carrying the enum type.
         if let Some(en) = cat.enum_types().get(name.as_str()) {
             return apply_enum_cast(v, en, name);
+        }
+        // v7.39 (read01 rowtypes.c) — `'(1,x)'::<composite>` parses PG's
+        // record text form against the type's field list; a ROW value
+        // re-labels its fields.
+        if let Some(comp) = cat.composite_types().get(name.as_str()) {
+            return apply_composite_cast(v, comp);
         }
     }
     // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks
