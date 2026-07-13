@@ -13312,6 +13312,8 @@ fn apply_function_dispatch(
                         "timestamptz" | "timestamp with time zone" => 1184,
                         "interval" => 1186,
                         "timetz" | "time with time zone" => 1266,
+                        "bit" => 1560,
+                        "varbit" | "bit varying" => 1562,
                         "numeric" | "decimal" => 1700,
                         "uuid" => 2950,
                         "jsonb" => 3802,
@@ -13334,18 +13336,48 @@ fn apply_function_dispatch(
                 }
                 Some(_) => return Ok(Value::Null),
             };
+            let typmod_given = matches!(
+                args.get(1),
+                Some(Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_))
+            );
             let typmod = match args.get(1) {
                 Some(Value::Int(n)) => i64::from(*n),
                 Some(Value::BigInt(n)) => *n,
                 Some(Value::SmallInt(n)) => i64::from(*n),
                 _ => -1,
             };
+            // A standard array-type OID renders as `<element>[]` (PG's
+            // typelem deconstruction).
+            let oid = match crate::conversions::array_oid_element(oid) {
+                Some(elem) => {
+                    is_array = true;
+                    elem
+                }
+                None => oid,
+            };
+            // PG's typmod-GIVEN-but--1 specials: bpchar/-1 is NOT the same
+            // as CHARACTER (which means CHARACTER(1)), so PG reports the
+            // internal name; same for bit (quoted — it's a keyword).
+            if typmod_given && typmod < 0 {
+                if oid == 1042 {
+                    let n = if is_array { "bpchar[]" } else { "bpchar" };
+                    return Ok(Value::text::<String>(n.into()));
+                }
+                if oid == 1560 {
+                    let n = if is_array { "\"bit\"[]" } else { "\"bit\"" };
+                    return Ok(Value::text::<String>(n.into()));
+                }
+            }
             // PG's deparse names (SQL-standard spellings, not the
             // internal typname) — shared with the `::regtype` cast.
             let Some(base) = crate::conversions::regtype_oid_to_name(oid) else {
                 return Ok(Value::text::<String>("???".into()));
             };
-            let rendered = if typmod >= 4 {
+            let rendered = if typmod >= 0 && matches!(oid, 1560 | 1562) {
+                // bit typmods are the bit count directly (no varlena
+                // header offset).
+                alloc::format!("{base}({typmod})")
+            } else if typmod >= 4 {
                 match oid {
                     1042 | 1043 => {
                         alloc::format!("{base}({})", typmod - 4)
