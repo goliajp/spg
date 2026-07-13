@@ -5826,7 +5826,7 @@ fn generate_series_integers(
 ) -> Result<alloc::vec::Vec<Row<'static>>, EngineError> {
     if step == 0 {
         return Err(EngineError::Unsupported(
-            "generate_series(): step argument cannot be zero".into(),
+            "step size cannot equal zero".into(),
         ));
     }
     let mut out = alloc::vec::Vec::new();

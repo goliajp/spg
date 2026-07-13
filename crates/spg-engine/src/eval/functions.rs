@@ -2616,6 +2616,21 @@ fn apply_function_dispatch(
                 b = a % b;
                 a = t;
             }
+            // v7.39 (read01 int.c) — gcd(INT_MIN, 0) overflows the result
+            // width (|INT_MIN| has no positive counterpart), PG's
+            // "integer out of range" / "bigint out of range".
+            let widest = matches!(&args[0], Value::BigInt(_)) || matches!(&args[1], Value::BigInt(_));
+            if widest {
+                if a > i64::MAX as u64 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "bigint out of range".into(),
+                    });
+                }
+            } else if a > i32::MAX as u64 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                });
+            }
             Ok(int_width_result(a as i64, &args[0], &args[1]))
         }
         "lcm" => {
@@ -2652,7 +2667,20 @@ fn apply_function_dispatch(
                 x = t;
             }
             let g = x;
-            let lcm = (a / g).saturating_mul(b);
+            // v7.39 (read01 int.c) — overflow is an error, not saturation
+            // (PG: lcm(2147483647, 2) -> "integer out of range").
+            let widest =
+                matches!(&args[0], Value::BigInt(_)) || matches!(&args[1], Value::BigInt(_));
+            let cap = if widest { i64::MAX as u64 } else { i32::MAX as u64 };
+            let lcm = (a / g).checked_mul(b).filter(|v| *v <= cap).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: if widest {
+                        "bigint out of range".into()
+                    } else {
+                        "integer out of range".into()
+                    },
+                }
+            })?;
             Ok(int_width_result(lcm as i64, &args[0], &args[1]))
         }
         "radians" => {

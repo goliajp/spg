@@ -3408,8 +3408,16 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "22P02"
         // v7.39 (read01 utils/adt, float.c) — inverse-trig domain
         // violations (asind(2)) are 22003 NUMERIC_VALUE_OUT_OF_RANGE.
-        } else if msg.contains("input is out of range") {
+        } else if msg.contains("input is out of range")
+            || msg.contains("integer out of range")
+            || msg.contains("smallint out of range")
+            || msg.contains("bigint out of range")
+            || msg.contains("value overflows numeric format")
+        {
             "22003"
+        // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
+        } else if msg.contains("division by zero") {
+            "22012"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.
@@ -3422,6 +3430,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("MinWords must be")
             || msg.contains("ShortWord must be")
             || msg.contains("MaxFragments must be")
+            || msg.contains("step size cannot equal zero")
         {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is

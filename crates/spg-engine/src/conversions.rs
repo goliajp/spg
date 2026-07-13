@@ -2804,7 +2804,16 @@ pub(crate) fn coerce_value(
     let coerced: Option<Value<'static>> = match (v, expected) {
         (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
         (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
-        (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+        // v7.39 (read01 int.c) — a narrowing overflow is PG's typed
+        // "smallint out of range" (22003), not a generic type mismatch.
+        (Value::Int(n), DataType::SmallInt) => match i16::try_from(n) {
+            Ok(v) => Some(Value::SmallInt(v)),
+            Err(_) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "smallint out of range".into(),
+                }));
+            }
+        },
         (Value::Int(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
             i128::from(n),
             precision,
@@ -2820,8 +2829,22 @@ pub(crate) fn coerce_value(
             scale,
             col_name,
         )?),
-        (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
-        (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+        (Value::BigInt(n), DataType::Int) => match i32::try_from(n) {
+            Ok(v) => Some(Value::Int(v)),
+            Err(_) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                }));
+            }
+        },
+        (Value::BigInt(n), DataType::SmallInt) => match i16::try_from(n) {
+            Ok(v) => Some(Value::SmallInt(v)),
+            Err(_) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "smallint out of range".into(),
+                }));
+            }
+        },
         #[allow(clippy::cast_precision_loss)]
         (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
         (Value::BigInt(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(

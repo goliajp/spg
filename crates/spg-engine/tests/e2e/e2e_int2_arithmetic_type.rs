@@ -95,3 +95,41 @@ fn int2_overflow_errors_like_pg() {
     // INT2_MIN / -1 has no representable int2 quotient.
     assert!(e.execute("SELECT (-32768)::int2 / (-1)::int2").is_err());
 }
+
+// v7.39 (read01 int.c/int8.c) — overflow/error surfaces byte-locked vs
+// PG18: canonical out-of-range texts on every width (22003 on the wire),
+// division by zero (22012), INT_MIN specials, gcd/lcm overflow, the
+// integer input-syntax wording, and generate_series' zero step.
+#[test]
+fn overflow_and_error_surfaces_match_pg() {
+    let mut e = Engine::new();
+    let err = |e: &mut Engine, sql: &str| -> String {
+        format!("{}", e.execute(sql).unwrap_err())
+    };
+    assert!(err(&mut e, "SELECT 2147483647::int + 1").contains("integer out of range"));
+    assert!(err(&mut e, "SELECT 32767::smallint + 1::smallint").contains("smallint out of range"));
+    assert!(
+        err(&mut e, "SELECT 9223372036854775807::bigint + 1").contains("bigint out of range")
+    );
+    assert!(err(&mut e, "SELECT (-2147483648)::int / (-1)").contains("integer out of range"));
+    assert!(
+        err(&mut e, "SELECT (-9223372036854775808)::bigint / (-1)")
+            .contains("bigint out of range")
+    );
+    assert!(err(&mut e, "SELECT abs((-2147483648)::int)").contains("integer out of range"));
+    // INT_MIN % -1 is 0, not an overflow (PG).
+    match e.execute("SELECT (-2147483648)::int % (-1)").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[0]), "0");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(err(&mut e, "SELECT gcd((-2147483648)::int, 0)").contains("integer out of range"));
+    assert!(err(&mut e, "SELECT lcm(2147483647::int, 2)").contains("integer out of range"));
+    assert!(err(&mut e, "SELECT 65535::int2").contains("smallint out of range"));
+    assert!(
+        err(&mut e, "SELECT '42abc'::int")
+            .contains("invalid input syntax for type integer: \"42abc\"")
+    );
+    assert!(err(&mut e, "SELECT generate_series(1, 5, 0)").contains("step size cannot equal zero"));
+}

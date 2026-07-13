@@ -786,7 +786,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             .and_then(|n| i32::try_from(n).ok())
             .map(Value::Int)
             .ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {s:?} as int"),
+                detail: format!("invalid input syntax for type integer: {s:?}"),
             }),
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
         // PG `bit`/`varbit` → int is the MSB-first bit value.
