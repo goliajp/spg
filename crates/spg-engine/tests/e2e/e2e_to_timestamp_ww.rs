@@ -19,12 +19,12 @@ fn to_timestamp_and_to_date_honour_ww() {
     let mut e = Engine::new();
     assert_eq!(
         text(&mut e, "SELECT to_timestamp('2023 15', 'YYYY WW')::text"),
-        "2023-04-09 00:00:00"
+        "2023-04-09 00:00:00+00"
     );
     // Week 1 is Jan 1.
     assert_eq!(
         text(&mut e, "SELECT to_timestamp('2023 1', 'YYYY WW')::text"),
-        "2023-01-01 00:00:00"
+        "2023-01-01 00:00:00+00"
     );
     assert_eq!(
         text(&mut e, "SELECT to_date('2020 10', 'YYYY WW')::text"),

@@ -3401,7 +3401,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "22007"
         // v7.39 (read01 utils/adt) — the generic bad-literal class
         // (boolean, money, …) is 22P02 INVALID_TEXT_REPRESENTATION.
-        } else if msg.contains("invalid input syntax for type") {
+        } else if msg.contains("invalid input syntax for type")
+            || msg.contains("invalid Roman numeral")
+        {
             "22P02"
         // v7.39 (read01 utils/adt, float.c) — inverse-trig domain
         // violations (asind(2)) are 22003 NUMERIC_VALUE_OUT_OF_RANGE.

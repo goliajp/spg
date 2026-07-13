@@ -5107,14 +5107,17 @@ fn to_char_l_currency() {
             o => format!("{o:?}"),
         }
     };
+    // v7.39 (read01 formatting.c) — L is the LOCALE currency symbol,
+    // which is a single space in the C locale (PG); the old `$`
+    // expectations were an SPG invention. Re-locked against PG18.
     let cases = [
-        ("1234.5", "L9999.99", "$ 1234.50"),
-        ("1234.5", "FML9999.99", "$1234.5"),
-        ("1234.5", "L99999.99", "$  1234.50"),
-        ("-1234.5", "L9999.99", "$-1234.50"),
-        ("5", "L9999", "$    5"),
-        ("1234.5", "FML99G999D99", "$1,234.5"),
-        ("0", "L9999.99", "$     .00"),
+        ("1234.5", "L9999.99", "  1234.50"),
+        ("1234.5", "FML9999.99", " 1234.5"),
+        ("1234.5", "L99999.99", "   1234.50"),
+        ("-1234.5", "L9999.99", " -1234.50"),
+        ("5", "L9999", "     5"),
+        ("1234.5", "FML99G999D99", " 1,234.5"),
+        ("0", "L9999.99", "      .00"),
     ];
     let mut bad = Vec::new();
     for (n, f, pg) in &cases {

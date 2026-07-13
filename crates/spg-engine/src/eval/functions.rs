@@ -6595,7 +6595,7 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let _fmt = match &args[1] {
+            let fmt = match &args[1] {
                 Value::Text(s) => s.to_string(),
                 _ => {
                     return Err(EvalError::TypeMismatch {
@@ -6603,20 +6603,67 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            // Strip locale + presentation chars.
-            let cleaned: alloc::string::String = raw
-                .chars()
-                .filter(|c| {
-                    c.is_ascii_digit()
-                        || matches!(*c, '.' | '-' | '+' | 'e' | 'E')
-                })
-                .collect();
+            let fmt_up = fmt.to_ascii_uppercase();
+            // v7.39 (read01 formatting.c) — RN reads a Roman numeral
+            // (standard form, PG's roman_to_int validation); a
+            // non-Roman input errors like PG.
+            if fmt_up.contains("RN") {
+                return match roman_numeral_to_int(raw.trim()) {
+                    Some(v) => Ok(Value::Numeric {
+                        scaled: i128::from(v),
+                        scale: 0,
+                        kind: spg_storage::NumericKind::Finite,
+                    }),
+                    None => Err(EvalError::TypeMismatch {
+                        detail: "invalid Roman numeral".into(),
+                    }),
+                };
+            }
+            // v7.39 (read01 formatting.c) — sign channels beyond a plain
+            // leading minus need their format token, like PG: `<n>` is
+            // negative only under PR; a trailing sign only under
+            // MI/PL/SG/S.
+            let trimmed = raw.trim();
+            let mut neg = false;
+            let mut body = trimmed;
+            if fmt_up.contains("PR")
+                && body.starts_with('<')
+                && body.ends_with('>')
+            {
+                neg = true;
+                body = &body[1..body.len() - 1];
+            } else if fmt_up.contains("MI")
+                || fmt_up.contains("SG")
+                || fmt_up.contains("PL")
+                || fmt_up.contains('S')
+            {
+                if let Some(b) = body.strip_suffix('-') {
+                    neg = true;
+                    body = b;
+                } else if let Some(b) = body.strip_suffix('+') {
+                    body = b;
+                }
+            }
+            // Strip locale + presentation chars from the remaining body.
+            let mut cleaned = alloc::string::String::new();
+            for c in body.chars() {
+                if c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E') {
+                    cleaned.push(c);
+                } else if c == '-' && cleaned.is_empty() && !neg {
+                    neg = true;
+                } else if c == '+' && cleaned.is_empty() {
+                    // explicit plus — ignore
+                }
+            }
             if cleaned.is_empty() {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "to_number(): could not parse {raw:?}"
                     ),
                 });
+            }
+            if neg {
+                cleaned.insert(0, '-');
             }
             // v7.38 (read01 P6.02) — PG's to_number returns `numeric`, not a
             // float; parse into the exact (scaled, scale) representation so
@@ -7799,7 +7846,16 @@ fn apply_function_dispatch(
                     + i64::from(mi) * 60_000_000
                     + i64::from(s) * 1_000_000
                     + i64::from(us);
-                return Ok(Value::Timestamp(micros));
+                // v7.39 (read01 formatting.c) — to_timestamp returns
+                // timestamptz: the parsed wall time is a reading in the
+                // SESSION zone, converted to the UTC instant here (PG's
+                // DetermineTimeZoneOffset step).
+                let utc = ctx
+                    .session_gucs
+                    .and_then(|g| g.get("timezone"))
+                    .and_then(|z| ctx.zone_local_to_utc(z, micros))
+                    .unwrap_or(micros);
+                return Ok(Value::Timestamp(utc));
             }
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -15168,6 +15224,95 @@ fn adjust_partial_year_to_2020(year: i32) -> i32 {
 }
 
 #[allow(clippy::type_complexity)]
+/// v7.39 (read01 formatting.c) — parse a standard-form Roman numeral
+/// (case-insensitive) into 1..=3999, or None when invalid. The validation
+/// mirrors PG's observable rules: at most 15 chars; I/X/C/M repeat at most
+/// 3 times; V/L/D never repeat and never precede a larger numeral; only
+/// IV/IX/XL/XC/CD/CM subtract, a subtraction can't follow a repeat, and
+/// nothing >= the subtracted numeral may appear after it.
+fn roman_numeral_to_int(input: &str) -> Option<i32> {
+    fn val(c: char) -> i32 {
+        match c {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => 0,
+        }
+    }
+    fn valid_sub(curr: char, next: char) -> bool {
+        matches!(
+            (curr, next),
+            ('I', 'V') | ('I', 'X') | ('X', 'L') | ('X', 'C') | ('C', 'D') | ('C', 'M')
+        )
+    }
+    let chars: alloc::vec::Vec<char> = input
+        .chars()
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if chars.is_empty() || chars.len() > 15 || chars.iter().any(|&c| val(c) == 0) {
+        return None;
+    }
+    let mut result = 0i32;
+    let mut repeat = 1;
+    let (mut v_seen, mut l_seen, mut d_seen) = (false, false, false);
+    let mut last_subtracted = 0i32;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let v = val(c);
+        if last_subtracted != 0 && v >= last_subtracted {
+            return None;
+        }
+        if (v_seen && v >= 5) || (l_seen && v >= 50) || (d_seen && v >= 500) {
+            return None;
+        }
+        match c {
+            'V' => v_seen = true,
+            'L' => l_seen = true,
+            'D' => d_seen = true,
+            _ => {}
+        }
+        if i + 1 < chars.len() {
+            let n = chars[i + 1];
+            let nv = val(n);
+            if v < nv {
+                if !valid_sub(c, n) || repeat > 1 {
+                    return None;
+                }
+                if (v_seen && nv >= 5) || (l_seen && nv >= 50) || (d_seen && nv >= 500) {
+                    return None;
+                }
+                match n {
+                    'V' => v_seen = true,
+                    'L' => l_seen = true,
+                    'D' => d_seen = true,
+                    _ => {}
+                }
+                result += nv - v;
+                last_subtracted = v;
+                repeat = 1;
+                i += 2;
+                continue;
+            }
+            if c == n {
+                repeat += 1;
+                if repeat > 3 {
+                    return None;
+                }
+            } else {
+                repeat = 1;
+            }
+        }
+        result += v;
+        i += 1;
+    }
+    Some(result)
+}
+
 fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u32, u32), String> {
     const MONTHS: [&str; 12] = [
         "JANUARY",
@@ -15183,7 +15328,9 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
         "NOVEMBER",
         "DECEMBER",
     ];
-    let mut year: i32 = 1;
+    // PG's ZERO_tm leaves the year at 0 (astronomical), which is 1 BC —
+    // a format with no year field yields 0001-01-01 ... BC.
+    let mut year: i32 = 0;
     // Deferred year resolution: (raw value, format-token digit width). A
     // partial (< 4-digit) field gets PG's adjust_partial_year_to_2020
     // pivot; a `CC` century token, when present, overrides the high
@@ -15201,6 +15348,13 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
     // v7.37 — `DDD` day-of-year, resolved to month/day after the loop (the
     // year may appear after DDD in the format).
     let mut doy: Option<u32> = None;
+    // v7.39 (read01 formatting.c) — ISO week-date fields (IYYY/IW/ID):
+    // resolved post-loop; a missing ID leaves the date at the ISO week's
+    // Monday (PG). `julian` is the J token (Julian day number), which
+    // supplies the whole date.
+    let mut iso_week: Option<u32> = None;
+    let mut iso_day: Option<u32> = None;
+    let mut julian: Option<i64> = None;
 
     let fmt_bytes: alloc::vec::Vec<char> = fmt.chars().collect();
     let in_bytes: alloc::vec::Vec<char> = input.chars().collect();
@@ -15230,7 +15384,40 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
 
     while fi < fmt_bytes.len() {
         // Longest-token-first matching.
-        if starts_with_ci(&fmt_bytes, fi, "YYYY") {
+        if starts_with_ci(&fmt_bytes, fi, "IYYY") {
+            let v = take_digits(&in_bytes, &mut ii, 4)
+                .ok_or_else(|| alloc::format!("expected ISO year digits at position {ii}"))?;
+            year_token = Some((v as i32, 4));
+            fi += 4;
+        } else if starts_with_ci(&fmt_bytes, fi, "IW") {
+            let v = take_digits(&in_bytes, &mut ii, 2)
+                .ok_or_else(|| alloc::format!("expected ISO week digits at position {ii}"))?;
+            iso_week = Some(v as u32);
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "ID") {
+            let v = take_digits(&in_bytes, &mut ii, 1)
+                .ok_or_else(|| alloc::format!("expected ISO day digits at position {ii}"))?;
+            iso_day = Some(v as u32);
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "RM") {
+            // Roman-numeral month; the table is longest-first so VIII
+            // beats V (PG's reversed rm_months array).
+            const RM: [&str; 12] = [
+                "XII", "XI", "X", "IX", "VIII", "VII", "VI", "V", "IV", "III", "II", "I",
+            ];
+            let m = RM
+                .iter()
+                .position(|r| starts_with_ci(&in_bytes, ii, r))
+                .ok_or_else(|| alloc::format!("unrecognized roman month at position {ii}"))?;
+            month = 12 - m as u32;
+            ii += RM[m].len();
+            fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "J") {
+            let v = take_digits(&in_bytes, &mut ii, 7)
+                .ok_or_else(|| alloc::format!("expected Julian day digits at position {ii}"))?;
+            julian = Some(v as i64);
+            fi += 1;
+        } else if starts_with_ci(&fmt_bytes, fi, "YYYY") {
             let v = take_digits(&in_bytes, &mut ii, 4)
                 .ok_or_else(|| alloc::format!("expected year digits at position {ii}"))?;
             year_token = Some((v as i32, 4));
@@ -15321,6 +15508,16 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
                 .ok_or_else(|| alloc::format!("expected minute digits at position {ii}"))?;
             minute = v as u32;
             fi += 2;
+        } else if starts_with_ci(&fmt_bytes, fi, "SSSSS") || starts_with_ci(&fmt_bytes, fi, "SSSS") {
+            // Seconds past midnight (0..86399).
+            let width = if starts_with_ci(&fmt_bytes, fi, "SSSSS") { 5 } else { 4 };
+            let v = take_digits(&in_bytes, &mut ii, 5)
+                .ok_or_else(|| alloc::format!("expected seconds digits at position {ii}"))?;
+            let v = v as u32;
+            hour = v / 3600;
+            minute = (v / 60) % 60;
+            second = v % 60;
+            fi += width;
         } else if starts_with_ci(&fmt_bytes, fi, "SS") {
             let v = take_digits(&in_bytes, &mut ii, 2)
                 .ok_or_else(|| alloc::format!("expected second digits at position {ii}"))?;
@@ -15382,6 +15579,38 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
             };
         }
         (None, None) => {}
+    }
+    // v7.39 (read01 formatting.c) — a J (Julian day number) field supplies
+    // the whole date (PG's j2date); Julian day of 1970-01-01 is 2440588.
+    if let Some(j) = julian {
+        let abs = i32::try_from(j - 2_440_588)
+            .map_err(|_| alloc::string::String::from("Julian day out of range"))?;
+        let (jy, jm, jd) = super::civil_from_days(abs);
+        year = jy;
+        month = jm;
+        day = jd;
+    }
+    // v7.39 (read01 formatting.c) — resolve ISO week-date fields: the year
+    // parsed above is the ISO year; Jan 4 is always in ISO week 1, whose
+    // Monday anchors the week arithmetic. A missing ID stays at Monday.
+    if let Some(w) = iso_week
+        && julian.is_none()
+    {
+        if !(1..=53).contains(&w) {
+            return Err(alloc::format!("ISO week {w} out of range"));
+        }
+        let jan4 = super::days_from_civil(year, 1, 4);
+        let jan4_dow_mon0 = (i64::from(jan4) + 3).rem_euclid(7) as i32;
+        let week1_monday = jan4 - jan4_dow_mon0;
+        let d = iso_day.unwrap_or(1);
+        if !(1..=7).contains(&d) {
+            return Err(alloc::format!("ISO day {d} out of range"));
+        }
+        let abs = week1_monday + ((w - 1) * 7 + (d - 1)) as i32;
+        let (jy, jm, jd) = super::civil_from_days(abs);
+        year = jy;
+        month = jm;
+        day = jd;
     }
     // v7.37 — resolve DDD (day of year) to month/day now that the year is
     // known (Jan 1 + doy - 1).
