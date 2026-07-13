@@ -273,6 +273,36 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     return int_to_bit_string(v, width);
                 }
             }
+            // v7.39 (read01 mac8.c) — macaddr8 -> macaddr requires the
+            // EUI-64 ff:fe infix; anything else is PG's dedicated error.
+            if name.eq_ignore_ascii_case("macaddr") {
+                if let Value::Macaddr8(b) = &v {
+                    if b[3] == 0xff && b[4] == 0xfe {
+                        return Ok(Value::Macaddr([b[0], b[1], b[2], b[5], b[6], b[7]]));
+                    }
+                    return Err(EvalError::TypeMismatch {
+                        detail: "macaddr8 data out of range to convert to macaddr".into(),
+                    });
+                }
+            }
+            // v7.39 (read01 jsonpath.c) — `::jsonpath` parses and prints
+            // the canonical form (PG's jsonpath type; SPG carries it as
+            // text — the wire OID is a recorded residual with the other
+            // literal projection OIDs).
+            if name.eq_ignore_ascii_case("jsonpath") {
+                return match v {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(s) => Ok(Value::text(
+                        crate::json::jsonpath_canonical(s.as_ref())?,
+                    )),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot cast {:?} to jsonpath",
+                            other.data_type()
+                        ),
+                    }),
+                };
+            }
             let temporal_prec = temporal_typmod(&name);
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
                 alloc::borrow::Cow::Owned(

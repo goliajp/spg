@@ -1740,6 +1740,16 @@ fn eval_like_arm(
 ) -> Result<Value<'static>, EvalError> {
     let v = eval_expr(expr, row, ctx)?;
     let p = eval_expr(pattern, row, ctx)?;
+    // v7.39 (read01 like_match.c) — a pattern ending in an UNPAIRED
+    // escape character is PG's 22025 error, not a silent non-match.
+    if let Value::Text(ps) = &p {
+        let trailing = ps.chars().rev().take_while(|c| *c == '\\').count();
+        if trailing % 2 == 1 {
+            return Err(EvalError::TypeMismatch {
+                detail: "LIKE pattern must not end with escape character".into(),
+            });
+        }
+    }
     // NULL on either side propagates to NULL — same as PG.
     // v7.39 (bpchar epic) — LIKE matches bpchar on its PADDED
     // stored form, per PG's bpchar pattern operators.

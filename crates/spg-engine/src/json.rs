@@ -1378,6 +1378,10 @@ struct FilterPred {
     path: Vec<String>,
     op: FilterOp,
     val: FilterVal,
+    /// v7.39 (read01 jsonpath.c) — `like_regex ... flag "izsq..."`.
+    /// Only `i` affects evaluation today; the string round-trips
+    /// through the canonical printer.
+    regex_flags: Option<String>,
 }
 
 /// A filter predicate tree — a single comparison or a `&&`/`||` combination.
@@ -1694,9 +1698,17 @@ fn parse_filter_atom(chars: &[char], mut i: usize) -> Result<(FilterExpr, usize)
         }
         path.push(chars[start..i].iter().collect());
     }
-    let (op, val, ni) = parse_cmp_and_literal(chars, i)?;
+    let (op, val, regex_flags, ni) = parse_cmp_and_literal(chars, i)?;
     i = ni;
-    Ok((FilterExpr::Cmp(FilterPred { path, op, val }), i))
+    Ok((
+        FilterExpr::Cmp(FilterPred {
+            path,
+            op,
+            val,
+            regex_flags,
+        }),
+        i,
+    ))
 }
 
 /// Parse a comparison operator and its literal operand (`> 8`, `== "b"`,
@@ -1705,7 +1717,7 @@ fn parse_filter_atom(chars: &[char], mut i: usize) -> Result<(FilterExpr, usize)
 fn parse_cmp_and_literal(
     chars: &[char],
     mut i: usize,
-) -> Result<(FilterOp, FilterVal, usize), EvalError> {
+) -> Result<(FilterOp, FilterVal, Option<String>, usize), EvalError> {
     let err = |m: &str| EvalError::TypeMismatch {
         detail: alloc::format!("jsonpath predicate: {m}"),
     };
@@ -1803,7 +1815,34 @@ fn parse_cmp_and_literal(
             .map_err(|_| err("invalid numeric literal"))?;
         FilterVal::Num(num)
     };
-    Ok((op, val, i))
+    // v7.39 (read01 jsonpath.c) — optional `flag "..."` after a
+    // like_regex pattern.
+    let mut flags: Option<String> = None;
+    if matches!(op, FilterOp::LikeRegex) {
+        let mut j = i;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if chars[j..].starts_with(&['f', 'l', 'a', 'g']) {
+            j += 4;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '"' {
+                j += 1;
+                let start = j;
+                while j < chars.len() && chars[j] != '"' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    flags = Some(chars[start..j].iter().collect());
+                    j += 1;
+                    i = j;
+                }
+            }
+        }
+    }
+    Ok((op, val, flags, i))
 }
 
 /// v7.38 (read01, T8) — the PG `.type()` name of a JSON value.
@@ -1897,7 +1936,21 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred, vars: Option<&JsonValue>)
                 // v7.39 — string pattern predicates.
                 FilterOp::StartsWith => lhs.starts_with(rhs.as_str()),
                 FilterOp::LikeRegex => {
-                    crate::eval::regex_is_match(rhs, lhs).unwrap_or(false)
+                    // v7.39 (read01 jsonpath.c) — the `i` flag folds case
+                    // (other flags round-trip but don't alter matching yet).
+                    if pred
+                        .regex_flags
+                        .as_deref()
+                        .is_some_and(|f| f.contains('i'))
+                    {
+                        crate::eval::regex_is_match(
+                            &rhs.to_lowercase(),
+                            &lhs.to_lowercase(),
+                        )
+                        .unwrap_or(false)
+                    } else {
+                        crate::eval::regex_is_match(rhs, lhs).unwrap_or(false)
+                    }
                 }
             },
             _ => false,
@@ -2095,7 +2148,7 @@ pub fn path_predicate_vars(
     let Some(pos) = op_at else { return Ok(None) };
     let left: String = chars[..pos].iter().collect();
     let steps = parse_jsonpath(left.trim())?;
-    let (op, val, _) = parse_cmp_and_literal(&chars, pos)?;
+    let (op, val, regex_flags, _) = parse_cmp_and_literal(&chars, pos)?;
     let root = parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("{e}"),
     })?;
@@ -2104,6 +2157,7 @@ pub fn path_predicate_vars(
         path: Vec::new(),
         op,
         val,
+        regex_flags,
     };
     Ok(Some(
         results.iter().any(|v| filter_matches(v, &pred, vars)),
@@ -2260,6 +2314,139 @@ pub fn path_query_array_vars(
 ///   * Arrays → "[..,..]" with element-wise encoding.
 ///   * Bytes / Date / Timestamp / Uuid / Numeric → quoted textual
 ///     form via Display; PG canonical text shape.
+/// v7.39 (read01 jsonpath.c) — canonicalize a jsonpath literal the way
+/// PG's jsonpath output function does: `lax` is the implicit default and
+/// is not printed, `strict` is; field accessors always print quoted
+/// (`$."a"`); filters print as `?(@ <op> <val>)` with spaces around the
+/// operator; `last - k` keeps its spaces. Errors surface as 22P02-shaped
+/// syntax errors.
+pub fn jsonpath_canonical(input: &str) -> Result<String, EvalError> {
+    let trimmed = input.trim();
+    let (strict, body) = if let Some(rest) = trimmed.strip_prefix("strict ") {
+        (true, rest.trim_start())
+    } else if let Some(rest) = trimmed.strip_prefix("lax ") {
+        (false, rest.trim_start())
+    } else {
+        (false, trimmed)
+    };
+    let steps = parse_jsonpath(body).map_err(|_| {
+        // PG reports the first offending token; the first character is
+        // a close-enough stand-in for the common shapes.
+        let tok: String = body.chars().take(1).collect();
+        EvalError::TypeMismatch {
+            detail: alloc::format!("syntax error at or near {tok:?} of jsonpath input"),
+        }
+    })?;
+    let mut out = String::new();
+    if strict {
+        out.push_str("strict ");
+    }
+    out.push('$');
+    fn idx(b: &IdxBound, out: &mut String) {
+        match b {
+            IdxBound::At(n) => {
+                let _ = core::fmt::Write::write_fmt(out, format_args!("{n}"));
+            }
+            IdxBound::FromLast(0) => out.push_str("last"),
+            IdxBound::FromLast(k) => {
+                let _ = core::fmt::Write::write_fmt(out, format_args!("last - {k}"));
+            }
+        }
+    }
+    fn fval(v: &FilterVal, out: &mut String) {
+        match v {
+            FilterVal::Num(x) => {
+                if x.fract() == 0.0 && x.abs() < 1e15 {
+                    let _ = core::fmt::Write::write_fmt(out, format_args!("{}", *x as i64));
+                } else {
+                    let _ = core::fmt::Write::write_fmt(out, format_args!("{x}"));
+                }
+            }
+            FilterVal::Str(s) => {
+                let _ = core::fmt::Write::write_fmt(out, format_args!("{s:?}"));
+            }
+            FilterVal::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            FilterVal::Null => out.push_str("null"),
+            FilterVal::Var(n) => {
+                let _ = core::fmt::Write::write_fmt(out, format_args!("$\"{n}\""));
+            }
+        }
+    }
+    fn fexpr(e: &FilterExpr, out: &mut String) {
+        match e {
+            FilterExpr::Cmp(p) => {
+                out.push('@');
+                for seg in &p.path {
+                    let _ = core::fmt::Write::write_fmt(out, format_args!(".\"{seg}\""));
+                }
+                let op = match p.op {
+                    FilterOp::Gt => " > ",
+                    FilterOp::Lt => " < ",
+                    FilterOp::Ge => " >= ",
+                    FilterOp::Le => " <= ",
+                    FilterOp::Eq => " == ",
+                    FilterOp::Ne => " != ",
+                    FilterOp::StartsWith => " starts with ",
+                    FilterOp::LikeRegex => " like_regex ",
+                };
+                out.push_str(op);
+                fval(&p.val, out);
+                if let Some(f) = &p.regex_flags {
+                    let _ = core::fmt::Write::write_fmt(
+                        out,
+                        format_args!(" flag \"{f}\""),
+                    );
+                }
+            }
+            FilterExpr::And(l, r) => {
+                fexpr(l, out);
+                out.push_str(" && ");
+                fexpr(r, out);
+            }
+            FilterExpr::Or(l, r) => {
+                fexpr(l, out);
+                out.push_str(" || ");
+                fexpr(r, out);
+            }
+        }
+    }
+    for st in &steps {
+        match st {
+            PathStep::Field(f) => {
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!(".\"{f}\""));
+            }
+            PathStep::Index(b) => {
+                out.push('[');
+                idx(b, &mut out);
+                out.push(']');
+            }
+            PathStep::Wildcard => out.push_str("[*]"),
+            PathStep::Range(a, b) => {
+                out.push('[');
+                idx(a, &mut out);
+                out.push_str(" to ");
+                idx(b, &mut out);
+                out.push(']');
+            }
+            PathStep::Filter(e) => {
+                out.push_str("?(");
+                fexpr(e, &mut out);
+                out.push(')');
+            }
+            PathStep::Size => out.push_str(".size()"),
+            PathStep::TypeOf => out.push_str(".type()"),
+            PathStep::Num(m) => out.push_str(match m {
+                NumMethod::Abs => ".abs()",
+                NumMethod::Floor => ".floor()",
+                NumMethod::Ceiling => ".ceiling()",
+                NumMethod::Double => ".double()",
+            }),
+            PathStep::RecursiveAll => out.push_str(".**"),
+        }
+    }
+    Ok(out)
+}
+
 pub fn value_to_json_text(v: &Value) -> String {
     let mut out = String::new();
     encode_value_into(v, &mut out);

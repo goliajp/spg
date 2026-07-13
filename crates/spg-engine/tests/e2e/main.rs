@@ -190,6 +190,7 @@ mod e2e_jsonb_subscript;
 mod e2e_jsonb_total_order;
 mod e2e_jsonb_typeof_array_length;
 mod e2e_jsonpath_filter;
+mod e2e_jsonpath_like_mac;
 mod e2e_lastval;
 mod e2e_lateral_correlated_srf;
 mod e2e_levenshtein;

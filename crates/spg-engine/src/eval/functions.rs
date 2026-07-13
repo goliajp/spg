@@ -10727,6 +10727,50 @@ fn apply_function_dispatch(
             }
         }
         // v7.39 (read01 json.c) — SQL:2016 json_scalar / json_serialize.
+        // v7.39 (read01 like.c) — like_escape(pattern, esc): rewrite a
+        // pattern that uses a custom escape into the default-backslash
+        // convention (PG's ESCAPE-clause helper function).
+        "like_escape" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("like_escape() takes 2 args, got {}", args.len()),
+                });
+            }
+            let (pat, esc) = match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(p), Value::Text(e)) => (p.as_ref(), e.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "like_escape() takes text args".into(),
+                    });
+                }
+            };
+            let esc_ch = esc.chars().next();
+            let mut out = String::with_capacity(pat.len() + 4);
+            let mut it = pat.chars().peekable();
+            while let Some(c) = it.next() {
+                if Some(c) == esc_ch {
+                    match it.next() {
+                        // Escaped char: keep it escaped with backslash when
+                        // it is a wildcard, literal otherwise.
+                        Some(n) if n == '%' || n == '_' || n == '\\' => {
+                            out.push('\\');
+                            out.push(n);
+                        }
+                        Some(n) => out.push(n),
+                        None => {}
+                    }
+                } else if c == '\\' {
+                    // A literal backslash must be escaped under the new
+                    // convention.
+                    out.push('\\');
+                    out.push('\\');
+                } else {
+                    out.push(c);
+                }
+            }
+            Ok(Value::text(out))
+        }
         "json_scalar" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {

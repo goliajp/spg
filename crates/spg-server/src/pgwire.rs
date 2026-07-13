@@ -3421,6 +3421,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 json.c) — 22030 DUPLICATE_JSON_OBJECT_KEY_VALUE.
         } else if msg.contains("duplicate JSON object key value") {
             "22030"
+        // v7.39 (read01 like_match.c) — 22025 INVALID_ESCAPE_SEQUENCE.
+        } else if msg.contains("LIKE pattern must not end with escape") {
+            "22025"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.
@@ -3441,7 +3444,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is
         // PG's 42601 SYNTAX_ERROR.
-        } else if msg.contains("invalid parameter list format") {
+        } else if msg.contains("invalid parameter list format")
+            || msg.contains("of jsonpath input")
+        {
             "42601"
         // v7.39 (read01 utils/adt) — PG's multidim-search refusal is
         // 0A000 FEATURE_NOT_SUPPORTED.

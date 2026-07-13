@@ -1682,6 +1682,17 @@ pub fn parse_macaddr_text(s: &str) -> Option<[u8; 6]> {
 pub fn parse_macaddr8_text(s: &str) -> Option<[u8; 8]> {
     let s = s.trim();
     let cleaned: alloc::string::String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    // v7.39 (read01 mac8.c) — a 6-byte (EUI-48) input converts by
+    // inserting ff:fe as the 4th/5th octets, like PG's macaddr8_in.
+    if cleaned.len() == 12 {
+        let mut six = [0u8; 6];
+        for i in 0..6 {
+            six[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        return Some([
+            six[0], six[1], six[2], 0xff, 0xfe, six[3], six[4], six[5],
+        ]);
+    }
     if cleaned.len() != 16 {
         return None;
     }
@@ -3231,7 +3242,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for MACADDR: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type macaddr: {s:?}"
                     ),
                 }));
             }
@@ -3241,7 +3252,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for MACADDR8: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type macaddr8: {s:?}"
                     ),
                 }));
             }
