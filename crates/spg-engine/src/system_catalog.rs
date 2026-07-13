@@ -2529,9 +2529,82 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("proargtypes", DataType::Text, false),
         ColumnSchema::new("prosrc", DataType::Text, false),
     ];
-    // (oid, name, kind, nargs, rettype). OIDs taken from PG's
-    // pg_proc.dat for the common subset.
-    let funcs: &[(i64, &str, &str, i32, i64)] = &[
+    let funcs: &[(i64, &str, &str, i32, i64)] = PG_PROC_FUNCS;
+    let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
+    // PG conventions for SPG-internal builtins:
+    // - prolang = 12 (internal: built-in C function)
+    // - procost = 1 (default cost; planner uses for tie-breaking)
+    // - prorows = 0 for scalar functions, 1000 for set-returning
+    // - provariadic = 0 (no built-in below is VARIADIC by signature)
+    // - provolatile: 'i' immutable, 's' stable, 'v' volatile
+    //   (now/random/current_timestamp = 'v'; date_trunc = 'i'; etc.)
+    // - proparallel: 's' safe (default for pure functions),
+    //   'r' restricted, 'u' unsafe
+    // - proisstrict: most builtins are strict (NULL-on-NULL)
+    // - prosrc: PG's internal entry-point name; SPG uses the
+    //   function name itself as the body excerpt
+    let volatile_names: &[&str] = &[
+        "now",
+        "random",
+        "gen_random_uuid",
+        "current_database",
+        "current_user",
+        "session_user",
+        "current_schema",
+    ];
+    for &(oid, name, kind, nargs, rettype) in funcs {
+        let provolatile: &str = if volatile_names.contains(&name) {
+            "v"
+        } else {
+            "i"
+        };
+        let prorows: f64 = match kind {
+            "a" | "w" => 1000.0,
+            _ => 0.0,
+        };
+        // proargtypes — PG int2vector encoding; we don't have the
+        // per-arg type list in the table, so synthesise N placeholder
+        // zeros. ORMs that need the real list will fall back to the
+        // pg_proc.dat columns of pg_proc-loaded extensions.
+        let arg_count = if nargs < 0 { 0 } else { nargs };
+        let mut argtypes = alloc::string::String::new();
+        for i in 0..arg_count {
+            if i > 0 {
+                argtypes.push(' ');
+            }
+            argtypes.push('0');
+        }
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text::<String>(name.into()),
+            Value::BigInt(11), // pronamespace = pg_catalog
+            Value::BigInt(10), // proowner
+            Value::BigInt(12), // prolang = internal
+            Value::Float(1.0), // procost
+            Value::Float(prorows),
+            Value::BigInt(0), // provariadic
+            Value::text::<String>(kind.into()),
+            Value::Bool(false),       // prosecdef
+            Value::Bool(false),       // proleakproof
+            Value::Bool(true),        // proisstrict
+            Value::Bool(kind == "w"), // proretset — window funcs return per-row sets
+            Value::text::<String>(provolatile.into()),
+            Value::text::<String>("s".into()), // proparallel = safe
+            Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
+            Value::SmallInt(0), // pronargdefaults
+            Value::BigInt(rettype),
+            Value::text(argtypes),
+            Value::text::<String>(name.into()), // prosrc
+        ]));
+    }
+    (schema, rows)
+}
+
+/// (oid, name, kind, nargs, rettype). OIDs taken from PG's pg_proc.dat
+/// for the common subset. v7.39 (read01 regproc.c) — module-level so the
+/// regproc/regprocedure casts resolve names against the same table
+/// pg_proc synthesises.
+pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
         // Scalar functions.
         // PG ships eight length() overloads; mirror the full set so
         // catalog joins see the same rows (1317 text, 1318 bpchar,
@@ -2553,6 +2626,10 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         // pronargs = 1 (or 2 with a leading fixed arg), like PG.
         (870, "lower", "f", 1, 25),
         (871, "upper", "f", 1, 25),
+        // v7.39 (read01 regproc.c) — the range overloads make
+        // lower/upper ambiguous for ::regproc, as in PG.
+        (3848, "lower", "f", 1, 2283),
+        (3849, "upper", "f", 1, 2283),
         (936, "substring", "f", 3, 25),
         (937, "substring", "f", 2, 25),
         (885, "btrim", "f", 1, 25),
@@ -2641,76 +2718,7 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         (3112, "first_value", "w", 1, 2283),
         (3113, "last_value", "w", 1, 2283),
         (3114, "nth_value", "w", 2, 2283),
-    ];
-    let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
-    // PG conventions for SPG-internal builtins:
-    // - prolang = 12 (internal: built-in C function)
-    // - procost = 1 (default cost; planner uses for tie-breaking)
-    // - prorows = 0 for scalar functions, 1000 for set-returning
-    // - provariadic = 0 (no built-in below is VARIADIC by signature)
-    // - provolatile: 'i' immutable, 's' stable, 'v' volatile
-    //   (now/random/current_timestamp = 'v'; date_trunc = 'i'; etc.)
-    // - proparallel: 's' safe (default for pure functions),
-    //   'r' restricted, 'u' unsafe
-    // - proisstrict: most builtins are strict (NULL-on-NULL)
-    // - prosrc: PG's internal entry-point name; SPG uses the
-    //   function name itself as the body excerpt
-    let volatile_names: &[&str] = &[
-        "now",
-        "random",
-        "gen_random_uuid",
-        "current_database",
-        "current_user",
-        "session_user",
-        "current_schema",
-    ];
-    for &(oid, name, kind, nargs, rettype) in funcs {
-        let provolatile: &str = if volatile_names.contains(&name) {
-            "v"
-        } else {
-            "i"
-        };
-        let prorows: f64 = match kind {
-            "a" | "w" => 1000.0,
-            _ => 0.0,
-        };
-        // proargtypes — PG int2vector encoding; we don't have the
-        // per-arg type list in the table, so synthesise N placeholder
-        // zeros. ORMs that need the real list will fall back to the
-        // pg_proc.dat columns of pg_proc-loaded extensions.
-        let arg_count = if nargs < 0 { 0 } else { nargs };
-        let mut argtypes = alloc::string::String::new();
-        for i in 0..arg_count {
-            if i > 0 {
-                argtypes.push(' ');
-            }
-            argtypes.push('0');
-        }
-        rows.push(Row::new(alloc::vec![
-            Value::BigInt(oid),
-            Value::text::<String>(name.into()),
-            Value::BigInt(11), // pronamespace = pg_catalog
-            Value::BigInt(10), // proowner
-            Value::BigInt(12), // prolang = internal
-            Value::Float(1.0), // procost
-            Value::Float(prorows),
-            Value::BigInt(0), // provariadic
-            Value::text::<String>(kind.into()),
-            Value::Bool(false),       // prosecdef
-            Value::Bool(false),       // proleakproof
-            Value::Bool(true),        // proisstrict
-            Value::Bool(kind == "w"), // proretset — window funcs return per-row sets
-            Value::text::<String>(provolatile.into()),
-            Value::text::<String>("s".into()), // proparallel = safe
-            Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
-            Value::SmallInt(0), // pronargdefaults
-            Value::BigInt(rettype),
-            Value::text(argtypes),
-            Value::text::<String>(name.into()), // prosrc
-        ]));
-    }
-    (schema, rows)
-}
+];
 
 /// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
 /// queries (`SELECT user, host FROM mysql.user`) probe this at

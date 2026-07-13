@@ -14142,17 +14142,27 @@ fn apply_function_dispatch(
                 .strip_prefix("public.")
                 .unwrap_or(name_arg)
                 .trim_matches('"');
-            for (pos, tname) in cat.table_names().iter().enumerate() {
+            // v7.39 (read01 regproc.c) — to_regclass returns a regclass,
+            // which renders as the relation NAME. System catalogs the
+            // engine synthesises resolve too.
+            for tname in &cat.table_names() {
                 if tname == bare {
-                    return Ok(Value::BigInt(16384 + pos as i64));
+                    return Ok(Value::text(bare.to_string()));
                 }
             }
-            // Views resolve too (regclass covers all relations);
-            // their oid band sits above the table band.
-            for (pos, (vname, _)) in cat.views().iter().enumerate() {
+            for (vname, _) in cat.views() {
                 if vname == bare {
-                    return Ok(Value::BigInt(32768 + pos as i64));
+                    return Ok(Value::text(bare.to_string()));
                 }
+            }
+            const SYSTEM_RELS: &[&str] = &[
+                "pg_class", "pg_namespace", "pg_database", "pg_type", "pg_proc",
+                "pg_attribute", "pg_index", "pg_constraint", "pg_roles", "pg_user",
+                "pg_tables", "pg_views", "pg_settings", "pg_stat_activity",
+                "pg_stat_database", "pg_stat_user_tables",
+            ];
+            if SYSTEM_RELS.contains(&bare) {
+                return Ok(Value::text(bare.to_string()));
             }
             Ok(Value::Null)
         }
@@ -14197,22 +14207,48 @@ fn apply_function_dispatch(
                 "tsquery" => Some(3615),
                 _ => None,
             };
-            Ok(oid.map_or(Value::Null, Value::BigInt))
+            let _ = oid;
+            // v7.39 (read01 regproc.c) — to_regtype returns a regtype,
+            // which renders as the CANONICAL type name (PG); NULL for
+            // unknown names.
+            Ok(crate::conversions::regtype_canonical_name(&name_arg)
+                .map_or(Value::Null, Value::text))
         }
         // to_regnamespace — 'public' and 'pg_catalog' exist.
+        // v7.39 (read01 regproc.c) — to_regnamespace returns a
+        // regnamespace, rendering as the schema NAME.
         "to_regnamespace" => match args.first() {
             None | Some(Value::Null) => Ok(Value::Null),
             Some(Value::Text(s)) => match s.as_ref() {
-                "public" => Ok(Value::BigInt(2200)),
-                "pg_catalog" => Ok(Value::BigInt(11)),
-                "information_schema" => Ok(Value::BigInt(13000)),
+                "public" | "pg_catalog" | "information_schema" => {
+                    Ok(Value::text(s.as_ref().to_string()))
+                }
                 _ => Ok(Value::Null),
             },
             Some(_) => Ok(Value::Null),
         },
-        // Function/operator/role resolvers — the oid spaces queue
-        // with system_catalog v7.40 widening.
-        "to_regproc"
+        // v7.39 (read01 regproc.c) — to_regproc resolves against the
+        // static pg_proc table; ambiguous / unknown names are NULL
+        // (unlike the ::regproc cast, which errors).
+        "to_regproc" => match args.first() {
+            None | Some(Value::Null) => Ok(Value::Null),
+            Some(Value::Text(s)) => {
+                let bare = s.strip_prefix("pg_catalog.").unwrap_or(s.as_ref());
+                let hits = crate::system_catalog::PG_PROC_FUNCS
+                    .iter()
+                    .filter(|(_, n, ..)| *n == bare)
+                    .count();
+                if hits == 1 {
+                    Ok(Value::text(bare.to_string()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            Some(_) => Ok(Value::Null),
+        },
+        // Operator/role resolvers — the oid spaces queue with
+        // system_catalog v7.40 widening.
+        "to_regoper"
         | "to_regprocedure"
         | "to_regoperator"
         | "to_regrole" => Ok(Value::Null),

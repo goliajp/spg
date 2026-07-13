@@ -3452,6 +3452,20 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 regexp.c) — 2201B INVALID_REGULAR_EXPRESSION.
         } else if msg.contains("invalid regular expression") {
             "2201B"
+        // v7.39 (read01 regproc.c) — name-resolution errors.
+        } else if msg.contains("more than one function named")
+            || msg.contains("more than one operator named")
+        {
+            "42725"
+        } else if (msg.contains("type \"") && msg.contains("\" does not exist"))
+            || msg.contains("text search configuration \"")
+            || msg.contains("text search dictionary \"")
+        {
+            "42704"
+        } else if (msg.contains("function \"") && msg.contains("\" does not exist"))
+            || msg.contains("operator does not exist:")
+        {
+            "42883"
         } else if msg.contains("cannot take logarithm of") {
             "2201E"
         } else if msg.contains("zero raised to a negative power is undefined")

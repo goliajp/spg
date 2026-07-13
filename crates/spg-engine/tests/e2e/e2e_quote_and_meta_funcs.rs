@@ -65,10 +65,11 @@ fn to_regclass_missing_relation_is_null() {
         first(&mut e, "SELECT to_regclass('some_table')"),
         spg_storage::Value::Null
     ));
-    assert!(matches!(
+    // v7.39 (read01 regproc.c) — to_regtype renders the canonical name.
+    assert_eq!(
         first(&mut e, "SELECT to_regtype('int')"),
-        spg_storage::Value::BigInt(23)
-    ));
+        spg_storage::Value::text("integer")
+    );
 }
 
 /// U24 (read01 A-group): quote_literal / quote_nullable on a

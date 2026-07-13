@@ -113,7 +113,8 @@ fn regtype_text_in_text_out() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::text("int4"));
+    // v7.39 (read01 regproc.c) — regtype canonicalizes ('int4' → 'integer').
+    assert_eq!(rows[0].values[0], Value::text("integer"));
 }
 
 #[test]
