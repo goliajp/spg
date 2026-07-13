@@ -2902,7 +2902,7 @@ pub(crate) fn coerce_value(
             }
             let Some((mantissa, src_scale)) = parse_numeric_text(&s) else {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("cannot parse {s:?} as NUMERIC for column `{col_name}`"),
+                    detail: alloc::format!("invalid input syntax for type numeric: \"{s}\""),
                 }));
             };
             // Unconstrained `numeric` keeps the parsed scale as-is.

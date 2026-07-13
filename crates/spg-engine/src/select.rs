@@ -5817,6 +5817,82 @@ pub(crate) fn generate_series_rows(
                 rows,
             ))
         }
+        // v7.39 (read01 numeric.c) — the NUMERIC overload. PG walks the
+        // series in exact numeric arithmetic; NaN / infinity bounds and a
+        // zero step get dedicated wordings, and a mixed int/numeric call
+        // resolves here via the implicit int→numeric cast.
+        [_, _] | [_, _, _]
+            if arg_values
+                .iter()
+                .any(|v| matches!(v, Value::Numeric { .. } | Value::NumericBig(_)))
+                && arg_values.iter().all(|v| {
+                    matches!(v, Value::Numeric { .. } | Value::NumericBig(_))
+                        || value_is_integer(v)
+                }) =>
+        {
+            use spg_storage::NumericKind as K;
+            let words: [(&str, &str); 3] = [
+                ("start value cannot be NaN", "start value cannot be infinity"),
+                ("stop value cannot be NaN", "stop value cannot be infinity"),
+                ("step size cannot be NaN", "step size cannot be infinity"),
+            ];
+            for (i, v) in arg_values.iter().enumerate() {
+                if let Value::Numeric { kind, .. } = v {
+                    if *kind != K::Finite {
+                        let (nan_w, inf_w) = words[i];
+                        return Err(EngineError::Unsupported(
+                            if *kind == K::NaN { nan_w } else { inf_w }.into(),
+                        ));
+                    }
+                }
+            }
+            let big = |v: &Value<'_>| {
+                eval::binop::value_to_bignum(v).expect("finite numeric or integer")
+            };
+            let start = big(&arg_values[0]);
+            let stop = big(&arg_values[1]);
+            let step = if arg_values.len() == 3 {
+                big(&arg_values[2])
+            } else {
+                spg_storage::bignum::BigNumeric::from_i128(1, 0)
+            };
+            if step.is_zero() {
+                return Err(EngineError::Unsupported(
+                    "step size cannot equal zero".into(),
+                ));
+            }
+            let descending = step.parts().0;
+            let mut rows = alloc::vec::Vec::new();
+            let mut cur = start;
+            const MAX_ROWS: usize = 10_000_000;
+            loop {
+                cancel.check()?;
+                let c = cur.cmp(&stop);
+                if descending {
+                    if c == core::cmp::Ordering::Less {
+                        break;
+                    }
+                } else if c == core::cmp::Ordering::Greater {
+                    break;
+                }
+                if rows.len() >= MAX_ROWS {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "generate_series() result exceeds {MAX_ROWS} rows"
+                    )));
+                }
+                rows.push(Row::new(alloc::vec![eval::binop::bignum_to_value(
+                    cur.clone()
+                )]));
+                cur = cur.add(&step);
+            }
+            Ok((
+                DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+                rows,
+            ))
+        }
         _ => Err(EngineError::Unsupported(alloc::format!(
             "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
              argument shapes; got {:?}",

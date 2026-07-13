@@ -68,6 +68,62 @@ fn check_log_domain(v: &spg_storage::bignum::BigNumeric) -> Result<(), EvalError
     Ok(())
 }
 
+/// v7.39 (read01 numeric.c) — the NUMERIC overload of gcd()/lcm(): Euclid on
+/// the scale-aligned integer mantissas, result carrying PG's display scale
+/// max(d1, d2). NaN / infinity inputs yield NaN; a non-numeric argument
+/// returns None so the caller's integer path (or its error) still applies.
+fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value<'static>> {
+    use spg_storage::bignum::BigNumeric;
+    let numericish =
+        |v: &Value<'_>| matches!(v, Value::Numeric { .. } | Value::NumericBig(_));
+    let intish = |v: &Value<'_>| {
+        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+    };
+    if !(numericish(x) || numericish(y))
+        || !(numericish(x) || intish(x))
+        || !(numericish(y) || intish(y))
+    {
+        return None;
+    }
+    let special = |v: &Value<'_>| {
+        matches!(v, Value::Numeric { kind, .. } if *kind != spg_storage::NumericKind::Finite)
+    };
+    if special(x) || special(y) {
+        return Some(Value::numeric_special(spg_storage::NumericKind::NaN));
+    }
+    let a = crate::eval::binop::value_to_bignum(x)?;
+    let b = crate::eval::binop::value_to_bignum(y)?;
+    let s = a.scale().max(b.scale());
+    let as_int = |v: &BigNumeric| {
+        let padded = v.round_to(s);
+        let (_, limbs, _) = padded.parts();
+        BigNumeric::from_parts(false, limbs.to_vec(), 0)
+    };
+    let (mut g, mut r) = (as_int(&a), as_int(&b));
+    while !r.is_zero() {
+        let (_, m) = g.div_rem_int(&r);
+        g = r;
+        r = m;
+    }
+    let result_int = if want_lcm {
+        if as_int(&a).is_zero() || as_int(&b).is_zero() {
+            BigNumeric::from_i128(0, 0)
+        } else {
+            // lcm = |a / g · b|; the division by the gcd is exact.
+            let (q, _) = as_int(&a).div_rem_int(&g);
+            q.mul(&as_int(&b))
+        }
+    } else {
+        g
+    };
+    let (_, limbs, _) = result_int.parts();
+    Some(crate::eval::binop::bignum_to_value(BigNumeric::from_parts(
+        false,
+        limbs.to_vec(),
+        s,
+    )))
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -2206,19 +2262,25 @@ fn apply_function_dispatch(
                 | Value::NumericBig(_)) => {
                     let big = crate::eval::binop::value_to_bignum(v)
                         .ok_or_else(|| EvalError::TypeMismatch { detail: "ln(): numeric".into() })?;
+                    check_log_domain(&big)?;
                     big.ln()
                         .map(crate::eval::binop::bignum_to_value)
                         .ok_or_else(|| EvalError::TypeMismatch {
-                            detail: "ln(): input must be > 0".into(),
+                            detail: "ln(): numeric".into(),
                         })
                 }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!("ln() needs numeric, got {:?}", v.data_type()),
                     })?;
-                    if x <= 0.0 {
+                    if x == 0.0 {
                         return Err(EvalError::TypeMismatch {
-                            detail: "ln(): input must be > 0".into(),
+                            detail: "cannot take logarithm of zero".into(),
+                        });
+                    }
+                    if x < 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "cannot take logarithm of a negative number".into(),
                         });
                     }
                     Ok(Value::Float(f64_ln(x)))
@@ -2249,9 +2311,14 @@ fn apply_function_dispatch(
                         let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                             detail: alloc::format!("{name}() needs numeric, got {:?}", v.data_type()),
                         })?;
-                        if x <= 0.0 {
+                        if x == 0.0 {
                             return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!("{name}(): input must be > 0"),
+                                detail: "cannot take logarithm of zero".into(),
+                            });
+                        }
+                        if x < 0.0 {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "cannot take logarithm of a negative number".into(),
                             });
                         }
                         // PG's log(x) / log10(x) is the dedicated
@@ -2618,6 +2685,9 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            if let Some(v) = numeric_gcd_lcm(&args[0], &args[1], false) {
+                return Ok(v);
+            }
             fn to_i64(v: &Value<'_>) -> Result<i64, EvalError> {
                 match v {
                     Value::Int(n) => Ok(*n as i64),
@@ -2662,6 +2732,9 @@ fn apply_function_dispatch(
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
+            }
+            if let Some(v) = numeric_gcd_lcm(&args[0], &args[1], true) {
+                return Ok(v);
             }
             fn to_i64(v: &Value<'_>) -> Result<i64, EvalError> {
                 match v {
@@ -9264,12 +9337,12 @@ fn apply_function_dispatch(
                     })?;
                     if big.parts().0 {
                         return Err(EvalError::TypeMismatch {
-                            detail: "sqrt(): negative input outside real domain".into(),
+                            detail: "cannot take square root of a negative number".into(),
                         });
                     }
                     let rscale = crate::numeric::sqrt_display_scale_big(&big);
                     let root = big.sqrt(rscale).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: "sqrt(): negative input outside real domain".into(),
+                        detail: "cannot take square root of a negative number".into(),
                     })?;
                     Ok(crate::eval::binop::bignum_to_value(root))
                 }
@@ -9279,7 +9352,7 @@ fn apply_function_dispatch(
                     })?;
                     if x < 0.0 {
                         return Err(EvalError::TypeMismatch {
-                            detail: "sqrt(): negative input outside real domain".into(),
+                            detail: "cannot take square root of a negative number".into(),
                         });
                     }
                     if x == 0.0 {
@@ -9297,6 +9370,160 @@ fn apply_function_dispatch(
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
+            }
+            // v7.39 (read01 numeric.c) — NUMERIC power follows the POSIX
+            // pow(3) special-value table: NaN^0 = 1 and 1^NaN = 1 (all other
+            // NaN inputs yield NaN), and infinities resolve by the sign /
+            // magnitude rules below. Error conditions still apply first.
+            {
+                use spg_storage::NumericKind as K;
+                // An unknown-type literal ('NaN', 'inf') resolves to numeric
+                // in PG when the other operand is numeric.
+                let spec = |v: &Value<'_>| match v {
+                    Value::Numeric { kind, .. } if *kind != K::Finite => Some(*kind),
+                    Value::Text(s) => crate::numeric::parse_numeric_special(s),
+                    // A special that arrived as a float ('NaN' literal
+                    // pre-coerced by the arg table) follows the same table —
+                    // POSIX pow(3) rules govern the double overload too.
+                    Value::Float(f) if f.is_nan() => Some(K::NaN),
+                    Value::Float(f) if *f == f64::INFINITY => Some(K::PosInf),
+                    Value::Float(f) if *f == f64::NEG_INFINITY => Some(K::NegInf),
+                    _ => None,
+                };
+                let (s1, s2) = (spec(&args[0]), spec(&args[1]));
+                if s1.is_some() || s2.is_some() {
+                    let fin = |v: &Value<'_>| match v {
+                        Value::Text(s) => {
+                            spg_storage::bignum::BigNumeric::from_decimal_str(s)
+                        }
+                        Value::Float(f) if f.is_finite() => {
+                            spg_storage::bignum::BigNumeric::from_decimal_str(
+                                &alloc::format!("{f}"),
+                            )
+                        }
+                        _ => crate::eval::binop::value_to_bignum(v),
+                    };
+                    let one = || Value::Numeric {
+                        scaled: 1,
+                        scale: 0,
+                        kind: K::Finite,
+                    };
+                    if s1 == Some(K::NaN) {
+                        if let Some(b) = fin(&args[1]) {
+                            if b.is_zero() {
+                                return Ok(one());
+                            }
+                        }
+                        return Ok(Value::numeric_special(K::NaN));
+                    }
+                    if s2 == Some(K::NaN) {
+                        if let Some(a) = fin(&args[0]) {
+                            if a.cmp(&spg_storage::bignum::BigNumeric::from_i128(1, 0))
+                                == core::cmp::Ordering::Equal
+                            {
+                                return Ok(one());
+                            }
+                        }
+                        return Ok(Value::numeric_special(K::NaN));
+                    }
+                    // Signs: -1 / 0 / +1 for finite values, ±1 for infinities.
+                    let sign = |v: &Value<'_>, s: Option<K>| -> i8 {
+                        match s {
+                            Some(K::PosInf) => 1,
+                            Some(K::NegInf) => -1,
+                            _ => match fin(v) {
+                                Some(b) if b.is_zero() => 0,
+                                Some(b) if b.parts().0 => -1,
+                                _ => 1,
+                            },
+                        }
+                    };
+                    let (sign1, sign2) = (sign(&args[0], s1), sign(&args[1], s2));
+                    if sign1 == 0 && sign2 < 0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "zero raised to a negative power is undefined".into(),
+                        });
+                    }
+                    // Infinite exponents count as integral here (PG).
+                    let y_integral = s2.is_some()
+                        || fin(&args[1]).is_some_and(|b| {
+                            b.round_to(0).cmp(&b) == core::cmp::Ordering::Equal
+                        });
+                    if sign1 < 0 && !y_integral {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "a negative number raised to a non-integer power \
+                                     yields a complex result"
+                                .into(),
+                        });
+                    }
+                    let zero = || Value::Numeric {
+                        scaled: 0,
+                        scale: 0,
+                        kind: K::Finite,
+                    };
+                    let x_fin = fin(&args[0]);
+                    if let Some(a) = &x_fin {
+                        if a.cmp(&spg_storage::bignum::BigNumeric::from_i128(1, 0))
+                            == core::cmp::Ordering::Equal
+                        {
+                            return Ok(one());
+                        }
+                    }
+                    if sign2 == 0 {
+                        return Ok(one());
+                    }
+                    if sign1 == 0 && sign2 > 0 {
+                        return Ok(zero());
+                    }
+                    if s2.is_some() {
+                        // y = ±Inf: x = -1 → 1; |x| > 1 matches sign(y) → Inf,
+                        // otherwise 0.
+                        let abs_x_gt_one = match &x_fin {
+                            None => true,
+                            Some(a) => {
+                                if a.cmp(&spg_storage::bignum::BigNumeric::from_i128(-1, 0))
+                                    == core::cmp::Ordering::Equal
+                                {
+                                    return Ok(one());
+                                }
+                                let (_, limbs, scale) = a.parts();
+                                let abs = spg_storage::bignum::BigNumeric::from_parts(
+                                    false,
+                                    limbs.to_vec(),
+                                    scale,
+                                );
+                                abs.cmp(&spg_storage::bignum::BigNumeric::from_i128(1, 0))
+                                    == core::cmp::Ordering::Greater
+                            }
+                        };
+                        return Ok(if abs_x_gt_one == (sign2 > 0) {
+                            Value::numeric_special(K::PosInf)
+                        } else {
+                            zero()
+                        });
+                    }
+                    if s1 == Some(K::PosInf) {
+                        return Ok(if sign2 > 0 {
+                            Value::numeric_special(K::PosInf)
+                        } else {
+                            zero()
+                        });
+                    }
+                    // x = -Inf, y finite: negative y → 0; positive odd
+                    // integer y → -Inf, other positive y → +Inf.
+                    if sign2 < 0 {
+                        return Ok(zero());
+                    }
+                    let y_odd = fin(&args[1]).is_some_and(|b| {
+                        let t = b.round_to(0).to_decimal_str();
+                        t.bytes().last().is_some_and(|c| (c - b'0') % 2 == 1)
+                    });
+                    return Ok(Value::numeric_special(if y_odd {
+                        K::NegInf
+                    } else {
+                        K::PosInf
+                    }));
+                }
             }
             // v7.38 (read01) — PG's `^` / power() are numeric whenever either
             // operand is numeric and neither is float (`2 ^ 0.5` → numeric),
@@ -9440,17 +9667,18 @@ fn apply_function_dispatch(
                 if let (Some(base), Some(exp_b)) = (base, exp_b) {
                     if base.is_zero() {
                         if !exp_b.parts().0 && !exp_b.is_zero() {
+                            // PG renders 0^y at the standard 16-digit rscale.
                             return Ok(crate::eval::binop::bignum_to_value(
-                                spg_storage::bignum::BigNumeric::from_i128(0, 0),
+                                spg_storage::bignum::BigNumeric::from_i128(0, 16),
                             ));
                         }
                         return Err(EvalError::TypeMismatch {
-                            detail: "power(): 0 raised to a non-positive power is undefined".into(),
+                            detail: "zero raised to a negative power is undefined".into(),
                         });
                     }
                     if base.parts().0 {
                         return Err(EvalError::TypeMismatch {
-                            detail: "power(): negative base with fractional exponent yields complex result".into(),
+                            detail: "a negative number raised to a non-integer power yields a complex result".into(),
                         });
                     }
                     if let Some(ln_base) = base.pow_numeric(&exp_b) {
@@ -9469,13 +9697,13 @@ fn apply_function_dispatch(
             // complex; reject cleanly.
             if x < 0.0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "power(): negative base with fractional exponent yields complex result"
+                    detail: "a negative number raised to a non-integer power yields a complex result"
                         .into(),
                 });
             }
             if x == 0.0 && y < 0.0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "power(): 0 raised to negative power is undefined".into(),
+                    detail: "zero raised to a negative power is undefined".into(),
                 });
             }
             if x == 0.0 {
