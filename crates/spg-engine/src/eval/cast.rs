@@ -204,10 +204,15 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         // falls back to the verbatim text (validation stays a separate
         // concern from this representation fix).
         CastTarget::Jsonb => match v {
-            Value::Json(s) | Value::Text(s) => Ok(Value::json(
-                crate::json::canonicalize_jsonb(s.as_ref())
-                    .unwrap_or_else(|_| s.as_ref().to_string()),
-            )),
+            // v7.39 (read01 jsonb) — the explicit ::jsonb cast validates:
+            // invalid tokens (NaN / Infinity / malformed) error like PG
+            // instead of passing the raw text through.
+            Value::Json(s) | Value::Text(s) => match crate::json::canonicalize_jsonb(s.as_ref()) {
+                Ok(c) => Ok(Value::json(c)),
+                Err(_) => Err(EvalError::TypeMismatch {
+                    detail: alloc::string::String::from("invalid input syntax for type json"),
+                }),
+            },
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "::jsonb only accepts TEXT-shape inputs, got {:?}",

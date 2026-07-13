@@ -1419,6 +1419,14 @@ enum FilterVal {
 }
 
 fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
+    // v7.39 (read01 jsonpath) — an optional leading `strict`/`lax` mode
+    // word precedes the `$` (PG's jsonpath grammar). SPG evaluates lax
+    // semantics; the mode word is accepted and stripped.
+    let p = p
+        .trim_start()
+        .strip_prefix("strict")
+        .or_else(|| p.trim_start().strip_prefix("lax"))
+        .map_or(p.trim_start(), str::trim_start);
     let chars: Vec<char> = p.chars().collect();
     let mut i = 0;
     if i >= chars.len() || chars[i] != '$' {
