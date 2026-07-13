@@ -25,7 +25,7 @@ users
 query T
 SELECT 'int4'::REGTYPE
 ----
-int4
+integer
 
 # Integer-shaped input renders as a textual OID.
 query T

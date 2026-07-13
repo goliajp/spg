@@ -1002,6 +1002,67 @@ fn parse_hhmm_offset_secs(off: &str) -> Option<i32> {
     Some(h * 3600 + m * 60)
 }
 
+/// v7.39 (read01 regproc.c) — builtin type name (or alias) → OID, the
+/// resolve half of regtype input. Mirrors the scalar map format_type
+/// renders; extend both together.
+pub(crate) fn regtype_name_to_oid(name: &str) -> Option<i64> {
+    Some(match name.trim() {
+        "bool" | "boolean" => 16,
+        "bytea" => 17,
+        "name" => 19,
+        "int8" | "bigint" => 20,
+        "int2" | "smallint" => 21,
+        "int4" | "int" | "integer" => 23,
+        "text" => 25,
+        "oid" => 26,
+        "json" => 114,
+        "xml" => 142,
+        "float4" | "real" => 700,
+        "float8" | "double precision" => 701,
+        "cidr" => 650,
+        "inet" => 869,
+        "macaddr" => 829,
+        "macaddr8" => 774,
+        "money" => 790,
+        "bpchar" | "char" | "character" => 1042,
+        "varchar" | "character varying" => 1043,
+        "date" => 1082,
+        "time" | "time without time zone" => 1083,
+        "timestamp" | "timestamp without time zone" => 1114,
+        "timestamptz" | "timestamp with time zone" => 1184,
+        "interval" => 1186,
+        "timetz" | "time with time zone" => 1266,
+        "numeric" | "decimal" => 1700,
+        "uuid" => 2950,
+        "jsonb" => 3802,
+        "tsvector" => 3614,
+        "tsquery" => 3615,
+        "pg_lsn" => 3220,
+        "regtype" => 2206,
+        "regclass" => 2205,
+        "regproc" => 24,
+        _ => return None,
+    })
+}
+
+/// Type name (or alias) → PG's canonical spelling ('int4' → 'integer'),
+/// via the two builtin OID maps; `None` when unknown. Handles a `[]`
+/// array suffix.
+pub(crate) fn regtype_canonical_name(name: &str) -> Option<alloc::string::String> {
+    let t = name.trim();
+    if let Some(base) = t.strip_suffix("[]") {
+        let inner = regtype_canonical_name(base)?;
+        return Some(alloc::format!("{inner}[]"));
+    }
+    // PG's internal array-type spelling ('_int4' = int4[]).
+    if let Some(base) = t.strip_prefix('_') {
+        let inner = regtype_canonical_name(base)?;
+        return Some(alloc::format!("{inner}[]"));
+    }
+    let oid = regtype_name_to_oid(&t.to_lowercase())?;
+    regtype_oid_to_name(oid).map(alloc::string::String::from)
+}
+
 pub(crate) fn parse_range_element(
     text: &str,
     kind: spg_storage::RangeKind,
@@ -2659,6 +2720,7 @@ pub(crate) fn array_oid_element(oid: i64) -> Option<i64> {
 
 pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
     Some(match oid {
+        4600 => "pg_brin_bloom_summary",
         16 => "boolean",
         17 => "bytea",
         18 => "\"char\"",

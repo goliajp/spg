@@ -21,6 +21,127 @@ use super::{
     parse_timestamp_literal, value_to_text,
 };
 
+/// v7.39 (read01 regproc.c) — the reg* input types SPG carries as text:
+/// resolve the name and return its canonical rendering, with PG's
+/// distinct not-found / ambiguous errors.
+fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
+    let bare = s
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(s)
+        .trim()
+        .to_string();
+    match kind {
+        "regconfig" => {
+            const CONFIGS: &[&str] = &[
+                "simple", "arabic", "armenian", "basque", "catalan", "danish", "dutch",
+                "english", "finnish", "french", "german", "greek", "hindi", "hungarian",
+                "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian",
+                "portuguese", "romanian", "russian", "serbian", "spanish", "swedish",
+                "tamil", "turkish", "yiddish",
+            ];
+            if CONFIGS.contains(&bare.as_str()) {
+                Ok(Value::text(bare))
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "text search configuration \"{s}\" does not exist"
+                    ),
+                })
+            }
+        }
+        "regdictionary" => {
+            if bare == "simple" || bare.ends_with("_stem") {
+                Ok(Value::text(bare))
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "text search dictionary \"{s}\" does not exist"
+                    ),
+                })
+            }
+        }
+        "regproc" => {
+            let hits = crate::system_catalog::PG_PROC_FUNCS
+                .iter()
+                .filter(|(_, n, ..)| *n == bare)
+                .count();
+            match hits {
+                0 => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("function \"{s}\" does not exist"),
+                }),
+                1 => Ok(Value::text(bare)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("more than one function named \"{bare}\""),
+                }),
+            }
+        }
+        "regprocedure" => {
+            // `name(argtype, ...)` — resolve the name, canonicalize each
+            // argument type, and re-render.
+            let Some((fname, rest)) = bare.split_once('(') else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "expected a left parenthesis in \"{s}\""
+                    ),
+                });
+            };
+            let Some(args_txt) = rest.strip_suffix(')') else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "expected a right parenthesis in \"{s}\""
+                    ),
+                });
+            };
+            let fname = fname.trim().to_ascii_lowercase();
+            let args: Vec<String> = if args_txt.trim().is_empty() {
+                Vec::new()
+            } else {
+                args_txt
+                    .split(',')
+                    .map(|a| {
+                        crate::conversions::regtype_canonical_name(a.trim())
+                            .ok_or_else(|| EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "type \"{}\" does not exist",
+                                    a.trim()
+                                ),
+                            })
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+            let nargs = args.len() as i32;
+            let known = crate::system_catalog::PG_PROC_FUNCS
+                .iter()
+                .any(|(_, n, _, na, _)| *n == fname && *na == nargs);
+            if !known {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("function \"{s}\" does not exist"),
+                });
+            }
+            Ok(Value::text(alloc::format!("{fname}({})", args.join(","))))
+        }
+        // regoper / regoperator: SPG has no operator catalog; every core
+        // operator symbol is multiply overloaded in PG, so a known symbol
+        // reports PG's ambiguity and anything else does not exist.
+        _ => {
+            let sym: String = bare.chars().filter(|c| !c.is_whitespace()).collect();
+            let core_op = !sym.is_empty()
+                && sym
+                    .chars()
+                    .all(|c| "+-*/<>=~!@#%^&|`?".contains(c));
+            if core_op {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("more than one operator named {sym}"),
+                })
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("operator does not exist: {s}"),
+                })
+            }
+        }
+    }
+}
+
 /// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
 /// integer, half-away-from-zero — PG's `numeric → int` coercion rule.
 fn numeric_round_to_i128(scaled: i128, scale: u8) -> i128 {
@@ -116,6 +237,17 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 // the search_path; SPG is single-schema so
                 // dropping is always safe.
                 let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
+                // v7.39 (read01 regproc.c) — regtype canonicalizes the
+                // name ('int4' → 'integer') and rejects unknown types
+                // (PG 42704).
+                if matches!(target, CastTarget::RegType) {
+                    return match crate::conversions::regtype_canonical_name(&bare) {
+                        Some(c) => Ok(Value::text(c)),
+                        None => Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("type \"{s}\" does not exist"),
+                        }),
+                    };
+                }
                 Ok(Value::text(bare))
             }
             // A numeric OID → its type name for `::regtype` (the common
@@ -318,6 +450,32 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     return Err(EvalError::TypeMismatch {
                         detail: "macaddr8 data out of range to convert to macaddr".into(),
                     });
+                }
+            }
+            // v7.39 (read01 regproc.c) — the remaining reg* input types.
+            // SPG carries them as their canonical text rendering; name
+            // resolution runs against the static pg_proc table / the FTS
+            // configuration list.
+            {
+                let lower_name = name.to_ascii_lowercase();
+                match lower_name.as_str() {
+                    "regproc" | "regprocedure" | "regoper" | "regoperator"
+                    | "regconfig" | "regdictionary" => {
+                        let s = match &v {
+                            Value::Null => return Ok(Value::Null),
+                            Value::Text(s) => s.as_ref().trim().to_string(),
+                            other => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: alloc::format!(
+                                        "::{lower_name} accepts TEXT, got {:?}",
+                                        other.data_type()
+                                    ),
+                                });
+                            }
+                        };
+                        return cast_reg_misc(&lower_name, &s);
+                    }
+                    _ => {}
                 }
             }
             // v7.39 (read01 pseudotypes.c) — casting a value INTO a
