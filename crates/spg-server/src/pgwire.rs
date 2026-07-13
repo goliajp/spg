@@ -3432,6 +3432,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
         } else if msg.contains("division by zero") {
             "22012"
+        // v7.39 (read01 numeric.c) — log/power domain violations carry
+        // their SQL-spec-mandated states.
+        } else if msg.contains("cannot take logarithm of") {
+            "2201E"
+        } else if msg.contains("zero raised to a negative power is undefined")
+            || msg.contains("a negative number raised to a non-integer power")
+            || msg.contains("cannot take square root of a negative number")
+        {
+            "2201F"
         // v7.39 (read01 json.c) — 22030 DUPLICATE_JSON_OBJECT_KEY_VALUE.
         } else if msg.contains("duplicate JSON object key value") {
             "22030"
@@ -3457,6 +3466,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("ShortWord must be")
             || msg.contains("MaxFragments must be")
             || msg.contains("step size cannot equal zero")
+            // v7.39 (read01 numeric.c) — generate_series(numeric) bound /
+            // step rejections.
+            || msg.contains("start value cannot be")
+            || msg.contains("stop value cannot be")
+            || msg.contains("step size cannot be")
             || msg.contains("cannot get array length of")
             || msg.contains("cannot call json_object_keys")
             || msg.contains("cannot call jsonb_object_keys")
