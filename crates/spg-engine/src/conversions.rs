@@ -2423,6 +2423,48 @@ fn coerce_text_array_to(
 /// / `oid::regtype` spelling (without the typmod). `None` for OIDs SPG
 /// doesn't recognise (callers render the numeric OID, as PG does for an
 /// unknown regtype). Shared by the `::regtype` cast and `format_type`.
+/// v7.39 (read01 utils/adt, format_type.c) — the element OID for a
+/// standard array type OID (PG's pg_type.typelem for the built-in `_x`
+/// array types). format_type renders these as `<element>[]`.
+pub(crate) fn array_oid_element(oid: i64) -> Option<i64> {
+    Some(match oid {
+        1000 => 16,   // _bool
+        1001 => 17,   // _bytea
+        1002 => 18,   // _char
+        1003 => 19,   // _name
+        1016 => 20,   // _int8
+        1005 => 21,   // _int2
+        1007 => 23,   // _int4
+        1009 => 25,   // _text
+        1028 => 26,   // _oid
+        199 => 114,   // _json
+        143 => 142,   // _xml
+        651 => 650,   // _cidr
+        1021 => 700,  // _float4
+        1022 => 701,  // _float8
+        775 => 774,   // _macaddr8
+        791 => 790,   // _money
+        1040 => 829,  // _macaddr
+        1041 => 869,  // _inet
+        1014 => 1042, // _bpchar
+        1015 => 1043, // _varchar
+        1182 => 1082, // _date
+        1183 => 1083, // _time
+        1115 => 1114, // _timestamp
+        1185 => 1184, // _timestamptz
+        1187 => 1186, // _interval
+        1270 => 1266, // _timetz
+        1561 => 1560, // _bit
+        1563 => 1562, // _varbit
+        1231 => 1700, // _numeric
+        2951 => 2950, // _uuid
+        3643 => 3614, // _tsvector
+        3645 => 3615, // _tsquery
+        3807 => 3802, // _jsonb
+        _ => return None,
+    })
+}
+
 pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
     Some(match oid {
         16 => "boolean",
@@ -2451,6 +2493,8 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         1184 => "timestamp with time zone",
         1186 => "interval",
         1266 => "time with time zone",
+        1560 => "bit",
+        1562 => "bit varying",
         1700 => "numeric",
         2950 => "uuid",
         3614 => "tsvector",
