@@ -739,6 +739,12 @@ pub enum Value<'arena> {
     Macaddr8([u8; 8]),
     /// v7.39 (read01 pg_lsn.c) — PG `pg_lsn`, a 64-bit WAL location.
     PgLsn(u64),
+    /// v7.39 (read01 ruleutils.c) — PG `regclass`: an OID-typed relation
+    /// reference that renders as the relation name. SPG carries BOTH
+    /// (the synthetic oid for catalog joins, the name for display) so
+    /// `conrelid = 't'::regclass` and `'t'::regclass::text` agree.
+    /// Eval-only (no column storage).
+    RegClass(i64, alloc::boxed::Box<str>),
     /// v7.37.5 ζ-A — PG `bit` / `bit varying`. `nbits` is the
     /// actual bit count; `bytes` is the packed representation
     /// (big-endian within each byte; final byte right-padded
@@ -982,6 +988,9 @@ impl<'arena> Value<'arena> {
             // v7.38 (read01, T9) — a transient composite/record has no storable
             // column DataType (it flows through row_to_json / to_json).
             Self::Composite(_) => None,
+            // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
+            // oid+name shape); no column storage type.
+            Self::RegClass(..) => None,
             Self::Null => None,
         }
     }
@@ -1053,6 +1062,7 @@ impl<'arena> Value<'arena> {
             Value::Multirange { kind, ranges } => Value::Multirange { kind, ranges },
             // v7.38 (read01, T9) — Composite fields are already `Value<'static>`.
             Value::Composite(fields) => Value::Composite(fields),
+            Value::RegClass(oid, name) => Value::RegClass(oid, name),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
             Value::Path { points, closed } => Value::Path { points, closed },
@@ -1910,7 +1920,8 @@ impl IndexKey {
             | Value::Xml(_)
             | Value::Char1(_)
             | Value::MoneyArray(_)
-            | Value::Composite(_) => None,
+            | Value::Composite(_)
+            | Value::RegClass(..) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

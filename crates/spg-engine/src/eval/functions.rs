@@ -14262,24 +14262,15 @@ fn apply_function_dispatch(
                 .strip_prefix("public.")
                 .unwrap_or(name_arg)
                 .trim_matches('"');
-            // v7.39 (read01 regproc.c) — to_regclass returns a regclass,
-            // which renders as the relation NAME. System catalogs the
-            // engine synthesises resolve too.
-            for tname in &cat.table_names() {
-                if tname == bare {
-                    return Ok(Value::text(bare.to_string()));
-                }
-            }
-            for (vname, _) in cat.views() {
-                if vname == bare {
-                    return Ok(Value::text(bare.to_string()));
-                }
+            // v7.39 (read01 ruleutils.c) — to_regclass returns a DUAL-shape
+            // regclass (oid + name); unknown system views keep the plain
+            // name form (no oid space) and misses are NULL.
+            if let Some(oid) = crate::eval::regclass_name_to_oid(cat, bare) {
+                return Ok(Value::RegClass(oid, bare.into()));
             }
             const SYSTEM_RELS: &[&str] = &[
-                "pg_class", "pg_namespace", "pg_database", "pg_type", "pg_proc",
-                "pg_attribute", "pg_index", "pg_constraint", "pg_roles", "pg_user",
-                "pg_tables", "pg_views", "pg_settings", "pg_stat_activity",
-                "pg_stat_database", "pg_stat_user_tables",
+                "pg_roles", "pg_user", "pg_tables", "pg_views", "pg_settings",
+                "pg_stat_activity", "pg_stat_database", "pg_stat_user_tables",
             ];
             if SYSTEM_RELS.contains(&bare) {
                 return Ok(Value::text(bare.to_string()));

@@ -1906,8 +1906,10 @@ pub(crate) fn synth_information_schema_table_constraints(
             ]));
         }
         // Single-column unique indices without a UC entry.
+        // v7.39 (read01 ruleutils.c) — partial unique indexes are not
+        // constraints (PG).
         for idx in t.indices() {
-            if !idx.is_unique {
+            if !idx.is_unique || idx.partial_predicate.is_some() {
                 continue;
             }
             let already = t
@@ -3265,8 +3267,10 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             ]));
         }
         // Single-column unique indices that don't have a UC entry.
+        // v7.39 (read01 ruleutils.c) — a PARTIAL unique index is never a
+        // constraint in PG (constraints cannot carry predicates).
         for idx in t.indices() {
-            if !idx.is_unique {
+            if !idx.is_unique || idx.partial_predicate.is_some() {
                 continue;
             }
             let already = t
