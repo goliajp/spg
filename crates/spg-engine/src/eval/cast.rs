@@ -170,6 +170,8 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // v7.38 (read01, T11) — bpchar → text strips the trailing blanks
             // (unlike the padded wire display).
             Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
+            // v7.39 (read01 ruleutils.c) — regclass::text is the name.
+            Value::RegClass(_, name) => name.to_string(),
             _ => value_to_text(&v),
         })),
         CastTarget::Int => cast_numeric_to_int(v),

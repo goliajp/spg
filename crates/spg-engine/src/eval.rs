@@ -544,6 +544,35 @@ fn apply_domain_constraints<'a>(
 /// `(v1,"v 2",)` record text (double-quote wrapping with doubled quotes,
 /// empty field = NULL) and coerce each field to the declared type; a ROW
 /// value re-labels positionally.
+/// v7.39 (read01 ruleutils.c) — resolve a relation name to its synthetic
+/// oid: user tables in the 16384+ band (table_names order), views at
+/// 32768+, and the synthesised system catalogs at their REAL PG oids.
+/// `None` when the name is unknown (the caller keeps the legacy text
+/// behaviour so `'anything'::regclass::text` still round-trips).
+pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Option<i64> {
+    for (pos, tname) in cat.table_names().iter().enumerate() {
+        if tname == bare {
+            return Some(16384 + pos as i64);
+        }
+    }
+    for (pos, (vname, _)) in cat.views().iter().enumerate() {
+        if vname == bare {
+            return Some(32768 + pos as i64);
+        }
+    }
+    Some(match bare {
+        "pg_type" => 1247,
+        "pg_attribute" => 1249,
+        "pg_proc" => 1255,
+        "pg_class" => 1259,
+        "pg_database" => 1262,
+        "pg_constraint" => 2606,
+        "pg_index" => 2610,
+        "pg_namespace" => 2615,
+        _ => return None,
+    })
+}
+
 fn apply_composite_cast(
     v: Value<'static>,
     comp: &spg_storage::CompositeDef,
@@ -1006,19 +1035,32 @@ fn eval_cast_arm(
     // table_names() order). System OIDs / non-matches fall through to
     // the integer-rendering path in cast_value.
     if matches!(target, CastTarget::RegClass) {
-        let oid = match &v {
+        // v7.39 (read01 ruleutils.c) — regclass is DUAL-shape: oid for
+        // catalog joins (conrelid = 't'::regclass), name for display.
+        let oid_in = match &v {
             Value::SmallInt(n) => Some(i64::from(*n)),
             Value::Int(n) => Some(i64::from(*n)),
             Value::BigInt(n) => Some(*n),
             _ => None,
         };
-        if let (Some(oid), Some(cat)) = (oid, ctx.catalog) {
+        if let (Some(oid), Some(cat)) = (oid_in, ctx.catalog) {
             if oid >= 16384 {
                 if let Some(name) =
                     cat.table_names().into_iter().nth((oid - 16384) as usize)
                 {
-                    return Ok(Value::text(name));
+                    return Ok(Value::RegClass(oid, name.into()));
                 }
+            }
+        }
+        if let (Value::Text(s), Some(cat)) = (&v, ctx.catalog) {
+            let bare = s
+                .rsplit('.')
+                .next()
+                .unwrap_or(s)
+                .trim_matches('"')
+                .to_string();
+            if let Some(oid) = regclass_name_to_oid(cat, &bare) {
+                return Ok(Value::RegClass(oid, bare.into()));
             }
         }
     }

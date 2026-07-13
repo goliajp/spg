@@ -5063,6 +5063,16 @@ pub(super) fn compare(
         (Value::Macaddr8(a), Value::Macaddr8(b)) => a.cmp(b),
         // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
         (Value::PgLsn(a), Value::PgLsn(b)) => a.cmp(b),
+        // v7.39 (read01 ruleutils.c) — regclass compares by oid, including
+        // against the synth catalogs' plain integer oid columns.
+        (Value::RegClass(a, _), Value::RegClass(b, _)) => a.cmp(b),
+        (Value::RegClass(a, _), Value::BigInt(b)) => a.cmp(b),
+        (Value::BigInt(a), Value::RegClass(b, _)) => a.cmp(b),
+        (Value::RegClass(a, _), Value::Int(b)) => a.cmp(&i64::from(*b)),
+        (Value::Int(a), Value::RegClass(b, _)) => i64::from(*a).cmp(b),
+        // Text form compares by name (the pre-dual-shape contract).
+        (Value::RegClass(_, a), Value::Text(b)) => a.as_ref().cmp(b.as_ref()),
+        (Value::Text(a), Value::RegClass(_, b)) => a.as_ref().cmp(b.as_ref()),
         // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is

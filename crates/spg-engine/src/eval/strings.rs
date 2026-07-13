@@ -745,6 +745,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Macaddr(_) => "macaddr",
         Value::Macaddr8(_) => "macaddr8",
         Value::PgLsn(_) => "pg_lsn",
+        Value::RegClass(..) => "regclass",
         Value::Xml(_) => "xml",
         Value::Hstore(_) => "hstore",
         Value::BpChar(_) => "character",

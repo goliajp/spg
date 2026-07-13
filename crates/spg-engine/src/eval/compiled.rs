@@ -364,6 +364,16 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             });
         }
         Expr::Cast { expr, target } => {
+            // v7.39 (read01 ruleutils.c) — catalog-dependent casts run
+            // through eval's pre-hook (regclass dual-shape, domain/enum/
+            // composite named types).
+            if matches!(
+                target,
+                spg_sql::ast::CastTarget::RegClass | spg_sql::ast::CastTarget::Named(_)
+            ) {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             compile_into(expr, ctx, steps);
             steps.push(Step::Cast {
                 target: target.clone(),
@@ -512,7 +522,15 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // v7.36 — CAST over a compilable expression. `cast_value`
         // is pure / context-free for the scalar targets we care
         // about (text, ints, floats, bool, dates).
-        Expr::Cast { expr, .. } => fully_compilable(expr),
+        // v7.39 (read01 ruleutils.c) — regclass / user-named casts
+        // need the catalog (dual-shape resolve, domain/enum/composite
+        // hooks); they stay Subtree so eval's pre-hook runs.
+        Expr::Cast { expr, target } => {
+            !matches!(
+                target,
+                spg_sql::ast::CastTarget::RegClass | spg_sql::ast::CastTarget::Named(_)
+            ) && fully_compilable(expr)
+        }
         // v7.37.5-A2b — `CASE [operand] WHEN x THEN y … ELSE z END`
         // when every sub-expression is itself fully-compilable. Hot
         // shape: Track A's 14 aggregates over

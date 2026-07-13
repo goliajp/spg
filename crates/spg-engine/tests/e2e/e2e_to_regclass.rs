@@ -18,17 +18,15 @@ fn to_regclass_existence_check() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE reg_t (id INT)").unwrap();
     // The Django/Alembic existence-check shape.
-    // v7.39 (read01 regproc.c) — to_regclass returns a regclass, which
-    // renders as the relation name (the IS NOT NULL check still works).
-    assert_eq!(
-        first(&mut e, "SELECT to_regclass('reg_t')"),
-        spg_storage::Value::text("reg_t")
-    );
+    // v7.39 (read01 ruleutils.c) — to_regclass returns a DUAL-shape
+    // regclass (oid for joins, name for display); it renders as the name
+    // and the IS NOT NULL existence check still works.
+    let v = first(&mut e, "SELECT to_regclass('reg_t')");
+    assert_eq!(spg_engine::eval::value_to_text(&v), "reg_t");
+    assert!(matches!(v, spg_storage::Value::RegClass(oid, _) if oid >= 16384));
     // 'public.' qualification accepted.
-    assert_eq!(
-        first(&mut e, "SELECT to_regclass('public.reg_t')"),
-        spg_storage::Value::text("reg_t")
-    );
+    let v2 = first(&mut e, "SELECT to_regclass('public.reg_t')");
+    assert_eq!(spg_engine::eval::value_to_text(&v2), "reg_t");
     // Missing relation → NULL (never an error — that's the point
     // of to_regclass vs a regclass cast).
     assert!(matches!(
@@ -42,10 +40,9 @@ fn to_regclass_resolves_views() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE vt (id INT)").unwrap();
     e.execute("CREATE VIEW v_vt AS SELECT id FROM vt").unwrap();
-    assert_eq!(
-        first(&mut e, "SELECT to_regclass('v_vt')"),
-        spg_storage::Value::text("v_vt")
-    );
+    let v = first(&mut e, "SELECT to_regclass('v_vt')");
+    assert_eq!(spg_engine::eval::value_to_text(&v), "v_vt");
+    assert!(matches!(v, spg_storage::Value::RegClass(oid, _) if oid >= 32768));
 }
 
 #[test]

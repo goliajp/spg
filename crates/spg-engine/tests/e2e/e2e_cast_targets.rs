@@ -93,7 +93,10 @@ fn regclass_cast_strips_schema_prefix() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::text("t"));
+    // v7.39 (read01 ruleutils.c) — regclass is dual-shape (oid + name);
+    // it renders as the bare name.
+    assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[0]), "t");
+    assert!(matches!(rows[0].values[0], Value::RegClass(oid, _) if oid >= 16384));
 }
 
 #[test]
@@ -124,7 +127,8 @@ fn regclass_passes_unqualified_name_through() {
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::text("t"));
+    // v7.39 (read01 ruleutils.c) — dual-shape; renders as the name.
+    assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[0]), "t");
 }
 
 #[test]
