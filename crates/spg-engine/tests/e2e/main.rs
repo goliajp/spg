@@ -319,6 +319,7 @@ mod e2e_similar_to_round31;
 mod e2e_timestamp_round32;
 mod e2e_varbit_round33;
 mod e2e_varlena_round34;
+mod e2e_uuid_xml_round35;
 mod e2e_rowtypes_round28;
 mod e2e_ruleutils_round29;
 mod e2e_random_int;

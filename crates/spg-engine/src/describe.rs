@@ -560,6 +560,8 @@ fn function_return_shape(
         "to_timestamp" => (DataType::Timestamptz, true),
         // v7.39 (read01 timestamp.c) — make_timestamptz returns tstz.
         "make_timestamptz" => (DataType::Timestamptz, true),
+        // v7.39 (read01 uuid.c) — uuid_extract_timestamp returns tstz.
+        "uuid_extract_timestamp" => (DataType::Timestamptz, true),
         "date_part" | "extract" => (DataType::Float, true),
         // v7.26 (round-20 C) — remaining aggregate signatures
         // (count / ts_rank were already mapped above). PG types
