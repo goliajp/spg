@@ -696,6 +696,64 @@ pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
             ),
         });
     };
+    // v7.39 (read01 timestamp.c) — the INTERVAL overload truncates the
+    // interval's fields below the unit (PG interval_trunc).
+    if let Value::Interval {
+        months,
+        days,
+        micros,
+    } = &args[1]
+    {
+        let unit_lc = unit.to_ascii_lowercase();
+        let (mut mo, mut dd, mut us) = (*months, *days, *micros);
+        match unit_lc.as_str() {
+            "millennium" => {
+                mo = mo / 12000 * 12000;
+                dd = 0;
+                us = 0;
+            }
+            "century" => {
+                mo = mo / 1200 * 1200;
+                dd = 0;
+                us = 0;
+            }
+            "decade" => {
+                mo = mo / 120 * 120;
+                dd = 0;
+                us = 0;
+            }
+            "year" => {
+                mo = mo / 12 * 12;
+                dd = 0;
+                us = 0;
+            }
+            "quarter" => {
+                mo = mo / 3 * 3;
+                dd = 0;
+                us = 0;
+            }
+            "month" => {
+                dd = 0;
+                us = 0;
+            }
+            "day" => us = 0,
+            "hour" => us = us / 3_600_000_000 * 3_600_000_000,
+            "minute" => us = us / 60_000_000 * 60_000_000,
+            "second" => us = us / 1_000_000 * 1_000_000,
+            "milliseconds" | "millisecond" => us = us / 1_000 * 1_000,
+            "microseconds" | "microsecond" => {}
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("unit \"{other}\" not supported for type interval"),
+                });
+            }
+        }
+        return Ok(Value::Interval {
+            months: mo,
+            days: dd,
+            micros: us,
+        });
+    }
     // Both DATE and TIMESTAMP sources are accepted. DATE lifts to
     // midnight first; the result is always TIMESTAMP.
     let micros = match &args[1] {

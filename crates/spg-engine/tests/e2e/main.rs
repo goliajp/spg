@@ -316,6 +316,7 @@ mod e2e_regexp_round26;
 mod e2e_regclass_dual_round30;
 mod e2e_regproc_round27;
 mod e2e_similar_to_round31;
+mod e2e_timestamp_round32;
 mod e2e_rowtypes_round28;
 mod e2e_ruleutils_round29;
 mod e2e_random_int;

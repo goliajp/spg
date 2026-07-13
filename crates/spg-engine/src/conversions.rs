@@ -4200,6 +4200,12 @@ pub(crate) fn coerce_value(
         }
         // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
         // TIMESTAMP → day truncation).
+        (Value::Date(i32::MAX), DataType::Timestamp | DataType::Timestamptz) => {
+            Some(Value::Timestamp(i64::MAX))
+        }
+        (Value::Date(i32::MIN), DataType::Timestamp | DataType::Timestamptz) => {
+            Some(Value::Timestamp(i64::MIN))
+        }
         (Value::Date(d), DataType::Timestamp | DataType::Timestamptz) => {
             Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
         }

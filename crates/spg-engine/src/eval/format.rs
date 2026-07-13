@@ -1079,10 +1079,15 @@ pub fn parse_timestamp_literal_tz_ordered(s: &str, order: DateOrder) -> Option<(
     // round-trip then re-applies the session timezone on the
     // SELECT side when format_timestamp is asked for a TZ-aware
     // render.
-    Some((
-        i64::from(days) * 86_400_000_000 + day_micros - tz_offset_micros,
-        had_tz,
-    ))
+    // v7.39 (read01 timestamp.c) — an instant past SPG's representable
+    // i64 window (Unix-epoch microseconds; PG's own ceiling sits ~30
+    // years further out on its 2000-based clock — recorded delta) must
+    // fail the parse rather than wrap (debug builds panicked here).
+    let t = i64::from(days)
+        .checked_mul(86_400_000_000)?
+        .checked_add(day_micros)?
+        .checked_sub(tz_offset_micros)?;
+    Some((t, had_tz))
 }
 
 /// v7.15.0 — Parse `HH:MM:SS[.frac][<tz>]` and return

@@ -6457,9 +6457,13 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Float(f) => Ok(Value::Bool(f.is_finite())),
-                Value::Date(_)
-                | Value::Timestamp(_)
-                | Value::Interval { .. } => Ok(Value::Bool(true)),
+                // v7.39 (read01 timestamp.c) — the ±infinity sentinels
+                // (i64::MAX/MIN micros, i32::MAX/MIN days) are not finite.
+                Value::Date(d) => Ok(Value::Bool(*d != i32::MAX && *d != i32::MIN)),
+                Value::Timestamp(t) => {
+                    Ok(Value::Bool(*t != i64::MAX && *t != i64::MIN))
+                }
+                Value::Interval { .. } => Ok(Value::Bool(true)),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "isfinite() needs date/timestamp/interval, got {:?}",
@@ -6589,7 +6593,7 @@ fn apply_function_dispatch(
             // reported the wrong pg_typeof.
             Ok(Value::Time(us))
         }
-        "make_timestamp" => {
+        "make_timestamp" | "make_timestamptz" => {
             if args.len() != 6 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
