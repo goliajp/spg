@@ -2901,6 +2901,33 @@ pub(crate) fn coerce_value(
                 return Ok(Value::numeric_special(kind));
             }
             let Some((mantissa, src_scale)) = parse_numeric_text(&s) else {
+                // v7.39 (read01 numeric.c) — PG's numeric input accepts
+                // scientific notation ('1e300'::numeric): expand the exponent
+                // and re-enter this arm with the plain form (which no longer
+                // contains an 'e', so this recurses at most once).
+                match spg_sql::parser::expand_scientific_literal(&s) {
+                    spg_sql::parser::SciExpanded::Expanded(plain) => {
+                        return coerce_value(
+                            Value::Text(plain.into()),
+                            DataType::Numeric { precision, scale },
+                            col_name,
+                            position,
+                        );
+                    }
+                    spg_sql::parser::SciExpanded::Overflow => {
+                        return Err(EngineError::Eval(EvalError::TypeMismatch {
+                            detail: "value overflows numeric format".into(),
+                        }));
+                    }
+                    spg_sql::parser::SciExpanded::NotScientific => {}
+                }
+                // A plain decimal whose mantissa overflows i128 is still a
+                // valid unconstrained NUMERIC — keep it exact as NumericBig.
+                if precision == 0 && scale == 0 {
+                    if let Some(b) = spg_storage::bignum::BigNumeric::from_decimal_str(&s) {
+                        return Ok(Value::NumericBig(alloc::boxed::Box::new(b)));
+                    }
+                }
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!("invalid input syntax for type numeric: \"{s}\""),
                 }));
@@ -4015,6 +4042,16 @@ pub(crate) fn coerce_value(
             let days = t.div_euclid(86_400_000_000);
             i32::try_from(days).ok().map(Value::Date)
         }
+        // v7.39 (read01 numeric.c) — a NumericBig is already an unconstrained
+        // NUMERIC ('…0.5::numeric' where the mantissa exceeds i128); pass it
+        // through. A declared numeric(p, s) still falls to the typed error.
+        (
+            Value::NumericBig(b),
+            DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+        ) => Some(Value::NumericBig(b)),
         (
             Value::Numeric {
                 scaled,
@@ -4047,6 +4084,22 @@ pub(crate) fn coerce_value(
                 div *= 10.0;
             }
             Some(Value::Float((scaled as f64) / div))
+        }
+        // v7.39 (read01 numeric.c) — a big NUMERIC (`3.14e100` literal) casts
+        // to float8 through its decimal text; a value beyond the double range
+        // errors like PG ("value out of range: overflow").
+        (Value::NumericBig(b), DataType::Float) => {
+            let x: f64 = b.to_decimal_str().parse().map_err(|_| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "value out of range: overflow".into(),
+                })
+            })?;
+            if !x.is_finite() {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "value out of range: overflow".into(),
+                }));
+            }
+            Some(Value::Float(x))
         }
         // v7.38 (read01) — coercing NUMERIC into an integer column rounds half
         // away from zero (PG assignment cast: `1.5 → 2`), matching the `::int`

@@ -1584,10 +1584,10 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
         &s[..i]
     };
     if has_exp {
-        // Exponent form → double precision.
-        lit.parse::<f64>()
-            .map(|v| (Token::Float(v), i))
-            .map_err(|_| LexErrorKind::BadNumber(lit.to_string()))
+        // v7.39 (read01 numeric.c) — an exponent literal is NUMERIC in PG
+        // (`pg_typeof(1e5)` → numeric), not double precision. Keep the source
+        // text; the parser expands the notation into a plain decimal.
+        Ok((Token::Numeric(lit.to_string()), i))
     } else if has_dot {
         // Dotted literal → exact NUMERIC (keep the source text verbatim).
         Ok((Token::Numeric(lit.to_string()), i))
@@ -1664,8 +1664,8 @@ mod tests {
                 Token::Integer(42),
                 Token::Numeric("1.5".to_string()),
                 Token::Numeric(".5".to_string()),
-                Token::Float(1e10),
-                Token::Float(2.5e-3),
+                Token::Numeric("1e10".to_string()),
+                Token::Numeric("2.5e-3".to_string()),
                 Token::Eof,
             ]
         );

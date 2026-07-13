@@ -2823,6 +2823,14 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
             }
             Ok((*scaled as f64) / div)
         }
+        // v7.39 (read01 numeric.c) — a big NUMERIC in a mixed float op
+        // approximates through its decimal text (same promotion as the
+        // i128-mantissa arm above).
+        Value::NumericBig(b) => {
+            b.to_decimal_str().parse().map_err(|_| EvalError::TypeMismatch {
+                detail: "value out of range: overflow".into(),
+            })
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot convert {:?} to FLOAT", other.data_type()),
         }),

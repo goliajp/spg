@@ -252,6 +252,119 @@ fn reorder_named_args(
 /// v7.38 (read01) — parse a lexer `Token::Numeric` source string (digits with
 /// an optional single `.`, no sign, no exponent) into `(unscaled, scale)` for
 /// `Literal::Numeric`. Returns `None` if the mantissa overflows i128.
+/// v7.39 (read01 numeric.c) — the result of expanding an `1.5e3`-style
+/// scientific literal into PG's plain NUMERIC decimal form.
+#[derive(Debug)]
+pub enum SciExpanded {
+    /// Plain decimal string ("1.5e3" → "1500", "1e-5" → "0.00001").
+    Expanded(String),
+    /// Exponent pushes the value outside PG's numeric format
+    /// (more than 131072 integer digits or 16383 fractional digits).
+    Overflow,
+    /// Not a `[±]digits[.digits]e[±]digits` literal at all.
+    NotScientific,
+}
+
+/// Expand scientific notation into a plain decimal string by moving the
+/// decimal point — no float round-trip, so the value stays exact. PG treats
+/// such literals as NUMERIC; the digit-count caps mirror PG's numeric format
+/// limits ("value overflows numeric format").
+pub fn expand_scientific_literal(s: &str) -> SciExpanded {
+    let s = s.trim();
+    let Some(epos) = s.find(['e', 'E']) else {
+        return SciExpanded::NotScientific;
+    };
+    let (mant, exp_str) = (&s[..epos], &s[epos + 1..]);
+    let Ok(exp) = exp_str.parse::<i64>() else {
+        return SciExpanded::NotScientific;
+    };
+    let (neg, mant) = match mant.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, mant.strip_prefix('+').unwrap_or(mant)),
+    };
+    let (int_part, frac_part) = match mant.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mant, ""),
+    };
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return SciExpanded::NotScientific;
+    }
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    // Decimal point position within `digits` after applying the exponent.
+    let new_point = int_part.len() as i64 + exp;
+    // PG's numeric format: up to 131072 digits before the point, 16383 after.
+    if new_point > 131_072 {
+        return SciExpanded::Overflow;
+    }
+    if (digits.len() as i64 - new_point) > 16_383 {
+        return SciExpanded::Overflow;
+    }
+    let sign = if neg { "-" } else { "" };
+    let plain = if new_point <= 0 {
+        let mut out = String::with_capacity(digits.len() + 2 + (-new_point) as usize);
+        out.push_str("0.");
+        for _ in 0..(-new_point) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+        out
+    } else if (new_point as usize) >= digits.len() {
+        let mut out = digits;
+        for _ in 0..(new_point as usize - out.len()) {
+            out.push('0');
+        }
+        out
+    } else {
+        let mut out = String::with_capacity(digits.len() + 1);
+        out.push_str(&digits[..new_point as usize]);
+        out.push('.');
+        out.push_str(&digits[new_point as usize..]);
+        out
+    };
+    SciExpanded::Expanded(alloc::format!("{sign}{plain}"))
+}
+
+/// Resolve a lexer `Token::Numeric` into its literal. PG semantics: a dotted
+/// or over-i64 literal is exact NUMERIC; scientific notation is NUMERIC too
+/// (expanded to the plain decimal form); only a fractional depth beyond SPG's
+/// scale width (u8) falls back to double precision (recorded delta).
+/// Kept out of the parse_expr recursion frame — see the call site.
+#[inline(never)]
+fn numeric_token_to_literal(s: String) -> Result<Literal, String> {
+    match parse_decimal_literal(&s) {
+        Some((unscaled, scale)) => Ok(Literal::Numeric { unscaled, scale }),
+        // v7.38 (read01, T3.C3) — a plain decimal too wide for i128 keeps
+        // its exact value as a NumericBig.
+        None if !s.contains(['e', 'E']) => Ok(Literal::NumericBig(s)),
+        // v7.39 (read01 numeric.c) — expand the exponent form.
+        None => match expand_scientific_literal(&s) {
+            SciExpanded::Expanded(plain) => match parse_decimal_literal(&plain) {
+                Some((unscaled, scale)) => Ok(Literal::Numeric { unscaled, scale }),
+                None if plain
+                    .split_once('.')
+                    .is_none_or(|(_, f)| f.len() <= u8::MAX as usize) =>
+                {
+                    Ok(Literal::NumericBig(plain))
+                }
+                None => s
+                    .parse::<f64>()
+                    .map(Literal::Float)
+                    .map_err(|_| format!("invalid numeric literal {s:?}")),
+            },
+            SciExpanded::Overflow => Err("value overflows numeric format".to_string()),
+            SciExpanded::NotScientific => s
+                .parse::<f64>()
+                .map(Literal::Float)
+                .map_err(|_| format!("invalid numeric literal {s:?}")),
+        },
+    }
+}
+
 fn parse_decimal_literal(s: &str) -> Option<(i128, u8)> {
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
@@ -14393,16 +14506,12 @@ impl Parser {
             // v7.38 (read01) — dotted / over-i64 literal → exact NUMERIC (PG),
             // carrying the source mantissa + scale so no precision is lost. A
             // literal too wide for i128 falls back to double precision.
-            Token::Numeric(s) => match parse_decimal_literal(&s) {
-                Some((unscaled, scale)) => Ok(Expr::Literal(Literal::Numeric { unscaled, scale })),
-                // v7.38 (read01, T3.C3) — a plain decimal too wide for i128 keeps
-                // its exact value as a NumericBig (only scientific `e`-notation
-                // still widens to double).
-                None if !s.contains(['e', 'E']) => Ok(Expr::Literal(Literal::NumericBig(s))),
-                None => s
-                    .parse::<f64>()
-                    .map(|x| Expr::Literal(Literal::Float(x)))
-                    .map_err(|_| self.err(format!("invalid numeric literal {s:?}"))),
+            // Out-of-line (#[inline(never)]) — this arm sits on the
+            // parse_expr recursion chain; its expansion locals must not
+            // widen the recursive frame (debug frame-cliff discipline).
+            Token::Numeric(s) => match numeric_token_to_literal(s) {
+                Ok(lit) => Ok(Expr::Literal(lit)),
+                Err(msg) => Err(self.err(msg)),
             },
             Token::String(s) => Ok(Expr::Literal(Literal::String(s))),
             Token::True => Ok(Expr::Literal(Literal::Bool(true))),
