@@ -57,6 +57,7 @@ mod e2e_bpchar;
 mod e2e_brin;
 mod e2e_bytea;
 mod e2e_bytea_bitops;
+mod e2e_bytea_round36;
 mod e2e_bytea_ops;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
