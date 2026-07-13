@@ -303,6 +303,7 @@ fn bare_table_ref(name: String) -> TableRef {
         generate_series_args: None,
         lateral_subquery: None,
         jsonb_each_text_arg: None,
+        table_fn_call: None,
     }
 }
 

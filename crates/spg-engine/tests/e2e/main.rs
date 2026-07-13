@@ -261,6 +261,7 @@ mod e2e_pageinspect_probes;
 mod e2e_pairwise_catalog_fns;
 mod e2e_parse_ident;
 mod e2e_pg_backend_start_time;
+mod e2e_pglsn_partition_srf;
 mod e2e_pg_backup_probes;
 mod e2e_pg_bytes_pretty;
 mod e2e_pg_catalog_probe_funcs;

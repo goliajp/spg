@@ -346,6 +346,7 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         }
         Value::Macaddr(b) => crate::conversions::format_macaddr(b),
         Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),
+        Value::PgLsn(l) => crate::conversions::format_pg_lsn(*l),
         Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
         Value::Xml(s) => s.to_string(),
         Value::Char1(b) => format!("{}", *b as char),

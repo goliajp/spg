@@ -257,6 +257,9 @@ pub enum DataType {
     Cidr,
     Macaddr,
     Macaddr8,
+    /// v7.39 (read01 pg_lsn.c) — PG `pg_lsn` (WAL location). 8 bytes,
+    /// rendered `%X/%X`. Catalog tag 66. OID 3220.
+    PgLsn,
     /// v7.37.5 ζ-A — PG bit string. Body = `[u32 nbits][ceil(nbits/8) bytes]`,
     /// big-endian within each byte (matches PG binary).
     ///   Bit         OID 1560 (fixed-length, but SPG carries the
@@ -481,6 +484,7 @@ impl fmt::Display for DataType {
             Self::Cidr => f.write_str("CIDR"),
             Self::Macaddr => f.write_str("MACADDR"),
             Self::Macaddr8 => f.write_str("MACADDR8"),
+            Self::PgLsn => f.write_str("PG_LSN"),
             Self::Bit => f.write_str("BIT"),
             Self::BitVarying => f.write_str("VARBIT"),
             Self::Xml => f.write_str("XML"),
@@ -733,6 +737,8 @@ pub enum Value<'arena> {
     Macaddr([u8; 6]),
     /// v7.37.5 ζ-A — PG `macaddr8`. 8 bytes (EUI-64).
     Macaddr8([u8; 8]),
+    /// v7.39 (read01 pg_lsn.c) — PG `pg_lsn`, a 64-bit WAL location.
+    PgLsn(u64),
     /// v7.37.5 ζ-A — PG `bit` / `bit varying`. `nbits` is the
     /// actual bit count; `bytes` is the packed representation
     /// (big-endian within each byte; final byte right-padded
@@ -948,6 +954,7 @@ impl<'arena> Value<'arena> {
             Self::Cidr { .. } => Some(DataType::Cidr),
             Self::Macaddr(_) => Some(DataType::Macaddr),
             Self::Macaddr8(_) => Some(DataType::Macaddr8),
+            Self::PgLsn(_) => Some(DataType::PgLsn),
             // BitString could be either Bit or BitVarying; column
             // schema decides. Default to BitVarying when called
             // schema-less (rare; storage path is always
@@ -1057,6 +1064,7 @@ impl<'arena> Value<'arena> {
             Value::Cidr { family, bits, addr } => Value::Cidr { family, bits, addr },
             Value::Macaddr(m) => Value::Macaddr(m),
             Value::Macaddr8(m) => Value::Macaddr8(m),
+            Value::PgLsn(l) => Value::PgLsn(l),
             Value::BitString { nbits, bytes } => Value::BitString {
                 nbits,
                 bytes: Cow::Owned(bytes.into_owned()),
@@ -1897,6 +1905,7 @@ impl IndexKey {
             | Value::Cidr { .. }
             | Value::Macaddr(_)
             | Value::Macaddr8(_)
+            | Value::PgLsn(_)
             | Value::BitString { .. }
             | Value::Xml(_)
             | Value::Char1(_)

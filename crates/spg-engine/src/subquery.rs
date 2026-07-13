@@ -2094,6 +2094,7 @@ impl Engine {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             },
             on: Some(Expr::Binary {
                 lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
@@ -2371,6 +2372,7 @@ impl Engine {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             },
             on: Some(on),
             using_cols: None,
@@ -2901,6 +2903,7 @@ impl Engine {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             },
             on: Some(on),
             using_cols: None,

@@ -768,6 +768,7 @@ impl Engine {
             generate_series_args: None,
             lateral_subquery: None,
             jsonb_each_text_arg: None,
+            table_fn_call: None,
         };
         let where_ = combine_with_and_owned(inner_preds);
         let pk_col_name = ColumnName {

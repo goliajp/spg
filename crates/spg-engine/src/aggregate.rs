@@ -5647,6 +5647,7 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         (Value::Macaddr(x), Value::Macaddr(y)) => x.cmp(y),
         (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
+        (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
         (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
         (
             Value::Inet {

@@ -5711,6 +5711,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Cidr => 650,
         DataType::Macaddr => 829,
         DataType::Macaddr8 => 774,
+        DataType::PgLsn => 3220,
         DataType::Bit => 1560,
         DataType::BitVarying => 1562,
         DataType::Xml => 142,

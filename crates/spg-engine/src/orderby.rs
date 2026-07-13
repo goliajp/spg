@@ -351,6 +351,8 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             .unwrap_or(Ordering::Equal),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
+        (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
         // v7.39 (read01 orderedsetaggs.c, found via interval percentile) —
         // INTERVAL had no arm and fell to the debug-string fallback, which
         // ordered by the decimal rendering of `micros` (so 4h < 1h < 2h) —

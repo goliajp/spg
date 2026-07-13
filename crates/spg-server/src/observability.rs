@@ -654,6 +654,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::Inet | DataType::Cidr => 18,
                 DataType::Macaddr => 6,
                 DataType::Macaddr8 => 8,
+                DataType::PgLsn => 8,
                 // BIT(n) avg 32 bytes (256 bits); BIT VARYING varlena
                 // wider.
                 DataType::Bit | DataType::BitVarying => 32,
