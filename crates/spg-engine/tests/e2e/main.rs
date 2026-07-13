@@ -177,6 +177,7 @@ mod e2e_json_field_fns;
 mod e2e_json_object;
 mod e2e_json_object_text;
 mod e2e_jsonb_array_elements;
+mod e2e_jsonb_round38;
 mod e2e_jsonb_concat_delete;
 mod e2e_jsonb_delete_path;
 mod e2e_jsonb_each;

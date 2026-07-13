@@ -1666,11 +1666,17 @@ fn apply_function_dispatch(
                         })?;
                     match parsed {
                         crate::json::JsonValue::Object(members) => {
-                            let keys: alloc::vec::Vec<Option<alloc::string::String>> = members
-                                .into_iter()
-                                .map(|(k, _)| Some(k))
-                                .collect();
-                            Ok(Value::TextArray(keys))
+                            let mut keys: alloc::vec::Vec<alloc::string::String> =
+                                members.into_iter().map(|(k, _)| k).collect();
+                            // v7.39 (read01 jsonb) — jsonb_object_keys returns
+                            // keys in the canonical stored order (length, then
+                            // bytes); json_object_keys keeps insertion order.
+                            if name == "jsonb_object_keys" {
+                                keys.sort_by(|a, b| {
+                                    a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+                                });
+                            }
+                            Ok(Value::TextArray(keys.into_iter().map(Some).collect()))
                         }
                         // v7.39 (read01 jsonfuncs.c) — PG splits the
                         // wording by the actual type (22023).
