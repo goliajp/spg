@@ -3489,6 +3489,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // 0A000 FEATURE_NOT_SUPPORTED.
         } else if msg.contains("searching for elements in multidimensional arrays")
             || msg.contains("encoding conversion from UTF8 to ASCII")
+            // v7.39 (read01 pseudotypes.c) — dummy pseudotype input funcs.
+            || msg.contains("cannot accept a value of type")
         {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")
