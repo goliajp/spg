@@ -303,6 +303,12 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 // deliberately rejects a bare INT→TEXT so INSERT stays strict.)
                 (spg_storage::DataType::Text, v) => match v {
                     Value::Text(s) => Value::Text(s),
+                    // v7.39 (read01 inet family) — inet/cidr ::text carries
+                    // the mask even at full length (cast-path form).
+                    Value::Inet { family, bits, addr }
+                    | Value::Cidr { family, bits, addr } => Value::text(
+                        crate::conversions::format_inet_full(family, bits, &addr),
+                    ),
                     other => Value::text(value_to_text(&other)),
                 },
                 (spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n), v) => {

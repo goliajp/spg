@@ -13,6 +13,20 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
     rows[0].values[0].clone()
 }
 
+fn row(e: &mut Engine, sql: &str) -> Vec<String> {
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    rows[0]
+        .values
+        .iter()
+        .map(spg_engine::eval::value_to_text)
+        .collect()
+}
+
 fn text(v: &spg_storage::Value<'_>) -> String {
     match v {
         spg_storage::Value::Text(s) => s.to_string(),
@@ -152,5 +166,57 @@ fn abbrev_inet_vs_cidr_and_same_family_values() {
             "SELECT inet_same_family(cidr '192.168.1.0/24', inet '10.0.0.1')"
         ),
         spg_storage::Value::Bool(true)
+    );
+}
+
+// v7.39 (read01 inet_cidr_ntop.c / inet_net_pton.c) — abbreviated CIDR
+// input forms, host-bit validation, cidr set_masklen zeroing, text(inet)
+// mask, and the typed inet_merge. All values byte-locked vs PG18.
+#[test]
+fn cidr_abbreviated_input_and_validation() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row(&mut e, "SELECT cidr '10/8', cidr '10.5/16', cidr '10.5.3/24', cidr '128.1', cidr '192.5.5.240/28'"),
+        vec!["10.0.0.0/8", "10.5.0.0/16", "10.5.3.0/24", "128.1.0.0/16", "192.5.5.240/28"]
+    );
+    // Host bits right of the mask are rejected (PG's dedicated error).
+    let err = e.execute("SELECT cidr '10.1.2.3/8'").unwrap_err();
+    assert!(
+        format!("{err}").contains("invalid cidr value: \"10.1.2.3/8\""),
+        "{err}"
+    );
+}
+
+#[test]
+fn set_masklen_cidr_zeroes_host_bits() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row(
+            &mut e,
+            "SELECT set_masklen(inet '192.168.1.5/24', 16), set_masklen(cidr '10.1.0.0/16', 8)"
+        ),
+        vec!["192.168.1.5/16", "10.0.0.0/8"]
+    );
+}
+
+#[test]
+fn text_of_inet_carries_full_mask() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row(&mut e, "SELECT text(inet '192.168.1.5'), text(cidr '10/8')"),
+        vec!["192.168.1.5/32", "10.0.0.0/8"]
+    );
+}
+
+#[test]
+fn inet_merge_and_same_family_typed() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row(
+            &mut e,
+            "SELECT inet_merge(inet '192.168.1.5/24', inet '192.168.2.5/24'), \
+             inet_same_family(inet '192.168.1.5', inet '::1')"
+        ),
+        vec!["192.168.0.0/22", "false"]
     );
 }

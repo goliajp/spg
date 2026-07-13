@@ -1601,6 +1601,68 @@ pub fn parse_inet_text(s: &str) -> Option<(u8, u8, [u8; 16])> {
     }
 }
 
+/// v7.39 (read01 inet_net_pton.c) — parse CIDR text. Beyond the inet
+/// grammar, cidr accepts ABBREVIATED IPv4 network forms (`10/8`,
+/// `10.5/16`, `128.1`) zero-filling the missing octets; a missing
+/// /width defaults to 8×(octets given) for IPv4 and 128 for IPv6.
+/// Returns Err(()) for "bits set to right of mask" (PG's dedicated
+/// invalid-cidr-value error), Ok(None) for a plain syntax error.
+pub fn parse_cidr_text(s: &str) -> Result<Option<(u8, u8, [u8; 16])>, ()> {
+    let s = s.trim();
+    let parsed = if !s.contains(':') {
+        let (addr_s, bits_s) = match s.split_once('/') {
+            Some((a, b)) => (a, Some(b)),
+            None => (s, None),
+        };
+        let parts: alloc::vec::Vec<&str> = addr_s.split('.').collect();
+        if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+            return Ok(None);
+        }
+        let mut addr = [0u8; 16];
+        for (i, p) in parts.iter().enumerate() {
+            match p.parse::<u8>() {
+                Ok(v) => addr[i] = v,
+                Err(_) => return Ok(None),
+            }
+        }
+        let bits = match bits_s {
+            Some(b) => match b.parse::<u8>() {
+                Ok(n) if n <= 32 => n,
+                _ => return Ok(None),
+            },
+            None => (parts.len() as u8) * 8,
+        };
+        Some((4u8, bits, addr))
+    } else {
+        parse_inet_text(s).map(|(f, b, a)| {
+            // cidr IPv6 without a /width is the full /128.
+            (f, if s.contains('/') { b } else { 128 }, a)
+        })
+    };
+    let Some((family, bits, addr)) = parsed else {
+        return Ok(None);
+    };
+    // PG cidr_in rejects host bits to the right of the mask.
+    let total = if family == 4 { 32u16 } else { 128 };
+    let nbytes = if family == 4 { 4 } else { 16 };
+    for byte in 0..nbytes {
+        let bit_base = (byte as u16) * 8;
+        let keep = (u16::from(bits)).saturating_sub(bit_base).min(8) as u8;
+        let mask: u8 = if keep == 0 {
+            0
+        } else {
+            0xffu8 << (8 - keep)
+        };
+        if addr[byte] & !mask != 0 {
+            return Err(());
+        }
+        if bit_base >= total {
+            break;
+        }
+    }
+    Ok(Some((family, bits, addr)))
+}
+
 /// v7.37.5 ζ-A — parse PG MACADDR text `aa:bb:cc:dd:ee:ff` (also
 /// accepts `aa-bb-cc-dd-ee-ff` and unseparated `aabbccddeeff`).
 pub fn parse_macaddr_text(s: &str) -> Option<[u8; 6]> {
@@ -3108,12 +3170,19 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
-        (Value::Text(s), DataType::Cidr) => match parse_inet_text(&s) {
-            Some((family, bits, addr)) => Some(Value::Cidr { family, bits, addr }),
-            None => {
+        (Value::Text(s), DataType::Cidr) => match parse_cidr_text(&s) {
+            Ok(Some((family, bits, addr))) => Some(Value::Cidr { family, bits, addr }),
+            Err(()) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for CIDR: {s:?} (column `{col_name}`)"
+                        "invalid cidr value: {s:?} DETAIL: Value has bits set to right of mask."
+                    ),
+                }));
+            }
+            Ok(None) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type cidr: {s:?}"
                     ),
                 }));
             }
@@ -3205,7 +3274,15 @@ pub(crate) fn coerce_value(
         }
         // v7.37.5 ζ-A — inverse coerces.
         (Value::Inet { family, bits, addr }, DataType::Text) => {
-            Some(Value::text(format_inet(family, bits, &addr)))
+            // v7.39 (read01 inet family) — PG's text(inet) ALWAYS carries
+            // the /netmask (192.168.1.5 -> "192.168.1.5/32"), unlike the
+            // display form which suppresses a full-length mask.
+            let base = format_inet(family, bits, &addr);
+            Some(Value::text(if base.contains('/') {
+                base
+            } else {
+                alloc::format!("{base}/{bits}")
+            }))
         }
         (Value::Cidr { family, bits, addr }, DataType::Text) => {
             Some(Value::text(format_inet(family, bits, &addr)))

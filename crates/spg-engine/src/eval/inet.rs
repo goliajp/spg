@@ -234,64 +234,62 @@ pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
 /// families" when families differ, text passthrough of the first
 /// arg when both are IPv6).
 pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (a, b) = match args {
-        [Value::Null, _] | [_, Value::Null] => return Ok(Value::Null),
-        [Value::Text(a), Value::Text(b)] => (a.as_ref(), b.as_ref()),
-        _ => {
-            return Err(EvalError::TypeMismatch {
-                detail: "inet_merge() takes 2 TEXT args".into(),
-            });
+    // v7.39 (read01 inet family) — typed rewrite: the smallest network
+    // containing both arguments (longest common prefix capped by both
+    // masks), PG inet_merge.
+    let unpack = |v: &Value<'_>| -> Option<(u8, u8, [u8; 16])> {
+        match v {
+            Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                Some((*family, *bits, *addr))
+            }
+            // An unknown text literal coerces to inet, like PG.
+            Value::Text(s) => crate::conversions::parse_inet_text(s),
+            _ => None,
         }
     };
-    let fam = |s: &str| {
-        if s.split('/').next().unwrap_or("").contains(':') {
-            6
-        } else {
-            4
-        }
-    };
-    if fam(a) != fam(b) {
-        return Err(EvalError::TypeMismatch {
-            detail: "inet_merge(): cannot merge addresses from different families".into(),
-        });
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
     }
-    if fam(a) == 6 {
-        // IPv6 — text passthrough until full v6 bit math lands.
-        return Ok(Value::text(a.to_string()));
-    }
-    let parse = |s: &str| -> Option<(u32, u32)> {
-        let mut split = s.splitn(2, '/');
-        let host = split.next()?;
-        let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
-        let octets: Vec<u32> = host.split('.').filter_map(|o| o.parse().ok()).collect();
-        if octets.len() != 4 {
-            return None;
-        }
-        Some((
-            (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3],
-            mask.min(32),
-        ))
-    };
-    let (Some((addr_a, mask_a)), Some((addr_b, mask_b))) = (parse(a), parse(b)) else {
+    let (Some((fa, ba, aa)), Some((fb, bb, ab))) =
+        (args.first().and_then(unpack), args.get(1).and_then(unpack))
+    else {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("inet_merge(): invalid inet input '{a}' / '{b}'"),
+            detail: "inet_merge() takes 2 inet/cidr args".into(),
         });
     };
-    // Common prefix length, capped by both input masks.
-    let diff = addr_a ^ addr_b;
-    let common = diff.leading_zeros().min(mask_a).min(mask_b);
-    let net = if common == 0 {
-        0
-    } else {
-        addr_a & (u32::MAX << (32 - common))
-    };
-    Ok(Value::text(alloc::format!(
-        "{}.{}.{}.{}/{common}",
-        (net >> 24) & 0xFF,
-        (net >> 16) & 0xFF,
-        (net >> 8) & 0xFF,
-        net & 0xFF
-    )))
+    if fa != fb {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot merge addresses from different families".into(),
+        });
+    }
+    let nbits = u16::from(ba.min(bb));
+    let mut common: u16 = 0;
+    'outer: for byte in 0..16usize {
+        for bit in 0..8u16 {
+            let pos = (byte as u16) * 8 + bit;
+            if pos >= nbits {
+                break 'outer;
+            }
+            let mask = 0x80u8 >> bit;
+            if (aa[byte] & mask) != (ab[byte] & mask) {
+                break 'outer;
+            }
+            common = pos + 1;
+        }
+    }
+    let mut addr = [0u8; 16];
+    for byte in 0..16usize {
+        let bit_base = (byte as u16) * 8;
+        let keep = common.saturating_sub(bit_base).min(8) as u8;
+        let mask: u8 = if keep == 0 { 0 } else { 0xffu8 << (8 - keep) };
+        addr[byte] = aa[byte] & mask;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(Value::Cidr {
+        family: fa,
+        bits: common as u8,
+        addr,
+    })
 }
 
 /// v7.37.17 (17.6 siblings) — macaddr8_set7bit(macaddr8) — sets
@@ -327,13 +325,9 @@ pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 
 /// v7.37.17 (17.6 siblings) — inet_same_family(a, b).
 pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    if args.iter().any(|v| matches!(v, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    // Accept real inet/cidr values (family is stored directly) as well
-    // as the textual form — mirrors the other inet builtins that no
-    // longer insist on TEXT.
-    let fam_of = |v: &Value| -> Option<u8> {
+    // v7.39 (read01 inet family) — typed rewrite (values arrive as
+    // Value::Inet/Cidr since the typed-inet work; text stays accepted).
+    let fam = |v: &Value<'_>| -> Option<u8> {
         match v {
             Value::Inet { family, .. } | Value::Cidr { family, .. } => Some(*family),
             Value::Text(s) => Some(if s.split('/').next().unwrap_or("").contains(':') {
@@ -344,10 +338,13 @@ pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, Eva
             _ => None,
         }
     };
-    match (args.first().and_then(fam_of), args.get(1).and_then(fam_of)) {
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    match (args.first().and_then(fam), args.get(1).and_then(fam)) {
         (Some(a), Some(b)) => Ok(Value::Bool(a == b)),
         _ => Err(EvalError::TypeMismatch {
-            detail: "inet_same_family() takes two inet/cidr/text arguments".into(),
+            detail: "inet_same_family() takes 2 inet args".into(),
         }),
     }
 }
@@ -401,6 +398,17 @@ pub(super) fn inet_set_masklen(args: &[Value<'_>]) -> Result<Value<'static>, Eva
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let bits = n.clamp(0, max) as u8;
     if is_cidr {
+        // v7.39 (read01 inet_cidr_ntop.c) — the cidr variant ZEROES the
+        // bits right of the new mask (PG cidr_set_masklen); the inet
+        // variant keeps the host part.
+        let mut addr = addr;
+        let nbytes = if family == 4 { 4 } else { 16 };
+        for byte in 0..nbytes {
+            let bit_base = (byte as u16) * 8;
+            let keep = u16::from(bits).saturating_sub(bit_base).min(8) as u8;
+            let mask: u8 = if keep == 0 { 0 } else { 0xffu8 << (8 - keep) };
+            addr[byte] &= mask;
+        }
         Ok(Value::Cidr { family, bits, addr })
     } else {
         Ok(Value::Inet { family, bits, addr })

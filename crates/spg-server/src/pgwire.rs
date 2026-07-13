@@ -3403,6 +3403,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // (boolean, money, …) is 22P02 INVALID_TEXT_REPRESENTATION.
         } else if msg.contains("invalid input syntax for type")
             || msg.contains("invalid Roman numeral")
+            || msg.contains("invalid cidr value")
         {
             "22P02"
         // v7.39 (read01 utils/adt, float.c) — inverse-trig domain
@@ -4877,12 +4878,22 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     // understood the error precisely, so strip it from the client
     // message (PG has no such prefix).
     let main_msg: &str = if sqlstate != "42000" {
-        main.strip_prefix("unsupported: ")
-            .or_else(|| main.strip_prefix("storage: "))
-            // v7.39 (GUC knife 5) — typed datetime input errors ride
-            // EvalError::TypeMismatch; PG's message has no prefix.
-            .or_else(|| main.strip_prefix("eval: type mismatch: "))
-            .unwrap_or(main)
+        // v7.39 (GUC knife 5, extended) — typed states mean we understood
+        // the error precisely; strip EVERY layer of internal prefix (a
+        // coerce error can arrive double-wrapped through the dispatch).
+        let mut m = main;
+        loop {
+            let next = m
+                .strip_prefix("unsupported: ")
+                .or_else(|| m.strip_prefix("storage: "))
+                .or_else(|| m.strip_prefix("eval: "))
+                .or_else(|| m.strip_prefix("type mismatch: "));
+            match next {
+                Some(n) => m = n,
+                None => break,
+            }
+        }
+        m
     } else {
         main
     };

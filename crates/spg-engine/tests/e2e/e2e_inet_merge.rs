@@ -14,10 +14,9 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 }
 
 fn text(v: &spg_storage::Value<'_>) -> String {
-    match v {
-        spg_storage::Value::Text(s) => s.to_string(),
-        other => panic!("expected Text, got {other:?}"),
-    }
+    // v7.39 (read01 inet family) — inet_merge now returns a typed CIDR
+    // (matching PG's return type), so render through the canonical form.
+    spg_engine::eval::value_to_text(v)
 }
 
 #[test]
