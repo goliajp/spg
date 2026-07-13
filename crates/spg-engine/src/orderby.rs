@@ -351,6 +351,29 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             .unwrap_or(Ordering::Equal),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // v7.39 (read01 orderedsetaggs.c, found via interval percentile) —
+        // INTERVAL had no arm and fell to the debug-string fallback, which
+        // ordered by the decimal rendering of `micros` (so 4h < 1h < 2h) —
+        // ORDER BY on an interval column was wrong everywhere. PG's
+        // interval_cmp compares the normalized span: a month is 30 days,
+        // a day 24 hours.
+        (
+            Value::Interval {
+                months: xm,
+                days: xd,
+                micros: xu,
+            },
+            Value::Interval {
+                months: ym,
+                days: yd,
+                micros: yu,
+            },
+        ) => {
+            let span = |m: i32, d: i32, u: i64| -> i128 {
+                (i128::from(m) * 30 + i128::from(d)) * 86_400_000_000 + i128::from(u)
+            };
+            span(*xm, *xd, *xu).cmp(&span(*ym, *yd, *yu))
+        }
         // Cross-type compare: fall back to the debug rendering —
         // same-partition is the goal, exact order is irrelevant.
         _ => alloc::format!("{a:?}").cmp(&alloc::format!("{b:?}")),

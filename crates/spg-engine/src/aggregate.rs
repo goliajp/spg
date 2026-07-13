@@ -476,6 +476,11 @@ struct AggSpec {
     /// PG requires it constant, so it is evaluated once. `None` for
     /// `mode()` and for every non-ordered-set aggregate.
     direct_arg: Option<Expr>,
+    /// v7.39 (read01 orderedsetaggs.c) — the remaining direct arguments
+    /// of a multi-key hypothetical-set call (`rank(5, 'x') WITHIN GROUP
+    /// (ORDER BY a, b)`); one per sort key past the first. Empty
+    /// everywhere else.
+    direct_args_extra: Vec<Expr>,
     /// v7.33 (array_agg argmax) — set when this spec came from
     /// `(array_agg(x ORDER BY y))[1]`: accumulate only the first-by-order
     /// element (a running argmax/argmin) and finalise to that scalar
@@ -893,16 +898,39 @@ fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
                     detail: format!("{}() requires a direct argument", spec.name),
                 });
             }
-            // Multi-key WITHIN GROUP (multiple sort keys / hypothetical
-            // args) is not supported yet — error loudly instead of
-            // silently using only the first key.
+            // v7.39 (read01 orderedsetaggs.c) — the hypothetical-set
+            // family supports the multi-key form: one direct argument
+            // per sort key (PG resolves a mismatch as a missing
+            // function overload; its HINT carries the real rule).
             if spec.order_by.len() > 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "{}() with multiple WITHIN GROUP sort keys is not supported yet",
-                        spec.name
-                    ),
-                });
+                let hypothetical = matches!(
+                    spec.name.as_str(),
+                    "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+                );
+                if !hypothetical {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{}() with multiple WITHIN GROUP sort keys is not supported yet",
+                            spec.name
+                        ),
+                    });
+                }
+            }
+            if matches!(
+                spec.name.as_str(),
+                "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+            ) {
+                let n_direct = 1 + spec.direct_args_extra.len();
+                if n_direct != spec.order_by.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "the number of hypothetical direct arguments (here {}) must \
+                             match the number of ordering columns (here {})",
+                            n_direct,
+                            spec.order_by.len()
+                        ),
+                    });
+                }
             }
         }
     }
@@ -2962,6 +2990,19 @@ fn finalize_synth_rows(
             _ => Ok(None),
         })
         .collect::<Result<_, _>>()?;
+    // v7.39 (read01 orderedsetaggs.c) — the remaining hypothetical direct
+    // arguments of a multi-key call, evaluated once like the first.
+    let direct_extra_vals: Vec<Vec<Value>> = agg_specs
+        .iter()
+        .map(|spec| match rows.first() {
+            Some(r) if !spec.direct_args_extra.is_empty() => spec
+                .direct_args_extra
+                .iter()
+                .map(|e| eval::eval_expr(e, &r.as_row(), &ctx))
+                .collect(),
+            _ => Ok(Vec::new()),
+        })
+        .collect::<Result<_, _>>()?;
 
     // Materialise synthetic rows (insertion order = `order`).
     let mut synth_rows: Vec<Row<'static>> = Vec::new();
@@ -3009,8 +3050,9 @@ fn finalize_synth_rows(
                     &agg_specs[i].name,
                     st_final,
                     direct_arg_vals[i].as_ref(),
-                    agg_specs[i].order_by.first(),
-                )
+                    &direct_extra_vals[i],
+                    &agg_specs[i].order_by,
+                )?
             } else {
                 finalize(&agg_specs[i].name, st_final)
             };
@@ -3440,13 +3482,14 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     // aggregate from the sort spec and the in-parens
                     // arg as the direct (fraction) argument.
                     let ordered_set = is_within_group_name(&canonical);
-                    let (arg, direct_arg) = if ordered_set {
+                    let (arg, direct_arg, direct_args_extra) = if ordered_set {
                         (
                             order_by.first().map(|o| o.expr.clone()),
                             args.first().cloned(),
+                            args.iter().skip(1).cloned().collect(),
                         )
                     } else {
-                        (args.first().cloned(), None)
+                        (args.first().cloned(), None, Vec::new())
                     };
                     let spec = AggSpec {
                         kind: classify_agg_name(&canonical),
@@ -3463,6 +3506,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         order_by: order_by.clone(),
                         filter: filter.as_deref().cloned(),
                         direct_arg,
+                        direct_args_extra,
                         first_ordered: false,
                     };
                     if !out.iter().any(|s| {
@@ -3473,6 +3517,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                             && s.order_by == spec.order_by
                             && s.filter == spec.filter
                             && s.direct_arg == spec.direct_arg
+                            && s.direct_args_extra == spec.direct_args_extra
                             && s.first_ordered == spec.first_ordered
                     }) {
                         out.push(spec);
@@ -3520,6 +3565,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     order_by: Vec::new(),
                     filter: None,
                     direct_arg: None,
+                    direct_args_extra: Vec::new(),
                     first_ordered: false,
                 };
                 if !out.iter().any(|s| {
@@ -3597,6 +3643,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     order_by: order_by.to_vec(),
                     filter: filter.cloned(),
                     direct_arg: None,
+                    direct_args_extra: Vec::new(),
                     first_ordered: true,
                 };
                 if !out.iter().any(|s| {
@@ -4507,26 +4554,22 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
 
 /// The array form of a `percentile_cont/disc` direct argument
 /// (`percentile_cont(ARRAY[0.25,0.5,0.75])`), as f64 fractions. `None` when the
-/// direct argument is a plain scalar fraction. NULL elements resolve to 0.0
-/// (PG rejects NULL fractions; we clamp rather than error).
-fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<f64>> {
+/// direct argument is a plain scalar fraction. A NULL element stays `None` —
+/// PG yields a NULL result element for it.
+fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<Option<f64>>> {
     match v? {
-        Value::FloatArray(a) => Some(a.iter().map(|x| x.unwrap_or(0.0)).collect()),
+        Value::FloatArray(a) => Some(a.clone()),
         Value::NumericArray(a) => Some(
             a.iter()
-                .map(|x| x.map_or(0.0, |(scaled, scale)| numeric_to_f64(scaled, scale)))
+                .map(|x| x.map(|(scaled, scale)| numeric_to_f64(scaled, scale)))
                 .collect(),
         ),
-        Value::IntArray(a) => Some(a.iter().map(|x| f64::from(x.unwrap_or(0))).collect()),
+        Value::IntArray(a) => Some(a.iter().map(|x| x.map(f64::from)).collect()),
         // Array literals (`ARRAY[0.25,0.5,0.75]`) evaluate to a TextArray of the
         // element renderings; parse each back to f64.
         Value::TextArray(a) => Some(
             a.iter()
-                .map(|x| {
-                    x.as_deref()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(0.0)
-                })
+                .map(|x| x.as_deref().and_then(|s| s.parse::<f64>().ok()))
                 .collect(),
         ),
         _ => None,
@@ -4583,56 +4626,104 @@ fn numeric_to_f64(scaled: i128, scale: u8) -> f64 {
 /// v7.32 (round-29) — finalize a WITHIN GROUP aggregate. `st.items` is
 /// already sorted by the `WITHIN GROUP (ORDER BY …)` spec. `direct` is
 /// the evaluated direct argument: the fraction for `percentile_*`, the
-/// hypothetical value for the hypothetical-set family (`rank` etc.),
-/// and unused by `mode`. `order` is the (single) sort key, needed by
-/// the hypothetical-set family to compare in the sort direction.
+/// first hypothetical value for the hypothetical-set family (`rank`
+/// etc. — `direct_extra` carries the rest of a multi-key call), and
+/// unused by `mode`. `order_by` is the sort spec; the hypothetical-set
+/// family compares in the sort direction (multi-key via `st.item_keys`).
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
 )]
 fn finalize_ordered_set(
     name: &str,
     st: &AggState,
     direct: Option<&Value>,
-    order: Option<&spg_sql::ast::OrderBy>,
-) -> Value<'static> {
+    direct_extra: &[Value<'static>],
+    order_by: &[spg_sql::ast::OrderBy],
+) -> Result<Value<'static>, EvalError> {
     let fraction = direct;
+    // v7.39 (read01 orderedsetaggs.c) — PG validates the percentile
+    // fraction before looking at the rows (an out-of-range fraction
+    // errors even over an empty group), and a NULL fraction is NULL.
+    let check_fraction = |f: f64| -> Result<f64, EvalError> {
+        if !(0.0..=1.0).contains(&f) || f.is_nan() {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("percentile value {f} is not between 0 and 1"),
+            });
+        }
+        Ok(f)
+    };
+    let scalar_fraction: Option<Result<f64, EvalError>> =
+        if matches!(name, "percentile_cont" | "percentile_disc") {
+            match fraction {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => match percentile_fraction_array(Some(v)) {
+                    Some(fracs) => {
+                        for f in fracs.iter().flatten() {
+                            check_fraction(*f)?;
+                        }
+                        None
+                    }
+                    None => Some(
+                        agg_value_to_f64(v)
+                            .ok_or_else(|| EvalError::TypeMismatch {
+                                detail: format!(
+                                    "percentile fraction must be numeric, got {:?}",
+                                    v.data_type()
+                                ),
+                            })
+                            .and_then(check_fraction),
+                    ),
+                },
+            }
+        } else {
+            None
+        };
     let items = &st.items;
     if items.is_empty() {
         // A hypothetical row ranks first over an empty group; the
         // distribution functions are 0 / divide-by-(n+1).
-        return match name {
+        return Ok(match name {
             "rank" | "dense_rank" => Value::BigInt(1),
             "percent_rank" => Value::Float(0.0),
             "cume_dist" => Value::Float(1.0),
             _ => Value::Null,
-        };
+        });
     }
     let n = items.len();
-    match name {
+    Ok(match name {
         // v7.32 (round-29) — hypothetical-set: the rank the direct value
         // would have if inserted into the group, in the sort direction.
         "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
             let Some(h) = fraction else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
-            let (desc, nulls_first) = order.map_or((false, None), |o| (o.desc, o.nulls_first));
-            let mut before = 0usize; // sort strictly before h
+            // v7.39 (read01 orderedsetaggs.c) — the multi-key form
+            // compares the hypothetical tuple against the collected
+            // `item_keys` tuples with the full sort spec.
+            let multi = order_by.len() > 1 && st.item_keys.len() == items.len();
+            let hv: Vec<Value<'static>> = core::iter::once(h.clone().into_owned())
+                .chain(direct_extra.iter().cloned())
+                .collect();
+            let (desc, nulls_first) = order_by
+                .first()
+                .map_or((false, None), |o| (o.desc, o.nulls_first));
+            let cmp_i = |i: usize| -> core::cmp::Ordering {
+                if multi {
+                    cmp_order_keys(order_by, &[], &st.item_keys[i], &hv)
+                } else {
+                    crate::order_by_value_cmp(desc, nulls_first, &items[i], h)
+                }
+            };
+            let mut before: Vec<usize> = Vec::new(); // sort strictly before h
             let mut before_or_eq = 0usize; // sort before-or-peer with h
-            let mut distinct_before = 0usize;
-            let mut last_before: Option<&Value> = None;
-            for it in items {
-                match crate::order_by_value_cmp(desc, nulls_first, it, h) {
+            for i in 0..n {
+                match cmp_i(i) {
                     core::cmp::Ordering::Less => {
-                        before += 1;
+                        before.push(i);
                         before_or_eq += 1;
-                        if last_before
-                            .is_none_or(|p| value_cmp(p, it) != core::cmp::Ordering::Equal)
-                        {
-                            distinct_before += 1;
-                            last_before = Some(it);
-                        }
                     }
                     core::cmp::Ordering::Equal => before_or_eq += 1,
                     core::cmp::Ordering::Greater => {}
@@ -4640,9 +4731,31 @@ fn finalize_ordered_set(
             }
             let nn = n as f64;
             match name {
-                "rank" => Value::BigInt((before + 1) as i64),
-                "dense_rank" => Value::BigInt((distinct_before + 1) as i64),
-                "percent_rank" => Value::Float(before as f64 / nn),
+                "rank" => Value::BigInt((before.len() + 1) as i64),
+                "dense_rank" => {
+                    // Count distinct sort-key tuples among the strictly-
+                    // before rows (items arrive unsorted relative to
+                    // item_keys in the multi-key form, so sort + dedup).
+                    let tuple_cmp = |&x: &usize, &y: &usize| -> core::cmp::Ordering {
+                        if multi {
+                            cmp_order_keys(order_by, &[], &st.item_keys[x], &st.item_keys[y])
+                        } else {
+                            value_cmp(&items[x], &items[y])
+                        }
+                    };
+                    let mut sorted = before.clone();
+                    sorted.sort_by(tuple_cmp);
+                    let mut distinct = 0usize;
+                    for (k, &i) in sorted.iter().enumerate() {
+                        if k == 0
+                            || tuple_cmp(&sorted[k - 1], &i) != core::cmp::Ordering::Equal
+                        {
+                            distinct += 1;
+                        }
+                    }
+                    Value::BigInt((distinct + 1) as i64)
+                }
+                "percent_rank" => Value::Float(before.len() as f64 / nn),
                 "cume_dist" => Value::Float((before_or_eq as f64 + 1.0) / (nn + 1.0)),
                 _ => unreachable!(),
             }
@@ -4669,10 +4782,10 @@ fn finalize_ordered_set(
         }
         // The first value whose cumulative fraction reaches `f`. PG accepts
         // both a scalar fraction (→ the element) and an array of fractions (→
-        // an array of the ordered-column element type).
+        // an array of the ordered-column element type, with NULL fractions
+        // yielding NULL elements).
         "percentile_disc" => {
             let idx_at = |f: f64| -> usize {
-                let f = f.clamp(0.0, 1.0);
                 if f <= 0.0 {
                     0
                 } else {
@@ -4682,25 +4795,75 @@ fn finalize_ordered_set(
                 }
             };
             if let Some(fracs) = percentile_fraction_array(fraction) {
-                let picked: Vec<Value> = fracs.iter().map(|f| items[idx_at(*f)].clone()).collect();
-                return values_to_array(&picked);
+                let picked: Vec<Value> = fracs
+                    .iter()
+                    .map(|f| f.map_or(Value::Null, |f| items[idx_at(f)].clone()))
+                    .collect();
+                return Ok(values_to_array(&picked));
             }
-            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0);
+            let f = scalar_fraction.transpose()?.unwrap_or(0.0);
             items[idx_at(f)].clone()
         }
         // Linear interpolation between the two bracketing values. PG accepts
         // both a scalar fraction (→ float) and an array of fractions (→ a
         // float array, one interpolated value per requested percentile).
         "percentile_cont" => {
+            // v7.39 (read01 orderedsetaggs.c) — the INTERVAL overload
+            // interpolates component-wise with PG's month→day→time
+            // remainder spill (a month is 30 days, a day 86400 s).
+            if items
+                .iter()
+                .all(|v| matches!(v, Value::Interval { .. }))
+            {
+                let iv = |i: usize| -> (f64, f64, f64) {
+                    match &items[i] {
+                        Value::Interval {
+                            months,
+                            days,
+                            micros,
+                        } => (f64::from(*months), f64::from(*days), *micros as f64),
+                        _ => unreachable!(),
+                    }
+                };
+                let at = |f: f64| -> Value<'static> {
+                    if n == 1 {
+                        return items[0].clone();
+                    }
+                    let rank = f * (n as f64 - 1.0);
+                    let lo = crate::eval::f64_floor(rank) as usize;
+                    let hi = crate::eval::f64_ceil(rank) as usize;
+                    let frac = rank - lo as f64;
+                    let (lm, ld, lu) = iv(lo);
+                    let (hm, hd, hu) = iv(hi);
+                    let dm = (hm - lm) * frac;
+                    let m_i = dm as i64; // trunc toward zero
+                    let rem_days = (dm - m_i as f64) * 30.0 + (hd - ld) * frac;
+                    let d_i = rem_days as i64;
+                    let us = (rem_days - d_i as f64) * 86_400_000_000.0 + (hu - lu) * frac;
+                    Value::Interval {
+                        months: (lm as i64 + m_i) as i32,
+                        days: (ld as i64 + d_i) as i32,
+                        micros: lu as i64 + libm::round(us) as i64,
+                    }
+                };
+                if let Some(fracs) = percentile_fraction_array(fraction) {
+                    let picked: Vec<Value> = fracs
+                        .iter()
+                        .map(|f| f.map_or(Value::Null, at))
+                        .collect();
+                    return Ok(values_to_array(&picked));
+                }
+                let f = scalar_fraction.transpose()?.unwrap_or(0.0);
+                return Ok(at(f));
+            }
             let Some(nums) = items
                 .iter()
                 .map(agg_value_to_f64)
                 .collect::<Option<Vec<f64>>>()
             else {
-                return Value::Null; // non-numeric ordered set
+                return Ok(Value::Null); // non-numeric ordered set
             };
             let at = |f: f64| -> f64 {
-                let f = f.clamp(0.0, 1.0);
                 if n == 1 {
                     return nums[0];
                 }
@@ -4711,13 +4874,15 @@ fn finalize_ordered_set(
                 nums[lo] + (nums[hi] - nums[lo]) * frac
             };
             if let Some(fracs) = percentile_fraction_array(fraction) {
-                return Value::FloatArray(fracs.iter().map(|f| Some(at(*f))).collect());
+                return Ok(Value::FloatArray(
+                    fracs.iter().map(|f| f.map(at)).collect(),
+                ));
             }
-            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0);
+            let f = scalar_fraction.transpose()?.unwrap_or(0.0);
             Value::Float(at(f))
         }
         _ => unreachable!(),
-    }
+    })
 }
 
 fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {

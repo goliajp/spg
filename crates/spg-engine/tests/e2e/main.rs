@@ -254,6 +254,7 @@ mod e2e_numeric_underscore_sep;
 mod e2e_numnode_tsquery;
 mod e2e_on_conflict_cardinality;
 mod e2e_on_conflict_constraint;
+mod e2e_ordered_set_round21;
 mod e2e_orderby_topk;
 mod e2e_overlay_and_bit_ops;
 mod e2e_pageinspect_probes;
