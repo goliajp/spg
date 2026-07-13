@@ -320,6 +320,48 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     });
                 }
             }
+            // v7.39 (read01 pseudotypes.c) — casting a value INTO a
+            // pseudotype hits PG's dummy input functions (0A000).
+            {
+                let lower = name.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "anyarray"
+                        | "anyelement"
+                        | "anyenum"
+                        | "anyrange"
+                        | "anymultirange"
+                        | "anynonarray"
+                        | "anycompatible"
+                        | "anycompatiblearray"
+                        | "anycompatiblenonarray"
+                        | "anycompatiblerange"
+                        | "anycompatiblemultirange"
+                        | "any"
+                        | "trigger"
+                        | "event_trigger"
+                        | "internal"
+                        | "language_handler"
+                        | "fdw_handler"
+                        | "pg_ddl_command"
+                ) && !matches!(v, Value::Null)
+                {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("cannot accept a value of type {lower}"),
+                    });
+                }
+            }
+            // v7.39 (read01 pseudotypes.c) — `::cstring` is PG's I/O-form
+            // pseudotype: text in, text out (cstring_in/out are identity).
+            // SPG carries it as text; pg_typeof(cstring) reading "text" is
+            // a recorded delta alongside the literal projection OIDs.
+            if name.eq_ignore_ascii_case("cstring") {
+                return Ok(match v {
+                    Value::Null => Value::Null,
+                    Value::Text(s) => Value::Text(s),
+                    other => Value::text(value_to_text(&other)),
+                });
+            }
             // v7.39 (read01 jsonpath.c) — `::jsonpath` parses and prints
             // the canonical form (PG's jsonpath type; SPG carries it as
             // text — the wire OID is a recorded residual with the other
