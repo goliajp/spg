@@ -3461,6 +3461,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 varlena.c) — 22011 SUBSTRING_ERROR.
         } else if msg.contains("negative substring length not allowed") {
             "22011"
+        // v7.39 (read01 varlena.c) — byte/bit index out of range.
+        } else if msg.contains("out of valid range, 0..") {
+            "22003"
         // v7.39 (read01 regexp.c) — 2201B INVALID_REGULAR_EXPRESSION.
         } else if msg.contains("invalid regular expression") {
             "2201B"

@@ -702,6 +702,36 @@ fn apply_function_dispatch(
                     bytes: alloc::borrow::Cow::Owned(out),
                 });
             }
+            // v7.39 (read01 varlena.c part 2) — overlay(bytea PLACING bytea
+            // FROM n [FOR len]) splices at the byte level.
+            if let (Value::Bytes(sb), Value::Bytes(rb)) = (&args[0], &args[1]) {
+                let int_of = |v: &Value<'_>| -> Option<i64> {
+                    match v {
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        _ => None,
+                    }
+                };
+                let Some(start) = int_of(&args[2]) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "overlay(): start must be integer".into(),
+                    });
+                };
+                let for_len = match args.get(3) {
+                    None => rb.len() as i64,
+                    Some(v) => int_of(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "overlay(): length must be integer".into(),
+                    })?,
+                };
+                let s0 = ((start - 1).max(0) as usize).min(sb.len());
+                let after = (s0 + for_len.max(0) as usize).min(sb.len());
+                let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                out.extend_from_slice(&sb[..s0]);
+                out.extend_from_slice(rb);
+                out.extend_from_slice(&sb[after..]);
+                return Ok(Value::Bytes(out.into()));
+            }
             let s = match &args[0] {
                 Value::Text(s) => s.as_ref(),
                 other => {
@@ -814,8 +844,8 @@ fn apply_function_dispatch(
             if idx < 0 || (idx as usize) >= b.len() {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "get_byte(): index {idx} out of range 0..{}",
-                        b.len()
+                        "index {idx} out of valid range, 0..{}",
+                        b.len().saturating_sub(1)
                     ),
                 });
             }
@@ -845,7 +875,8 @@ fn apply_function_dispatch(
                 if bit_idx < 0 || (bit_idx as u64) >= u64::from(*nbits) {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "get_bit(): index {bit_idx} out of range 0..{nbits}"
+                            "index {bit_idx} out of valid range, 0..{}",
+                            nbits.saturating_sub(1)
                         ),
                     });
                 }
@@ -877,8 +908,8 @@ fn apply_function_dispatch(
             if bit_idx < 0 || (bit_idx as usize) >= b.len() * 8 {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "get_bit(): index {bit_idx} out of range 0..{}",
-                        b.len() * 8
+                        "index {bit_idx} out of valid range, 0..{}",
+                        (b.len() * 8).saturating_sub(1)
                     ),
                 });
             }
@@ -931,8 +962,8 @@ fn apply_function_dispatch(
             if idx < 0 || (idx as usize) >= b.len() {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "set_byte(): index {idx} out of range 0..{}",
-                        b.len()
+                        "index {idx} out of valid range, 0..{}",
+                        b.len().saturating_sub(1)
                     ),
                 });
             }
@@ -978,7 +1009,8 @@ fn apply_function_dispatch(
                 if bit_idx < 0 || (bit_idx as u64) >= u64::from(*nbits) {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "set_bit(): index {bit_idx} out of range 0..{nbits}"
+                            "index {bit_idx} out of valid range, 0..{}",
+                            nbits.saturating_sub(1)
                         ),
                     });
                 }
@@ -1030,8 +1062,8 @@ fn apply_function_dispatch(
             if bit_idx < 0 || (bit_idx as usize) >= b.len() * 8 {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "set_bit(): index {bit_idx} out of range 0..{}",
-                        b.len() * 8
+                        "index {bit_idx} out of valid range, 0..{}",
+                        (b.len() * 8).saturating_sub(1)
                     ),
                 });
             }
@@ -10893,6 +10925,13 @@ fn apply_function_dispatch(
                 Value::Text(s) => {
                     let reversed: alloc::string::String = s.chars().rev().collect();
                     Ok(Value::text(reversed))
+                }
+                // v7.39 (read01 varlena.c part 2) — reverse(bytea) reverses
+                // the byte order.
+                Value::Bytes(b) => {
+                    let mut out = b.to_vec();
+                    out.reverse();
+                    Ok(Value::Bytes(out.into()))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
