@@ -1328,11 +1328,22 @@ fn apply_binary_calendar(
             });
         }
         (Value::Timestamp(a), Value::Timestamp(b)) if op == BinOp::Sub => {
+            // v7.39 (read01 timestamp.c) — like-signed infinities cannot
+            // subtract (PG "interval out of range"); mixed-sign needs an
+            // interval infinity SPG's Interval can't represent yet
+            // (recorded delta) so it errors the same way.
+            let a_inf = *a == i64::MAX || *a == i64::MIN;
+            let b_inf = *b == i64::MAX || *b == i64::MIN;
+            if a_inf || b_inf {
+                return Err(EvalError::TypeMismatch {
+                    detail: "interval out of range".into(),
+                });
+            }
             // PG: timestamp - timestamp -> interval, justified to hours (every
             // 24h of the microsecond delta becomes one day). 30h -> `1 day
             // 06:00:00`, not a raw microsecond count.
             let delta = a.checked_sub(*b).ok_or(EvalError::TypeMismatch {
-                detail: "TIMESTAMP - TIMESTAMP overflows i64 microseconds".into(),
+                detail: "interval out of range".into(),
             })?;
             const DAY_US: i64 = 86_400_000_000;
             let days = i32::try_from(delta / DAY_US).map_err(|_| EvalError::TypeMismatch {
@@ -1611,6 +1622,11 @@ pub(crate) fn add_interval_to_micros(
     micros: i64,
 ) -> Result<i64, EvalError> {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
+    // v7.39 (read01 timestamp.c) — an infinite timestamp absorbs any
+    // finite interval (PG: infinity + '1 day' = infinity).
+    if t == i64::MAX || t == i64::MIN {
+        return Ok(t);
+    }
     let mut out = t;
     if months != 0 {
         let day_count = out.div_euclid(MICROS_PER_DAY);
@@ -1636,9 +1652,21 @@ pub(crate) fn add_interval_to_micros(
             detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
         })?;
     }
-    out.checked_add(micros).ok_or(EvalError::TypeMismatch {
-        detail: "TIMESTAMP ± INTERVAL micros overflows i64".into(),
-    })
+    let out = out.checked_add(micros).ok_or(EvalError::TypeMismatch {
+        detail: "timestamp out of range".into(),
+    })?;
+    // v7.39 (read01 timestamp.c) — PG's lower bound (4714-11-24 BC,
+    // Unix-epoch microseconds); arithmetic below it errors like PG.
+    // The upper bound is i64 itself (checked adds above) — SPG's
+    // 1970-based clock ends ~30 years before PG's 2000-based ceiling,
+    // a recorded delta at the extreme fringe.
+    const TS_MIN: i64 = -210_866_803_200_000_000;
+    if out < TS_MIN {
+        return Err(EvalError::TypeMismatch {
+            detail: "timestamp out of range".into(),
+        });
+    }
+    Ok(out)
 }
 
 /// Dispatch for any binary op when at least one operand is NUMERIC.

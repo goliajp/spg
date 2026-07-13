@@ -3410,7 +3410,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // that don't fit the calendar/DateStyle are 22008
         // DATETIME_FIELD_OVERFLOW; malformed text is 22007
         // INVALID_DATETIME_FORMAT.
-        } else if msg.contains("date/time field value out of range") {
+        } else if msg.contains("date/time field value out of range")
+            // v7.39 (read01 timestamp.c) — arithmetic range family.
+            || msg.contains("timestamp out of range")
+            || msg.contains("interval out of range")
+        {
             "22008"
         } else if msg.contains("invalid input syntax for type date")
             || msg.contains("invalid input syntax for type timestamp")

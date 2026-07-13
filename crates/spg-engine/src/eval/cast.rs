@@ -1022,6 +1022,10 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
         Value::Int(n) => Ok(Value::Timestamp(i64::from(n))),
         Value::BigInt(n) => Ok(Value::Timestamp(n)),
         // DATE → TIMESTAMP picks midnight on the date.
+        // v7.39 (read01 timestamp.c) — the ±infinity date sentinels map
+        // to the timestamp sentinels (multiplying them overflowed).
+        Value::Date(i32::MAX) => Ok(Value::Timestamp(i64::MAX)),
+        Value::Date(i32::MIN) => Ok(Value::Timestamp(i64::MIN)),
         Value::Date(d) => Ok(Value::Timestamp(i64::from(d) * 86_400_000_000)),
         Value::Text(s) => {
             parse_timestamp_literal(&s)
