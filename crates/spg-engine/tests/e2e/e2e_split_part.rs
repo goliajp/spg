@@ -112,9 +112,13 @@ fn split_part_n_zero_errors() {
 // ── EMPTY DELIMITER ERRORS ───────────────────────────────────────
 
 #[test]
-fn split_part_empty_delim_errors() {
+fn split_part_empty_delim_is_whole_string() {
+    // v7.39 (read01 varlena.c) — PG treats an empty delimiter as "the
+    // whole string is field 1" (also -1); other fields are ''.
     let mut e = Engine::new();
-    assert!(e.execute("SELECT split_part('abc', '', 1)").is_err());
+    assert_eq!(text(&mut e, "SELECT split_part('abc', '', 1)"), "abc");
+    assert_eq!(text(&mut e, "SELECT split_part('abc', '', -1)"), "abc");
+    assert_eq!(text(&mut e, "SELECT split_part('abc', '', 2)"), "");
 }
 
 // ── DELIM NOT PRESENT ────────────────────────────────────────────

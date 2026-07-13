@@ -10932,11 +10932,6 @@ fn apply_function_dispatch(
             }
             let s = value_to_format_text(&args[0]);
             let delim = value_to_format_text(&args[1]);
-            if delim.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: "split_part(): delimiter cannot be empty".into(),
-                });
-            }
             let n = match &args[2] {
                 Value::SmallInt(x) => i64::from(*x),
                 Value::Int(x) => i64::from(*x),
@@ -10952,8 +10947,17 @@ fn apply_function_dispatch(
             };
             if n == 0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "split_part(): n must be nonzero (PG: 1-indexed)".into(),
+                    detail: "field position must not be zero".into(),
                 });
+            }
+            // v7.39 (read01 varlena.c) — an empty delimiter means the
+            // whole string is field 1 (or -1); other fields are ''.
+            if delim.is_empty() {
+                return Ok(Value::text(if n == 1 || n == -1 {
+                    s.to_string()
+                } else {
+                    String::new()
+                }));
             }
             let parts: alloc::vec::Vec<&str> = s.split(&delim[..]).collect();
             let total = parts.len() as i64;
@@ -11065,6 +11069,33 @@ fn apply_function_dispatch(
             Ok(Value::text(out))
         }
         // v7.17.0 Phase 3.7 — PG regex function family.
+        // v7.39 (read01 varlena.c) — the pg_proc-level text operator
+        // support functions callable by name.
+        "texteq" | "textne" | "text_lt" | "text_le" | "text_gt" | "text_ge" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 2 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Text(a), Value::Text(b)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() needs text args"),
+                });
+            };
+            let ord = a.as_ref().cmp(b.as_ref());
+            use core::cmp::Ordering as O;
+            Ok(Value::Bool(match name {
+                "texteq" => ord == O::Equal,
+                "textne" => ord != O::Equal,
+                "text_lt" => ord == O::Less,
+                "text_le" => ord != O::Greater,
+                "text_gt" => ord == O::Greater,
+                _ => ord != O::Less,
+            }))
+        }
         "regexp_matches" => regexp_matches(args),
         // v7.39 (read01 regexp.c) — SIMILAR TO family.
         "__similar_to" => super::regexp::similar_to_match(args),
