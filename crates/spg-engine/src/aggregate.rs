@@ -473,6 +473,16 @@ struct AggSpec {
     /// instead of a string compare for every (row × aggregate)
     /// iteration.
     kind: AggKind,
+    /// v7.39 (enum order knife) — member labels when the aggregate's
+    /// argument is enum-typed and the aggregate orders its input
+    /// (min/max): extreme comparisons use member order, not label text.
+    /// Enriched once per query in `run` (spec collection is AST-only and
+    /// has no catalog).
+    enum_labels: Option<Vec<String>>,
+    /// v7.39 (enum order knife) — per-ORDER-BY-key member labels for the
+    /// ordered collection aggregates (`array_agg(x ORDER BY enum_col)`).
+    /// Parallel to `order_by`; all-None when no key is enum-typed.
+    order_enum_labels: Vec<Option<Vec<String>>>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -617,6 +627,9 @@ pub(crate) fn run(
     // v7.39 (parallel-agg P1) — host-injected executor; None = the
     // single-threaded paths, byte-identical to pre-P1.
     runner: Option<&dyn crate::ParallelRunner>,
+    // v7.39 (enum order knife) — catalog for enum member-order metadata
+    // (spec collection is AST-only). None keeps every ordering textual.
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<AggResult, EvalError> {
     // v7.38 P0 元机制 A — fires at the top of the aggregate
     // executor with the number of input rows. Tests use this to
@@ -660,6 +673,32 @@ pub(crate) fn run(
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
     validate_within_group(&agg_specs)?;
+
+    // v7.39 (enum order knife) — resolve enum member-order metadata once
+    // per query: min/max extremes and ordered-collection sort keys over
+    // enum-typed expressions compare by member order (PG enumsortorder).
+    if let Some(cat) = catalog
+        && !cat.enum_types().is_empty()
+    {
+        for spec in &mut agg_specs {
+            if matches!(spec.kind, AggKind::Min | AggKind::Max)
+                && let Some(arg) = &spec.arg
+            {
+                spec.enum_labels =
+                    crate::eval::expr_enum_labels(arg, schema_cols, catalog).map(<[String]>::to_vec);
+            }
+            if !spec.order_by.is_empty() {
+                spec.order_enum_labels = spec
+                    .order_by
+                    .iter()
+                    .map(|o| {
+                        crate::eval::expr_enum_labels(&o.expr, schema_cols, catalog)
+                            .map(<[String]>::to_vec)
+                    })
+                    .collect();
+            }
+        }
+    }
 
     // (1) Stream the WHERE-filtered rows into insertion-ordered group state.
     let order = accumulate_groups(
@@ -718,6 +757,7 @@ pub(crate) fn run(
         &synth_schema,
         correlated_eval,
         defer_projection,
+        catalog,
     )?;
 
     // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
@@ -757,6 +797,7 @@ pub(crate) fn run(
             out_rows,
             correlated_eval,
             keep_n,
+            catalog,
         )?;
         kept_synth = sorted_synth;
         out_rows = sorted_out;
@@ -772,7 +813,10 @@ pub(crate) fn run(
         items_compiled,
     }) = deferred_project
     {
-        let synth_ctx = EvalContext::new(&synth_schema, None);
+        let mut synth_ctx = EvalContext::new(&synth_schema, None);
+        if let Some(cat) = catalog {
+            synth_ctx = synth_ctx.with_catalog(cat);
+        }
         let mut stack: Vec<Value<'static>> = Vec::new();
         for (idx, srow) in kept_synth.iter().enumerate() {
             let mut values: Vec<Value<'static>> = Vec::with_capacity(columns.len());
@@ -1917,7 +1961,10 @@ fn accumulate_groups(
                 let st = &mut order[idx].1[0];
                 let upd = match &st.extreme {
                     None => true,
-                    Some(prev) => value_cmp(av, prev) == core::cmp::Ordering::Greater,
+                    Some(prev) => {
+                        extreme_cmp(agg_specs[0].enum_labels.as_deref(), av, prev)
+                            == core::cmp::Ordering::Greater
+                    }
                 };
                 if upd {
                     st.extreme = Some(av.clone().into_owned());
@@ -2036,7 +2083,7 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &keys, bk)
+                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
                                     == core::cmp::Ordering::Less
                             }
                         };
@@ -2100,7 +2147,8 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    value_cmp(arg_ref, prev) == core::cmp::Ordering::Greater
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                        == core::cmp::Ordering::Greater
                                 }
                             };
                             if upd {
@@ -2113,7 +2161,10 @@ fn accumulate_groups(
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
-                                Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
+                                Some(prev) => {
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                        == core::cmp::Ordering::Less
+                                }
                             };
                             if upd {
                                 st.extreme = Some(arg_ref.clone().into_owned());
@@ -2149,6 +2200,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?,
                     },
                     AggKind::BoolAnd => match arg_ref {
@@ -2164,6 +2216,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?,
                     },
                     _ => {
@@ -2174,6 +2227,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?;
                     }
                 }
@@ -2417,7 +2471,7 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &keys, bk)
+                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
                                     == core::cmp::Ordering::Less
                             }
                         };
@@ -2471,7 +2525,8 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    value_cmp(arg_ref, prev) == core::cmp::Ordering::Greater
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                        == core::cmp::Ordering::Greater
                                 }
                             };
                             if upd {
@@ -2484,7 +2539,10 @@ fn accumulate_groups(
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
-                                Some(prev) => value_cmp(arg_ref, prev) == core::cmp::Ordering::Less,
+                                Some(prev) => {
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                        == core::cmp::Ordering::Less
+                                }
                             };
                             if upd {
                                 st.extreme = Some(arg_ref.clone().into_owned());
@@ -2520,6 +2578,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?,
                     },
                     AggKind::BoolAnd => match arg_ref {
@@ -2535,6 +2594,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?,
                     },
                     _ => {
@@ -2545,6 +2605,7 @@ fn accumulate_groups(
                             arg_ref,
                             arg2_val.as_ref(),
                             order_keys,
+                            spec.enum_labels.as_deref(),
                         )?;
                     }
                 }
@@ -2628,7 +2689,8 @@ fn accumulate_groups(
                     let better = match &st.first_best {
                         None => true,
                         Some((bk, _)) => {
-                            cmp_order_keys(&spec.order_by, &keys, bk) == core::cmp::Ordering::Less
+                            cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
+                                == core::cmp::Ordering::Less
                         }
                     };
                     if better {
@@ -2672,6 +2734,7 @@ fn accumulate_groups(
                 &arg_val,
                 arg2_val.as_ref(),
                 order_keys,
+                spec.enum_labels.as_deref(),
             )?;
         }
     }
@@ -2710,7 +2773,17 @@ fn build_synth_schema(
         .collect();
     let mut synth_schema: Vec<ColumnSchema> = Vec::new();
     for (i, ty) in group_types.iter().enumerate() {
-        synth_schema.push(ColumnSchema::new(format!("__grp_{i}"), *ty, true));
+        let mut col = ColumnSchema::new(format!("__grp_{i}"), *ty, true);
+        // v7.39 (enum order knife) — a bare enum-column group key keeps
+        // its enum identity so HAVING comparisons and the grouped-output
+        // ORDER BY sort by member order downstream.
+        if let Some(Expr::Column(c)) = group_exprs.get(i) {
+            col.user_enum_type = schema_cols
+                .iter()
+                .find(|sc| sc.name == c.name)
+                .and_then(|sc| sc.user_enum_type.clone());
+        }
+        synth_schema.push(col);
     }
     for (i, ty) in agg_types.iter().enumerate() {
         synth_schema.push(ColumnSchema::new(format!("__agg_{i}"), *ty, true));
@@ -2728,10 +2801,24 @@ fn build_synth_schema(
 /// element `[1]` of the fully-sorted array.
 fn cmp_order_keys(
     order_by: &[spg_sql::ast::OrderBy],
+    order_enum_labels: &[Option<Vec<String>>],
     a: &[Value<'static>],
     b: &[Value<'static>],
 ) -> core::cmp::Ordering {
     for (k, o) in order_by.iter().enumerate() {
+        // v7.39 (enum order knife) — an enum-typed sort key compares by
+        // member order; NULLs and non-members keep the generic path.
+        if let Some(Some(labels)) = order_enum_labels.get(k)
+            && !matches!(&a[k], Value::Null)
+            && !matches!(&b[k], Value::Null)
+            && let Some(ord) = crate::eval::enum_ord_cmp(labels, &a[k], &b[k])
+        {
+            let ord = if o.desc { ord.reverse() } else { ord };
+            if ord != core::cmp::Ordering::Equal {
+                return ord;
+            }
+            continue;
+        }
         let cmp = crate::order_by_value_cmp(o.desc, o.nulls_first, &a[k], &b[k]);
         if cmp != core::cmp::Ordering::Equal {
             return cmp;
@@ -2783,7 +2870,14 @@ fn finalize_synth_rows(
                 if !agg_specs[i].order_by.is_empty() && st.item_keys.len() == st.items.len() {
                     let mut idx: Vec<usize> = (0..st.items.len()).collect();
                     let ob = &agg_specs[i].order_by;
-                    idx.sort_by(|&x, &y| cmp_order_keys(ob, &st.item_keys[x], &st.item_keys[y]));
+                    idx.sort_by(|&x, &y| {
+                        cmp_order_keys(
+                            ob,
+                            &agg_specs[i].order_enum_labels,
+                            &st.item_keys[x],
+                            &st.item_keys[y],
+                        )
+                    });
                     let mut sorted = st.clone();
                     sorted.items = idx.iter().map(|&j| st.items[j].clone()).collect();
                     st_sorted = sorted;
@@ -2823,6 +2917,7 @@ fn project_groups(
     synth_schema: &[ColumnSchema],
     correlated_eval: Option<CorrelatedEval<'_>>,
     defer_projection: bool,
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<Projection, EvalError> {
     // Rewrite the user's SELECT items + ORDER BY to reference synthetic
     // columns. After rewriting, every remaining `Expr::Column` must
@@ -2851,7 +2946,13 @@ fn project_groups(
     // we keep the projected row — same semantics as PG: HAVING runs
     // against the aggregated row (so `HAVING count(*) > 1` works) and
     // sees only group-by'd columns plus aggregate values.
-    let synth_ctx = EvalContext::new(synth_schema, None);
+    let mut synth_ctx = EvalContext::new(synth_schema, None);
+    // v7.39 (enum order knife) — HAVING comparisons over enum group keys
+    // need the catalog for member-order semantics (both the compile-time
+    // Subtree fallback witness and the eval hook read it).
+    if let Some(cat) = catalog {
+        synth_ctx = synth_ctx.with_catalog(cat);
+    }
     let having_rewritten = stmt
         .having
         .as_ref()
@@ -2991,8 +3092,18 @@ fn sort_synth_by_order_by(
     mut out_rows: Vec<Row<'static>>,
     correlated_eval: Option<CorrelatedEval<'_>>,
     keep_n: Option<usize>,
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<(Vec<Row<'static>>, Vec<Row<'static>>), EvalError> {
-    let synth_ctx = EvalContext::new(synth_schema, None);
+    let mut synth_ctx = EvalContext::new(synth_schema, None);
+    if let Some(cat) = catalog {
+        synth_ctx = synth_ctx.with_catalog(cat);
+    }
+    // v7.39 (enum order knife) — per-key member labels when the rewritten
+    // sort key is an enum-typed column (`__grp_K` carrying user_enum_type).
+    let key_enum_labels: Vec<Option<&[String]>> = order_rewritten
+        .iter()
+        .map(|e| crate::eval::expr_enum_labels(e, synth_schema, catalog))
+        .collect();
     // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
     // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
     // above as `order_rewritten` — shared with the deferral
@@ -3032,6 +3143,18 @@ fn sort_synth_by_order_by(
         use core::cmp::Ordering;
         for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
             let (desc, nf) = keys_meta[i];
+            // v7.39 (enum order knife) — enum keys sort by member order.
+            if let Some(Some(labels)) = key_enum_labels.get(i)
+                && !matches!(ka, Value::Null)
+                && !matches!(kb, Value::Null)
+                && let Some(ord) = crate::eval::enum_ord_cmp(labels, ka, kb)
+            {
+                let ord = if desc { ord.reverse() } else { ord };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                continue;
+            }
             let c = crate::order_by_value_cmp(desc, nf, ka, kb);
             if c != Ordering::Equal {
                 return c;
@@ -3207,6 +3330,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     };
                     let spec = AggSpec {
                         kind: classify_agg_name(&canonical),
+                        enum_labels: None,
+                        order_enum_labels: Vec::new(),
                         name: canonical.clone(),
                         arg,
                         arg2: if agg_uses_second_arg(&canonical) {
@@ -3266,6 +3391,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 };
                 let spec = AggSpec {
                     kind: classify_agg_name(&canonical),
+                    enum_labels: None,
+                    order_enum_labels: Vec::new(),
                     name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
@@ -3341,6 +3468,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             if let Some((arg, order_by, filter)) = first_ordered_array_agg(e) {
                 let spec = AggSpec {
                     kind: AggKind::ArrayAgg,
+                    enum_labels: None,
+                    order_enum_labels: Vec::new(),
                     name: "array_agg".to_string(),
                     arg: Some(arg.clone()),
                     arg2: None,
@@ -3403,6 +3532,7 @@ fn update_state(
     v: &Value<'_>,
     arg2: Option<&Value<'_>>,
     order_keys: Option<Vec<Value<'static>>>,
+    enum_labels: Option<&[String]>,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
     // v7.37.4 (R34) — dispatch by pre-classified `kind` (`Copy`
@@ -3492,7 +3622,7 @@ fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if value_cmp(v, cur) == core::cmp::Ordering::Less {
+                    if extreme_cmp(enum_labels, v, cur) == core::cmp::Ordering::Less {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -3567,7 +3697,7 @@ fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if value_cmp(v, cur) == core::cmp::Ordering::Greater {
+                    if extreme_cmp(enum_labels, v, cur) == core::cmp::Ordering::Greater {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -5083,6 +5213,21 @@ fn fold_sum_kind(
         (a, b) if a == b => a,
         _ => NK::NaN,
     }
+}
+
+/// v7.39 (enum order knife) — min/max extreme comparison: member order when
+/// the spec's argument is enum-typed, the generic value order otherwise.
+fn extreme_cmp(
+    enum_labels: Option<&[String]>,
+    a: &Value,
+    b: &Value,
+) -> core::cmp::Ordering {
+    if let Some(labels) = enum_labels
+        && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
+    {
+        return ord;
+    }
+    value_cmp(a, b)
 }
 
 fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {

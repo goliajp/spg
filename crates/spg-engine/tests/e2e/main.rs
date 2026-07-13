@@ -118,6 +118,7 @@ mod e2e_encoding_matrix;
 mod e2e_enum_and_reg_to_text;
 mod e2e_enum_cast;
 mod e2e_enum_introspection;
+mod e2e_enum_order;
 mod e2e_enum_type;
 mod e2e_extension_probes;
 mod e2e_extract_from_time;
