@@ -92,6 +92,9 @@ pub enum Token {
     /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
     /// Either side contains any address of the other.
     InetOverlap,
+    /// v7.39 — range `&<` / `&>`.
+    OverLeft,
+    OverRight,
 
     // Punctuation
     LParen,
@@ -731,6 +734,16 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             b'&' if peek_eq(bytes, i + 1, b'&') => {
                 // v7.17.0 Phase 3.P0-47 — PG INET network overlap `&&`.
                 out.push(Token::InetOverlap);
+                i += 2;
+            }
+            // v7.39 (read01 rangetypes.c) — range `&<` (does not extend to
+            // the right of) / `&>` (does not extend to the left of).
+            b'&' if peek_eq(bytes, i + 1, b'<') => {
+                out.push(Token::OverLeft);
+                i += 2;
+            }
+            b'&' if peek_eq(bytes, i + 1, b'>') => {
+                out.push(Token::OverRight);
                 i += 2;
             }
             b'&' => {

@@ -4752,6 +4752,15 @@ fn apply_function_dispatch(
             };
             let lower = coerce(&args[0])?;
             let upper = coerce(&args[1])?;
+            // v7.39 (read01 rangetypes.c) — PG rejects misordered bounds
+            // before canonicalization (int4range(5,1) errors, 22000).
+            if crate::conversions::range_bounds_misordered(&lower, &upper) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "range lower bound must be less than or equal to \
+                             range upper bound"
+                        .into(),
+                });
+            }
             // Canonicalize (infinite→exclusive + discrete `[)` fold) via the
             // shared helper so the constructors and the `'…'::int4range`
             // text-input path agree — `int4range(1,3,'[]')` is `[1,4)`.

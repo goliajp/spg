@@ -3234,6 +3234,9 @@ pub enum BinOp {
     L2Distance,
     /// v7.39 (read01 geo_ops.c) — `?||` geometric "is parallel".
     GeomParallel,
+    /// v7.39 (read01 rangetypes.c) — range `&<` / `&>`.
+    OverLeft,
+    OverRight,
     /// v7.39 (read01 geo_ops.c) — `?-|` geometric "is perpendicular".
     GeomPerp,
     /// v7.39 (read01 geo_ops.c) — `~=` geometric "same as".
@@ -5740,6 +5743,8 @@ impl fmt::Display for BinOp {
             Self::Mod => "%",
             Self::L2Distance => "<->",
             Self::GeomParallel => "?||",
+            Self::OverLeft => "&<",
+            Self::OverRight => "&>",
             Self::GeomPerp => "?-|",
             Self::GeomSameAs => "~=",
             Self::ClosestPoint => "##",

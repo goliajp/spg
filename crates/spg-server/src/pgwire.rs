@@ -3440,6 +3440,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "22012"
         // v7.39 (read01 numeric.c) — log/power domain violations carry
         // their SQL-spec-mandated states.
+        // v7.39 (read01 rangetypes.c) — range construction rejections are
+        // PG's 22000 DATA_EXCEPTION.
+        } else if msg.contains("range lower bound must be less than or equal")
+            || msg.contains("result of range difference would not be contiguous")
+            || msg.contains("result of range union would not be contiguous")
+        {
+            "22000"
+        } else if msg.contains("malformed range literal") {
+            "22P02"
         } else if msg.contains("cannot take logarithm of") {
             "2201E"
         } else if msg.contains("zero raised to a negative power is undefined")

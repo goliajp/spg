@@ -17772,6 +17772,10 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // v7.39 (read01 geo_ops.c) — geometric predicates ride the
         // comparison rung.
         Token::GeomParallel => (BinOp::GeomParallel, 4),
+        // v7.39 (read01 rangetypes.c) — range `&<` / `&>` on the
+        // comparison rung.
+        Token::OverLeft => (BinOp::OverLeft, 4),
+        Token::OverRight => (BinOp::OverRight, 4),
         Token::GeomPerp => (BinOp::GeomPerp, 4),
         Token::GeomSameAs => (BinOp::GeomSameAs, 4),
         Token::ClosestPoint => (BinOp::ClosestPoint, 5),

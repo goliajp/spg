@@ -1133,6 +1133,26 @@ pub(super) fn apply_binary(
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // v7.39 (read01 rangetypes.c) — range `&<` / `&>`.
+        BinOp::OverLeft | BinOp::OverRight
+            if matches!(l, Value::Range { .. }) && matches!(r, Value::Range { .. }) =>
+        {
+            let (Some(a), Some(b)) = (RangeParts::from_value(&l), RangeParts::from_value(&r))
+            else {
+                unreachable!("guard checked both are ranges")
+            };
+            Ok(Value::Bool(if matches!(op, BinOp::OverLeft) {
+                range_overleft(a, b)
+            } else {
+                range_overright(a, b)
+            }))
+        }
+        BinOp::OverLeft | BinOp::OverRight => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "operator {} requires range operands",
+                if matches!(op, BinOp::OverLeft) { "&<" } else { "&>" }
+            ),
+        }),
         // range `<<` / `>>` — strictly left / right of. Claims the operator
         // ahead of the bitstring / integer-shift / inet interpretations when
         // both operands are ranges.
@@ -3263,6 +3283,24 @@ struct RangeParts<'v> {
 }
 
 impl<'v> RangeParts<'v> {
+    /// v7.39 (read01 rangetypes.c) — borrow the parts straight off a
+    /// `Value::Range`; `None` for any other variant.
+    fn from_value(v: &'v Value<'_>) -> Option<Self> {
+        match v {
+            Value::Range {
+                kind,
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+            } => Some(Self::new(
+                *kind, lower, upper, *lower_inc, *upper_inc, *empty,
+            )),
+            _ => None,
+        }
+    }
+
     fn new(
         kind: spg_storage::RangeKind,
         lower: &'v Option<alloc::boxed::Box<Value<'static>>>,
@@ -4104,6 +4142,50 @@ fn range_strictly_left(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
             Ordering::Less => true,
             Ordering::Equal => !(aui2 && bli2),
             Ordering::Greater => false,
+        },
+    }
+}
+
+/// v7.39 (read01 rangetypes.c) — range `&<` "does not extend to the right
+/// of": a's upper bound position <= b's (empty on either side → false; at
+/// equal values an inclusive upper sits right of an exclusive one).
+fn range_overleft(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
+    use core::cmp::Ordering;
+    if a.empty || b.empty {
+        return false;
+    }
+    let (_, _, au, aui) = range_canonical(a.kind, a.lower, a.upper, a.lower_inc, a.upper_inc);
+    let (_, _, bu, bui) = range_canonical(b.kind, b.lower, b.upper, b.lower_inc, b.upper_inc);
+    match (&au, &bu) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some(x), Some(y)) => match bound_cmp(x, y) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => !aui || bui,
+        },
+    }
+}
+
+/// v7.39 (read01 rangetypes.c) — range `&>` "does not extend to the left
+/// of": a's lower bound position >= b's (at equal values an exclusive lower
+/// sits right of an inclusive one).
+fn range_overright(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
+    use core::cmp::Ordering;
+    if a.empty || b.empty {
+        return false;
+    }
+    let (al, ali, _, _) = range_canonical(a.kind, a.lower, a.upper, a.lower_inc, a.upper_inc);
+    let (bl, bli, _, _) = range_canonical(b.kind, b.lower, b.upper, b.lower_inc, b.upper_inc);
+    match (&al, &bl) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some(x), Some(y)) => match bound_cmp(x, y) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => !ali || bli,
         },
     }
 }
@@ -5189,6 +5271,8 @@ pub(super) fn compare(
         | BinOp::BitAnd
         | BinOp::BitXor
         | BinOp::GeomParallel
+        | BinOp::OverLeft
+        | BinOp::OverRight
         | BinOp::GeomPerp
         | BinOp::GeomSameAs
         | BinOp::ClosestPoint
