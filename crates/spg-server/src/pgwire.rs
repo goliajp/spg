@@ -3435,6 +3435,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("bigint out of range")
             || msg.contains("value overflows numeric format")
             || msg.contains("OID out of range")
+            || msg.contains("is out of range for type double precision")
+            || msg.contains("is out of range for type real")
             // v7.39 (read01 orderedsetaggs.c) — percentile fraction range.
             || msg.contains("is not between 0 and 1")
         {
