@@ -842,10 +842,35 @@ pub(crate) fn canonicalize_range_bounds(
     Some((lower, upper, lower_inc, upper_inc, empty))
 }
 
-pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value<'static>> {
+/// v7.39 (read01 rangetypes.c) — the two failure classes of range text
+/// input, mapping to PG's distinct errors (22P02 malformed vs 22000
+/// misordered bounds).
+pub(crate) enum RangeParseError {
+    Malformed,
+    Misordered,
+}
+
+/// True when both bounds are present and lower sorts after upper —
+/// PG rejects the range before canonicalization.
+pub(crate) fn range_bounds_misordered(
+    lower: &Option<Value<'static>>,
+    upper: &Option<Value<'static>>,
+) -> bool {
+    match (lower, upper) {
+        (Some(l), Some(u)) => {
+            crate::orderby::value_cmp(l, u) == core::cmp::Ordering::Greater
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn parse_range_str(
+    s: &str,
+    kind: spg_storage::RangeKind,
+) -> Result<Value<'static>, RangeParseError> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("empty") {
-        return Some(Value::Range {
+        return Ok(Value::Range {
             kind,
             lower: None,
             upper: None,
@@ -856,35 +881,41 @@ pub(crate) fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<V
     }
     let bytes = s.as_bytes();
     if bytes.len() < 3 {
-        return None;
+        return Err(RangeParseError::Malformed);
     }
     let lower_inc = match bytes[0] {
         b'[' => true,
         b'(' => false,
-        _ => return None,
+        _ => return Err(RangeParseError::Malformed),
     };
     let upper_inc = match bytes[bytes.len() - 1] {
         b']' => true,
         b')' => false,
-        _ => return None,
+        _ => return Err(RangeParseError::Malformed),
     };
     let inner = &s[1..s.len() - 1];
-    let (lo_text, up_text) = inner.split_once(',')?;
+    let (lo_text, up_text) = inner.split_once(',').ok_or(RangeParseError::Malformed)?;
     let lower = if lo_text.is_empty() {
         None
     } else {
-        Some(parse_range_element(lo_text, kind)?)
+        Some(parse_range_element(lo_text, kind).ok_or(RangeParseError::Malformed)?)
     };
     let upper = if up_text.is_empty() {
         None
     } else {
-        Some(parse_range_element(up_text, kind)?)
+        Some(parse_range_element(up_text, kind).ok_or(RangeParseError::Malformed)?)
     };
+    // v7.39 (read01 rangetypes.c) — PG rejects misordered bounds before
+    // canonicalization ('[3,1]'::int4range).
+    if range_bounds_misordered(&lower, &upper) {
+        return Err(RangeParseError::Misordered);
+    }
     // Canonicalize (discrete `[)` fold + infinite→exclusive) so text
     // input agrees with the constructor functions.
     let (lower, upper, lower_inc, upper_inc, empty) =
-        canonicalize_range_bounds(kind, lower, upper, lower_inc, upper_inc)?;
-    Some(Value::Range {
+        canonicalize_range_bounds(kind, lower, upper, lower_inc, upper_inc)
+            .ok_or(RangeParseError::Malformed)?;
+    Ok(Value::Range {
         kind,
         lower: lower.map(alloc::boxed::Box::new),
         upper: upper.map(alloc::boxed::Box::new),
@@ -931,7 +962,7 @@ pub(crate) fn parse_multirange_str(
         if piece.is_empty() {
             return None;
         }
-        let r = parse_range_str(piece, kind)?;
+        let r = parse_range_str(piece, kind).ok()?;
         let Value::Range {
             lower,
             upper,
@@ -957,6 +988,20 @@ pub(crate) fn parse_multirange_str(
 
 /// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
 /// the matching element Value for the RangeKind.
+/// "+HH[:MM]" tail (without the sign, caller split on '+') → seconds east.
+fn parse_hhmm_offset_secs(off: &str) -> Option<i32> {
+    let (h, m) = match off.split_once(':') {
+        Some((h, m)) => (h, m),
+        None => (off, "0"),
+    };
+    let h: i32 = h.parse().ok()?;
+    let m: i32 = m.parse().ok()?;
+    if !(0..=15).contains(&h) || !(0..60).contains(&m) {
+        return None;
+    }
+    Some(h * 3600 + m * 60)
+}
+
 pub(crate) fn parse_range_element(
     text: &str,
     kind: spg_storage::RangeKind,
@@ -983,11 +1028,23 @@ pub(crate) fn parse_range_element(
             })
         }
         K::Ts | K::TsTz => {
-            // Reuse the existing timestamp parse path. v7.17.0
-            // expects `'YYYY-MM-DD HH:MM:SS[.ffffff]'` in range
-            // bounds (TZ offset on TsTz is OOS for the initial
-            // P0-38; ship plain Timestamp shape).
-            crate::eval::parse_timestamp_literal(text).map(Value::Timestamp)
+            // v7.39 (read01 rangetypes.c) — the timestamp parser handles
+            // datetime[+offset]; a bare date with an offset suffix
+            // ('2024-01-02+00', legal tstz input) parses as its midnight.
+            crate::eval::parse_timestamp_literal(text)
+                .or_else(|| {
+                    let (date_part, off) = text.split_once(['+'])?;
+                    if !off.chars().all(|c| c.is_ascii_digit() || c == ':') {
+                        return None;
+                    }
+                    let d = crate::eval::parse_date_literal(date_part.trim())?;
+                    let mut t = i64::from(d) * 86_400_000_000;
+                    // Apply the offset (east-positive) back to UTC.
+                    let secs = parse_hhmm_offset_secs(off)?;
+                    t -= i64::from(secs) * 1_000_000;
+                    Some(t)
+                })
+                .map(Value::Timestamp)
         }
         K::Date => crate::eval::parse_date_literal(text).map(Value::Date),
     }
@@ -1002,12 +1059,12 @@ pub fn format_range_text(v: &Value) -> alloc::string::String {
 
 pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
     let Value::Range {
+        kind,
         lower,
         upper,
         lower_inc,
         upper_inc,
         empty,
-        ..
     } = v
     else {
         return alloc::string::String::new();
@@ -1015,14 +1072,26 @@ pub(crate) fn format_range_str(v: &Value) -> alloc::string::String {
     if *empty {
         return "empty".into();
     }
+    // v7.39 (read01 rangetypes.c) — tstzrange bounds render with the
+    // session-UTC offset suffix, as PG's timestamptz_out does. (Named
+    // session zones inside range elements are a recorded residual with
+    // the per-value wire SessionTz channel.)
+    let elem = |v: &Value| -> alloc::string::String {
+        let base = format_range_element(v);
+        if matches!(kind, spg_storage::RangeKind::TsTz) && matches!(v, Value::Timestamp(_)) {
+            alloc::format!("{base}+00")
+        } else {
+            base
+        }
+    };
     let mut out = alloc::string::String::new();
     out.push(if *lower_inc { '[' } else { '(' });
     if let Some(l) = lower {
-        out.push_str(&quote_range_bound(&format_range_element(l)));
+        out.push_str(&quote_range_bound(&elem(l)));
     }
     out.push(',');
     if let Some(u) = upper {
-        out.push_str(&quote_range_bound(&format_range_element(u)));
+        out.push_str(&quote_range_bound(&elem(u)));
     }
     out.push(if *upper_inc { ']' } else { ')' });
     out
@@ -3229,12 +3298,18 @@ pub(crate) fn coerce_value(
         // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
         // `'(a,b)'`, with empty lower or upper for unbounded.
         (Value::Text(s), DataType::Range(kind)) => match parse_range_str(&s, kind) {
-            Some(v) => Some(v),
-            None => {
+            Ok(v) => Some(v),
+            // v7.39 (read01 rangetypes.c) — PG's two distinct rejections.
+            Err(RangeParseError::Misordered) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for range type: {s:?} (column `{col_name}`)"
+                    detail: alloc::string::String::from(
+                        "range lower bound must be less than or equal to range upper bound",
                     ),
+                }));
+            }
+            Err(RangeParseError::Malformed) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("malformed range literal: \"{s}\""),
                 }));
             }
         },
