@@ -171,6 +171,7 @@ mod e2e_is_normalized;
 mod e2e_isfinite;
 mod e2e_json_arrayagg;
 mod e2e_json_extract_path;
+mod e2e_json_family_round14;
 mod e2e_json_field_fns;
 mod e2e_json_object;
 mod e2e_json_object_text;

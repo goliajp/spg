@@ -168,6 +168,10 @@ pub fn is_aggregate_name(name: &str) -> bool {
             | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
             // v7.32 (round-29) — JSON aggregates.
             | "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
+            | "json_agg_strict" | "jsonb_agg_strict"
+            | "json_object_agg_strict" | "jsonb_object_agg_strict"
+            | "json_object_agg_unique" | "jsonb_object_agg_unique"
+            | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict"
             // SQL:2016 standard spellings (PG 16+ accepts both).
             | "json_arrayagg" | "json_objectagg"
     )
@@ -197,7 +201,8 @@ fn is_regression_name(name: &str) -> bool {
 /// `json_object_agg(key, value)`.
 fn agg_uses_second_arg(name: &str) -> bool {
     name == "string_agg"
-        || name == "json_object_agg"
+        || name.starts_with("json_object_agg")
+        || name.starts_with("jsonb_object_agg")
         || name == "jsonb_object_agg"
         || name == "json_objectagg"
         || is_regression_name(name)
@@ -301,8 +306,15 @@ fn classify_agg_name(name: &str) -> AggKind {
         "bit_and" => AggKind::BitAnd,
         "bit_or" => AggKind::BitOr,
         "bit_xor" => AggKind::BitXor,
-        "json_agg" | "jsonb_agg" | "json_arrayagg" => AggKind::JsonAgg,
-        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => AggKind::JsonObjectAgg,
+        "json_agg" | "jsonb_agg" | "json_arrayagg" | "json_agg_strict" | "jsonb_agg_strict" => {
+            AggKind::JsonAgg
+        }
+        "json_object_agg" | "jsonb_object_agg" | "json_objectagg"
+        | "json_object_agg_strict" | "jsonb_object_agg_strict"
+        | "json_object_agg_unique" | "jsonb_object_agg_unique"
+        | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict" => {
+            AggKind::JsonObjectAgg
+        }
         n if is_within_group_name(n) => AggKind::WithinGroup,
         n if is_regression_name(n) => AggKind::Regression,
         other => panic!("classify_agg_name: unknown aggregate {other}"),
@@ -3212,7 +3224,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 | "variance" | "var_samp" | "var_pop"
                 | "bit_and" | "bit_or" | "bit_xor"
                 | "json_agg" | "jsonb_agg" | "group_concat" | "xmlagg"
-                | "json_arrayagg" => Some(1),
+                | "json_arrayagg" | "json_agg_strict" | "jsonb_agg_strict" => Some(1),
                 // v7.32 (round-29) — two-argument aggregates: string_agg,
                 // the regression family f(Y, X), and json_object_agg.
                 "string_agg"
@@ -3220,7 +3232,10 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
                 | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
                 | "json_object_agg" | "jsonb_object_agg"
-                | "json_objectagg" => Some(2),
+                | "json_objectagg"
+                | "json_object_agg_strict" | "jsonb_object_agg_strict"
+                | "json_object_agg_unique" | "jsonb_object_agg_unique"
+                | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict" => Some(2),
                 _ => None,
             };
             if let Some(want) = expected
@@ -3881,6 +3896,10 @@ fn update_state(
         // v7.32 (round-29) — json_agg / jsonb_agg collect every input
         // (NULL becomes JSON null, per PG) in row order.
         AggKind::JsonAgg => {
+            // v7.39 (read01 json.c) — the _strict variants skip NULLs.
+            if is_null && name.ends_with("_strict") {
+                return Ok(());
+            }
             st.items.push(v.clone().into_owned());
             // Attach the ORDER BY key so finalize_synth_rows sorts the
             // elements (`json_agg(x ORDER BY x DESC)`), the same way
@@ -3897,9 +3916,31 @@ fn update_state(
             if is_null {
                 return Ok(());
             }
+            // v7.39 (read01 json.c) — _strict skips NULL VALUES; _unique
+            // raises PG's duplicate-key error.
+            let val = arg2.cloned().map(Value::into_owned).unwrap_or(Value::Null);
+            if matches!(val, Value::Null) && name.contains("_strict") {
+                return Ok(());
+            }
+            if name.contains("_unique") {
+                let kt = match v {
+                    Value::Text(s) | Value::Json(s) => s.to_string(),
+                    other => crate::json::value_to_json_text(other),
+                };
+                let dup = st.items.iter().any(|k| match k {
+                    Value::Text(s) | Value::Json(s) => *s == kt,
+                    other => crate::json::value_to_json_text(other) == kt,
+                });
+                if dup {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "duplicate JSON object key value: {kt:?}"
+                        ),
+                    });
+                }
+            }
             st.items.push(v.clone().into_owned());
-            st.aux_items
-                .push(arg2.cloned().map(Value::into_owned).unwrap_or(Value::Null));
+            st.aux_items.push(val);
             st.count += 1;
         }
     }
@@ -4234,7 +4275,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — json_agg / jsonb_agg: a JSON array of every
         // collected element in row order; empty set → SQL NULL.
-        "json_agg" | "jsonb_agg" | "json_arrayagg" => {
+        "json_agg" | "jsonb_agg" | "json_arrayagg" | "json_agg_strict" | "jsonb_agg_strict" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
@@ -4249,7 +4290,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             // jsonb_agg yields canonical jsonb (nested object keys sorted,
             // numbers normalised); json_agg keeps the input verbatim.
             let result = Value::json(out);
-            if name == "jsonb_agg" {
+            if name.starts_with("jsonb_agg") {
                 crate::json::canonicalize_value(result)
             } else {
                 result
@@ -4257,7 +4298,10 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — json_object_agg: a JSON object built from
         // the parallel key (`items`) / value (`aux_items`) streams.
-        "json_object_agg" | "jsonb_object_agg" | "json_objectagg" => {
+        "json_object_agg" | "jsonb_object_agg" | "json_objectagg"
+        | "json_object_agg_strict" | "jsonb_object_agg_strict"
+        | "json_object_agg_unique" | "jsonb_object_agg_unique"
+        | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
@@ -4270,7 +4314,7 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
             };
             // jsonb dedups keys keeping the last value (jsonb is a
             // map); json preserves every pair including duplicates.
-            let dedup = name == "jsonb_object_agg";
+            let dedup = name.starts_with("jsonb_object_agg");
             // (key, value-index) pairs in first-seen key order; for
             // jsonb a repeated key updates its value-index in place.
             let mut pairs: Vec<(String, usize)> = Vec::with_capacity(st.items.len());
@@ -4284,17 +4328,20 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 }
                 pairs.push((kt, i));
             }
-            let mut out = String::from("{");
+            // v7.39 (read01 json.c) — PG's json_object_agg emits the
+            // distinctive "{ \"k\" : v, ... }" spacing (jsonb variants
+            // canonicalize it away below).
+            let mut out = String::from("{ ");
             for (n, (kt, i)) in pairs.iter().enumerate() {
                 if n > 0 {
                     out.push_str(", ");
                 }
                 out.push_str(&crate::json::value_to_json_text(&Value::text(kt.clone())));
-                out.push_str(": ");
+                out.push_str(" : ");
                 let val = st.aux_items.get(*i).unwrap_or(&Value::Null);
                 out.push_str(&crate::json::value_to_json_text(val));
             }
-            out.push('}');
+            out.push_str(" }");
             // jsonb_object_agg emits canonical jsonb — keys sorted by PG's
             // (length, byte) order; json_object_agg keeps first-seen order.
             let result = Value::json(out);

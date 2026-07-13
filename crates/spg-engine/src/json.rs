@@ -2274,10 +2274,38 @@ fn encode_value_into(v: &Value, out: &mut String) {
         Value::SmallInt(n) => out.push_str(&alloc::format!("{n}")),
         Value::Int(n) => out.push_str(&alloc::format!("{n}")),
         Value::BigInt(n) => out.push_str(&alloc::format!("{n}")),
+        // v7.39 (read01 json.c) — non-finite floats are not legal JSON
+        // numbers; PG quotes the canonical spellings ("NaN"/"Infinity").
+        Value::Float(x) if !x.is_finite() => {
+            let txt = if x.is_nan() {
+                "NaN"
+            } else if *x > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            };
+            write_json(&JsonValue::String(txt.into()), out);
+        }
         Value::Float(x) => out.push_str(&alloc::format!("{x}")),
-        Value::Numeric { scaled, scale, .. } => {
-            // Render the exact decimal text — same shape display uses.
-            out.push_str(&render_numeric(*scaled, *scale));
+        Value::Real(x) if !x.is_finite() => {
+            let txt = if x.is_nan() {
+                "NaN"
+            } else if *x > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            };
+            write_json(&JsonValue::String(txt.into()), out);
+        }
+        Value::Numeric { scaled, scale, kind } => {
+            use spg_storage::NumericKind as NK;
+            match kind {
+                NK::NaN => write_json(&JsonValue::String("NaN".into()), out),
+                NK::PosInf => write_json(&JsonValue::String("Infinity".into()), out),
+                NK::NegInf => write_json(&JsonValue::String("-Infinity".into()), out),
+                // Render the exact decimal text — same shape display uses.
+                NK::Finite => out.push_str(&render_numeric(*scaled, *scale)),
+            }
         }
         Value::Text(s) => write_json(&JsonValue::String(s.to_string()), out),
         Value::Json(s) => {

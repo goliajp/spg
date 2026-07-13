@@ -3418,6 +3418,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
         } else if msg.contains("division by zero") {
             "22012"
+        // v7.39 (read01 json.c) — 22030 DUPLICATE_JSON_OBJECT_KEY_VALUE.
+        } else if msg.contains("duplicate JSON object key value") {
+            "22030"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.

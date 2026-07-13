@@ -1375,6 +1375,40 @@ fn eval_function_call_arm(
     let evaluated: Result<Vec<Value<'static>>, _> =
         args.iter().map(|a| eval_expr(a, row, ctx)).collect();
     let evaluated = evaluated?;
+    // v7.39 (read01 json.c) — to_json(timestamptz) spells the instant in
+    // ISO 8601 WITH the session-zone offset ("2024-03-09T14:05:06+00:00"),
+    // unlike plain timestamp. The runtime value carries no tz tag, so the
+    // argument's static type is the witness.
+    if (name.eq_ignore_ascii_case("to_json") || name.eq_ignore_ascii_case("to_jsonb"))
+        && evaluated.len() == 1
+        && let Some(Value::Timestamp(t)) = evaluated.first()
+        && args.first().is_some_and(|a| {
+            crate::describe::describe_expr(a, ctx.columns)
+                .is_some_and(|sh| matches!(sh.ty, spg_storage::DataType::Timestamptz))
+        })
+    {
+        let off = ctx.session_tz_offset_at(*t);
+        let local = t + off;
+        let days = local.div_euclid(86_400_000_000);
+        let day_us = local.rem_euclid(86_400_000_000);
+        let (y, mo, d) = civil_from_days(i32::try_from(days).unwrap_or(0));
+        let secs = day_us / 1_000_000;
+        let frac = day_us % 1_000_000;
+        let (hh, mi, ss) = (secs / 3600, (secs / 60) % 60, secs % 60);
+        let mut txt = alloc::format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}");
+        if frac != 0 {
+            let f = alloc::format!("{frac:06}");
+            txt.push('.');
+            txt.push_str(f.trim_end_matches('0'));
+        }
+        let (sign, omag) = if off < 0 { ('-', -off) } else { ('+', off) };
+        let (oh, om) = (omag / 3_600_000_000, (omag / 60_000_000) % 60);
+        let _ = core::fmt::Write::write_fmt(
+            &mut txt,
+            format_args!("{sign}{oh:02}:{om:02}"),
+        );
+        return Ok(Value::json(alloc::format!("\"{txt}\"")));
+    }
     // v7.39 (enum order knife) — greatest/least over enum-typed arguments
     // pick by member order, not label text (PG). The witness needs the arg
     // ASTs, so this can't live in the value-level function dispatch.
