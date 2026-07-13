@@ -2242,7 +2242,7 @@ fn like_match(text: &str, pattern: &str) -> bool {
 /// TEXT maps to None because a NULL literal describes as TEXT — the
 /// unknown stand-in — and pg_typeof(NULL) must stay "unknown"; every
 /// type not listed also returns None (caller keeps the value answer).
-fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'static str> {
+pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'static str> {
     use spg_storage::DataType as D;
     Some(match t {
         D::SmallInt => "smallint",

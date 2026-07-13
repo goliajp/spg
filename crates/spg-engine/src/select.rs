@@ -1977,6 +1977,22 @@ impl Engine {
                                 .collect();
                             (DataType::BigInt, rows)
                         }
+                        Value::Multirange { kind, ranges } => {
+                            let rows = ranges
+                                .iter()
+                                .map(|sp| {
+                                    Row::new(alloc::vec![Value::Range {
+                                        kind,
+                                        lower: sp.lower.clone(),
+                                        upper: sp.upper.clone(),
+                                        lower_inc: sp.lower_inc,
+                                        upper_inc: sp.upper_inc,
+                                        empty: false,
+                                    }])
+                                })
+                                .collect();
+                            (DataType::Range(kind), rows)
+                        }
                         other => {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "unnest() expects an array argument, got {:?}",
@@ -6155,6 +6171,19 @@ fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, EngineError
         Value::BigIntArray(items) => Ok(items
             .iter()
             .map(|opt| opt.map(Value::BigInt).unwrap_or(Value::Null))
+            .collect()),
+        // v7.39 (read01 multirangetypes.c) — unnest(anymultirange): one
+        // range per canonical span.
+        Value::Multirange { kind, ranges } => Ok(ranges
+            .iter()
+            .map(|s| Value::Range {
+                kind: *kind,
+                lower: s.lower.clone(),
+                upper: s.upper.clone(),
+                lower_inc: s.lower_inc,
+                upper_inc: s.upper_inc,
+                empty: false,
+            })
             .collect()),
         other => Err(EngineError::Eval(EvalError::TypeMismatch {
             detail: alloc::format!(

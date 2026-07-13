@@ -1248,6 +1248,22 @@ fn run_pg_session(
         .iter()
         .find_map(|(k, v)| (k == "application_name").then(|| v.clone()))
         .unwrap_or_default();
+    // v7.39 (read01 misc.c) — surface the startup `database` param so
+    // current_database() answers the connection's database name (the
+    // engine session is process-wide; every connection names the same
+    // single database, so the shared GUC is faithful).
+    if let Some(db) = params
+        .iter()
+        .find_map(|(k, v)| (k == "database").then(|| v.clone()))
+    {
+        if !db.is_empty()
+            && db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            if let Ok(mut e) = state.engine.write() {
+                let _ = e.execute(&format!("SET spg.database = '{db}'"));
+            }
+        }
+    }
 
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
@@ -1928,9 +1944,6 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
             "standard_conforming_strings",
             "on",
         ));
-    }
-    if ci_starts_with(b, b"select current_database()") || ci_eq(b, b"select current_database()") {
-        return Some(CannedResponse::single_text("current_database", "spg"));
     }
     if ci_starts_with(b, b"select current_schema()")
         || ci_eq(b, b"select current_schema()")
@@ -3440,6 +3453,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("cannot get array length of")
             || msg.contains("cannot call json_object_keys")
             || msg.contains("cannot call jsonb_object_keys")
+            || msg.contains("string is not a valid identifier")
         {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is
