@@ -37,7 +37,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
             n.checked_neg()
                 .map(Value::BigInt)
                 .ok_or(EvalError::TypeMismatch {
-                    detail: "bigint overflow on unary -".into(),
+                    detail: "bigint out of range".into(),
                 })
         }
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
@@ -2570,19 +2570,19 @@ fn arith(
         // so each side keeps its place for the non-commutative ops.
         (Value::Int(a), Value::BigInt(b)) => {
             let result = int_op(i64::from(a), b).ok_or(EvalError::TypeMismatch {
-                detail: format!("bigint overflow on {op_name}"),
+                detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
         }
         (Value::BigInt(a), Value::Int(b)) => {
             let result = int_op(a, i64::from(b)).ok_or(EvalError::TypeMismatch {
-                detail: format!("bigint overflow on {op_name}"),
+                detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
         }
         (Value::BigInt(a), Value::BigInt(b)) => {
             let result = int_op(a, b).ok_or(EvalError::TypeMismatch {
-                detail: format!("bigint overflow on {op_name}"),
+                detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
         }
