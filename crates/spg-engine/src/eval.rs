@@ -1111,7 +1111,7 @@ fn eval_cast_arm(
                 return Ok(match (&target, w.as_str()) {
                     (CastTarget::Date, _) => Value::Date(day),
                     (_, "now") => Value::Timestamp(now_us),
-                    _ => Value::Timestamp(i64::from(day) * 86_400_000_000),
+                    _ => Value::Timestamp(crate::conversions::date_days_to_micros(day)),
                 });
             }
         }

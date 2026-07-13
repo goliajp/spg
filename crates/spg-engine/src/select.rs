@@ -5878,7 +5878,7 @@ pub(crate) fn generate_series_rows(
     // the shape match so the existing timestamp arm drives the walk.
     for v in &mut arg_values {
         if let Value::Date(d) = *v {
-            *v = Value::Timestamp(i64::from(d) * 86_400_000_000);
+            *v = Value::Timestamp(crate::conversions::date_days_to_micros(d));
         }
     }
     match arg_values.as_slice() {

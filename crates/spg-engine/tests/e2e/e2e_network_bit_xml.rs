@@ -111,8 +111,10 @@ fn bit_string_round_trip() {
     e.execute("CREATE TABLE t (id INT NOT NULL, b BIT NOT NULL)")
         .unwrap();
     // 12-bit string `101010111100` → nbits=12, packed BE per byte
-    // = [10101011 11000000] = [0xab, 0xc0].
-    e.execute("INSERT INTO t VALUES (1, '101010111100'::bit)")
+    // = [10101011 11000000] = [0xab, 0xc0]. (B'...' keeps its exact
+    // length; a bare '...'::bit is bit(1) with truncation, as in PG —
+    // v7.39 read01 varbit.c.)
+    e.execute("INSERT INTO t VALUES (1, B'101010111100')")
         .unwrap();
     let r = rows(e.execute("SELECT b FROM t").unwrap());
     let Value::BitString { nbits, bytes } = &r[0][0] else {

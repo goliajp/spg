@@ -114,7 +114,7 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         // through a TEXT literal that `coerce_value` re-parses
         // against the target column type.
         Value::Date(days) => {
-            let micros = (i64::from(days)) * 86_400_000_000;
+            let micros = crate::conversions::date_days_to_micros(days);
             Literal::String(format_timestamp_micros_as_date(micros))
         }
         Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),

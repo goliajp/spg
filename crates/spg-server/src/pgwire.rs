@@ -3451,8 +3451,13 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("result of range union would not be contiguous")
         {
             "22000"
-        } else if msg.contains("malformed range literal") {
+        } else if msg.contains("malformed range literal")
+            || msg.contains("is not a valid binary digit")
+        {
             "22P02"
+        // v7.39 (read01 varbit.c) — bit-string length mismatch family.
+        } else if msg.contains("bit strings of different sizes") {
+            "22026"
         // v7.39 (read01 regexp.c) — 2201B INVALID_REGULAR_EXPRESSION.
         } else if msg.contains("invalid regular expression") {
             "2201B"

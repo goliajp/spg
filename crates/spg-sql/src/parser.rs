@@ -14563,9 +14563,12 @@ impl Parser {
             // Route through the postfix-cast loop so a chained cast like
             // `B'1010'::int` attaches onto the implicit `::bit` cast instead
             // of erroring at the `::`.
+            // v7.39 (read01 varbit.c) — a distinct internal target: a
+            // B'...' literal keeps its exact length, while an explicit
+            // `::bit` cast is bit(1) with pad/truncate semantics (PG).
             return self.finish_postfix_casts(Expr::Cast {
                 expr: Box::new(Expr::Literal(Literal::String(bits))),
-                target: CastTarget::Named("bit".to_string()),
+                target: CastTarget::Named("__bit_literal".to_string()),
             });
         }
         let tok_pos = self.pos;
@@ -18193,7 +18196,7 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
         | "tstzrange" | "int4multirange" | "int8multirange" | "nummultirange"
         | "datemultirange" | "tsmultirange" | "tstzmultirange"
         // v7.39 (read01 round 18) — oid / name / jsonpath literal prefixes.
-        | "oid" | "name" | "jsonpath" | "pg_lsn" => {
+        | "oid" | "name" | "jsonpath" | "pg_lsn" | "varchar" => {
             CastTarget::Named(alloc::string::String::from(ident))
         }
         _ => return None,
