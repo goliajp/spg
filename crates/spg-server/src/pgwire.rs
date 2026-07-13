@@ -3477,7 +3477,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if msg.contains("duplicate JSON object key value") {
             "22030"
         // v7.39 (read01 like_match.c) — 22025 INVALID_ESCAPE_SEQUENCE.
-        } else if msg.contains("LIKE pattern must not end with escape") {
+        } else if msg.contains("LIKE pattern must not end with escape")
+            || msg.contains("invalid escape string")
+        {
             "22025"
         // v7.39 (read01 oracle_compat.c) — chr() limits are PG's 54000
         // PROGRAM_LIMIT_EXCEEDED.
