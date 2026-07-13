@@ -3233,6 +3233,11 @@ pub enum BinOp {
     GeomPerp,
     /// v7.39 (read01 geo_ops.c) — `~=` geometric "same as".
     GeomSameAs,
+    /// v7.39 (read01 geo_ops.c) — `##` closest point on the right-hand
+    /// object to the left-hand one.
+    ClosestPoint,
+    /// v7.39 (read01 geo_ops.c) — `?-` points horizontally aligned.
+    GeomHoriz,
     /// pgvector inner-product `<#>` — returns `-Σ aᵢ bᵢ` so "smaller =
     /// more similar" remains true (matches pgvector's published convention).
     InnerProduct,
@@ -5732,6 +5737,8 @@ impl fmt::Display for BinOp {
             Self::GeomParallel => "?||",
             Self::GeomPerp => "?-|",
             Self::GeomSameAs => "~=",
+            Self::ClosestPoint => "##",
+            Self::GeomHoriz => "?-",
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
             Self::Concat => "||",

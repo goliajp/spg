@@ -149,6 +149,11 @@ pub enum Token {
     GeomPerp,
     /// v7.39 (read01 geo_ops.c) — `~=` "same as" (geometric equality).
     GeomSameAs,
+    /// v7.39 (read01 geo_ops.c) — `##` closest point.
+    ClosestPoint,
+    /// v7.39 (read01 geo_ops.c) — `?-` "is horizontal" (binary points /
+    /// prefix lseg-line).
+    GeomHoriz,
     /// v7.37.6-A `?&` — JSON all-keys-exist. `j ?& ARRAY['a','b']`
     /// returns BOOL; true if every listed key exists in `j`.
     JsonKeysAll,
@@ -488,6 +493,12 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 out.push(Token::JsonKeysAll);
                 i += 2;
             }
+            // v7.39 (read01 geo_ops.c) — `?-` "is horizontal" (after `?-|`
+            // above claims the perpendicular spelling).
+            b'?' if peek_eq(bytes, i + 1, b'-') => {
+                out.push(Token::GeomHoriz);
+                i += 2;
+            }
             b'?' => single(&mut out, Token::JsonKeyExists, &mut i),
             b'-' => {
                 // Range `-|-` "is adjacent to" — longest match ahead of `->`.
@@ -513,6 +524,10 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::JsonGetPathText);
                     i += 3;
+                // v7.39 (read01 geo_ops.c) — `##` closest-point operator.
+                } else if peek_eq(bytes, i + 1, b'#') {
+                    out.push(Token::ClosestPoint);
+                    i += 2;
                 } else if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::JsonGetPath);
                     i += 2;

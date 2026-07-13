@@ -13894,6 +13894,22 @@ impl Parser {
         Ok(build_center_call(e))
     }
 
+    /// v7.39 (read01 geo_ops.c) — prefix `?|` (vertical) / `?-`
+    /// (horizontal). Out-of-line from `parse_unary` (frame budget).
+    #[inline(never)]
+    fn parse_prefix_geom_axis(&mut self, vertical: bool) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(8)?;
+        Ok(Expr::FunctionCall {
+            name: alloc::string::String::from(if vertical {
+                "isvertical"
+            } else {
+                "ishorizontal"
+            }),
+            args: alloc::vec![e],
+        })
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::Not => {
@@ -13931,6 +13947,12 @@ impl Parser {
             // frame chain that MAX_NEST_DEPTH is tuned against, so no
             // Expr-sized local may live in this frame.
             Token::TsMatch => self.parse_prefix_center(),
+            // v7.39 (read01 geo_ops.c) — prefix `?|` / `?-`: "is vertical" /
+            // "is horizontal" (lseg / line); desugars to the existing
+            // isvertical()/ishorizontal() functions. Out-of-line for the
+            // same nesting-frame reason as parse_prefix_center.
+            Token::JsonKeysAny => self.parse_prefix_geom_axis(true),
+            Token::GeomHoriz => self.parse_prefix_geom_axis(false),
             Token::DoubleBang => {
                 self.advance();
                 // tsquery `!!` prefix negation — lowered to the catalog
@@ -17494,6 +17516,8 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::GeomParallel => (BinOp::GeomParallel, 4),
         Token::GeomPerp => (BinOp::GeomPerp, 4),
         Token::GeomSameAs => (BinOp::GeomSameAs, 4),
+        Token::ClosestPoint => (BinOp::ClosestPoint, 5),
+        Token::GeomHoriz => (BinOp::GeomHoriz, 4),
         Token::InnerProduct => (BinOp::InnerProduct, 5),
         Token::CosineDistance => (BinOp::CosineDistance, 5),
         Token::Plus => (BinOp::Add, 6),
