@@ -37,7 +37,7 @@ fn json_preserves_duplicates() {
     let mut e = setup();
     // json keeps every pair, duplicates and all.
     let got = json_text(&mut e, "SELECT json_object_agg(g, v) FROM oa");
-    assert_eq!(got, "{\"a\": 10, \"a\": 20, \"b\": 30}");
+    assert_eq!(got, "{ \"a\" : 10, \"a\" : 20, \"b\" : 30 }");
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn jsonb_object_agg_canonicalises_key_order() {
     // json_object_agg keeps insertion order.
     assert_eq!(
         json_text(&mut e, "SELECT json_object_agg(k, v) FROM ord"),
-        "{\"b\": 2, \"a\": 1, \"c\": 3}"
+        "{ \"b\" : 2, \"a\" : 1, \"c\" : 3 }"
     );
     // jsonb_agg canonicalises nested object keys.
     assert_eq!(

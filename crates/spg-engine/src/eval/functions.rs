@@ -10676,11 +10676,66 @@ fn apply_function_dispatch(
             } else {
                 Value::json(crate::json::value_to_json_text(&args[0]))
             };
+            // v7.39 (read01 json.c) — row_to_json(record, true): PG's
+            // pretty flag joins fields with ",\n " instead of ",".
+            let out = if is_row
+                && matches!(args.get(1), Some(Value::Bool(true)))
+            {
+                if let Value::Composite(fields) = &args[0] {
+                    let mut pretty = String::from("{");
+                    for (i, (fname, fv)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            pretty.push_str(",\n ");
+                        }
+                        pretty.push_str(&crate::json::value_to_json_text(
+                            &Value::text(fname.clone()),
+                        ));
+                        pretty.push(':');
+                        pretty.push_str(&crate::json::value_to_json_text(fv));
+                    }
+                    pretty.push('}');
+                    Value::json(pretty)
+                } else {
+                    out
+                }
+            } else {
+                out
+            };
             // to_jsonb yields canonical jsonb; to_json stays verbatim.
             if name == "to_jsonb" || name == "row_to_jsonb" {
                 Ok(crate::json::canonicalize_value(out))
             } else {
                 Ok(out)
+            }
+        }
+        // v7.39 (read01 json.c) — SQL:2016 json_scalar / json_serialize.
+        "json_scalar" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_scalar() takes 1 arg, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            Ok(Value::json(crate::json::value_to_json_text(&args[0])))
+        }
+        "json_serialize" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("json_serialize() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Json(s) => Ok(Value::text(s.clone())),
+                Value::Text(s) => Ok(Value::text(s.to_string())),
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "json_serialize() needs json, got {:?}",
+                        other.data_type()
+                    ),
+                }),
             }
         }
         "jsonb_build_object" => {
