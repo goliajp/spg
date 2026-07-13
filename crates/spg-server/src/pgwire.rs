@@ -1287,6 +1287,10 @@ fn run_pg_session(
         cancel_secret: new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
     });
+
+    // v7.39 (read01 pgstatfuncs.c) — stamp this connection's pid into the
+    // thread-local the engine's pg_backend_pid() slot reads.
+    crate::set_conn_pid(conn_state.pid);
     if let Ok(mut conns) = state.connections.write() {
         conns.push(Arc::clone(&conn_state));
     }

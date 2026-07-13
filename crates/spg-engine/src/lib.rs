@@ -335,6 +335,12 @@ pub type ClockFn = fn() -> i64;
 /// `pg_stat_database.numbackends`.
 pub type BackendCountFn = fn() -> u32;
 
+/// v7.39 (read01 pgstatfuncs.c) — host-provided identity of the CALLING
+/// connection for `pg_backend_pid()` / the pg_stat_activity self-join.
+/// The host reads a connection-thread-local set at session start; the
+/// no_std engine just calls through. `None` (embedded) → pid 1.
+pub type BackendPidFn = fn() -> u32;
+
 /// v7.39 (tz epic) — host-injected IANA timezone lookups (the no_std
 /// engine can't read the system zoneinfo directory; spg-tzif is the
 /// std-side implementation). All instants are MICROSECONDS.
@@ -784,6 +790,7 @@ pub struct Engine {
     /// pg_stat_database.numbackends (ClockFn-style fn slot; the server
     /// wires its connection registry, embedded stays None -> 1).
     pub(crate) backend_count_fn: Option<BackendCountFn>,
+    pub(crate) backend_pid_fn: Option<BackendPidFn>,
     /// v7.39 (tz epic) — injected IANA timezone lookups; None on a
     /// host without zoneinfo (named zones then fail to SET, honestly).
     pub(crate) tz_offset_fn: Option<TzOffsetFn>,
@@ -966,6 +973,7 @@ impl Engine {
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            backend_pid_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
             tz_canon_fn: None,
@@ -1188,6 +1196,12 @@ impl Engine {
         self.backend_count_fn = Some(f);
     }
 
+    /// v7.39 (read01 pgstatfuncs.c) — inject the host's calling-connection
+    /// identity for pg_backend_pid().
+    pub fn set_backend_pid_fn(&mut self, f: BackendPidFn) {
+        self.backend_pid_fn = Some(f);
+    }
+
     /// v7.39 (tz epic) — inject the host's IANA timezone lookups
     /// (spg-tzif's fn family on std hosts).
     pub fn set_tz_fns(
@@ -1300,6 +1314,7 @@ impl Engine {
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            backend_pid_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
             tz_canon_fn: None,
@@ -1396,6 +1411,7 @@ impl Engine {
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
+            backend_pid_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
             tz_canon_fn: None,

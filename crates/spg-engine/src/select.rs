@@ -1687,6 +1687,12 @@ impl Engine {
                     if let Some(f) = self.salt_fn {
                         eng = eng.with_salt_fn(f);
                     }
+                    // v7.39 (read01 pgstatfuncs.c) — carry the calling-
+                    // connection identity so `WHERE pid = pg_backend_pid()`
+                    // matches inside the staged meta-view run.
+                    if let Some(f) = self.backend_pid_fn {
+                        eng.set_backend_pid_fn(f);
+                    }
                     return eng.exec_select_cancel(stmt, cancel);
                 }
                 return Ok(result);

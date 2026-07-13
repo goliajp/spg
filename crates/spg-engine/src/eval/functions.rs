@@ -13516,9 +13516,13 @@ fn apply_function_dispatch(
         | "has_foreign_data_wrapper_privilege"
         | "has_parameter_privilege"
         | "pg_has_role" => Ok(Value::Bool(true)),
-        // pg_backend_pid — session identifier. SPG uses u64 slot
-        // ids; return a low deterministic value for embedded runs.
-        "pg_backend_pid" => Ok(Value::Int(1)),
+        // v7.39 (read01 pgstatfuncs.c) — pg_backend_pid reports the REAL
+        // calling-connection id (the same value pg_stat_activity.pid and
+        // BackendKeyData carry), via the host slot; embedded runs → 1.
+        "pg_backend_pid" => Ok(Value::Int(
+            ctx.backend_pid_fn
+                .map_or(1, |f| i32::try_from(f()).unwrap_or(i32::MAX)),
+        )),
         // v7.37.17 (17.6 siblings) — PG 16+ system_user() returns
         // the authenticated identity in "auth_method:user_name"
         // form (e.g. "cert:alice", "scram-sha-256:bob"). SPG has

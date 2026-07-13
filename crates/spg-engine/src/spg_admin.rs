@@ -404,7 +404,7 @@ impl Engine {
             ColumnSchema::new("backend_type", DataType::Text, false),
         ];
         let datname = self
-            .session_param("database")
+            .session_param("spg.database")
             .map_or(Value::Null, |d| Value::text(alloc::string::String::from(d)));
         let rows: Vec<Row<'static>> = self
             .activity_provider
