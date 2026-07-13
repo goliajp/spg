@@ -1164,9 +1164,19 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     // here; the rest formats normally and `$` is prepended post-pass.
     // v7.38 (read01) — a leading literal `$` (`FM$9,999.00`) anchors the dollar
     // sign at the front too, matching PG (`$1,234.50`).
-    let has_currency = pat.starts_with(['L', 'l', '$']);
-    if has_currency {
+    // v7.39 (read01 formatting.c) — the currency symbol comes from the
+    // locale: in the C locale PG's L is a single SPACE, while a literal
+    // `$` in the picture stays a dollar sign.
+    let has_locale_currency = pat.starts_with(['L', 'l']);
+    let has_lit_currency = !has_locale_currency && pat.starts_with('$');
+    if has_locale_currency || has_lit_currency {
         pat = &pat[1..];
+    }
+    // v7.39 (read01 formatting.c) — leading `SG` writes the sign itself
+    // (always + or -, no blank column), like PG's NUM_SG action.
+    let has_leading_sg = pat.len() >= 2 && pat[..2].eq_ignore_ascii_case("SG");
+    if has_leading_sg {
+        pat = &pat[2..];
     }
     // v7.37 — trailing sign / literal suffixes (stripped here, applied
     // post-pass; the sign moves out of the leading column). Mutually
@@ -1391,7 +1401,20 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     if has_pct {
         out.push('%');
     }
-    if has_currency {
+    if has_leading_sg {
+        // SG owns the sign COLUMN: replace the single leading blank or
+        // minus the slot machinery wrote (later pre-decimal blanks stay,
+        // PG: SG9.9 of .5 = "+ .5"), or prepend when there is none.
+        let sign = if neg { '-' } else { '+' };
+        if out.starts_with(' ') || out.starts_with('-') {
+            out.replace_range(..1, &sign.to_string());
+        } else {
+            out.insert(0, sign);
+        }
+    }
+    if has_locale_currency {
+        out.insert(0, ' ');
+    } else if has_lit_currency {
         out.insert(0, '$');
     }
     out
@@ -1536,6 +1559,15 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     } else {
         i64::from(y / 100) - 1
     }; // CC
+    // v7.39 (read01 formatting.c) — year fields render the ERA year (PG's
+    // ADJUST_YEAR): there is no year 0, so astronomical year <= 0 displays
+    // as 1 - y (44 BC is stored as -43 and prints 0044; the era tokens
+    // still read the raw sign).
+    let disp_y: i64 = if y <= 0 {
+        1 - i64::from(y)
+    } else {
+        i64::from(y)
+    };
 
     let mut out = String::with_capacity(fmt.len() + 8);
     let bytes = fmt.as_bytes();
@@ -1593,10 +1625,10 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         let mut consumed = 2usize;
         if rest.starts_with(b"Y,YYY") {
             // v7.37 — special comma-grouped year token (2026 → "2,026").
-            out.push_str(&group_thousands(&alloc::format!("{y}")));
+            out.push_str(&group_thousands(&alloc::format!("{disp_y}")));
             consumed = 5;
         } else if rest.starts_with(b"YYYY") {
-            num!(y, 4);
+            num!(disp_y, 4);
             consumed = 4;
         } else if rest.starts_with(b"IYYY") {
             num!(iso_year, 4);
@@ -1611,7 +1643,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             let _ = write!(out, "{:03}", iso_year.rem_euclid(1000));
             consumed = 3;
         } else if rest.starts_with(b"YYY") {
-            let _ = write!(out, "{:03}", i64::from(y).rem_euclid(1000));
+            let _ = write!(out, "{:03}", disp_y.rem_euclid(1000));
             consumed = 3;
         } else if rest.starts_with(b"DDD") {
             num!(day_of_year, 3);
@@ -1680,7 +1712,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         } else if rest.starts_with(b"dy") {
             out.push_str(&cased_name(DAY_ABBR[dow_mon0], false, true, None));
         } else if rest.starts_with(b"YY") {
-            let _ = write!(out, "{:02}", i64::from(y).rem_euclid(100));
+            let _ = write!(out, "{:02}", disp_y.rem_euclid(100));
         } else if rest.starts_with(b"IW") {
             num!(iso_week, 2);
         } else if rest.starts_with(b"IY") {
@@ -1774,11 +1806,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             }
         } else if rest.starts_with(b"Y") || rest.starts_with(b"I") {
             // Single-digit year / ISO-year (last digit).
-            let base = if rest[0] == b'I' {
-                iso_year
-            } else {
-                i64::from(y)
-            };
+            let base = if rest[0] == b'I' { iso_year } else { disp_y };
             let _ = write!(out, "{}", base.rem_euclid(10));
             consumed = 1;
         } else if rest.starts_with(b"Q") {

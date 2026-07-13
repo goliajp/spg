@@ -555,6 +555,9 @@ fn function_return_shape(
             }
         }
         "make_date" | "to_date" => (DataType::Date, true),
+        // v7.39 (read01 formatting.c) — PG's to_timestamp (both the epoch
+        // and the format form) returns timestamptz.
+        "to_timestamp" => (DataType::Timestamptz, true),
         "date_part" | "extract" => (DataType::Float, true),
         // v7.26 (round-20 C) — remaining aggregate signatures
         // (count / ts_rank were already mapped above). PG types
