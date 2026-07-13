@@ -1228,15 +1228,45 @@ pub fn parse_box_text(s: &str) -> Option<(spg_storage::Point2D, spg_storage::Poi
 /// v7.37.5 ε — parse Line text `{a,b,c}`.
 pub fn parse_line_text(s: &str) -> Option<(f64, f64, f64)> {
     let s = s.trim();
-    let inner = s.strip_prefix('{').and_then(|x| x.strip_suffix('}'))?;
-    let parts: Vec<&str> = inner.split(',').collect();
-    if parts.len() != 3 {
+    if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let a: f64 = parts[0].trim().parse().ok()?;
+        let b: f64 = parts[1].trim().parse().ok()?;
+        // PG rejects A = B = 0 (not a line).
+        if a == 0.0 && b == 0.0 {
+            return None;
+        }
+        let c: f64 = parts[2].trim().parse().ok()?;
+        return Some((a, b, c));
+    }
+    // v7.39 (read01 geo_ops.c) — the two-point form `((x1,y1),(x2,y2))`
+    // (or the lseg spellings): PG builds Ax+By+C=0 from the slope —
+    // vertical is "x = C" (-1, 0, x), horizontal "y = C" (0, -1, y),
+    // else (m, -1, y - m·x). Coincident points are not a line.
+    let (p1, p2) = parse_lseg_text(s)?;
+    if p1.x == p2.x && p1.y == p2.y {
         return None;
     }
-    let a: f64 = parts[0].trim().parse().ok()?;
-    let b: f64 = parts[1].trim().parse().ok()?;
-    let c: f64 = parts[2].trim().parse().ok()?;
-    Some((a, b, c))
+    Some(line_from_points(p1, p2))
+}
+
+/// PG's line_construct from two points (geo_ops.c behavior).
+pub fn line_from_points(
+    p1: spg_storage::Point2D,
+    p2: spg_storage::Point2D,
+) -> (f64, f64, f64) {
+    if p1.x == p2.x {
+        (-1.0, 0.0, p1.x)
+    } else if p1.y == p2.y {
+        (0.0, -1.0, p1.y)
+    } else {
+        let m = (p1.y - p2.y) / (p1.x - p2.x);
+        let c = p1.y - m * p1.x;
+        (m, -1.0, if c == 0.0 { 0.0 } else { c })
+    }
 }
 
 /// v7.37.5 ε — parse Circle text `<(x,y),r>` or `((x,y),r)`.
@@ -3267,6 +3297,19 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
+        // v7.39 (read01 geo_ops.c) — box_poly: a box converts to its
+        // 4-corner polygon (low, (low.x, high.y), high, (high.x, low.y)).
+        (Value::PgBox(a, b), DataType::Polygon) => {
+            let (hx, hy) = (a.x.max(b.x), a.y.max(b.y));
+            let (lx, ly) = (a.x.min(b.x), a.y.min(b.y));
+            let p = |x: f64, y: f64| spg_storage::Point2D { x, y };
+            Some(Value::Polygon(alloc::vec![
+                p(lx, ly),
+                p(lx, hy),
+                p(hx, hy),
+                p(hx, ly),
+            ]))
+        }
         (Value::Text(s), DataType::Polygon) => match parse_polygon_text(&s) {
             Some(points) => Some(Value::Polygon(points)),
             None => {

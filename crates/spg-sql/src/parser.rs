@@ -398,6 +398,16 @@ struct Parser {
 /// worker stack in BOTH debug and release builds.
 const MAX_NEST_DEPTH: usize = 64;
 
+/// v7.39 (read01 geo_ops.c) — prefix `@@` desugar target, out-of-line so
+/// the constructor's temporaries stay off `parse_unary`'s recursion frame.
+#[inline(never)]
+fn build_center_call(e: Expr) -> Expr {
+    Expr::FunctionCall {
+        name: alloc::string::String::from("center"),
+        args: alloc::vec![e],
+    }
+}
+
 /// Max consecutive binary operators at ONE precedence level
 /// (`a OR b OR c …`, `1+1+1…`). The chain builds iteratively at
 /// parse time but evaluates and drops recursively — depth beyond
@@ -13875,6 +13885,15 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// v7.39 (read01 geo_ops.c) — prefix `@@` (center-of). Out-of-line
+    /// from `parse_unary` (see the frame-budget note at MAX_NEST_DEPTH).
+    #[inline(never)]
+    fn parse_prefix_center(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(8)?;
+        Ok(build_center_call(e))
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::Not => {
@@ -13906,6 +13925,12 @@ impl Parser {
                     expr: Box::new(e),
                 })
             }
+            // v7.39 (read01 geo_ops.c) — prefix `@@` is PG's geometric
+            // "center of" operator; desugars to center(x). The whole arm
+            // is out-of-line: parse_unary sits on the per-nesting-level
+            // frame chain that MAX_NEST_DEPTH is tuned against, so no
+            // Expr-sized local may live in this frame.
+            Token::TsMatch => self.parse_prefix_center(),
             Token::DoubleBang => {
                 self.advance();
                 // tsquery `!!` prefix negation — lowered to the catalog
@@ -17464,6 +17489,11 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // pgvector distance ops all sit on the same rung — tighter than
         // comparisons (4) so `col <-> v < threshold` parses correctly.
         Token::L2Distance => (BinOp::L2Distance, 5),
+        // v7.39 (read01 geo_ops.c) — geometric predicates ride the
+        // comparison rung.
+        Token::GeomParallel => (BinOp::GeomParallel, 4),
+        Token::GeomPerp => (BinOp::GeomPerp, 4),
+        Token::GeomSameAs => (BinOp::GeomSameAs, 4),
         Token::InnerProduct => (BinOp::InnerProduct, 5),
         Token::CosineDistance => (BinOp::CosineDistance, 5),
         Token::Plus => (BinOp::Add, 6),

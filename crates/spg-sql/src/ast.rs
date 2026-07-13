@@ -3227,6 +3227,12 @@ pub enum BinOp {
     /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
     /// operands of equal dimension; engine returns `Value::Float(d)`.
     L2Distance,
+    /// v7.39 (read01 geo_ops.c) — `?||` geometric "is parallel".
+    GeomParallel,
+    /// v7.39 (read01 geo_ops.c) — `?-|` geometric "is perpendicular".
+    GeomPerp,
+    /// v7.39 (read01 geo_ops.c) — `~=` geometric "same as".
+    GeomSameAs,
     /// pgvector inner-product `<#>` — returns `-Σ aᵢ bᵢ` so "smaller =
     /// more similar" remains true (matches pgvector's published convention).
     InnerProduct,
@@ -5723,6 +5729,9 @@ impl fmt::Display for BinOp {
             Self::Div => "/",
             Self::Mod => "%",
             Self::L2Distance => "<->",
+            Self::GeomParallel => "?||",
+            Self::GeomPerp => "?-|",
+            Self::GeomSameAs => "~=",
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
             Self::Concat => "||",
