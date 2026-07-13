@@ -1667,6 +1667,173 @@ fn flags_have_i(args: &[Value<'_>], idx: usize) -> Result<bool, EvalError> {
 
 /// v7.39 (jsonpath like_regex) — bare "does `pat` match anywhere in
 /// `text`" entry over the engine's POSIX regex core.
+/// v7.39 (read01 regexp.c) — clean-room SQL `SIMILAR TO` → POSIX regex
+/// transform (PG's similar_escape_internal contract): wrap `^(?: … )$`,
+/// `%` → `.*`, `_` → `.`, `(` → non-capturing `(?:`, regex metachars
+/// `\ . ^ $` escaped, bracket classes pass through (nesting tracked),
+/// the escape character hides the next char, and the escape-double-quote
+/// separators split the pattern into `^(?:p1){1,1}?(p2){1,1}(?:p3)$`
+/// for SUBSTRING (part2 is the one capturing group).
+pub(crate) fn similar_to_regex(pat: &str, esc: Option<&str>) -> Result<String, EvalError> {
+    similar_to_regex_mode(pat, esc, false)
+}
+
+/// The `for_substring` mode emits a backtracking-friendly shape for SPG's
+/// enumerating matcher: the part separators become plain `)(` / `)(?:`
+/// (dropping PG's `{1,1}?` / `{1,1}` wrappers, which pin the inner
+/// quantifiers to a single end position) and part1's `%` compiles to the
+/// lazy `.*?` so the captured part2 starts at the EARLIEST position — the
+/// SQL "smallest part1" rule. The default mode is byte-identical to PG's
+/// similar_escape output (exposed via similar_to_escape()).
+fn similar_to_regex_mode(
+    pat: &str,
+    esc: Option<&str>,
+    for_substring: bool,
+) -> Result<String, EvalError> {
+    let esc_char: Option<char> = match esc {
+        None => Some('\\'),
+        Some("") => None,
+        Some(e) => {
+            let mut it = e.chars();
+            let c = it.next();
+            if it.next().is_some() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "invalid escape string".into(),
+                });
+            }
+            c
+        }
+    };
+    let mut out = String::with_capacity(pat.len() * 3 + 8);
+    out.push_str("^(?:");
+    let mut nquotes = 0u8;
+    let mut afterescape = false;
+    let mut bracket_depth = 0i32;
+    let mut charclass_pos = 0i32;
+    for c in pat.chars() {
+        if afterescape {
+            if c == '"' && bracket_depth < 1 {
+                match nquotes {
+                    0 => out.push_str(if for_substring { ")(" } else { "){1,1}?(" }),
+                    1 => out.push_str(if for_substring { ")(?:" } else { "){1,1}(?:" }),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "SQL regular expression may not contain more than \
+                                     two escape-double-quote separators"
+                                .into(),
+                        });
+                    }
+                }
+                nquotes += 1;
+            } else {
+                out.push('\\');
+                out.push(c);
+                charclass_pos = 3;
+            }
+            afterescape = false;
+        } else if Some(c) == esc_char {
+            afterescape = true;
+        } else if bracket_depth > 0 {
+            if c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+            if c == ']' && charclass_pos > 2 {
+                bracket_depth -= 1;
+            } else if c == '[' {
+                bracket_depth += 1;
+                charclass_pos = 3;
+            } else if c == '^' {
+                charclass_pos += 1;
+            } else {
+                charclass_pos = 3;
+            }
+        } else if c == '[' {
+            out.push('[');
+            bracket_depth = 1;
+            charclass_pos = 1;
+        } else if c == '%' {
+            // Substring mode: part1 (before the first escape-double-quote)
+            // must match as little as possible.
+            out.push_str(if for_substring && nquotes == 0 {
+                ".*?"
+            } else {
+                ".*"
+            });
+        } else if c == '_' {
+            out.push('.');
+        } else if c == '(' {
+            out.push_str("(?:");
+        } else if matches!(c, '\\' | '.' | '^' | '$') {
+            out.push('\\');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
+}
+
+/// `expr SIMILAR TO pattern [ESCAPE e]` — whole-string match.
+pub(super) fn similar_to_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("SIMILAR TO takes 2-3 args, got {}", args.len()),
+        });
+    }
+    let (Some(text), Some(pat)) = (text_arg(&args[0])?, text_arg(&args[1])?) else {
+        return Ok(Value::Null);
+    };
+    let esc = match args.get(2) {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(v) => text_arg(v)?,
+    };
+    // The backtracking-friendly shape — boolean-equivalent to PG's
+    // {1,1}-wrapped form, but SPG's enumerating matcher can backtrack
+    // through it (the wrappers pin inner quantifiers to one end).
+    let re = similar_to_regex_mode(&pat, esc.as_deref(), true)?;
+    Ok(Value::Bool(regex_is_match(&re, &text)?))
+}
+
+/// `substring(str SIMILAR pat ESCAPE e)` — the escape-double-quote
+/// section (the capturing group) of the match, or the whole match when
+/// the pattern has no separators; NULL on no match.
+pub(super) fn substring_similar(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("substring(similar) takes 3 args, got {}", args.len()),
+        });
+    }
+    let (Some(text), Some(pat)) = (text_arg(&args[0])?, text_arg(&args[1])?) else {
+        return Ok(Value::Null);
+    };
+    let Some(esc) = text_arg(&args[2])? else {
+        return Ok(Value::Null);
+    };
+    let re = similar_to_regex_mode(&pat, Some(esc.as_str()), true)?;
+    let node = re_compile(&re)?;
+    let chars: Vec<char> = text.chars().collect();
+    let ngroups = max_group(&node);
+    match re_find_caps(&node, &chars, 0, ngroups)? {
+        Some(((s_pos, e_pos), caps)) => {
+            let span = if ngroups >= 1 {
+                match caps.get(1).copied().flatten() {
+                    Some(sp) => sp,
+                    None => return Ok(Value::Null),
+                }
+            } else {
+                (s_pos, e_pos)
+            };
+            Ok(Value::text(
+                chars[span.0..span.1].iter().collect::<String>(),
+            ))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
 pub(crate) fn regex_is_match(pat: &str, text: &str) -> Result<bool, EvalError> {
     let node = re_compile(pat)?;
     let chars: Vec<char> = text.chars().collect();

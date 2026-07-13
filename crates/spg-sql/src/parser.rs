@@ -14205,30 +14205,24 @@ impl Parser {
             expr = self.parse_in_tail(expr, negated)?;
             { return Ok(Some(expr)); }
         }
-        // `x [NOT] SIMILAR TO p [ESCAPE e]` — lowers onto the
-        // existing pieces: similar_to_escape converts the
-        // SQL-standard pattern to a fully anchored regex and
-        // regexp_like matches it.
+        // v7.39 (read01 regexp.c) — `x [NOT] SIMILAR TO p [ESCAPE e]`
+        // lowers onto the internal __similar_to(expr, pat[, esc]) call
+        // (the SQL→regex transform runs inside, in the backtracking-
+        // friendly shape SPG's matcher needs).
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
         {
             self.advance(); // SIMILAR
             self.advance(); // TO
             let pattern = self.parse_expr(5)?;
-            let mut esc_args = alloc::vec![pattern];
+            let mut args = alloc::vec![expr, pattern];
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
                 self.advance();
-                esc_args.push(self.parse_expr(5)?);
+                args.push(self.parse_expr(5)?);
             }
             let call = Expr::FunctionCall {
-                name: "regexp_like".to_string(),
-                args: alloc::vec![
-                    expr,
-                    Expr::FunctionCall {
-                        name: "similar_to_escape".to_string(),
-                        args: esc_args,
-                    },
-                ],
+                name: "__similar_to".to_string(),
+                args,
             };
             expr = maybe_not(call, negated);
             { return Ok(Some(expr)); }
@@ -17483,6 +17477,39 @@ impl Parser {
                     // handles. Triggered after the first arg when the function
                     // name is substring / substr and the next token is FROM
                     // (a reserved keyword in PG; SPG also reserves it).
+                    // v7.39 (read01 regexp.c) — `substring(str SIMILAR pat
+                    // ESCAPE esc)` (SQL:1999 three-part form) desugars to the
+                    // internal __substring_similar(str, pat, esc) call.
+                    if (first.eq_ignore_ascii_case("substring")
+                        || first.eq_ignore_ascii_case("substr"))
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
+                    {
+                        self.advance(); // SIMILAR
+                        let pattern = self.parse_expr(0)?;
+                        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape"))
+                        {
+                            return Err(self.err(format!(
+                                "expected ESCAPE in substring(... SIMILAR ...), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance(); // ESCAPE
+                        let esc = self.parse_expr(0)?;
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close substring(... SIMILAR ...), got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        args.push(pattern);
+                        args.push(esc);
+                        return Ok(Expr::FunctionCall {
+                            name: "__substring_similar".to_string(),
+                            args,
+                        });
+                    }
                     if (first.eq_ignore_ascii_case("substring")
                         || first.eq_ignore_ascii_case("substr"))
                         && args.len() == 1

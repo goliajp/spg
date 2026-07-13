@@ -11006,6 +11006,44 @@ fn apply_function_dispatch(
         }
         // v7.17.0 Phase 3.7 — PG regex function family.
         "regexp_matches" => regexp_matches(args),
+        // v7.39 (read01 regexp.c) — SIMILAR TO family.
+        "__similar_to" => super::regexp::similar_to_match(args),
+        "__substring_similar" => super::regexp::substring_similar(args),
+        "similar_to_escape" => {
+            if !matches!(args.len(), 1 | 2) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("similar_to_escape() takes 1-2 args, got {}", args.len()),
+                });
+            }
+            let Value::Text(pat) = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let esc = match args.get(1) {
+                None => None,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(e)) => Some(e.as_ref().to_string()),
+                Some(_) => return Ok(Value::Null),
+            };
+            super::regexp::similar_to_regex(pat.as_ref(), esc.as_deref()).map(Value::text)
+        }
+        "similar_escape" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("similar_escape() takes 2 args, got {}", args.len()),
+                });
+            }
+            let Value::Text(pat) = &args[0] else {
+                return Ok(Value::Null);
+            };
+            // A NULL escape selects the default backslash (PG quirk of the
+            // legacy 2-arg form).
+            let esc = match &args[1] {
+                Value::Null => None,
+                Value::Text(e) => Some(e.as_ref().to_string()),
+                _ => return Ok(Value::Null),
+            };
+            super::regexp::similar_to_regex(pat.as_ref(), esc.as_deref()).map(Value::text)
+        }
         // PG 10+ singular form: first match as text[], NULL when
         // no match.
         "regexp_match" => super::regexp::regexp_match(args),
@@ -15163,93 +15201,9 @@ fn apply_function_dispatch(
             };
             Ok(Value::BigInt(a - b))
         }
+        // version() — the PG-compatible banner (canned wire layer was
+        // dismantled; the engine is the single source).
         "version" => Ok(Value::text("PostgreSQL 18.4 (SPG-compat)")),
-        // v7.37.17 (17.6 siblings) — PG's `similar_to_escape(pattern
-        // [, escape])` converts a SQL-standard SIMILAR TO pattern
-        // to a POSIX regex string. The conversion table:
-        //   %       → .*
-        //   _       → .
-        //   [       → [
-        //   ]       → ]
-        //   |       → |
-        //   +*?{}() → same (already regex metachar)
-        //   any other char → escaped literal
-        // Result is wrapped in ^(?:...)$ so it matches the whole
-        // string, matching PG's SIMILAR TO whole-string semantics. The
-        // non-capturing group is essential: without it a top-level
-        // alternation like `a|b` would anchor as `^a|b$` = `(^a)|(b$)`
-        // and wrongly match `abc`.
-        "similar_to_escape" | "similar_escape" => {
-            if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "similar_to_escape() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
-                });
-            }
-            let pat = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s.to_string(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "similar_to_escape(): pattern must be text, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
-            };
-            let esc: Option<char> = if args.len() == 2 {
-                match &args[1] {
-                    Value::Null => None,
-                    Value::Text(s) => {
-                        let mut chars = s.chars();
-                        chars.next()
-                    }
-                    _ => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "similar_to_escape(): escape must be text".into(),
-                        });
-                    }
-                }
-            } else {
-                Some('\\')
-            };
-            let mut out = alloc::string::String::from("^(?:");
-            let mut iter = pat.chars();
-            while let Some(c) = iter.next() {
-                if Some(c) == esc {
-                    match iter.next() {
-                        Some(next) => {
-                            out.push('\\');
-                            out.push(next);
-                        }
-                        None => out.push('\\'),
-                    }
-                    continue;
-                }
-                match c {
-                    '%' => out.push_str(".*"),
-                    '_' => out.push('.'),
-                    // PG turns a SIMILAR group `(` into a non-capturing
-                    // `(?:` so groups never capture (mirrors its own output).
-                    '(' => out.push_str("(?:"),
-                    ']' | '[' | ')' | '|' | '+' | '*' | '?' | '{' | '}' => {
-                        out.push(c);
-                    }
-                    // POSIX regex metachars that SIMILAR TO doesn't
-                    // treat as special — escape them.
-                    '.' | '^' | '$' | '\\' => {
-                        out.push('\\');
-                        out.push(c);
-                    }
-                    _ => out.push(c),
-                }
-            }
-            out.push_str(")$");
-            Ok(Value::text(out))
-        }
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
         // (`WHERE schemaname = current_schema()`, `SELECT *,
