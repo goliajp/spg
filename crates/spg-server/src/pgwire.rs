@@ -3449,6 +3449,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "22000"
         } else if msg.contains("malformed range literal") {
             "22P02"
+        // v7.39 (read01 regexp.c) — 2201B INVALID_REGULAR_EXPRESSION.
+        } else if msg.contains("invalid regular expression") {
+            "2201B"
         } else if msg.contains("cannot take logarithm of") {
             "2201E"
         } else if msg.contains("zero raised to a negative power is undefined")
