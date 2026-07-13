@@ -2600,6 +2600,24 @@ fn apply_function_dispatch(
             Ok(Value::Float(core::f64::consts::PI))
         }
         // point(x, y) — the geometric-point constructor.
+        // v7.39 (read01 geo) — point(box) is the box centre; point(circle)
+        // is its centre; point(lseg) the midpoint. The 2-arg form is
+        // point(x, y).
+        "point" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::PgBox(ur, ll) => Ok(Value::Point(spg_storage::Point2D {
+                x: (ur.x + ll.x) / 2.0,
+                y: (ur.y + ll.y) / 2.0,
+            })),
+            Value::Circle { center, .. } => Ok(Value::Point(*center)),
+            Value::Lseg(a, b) => Ok(Value::Point(spg_storage::Point2D {
+                x: (a.x + b.x) / 2.0,
+                y: (a.y + b.y) / 2.0,
+            })),
+            v => Err(EvalError::TypeMismatch {
+                detail: alloc::format!("point() not defined for {:?}", v.data_type()),
+            }),
+        },
         "point" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -2656,6 +2674,34 @@ fn apply_function_dispatch(
                 y: a.y.min(b.y),
             };
             Ok(Value::PgBox(ur, ll))
+        }
+        // v7.39 (read01 geo) — line(point, point): the line Ax+By+C=0
+        // through two points (PG normalizes A^2+B^2; a coincident pair
+        // errors). We emit the PG-canonical (A,B,C) with A or B = 1.
+        "line" if args.len() == 2 => {
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Point(p1), Value::Point(p2)) = (&args[0], &args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "line(point, point) needs two points".into(),
+                });
+            };
+            if (p1.x - p2.x).abs() < f64::EPSILON && (p1.y - p2.y).abs() < f64::EPSILON {
+                return Err(EvalError::TypeMismatch {
+                    detail: "cannot create line from two identical points".into(),
+                });
+            }
+            // Vertical line: x = c → 1*x + 0*y - p1.x = 0.
+            let (a, b, c) = if (p1.x - p2.x).abs() < f64::EPSILON {
+                (1.0, 0.0, -p1.x)
+            } else {
+                // slope m; y = m*x + k → m*x - y + k = 0 → A=m, B=-1, C=k.
+                let m = (p2.y - p1.y) / (p2.x - p1.x);
+                let k = p1.y - m * p1.x;
+                (m, -1.0, k)
+            };
+            Ok(Value::Line { a, b, c })
         }
         "lseg" if args.len() == 2 => {
             if args.iter().any(|v| matches!(v, Value::Null)) {

@@ -4302,6 +4302,40 @@ pub(crate) fn coerce_value(
         // v7.38 (read01) — coercing NUMERIC into an integer column rounds half
         // away from zero (PG assignment cast: `1.5 → 2`), matching the `::int`
         // cast path; it previously truncated (`1.7 → 1`).
+        // v7.39 (read01 float.c) — float → integer coercion (int4()/int8()/
+        // int2() function casts, INSERT float into int column): PG rounds
+        // half-to-even and errors on a non-finite / out-of-range value
+        // rather than saturating.
+        (Value::Float(x), DataType::Int) => {
+            let r = crate::eval::math::f64_round_half_even(x);
+            if !r.is_finite() || !(-2_147_483_648.0..=2_147_483_647.0).contains(&r) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::Int(r as i32))
+        }
+        (Value::Float(x), DataType::BigInt) => {
+            let r = crate::eval::math::f64_round_half_even(x);
+            if !r.is_finite() || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "bigint out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::BigInt(r as i64))
+        }
+        (Value::Float(x), DataType::SmallInt) => {
+            let r = crate::eval::math::f64_round_half_even(x);
+            if !r.is_finite() || !(-32768.0..=32767.0).contains(&r) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "smallint out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::SmallInt(r as i16))
+        }
         (Value::Numeric { scaled, scale, .. }, DataType::Int) => {
             let rounded = numeric_round_to_integer(scaled, scale);
             i32::try_from(rounded).ok().map(Value::Int)

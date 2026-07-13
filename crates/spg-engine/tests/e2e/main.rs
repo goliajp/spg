@@ -138,6 +138,7 @@ mod e2e_function_and_slru_stats;
 mod e2e_function_style_typecast;
 mod e2e_generate_series_string_step;
 mod e2e_generate_subscripts;
+mod e2e_geo_float_round39;
 mod e2e_geo_ops_batch;
 mod e2e_geo_ops_batch2;
 mod e2e_geometric_constructors;
