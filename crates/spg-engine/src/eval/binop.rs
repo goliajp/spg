@@ -465,6 +465,73 @@ pub(super) fn apply_binary(
             _ => {}
         }
     }
+    // v7.39 (read01 geo_ops.c part 2) — box / circle / path scale by a
+    // point with complex-number multiply/divide, like `point * point`
+    // (PG box_mul / circle_mul_pt / path_mul_pt and the _div twins).
+    if matches!(op, BinOp::Mul | BinOp::Div)
+        && matches!(&r, Value::Point(_))
+        && matches!(
+            &l,
+            Value::PgBox(..) | Value::Circle { .. } | Value::Path { .. }
+        )
+    {
+        let Value::Point(f) = &r else { unreachable!() };
+        let cx = |p: &spg_storage::Point2D| -> Result<spg_storage::Point2D, EvalError> {
+            Ok(if matches!(op, BinOp::Mul) {
+                spg_storage::Point2D {
+                    x: p.x * f.x - p.y * f.y,
+                    y: p.x * f.y + p.y * f.x,
+                }
+            } else {
+                let denom = f.x * f.x + f.y * f.y;
+                if denom == 0.0 {
+                    return Err(EvalError::DivisionByZero);
+                }
+                spg_storage::Point2D {
+                    x: (p.x * f.x + p.y * f.y) / denom,
+                    y: (p.y * f.x - p.x * f.y) / denom,
+                }
+            })
+        };
+        let mag = sqrt_newton(f.x * f.x + f.y * f.y);
+        return match &l {
+            Value::PgBox(a, b) => {
+                let (na, nb) = (cx(a)?, cx(b)?);
+                // Re-canonicalize the corners (high, low).
+                let hi = spg_storage::Point2D {
+                    x: na.x.max(nb.x),
+                    y: na.y.max(nb.y),
+                };
+                let lo = spg_storage::Point2D {
+                    x: na.x.min(nb.x),
+                    y: na.y.min(nb.y),
+                };
+                Ok(Value::PgBox(hi, lo))
+            }
+            Value::Circle { center, radius } => Ok(Value::Circle {
+                center: cx(center)?,
+                radius: if matches!(op, BinOp::Mul) {
+                    radius * mag
+                } else {
+                    if mag == 0.0 {
+                        return Err(EvalError::DivisionByZero);
+                    }
+                    radius / mag
+                },
+            }),
+            Value::Path { points, closed } => {
+                let mut out = alloc::vec::Vec::with_capacity(points.len());
+                for p in points {
+                    out.push(cx(p)?);
+                }
+                Ok(Value::Path {
+                    points: out,
+                    closed: *closed,
+                })
+            }
+            _ => unreachable!(),
+        };
+    }
     // MONEY arithmetic (integer cents) before the generic numeric path.
     if let Some(result) = money_arith(op, &l, &r) {
         return result;
@@ -580,7 +647,94 @@ pub(super) fn apply_binary(
                 None => Ok(Value::Null),
             }
         }
+        // v7.39 (read01 geo_ops.c part 2) — `box # box` intersection box
+        // (NULL when they don't overlap) and `line # line` intersection
+        // point (NULL for parallel lines, PG line_interpt_line).
+        BinOp::BitXor if matches!(l, Value::PgBox(..)) && matches!(r, Value::PgBox(..)) => {
+            let (Value::PgBox(aur, all), Value::PgBox(bur, bll)) = (&l, &r) else {
+                unreachable!()
+            };
+            if !(all.x <= bur.x && bll.x <= aur.x && all.y <= bur.y && bll.y <= aur.y) {
+                return Ok(Value::Null);
+            }
+            Ok(Value::PgBox(
+                spg_storage::Point2D {
+                    x: aur.x.min(bur.x),
+                    y: aur.y.min(bur.y),
+                },
+                spg_storage::Point2D {
+                    x: all.x.max(bll.x),
+                    y: all.y.max(bll.y),
+                },
+            ))
+        }
+        BinOp::BitXor if matches!(l, Value::Line { .. }) && matches!(r, Value::Line { .. }) => {
+            let (Value::Line { a: a1, b: b1, c: c1 }, Value::Line { a: a2, b: b2, c: c2 }) =
+                (&l, &r)
+            else {
+                unreachable!()
+            };
+            match line_line_interpt(*a1, *b1, *c1, *a2, *b2, *c2) {
+                Some(p) => Ok(Value::Point(p)),
+                None => Ok(Value::Null),
+            }
+        }
         BinOp::BitXor => bitop(l, r, |a, b| a ^ b, "#"),
+        // v7.39 (read01 geo_ops.c part 2) — `##` closest point on the
+        // right-hand object to the left-hand point (PG close_ps /
+        // close_pb; the point is ITS OWN closest point when inside the
+        // box).
+        BinOp::ClosestPoint => match (&l, &r) {
+            (Value::Point(pt), Value::Lseg(a, b)) => {
+                Ok(Value::Point(lseg_closest_to_point(a, b, pt)))
+            }
+            (Value::Point(pt), Value::PgBox(ur, ll)) => {
+                let (hx, hy) = (ll.x.max(ur.x), ll.y.max(ur.y));
+                let (lx, ly) = (ll.x.min(ur.x), ll.y.min(ur.y));
+                if pt.x >= lx && pt.x <= hx && pt.y >= ly && pt.y <= hy {
+                    return Ok(Value::Point(*pt));
+                }
+                let c = [
+                    spg_storage::Point2D { x: lx, y: ly },
+                    spg_storage::Point2D { x: lx, y: hy },
+                    spg_storage::Point2D { x: hx, y: hy },
+                    spg_storage::Point2D { x: hx, y: ly },
+                ];
+                let mut best = spg_storage::Point2D { x: lx, y: ly };
+                let mut bd = f64::INFINITY;
+                for i in 0..4 {
+                    let j = (i + 1) % 4;
+                    let n = lseg_closest_to_point(&c[i], &c[j], pt);
+                    let d = pt_dist(&n, pt);
+                    if d < bd {
+                        bd = d;
+                        best = n;
+                    }
+                }
+                Ok(Value::Point(best))
+            }
+            _ => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "operator ## not supported for {:?} and {:?}",
+                    l.data_type(),
+                    r.data_type()
+                ),
+            }),
+        },
+        // v7.39 (read01 geo_ops.c part 2) — `point ?- point`: horizontally
+        // aligned (equal y under the geometric epsilon).
+        BinOp::GeomHoriz => match (&l, &r) {
+            (Value::Point(a), Value::Point(b)) => {
+                Ok(Value::Bool((a.y - b.y).abs() <= 1.0e-6))
+            }
+            _ => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "operator ?- not supported for {:?} and {:?}",
+                    l.data_type(),
+                    r.data_type()
+                ),
+            }),
+        },
         // v7.39 (read01 geo_ops.c) — geometric predicates. Slopes compare
         // with PG's geometric EPSILON (1e-6): parallel = equal slopes,
         // perpendicular = vertical×horizontal or m1·m2 = -1.
@@ -790,6 +944,20 @@ pub(super) fn apply_binary(
         BinOp::JsonContainedBy if geo_contains_point(&r, &l).is_some() => Ok(Value::Bool(
             geo_contains_point(&r, &l).expect("guard checked"),
         )),
+        // v7.39 (read01 geo_ops.c part 2) — polygon⊃polygon and
+        // circle⊃circle containment (both directions).
+        BinOp::JsonContains if geo_contains_geo(&l, &r).is_some() => Ok(Value::Bool(
+            geo_contains_geo(&l, &r).expect("guard checked"),
+        )),
+        BinOp::JsonContainedBy if geo_contains_geo(&r, &l).is_some() => Ok(Value::Bool(
+            geo_contains_geo(&r, &l).expect("guard checked"),
+        )),
+        // v7.39 (read01 geo_ops.c part 2) — `point <@ lseg` / `point <@
+        // path` (the `@>` spellings do not exist in PG, so only the
+        // contained-by direction hooks here).
+        BinOp::JsonContainedBy if geo_pt_on_object(&r, &l).is_some() => Ok(Value::Bool(
+            geo_pt_on_object(&r, &l).expect("guard checked"),
+        )),
         BinOp::JsonContains if geo_contains_box(&l, &r).is_some() => Ok(Value::Bool(
             geo_contains_box(&l, &r).expect("guard checked"),
         )),
@@ -838,6 +1006,15 @@ pub(super) fn apply_binary(
         // v7.37.6-A `<@` reuses `@>` with swapped args.
         BinOp::JsonContainedBy => crate::json::contains(&r, &l),
         BinOp::JsonKeyExists => crate::json::key_exists(&l, &r),
+        // v7.39 (read01 geo_ops.c part 2) — `point ?| point`: vertically
+        // aligned (equal x under the geometric epsilon), ahead of the
+        // JSONB keys-any interpretation.
+        BinOp::JsonKeysAny if matches!(l, Value::Point(_)) && matches!(r, Value::Point(_)) => {
+            let (Value::Point(a), Value::Point(b)) = (&l, &r) else {
+                unreachable!()
+            };
+            Ok(Value::Bool((a.x - b.x).abs() <= 1.0e-6))
+        }
         BinOp::JsonKeysAny => crate::json::keys_any(&l, &r),
         BinOp::JsonKeysAll => crate::json::keys_all(&l, &r),
         // v7.38 (read01, T8) — `jsonb @@ jsonpath` evaluates a boolean
@@ -2475,6 +2652,11 @@ fn l2_distance(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, E
         let gap = sqrt_newton(dx * dx + dy * dy) - ar - br;
         return Ok(Value::Float(if gap < 0.0 { 0.0 } else { gap }));
     }
+    // v7.39 (read01 geo_ops.c part 2) — the remaining geometric distance
+    // pairs (lseg↔lseg, box↔lseg, point↔path, point↔polygon).
+    if let Some(d) = geo_pair_distance(&l, &r) {
+        return Ok(Value::Float(d));
+    }
     // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
     // cells dequantise on the way in. Sub-f64 precision loss is
     // negligible vs the dequantisation noise the SQ8 path already
@@ -3659,6 +3841,262 @@ fn range_strictly_left(a: RangeParts<'_>, b: RangeParts<'_>) -> bool {
 /// Distance from a point to a segment, box, or circle (`point <-> geo`).
 /// `None` unless the first operand is a point and the second is one of those
 /// geometries.
+/// v7.39 (read01 geo_ops.c part 2) — nearest point on segment (a,b) to pt
+/// (projection clamped to the segment).
+fn lseg_closest_to_point(
+    a: &spg_storage::Point2D,
+    b: &spg_storage::Point2D,
+    pt: &spg_storage::Point2D,
+) -> spg_storage::Point2D {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((pt.x - a.x) * vx + (pt.y - a.y) * vy) / len2).clamp(0.0, 1.0)
+    };
+    spg_storage::Point2D {
+        x: a.x + t * vx,
+        y: a.y + t * vy,
+    }
+}
+
+/// v7.39 (read01 geo_ops.c part 2) — intersection of Ax+By+C=0 lines
+/// (PG line_interpt_line): parallel (epsilon slope test) → None; -0 is
+/// normalized to 0.
+fn line_line_interpt(
+    a1: f64,
+    b1: f64,
+    c1: f64,
+    a2: f64,
+    b2: f64,
+    c2: f64,
+) -> Option<spg_storage::Point2D> {
+    const EPS: f64 = 1.0e-6;
+    let (x, y);
+    if b1.abs() > EPS {
+        if (a2 - a1 * (b2 / b1)).abs() <= EPS {
+            return None;
+        }
+        x = (b1 * c2 - b2 * c1) / (a1 * b2 - a2 * b1);
+        y = -(a1 * x + c1) / b1;
+    } else if b2.abs() > EPS {
+        if (a1 - a2 * (b1 / b2)).abs() <= EPS {
+            return None;
+        }
+        x = (b2 * c1 - b1 * c2) / (a2 * b1 - a1 * b2);
+        y = -(a2 * x + c2) / b2;
+    } else {
+        return None;
+    }
+    Some(spg_storage::Point2D {
+        x: if x == 0.0 { 0.0 } else { x },
+        y: if y == 0.0 { 0.0 } else { y },
+    })
+}
+
+fn pt_dist(a: &spg_storage::Point2D, b: &spg_storage::Point2D) -> f64 {
+    let (dx, dy) = (a.x - b.x, a.y - b.y);
+    sqrt_newton(dx * dx + dy * dy)
+}
+
+/// Segment-to-segment distance: 0 when they intersect, else the minimum
+/// endpoint-to-segment distance over the four combinations (PG's
+/// lseg_closept_lseg shape).
+fn lseg_lseg_distance(
+    a1: &spg_storage::Point2D,
+    a2: &spg_storage::Point2D,
+    b1: &spg_storage::Point2D,
+    b2: &spg_storage::Point2D,
+) -> f64 {
+    if lseg_intersection(*a1, *a2, *b1, *b2).is_some() {
+        return 0.0;
+    }
+    let d1 = pt_dist(&lseg_closest_to_point(a1, a2, b1), b1);
+    let d2 = pt_dist(&lseg_closest_to_point(a1, a2, b2), b2);
+    let d3 = pt_dist(&lseg_closest_to_point(b1, b2, a1), a1);
+    let d4 = pt_dist(&lseg_closest_to_point(b1, b2, a2), a2);
+    d1.min(d2).min(d3).min(d4)
+}
+
+/// Even-odd ray-casting point-in-polygon (shared by containment and the
+/// point-polygon distance).
+fn point_in_polygon(pt: &spg_storage::Point2D, pts: &[spg_storage::Point2D]) -> bool {
+    if pts.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = pts.len() - 1;
+    for i in 0..pts.len() {
+        let (xi, yi) = (pts[i].x, pts[i].y);
+        let (xj, yj) = (pts[j].x, pts[j].y);
+        if ((yi > pt.y) != (yj > pt.y)) && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// The polygon's edges including the closure segment.
+fn poly_edges(
+    pts: &[spg_storage::Point2D],
+) -> impl Iterator<Item = (&spg_storage::Point2D, &spg_storage::Point2D)> {
+    (0..pts.len()).map(move |i| {
+        let j = if i == 0 { pts.len() - 1 } else { i - 1 };
+        (&pts[j], &pts[i])
+    })
+}
+
+/// v7.39 (read01 geo_ops.c part 2) — distances the generic point arm
+/// doesn't cover: lseg↔lseg, box↔lseg, point↔path, point↔polygon
+/// (either operand order for the mixed pairs).
+fn geo_pair_distance(l: &Value<'_>, r: &Value<'_>) -> Option<f64> {
+    let one = |a: &Value<'_>, b: &Value<'_>| -> Option<f64> {
+        match (a, b) {
+            (Value::Lseg(a1, a2), Value::Lseg(b1, b2)) => {
+                Some(lseg_lseg_distance(a1, a2, b1, b2))
+            }
+            (Value::PgBox(ur, ll), Value::Lseg(s1, s2)) => {
+                // Inside or crossing the box is distance 0; otherwise the
+                // minimum over the four box edges (PG box_closept_lseg).
+                let inside = |p: &spg_storage::Point2D| {
+                    p.x >= ll.x.min(ur.x)
+                        && p.x <= ll.x.max(ur.x)
+                        && p.y >= ll.y.min(ur.y)
+                        && p.y <= ll.y.max(ur.y)
+                };
+                if inside(s1) || inside(s2) {
+                    return Some(0.0);
+                }
+                let (hx, hy) = (ll.x.max(ur.x), ll.y.max(ur.y));
+                let (lx, ly) = (ll.x.min(ur.x), ll.y.min(ur.y));
+                let c = [
+                    spg_storage::Point2D { x: lx, y: ly },
+                    spg_storage::Point2D { x: lx, y: hy },
+                    spg_storage::Point2D { x: hx, y: hy },
+                    spg_storage::Point2D { x: hx, y: ly },
+                ];
+                let mut best = f64::INFINITY;
+                for i in 0..4 {
+                    let j = (i + 1) % 4;
+                    best = best.min(lseg_lseg_distance(&c[i], &c[j], s1, s2));
+                }
+                Some(best)
+            }
+            (Value::Point(pt), Value::Path { points, closed }) => {
+                if points.is_empty() {
+                    return None;
+                }
+                if points.len() == 1 {
+                    return Some(pt_dist(pt, &points[0]));
+                }
+                let mut best = f64::INFINITY;
+                for i in 0..points.len() {
+                    if i == 0 && !closed {
+                        continue;
+                    }
+                    let j = if i == 0 { points.len() - 1 } else { i - 1 };
+                    let n = lseg_closest_to_point(&points[j], &points[i], pt);
+                    best = best.min(pt_dist(&n, pt));
+                }
+                Some(best)
+            }
+            (Value::Point(pt), Value::Polygon(pts)) => {
+                if point_in_polygon(pt, pts) {
+                    return Some(0.0);
+                }
+                let mut best = f64::INFINITY;
+                for (a, b) in poly_edges(pts) {
+                    let n = lseg_closest_to_point(a, b, pt);
+                    best = best.min(pt_dist(&n, pt));
+                }
+                Some(best)
+            }
+            _ => None,
+        }
+    };
+    one(l, r).or_else(|| one(r, l))
+}
+
+/// v7.39 (read01 geo_ops.c part 2) — direction-sensitive geometric
+/// containments beyond point-in-shape: polygon⊃polygon (bbox gate +
+/// every vertex and edge midpoint of the contained polygon inside the
+/// container — a clean-room simplification of PG's lseg_inside_poly
+/// recursion; concave edge-crossing corner cases are a recorded
+/// residual), and circle⊃circle.
+fn geo_contains_geo(container: &Value<'_>, contained: &Value<'_>) -> Option<bool> {
+    const EPS: f64 = 1.0e-6;
+    match (container, contained) {
+        (Value::Polygon(a), Value::Polygon(b)) => {
+            if a.len() < 3 || b.is_empty() {
+                return Some(false);
+            }
+            let on_edge = |p: &spg_storage::Point2D| {
+                poly_edges(a).any(|(e1, e2)| {
+                    (pt_dist(p, e1) + pt_dist(p, e2) - pt_dist(e1, e2)).abs() <= EPS
+                })
+            };
+            let inside = |p: &spg_storage::Point2D| point_in_polygon(p, a) || on_edge(p);
+            if !b.iter().all(|p| inside(p)) {
+                return Some(false);
+            }
+            let mids = (0..b.len()).all(|i| {
+                let j = if i == 0 { b.len() - 1 } else { i - 1 };
+                let m = spg_storage::Point2D {
+                    x: (b[i].x + b[j].x) / 2.0,
+                    y: (b[i].y + b[j].y) / 2.0,
+                };
+                inside(&m)
+            });
+            Some(mids)
+        }
+        (
+            Value::Circle {
+                center: c1,
+                radius: r1,
+            },
+            Value::Circle {
+                center: c2,
+                radius: r2,
+            },
+        ) => Some(pt_dist(c1, c2) + r2 <= r1 + EPS),
+        _ => None,
+    }
+}
+
+/// v7.39 (read01 geo_ops.c part 2) — containers valid only on the `<@`
+/// side (PG has point <@ lseg / point <@ path but no lseg @> point).
+fn geo_pt_on_object(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
+    const EPS: f64 = 1.0e-6;
+    let Value::Point(pt) = p else { return None };
+    match container {
+        Value::Lseg(a, b) => {
+            Some((pt_dist(pt, a) + pt_dist(pt, b) - pt_dist(a, b)).abs() <= EPS)
+        }
+        Value::Path { points, closed } => {
+            if points.is_empty() {
+                return Some(false);
+            }
+            if points.len() == 1 {
+                return Some(pt_dist(pt, &points[0]) <= EPS);
+            }
+            let on_any = (0..points.len()).any(|i| {
+                if i == 0 && !closed {
+                    return false;
+                }
+                let j = if i == 0 { points.len() - 1 } else { i - 1 };
+                (pt_dist(pt, &points[j]) + pt_dist(pt, &points[i])
+                    - pt_dist(&points[j], &points[i]))
+                .abs()
+                    <= EPS
+            });
+            Some(on_any)
+        }
+        _ => None,
+    }
+}
+
 fn point_geo_distance(p: &Value<'_>, geo: &Value<'_>) -> Option<f64> {
     let Value::Point(pt) = p else { return None };
     match geo {
@@ -3687,14 +4125,29 @@ fn point_geo_distance(p: &Value<'_>, geo: &Value<'_>) -> Option<f64> {
             let d = sqrt_newton(dx * dx + dy * dy) - radius;
             Some(if d < 0.0 { 0.0 } else { d })
         }
-        // Point-to-line distance for the line `a*x + b*y + c = 0`:
-        // |a*px + b*py + c| / sqrt(a^2 + b^2).
+        // Point-to-line distance: PG's line_closept_point drops a
+        // perpendicular through the point and measures to the
+        // intersection — same math as |Ax+By+C|/√(A²+B²) but the
+        // operation order matters to the last ULP, so mirror it.
         Value::Line { a, b, c } => {
-            let denom = sqrt_newton(a * a + b * b);
-            if denom == 0.0 {
-                return None;
-            }
-            Some((a * pt.x + b * pt.y + c).abs() / denom)
+            const EPS: f64 = 1.0e-6;
+            // Perpendicular through pt: slope of the line is -a/b
+            // (vertical when |b|≈0), the perpendicular inverts it.
+            let (pa, pb, pc) = if b.abs() <= EPS {
+                // Line is vertical → perpendicular is horizontal y = pt.y.
+                (0.0, -1.0, pt.y)
+            } else {
+                let m = -a / b;
+                let im = if m.abs() <= EPS {
+                    // Horizontal line → vertical perpendicular x = pt.x.
+                    return line_line_interpt(-1.0, 0.0, pt.x, *a, *b, *c)
+                        .map(|ip| pt_dist(&ip, pt));
+                } else {
+                    -1.0 / m
+                };
+                (im, -1.0, pt.y - im * pt.x)
+            };
+            line_line_interpt(pa, pb, pc, *a, *b, *c).map(|ip| pt_dist(&ip, pt))
         }
         _ => None,
     }
@@ -3738,6 +4191,26 @@ fn geo_contains_box(container: &Value<'_>, inner: &Value<'_>) -> Option<bool> {
 /// between centres is ≤ the sum of the radii. `None` for other operand pairs.
 fn geo_overlaps(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
     match (a, b) {
+        // v7.39 (read01 geo_ops.c part 2) — polygon overlap: any vertex of
+        // one inside the other, or any pair of edges crossing.
+        (Value::Polygon(pa), Value::Polygon(pb)) => {
+            if pa.len() < 3 || pb.len() < 3 {
+                return Some(false);
+            }
+            if pa.iter().any(|p| point_in_polygon(p, pb))
+                || pb.iter().any(|p| point_in_polygon(p, pa))
+            {
+                return Some(true);
+            }
+            for (a1, a2) in poly_edges(pa) {
+                for (b1, b2) in poly_edges(pb) {
+                    if lseg_intersection(*a1, *a2, *b1, *b2).is_some() {
+                        return Some(true);
+                    }
+                }
+            }
+            Some(false)
+        }
         (Value::PgBox(aur, all), Value::PgBox(bur, bll)) => {
             Some(all.x <= bur.x && bll.x <= aur.x && all.y <= bur.y && bll.y <= aur.y)
         }
@@ -4446,6 +4919,8 @@ pub(super) fn compare(
         | BinOp::GeomParallel
         | BinOp::GeomPerp
         | BinOp::GeomSameAs
+        | BinOp::ClosestPoint
+        | BinOp::GeomHoriz
         | BinOp::Add
         | BinOp::Sub
         | BinOp::Mul
