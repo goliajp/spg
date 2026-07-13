@@ -88,3 +88,41 @@ fn misc_knives() {
         "{err}"
     );
 }
+
+// v7.39 (read01 round 18) — numutils.c / oid.c / oracle_compat.c:
+// bytea trims, chr() limit errors, OID's unsigned-32 semantics, and
+// the oid/name literal prefixes. Byte-locked vs PG18.
+#[test]
+fn round18_numutils_oid_oracle_compat() {
+    let mut e = Engine::new();
+    assert_eq!(
+        row_of(
+            &mut e,
+            "SELECT btrim('\\x001122'::bytea, '\\x00'::bytea), \
+             ltrim('\\x0011'::bytea, '\\x00'::bytea), \
+             rtrim('\\x1100'::bytea, '\\x00'::bytea)"
+        ),
+        vec!["\\x1122", "\\x11", "\\x11"]
+    );
+    // OID wraps negatives like a C cast; overflow errors.
+    assert_eq!(
+        row_of(
+            &mut e,
+            "SELECT (-1)::oid, 4294967295::oid, oid '16384', 'abc' = 'abc'"
+        ),
+        vec!["4294967295", "4294967295", "16384", "true"]
+    );
+    let err = |e: &mut Engine, sql: &str| -> String {
+        format!("{}", e.execute(sql).unwrap_err())
+    };
+    assert!(err(&mut e, "SELECT 4294967296::oid").contains("OID out of range"));
+    assert!(
+        err(&mut e, "SELECT 'abc'::oid")
+            .contains("invalid input syntax for type oid: \"abc\"")
+    );
+    assert!(err(&mut e, "SELECT chr(0)").contains("null character not permitted"));
+    assert!(
+        err(&mut e, "SELECT chr(1114112)")
+            .contains("requested character too large for encoding: 1114112")
+    );
+}
