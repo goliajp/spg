@@ -1465,12 +1465,27 @@ pub(crate) fn synth_pg_stat_database(
         ColumnSchema::new("tup_inserted", DataType::BigInt, false),
         ColumnSchema::new("tup_updated", DataType::BigInt, false),
         ColumnSchema::new("tup_deleted", DataType::BigInt, false),
+        // v7.39 (read01 pgstatfuncs.c) — the full PG18 column set in PG's
+        // order (deadlocks sits after temp_bytes; the checksum / session /
+        // parallel-worker columns follow).
         ColumnSchema::new("conflicts", DataType::BigInt, false),
-        ColumnSchema::new("deadlocks", DataType::BigInt, false),
         ColumnSchema::new("temp_files", DataType::BigInt, false),
         ColumnSchema::new("temp_bytes", DataType::BigInt, false),
+        ColumnSchema::new("deadlocks", DataType::BigInt, false),
+        ColumnSchema::new("checksum_failures", DataType::BigInt, true),
+        ColumnSchema::new("checksum_last_failure", DataType::Timestamptz, true),
         ColumnSchema::new("blk_read_time", DataType::Float, false),
         ColumnSchema::new("blk_write_time", DataType::Float, false),
+        ColumnSchema::new("session_time", DataType::Float, false),
+        ColumnSchema::new("active_time", DataType::Float, false),
+        ColumnSchema::new("idle_in_transaction_time", DataType::Float, false),
+        ColumnSchema::new("sessions", DataType::BigInt, false),
+        ColumnSchema::new("sessions_abandoned", DataType::BigInt, false),
+        ColumnSchema::new("sessions_fatal", DataType::BigInt, false),
+        ColumnSchema::new("sessions_killed", DataType::BigInt, false),
+        ColumnSchema::new("parallel_workers_to_launch", DataType::BigInt, false),
+        ColumnSchema::new("parallel_workers_launched", DataType::BigInt, false),
+        ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
     ];
     // Single-row, single-database; everything reads as 0 until
     // per-counter wiring lands (the shape is stable so monitoring
@@ -1526,11 +1541,23 @@ pub(crate) fn synth_pg_stat_database(
         Value::BigInt(i64::try_from(tup_updated).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_deleted).unwrap_or(i64::MAX)),
         Value::BigInt(0),  // conflicts (PG: replication-conflict count)
-        Value::BigInt(0),  // deadlocks (SPG single-writer; always 0)
         Value::BigInt(0),  // temp_files (spill; pending 19.15)
         Value::BigInt(0),  // temp_bytes
+        Value::BigInt(0),  // deadlocks (SPG single-writer; always 0)
+        Value::BigInt(0),  // checksum_failures
+        Value::Null,       // checksum_last_failure
         Value::Float(0.0), // blk_read_time
         Value::Float(0.0), // blk_write_time
+        Value::Float(0.0), // session_time
+        Value::Float(0.0), // active_time
+        Value::Float(0.0), // idle_in_transaction_time
+        Value::BigInt(0),  // sessions
+        Value::BigInt(0),  // sessions_abandoned
+        Value::BigInt(0),  // sessions_fatal
+        Value::BigInt(0),  // sessions_killed
+        Value::BigInt(0),  // parallel_workers_to_launch
+        Value::BigInt(0),  // parallel_workers_launched
+        Value::Null,       // stats_reset (never reset)
     ])];
     (schema, rows)
 }

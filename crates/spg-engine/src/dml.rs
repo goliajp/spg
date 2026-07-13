@@ -2629,6 +2629,7 @@ pub(crate) fn apply_generated_stored_columns(
                 // gen_random_bytes / uuidv7 aren't expected in a column
                 // DEFAULT, so the deterministic fallbacks are acceptable here.
                 salt_fn: None,
+                backend_pid_fn: None,
                 clock: None,
                 xact: None,
                 assigned_xid: core::cell::Cell::new(None),

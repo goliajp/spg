@@ -1196,6 +1196,7 @@ fn run(
     // v7.39 (pg_stat knife A) — pg_stat_database.numbackends reads the
     // live connection count.
     engine.set_backend_count_fn(live_backend_count);
+    engine.set_backend_pid_fn(current_backend_pid);
     // v7.39 (tz epic) — named-timezone lookups via the system zoneinfo.
     engine.set_tz_fns(
         spg_tzif::tz_offset_at,
@@ -1735,6 +1736,22 @@ static BACKEND_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 
 fn live_backend_count() -> u32 {
     BACKEND_COUNT.load(Ordering::Relaxed)
+}
+
+// v7.39 (read01 pgstatfuncs.c) — per-connection identity for
+// pg_backend_pid(). Each pgwire connection runs on its own thread and
+// stamps its ConnState.pid here at session start; the engine's
+// BackendPidFn slot reads it back during evaluation on that thread.
+thread_local! {
+    static CONN_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+pub(crate) fn set_conn_pid(pid: u32) {
+    CONN_PID.with(|c| c.set(pid));
+}
+
+fn current_backend_pid() -> u32 {
+    CONN_PID.with(std::cell::Cell::get)
 }
 
 pub(crate) fn backend_count_incr() {

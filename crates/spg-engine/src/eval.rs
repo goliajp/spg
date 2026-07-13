@@ -185,6 +185,9 @@ pub struct EvalContext<'a> {
     /// PRNG, so their output isn't predictable. `None` (no host CSPRNG)
     /// falls back to the PRNG — fine for the non-cryptographic `random()`.
     pub salt_fn: Option<crate::SaltFn>,
+    /// v7.39 (read01 pgstatfuncs.c) — calling-connection identity for
+    /// pg_backend_pid(); `None` (embedded / detached contexts) → 1.
+    pub backend_pid_fn: Option<crate::BackendPidFn>,
     /// v7.38 (read01 P6.08) — host wall clock (µs since Unix epoch). `uuidv7`
     /// uses it for the real time-ordered 48-bit millisecond prefix; `None`
     /// (no host clock) falls back to the deterministic anchor.
@@ -257,6 +260,7 @@ impl<'a> EvalContext<'a> {
             tz_localize_fn: None,
             tz_abbrev_fn: None,
             salt_fn: None,
+            backend_pid_fn: None,
             clock: None,
             xact: None,
             assigned_xid: core::cell::Cell::new(None),
@@ -267,6 +271,13 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_render_style(mut self, style: crate::eval::format::RenderStyle) -> Self {
         self.render_style = style;
+        self
+    }
+
+    /// v7.39 (read01 pgstatfuncs.c) — attach the calling-connection id.
+    #[must_use]
+    pub const fn with_backend_pid_fn(mut self, f: Option<crate::BackendPidFn>) -> Self {
+        self.backend_pid_fn = f;
         self
     }
 
