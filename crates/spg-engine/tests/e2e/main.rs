@@ -312,6 +312,7 @@ mod e2e_querytree;
 mod e2e_quote_and_meta_funcs;
 mod e2e_quote_pseudotypes;
 mod e2e_range_round25;
+mod e2e_regexp_round26;
 mod e2e_random_int;
 mod e2e_random_normal;
 mod e2e_range_agg;

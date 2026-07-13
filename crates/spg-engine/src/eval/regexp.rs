@@ -486,7 +486,7 @@ fn re_parse_atom(
             let inner = re_parse_alt(chars, p, depth + 1, ng)?;
             if *p >= chars.len() || chars[*p] != ')' {
                 return Err(EvalError::TypeMismatch {
-                    detail: "regex compile: unmatched '('".into(),
+                    detail: "invalid regular expression: parentheses () not balanced".into(),
                 });
             }
             *p += 1;
@@ -730,7 +730,7 @@ fn re_parse_class(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
     }
     // Fell off the end of the pattern without a closing `]`.
     Err(EvalError::TypeMismatch {
-        detail: "regex compile: unmatched '['".into(),
+        detail: "invalid regular expression: brackets [] not balanced".into(),
     })
 }
 
@@ -1440,7 +1440,16 @@ fn re_match_seq_caps(
                     }
                     continue;
                 }
-                cap_undo(caps, journal, marks[reps]);
+                // v7.39 (read01 regexp.c) — keep the caps of the first `reps`
+                // repetitions: roll back to the state AFTER rep `reps`
+                // finished (marks[k] is the mark BEFORE rep k+1 starts, so
+                // that state is marks[reps + 1]; at the full count nothing
+                // rolls back). `cap_undo(marks[reps])` dropped rep `reps`'s
+                // own captures — the off-by-one that made `(o)(o)?` report
+                // a participating group as NULL.
+                if reps + 1 < n {
+                    cap_undo(caps, journal, marks[reps + 1]);
+                }
                 cap_set(caps, journal, *idx, (pos, ends[reps]));
                 let tail_mark = journal.len();
                 if let Some(e) = re_match_seq_caps(rest, s, ends[reps], d, steps, caps, journal)? {
@@ -1492,8 +1501,12 @@ fn re_match_seq_caps(
                     }
                     continue;
                 }
-                // Roll captures back to exactly `reps` repetitions.
-                cap_undo(caps, journal, marks[reps]);
+                // Roll captures back to exactly `reps` repetitions — the
+                // state AFTER rep `reps` finished (see the Group arm above;
+                // marks[reps] would also drop rep `reps`'s own captures).
+                if reps + 1 < n {
+                    cap_undo(caps, journal, marks[reps + 1]);
+                }
                 let tail_mark = journal.len();
                 if let Some(e) = re_match_seq_caps(rest, s, ends[reps], d, steps, caps, journal)? {
                     return Ok(Some(e));
@@ -1795,36 +1808,75 @@ pub(super) fn regexp_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         fold_case(&mut node);
     }
     let chars: Vec<char> = text.chars().collect();
-    match re_find(&node, &chars, 0)? {
-        Some((s_pos, e_pos)) => Ok(Value::TextArray(alloc::vec![Some(
-            chars[s_pos..e_pos].iter().collect(),
-        )])),
+    // v7.39 (read01 regexp.c) — with capturing groups PG returns the
+    // GROUPS (non-participating ones as NULL); only a group-free
+    // pattern returns the whole match. Same rule as regexp_matches.
+    let ngroups = max_group(&node);
+    match re_find_caps(&node, &chars, 0, ngroups)? {
+        Some(((s_pos, e_pos), caps)) => {
+            if ngroups == 0 {
+                Ok(Value::TextArray(alloc::vec![Some(
+                    chars[s_pos..e_pos].iter().collect(),
+                )]))
+            } else {
+                Ok(Value::TextArray(
+                    (1..=ngroups)
+                        .map(|g| caps[g].map(|(a, b)| chars[a..b].iter().collect()))
+                        .collect(),
+                ))
+            }
+        }
         None => Ok(Value::Null),
     }
 }
 
-/// v7.17.0 Phase 3.7 — `regexp_replace(s, pat, repl[, flags])`.
-/// `flags` containing `g` replaces all matches; absent flag
-/// replaces only the first match (PG default).
+/// v7.17.0 Phase 3.7 / v7.39 (read01 regexp.c) — `regexp_replace` in both
+/// PG shapes: `(source, pattern, replacement [, flags])` and the
+/// Oracle-style `(source, pattern, replacement, start [, N [, flags]])`
+/// (a 4th INTEGER argument selects the second shape). N = 0 replaces
+/// every match from `start`; N >= 1 replaces exactly the Nth.
 pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let (text, pat, repl, flags) = match args.len() {
-        3 => (
-            text_arg(&args[0])?,
-            text_arg(&args[1])?,
-            text_arg(&args[2])?,
-            String::new(),
-        ),
+    if args.len() < 3 || args.len() > 6 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("regexp_replace() takes 3-6 args, got {}", args.len()),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let repl = text_arg(&args[2])?;
+    fn int_arg(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
+        match v {
+            Value::Null => Ok(None),
+            Value::SmallInt(n) => Ok(Some(i64::from(*n))),
+            Value::Int(n) => Ok(Some(i64::from(*n))),
+            Value::BigInt(n) => Ok(Some(*n)),
+            _ => Err(EvalError::TypeMismatch {
+                detail: "regexp_replace(): integer arg required".into(),
+            }),
+        }
+    }
+    let is_int = |v: &Value<'_>| {
+        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+    };
+    let (start_1based, nth, flags): (i64, Option<i64>, String) = match args.len() {
+        3 => (1, None, String::new()),
+        4 if is_int(&args[3]) => match int_arg(&args[3])? {
+            None => return Ok(Value::Null),
+            Some(st) => (st, None, String::new()),
+        },
         4 => (
-            text_arg(&args[0])?,
-            text_arg(&args[1])?,
-            text_arg(&args[2])?,
+            1,
+            None,
             text_arg(&args[3])?.unwrap_or_default(),
         ),
-        n => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("regexp_replace() takes 3 or 4 args, got {n}"),
-            });
-        }
+        5 => match (int_arg(&args[3])?, int_arg(&args[4])?) {
+            (Some(st), Some(n)) => (st, Some(n), String::new()),
+            _ => return Ok(Value::Null),
+        },
+        _ => match (int_arg(&args[3])?, int_arg(&args[4])?) {
+            (Some(st), Some(n)) => (st, Some(n), text_arg(&args[5])?.unwrap_or_default()),
+            _ => return Ok(Value::Null),
+        },
     };
     let Some(text) = text else {
         return Ok(Value::Null);
@@ -1835,7 +1887,22 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     let Some(repl) = repl else {
         return Ok(Value::Null);
     };
-    let global = flags.contains('g');
+    if start_1based < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid value for parameter \"start\": {start_1based}"),
+        });
+    }
+    if let Some(n) = nth {
+        if n < 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("invalid value for parameter \"n\": {n}"),
+            });
+        }
+    }
+    // N = 0 (or the g flag without N) replaces all; N >= 1 exactly the Nth;
+    // no N and no g replaces the first.
+    let global = nth == Some(0) || (nth.is_none() && flags.contains('g'));
+    let nth_target = nth.filter(|n| *n >= 1);
     let mut node = re_compile(&pat)?;
     // The `i` flag folds the compiled pattern to match either case, same as
     // the `~*` operator path.
@@ -1847,15 +1914,32 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
     // (`\1`..`\9`), the whole match (`\&`), or an escaped backslash (`\\`).
     let ngroups = max_group(&node);
     let mut out = String::with_capacity(text.len());
-    let mut from = 0usize;
+    let start_idx = ((start_1based - 1) as usize).min(chars.len());
+    out.extend(chars[..start_idx].iter());
+    let mut from = start_idx;
+    let mut hits = 0i64;
     loop {
         match re_find_caps(&node, &chars, from, ngroups)? {
             Some(((s_pos, e_pos), caps)) => {
+                hits += 1;
+                let replace_this = match nth_target {
+                    Some(n) => hits == n,
+                    None => true,
+                };
                 out.extend(chars[from..s_pos].iter());
-                expand_replacement(&repl, &chars, (s_pos, e_pos), &caps, &mut out);
+                if replace_this {
+                    expand_replacement(&repl, &chars, (s_pos, e_pos), &caps, &mut out);
+                } else {
+                    out.extend(chars[s_pos..e_pos].iter());
+                }
                 let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
                 from = step;
-                if !global {
+                let done = if let Some(n) = nth_target {
+                    hits == n
+                } else {
+                    !global
+                };
+                if done {
                     if from <= chars.len() {
                         out.extend(chars[from..].iter());
                     }
@@ -1982,9 +2066,9 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
 /// index of the start (or end, if `endoption=1`) of the Nth match.
 /// Returns 0 if no match.
 pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    if args.len() < 2 || args.len() > 6 {
+    if args.len() < 2 || args.len() > 7 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_instr() takes 2-6 args, got {}", args.len()),
+            detail: alloc::format!("regexp_instr() takes 2-7 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2030,22 +2114,58 @@ pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     } else {
         0
     };
-    if start_1based < 1 || nth < 1 {
+    // v7.39 (read01 regexp.c) — PG's parameter wordings (22023).
+    if start_1based < 1 {
         return Err(EvalError::TypeMismatch {
-            detail: "regexp_instr(): start and N must be >= 1".into(),
+            detail: alloc::format!("invalid value for parameter \"start\": {start_1based}"),
+        });
+    }
+    if nth < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid value for parameter \"n\": {nth}"),
+        });
+    }
+    if !(0..=1).contains(&endoption) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid value for parameter \"endoption\": {endoption}"),
         });
     }
     let mut node = re_compile(&pat)?;
     if flags_have_i(args, 5)? {
         fold_case(&mut node);
     }
+    // v7.39 (read01 regexp.c) — the 7th argument addresses a capturing
+    // subexpression: the returned position is that group's start (or
+    // end with endoption 1); a non-participating group yields 0.
+    let subexpr = if args.len() >= 7 {
+        match int_arg(&args[6])? {
+            None => return Ok(Value::Null),
+            Some(n) => n,
+        }
+    } else {
+        0
+    };
+    if subexpr < 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid value for parameter \"subexpr\": {subexpr}"),
+        });
+    }
     let chars: Vec<char> = text.chars().collect();
+    let ngroups = max_group(&node);
     let mut from = (start_1based - 1) as usize;
     let mut hits = 0i64;
-    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from)? {
+    while let Some(((s_pos, e_pos), caps)) = re_find_caps(&node, &chars, from, ngroups)? {
         hits += 1;
         if hits == nth {
-            let idx = if endoption == 1 { e_pos } else { s_pos };
+            let span = if subexpr > 0 {
+                match caps.get(subexpr as usize).copied().flatten() {
+                    Some(sp) => sp,
+                    None => return Ok(Value::Int(0)),
+                }
+            } else {
+                (s_pos, e_pos)
+            };
+            let idx = if endoption == 1 { span.1 } else { span.0 };
             return Ok(Value::Int((idx + 1) as i32));
         }
         let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
@@ -2101,9 +2221,14 @@ pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
     } else {
         1
     };
-    if start_1based < 1 || nth < 1 {
+    if start_1based < 1 {
         return Err(EvalError::TypeMismatch {
-            detail: "regexp_substr(): start and N must be >= 1".into(),
+            detail: alloc::format!("invalid value for parameter \"start\": {start_1based}"),
+        });
+    }
+    if nth < 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("invalid value for parameter \"n\": {nth}"),
         });
     }
     let mut node = re_compile(&pat)?;
