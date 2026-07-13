@@ -3426,6 +3426,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("smallint out of range")
             || msg.contains("bigint out of range")
             || msg.contains("value overflows numeric format")
+            || msg.contains("OID out of range")
         {
             "22003"
         // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
@@ -3437,6 +3438,12 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 like_match.c) — 22025 INVALID_ESCAPE_SEQUENCE.
         } else if msg.contains("LIKE pattern must not end with escape") {
             "22025"
+        // v7.39 (read01 oracle_compat.c) — chr() limits are PG's 54000
+        // PROGRAM_LIMIT_EXCEEDED.
+        } else if msg.contains("null character not permitted")
+            || msg.contains("requested character too large for encoding")
+        {
+            "54000"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.

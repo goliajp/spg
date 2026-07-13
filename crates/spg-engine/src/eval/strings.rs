@@ -194,6 +194,25 @@ pub(super) fn string_trim(
     side: TrimSide,
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (read01 oracle_compat.c) — bytea trim variants work on BYTES
+    // (byteatrim/ltrim/rtrim): trim any byte present in the set argument,
+    // returning bytea — the text path would eat the \x prefix.
+    if let [Value::Bytes(b), Value::Bytes(set)] = args {
+        let setb: alloc::collections::BTreeSet<u8> = set.iter().copied().collect();
+        let mut lo = 0usize;
+        let mut hi = b.len();
+        if matches!(side, TrimSide::Left | TrimSide::Both) {
+            while lo < hi && setb.contains(&b[lo]) {
+                lo += 1;
+            }
+        }
+        if matches!(side, TrimSide::Right | TrimSide::Both) {
+            while hi > lo && setb.contains(&b[hi - 1]) {
+                hi -= 1;
+            }
+        }
+        return Ok(Value::Bytes(alloc::borrow::Cow::Owned(b[lo..hi].to_vec())));
+    }
     let (input, chars_str) = match args {
         [v] => (v.clone(), String::from(" ")),
         [v, c] => (v.clone(), {

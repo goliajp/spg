@@ -2083,37 +2083,40 @@ fn apply_function_dispatch(
                     detail: format!("chr() takes 1 arg, got {}", args.len()),
                 });
             }
-            match &args[0] {
-                Value::Null => Ok(Value::Null),
-                Value::Int(n) => {
-                    let code = u32::try_from(*n).map_err(|_| EvalError::TypeMismatch {
-                        detail: alloc::format!("chr(): {n} out of range"),
-                    })?;
-                    let ch = char::from_u32(code).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("chr(): {code} is not a valid Unicode code point"),
-                    })?;
-                    let mut s = alloc::string::String::new();
-                    s.push(ch);
-                    Ok(Value::text(s))
+            // v7.39 (read01 oracle_compat.c) — PG's chr errors: chr(0) is
+            // "null character not permitted" (54000-adjacent 22P02-shaped);
+            // beyond U+10FFFF is "requested character too large for
+            // encoding: %d".
+            let n = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::SmallInt(n) => i64::from(*n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "chr() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
                 }
-                Value::BigInt(n) => {
-                    let code = u32::try_from(*n).map_err(|_| EvalError::TypeMismatch {
-                        detail: alloc::format!("chr(): {n} out of range"),
-                    })?;
-                    let ch = char::from_u32(code).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("chr(): {code} is not a valid Unicode code point"),
-                    })?;
-                    let mut s = alloc::string::String::new();
-                    s.push(ch);
-                    Ok(Value::text(s))
-                }
-                other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "chr() needs integer, got {:?}",
-                        other.data_type()
-                    ),
-                }),
+            };
+            if n == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "null character not permitted".into(),
+                });
             }
+            let ch = u32::try_from(n)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "requested character too large for encoding: {n}"
+                    ),
+                })?;
+            let mut s = alloc::string::String::new();
+            s.push(ch);
+            Ok(Value::text(s))
         }
         "ascii" => {
             if args.len() != 1 {
