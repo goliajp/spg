@@ -34,9 +34,10 @@ fn viewdef_returns_body() {
     // 'public.' qualification accepted.
     let def2 = text(&first(&mut e, "SELECT pg_get_viewdef('public.v_names')"));
     assert_eq!(def, def2);
-    // Pretty flag accepted + ignored.
+    // v7.39 (read01 ruleutils.c) — the pretty flag drops the redundant
+    // top-level WHERE parentheses, as PG does.
     let def3 = text(&first(&mut e, "SELECT pg_get_viewdef('v_names', true)"));
-    assert_eq!(def, def3);
+    assert_eq!(def3, def.replace("WHERE (id > 0)", "WHERE id > 0"));
 }
 
 #[test]

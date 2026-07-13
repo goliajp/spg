@@ -315,6 +315,7 @@ mod e2e_range_round25;
 mod e2e_regexp_round26;
 mod e2e_regproc_round27;
 mod e2e_rowtypes_round28;
+mod e2e_ruleutils_round29;
 mod e2e_random_int;
 mod e2e_random_normal;
 mod e2e_range_agg;

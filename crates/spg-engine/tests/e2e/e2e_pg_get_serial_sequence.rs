@@ -21,7 +21,10 @@ fn text(v: &spg_storage::Value<'_>) -> String {
 
 #[test]
 fn pg_get_serial_sequence_bare_table() {
+    // v7.39 (read01 ruleutils.c) — only serial/identity columns map to a
+    // sequence; a plain column is NULL and a missing relation errors (PG).
     let mut e = Engine::new();
+    e.execute("CREATE TABLE users (id SERIAL, note TEXT)").unwrap();
     assert_eq!(
         text(&first(
             &mut e,
@@ -29,11 +32,23 @@ fn pg_get_serial_sequence_bare_table() {
         )),
         "public.users_id_seq"
     );
+    assert!(matches!(
+        first(&mut e, "SELECT pg_get_serial_sequence('users', 'note')"),
+        spg_storage::Value::Null
+    ));
+    let err = e
+        .execute("SELECT pg_get_serial_sequence('nope', 'id')")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("relation \"nope\" does not exist"),
+        "{err}"
+    );
 }
 
 #[test]
 fn pg_get_serial_sequence_qualified_table() {
     let mut e = Engine::new();
+    e.execute("CREATE TABLE orders (order_id SERIAL)").unwrap();
     // Strips the leading schema for the sequence-name computation.
     assert_eq!(
         text(&first(

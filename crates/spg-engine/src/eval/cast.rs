@@ -502,6 +502,7 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                         | "language_handler"
                         | "fdw_handler"
                         | "pg_ddl_command"
+                        | "pg_node_tree"
                 ) && !matches!(v, Value::Null)
                 {
                     return Err(EvalError::TypeMismatch {

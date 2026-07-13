@@ -124,6 +124,88 @@ fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value
     )))
 }
 
+/// v7.39 (read01 ruleutils.c) — render a view body in PG's
+/// pg_get_viewdef shape: ` SELECT a,\n    b\n   FROM t\n  WHERE (p);`
+/// (leading space, 4-space continuation columns, 3-space FROM, 2-space
+/// WHERE, trailing semicolon). `pretty` drops the redundant top-level
+/// WHERE parentheses, as PG's pretty mode does. Shapes beyond a plain
+/// single-table SELECT fall back to the stored single-line body.
+fn pg_viewdef_render(body: &str, pretty: bool) -> String {
+    let Ok(spg_sql::ast::Statement::Select(stmt)) =
+        spg_sql::parser::parse_statement(body)
+    else {
+        return body.to_string();
+    };
+    // Narrow shape: no CTEs / unions / grouping / ordering / limits.
+    let simple = stmt.ctes.is_empty()
+        && stmt.unions.is_empty()
+        && stmt.group_by.is_none()
+        && stmt.having.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && stmt.offset.is_none()
+        && !stmt.distinct;
+    let Some(from) = &stmt.from else {
+        return body.to_string();
+    };
+    if !simple
+        || !from.joins.is_empty()
+        || from.primary.lateral_subquery.is_some()
+        || from.primary.unnest_expr.is_some()
+        || from.primary.generate_series_args.is_some()
+    {
+        return body.to_string();
+    }
+    let mut out = String::from(" SELECT ");
+    let items: Vec<String> = stmt
+        .items
+        .iter()
+        .map(|i| alloc::format!("{i}"))
+        .collect();
+    out.push_str(&items.join(",\n    "));
+    out.push_str("\n   FROM ");
+    out.push_str(&from.primary.name);
+    if let Some(a) = &from.primary.alias {
+        if *a != from.primary.name {
+            out.push(' ');
+            out.push_str(a);
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        out.push_str("\n  WHERE ");
+        let mut pred = alloc::format!("{w}");
+        if pretty
+            && pred.starts_with('(')
+            && pred.ends_with(')')
+        {
+            // Drop ONE redundant outer layer when it wraps the whole
+            // predicate (balanced check).
+            let inner = &pred[1..pred.len() - 1];
+            let mut depth = 0i32;
+            let mut balanced = true;
+            for c in inner.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            balanced = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if balanced && depth == 0 {
+                pred = inner.to_string();
+            }
+        }
+        out.push_str(&pred);
+    }
+    out.push(';');
+    out
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -13102,11 +13184,25 @@ fn apply_function_dispatch(
                         ));
                     }
                     let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+                    // v7.39 (read01 ruleutils.c) — a partial index carries
+                    // its WHERE predicate (PG parenthesizes it).
+                    let where_sfx = idx.partial_predicate.as_ref().map_or_else(
+                        String::new,
+                        |p| {
+                            let inner = p.trim();
+                            if inner.starts_with('(') && inner.ends_with(')') {
+                                alloc::format!(" WHERE {inner}")
+                            } else {
+                                alloc::format!(" WHERE ({inner})")
+                            }
+                        },
+                    );
                     return Ok(Value::text(alloc::format!(
-                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({})",
+                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({}){}",
                         idx.name,
                         tname,
-                        col_names.join(", ")
+                        col_names.join(", "),
+                        where_sfx
                     )));
                 }
             }
@@ -13327,6 +13423,29 @@ fn apply_function_dispatch(
                 .rsplit_once('.')
                 .map(|(_schema, t)| t)
                 .unwrap_or(&table);
+            // v7.39 (read01 ruleutils.c) — PG errors on a missing relation
+            // or column, returns NULL for a non-sequence-backed column, and
+            // synthesizes the conventional name only for serial/identity.
+            if let Some(cat) = ctx.catalog {
+                let Some(t) = cat.get(table_short) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "relation \"{table_short}\" does not exist"
+                        ),
+                    });
+                };
+                let Some(c) = t.schema().columns.iter().find(|c| c.name == col)
+                else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "column \"{col}\" of relation \"{table_short}\" does not exist"
+                        ),
+                    });
+                };
+                if !c.auto_increment {
+                    return Ok(Value::Null);
+                }
+            }
             Ok(Value::text(alloc::format!(
                 "public.{table_short}_{col}_seq"
             )))
@@ -13355,8 +13474,9 @@ fn apply_function_dispatch(
                 .strip_prefix("public.")
                 .unwrap_or(name_arg)
                 .trim_matches('"');
+            let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             match cat.views().get(bare) {
-                Some(def) => Ok(Value::text(def.body.clone())),
+                Some(def) => Ok(Value::text(pg_viewdef_render(&def.body, pretty))),
                 None => Ok(Value::Null),
             }
         }
