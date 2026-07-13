@@ -407,6 +407,71 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     return int_to_bit_string(v, width);
                 }
             }
+            // v7.39 (read01 varbit.c) — internal exact-length form for
+            // B'...' literals (an explicit ::bit means bit(1) below).
+            if name == "__bit_literal" {
+                return match &v {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(s) => match crate::conversions::parse_bit_string_text(s) {
+                        Some((nb, by)) => Ok(Value::bit_string(nb, by)),
+                        None => Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "invalid input syntax for type bit: \"{s}\""
+                            ),
+                        }),
+                    },
+                    Value::BitString { .. } => Ok(v),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot cast {:?} to bit",
+                            other.data_type()
+                        ),
+                    }),
+                };
+            }
+            // v7.39 (read01 varbit.c) — `bit(n)` over a bit string (or a
+            // '0101' text form) zero-extends on the RIGHT or truncates to
+            // n (PG's bit() cast, unlike the input-time exact-length rule).
+            let bit_src: Option<Value<'static>> = match &v {
+                Value::BitString { .. } => Some(v.clone()),
+                Value::Text(s) if bit_cast_width(&name).is_some() => {
+                    match crate::conversions::parse_bit_string_text(s) {
+                        Some((nb, by)) => Some(Value::bit_string(nb, by)),
+                        None => {
+                            let bad = s.chars().find(|c| *c != '0' && *c != '1');
+                            return Err(EvalError::TypeMismatch {
+                                detail: match bad {
+                                    Some(c) => alloc::format!(
+                                        "\"{c}\" is not a valid binary digit"
+                                    ),
+                                    None => alloc::format!(
+                                        "invalid input syntax for type bit: \"{s}\""
+                                    ),
+                                },
+                            });
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(Value::BitString { nbits, bytes }) = &bit_src {
+                if let Some(width) = bit_cast_width(&name) {
+                    let mut bits: alloc::vec::Vec<bool> = (0..*nbits as usize)
+                        .map(|i| bytes[i / 8] & (0x80 >> (i % 8)) != 0)
+                        .collect();
+                    bits.resize(width as usize, false);
+                    let mut out = alloc::vec![0u8; width.div_ceil(8) as usize];
+                    for (i, b) in bits.iter().enumerate() {
+                        if *b {
+                            out[i / 8] |= 0x80 >> (i % 8);
+                        }
+                    }
+                    return Ok(Value::BitString {
+                        nbits: width,
+                        bytes: alloc::borrow::Cow::Owned(out),
+                    });
+                }
+            }
             // v7.39 (read01 oid.c) — OID is unsigned 32-bit: a negative
             // integer wraps (PG's (Oid) cast semantics: -1 -> 4294967295),
             // beyond u32 errors "OID out of range", bad text is 22P02.
@@ -516,6 +581,28 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // pseudotype: text in, text out (cstring_in/out are identity).
             // SPG carries it as text; pg_typeof(cstring) reading "text" is
             // a recorded delta alongside the literal projection OIDs.
+            // v7.39 (read01 varchar.c) — `::name` is text truncated to
+            // NAMEDATALEN-1 (63) bytes.
+            if name.eq_ignore_ascii_case("name") {
+                return Ok(match v {
+                    Value::Null => Value::Null,
+                    other => {
+                        let t = match other {
+                            Value::Text(s) => s.into_owned(),
+                            o => value_to_text(&o),
+                        };
+                        let mut cut = t;
+                        if cut.len() > 63 {
+                            let mut idx = 63;
+                            while !cut.is_char_boundary(idx) {
+                                idx -= 1;
+                            }
+                            cut.truncate(idx);
+                        }
+                        Value::text(cut)
+                    }
+                });
+            }
             if name.eq_ignore_ascii_case("cstring") {
                 return Ok(match v {
                     Value::Null => Value::Null,
@@ -1022,11 +1109,11 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
         Value::Int(n) => Ok(Value::Timestamp(i64::from(n))),
         Value::BigInt(n) => Ok(Value::Timestamp(n)),
         // DATE → TIMESTAMP picks midnight on the date.
-        // v7.39 (read01 timestamp.c) — the ±infinity date sentinels map
-        // to the timestamp sentinels (multiplying them overflowed).
-        Value::Date(i32::MAX) => Ok(Value::Timestamp(i64::MAX)),
-        Value::Date(i32::MIN) => Ok(Value::Timestamp(i64::MIN)),
-        Value::Date(d) => Ok(Value::Timestamp(i64::from(d) * 86_400_000_000)),
+        // v7.39 (read01 timestamp.c) — sentinel-aware (the plain multiply
+        // overflowed on ±infinity dates).
+        Value::Date(d) => Ok(Value::Timestamp(
+            crate::conversions::date_days_to_micros(d),
+        )),
         Value::Text(s) => {
             parse_timestamp_literal(&s)
                 .map(Value::Timestamp)

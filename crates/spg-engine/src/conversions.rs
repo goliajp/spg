@@ -1811,6 +1811,18 @@ pub fn parse_macaddr_text(s: &str) -> Option<[u8; 6]> {
 /// v7.37.5 ζ-A — parse PG MACADDR8 text.
 /// v7.39 (read01 pg_lsn.c) — parse PG's `%X/%X` LSN form: two hex halves,
 /// each at most 8 hex digits (u32), joined `hi << 32 | lo`.
+/// v7.39 (read01 timestamp.c, sentinel audit) — date days → timestamp
+/// microseconds with the ±infinity sentinels mapped through (the plain
+/// multiply overflowed i64 and aborted debug builds).
+#[must_use]
+pub fn date_days_to_micros(d: i32) -> i64 {
+    match d {
+        i32::MAX => i64::MAX,
+        i32::MIN => i64::MIN,
+        _ => i64::from(d) * 86_400_000_000,
+    }
+}
+
 pub fn parse_pg_lsn_text(s: &str) -> Option<u64> {
     let t = s.trim();
     let (hi, lo) = t.split_once('/')?;
@@ -2207,6 +2219,8 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "macaddr" => DataType::Macaddr,
         "macaddr8" => DataType::Macaddr8,
         "pg_lsn" => DataType::PgLsn,
+        // v7.39 (read01 varbit.c) — the B'...' literal's internal target.
+        "__bit_literal" => DataType::BitVarying,
         "bit" => DataType::Bit,
         "varbit" | "bit varying" => DataType::BitVarying,
         "xml" => DataType::Xml,
@@ -3464,10 +3478,17 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
             Some((nbits, bytes)) => Some(Value::bit_string(nbits, bytes)),
             None => {
+                // v7.39 (read01 varbit.c) — PG names the first bad digit.
+                let bad = s.chars().find(|c| *c != '0' && *c != '1');
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for BIT: {s:?} (column `{col_name}`)"
-                    ),
+                    detail: match bad {
+                        Some(c) => {
+                            alloc::format!("\"{c}\" is not a valid binary digit")
+                        }
+                        None => alloc::format!(
+                            "invalid input syntax for BIT: {s:?} (column `{col_name}`)"
+                        ),
+                    },
                 }));
             }
         },

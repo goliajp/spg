@@ -2516,8 +2516,15 @@ fn bitop(
     ) = (&l, &r)
     {
         if an != bn {
+            // v7.39 (read01 varbit.c) — PG spells the operator out.
+            let word = match op_name {
+                "&" => "AND",
+                "|" => "OR",
+                "#" => "XOR",
+                other => other,
+            };
             return Err(EvalError::TypeMismatch {
-                detail: format!("cannot {op_name} bit strings of different sizes"),
+                detail: format!("cannot {word} bit strings of different sizes"),
             });
         }
         let out: alloc::vec::Vec<u8> = ab

@@ -623,6 +623,11 @@ fn apply_function_dispatch(
                     let n = i32::try_from(b.len()).unwrap_or(i32::MAX);
                     Ok(Value::Int(n))
                 }
+                // v7.39 (read01 varbit.c) — octet_length(bit) counts the
+                // packed bytes (ceil(nbits/8)).
+                Value::BitString { nbits, .. } => {
+                    Ok(Value::Int(nbits.div_ceil(8) as i32))
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "octet_length() needs text or bytea, got {:?}",
@@ -645,6 +650,57 @@ fn apply_function_dispatch(
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
+            }
+            // v7.39 (read01 varbit.c) — overlay(bit PLACING bit FROM n
+            // [FOR len]) splices at the bit level.
+            if let (
+                Value::BitString { nbits: sn, bytes: sb },
+                Value::BitString { nbits: rn, bytes: rb },
+            ) = (&args[0], &args[1])
+            {
+                let int_of = |v: &Value<'_>| -> Option<i64> {
+                    match v {
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        _ => None,
+                    }
+                };
+                let Some(start) = int_of(&args[2]) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "overlay(): start must be integer".into(),
+                    });
+                };
+                let for_len = match args.get(3) {
+                    None => i64::from(*rn),
+                    Some(v) => int_of(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "overlay(): length must be integer".into(),
+                    })?,
+                };
+                let bit_at = |bytes: &[u8], i: usize| bytes[i / 8] & (0x80 >> (i % 8)) != 0;
+                let mut bits: alloc::vec::Vec<bool> = alloc::vec::Vec::new();
+                let s0 = ((start - 1).max(0) as usize).min(*sn as usize);
+                let after = (s0 + for_len.max(0) as usize).min(*sn as usize);
+                for i in 0..s0 {
+                    bits.push(bit_at(sb, i));
+                }
+                for i in 0..*rn as usize {
+                    bits.push(bit_at(rb, i));
+                }
+                for i in after..*sn as usize {
+                    bits.push(bit_at(sb, i));
+                }
+                let nbits = bits.len() as u32;
+                let mut out = alloc::vec![0u8; bits.len().div_ceil(8)];
+                for (i, b) in bits.iter().enumerate() {
+                    if *b {
+                        out[i / 8] |= 0x80 >> (i % 8);
+                    }
+                }
+                return Ok(Value::BitString {
+                    nbits,
+                    bytes: alloc::borrow::Cow::Owned(out),
+                });
             }
             let s = match &args[0] {
                 Value::Text(s) => s.as_ref(),
@@ -4812,7 +4868,7 @@ fn apply_function_dispatch(
                     (K::Date, Value::Date(d)) => Some(Value::Date(*d)),
                     (K::Ts | K::TsTz, Value::Timestamp(t)) => Some(Value::Timestamp(*t)),
                     (K::Ts | K::TsTz, Value::Date(d)) => {
-                        Some(Value::Timestamp(i64::from(*d) * 86_400_000_000))
+                        Some(Value::Timestamp(crate::conversions::date_days_to_micros(*d)))
                     }
                     // Text bounds reuse the range-element parser.
                     (_, Value::Text(s)) => {

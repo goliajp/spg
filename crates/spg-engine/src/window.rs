@@ -1004,7 +1004,7 @@ fn range_order_key_micros(key: &[(Value, bool, Option<bool>)]) -> Option<(i64, b
     }
     let (v, desc, _) = &key[0];
     let micros = match v {
-        Value::Date(d) => i64::from(*d) * 86_400_000_000,
+        Value::Date(d) => crate::conversions::date_days_to_micros(*d),
         Value::Timestamp(t) => *t,
         _ => return None,
     };
