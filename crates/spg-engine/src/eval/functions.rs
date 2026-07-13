@@ -2497,11 +2497,16 @@ fn apply_function_dispatch(
         // Geometric accessors over box / circle / lseg. (`length(lseg)` is
         // handled in the `length` arm above, which the text form shares.)
         "area" | "width" | "height" | "center" | "radius" | "diameter"
-        | "isvertical" | "ishorizontal"
+        | "isvertical" | "ishorizontal" | "isclosed" | "isopen" | "npoints"
+        | "pclose" | "popen"
             if args.len() == 1
                 && matches!(
                     &args[0],
-                    Value::PgBox(..) | Value::Circle { .. } | Value::Lseg(..)
+                    Value::PgBox(..)
+                        | Value::Circle { .. }
+                        | Value::Lseg(..)
+                        | Value::Path { .. }
+                        | Value::Polygon(_)
                 ) =>
         {
             let pt = |x: f64, y: f64| Value::Point(spg_storage::Point2D { x, y });
@@ -2512,10 +2517,46 @@ fn apply_function_dispatch(
                 ("area", Value::Circle { radius, .. }) => {
                     Ok(Value::Float(core::f64::consts::PI * radius * radius))
                 }
+                // v7.39 (read01 geo_ops.c) — path area: shoelace over a
+                // CLOSED path (|Σ xᵢyⱼ − yᵢxⱼ| / 2); an open path is NULL.
+                ("area", Value::Path { points, closed }) => {
+                    if !closed {
+                        return Ok(Value::Null);
+                    }
+                    let n = points.len();
+                    let mut acc = 0.0f64;
+                    for i in 0..n {
+                        let j = (i + 1) % n;
+                        acc += points[i].x * points[j].y;
+                        acc -= points[i].y * points[j].x;
+                    }
+                    Ok(Value::Float(acc.abs() / 2.0))
+                }
+                ("isclosed", Value::Path { closed, .. }) => Ok(Value::Bool(*closed)),
+                ("isopen", Value::Path { closed, .. }) => Ok(Value::Bool(!closed)),
+                ("npoints", Value::Path { points, .. }) => {
+                    Ok(Value::Int(points.len() as i32))
+                }
+                ("npoints", Value::Polygon(points)) => {
+                    Ok(Value::Int(points.len() as i32))
+                }
+                ("pclose", Value::Path { points, .. }) => Ok(Value::Path {
+                    points: points.clone(),
+                    closed: true,
+                }),
+                ("popen", Value::Path { points, .. }) => Ok(Value::Path {
+                    points: points.clone(),
+                    closed: false,
+                }),
                 ("width", Value::PgBox(a, b)) => Ok(Value::Float((a.x - b.x).abs())),
                 ("height", Value::PgBox(a, b)) => Ok(Value::Float((a.y - b.y).abs())),
                 ("center", Value::PgBox(a, b)) => Ok(pt((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)),
                 ("center", Value::Circle { center, .. }) => Ok(pt(center.x, center.y)),
+                // v7.39 (read01 geo_ops.c) — lseg center = midpoint (the
+                // prefix @@ operator desugars here too).
+                ("center", Value::Lseg(a, b)) => {
+                    Ok(pt((a.x + b.x) / 2.0, (a.y + b.y) / 2.0))
+                }
                 ("radius", Value::Circle { radius, .. }) => Ok(Value::Float(*radius)),
                 ("diameter", Value::Circle { radius, .. }) => Ok(Value::Float(2.0 * radius)),
                 ("isvertical", Value::Lseg(a, b)) => Ok(Value::Bool(a.x == b.x)),
@@ -2524,6 +2565,28 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{n}() not defined for {:?}", v.data_type()),
                 }),
             }
+        }
+        // v7.39 (read01 geo_ops.c) — slope of two points: PG's point_sl
+        // returns Infinity for a vertical pair (or coincident points, via
+        // the epsilon-equal x test) and 0 for a horizontal pair; the
+        // comparisons use PG's geometric EPSILON (1e-6).
+        "slope"
+            if args.len() == 2
+                && matches!(&args[0], Value::Point(_))
+                && matches!(&args[1], Value::Point(_)) =>
+        {
+            let (Value::Point(p1), Value::Point(p2)) = (&args[0], &args[1]) else {
+                unreachable!()
+            };
+            const EPS: f64 = 1.0e-6;
+            let r = if (p1.x - p2.x).abs() <= EPS {
+                f64::INFINITY
+            } else if (p1.y - p2.y).abs() <= EPS {
+                0.0
+            } else {
+                (p1.y - p2.y) / (p1.x - p2.x)
+            };
+            Ok(Value::Float(r))
         }
         "gcd" => {
             if args.len() != 2 {

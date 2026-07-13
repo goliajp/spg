@@ -581,6 +581,88 @@ pub(super) fn apply_binary(
             }
         }
         BinOp::BitXor => bitop(l, r, |a, b| a ^ b, "#"),
+        // v7.39 (read01 geo_ops.c) — geometric predicates. Slopes compare
+        // with PG's geometric EPSILON (1e-6): parallel = equal slopes,
+        // perpendicular = vertical×horizontal or m1·m2 = -1.
+        BinOp::GeomParallel | BinOp::GeomPerp => {
+            const EPS: f64 = 1.0e-6;
+            let slope_of = |v: &Value<'_>| -> Option<f64> {
+                match v {
+                    Value::Lseg(a, b) => Some(if (a.x - b.x).abs() <= EPS {
+                        f64::INFINITY
+                    } else if (a.y - b.y).abs() <= EPS {
+                        0.0
+                    } else {
+                        (a.y - b.y) / (a.x - b.x)
+                    }),
+                    Value::Line { a, b, .. } => Some(if b.abs() <= EPS {
+                        f64::INFINITY
+                    } else {
+                        -a / b
+                    }),
+                    _ => None,
+                }
+            };
+            match (slope_of(&l), slope_of(&r)) {
+                (Some(m1), Some(m2)) => {
+                    let res = if matches!(op, BinOp::GeomParallel) {
+                        (m1.is_infinite() && m2.is_infinite())
+                            || (m1 - m2).abs() <= EPS
+                    } else if m1.is_infinite() {
+                        m2.abs() <= EPS
+                    } else if m2.is_infinite() {
+                        m1.abs() <= EPS
+                    } else {
+                        (m1 * m2 + 1.0).abs() <= EPS
+                    };
+                    Ok(Value::Bool(res))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "operator {} needs lseg or line operands, got {:?} and {:?}",
+                        if matches!(op, BinOp::GeomParallel) { "?||" } else { "?-|" },
+                        l.data_type(),
+                        r.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.39 (read01 geo_ops.c) — `~=` "same as": component equality
+        // under the geometric EPSILON, for point / box / circle / polygon.
+        BinOp::GeomSameAs => {
+            const EPS: f64 = 1.0e-6;
+            let feq = |a: f64, b: f64| (a - b).abs() <= EPS;
+            let res = match (&l, &r) {
+                (Value::Point(a), Value::Point(b)) => Some(feq(a.x, b.x) && feq(a.y, b.y)),
+                (Value::PgBox(a1, a2), Value::PgBox(b1, b2)) => {
+                    // Canonical corners (high, low) compare pairwise.
+                    let hx = |p: &spg_storage::Point2D, q: &spg_storage::Point2D| {
+                        (p.x.max(q.x), p.y.max(q.y), p.x.min(q.x), p.y.min(q.y))
+                    };
+                    let a = hx(a1, a2);
+                    let b = hx(b1, b2);
+                    Some(feq(a.0, b.0) && feq(a.1, b.1) && feq(a.2, b.2) && feq(a.3, b.3))
+                }
+                (Value::Circle { center: c1, radius: r1 }, Value::Circle { center: c2, radius: r2 }) => {
+                    Some(feq(c1.x, c2.x) && feq(c1.y, c2.y) && feq(*r1, *r2))
+                }
+                (Value::Polygon(a), Value::Polygon(b)) => Some(
+                    a.len() == b.len()
+                        && a.iter().zip(b.iter()).all(|(p, q)| feq(p.x, q.x) && feq(p.y, q.y)),
+                ),
+                _ => None,
+            };
+            match res {
+                Some(v) => Ok(Value::Bool(v)),
+                None => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "operator ~= needs matching geometric operands, got {:?} and {:?}",
+                        l.data_type(),
+                        r.data_type()
+                    ),
+                }),
+            }
+        }
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
@@ -4361,6 +4443,9 @@ pub(super) fn compare(
         | BinOp::BitOr
         | BinOp::BitAnd
         | BinOp::BitXor
+        | BinOp::GeomParallel
+        | BinOp::GeomPerp
+        | BinOp::GeomSameAs
         | BinOp::Add
         | BinOp::Sub
         | BinOp::Mul

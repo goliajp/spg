@@ -143,6 +143,12 @@ pub enum Token {
     /// v7.37.6-A `?|` — JSON any-key-exists. `j ?| ARRAY['a','b']`
     /// returns BOOL; true if any one of the listed keys exists in `j`.
     JsonKeysAny,
+    /// v7.39 (read01 geo_ops.c) — `?||` "is parallel" (lseg / line).
+    GeomParallel,
+    /// v7.39 (read01 geo_ops.c) — `?-|` "is perpendicular" (lseg / line).
+    GeomPerp,
+    /// v7.39 (read01 geo_ops.c) — `~=` "same as" (geometric equality).
+    GeomSameAs,
     /// v7.37.6-A `?&` — JSON all-keys-exist. `j ?& ARRAY['a','b']`
     /// returns BOOL; true if every listed key exists in `j`.
     JsonKeysAll,
@@ -464,6 +470,16 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             // order matters: try `?|` and `?&` before bare `?`.
             // SPG doesn't use `?` as a placeholder (uses `$N`
             // instead), so the bare `?` slot is free for JSONB.
+            // v7.39 (read01 geo_ops.c) — `?||` (parallel) and `?-|`
+            // (perpendicular) must win over `?|` / bare `?`.
+            b'?' if peek_eq(bytes, i + 1, b'|') && peek_eq(bytes, i + 2, b'|') => {
+                out.push(Token::GeomParallel);
+                i += 3;
+            }
+            b'?' if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'|') => {
+                out.push(Token::GeomPerp);
+                i += 3;
+            }
             b'?' if peek_eq(bytes, i + 1, b'|') => {
                 out.push(Token::JsonKeysAny);
                 i += 2;
@@ -663,6 +679,11 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
             }
             b'~' if peek_eq(bytes, i + 1, b'*') => {
                 out.push(Token::TildeStar);
+                i += 2;
+            }
+            // v7.39 (read01 geo_ops.c) — `~=` geometric "same as".
+            b'~' if peek_eq(bytes, i + 1, b'=') => {
+                out.push(Token::GeomSameAs);
                 i += 2;
             }
             b'~' => {
