@@ -17253,6 +17253,32 @@ impl Parser {
                     args: row_items,
                 });
             }
+            // v7.39 (read01 xml.c) — `XMLPARSE(DOCUMENT|CONTENT expr)`:
+            // the parse-mode keyword introduces the source text. SPG
+            // carries XML as text, so both modes lower to __xmlparse(expr)
+            // which validates well-formedness and returns Value::Xml.
+            if first.eq_ignore_ascii_case("xmlparse")
+                && matches!(self.peek(), Token::Ident(kw)
+                    if kw.eq_ignore_ascii_case("document")
+                        || kw.eq_ignore_ascii_case("content"))
+            {
+                let mode = match self.advance() {
+                    Token::Ident(kw) => kw.to_ascii_lowercase(),
+                    _ => unreachable!("peeked an ident"),
+                };
+                let src = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' to close XMLPARSE, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                return Ok(Expr::FunctionCall {
+                    name: String::from("__xmlparse"),
+                    args: alloc::vec![src, Expr::Literal(Literal::String(mode))],
+                });
+            }
             // SQL/XML `XMLELEMENT(NAME ident [, content …])` — the NAME
             // keyword introduces the element name (a bare or quoted
             // identifier), then optional content expressions. Lower to a

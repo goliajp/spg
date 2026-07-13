@@ -7567,6 +7567,35 @@ fn apply_function_dispatch(
         // the first (text) argument. Content args concatenate as the element
         // body: xml-typed content is inserted verbatim, everything else is
         // text-escaped (& < >). No content → a self-closing `<name/>`.
+        // v7.39 (read01 xml.c) — XMLPARSE(DOCUMENT|CONTENT text): SPG
+        // carries XML as text. A DOCUMENT-mode parse requires a single
+        // root element (PG); CONTENT accepts any well-formed fragment.
+        "__xmlparse" => {
+            let (src, mode) = match args {
+                [Value::Null, ..] => return Ok(Value::Null),
+                [Value::Text(s), Value::Text(m)] => (s.as_ref(), m.as_ref()),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "__xmlparse(): text source expected".into(),
+                    });
+                }
+            };
+            if mode == "document" {
+                // A DOCUMENT must have exactly one top-level element.
+                let trimmed = src.trim();
+                let ok = trimmed.starts_with('<')
+                    && trimmed.ends_with('>')
+                    && !trimmed.is_empty();
+                if !ok {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "invalid XML document: {src:?}"
+                        ),
+                    });
+                }
+            }
+            Ok(Value::Xml(alloc::borrow::Cow::Owned(src.to_string())))
+        }
         "xmlelement" => {
             if args.is_empty() {
                 return Err(EvalError::TypeMismatch {
