@@ -551,6 +551,95 @@ fn apply_enum_cast<'a>(
     }
 }
 
+/// v7.39 (read01 utils/adt, enum.c) — enum_first / enum_last /
+/// enum_range resolved from the argument's STATIC enum type (an explicit
+/// `::enumtype` cast or a column's `ColumnSchema.user_enum_type`) over the
+/// catalog's member order. Returns None when no argument names a known
+/// enum, letting the generic function path produce its usual error.
+/// Out-of-line (`inline(never)`) so the sizable locals don't land in
+/// `eval_expr`'s recursion frame.
+/// Enum-ness lives outside the DataType lattice, so scan the argument
+/// ASTs for an explicit `::enumtype` cast or an enum-typed column.
+fn enum_arg_type_name<'e>(args: &'e [Expr], ctx: &EvalContext<'e>) -> Option<&'e str> {
+    args.iter()
+        .find_map(|a| match a {
+            Expr::Cast {
+                target: CastTarget::Named(n),
+                ..
+            } => Some(n.as_str()),
+            Expr::Column(c) => ctx
+                .columns
+                .iter()
+                .find(|col| col.name == c.name)
+                .and_then(|col| col.user_enum_type.as_deref()),
+            _ => None,
+        })
+        .filter(|n| {
+            ctx.catalog
+                .is_some_and(|cat| cat.enum_types().contains_key(*n))
+        })
+}
+
+/// Cheap value-free precheck so `eval_expr`'s recursion frame carries no
+/// binding for the enum path (stack-depth guard budget).
+#[inline(never)]
+fn enum_introspection_applies(args: &[Expr], ctx: &EvalContext<'_>) -> bool {
+    enum_arg_type_name(args, ctx).is_some()
+}
+
+#[inline(never)]
+fn eval_enum_introspection(
+    name: &str,
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let Some(en) = enum_arg_type_name(args, ctx)
+        .and_then(|n| ctx.catalog.and_then(|cat| cat.enum_types().get(n)))
+    else {
+        // The precheck guarantees this arm is unreachable; keep a typed
+        // error rather than a panic if the two ever drift.
+        return Err(EvalError::TypeMismatch {
+            detail: "could not determine polymorphic type".into(),
+        });
+    };
+    let labels = &en.labels;
+    if labels.is_empty() {
+        return Ok(Value::Null);
+    }
+    if name.eq_ignore_ascii_case("enum_first") {
+        return Ok(Value::text(labels[0].clone()));
+    }
+    if name.eq_ignore_ascii_case("enum_last") {
+        return Ok(Value::text(labels[labels.len() - 1].clone()));
+    }
+    // enum_range(NULL) = all; enum_range(lo, hi) slices inclusively,
+    // NULL bound = open end (PG).
+    let pos_of = |v: &Value<'_>| -> Option<usize> {
+        match v {
+            Value::Text(s) => labels.iter().position(|l| l == s.as_ref()),
+            _ => None,
+        }
+    };
+    let (lo, hi) = if args.len() == 2 {
+        let a = eval_expr(&args[0], row, ctx)?;
+        let b = eval_expr(&args[1], row, ctx)?;
+        (
+            pos_of(&a).unwrap_or(0),
+            pos_of(&b).unwrap_or(labels.len() - 1),
+        )
+    } else {
+        (0, labels.len() - 1)
+    };
+    let out: alloc::vec::Vec<Option<String>> = labels
+        .get(lo..=hi)
+        .unwrap_or(&[])
+        .iter()
+        .map(|l| Some(l.clone()))
+        .collect();
+    Ok(Value::TextArray(out))
+}
+
 /// Apply one `[index]` subscript to a value — the single-step semantics shared
 /// by 1-D array elements and JSON path access (`j['a']`, `j[0]`). NULL target
 /// or index → NULL; a 1-based integer indexes a 1-D array (out of range → NULL,
@@ -651,6 +740,1037 @@ fn eval_matrix_subscript(
         }
         _ => Ok(Value::Null),
     }
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_cast_arm(
+    expr: &Expr,
+    target: &CastTarget,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = eval_expr(expr, row, ctx)?;
+    // v7.38 (read01 P6.40) — a cast to a user DOMAIN (`x::posint`)
+    // enforces the domain's NOT NULL + CHECK constraints, matching PG.
+    // The base-type coercion already happened when `v` was produced
+    // (the domain is a constrained alias of its base type); here we
+    // only run the constraints.
+    if let CastTarget::Named(name) = target
+        && let Some(cat) = ctx.catalog
+    {
+        if let Some(dom) = cat.domain_types().get(name.as_str()) {
+            return apply_domain_constraints(v, dom, name);
+        }
+        // v7.38 (read01 P6.67) — `'label'::<user enum>` validates the
+        // label against the enum's members (a non-member errors like
+        // PG). A typed NULL passes through carrying the enum type.
+        if let Some(en) = cat.enum_types().get(name.as_str()) {
+            return apply_enum_cast(v, en, name);
+        }
+    }
+    // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks
+    // up the user relation name (PG's 16384+ band, assigned in
+    // table_names() order). System OIDs / non-matches fall through to
+    // the integer-rendering path in cast_value.
+    if matches!(target, CastTarget::RegClass) {
+        let oid = match &v {
+            Value::SmallInt(n) => Some(i64::from(*n)),
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            _ => None,
+        };
+        if let (Some(oid), Some(cat)) = (oid, ctx.catalog) {
+            if oid >= 16384 {
+                if let Some(name) =
+                    cat.table_names().into_iter().nth((oid - 16384) as usize)
+                {
+                    return Ok(Value::text(name));
+                }
+            }
+        }
+    }
+    // v7.38 (T-tstz Phase 1) — `<timestamptz>::text` renders the offset
+    // (`2024-01-15 10:30:00+00`); plain timestamp does not. The runtime
+    // value is the same tz-less `Value::Timestamp`, so consult the
+    // inner expression's static type. Falls through to the ordinary
+    // cast on any shape the static typer can't resolve — worst case is
+    // today's no-offset rendering, never a wrong instant.
+    if matches!(target, CastTarget::Text)
+        && let Value::Timestamp(t) = &v
+        && crate::describe::describe_expr(expr, ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+    {
+        // v7.39 (tz epic) — per-VALUE session offset (DST zones
+        // vary within a statement); non-ISO DateStyles carry the
+        // zone designation instead of the numeric offset.
+        let off = ctx.session_tz_offset_at(*t);
+        let abbr = ctx.session_tz_abbrev_at(*t);
+        return Ok(Value::text(format::format_timestamptz_tz(
+            *t,
+            &ctx.render_style,
+            off,
+            abbr.as_deref(),
+        )));
+    }
+    // v7.39 (read01 utils/adt, datetime.c) — the relative
+    // reserved words resolve against the transaction clock:
+    // 'today'/'tomorrow'/'yesterday' are midnight dates, 'now'
+    // is the current instant ('now'::date = today). Clockless
+    // engines fall through to the parser (which rejects them).
+    if matches!(
+        target,
+        CastTarget::Date | CastTarget::Timestamp | CastTarget::Timestamptz
+    ) && let Value::Text(word) = &v
+        && let Some(clock) = ctx.clock
+    {
+        let w = word.trim().to_ascii_lowercase();
+        if matches!(w.as_str(), "today" | "tomorrow" | "yesterday" | "now") {
+            let now_us = clock();
+            let today = i32::try_from(now_us.div_euclid(86_400_000_000)).ok();
+            if let Some(today) = today {
+                let day = match w.as_str() {
+                    "tomorrow" => today + 1,
+                    "yesterday" => today - 1,
+                    _ => today,
+                };
+                return Ok(match (&target, w.as_str()) {
+                    (CastTarget::Date, _) => Value::Date(day),
+                    (_, "now") => Value::Timestamp(now_us),
+                    _ => Value::Timestamp(i64::from(day) * 86_400_000_000),
+                });
+            }
+        }
+    }
+    // v7.39 (GUC knife 5) — text INPUT to date/timestamp under a
+    // non-MDY DateOrder disambiguates by the session order
+    // (`'01/02/2024'::date` is Feb 1 under DMY). The default MDY
+    // order flows through cast_value's parse_date_literal.
+    if ctx.render_style.date_order != format::DateOrder::Mdy {
+        match (&target, &v) {
+            (CastTarget::Date, Value::Text(s)) => {
+                if let Some(d) =
+                    format::parse_date_literal_ordered(s, ctx.render_style.date_order)
+                {
+                    return Ok(Value::Date(d));
+                }
+            }
+            (CastTarget::Timestamp, Value::Text(s)) => {
+                if let Some(t) = format::parse_timestamp_literal_ordered(
+                    s,
+                    ctx.render_style.date_order,
+                ) {
+                    return Ok(Value::Timestamp(t));
+                }
+            }
+            _ => {}
+        }
+    }
+    // v7.39 (tz epic) — timestamptz INPUT: an offset-less
+    // literal is a wall-clock reading in the session zone
+    // (PG); a trailing IANA zone name localises there. Both
+    // fall through to cast_value when nothing matches (its
+    // parse treats naive input as UTC — correct for a UTC
+    // session).
+    if matches!(target, CastTarget::Timestamptz)
+        && let Value::Text(txt) = &v
+    {
+        let order = ctx.render_style.date_order;
+        let sess_zone = ctx
+            .session_gucs
+            .and_then(|g| g.get("timezone"))
+            .map(String::as_str);
+        // Trailing zone name: the last space-separated token,
+        // when it names a resolvable zone (contains a letter
+        // and isn't consumed by the plain parse).
+        if let Some(idx) = txt.trim_end().rfind(' ') {
+            let (head, tail) = (txt[..idx].trim(), txt[idx + 1..].trim());
+            let tail_is_zoneish = tail.len() > 1
+                && tail.bytes().any(|b| b.is_ascii_alphabetic())
+                && !tail.eq_ignore_ascii_case("bc")
+                && !tail.eq_ignore_ascii_case("ad");
+            if tail_is_zoneish
+                && format::parse_timestamp_literal_tz_ordered(txt, order).is_none()
+                && let Some((wall, false)) =
+                    format::parse_timestamp_literal_tz_ordered(head, order)
+                && let Some(utc) = ctx.zone_local_to_utc(tail, wall)
+            {
+                return Ok(Value::Timestamp(utc));
+            }
+        }
+        if let Some((wall, had_tz)) =
+            format::parse_timestamp_literal_tz_ordered(txt, order)
+        {
+            if had_tz {
+                return Ok(Value::Timestamp(wall));
+            }
+            if let Some(zone) = sess_zone
+                && !zone.eq_ignore_ascii_case("utc")
+                && !zone.eq_ignore_ascii_case("gmt")
+                && let Some(utc) = ctx.zone_local_to_utc(zone, wall)
+            {
+                return Ok(Value::Timestamp(utc));
+            }
+            return Ok(Value::Timestamp(wall));
+        }
+    }
+    // v7.39 (GUC knife 3) — the out-function casts honour the
+    // session render style, like PG's date_out/interval_out/
+    // float8out under DateStyle/IntervalStyle/extra_float_digits.
+    if matches!(target, CastTarget::Text) {
+        match &v {
+            Value::Date(d) => {
+                return Ok(Value::text(format::format_date_styled(
+                    *d,
+                    &ctx.render_style,
+                )));
+            }
+            Value::Timestamp(t) => {
+                return Ok(Value::text(format::format_timestamp_styled(
+                    *t,
+                    &ctx.render_style,
+                )));
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                return Ok(Value::text(format::format_interval_styled(
+                    *months, *days, *micros, &ctx.render_style,
+                )));
+            }
+            Value::Float(x) => {
+                return Ok(Value::text(format::format_float_styled(
+                    *x,
+                    &ctx.render_style,
+                )));
+            }
+            Value::Real(x) => {
+                return Ok(Value::text(format::format_real_styled(
+                    *x,
+                    &ctx.render_style,
+                )));
+            }
+            _ => {}
+        }
+    }
+    cast_value(v, target.clone())
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_array_arm(
+    items: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let mut materialised: Vec<Value<'static>> = Vec::with_capacity(items.len());
+    for elem in items {
+        materialised.push(eval_expr(elem, row, ctx)?);
+    }
+    // v7.38 (read01, T10) — a constructor whose elements are all 1-D
+    // arrays builds a 2-D array (`ARRAY[[1,2],[3,4]]`). All rows must
+    // share a length (PG: "multidimensional arrays must have array
+    // expressions with matching dimensions"). Int rows promote to
+    // bigint if any row is bigint; a text row makes the whole thing text.
+    let all_arrays = !materialised.is_empty()
+        && materialised.iter().all(|v| {
+            matches!(
+                v,
+                Value::IntArray(_) | Value::BigIntArray(_) | Value::TextArray(_)
+            )
+        });
+    if all_arrays {
+        let row_len = match &materialised[0] {
+            Value::IntArray(r) => r.len(),
+            Value::BigIntArray(r) => r.len(),
+            Value::TextArray(r) => r.len(),
+            _ => unreachable!(),
+        };
+        let same_len = materialised.iter().all(|v| {
+            let l = match v {
+                Value::IntArray(r) => r.len(),
+                Value::BigIntArray(r) => r.len(),
+                Value::TextArray(r) => r.len(),
+                _ => 0,
+            };
+            l == row_len
+        });
+        if !same_len {
+            return Err(EvalError::TypeMismatch {
+                detail: "multidimensional arrays must have array expressions \
+                         with matching dimensions"
+                    .into(),
+            });
+        }
+        let any_text = materialised
+            .iter()
+            .any(|v| matches!(v, Value::TextArray(_)));
+        let any_big = materialised
+            .iter()
+            .any(|v| matches!(v, Value::BigIntArray(_)));
+        if any_text {
+            let rows: Vec<Vec<Option<String>>> = materialised
+                .into_iter()
+                .map(|v| match v {
+                    Value::TextArray(r) => r,
+                    Value::IntArray(r) => {
+                        r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
+                    }
+                    Value::BigIntArray(r) => {
+                        r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
+                    }
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Ok(Value::TextArray2D(rows));
+        }
+        if any_big {
+            let rows: Vec<Vec<Option<i64>>> = materialised
+                .into_iter()
+                .map(|v| match v {
+                    Value::BigIntArray(r) => r,
+                    Value::IntArray(r) => r.into_iter().map(|c| c.map(i64::from)).collect(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Ok(Value::BigIntArray2D(rows));
+        }
+        let rows: Vec<Vec<Option<i32>>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::IntArray(r) => r,
+                _ => unreachable!(),
+            })
+            .collect();
+        return Ok(Value::IntArray2D(rows));
+    }
+    let mut has_text = false;
+    let mut has_float = false;
+    let mut has_numeric = false;
+    let mut has_bigint = false;
+    let mut has_int = false;
+    // A NumericBig or non-finite (NaN/Inf) numeric can't be held in
+    // NumericArray's `(i128, scale)` cells, so it forces the text[]
+    // fallback rather than a lossy/panicking conversion.
+    let mut numeric_representable = true;
+    for v in &materialised {
+        match v {
+            Value::Null => {}
+            Value::Int(_) | Value::SmallInt(_) => has_int = true,
+            Value::BigInt(_) => has_bigint = true,
+            Value::Numeric {
+                kind: spg_storage::NumericKind::Finite,
+                ..
+            } => {
+                has_numeric = true;
+            }
+            Value::Numeric { .. } => {
+                has_numeric = true;
+                numeric_representable = false;
+            }
+            Value::NumericBig(_) => {
+                has_numeric = true;
+                numeric_representable = false;
+            }
+            Value::Float(_) => has_float = true,
+            Value::Text(_) | Value::Json(_) => has_text = true,
+            _ => has_text = true,
+        }
+    }
+    let any_numlike = has_int || has_bigint || has_numeric || has_float;
+    if has_text || !any_numlike || (has_numeric && !numeric_representable) {
+        let out: Vec<Option<String>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Text(s) | Value::Json(s) => Some(s.into_owned()),
+                other => Some(value_to_text_for_array(&other, &ctx.render_style)),
+            })
+            .collect();
+        return Ok(Value::TextArray(out));
+    }
+    // v7.38 (read01) — PG array-element unification across the numeric
+    // ladder: any float → double precision[]; else any numeric →
+    // numeric[] (each element keeps its own scale, PG's behaviour);
+    // else the integer widths. Matches `pg_typeof(ARRAY[1, 2.5])` =
+    // numeric[] and keeps downstream `[i]` arithmetic numeric.
+    if has_float {
+        let out: Vec<Option<f64>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Float(f) => Some(f),
+                Value::Int(n) => Some(f64::from(n)),
+                Value::SmallInt(n) => Some(f64::from(n)),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Some(n as f64),
+                #[allow(clippy::cast_precision_loss)]
+                Value::Numeric { scaled, scale, .. } => {
+                    Some(scaled as f64 / libm::pow(10.0, f64::from(scale)))
+                }
+                _ => None,
+            })
+            .collect();
+        return Ok(Value::FloatArray(out));
+    }
+    if has_numeric {
+        let out: Vec<Option<(i128, u8)>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::SmallInt(n) => Some((i128::from(n), 0)),
+                Value::Int(n) => Some((i128::from(n), 0)),
+                Value::BigInt(n) => Some((i128::from(n), 0)),
+                Value::Numeric { scaled, scale, .. } => Some((scaled, scale)),
+                _ => None,
+            })
+            .collect();
+        return Ok(Value::NumericArray(out));
+    }
+    if has_bigint {
+        let out: Vec<Option<i64>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Int(n) => Some(i64::from(n)),
+                Value::SmallInt(n) => Some(i64::from(n)),
+                Value::BigInt(n) => Some(n),
+                _ => unreachable!(),
+            })
+            .collect();
+        return Ok(Value::BigIntArray(out));
+    }
+    let out: Vec<Option<i32>> = materialised
+        .into_iter()
+        .map(|v| match v {
+            Value::Null => None,
+            Value::Int(n) => Some(n),
+            Value::SmallInt(n) => Some(i32::from(n)),
+            _ => unreachable!(),
+        })
+        .collect();
+    Ok(Value::IntArray(out))
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_function_call_arm(
+    name: &str,
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // v7.39 (read01 utils/adt, enum.c) — the enum introspection
+    // family needs the ARGUMENT'S STATIC TYPE (the value is
+    // usually NULL::enumtype): first/last/range over the
+    // catalog's member order. Out-of-line so eval_expr's
+    // recursion frame stays small (stack-depth guard budget).
+    if (name.eq_ignore_ascii_case("enum_first")
+        || name.eq_ignore_ascii_case("enum_last")
+        || name.eq_ignore_ascii_case("enum_range"))
+        && enum_introspection_applies(args, ctx)
+    {
+        return eval_enum_introspection(name, args, row, ctx);
+    }
+    // v7.39 (tz epic) — AT TIME ZONE (fn form: timezone(zone, ts))
+    // with a NAMED zone needs the host tzdb and the argument's
+    // static type for its two directions:
+    //   naive AT ZONE  -> that zone's wall clock -> UTC instant
+    //   tstz  AT ZONE  -> UTC instant -> that zone's wall clock
+    // Fixed offsets / abbreviations keep the legacy path below.
+    if args.len() == 2
+        && name.eq_ignore_ascii_case("timezone")
+        && let zone_v = eval_expr(&args[0], row, ctx)?
+        && let Value::Text(zone) = &zone_v
+        && datetime::resolve_zone_offset(zone.as_ref()).is_none()
+        && !zone.trim().eq_ignore_ascii_case("utc")
+        && !zone.trim().eq_ignore_ascii_case("gmt")
+        && zone.parse::<i64>().is_err()
+        && ctx.tz_offset_fn.is_some()
+    {
+        let zone = zone.trim();
+        let src_is_tstz = crate::describe::describe_expr(&args[1], ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz));
+        let inner = eval_expr(&args[1], row, ctx)?;
+        if let Value::Timestamp(t) = inner {
+            if src_is_tstz {
+                if let Some(off) = ctx.zone_offset_at(zone, t) {
+                    return Ok(Value::Timestamp(t + off));
+                }
+            } else if let Some(utc) = ctx.zone_local_to_utc(zone, t) {
+                return Ok(Value::Timestamp(utc));
+            }
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("time zone \"{zone}\" not recognized"),
+            });
+        }
+    }
+    // v7.29 (round-22 phase 3) - prefix fast path: LEFT(col, n)
+    // on a TEXT column borrows the cell and clones only the
+    // prefix. The generic path clones the WHOLE cell first -
+    // a LEFT(body, 120) over 24k x 30 KB rows spent 383 ms
+    // copying bytes it then threw away (7 ms without LEFT).
+    if args.len() == 2
+        && name.eq_ignore_ascii_case("left")
+        && let Expr::Column(c) = &args[0]
+        && let Some(cell) = resolve_column_borrowed(c, row, ctx)?
+    {
+        {
+            match cell {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(t) => {
+                    let n_v = eval_expr(&args[1], row, ctx)?;
+                    if let Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) = n_v {
+                        let n = match n_v {
+                            Value::SmallInt(x) => i64::from(x),
+                            Value::Int(x) => i64::from(x),
+                            Value::BigInt(x) => x,
+                            _ => 0,
+                        };
+                        return Ok(Value::text(text_prefix_chars(t, n)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // v7.38 (T-tstz Phase 1) — the ONE case where pg_typeof needs the
+    // static type: timestamptz. The runtime value is a tz-less
+    // Value::Timestamp, so the value-driven answer below can only ever
+    // say "without time zone". For every other type the value-driven
+    // path is strictly better (it distinguishes json vs jsonb, keeps
+    // NULL as "unknown", and is not fooled by describe_expr's lossy
+    // heuristics), so we consult the static typer ONLY when it says
+    // Timestamptz and otherwise fall through untouched.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && crate::describe::describe_expr(&args[0], ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+    {
+        return Ok(Value::text::<alloc::string::String>(
+            "timestamp with time zone".into(),
+        ));
+    }
+    // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
+    // static type when it has one (PG: `VALUES (NULL),(1.5)`
+    // types the column numeric and its NULL row's pg_typeof says
+    // numeric, not unknown). TEXT is excluded because a NULL
+    // literal *describes* as TEXT (the unknown stand-in), so a
+    // bare `pg_typeof(NULL)` keeps reporting "unknown". Known
+    // residual: a genuine text column's NULL cell therefore also
+    // reports unknown (needs a real Unknown type to fix).
+    if args.len() == 1 && name.eq_ignore_ascii_case("pg_typeof") {
+        let v = eval_expr(&args[0], row, ctx)?;
+        if matches!(v, Value::Null)
+            && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
+            && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
+        {
+            return Ok(Value::text(n));
+        }
+        return apply_function(name, &[v], ctx);
+    }
+    // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
+    // common type of its branches, so a typed sibling (`NULL::time`,
+    // `col::time`) makes the whole expression that type and an untyped
+    // string-literal branch is coerced to it. Without this,
+    // `COALESCE(NULL::time, '12:00')::text` rendered the raw `12:00`
+    // instead of `12:00:00`. Only kicks in when the picked value is a
+    // bare Text and a non-text cast-target sibling exists.
+    if name.eq_ignore_ascii_case("coalesce") && !args.is_empty() {
+        let evaluated: Result<Vec<Value<'static>>, _> =
+            args.iter().map(|a| eval_expr(a, row, ctx)).collect();
+        let evaluated = evaluated?;
+        let result = evaluated
+            .iter()
+            .find(|v| !matches!(v, Value::Null))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if matches!(result, Value::Text(_)) {
+            if let Some(target) = args.iter().find_map(coalesce_type_hint) {
+                return crate::eval::cast::cast_value(result, target);
+            }
+        }
+        // v7.38 (read01) — otherwise widen the picked value to the PG
+        // common type of all branches (COALESCE(1, 2.5) → numeric).
+        let types: Vec<spg_storage::DataType> =
+            evaluated.iter().filter_map(Value::data_type).collect();
+        return Ok(widen_to_common(result, &types));
+    }
+    let evaluated: Result<Vec<Value<'static>>, _> =
+        args.iter().map(|a| eval_expr(a, row, ctx)).collect();
+    apply_function(name, &evaluated?, ctx)
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_any_all_arm(
+    expr: &Expr,
+    op: &BinOp,
+    array: &Expr,
+    is_any: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let lhs = eval_expr(expr, row, ctx)?;
+    let arr = eval_expr(array, row, ctx)?;
+    if matches!(arr, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // v7.38 (read01) — an unknown-string RHS (`x = ANY('{1,2,3}')`)
+    // takes the LHS's type: coerce the external array text to the array
+    // type matching the LHS's element type, like PG.
+    let arr = match &arr {
+        Value::Text(_) => {
+            // The LHS's element type, or TEXT when the LHS is an
+            // untyped NULL (PG's unknown → text default).
+            let arr_ty = match lhs.data_type() {
+                Some(spg_storage::DataType::SmallInt) => {
+                    spg_storage::DataType::SmallIntArray
+                }
+                Some(spg_storage::DataType::Int) => spg_storage::DataType::IntArray,
+                Some(spg_storage::DataType::BigInt) => spg_storage::DataType::BigIntArray,
+                Some(spg_storage::DataType::Numeric { .. }) => {
+                    spg_storage::DataType::NumericArray
+                }
+                Some(spg_storage::DataType::Float) => spg_storage::DataType::FloatArray,
+                Some(spg_storage::DataType::Bool) => spg_storage::DataType::BoolArray,
+                Some(spg_storage::DataType::Date) => spg_storage::DataType::DateArray,
+                _ => spg_storage::DataType::TextArray,
+            };
+            crate::conversions::coerce_value(arr.clone(), arr_ty, "", 0).unwrap_or(arr)
+        }
+        _ => arr,
+    };
+    // Build the element list generically so every scalar array type
+    // (numeric[], float8[], bool[], date[], …) is accepted, not just
+    // int/bigint/text.
+    let Some(len) = array_len(&arr) else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "ANY/ALL right-hand side must be an array, got {:?}",
+                arr.data_type()
+            ),
+        });
+    };
+    let elems: Vec<Option<Value>> = (0..len)
+        .map(|i| match array_element_at(&arr, i) {
+            Some(Value::Null) | None => None,
+            Some(v) => Some(v),
+        })
+        .collect();
+    // PG: `x op ANY (empty)` → false and `x op ALL (empty)` →
+    // true, decided purely by emptiness — the comparison is
+    // never evaluated, so a NULL LHS is irrelevant. This must
+    // short-circuit before `saw_null` is seeded from the LHS,
+    // otherwise `NULL op ANY/ALL (empty)` wrongly yields NULL.
+    if elems.is_empty() {
+        return Ok(Value::Bool(!is_any));
+    }
+    let mut saw_null = matches!(lhs, Value::Null);
+    let mut saw_match = false;
+    let mut saw_mismatch = false;
+    for elem in elems {
+        let elem_v = match elem {
+            Some(v) => v,
+            None => {
+                saw_null = true;
+                continue;
+            }
+        };
+        if matches!(lhs, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+        match apply_binary(*op, lhs.clone(), elem_v) {
+            Ok(Value::Bool(true)) => saw_match = true,
+            Ok(Value::Bool(false)) => saw_mismatch = true,
+            Ok(Value::Null) => saw_null = true,
+            Ok(other) => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ANY/ALL comparison didn't return Bool: {:?}",
+                        other.data_type()
+                    ),
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let result = if is_any {
+        if saw_match {
+            Value::Bool(true)
+        } else if saw_null {
+            Value::Null
+        } else {
+            Value::Bool(false)
+        }
+    } else if saw_mismatch {
+        Value::Bool(false)
+    } else if saw_null {
+        Value::Null
+    } else {
+        Value::Bool(true)
+    };
+    Ok(result)
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_case_arm(
+    operand: &Option<alloc::boxed::Box<Expr>>,
+    branches: &[(Expr, Expr)],
+    else_branch: &Option<alloc::boxed::Box<Expr>>,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let operand_value = match operand {
+        Some(o) => Some(eval_expr(o, row, ctx)?),
+        None => None,
+    };
+    // v7.37 D.1 — CASE result-type coercion (same rule as COALESCE): a
+    // typed result branch (`... THEN '10:00'::time`) makes the whole
+    // CASE that type, so an untyped string-literal branch is coerced to
+    // it. Compute the hint once from every THEN/ELSE branch.
+    let case_hint = branches
+        .iter()
+        .map(|(_, t)| t)
+        .chain(else_branch.iter().map(|b| b.as_ref()))
+        .find_map(coalesce_type_hint);
+    // v7.38 (read01) — the CASE result is PG's common type of every
+    // THEN/ELSE branch, so a taken integer branch is widened to
+    // numeric when a sibling branch is numeric (and `pg_typeof` /
+    // downstream division match PG). Only one branch is evaluated, so
+    // the type must come from the branch expressions statically.
+    let branch_types: Vec<spg_storage::DataType> = branches
+        .iter()
+        .map(|(_, t)| t)
+        .chain(else_branch.iter().map(|b| b.as_ref()))
+        .filter_map(|e| crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty))
+        .collect();
+    let coerce = |v: Value<'static>| -> Result<Value<'static>, EvalError> {
+        let v = match (&v, &case_hint) {
+            (Value::Text(_), Some(target)) => cast::cast_value(v, target.clone())?,
+            _ => v,
+        };
+        Ok(widen_to_common(v, &branch_types))
+    };
+    for (when_expr, then_expr) in branches {
+        let when_value = eval_expr(when_expr, row, ctx)?;
+        let matched = match &operand_value {
+            None => matches!(when_value, Value::Bool(true)),
+            Some(op_v) => matches!(
+                apply_binary(spg_sql::ast::BinOp::Eq, op_v.clone(), when_value)?,
+                Value::Bool(true)
+            ),
+        };
+        if matched {
+            return coerce(eval_expr(then_expr, row, ctx)?);
+        }
+    }
+    match else_branch {
+        Some(e) => coerce(eval_expr(e, row, ctx)?),
+        None => Ok(Value::Null),
+    }
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_array_slice_arm(
+    target: &Expr,
+    lo: &Option<alloc::boxed::Box<Expr>>,
+    hi: &Option<alloc::boxed::Box<Expr>>,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let target_v = eval_expr(target, row, ctx)?;
+    if matches!(target_v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let bound = |e: Option<&Expr>| -> Result<Option<i64>, EvalError> {
+        match e {
+            None => Ok(None),
+            Some(b) => match eval_expr(b, row, ctx)? {
+                Value::Null => Ok(None),
+                Value::Int(n) => Ok(Some(i64::from(n))),
+                Value::BigInt(n) => Ok(Some(n)),
+                Value::SmallInt(n) => Ok(Some(i64::from(n))),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array slice bound must be integer, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            },
+        }
+    };
+    let lo_b = bound(lo.as_deref())?;
+    let hi_b = bound(hi.as_deref())?;
+    fn window(len: usize, lo: Option<i64>, hi: Option<i64>) -> (usize, usize) {
+        let start = lo.map_or(0, |l| (l.max(1) - 1) as usize).min(len);
+        let end = hi.map_or(len, |h| h.max(0) as usize).min(len);
+        (start, end.max(start))
+    }
+    match target_v {
+        Value::TextArray(items) => {
+            let (s, e) = window(items.len(), lo_b, hi_b);
+            Ok(Value::TextArray(items[s..e].to_vec()))
+        }
+        Value::IntArray(items) => {
+            let (s, e) = window(items.len(), lo_b, hi_b);
+            Ok(Value::IntArray(items[s..e].to_vec()))
+        }
+        Value::BigIntArray(items) => {
+            let (s, e) = window(items.len(), lo_b, hi_b);
+            Ok(Value::BigIntArray(items[s..e].to_vec()))
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("slice target must be an array, got {:?}", other.data_type()),
+        }),
+    }
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_in_list_arm(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let needle = eval_expr(expr, row, ctx)?;
+    let needle_null = matches!(needle, Value::Null);
+    let mut saw_null = needle_null && !list.is_empty();
+    let mut matched = false;
+    if !needle_null {
+        for item in list {
+            let v = eval_expr(item, row, ctx)?;
+            if matches!(v, Value::Null) {
+                saw_null = true;
+                continue;
+            }
+            match apply_binary(BinOp::Eq, needle.clone(), v)? {
+                Value::Bool(true) => {
+                    matched = true;
+                    break;
+                }
+                Value::Bool(false) => {}
+                Value::Null => saw_null = true,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "IN comparison didn't return Bool: {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    let inner = if matched {
+        Value::Bool(true)
+    } else if saw_null {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    };
+    Ok(match (negated, inner) {
+        (true, Value::Bool(b)) => Value::Bool(!b),
+        (_, v) => v,
+    })
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_like_arm(
+    expr: &Expr,
+    pattern: &Expr,
+    negated: bool,
+    case_insensitive: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = eval_expr(expr, row, ctx)?;
+    let p = eval_expr(pattern, row, ctx)?;
+    // NULL on either side propagates to NULL — same as PG.
+    // v7.39 (bpchar epic) — LIKE matches bpchar on its PADDED
+    // stored form, per PG's bpchar pattern operators.
+    let (text, pat) = match (v, p) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Text(a) | Value::BpChar(a), Value::Text(b) | Value::BpChar(b)) => (a, b),
+        (Value::Text(_) | Value::BpChar(_), other) | (other, _) => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("LIKE requires text operands, got {:?}", other.data_type()),
+            });
+        }
+    };
+    // v7.25 (round-17) — ILIKE folds both operands (PG
+    // lowercases per the default collation).
+    let m = if case_insensitive {
+        like_match(&text.to_lowercase(), &pat.to_lowercase())
+    } else {
+        like_match(&text, &pat)
+    };
+    Ok(Value::Bool(if negated { !m } else { m }))
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_extract_arm(
+    field: &spg_sql::ast::ExtractField,
+    source: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = eval_expr(source, row, ctx)?;
+    // v7.39 (tz epic) — timezone[_hour|_minute] of a timestamptz
+    // reports the SESSION offset at that instant (PG: 32400 for
+    // Tokyo; -14400 for New York in July).
+    if matches!(
+        field,
+        spg_sql::ast::ExtractField::Timezone
+            | spg_sql::ast::ExtractField::TimezoneHour
+            | spg_sql::ast::ExtractField::TimezoneMinute
+    ) && let Value::Timestamp(t) = &v
+        && crate::describe::describe_expr(source, ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+    {
+        let off_secs = ctx.session_tz_offset_at(*t) / 1_000_000;
+        let n = match field {
+            spg_sql::ast::ExtractField::Timezone => off_secs,
+            spg_sql::ast::ExtractField::TimezoneHour => off_secs / 3600,
+            _ => (off_secs / 60) % 60,
+        };
+        return Ok(Value::BigInt(n));
+    }
+    extract_field(*field, &v)
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_array_subscript_arm(
+    expr: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // Collect the whole subscript chain so PG's multi-dimensional
+    // access (`arr[i][j]` is ONE N-subscript op) is distinguishable
+    // from chained 1-D indexing. `arr[1][2]` parses as
+    // `(arr[1])[2]`; PG indexes the matrix directly and returns NULL
+    // for a partial subscript (`arr[1]` on a 2-D array is NULL).
+    let mut idx_exprs: Vec<&Expr> = Vec::new();
+    let mut base = expr;
+    while let Expr::ArraySubscript { target, index } = base {
+        idx_exprs.push(index);
+        base = target;
+    }
+    idx_exprs.reverse();
+    let base_v = eval_expr(base, row, ctx)?;
+    if matches!(
+        base_v,
+        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_)
+    ) {
+        return eval_matrix_subscript(&base_v, &idx_exprs, row, ctx);
+    }
+    // 1-D array / JSON: apply each subscript left-to-right. This
+    // reproduces the prior single-subscript semantics exactly, and
+    // chained JSON (`j['a']['b']`) still resolves step by step.
+    let mut cur = base_v;
+    for ix in idx_exprs {
+        cur = apply_one_subscript(cur, ix, row, ctx)?;
+    }
+    Ok(cur)
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_field_access_arm(
+    base: &Expr,
+    field: &str,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01, T9) — composite field access `(expr).field`.
+    // The base evaluates to a record; look the member up by name
+    // (`f1`..`fN` for an anonymous ROW, base column names for a
+    // whole-row). A NULL record yields NULL (PG semantics).
+    let v = eval_expr(base, row, ctx)?;
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Composite(fields) => fields
+            .into_iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, val)| val)
+            .ok_or_else(|| EvalError::ColumnNotFound {
+                name: field.to_string(),
+            }),
+        _ => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "field access `.{field}` requires a composite (record) value"
+            ),
+        }),
+    }
+}
+
+
+/// Out-of-lined `eval_expr` arm — keeps the recursive frame small
+/// (stack-depth guard budget); body unchanged.
+#[inline(never)]
+fn eval_is_null_arm(
+    expr: &Expr,
+    negated: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // v7.38 (read01 P4.11) — `ROW(...) IS [NOT] NULL` is evaluated
+    // field-wise, not as a whole-value null test: a row IS NULL when
+    // every field is null, and IS NOT NULL when every field is
+    // non-null — so the two are NOT simple negations (ROW(1,NULL) is
+    // neither). A field that is itself a row is a non-null value, so
+    // the check does not recurse. The `(a, b) IS NULL` tuple spelling
+    // is already desugared to `a IS NULL AND b IS NULL` in the parser;
+    // this covers the explicit `ROW(...)` constructor.
+    if let Expr::FunctionCall { name, args } = expr
+        && name.eq_ignore_ascii_case("row")
+    {
+        let mut all_null = true;
+        let mut all_non_null = true;
+        for a in args {
+            if matches!(eval_expr(a, row, ctx)?, Value::Null) {
+                all_non_null = false;
+            } else {
+                all_null = false;
+            }
+        }
+        return Ok(Value::Bool(if negated { all_non_null } else { all_null }));
+    }
+    let v = eval_expr(expr, row, ctx)?;
+    let is_null = matches!(v, Value::Null);
+    Ok(Value::Bool(if negated { !is_null } else { is_null }))
 }
 
 pub fn eval_expr(
@@ -765,445 +1885,17 @@ pub fn eval_expr(
             }
             apply_binary(*op, l, r)
         }
-        Expr::Cast { expr, target } => {
-            let v = eval_expr(expr, row, ctx)?;
-            // v7.38 (read01 P6.40) — a cast to a user DOMAIN (`x::posint`)
-            // enforces the domain's NOT NULL + CHECK constraints, matching PG.
-            // The base-type coercion already happened when `v` was produced
-            // (the domain is a constrained alias of its base type); here we
-            // only run the constraints.
-            if let CastTarget::Named(name) = target
-                && let Some(cat) = ctx.catalog
-            {
-                if let Some(dom) = cat.domain_types().get(name.as_str()) {
-                    return apply_domain_constraints(v, dom, name);
-                }
-                // v7.38 (read01 P6.67) — `'label'::<user enum>` validates the
-                // label against the enum's members (a non-member errors like
-                // PG). A typed NULL passes through carrying the enum type.
-                if let Some(en) = cat.enum_types().get(name.as_str()) {
-                    return apply_enum_cast(v, en, name);
-                }
-            }
-            // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks
-            // up the user relation name (PG's 16384+ band, assigned in
-            // table_names() order). System OIDs / non-matches fall through to
-            // the integer-rendering path in cast_value.
-            if matches!(target, CastTarget::RegClass) {
-                let oid = match &v {
-                    Value::SmallInt(n) => Some(i64::from(*n)),
-                    Value::Int(n) => Some(i64::from(*n)),
-                    Value::BigInt(n) => Some(*n),
-                    _ => None,
-                };
-                if let (Some(oid), Some(cat)) = (oid, ctx.catalog) {
-                    if oid >= 16384 {
-                        if let Some(name) =
-                            cat.table_names().into_iter().nth((oid - 16384) as usize)
-                        {
-                            return Ok(Value::text(name));
-                        }
-                    }
-                }
-            }
-            // v7.38 (T-tstz Phase 1) — `<timestamptz>::text` renders the offset
-            // (`2024-01-15 10:30:00+00`); plain timestamp does not. The runtime
-            // value is the same tz-less `Value::Timestamp`, so consult the
-            // inner expression's static type. Falls through to the ordinary
-            // cast on any shape the static typer can't resolve — worst case is
-            // today's no-offset rendering, never a wrong instant.
-            if matches!(target, CastTarget::Text)
-                && let Value::Timestamp(t) = &v
-                && crate::describe::describe_expr(expr, ctx.columns)
-                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
-            {
-                // v7.39 (tz epic) — per-VALUE session offset (DST zones
-                // vary within a statement); non-ISO DateStyles carry the
-                // zone designation instead of the numeric offset.
-                let off = ctx.session_tz_offset_at(*t);
-                let abbr = ctx.session_tz_abbrev_at(*t);
-                return Ok(Value::text(format::format_timestamptz_tz(
-                    *t,
-                    &ctx.render_style,
-                    off,
-                    abbr.as_deref(),
-                )));
-            }
-            // v7.39 (read01 utils/adt, datetime.c) — the relative
-            // reserved words resolve against the transaction clock:
-            // 'today'/'tomorrow'/'yesterday' are midnight dates, 'now'
-            // is the current instant ('now'::date = today). Clockless
-            // engines fall through to the parser (which rejects them).
-            if matches!(
-                target,
-                CastTarget::Date | CastTarget::Timestamp | CastTarget::Timestamptz
-            ) && let Value::Text(word) = &v
-                && let Some(clock) = ctx.clock
-            {
-                let w = word.trim().to_ascii_lowercase();
-                if matches!(w.as_str(), "today" | "tomorrow" | "yesterday" | "now") {
-                    let now_us = clock();
-                    let today = i32::try_from(now_us.div_euclid(86_400_000_000)).ok();
-                    if let Some(today) = today {
-                        let day = match w.as_str() {
-                            "tomorrow" => today + 1,
-                            "yesterday" => today - 1,
-                            _ => today,
-                        };
-                        return Ok(match (&target, w.as_str()) {
-                            (CastTarget::Date, _) => Value::Date(day),
-                            (_, "now") => Value::Timestamp(now_us),
-                            _ => Value::Timestamp(i64::from(day) * 86_400_000_000),
-                        });
-                    }
-                }
-            }
-            // v7.39 (GUC knife 5) — text INPUT to date/timestamp under a
-            // non-MDY DateOrder disambiguates by the session order
-            // (`'01/02/2024'::date` is Feb 1 under DMY). The default MDY
-            // order flows through cast_value's parse_date_literal.
-            if ctx.render_style.date_order != format::DateOrder::Mdy {
-                match (&target, &v) {
-                    (CastTarget::Date, Value::Text(s)) => {
-                        if let Some(d) =
-                            format::parse_date_literal_ordered(s, ctx.render_style.date_order)
-                        {
-                            return Ok(Value::Date(d));
-                        }
-                    }
-                    (CastTarget::Timestamp, Value::Text(s)) => {
-                        if let Some(t) = format::parse_timestamp_literal_ordered(
-                            s,
-                            ctx.render_style.date_order,
-                        ) {
-                            return Ok(Value::Timestamp(t));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // v7.39 (tz epic) — timestamptz INPUT: an offset-less
-            // literal is a wall-clock reading in the session zone
-            // (PG); a trailing IANA zone name localises there. Both
-            // fall through to cast_value when nothing matches (its
-            // parse treats naive input as UTC — correct for a UTC
-            // session).
-            if matches!(target, CastTarget::Timestamptz)
-                && let Value::Text(txt) = &v
-            {
-                let order = ctx.render_style.date_order;
-                let sess_zone = ctx
-                    .session_gucs
-                    .and_then(|g| g.get("timezone"))
-                    .map(String::as_str);
-                // Trailing zone name: the last space-separated token,
-                // when it names a resolvable zone (contains a letter
-                // and isn't consumed by the plain parse).
-                if let Some(idx) = txt.trim_end().rfind(' ') {
-                    let (head, tail) = (txt[..idx].trim(), txt[idx + 1..].trim());
-                    let tail_is_zoneish = tail.len() > 1
-                        && tail.bytes().any(|b| b.is_ascii_alphabetic())
-                        && !tail.eq_ignore_ascii_case("bc")
-                        && !tail.eq_ignore_ascii_case("ad");
-                    if tail_is_zoneish
-                        && format::parse_timestamp_literal_tz_ordered(txt, order).is_none()
-                        && let Some((wall, false)) =
-                            format::parse_timestamp_literal_tz_ordered(head, order)
-                        && let Some(utc) = ctx.zone_local_to_utc(tail, wall)
-                    {
-                        return Ok(Value::Timestamp(utc));
-                    }
-                }
-                if let Some((wall, had_tz)) =
-                    format::parse_timestamp_literal_tz_ordered(txt, order)
-                {
-                    if had_tz {
-                        return Ok(Value::Timestamp(wall));
-                    }
-                    if let Some(zone) = sess_zone
-                        && !zone.eq_ignore_ascii_case("utc")
-                        && !zone.eq_ignore_ascii_case("gmt")
-                        && let Some(utc) = ctx.zone_local_to_utc(zone, wall)
-                    {
-                        return Ok(Value::Timestamp(utc));
-                    }
-                    return Ok(Value::Timestamp(wall));
-                }
-            }
-            // v7.39 (GUC knife 3) — the out-function casts honour the
-            // session render style, like PG's date_out/interval_out/
-            // float8out under DateStyle/IntervalStyle/extra_float_digits.
-            if matches!(target, CastTarget::Text) {
-                match &v {
-                    Value::Date(d) => {
-                        return Ok(Value::text(format::format_date_styled(
-                            *d,
-                            &ctx.render_style,
-                        )));
-                    }
-                    Value::Timestamp(t) => {
-                        return Ok(Value::text(format::format_timestamp_styled(
-                            *t,
-                            &ctx.render_style,
-                        )));
-                    }
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    } => {
-                        return Ok(Value::text(format::format_interval_styled(
-                            *months, *days, *micros, &ctx.render_style,
-                        )));
-                    }
-                    Value::Float(x) => {
-                        return Ok(Value::text(format::format_float_styled(
-                            *x,
-                            &ctx.render_style,
-                        )));
-                    }
-                    Value::Real(x) => {
-                        return Ok(Value::text(format::format_real_styled(
-                            *x,
-                            &ctx.render_style,
-                        )));
-                    }
-                    _ => {}
-                }
-            }
-            cast_value(v, target.clone())
-        }
-        Expr::FieldAccess { base, field } => {
-            // v7.38 (read01, T9) — composite field access `(expr).field`.
-            // The base evaluates to a record; look the member up by name
-            // (`f1`..`fN` for an anonymous ROW, base column names for a
-            // whole-row). A NULL record yields NULL (PG semantics).
-            let v = eval_expr(base, row, ctx)?;
-            match v {
-                Value::Null => Ok(Value::Null),
-                Value::Composite(fields) => fields
-                    .into_iter()
-                    .find(|(name, _)| name == field)
-                    .map(|(_, val)| val)
-                    .ok_or_else(|| EvalError::ColumnNotFound {
-                        name: field.clone(),
-                    }),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "field access `.{field}` requires a composite (record) value"
-                    ),
-                }),
-            }
-        }
-        Expr::IsNull { expr, negated } => {
-            // v7.38 (read01 P4.11) — `ROW(...) IS [NOT] NULL` is evaluated
-            // field-wise, not as a whole-value null test: a row IS NULL when
-            // every field is null, and IS NOT NULL when every field is
-            // non-null — so the two are NOT simple negations (ROW(1,NULL) is
-            // neither). A field that is itself a row is a non-null value, so
-            // the check does not recurse. The `(a, b) IS NULL` tuple spelling
-            // is already desugared to `a IS NULL AND b IS NULL` in the parser;
-            // this covers the explicit `ROW(...)` constructor.
-            if let Expr::FunctionCall { name, args } = expr.as_ref()
-                && name.eq_ignore_ascii_case("row")
-            {
-                let mut all_null = true;
-                let mut all_non_null = true;
-                for a in args {
-                    if matches!(eval_expr(a, row, ctx)?, Value::Null) {
-                        all_non_null = false;
-                    } else {
-                        all_null = false;
-                    }
-                }
-                return Ok(Value::Bool(if *negated { all_non_null } else { all_null }));
-            }
-            let v = eval_expr(expr, row, ctx)?;
-            let is_null = matches!(v, Value::Null);
-            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
-        }
-        Expr::FunctionCall { name, args } => {
-            // v7.39 (tz epic) — AT TIME ZONE (fn form: timezone(zone, ts))
-            // with a NAMED zone needs the host tzdb and the argument's
-            // static type for its two directions:
-            //   naive AT ZONE  -> that zone's wall clock -> UTC instant
-            //   tstz  AT ZONE  -> UTC instant -> that zone's wall clock
-            // Fixed offsets / abbreviations keep the legacy path below.
-            if args.len() == 2
-                && name.eq_ignore_ascii_case("timezone")
-                && let zone_v = eval_expr(&args[0], row, ctx)?
-                && let Value::Text(zone) = &zone_v
-                && datetime::resolve_zone_offset(zone.as_ref()).is_none()
-                && !zone.trim().eq_ignore_ascii_case("utc")
-                && !zone.trim().eq_ignore_ascii_case("gmt")
-                && zone.parse::<i64>().is_err()
-                && ctx.tz_offset_fn.is_some()
-            {
-                let zone = zone.trim();
-                let src_is_tstz = crate::describe::describe_expr(&args[1], ctx.columns)
-                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz));
-                let inner = eval_expr(&args[1], row, ctx)?;
-                if let Value::Timestamp(t) = inner {
-                    if src_is_tstz {
-                        if let Some(off) = ctx.zone_offset_at(zone, t) {
-                            return Ok(Value::Timestamp(t + off));
-                        }
-                    } else if let Some(utc) = ctx.zone_local_to_utc(zone, t) {
-                        return Ok(Value::Timestamp(utc));
-                    }
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("time zone \"{zone}\" not recognized"),
-                    });
-                }
-            }
-            // v7.29 (round-22 phase 3) - prefix fast path: LEFT(col, n)
-            // on a TEXT column borrows the cell and clones only the
-            // prefix. The generic path clones the WHOLE cell first -
-            // a LEFT(body, 120) over 24k x 30 KB rows spent 383 ms
-            // copying bytes it then threw away (7 ms without LEFT).
-            if args.len() == 2
-                && name.eq_ignore_ascii_case("left")
-                && let Expr::Column(c) = &args[0]
-                && let Some(cell) = resolve_column_borrowed(c, row, ctx)?
-            {
-                {
-                    match cell {
-                        Value::Null => return Ok(Value::Null),
-                        Value::Text(t) => {
-                            let n_v = eval_expr(&args[1], row, ctx)?;
-                            if let Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) = n_v {
-                                let n = match n_v {
-                                    Value::SmallInt(x) => i64::from(x),
-                                    Value::Int(x) => i64::from(x),
-                                    Value::BigInt(x) => x,
-                                    _ => 0,
-                                };
-                                return Ok(Value::text(text_prefix_chars(t, n)));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // v7.38 (T-tstz Phase 1) — the ONE case where pg_typeof needs the
-            // static type: timestamptz. The runtime value is a tz-less
-            // Value::Timestamp, so the value-driven answer below can only ever
-            // say "without time zone". For every other type the value-driven
-            // path is strictly better (it distinguishes json vs jsonb, keeps
-            // NULL as "unknown", and is not fooled by describe_expr's lossy
-            // heuristics), so we consult the static typer ONLY when it says
-            // Timestamptz and otherwise fall through untouched.
-            if args.len() == 1
-                && name.eq_ignore_ascii_case("pg_typeof")
-                && crate::describe::describe_expr(&args[0], ctx.columns)
-                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
-            {
-                return Ok(Value::text::<alloc::string::String>(
-                    "timestamp with time zone".into(),
-                ));
-            }
-            // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
-            // static type when it has one (PG: `VALUES (NULL),(1.5)`
-            // types the column numeric and its NULL row's pg_typeof says
-            // numeric, not unknown). TEXT is excluded because a NULL
-            // literal *describes* as TEXT (the unknown stand-in), so a
-            // bare `pg_typeof(NULL)` keeps reporting "unknown". Known
-            // residual: a genuine text column's NULL cell therefore also
-            // reports unknown (needs a real Unknown type to fix).
-            if args.len() == 1 && name.eq_ignore_ascii_case("pg_typeof") {
-                let v = eval_expr(&args[0], row, ctx)?;
-                if matches!(v, Value::Null)
-                    && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
-                    && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
-                {
-                    return Ok(Value::text(n));
-                }
-                return apply_function(name, &[v], ctx);
-            }
-            // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
-            // common type of its branches, so a typed sibling (`NULL::time`,
-            // `col::time`) makes the whole expression that type and an untyped
-            // string-literal branch is coerced to it. Without this,
-            // `COALESCE(NULL::time, '12:00')::text` rendered the raw `12:00`
-            // instead of `12:00:00`. Only kicks in when the picked value is a
-            // bare Text and a non-text cast-target sibling exists.
-            if name.eq_ignore_ascii_case("coalesce") && !args.is_empty() {
-                let evaluated: Result<Vec<Value<'static>>, _> =
-                    args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-                let evaluated = evaluated?;
-                let result = evaluated
-                    .iter()
-                    .find(|v| !matches!(v, Value::Null))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                if matches!(result, Value::Text(_)) {
-                    if let Some(target) = args.iter().find_map(coalesce_type_hint) {
-                        return crate::eval::cast::cast_value(result, target);
-                    }
-                }
-                // v7.38 (read01) — otherwise widen the picked value to the PG
-                // common type of all branches (COALESCE(1, 2.5) → numeric).
-                let types: Vec<spg_storage::DataType> =
-                    evaluated.iter().filter_map(Value::data_type).collect();
-                return Ok(widen_to_common(result, &types));
-            }
-            let evaluated: Result<Vec<Value<'static>>, _> =
-                args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-            apply_function(name, &evaluated?, ctx)
-        }
+        Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),
+        Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),
+        Expr::IsNull { expr, negated } => eval_is_null_arm(expr, *negated, row, ctx),
+        Expr::FunctionCall { name, args } => eval_function_call_arm(name, args, row, ctx),
         Expr::Like {
             expr,
             pattern,
             negated,
             case_insensitive,
-        } => {
-            let v = eval_expr(expr, row, ctx)?;
-            let p = eval_expr(pattern, row, ctx)?;
-            // NULL on either side propagates to NULL — same as PG.
-            // v7.39 (bpchar epic) — LIKE matches bpchar on its PADDED
-            // stored form, per PG's bpchar pattern operators.
-            let (text, pat) = match (v, p) {
-                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
-                (Value::Text(a) | Value::BpChar(a), Value::Text(b) | Value::BpChar(b)) => (a, b),
-                (Value::Text(_) | Value::BpChar(_), other) | (other, _) => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!("LIKE requires text operands, got {:?}", other.data_type()),
-                    });
-                }
-            };
-            // v7.25 (round-17) — ILIKE folds both operands (PG
-            // lowercases per the default collation).
-            let m = if *case_insensitive {
-                like_match(&text.to_lowercase(), &pat.to_lowercase())
-            } else {
-                like_match(&text, &pat)
-            };
-            Ok(Value::Bool(if *negated { !m } else { m }))
-        }
-        Expr::Extract { field, source } => {
-            let v = eval_expr(source, row, ctx)?;
-            // v7.39 (tz epic) — timezone[_hour|_minute] of a timestamptz
-            // reports the SESSION offset at that instant (PG: 32400 for
-            // Tokyo; -14400 for New York in July).
-            if matches!(
-                field,
-                spg_sql::ast::ExtractField::Timezone
-                    | spg_sql::ast::ExtractField::TimezoneHour
-                    | spg_sql::ast::ExtractField::TimezoneMinute
-            ) && let Value::Timestamp(t) = &v
-                && crate::describe::describe_expr(source, ctx.columns)
-                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
-            {
-                let off_secs = ctx.session_tz_offset_at(*t) / 1_000_000;
-                let n = match field {
-                    spg_sql::ast::ExtractField::Timezone => off_secs,
-                    spg_sql::ast::ExtractField::TimezoneHour => off_secs / 3600,
-                    _ => (off_secs / 60) % 60,
-                };
-                return Ok(Value::BigInt(n));
-            }
-            extract_field(*field, &v)
-        }
+        } => eval_like_arm(expr, pattern, *negated, *case_insensitive, row, ctx),
+        Expr::Extract { field, source } => eval_extract_arm(field, source, row, ctx),
         // v4.10: subquery nodes should have been resolved into
         // Literal / InList nodes by Engine::resolve_select_subqueries
         // before the row loop. Anything reaching here is a bug.
@@ -1224,48 +1916,7 @@ pub fn eval_expr(
             expr,
             list,
             negated,
-        } => {
-            let needle = eval_expr(expr, row, ctx)?;
-            let needle_null = matches!(needle, Value::Null);
-            let mut saw_null = needle_null && !list.is_empty();
-            let mut matched = false;
-            if !needle_null {
-                for item in list {
-                    let v = eval_expr(item, row, ctx)?;
-                    if matches!(v, Value::Null) {
-                        saw_null = true;
-                        continue;
-                    }
-                    match apply_binary(BinOp::Eq, needle.clone(), v)? {
-                        Value::Bool(true) => {
-                            matched = true;
-                            break;
-                        }
-                        Value::Bool(false) => {}
-                        Value::Null => saw_null = true,
-                        other => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: format!(
-                                    "IN comparison didn't return Bool: {:?}",
-                                    other.data_type()
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-            let inner = if matched {
-                Value::Bool(true)
-            } else if saw_null {
-                Value::Null
-            } else {
-                Value::Bool(false)
-            };
-            Ok(match (negated, inner) {
-                (true, Value::Bool(b)) => Value::Bool(!b),
-                (_, v) => v,
-            })
-        }
+        } => eval_in_list_arm(expr, list, *negated, row, ctx),
         // v4.12: window functions should have been rewritten into
         // synthetic __win_N column references by
         // exec_select_with_window before row eval. Anything
@@ -1278,277 +1929,15 @@ pub fn eval_expr(
         // IntArray (or BigIntArray when widening), any Text →
         // TextArray. Non-TEXT non-integer elements (Bool, Float)
         // stringify into TextArray as the safe default.
-        Expr::Array(items) => {
-            let mut materialised: Vec<Value<'static>> = Vec::with_capacity(items.len());
-            for elem in items {
-                materialised.push(eval_expr(elem, row, ctx)?);
-            }
-            // v7.38 (read01, T10) — a constructor whose elements are all 1-D
-            // arrays builds a 2-D array (`ARRAY[[1,2],[3,4]]`). All rows must
-            // share a length (PG: "multidimensional arrays must have array
-            // expressions with matching dimensions"). Int rows promote to
-            // bigint if any row is bigint; a text row makes the whole thing text.
-            let all_arrays = !materialised.is_empty()
-                && materialised.iter().all(|v| {
-                    matches!(
-                        v,
-                        Value::IntArray(_) | Value::BigIntArray(_) | Value::TextArray(_)
-                    )
-                });
-            if all_arrays {
-                let row_len = match &materialised[0] {
-                    Value::IntArray(r) => r.len(),
-                    Value::BigIntArray(r) => r.len(),
-                    Value::TextArray(r) => r.len(),
-                    _ => unreachable!(),
-                };
-                let same_len = materialised.iter().all(|v| {
-                    let l = match v {
-                        Value::IntArray(r) => r.len(),
-                        Value::BigIntArray(r) => r.len(),
-                        Value::TextArray(r) => r.len(),
-                        _ => 0,
-                    };
-                    l == row_len
-                });
-                if !same_len {
-                    return Err(EvalError::TypeMismatch {
-                        detail: "multidimensional arrays must have array expressions \
-                                 with matching dimensions"
-                            .into(),
-                    });
-                }
-                let any_text = materialised
-                    .iter()
-                    .any(|v| matches!(v, Value::TextArray(_)));
-                let any_big = materialised
-                    .iter()
-                    .any(|v| matches!(v, Value::BigIntArray(_)));
-                if any_text {
-                    let rows: Vec<Vec<Option<String>>> = materialised
-                        .into_iter()
-                        .map(|v| match v {
-                            Value::TextArray(r) => r,
-                            Value::IntArray(r) => {
-                                r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
-                            }
-                            Value::BigIntArray(r) => {
-                                r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
-                            }
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    return Ok(Value::TextArray2D(rows));
-                }
-                if any_big {
-                    let rows: Vec<Vec<Option<i64>>> = materialised
-                        .into_iter()
-                        .map(|v| match v {
-                            Value::BigIntArray(r) => r,
-                            Value::IntArray(r) => r.into_iter().map(|c| c.map(i64::from)).collect(),
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    return Ok(Value::BigIntArray2D(rows));
-                }
-                let rows: Vec<Vec<Option<i32>>> = materialised
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::IntArray(r) => r,
-                        _ => unreachable!(),
-                    })
-                    .collect();
-                return Ok(Value::IntArray2D(rows));
-            }
-            let mut has_text = false;
-            let mut has_float = false;
-            let mut has_numeric = false;
-            let mut has_bigint = false;
-            let mut has_int = false;
-            // A NumericBig or non-finite (NaN/Inf) numeric can't be held in
-            // NumericArray's `(i128, scale)` cells, so it forces the text[]
-            // fallback rather than a lossy/panicking conversion.
-            let mut numeric_representable = true;
-            for v in &materialised {
-                match v {
-                    Value::Null => {}
-                    Value::Int(_) | Value::SmallInt(_) => has_int = true,
-                    Value::BigInt(_) => has_bigint = true,
-                    Value::Numeric {
-                        kind: spg_storage::NumericKind::Finite,
-                        ..
-                    } => {
-                        has_numeric = true;
-                    }
-                    Value::Numeric { .. } => {
-                        has_numeric = true;
-                        numeric_representable = false;
-                    }
-                    Value::NumericBig(_) => {
-                        has_numeric = true;
-                        numeric_representable = false;
-                    }
-                    Value::Float(_) => has_float = true,
-                    Value::Text(_) | Value::Json(_) => has_text = true,
-                    _ => has_text = true,
-                }
-            }
-            let any_numlike = has_int || has_bigint || has_numeric || has_float;
-            if has_text || !any_numlike || (has_numeric && !numeric_representable) {
-                let out: Vec<Option<String>> = materialised
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Null => None,
-                        Value::Text(s) | Value::Json(s) => Some(s.into_owned()),
-                        other => Some(value_to_text_for_array(&other, &ctx.render_style)),
-                    })
-                    .collect();
-                return Ok(Value::TextArray(out));
-            }
-            // v7.38 (read01) — PG array-element unification across the numeric
-            // ladder: any float → double precision[]; else any numeric →
-            // numeric[] (each element keeps its own scale, PG's behaviour);
-            // else the integer widths. Matches `pg_typeof(ARRAY[1, 2.5])` =
-            // numeric[] and keeps downstream `[i]` arithmetic numeric.
-            if has_float {
-                let out: Vec<Option<f64>> = materialised
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Null => None,
-                        Value::Float(f) => Some(f),
-                        Value::Int(n) => Some(f64::from(n)),
-                        Value::SmallInt(n) => Some(f64::from(n)),
-                        #[allow(clippy::cast_precision_loss)]
-                        Value::BigInt(n) => Some(n as f64),
-                        #[allow(clippy::cast_precision_loss)]
-                        Value::Numeric { scaled, scale, .. } => {
-                            Some(scaled as f64 / libm::pow(10.0, f64::from(scale)))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                return Ok(Value::FloatArray(out));
-            }
-            if has_numeric {
-                let out: Vec<Option<(i128, u8)>> = materialised
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Null => None,
-                        Value::SmallInt(n) => Some((i128::from(n), 0)),
-                        Value::Int(n) => Some((i128::from(n), 0)),
-                        Value::BigInt(n) => Some((i128::from(n), 0)),
-                        Value::Numeric { scaled, scale, .. } => Some((scaled, scale)),
-                        _ => None,
-                    })
-                    .collect();
-                return Ok(Value::NumericArray(out));
-            }
-            if has_bigint {
-                let out: Vec<Option<i64>> = materialised
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Null => None,
-                        Value::Int(n) => Some(i64::from(n)),
-                        Value::SmallInt(n) => Some(i64::from(n)),
-                        Value::BigInt(n) => Some(n),
-                        _ => unreachable!(),
-                    })
-                    .collect();
-                return Ok(Value::BigIntArray(out));
-            }
-            let out: Vec<Option<i32>> = materialised
-                .into_iter()
-                .map(|v| match v {
-                    Value::Null => None,
-                    Value::Int(n) => Some(n),
-                    Value::SmallInt(n) => Some(i32::from(n)),
-                    _ => unreachable!(),
-                })
-                .collect();
-            Ok(Value::IntArray(out))
-        }
+        Expr::Array(items) => eval_array_arm(items, row, ctx),
         // v7.10.12 — `arr[i]` PG-style 1-based indexing.
         // Out-of-range indices (including i ≤ 0) return NULL.
-        Expr::ArraySubscript { .. } => {
-            // Collect the whole subscript chain so PG's multi-dimensional
-            // access (`arr[i][j]` is ONE N-subscript op) is distinguishable
-            // from chained 1-D indexing. `arr[1][2]` parses as
-            // `(arr[1])[2]`; PG indexes the matrix directly and returns NULL
-            // for a partial subscript (`arr[1]` on a 2-D array is NULL).
-            let mut idx_exprs: Vec<&Expr> = Vec::new();
-            let mut base = expr;
-            while let Expr::ArraySubscript { target, index } = base {
-                idx_exprs.push(index);
-                base = target;
-            }
-            idx_exprs.reverse();
-            let base_v = eval_expr(base, row, ctx)?;
-            if matches!(
-                base_v,
-                Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_)
-            ) {
-                return eval_matrix_subscript(&base_v, &idx_exprs, row, ctx);
-            }
-            // 1-D array / JSON: apply each subscript left-to-right. This
-            // reproduces the prior single-subscript semantics exactly, and
-            // chained JSON (`j['a']['b']`) still resolves step by step.
-            let mut cur = base_v;
-            for ix in idx_exprs {
-                cur = apply_one_subscript(cur, ix, row, ctx)?;
-            }
-            Ok(cur)
-        }
+        Expr::ArraySubscript { .. } => eval_array_subscript_arm(expr, row, ctx),
         // Array slice `arr[lo:hi]` — PG 1-based, both ends
         // inclusive, out-of-range bounds clamp, missing bounds
         // extend to the array's ends. Result keeps the element
         // type; an empty window yields an empty array.
-        Expr::ArraySlice { target, lo, hi } => {
-            let target_v = eval_expr(target, row, ctx)?;
-            if matches!(target_v, Value::Null) {
-                return Ok(Value::Null);
-            }
-            let bound = |e: Option<&Expr>| -> Result<Option<i64>, EvalError> {
-                match e {
-                    None => Ok(None),
-                    Some(b) => match eval_expr(b, row, ctx)? {
-                        Value::Null => Ok(None),
-                        Value::Int(n) => Ok(Some(i64::from(n))),
-                        Value::BigInt(n) => Ok(Some(n)),
-                        Value::SmallInt(n) => Ok(Some(i64::from(n))),
-                        other => Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "array slice bound must be integer, got {:?}",
-                                other.data_type()
-                            ),
-                        }),
-                    },
-                }
-            };
-            let lo_b = bound(lo.as_deref())?;
-            let hi_b = bound(hi.as_deref())?;
-            fn window(len: usize, lo: Option<i64>, hi: Option<i64>) -> (usize, usize) {
-                let start = lo.map_or(0, |l| (l.max(1) - 1) as usize).min(len);
-                let end = hi.map_or(len, |h| h.max(0) as usize).min(len);
-                (start, end.max(start))
-            }
-            match target_v {
-                Value::TextArray(items) => {
-                    let (s, e) = window(items.len(), lo_b, hi_b);
-                    Ok(Value::TextArray(items[s..e].to_vec()))
-                }
-                Value::IntArray(items) => {
-                    let (s, e) = window(items.len(), lo_b, hi_b);
-                    Ok(Value::IntArray(items[s..e].to_vec()))
-                }
-                Value::BigIntArray(items) => {
-                    let (s, e) = window(items.len(), lo_b, hi_b);
-                    Ok(Value::BigIntArray(items[s..e].to_vec()))
-                }
-                other => Err(EvalError::TypeMismatch {
-                    detail: format!("slice target must be an array, got {:?}", other.data_type()),
-                }),
-            }
-        }
+        Expr::ArraySlice { target, lo, hi } => eval_array_slice_arm(target, lo, hi, row, ctx),
         // v7.10.12 — `x op ANY(arr)` / `x op ALL(arr)`. PG
         // 3VL: ANY → true if any element compares-true; NULL if
         // no true but some NULL; false otherwise. ALL: false if
@@ -1559,109 +1948,7 @@ pub fn eval_expr(
             op,
             array,
             is_any,
-        } => {
-            let lhs = eval_expr(expr, row, ctx)?;
-            let arr = eval_expr(array, row, ctx)?;
-            if matches!(arr, Value::Null) {
-                return Ok(Value::Null);
-            }
-            // v7.38 (read01) — an unknown-string RHS (`x = ANY('{1,2,3}')`)
-            // takes the LHS's type: coerce the external array text to the array
-            // type matching the LHS's element type, like PG.
-            let arr = match &arr {
-                Value::Text(_) => {
-                    // The LHS's element type, or TEXT when the LHS is an
-                    // untyped NULL (PG's unknown → text default).
-                    let arr_ty = match lhs.data_type() {
-                        Some(spg_storage::DataType::SmallInt) => {
-                            spg_storage::DataType::SmallIntArray
-                        }
-                        Some(spg_storage::DataType::Int) => spg_storage::DataType::IntArray,
-                        Some(spg_storage::DataType::BigInt) => spg_storage::DataType::BigIntArray,
-                        Some(spg_storage::DataType::Numeric { .. }) => {
-                            spg_storage::DataType::NumericArray
-                        }
-                        Some(spg_storage::DataType::Float) => spg_storage::DataType::FloatArray,
-                        Some(spg_storage::DataType::Bool) => spg_storage::DataType::BoolArray,
-                        Some(spg_storage::DataType::Date) => spg_storage::DataType::DateArray,
-                        _ => spg_storage::DataType::TextArray,
-                    };
-                    crate::conversions::coerce_value(arr.clone(), arr_ty, "", 0).unwrap_or(arr)
-                }
-                _ => arr,
-            };
-            // Build the element list generically so every scalar array type
-            // (numeric[], float8[], bool[], date[], …) is accepted, not just
-            // int/bigint/text.
-            let Some(len) = array_len(&arr) else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "ANY/ALL right-hand side must be an array, got {:?}",
-                        arr.data_type()
-                    ),
-                });
-            };
-            let elems: Vec<Option<Value>> = (0..len)
-                .map(|i| match array_element_at(&arr, i) {
-                    Some(Value::Null) | None => None,
-                    Some(v) => Some(v),
-                })
-                .collect();
-            // PG: `x op ANY (empty)` → false and `x op ALL (empty)` →
-            // true, decided purely by emptiness — the comparison is
-            // never evaluated, so a NULL LHS is irrelevant. This must
-            // short-circuit before `saw_null` is seeded from the LHS,
-            // otherwise `NULL op ANY/ALL (empty)` wrongly yields NULL.
-            if elems.is_empty() {
-                return Ok(Value::Bool(!*is_any));
-            }
-            let mut saw_null = matches!(lhs, Value::Null);
-            let mut saw_match = false;
-            let mut saw_mismatch = false;
-            for elem in elems {
-                let elem_v = match elem {
-                    Some(v) => v,
-                    None => {
-                        saw_null = true;
-                        continue;
-                    }
-                };
-                if matches!(lhs, Value::Null) {
-                    saw_null = true;
-                    continue;
-                }
-                match apply_binary(*op, lhs.clone(), elem_v) {
-                    Ok(Value::Bool(true)) => saw_match = true,
-                    Ok(Value::Bool(false)) => saw_mismatch = true,
-                    Ok(Value::Null) => saw_null = true,
-                    Ok(other) => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "ANY/ALL comparison didn't return Bool: {:?}",
-                                other.data_type()
-                            ),
-                        });
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            let result = if *is_any {
-                if saw_match {
-                    Value::Bool(true)
-                } else if saw_null {
-                    Value::Null
-                } else {
-                    Value::Bool(false)
-                }
-            } else if saw_mismatch {
-                Value::Bool(false)
-            } else if saw_null {
-                Value::Null
-            } else {
-                Value::Bool(true)
-            };
-            Ok(result)
-        }
+        } => eval_any_all_arm(expr, op, array, *is_any, row, ctx),
         // v7.13.0 — CASE WHEN … END (mailrs round-5 G9).
         // Short-circuit on the first matching branch. Searched form
         // (operand=None) treats each branch's WHEN as a Bool
@@ -1671,56 +1958,7 @@ pub fn eval_expr(
             operand,
             branches,
             else_branch,
-        } => {
-            let operand_value = match operand {
-                Some(o) => Some(eval_expr(o, row, ctx)?),
-                None => None,
-            };
-            // v7.37 D.1 — CASE result-type coercion (same rule as COALESCE): a
-            // typed result branch (`... THEN '10:00'::time`) makes the whole
-            // CASE that type, so an untyped string-literal branch is coerced to
-            // it. Compute the hint once from every THEN/ELSE branch.
-            let case_hint = branches
-                .iter()
-                .map(|(_, t)| t)
-                .chain(else_branch.iter().map(|b| b.as_ref()))
-                .find_map(coalesce_type_hint);
-            // v7.38 (read01) — the CASE result is PG's common type of every
-            // THEN/ELSE branch, so a taken integer branch is widened to
-            // numeric when a sibling branch is numeric (and `pg_typeof` /
-            // downstream division match PG). Only one branch is evaluated, so
-            // the type must come from the branch expressions statically.
-            let branch_types: Vec<spg_storage::DataType> = branches
-                .iter()
-                .map(|(_, t)| t)
-                .chain(else_branch.iter().map(|b| b.as_ref()))
-                .filter_map(|e| crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty))
-                .collect();
-            let coerce = |v: Value<'static>| -> Result<Value<'static>, EvalError> {
-                let v = match (&v, &case_hint) {
-                    (Value::Text(_), Some(target)) => cast::cast_value(v, target.clone())?,
-                    _ => v,
-                };
-                Ok(widen_to_common(v, &branch_types))
-            };
-            for (when_expr, then_expr) in branches {
-                let when_value = eval_expr(when_expr, row, ctx)?;
-                let matched = match &operand_value {
-                    None => matches!(when_value, Value::Bool(true)),
-                    Some(op_v) => matches!(
-                        apply_binary(spg_sql::ast::BinOp::Eq, op_v.clone(), when_value)?,
-                        Value::Bool(true)
-                    ),
-                };
-                if matched {
-                    return coerce(eval_expr(then_expr, row, ctx)?);
-                }
-            }
-            match else_branch {
-                Some(e) => coerce(eval_expr(e, row, ctx)?),
-                None => Ok(Value::Null),
-            }
-        }
+        } => eval_case_arm(operand, branches, else_branch, row, ctx),
     }
 }
 

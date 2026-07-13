@@ -1773,6 +1773,18 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "WITH" | "MERGE" => spg_sql::parser::parse_statement(sql)
             .map(|stmt| command_tag_for_ast(&stmt, affected))
             .unwrap_or(first),
+        // v7.39 (read01 utils/adt, enum.c) — PG's tag for the TYPE
+        // family is two words (CREATE TYPE / ALTER TYPE / DROP TYPE);
+        // the generic first-word fallback would drop the second.
+        first @ ("CREATE" | "ALTER" | "DROP")
+            if sql
+                .trim_start()
+                .split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|w| w.eq_ignore_ascii_case("type")) =>
+        {
+            format!("{first} TYPE")
+        }
         other => other.to_string(), // CREATE TABLE / DROP USER / etc.
     }
 }
@@ -3007,6 +3019,10 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         Statement::Savepoint(_) => "SAVEPOINT".to_string(),
         Statement::RollbackToSavepoint(_) => "ROLLBACK".to_string(),
         Statement::ReleaseSavepoint(_) => "RELEASE".to_string(),
+        // v7.39 (read01 utils/adt) — PG tags the TYPE family fully.
+        Statement::CreateType(_) => "CREATE TYPE".to_string(),
+        Statement::AlterTypeAddValue { .. } => "ALTER TYPE".to_string(),
+        Statement::DropType { .. } => "DROP TYPE".to_string(),
         Statement::CreateUser(_) => "CREATE USER".to_string(),
         Statement::DropUser(_) => "DROP USER".to_string(),
         // v6.1.2 — PG tag for `CREATE PUBLICATION` / `DROP PUBLICATION`.
@@ -3339,6 +3355,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // (boolean, money, …) is 22P02 INVALID_TEXT_REPRESENTATION.
         } else if msg.contains("invalid input syntax for type") {
             "22P02"
+        // v7.39 (read01 utils/adt, float.c) — inverse-trig domain
+        // violations (asind(2)) are 22003 NUMERIC_VALUE_OUT_OF_RANGE.
+        } else if msg.contains("input is out of range") {
+            "22003"
         // v7.39 (tz epic) — bad GUC values (TimeZone / DateStyle /
         // IntervalStyle / extra_float_digits range) are PG's 22023
         // INVALID_PARAMETER_VALUE.
@@ -5949,6 +5969,18 @@ mod tests {
             command_tag("WITH c AS (SELECT 1) DELETE FROM t WHERE id > 9", 0),
             "DELETE 0"
         );
+        // v7.39 (read01 utils/adt, enum.c) — the TYPE family is a
+        // two-word tag; other DDL keeps the first-word fallback.
+        assert_eq!(
+            command_tag("CREATE TYPE mood AS ENUM ('a')", 0),
+            "CREATE TYPE"
+        );
+        assert_eq!(
+            command_tag("ALTER TYPE mood ADD VALUE 'b'", 0),
+            "ALTER TYPE"
+        );
+        assert_eq!(command_tag("DROP TYPE IF EXISTS mood", 0), "DROP TYPE");
+        assert_eq!(command_tag("CREATE TABLE t (id INT)", 0), "CREATE");
     }
 
     fn read_cell(buf: &[u8]) -> &[u8] {

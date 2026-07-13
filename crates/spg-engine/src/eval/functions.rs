@@ -8483,14 +8483,108 @@ fn apply_function_dispatch(
                     });
                 }
             };
+            // v7.39 (read01 utils/adt, float.c) — PG's degree trig is
+            // EXACT at the standard angles (sind(30) = 0.5, cosd(60) =
+            // 0.5, tand(45) = 1): fold the angle into the first
+            // quadrant by symmetry, then normalise by the COMPUTED
+            // sin(30°) / one-minus-cos(60°) so the division cancels
+            // the libm rounding at those points.
+            fn sind_q1(x: f64) -> f64 {
+                const D2R: f64 = core::f64::consts::PI / 180.0;
+                if x <= 30.0 {
+                    let sin30 = libm::sin(30.0 * D2R);
+                    libm::sin(x * D2R) / sin30 / 2.0
+                } else {
+                    cosd_q1(90.0 - x)
+                }
+            }
+            fn cosd_q1(x: f64) -> f64 {
+                const D2R: f64 = core::f64::consts::PI / 180.0;
+                if x <= 60.0 {
+                    let one_minus_cos60 = 1.0 - libm::cos(60.0 * D2R);
+                    1.0 - (1.0 - libm::cos(x * D2R)) / one_minus_cos60 / 2.0
+                } else {
+                    sind_q1(90.0 - x)
+                }
+            }
+            fn sind_deg(x: f64) -> f64 {
+                if !x.is_finite() {
+                    return f64::NAN;
+                }
+                // Reduce to [0, 360).
+                let x = x % 360.0;
+                let x = if x < 0.0 { x + 360.0 } else { x };
+                match x {
+                    x if x <= 90.0 => sind_q1(x),
+                    x if x <= 180.0 => sind_q1(180.0 - x),
+                    x if x <= 270.0 => -sind_q1(x - 180.0),
+                    x => -sind_q1(360.0 - x),
+                }
+            }
+            fn cosd_deg(x: f64) -> f64 {
+                if !x.is_finite() {
+                    return f64::NAN;
+                }
+                let x = x % 360.0;
+                let x = if x < 0.0 { x + 360.0 } else { x };
+                match x {
+                    x if x <= 90.0 => cosd_q1(x),
+                    x if x <= 180.0 => -cosd_q1(180.0 - x),
+                    x if x <= 270.0 => -cosd_q1(x - 180.0),
+                    x => cosd_q1(360.0 - x),
+                }
+            }
             let r = match name {
-                "sind" => libm::sin(x * D2R),
-                "cosd" => libm::cos(x * D2R),
-                "tand" => libm::tan(x * D2R),
-                "cotd" => 1.0 / libm::tan(x * D2R),
-                "asind" => libm::asin(x) * R2D,
-                "acosd" => libm::acos(x) * R2D,
-                "atand" => libm::atan(x) * R2D,
+                "sind" => sind_deg(x),
+                "cosd" => cosd_deg(x),
+                "tand" => {
+                    let c = cosd_deg(x);
+                    if c == 0.0 { f64::INFINITY * sind_deg(x).signum() } else { sind_deg(x) / c }
+                }
+                "cotd" => {
+                    let s = sind_deg(x);
+                    if s == 0.0 { f64::INFINITY * cosd_deg(x).signum() } else { cosd_deg(x) / s }
+                }
+                "asind" => {
+                    // Exact at 0 / ±0.5 / ±1: below 0.5 scale by the
+                    // computed asin(0.5) (30° anchor); above, come down
+                    // from 90° via the computed acos(0.5) (60° anchor).
+                    fn asind_pos(x: f64) -> f64 {
+                        if x <= 0.5 {
+                            libm::asin(x) / libm::asin(0.5) * 30.0
+                        } else {
+                            90.0 - libm::acos(x) / libm::acos(0.5) * 60.0
+                        }
+                    }
+                    if x.is_nan() {
+                        return Ok(Value::Float(f64::NAN));
+                    }
+                    if !(-1.0..=1.0).contains(&x) {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "input is out of range".into(),
+                        });
+                    }
+                    if x < 0.0 { -asind_pos(-x) } else { asind_pos(x) }
+                }
+                "acosd" => {
+                    fn acosd_pos(x: f64) -> f64 {
+                        if x <= 0.5 {
+                            90.0 - libm::asin(x) / libm::asin(0.5) * 30.0
+                        } else {
+                            libm::acos(x) / libm::acos(0.5) * 60.0
+                        }
+                    }
+                    if x.is_nan() {
+                        return Ok(Value::Float(f64::NAN));
+                    }
+                    if !(-1.0..=1.0).contains(&x) {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "input is out of range".into(),
+                        });
+                    }
+                    if x < 0.0 { 180.0 - acosd_pos(-x) } else { acosd_pos(x) }
+                }
+                "atand" => libm::atan(x) / libm::atan(1.0) * 45.0,
                 _ => unreachable!(),
             };
             Ok(Value::Float(r))
