@@ -581,6 +581,39 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // pseudotype: text in, text out (cstring_in/out are identity).
             // SPG carries it as text; pg_typeof(cstring) reading "text" is
             // a recorded delta alongside the literal projection OIDs.
+            // v7.39 (read01 xid8funcs.c) — `::xid` (32-bit, wrapping) and
+            // `::xid8` (64-bit, full) parse an integer text and render it
+            // back verbatim. SPG carries them as BigInt.
+            if name.eq_ignore_ascii_case("xid") || name.eq_ignore_ascii_case("xid8") {
+                return Ok(match v {
+                    Value::Null => Value::Null,
+                    Value::SmallInt(n) => Value::BigInt(i64::from(n)),
+                    Value::Int(n) => Value::BigInt(i64::from(n)),
+                    Value::BigInt(n) => Value::BigInt(n),
+                    Value::Text(s) => {
+                        let t = s.trim();
+                        match t.parse::<u64>() {
+                            Ok(n) => Value::BigInt(n as i64),
+                            Err(_) => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: alloc::format!(
+                                        "invalid input syntax for type {}: \"{s}\"",
+                                        name.to_ascii_lowercase()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "cannot cast {:?} to {name}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                });
+            }
             // v7.39 (read01 varchar.c) — `::name` is text truncated to
             // NAMEDATALEN-1 (63) bytes.
             if name.eq_ignore_ascii_case("name") {

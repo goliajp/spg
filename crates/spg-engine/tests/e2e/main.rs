@@ -395,6 +395,7 @@ mod e2e_trig;
 mod e2e_trunc_numeric;
 mod e2e_truncate;
 mod e2e_ts_delete_filter;
+mod e2e_tsquery_xid_round37;
 mod e2e_ts_headline;
 mod e2e_ts_rank;
 mod e2e_ts_rewrite;

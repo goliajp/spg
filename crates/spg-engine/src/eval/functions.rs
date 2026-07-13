@@ -13156,29 +13156,27 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let q1 = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s.as_ref(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "tsquery_phrase() needs tsquery text, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+            // v7.39 (read01 tsquery) — accept a TsQuery value (rendered)
+            // or its text form.
+            let ast_of = |v: &Value<'_>| -> Result<Option<spg_storage::TsQueryAst>, EvalError> {
+                Ok(match v {
+                    Value::Null => None,
+                    Value::TsQuery(ast) => Some(ast.clone()),
+                    Value::Text(s) => {
+                        Some(super::textsearch::decode_tsquery_external(s.as_ref())?)
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "tsquery_phrase() needs tsquery, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                })
             };
-            let q2 = match &args[1] {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s.as_ref(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "tsquery_phrase() needs tsquery text, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+            let (Some(a1), Some(a2)) = (ast_of(&args[0])?, ast_of(&args[1])?) else {
+                return Ok(Value::Null);
             };
             let distance = match args.get(2) {
                 None => 1i64,
@@ -13195,12 +13193,14 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let joined = if distance == 1 {
-                alloc::format!("{q1} <-> {q2}")
-            } else {
-                alloc::format!("{q1} <{distance}> {q2}")
-            };
-            Ok(Value::text(joined))
+            let dist = u16::try_from(distance).map_err(|_| EvalError::TypeMismatch {
+                detail: alloc::format!("tsquery_phrase(): distance {distance} out of range"),
+            })?;
+            Ok(Value::TsQuery(spg_storage::TsQueryAst::Phrase {
+                left: alloc::boxed::Box::new(a1),
+                right: alloc::boxed::Box::new(a2),
+                distance: dist,
+            }))
         }
         // v7.14.0 — PG dump preamble emits
         // `SELECT pg_catalog.set_config('search_path', '', false);`
