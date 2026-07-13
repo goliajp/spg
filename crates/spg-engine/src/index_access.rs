@@ -476,6 +476,27 @@ fn parse_range_bounds(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
+    let bounds = parse_range_bounds_inner(where_expr, schema_cols, table_alias)?;
+    // v7.39 (enum order knife) — the index orders enum labels
+    // lexicographically but PG's enum order is the catalog member order,
+    // so a range walk would under-select (and the caller's WHERE re-eval
+    // cannot restore missing rows). Bail to a seq scan, whose Binary
+    // comparisons are member-order aware. Eq / IN-list seeks stay: label
+    // equality is exact.
+    if schema_cols
+        .get(bounds.0)
+        .is_some_and(|c| c.user_enum_type.is_some())
+    {
+        return None;
+    }
+    Some(bounds)
+}
+
+fn parse_range_bounds_inner(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
     let Expr::Binary {
         lhs,
         op: BinOp::And,

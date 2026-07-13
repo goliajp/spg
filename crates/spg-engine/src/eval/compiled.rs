@@ -215,12 +215,27 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             None => steps.push(Step::Subtree(e.clone())),
         },
         Expr::Binary { lhs, op, rhs } => {
-            compile_into(lhs, ctx, steps);
-            compile_into(rhs, ctx, steps);
             let cmp = matches!(
                 op,
                 BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
             );
+            // v7.39 (enum order knife) — an enum-witnessed comparison must
+            // order by catalog member order; the VM's value-level compare
+            // cannot. Fall back to the tree evaluator for this subtree
+            // (compile-time check, zero cost when the catalog has no
+            // enum types).
+            if cmp
+                && ctx
+                    .catalog
+                    .is_some_and(|cat| !cat.enum_types().is_empty())
+                && (crate::eval::expr_enum_labels(lhs, ctx.columns, ctx.catalog).is_some()
+                    || crate::eval::expr_enum_labels(rhs, ctx.columns, ctx.catalog).is_some())
+            {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            compile_into(lhs, ctx, steps);
+            compile_into(rhs, ctx, steps);
             let ci = cmp
                 && (matches!(
                     column_collation(lhs, ctx),

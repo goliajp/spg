@@ -558,22 +558,90 @@ fn apply_enum_cast<'a>(
 /// enum, letting the generic function path produce its usual error.
 /// Out-of-line (`inline(never)`) so the sizable locals don't land in
 /// `eval_expr`'s recursion frame.
-/// Enum-ness lives outside the DataType lattice, so scan the argument
-/// ASTs for an explicit `::enumtype` cast or an enum-typed column.
+/// Enum-ness lives outside the DataType lattice: the witness for "this
+/// expression is enum-typed" is an explicit `::enumtype` cast or a column
+/// whose `ColumnSchema.user_enum_type` is set.
+fn expr_enum_type_name<'e>(e: &'e Expr, columns: &'e [ColumnSchema]) -> Option<&'e str> {
+    match e {
+        Expr::Cast {
+            target: CastTarget::Named(n),
+            ..
+        } => Some(n.as_str()),
+        Expr::Column(c) => columns
+            .iter()
+            .find(|col| col.name == c.name)
+            .and_then(|col| col.user_enum_type.as_deref()),
+        _ => None,
+    }
+}
+
+/// v7.39 (enum order knife) — the member-label list for an enum-typed
+/// expression, or None when the expression carries no enum witness or the
+/// name is not a known enum. The returned slice borrows the catalog.
+pub(crate) fn expr_enum_labels<'c>(
+    e: &Expr,
+    columns: &[ColumnSchema],
+    catalog: Option<&'c spg_storage::Catalog>,
+) -> Option<&'c [String]> {
+    let name = expr_enum_type_name(e, columns)?;
+    catalog
+        .and_then(|cat| cat.enum_types().get(name))
+        .map(|en| en.labels.as_slice())
+}
+
+/// v7.39 (enum order knife) — compare two enum labels by member order.
+/// None when either side is not Text or not a member (caller falls back to
+/// the generic comparison, so a stray value never panics or misorders
+/// silently differently from before).
+pub(crate) fn enum_ord_cmp(
+    labels: &[String],
+    a: &Value<'_>,
+    b: &Value<'_>,
+) -> Option<core::cmp::Ordering> {
+    let pos = |v: &Value<'_>| -> Option<usize> {
+        match v {
+            Value::Text(s) => labels.iter().position(|l| l.as_str() == s.as_ref()),
+            _ => None,
+        }
+    };
+    Some(pos(a)?.cmp(&pos(b)?))
+}
+
+/// v7.39 (enum order knife) — Binary-comparison hook: when either side's
+/// static type witnesses an enum and both runtime values are member labels,
+/// compare by member order (PG's enumsortorder semantics). Out-of-line to
+/// keep `eval_expr`'s recursion frame small.
+#[inline(never)]
+fn enum_compare_hook(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: &Value<'_>,
+    r: &Value<'_>,
+    ctx: &EvalContext<'_>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    let cat = ctx.catalog?;
+    if cat.enum_types().is_empty() {
+        return None;
+    }
+    let labels = expr_enum_labels(lhs, ctx.columns, ctx.catalog)
+        .or_else(|| expr_enum_labels(rhs, ctx.columns, ctx.catalog))?;
+    let ord = enum_ord_cmp(labels, l, r)?;
+    let b = match op {
+        BinOp::Eq => ord == core::cmp::Ordering::Equal,
+        BinOp::NotEq => ord != core::cmp::Ordering::Equal,
+        BinOp::Lt => ord == core::cmp::Ordering::Less,
+        BinOp::LtEq => ord != core::cmp::Ordering::Greater,
+        BinOp::Gt => ord == core::cmp::Ordering::Greater,
+        BinOp::GtEq => ord != core::cmp::Ordering::Less,
+        _ => return None,
+    };
+    Some(Ok(Value::Bool(b)))
+}
+
 fn enum_arg_type_name<'e>(args: &'e [Expr], ctx: &EvalContext<'e>) -> Option<&'e str> {
     args.iter()
-        .find_map(|a| match a {
-            Expr::Cast {
-                target: CastTarget::Named(n),
-                ..
-            } => Some(n.as_str()),
-            Expr::Column(c) => ctx
-                .columns
-                .iter()
-                .find(|col| col.name == c.name)
-                .and_then(|col| col.user_enum_type.as_deref()),
-            _ => None,
-        })
+        .find_map(|a| expr_enum_type_name(a, ctx.columns))
         .filter(|n| {
             ctx.catalog
                 .is_some_and(|cat| cat.enum_types().contains_key(*n))
@@ -1306,7 +1374,35 @@ fn eval_function_call_arm(
     }
     let evaluated: Result<Vec<Value<'static>>, _> =
         args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-    apply_function(name, &evaluated?, ctx)
+    let evaluated = evaluated?;
+    // v7.39 (enum order knife) — greatest/least over enum-typed arguments
+    // pick by member order, not label text (PG). The witness needs the arg
+    // ASTs, so this can't live in the value-level function dispatch.
+    if (name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least"))
+        && let Some(labels) = args
+            .iter()
+            .find_map(|a| expr_enum_labels(a, ctx.columns, ctx.catalog))
+        && evaluated
+            .iter()
+            .all(|v| matches!(v, Value::Text(_) | Value::Null))
+    {
+        let is_greatest = name.eq_ignore_ascii_case("greatest");
+        let mut best: Option<&Value<'static>> = None;
+        for v in evaluated.iter().filter(|v| !matches!(v, Value::Null)) {
+            best = Some(match best {
+                None => v,
+                Some(b) => match enum_ord_cmp(labels, v, b) {
+                    Some(core::cmp::Ordering::Greater) if is_greatest => v,
+                    Some(core::cmp::Ordering::Less) if !is_greatest => v,
+                    Some(_) => b,
+                    // A non-member snuck in — fall out to the generic path.
+                    None => return apply_function(name, &evaluated, ctx),
+                },
+            });
+        }
+        return Ok(best.cloned().unwrap_or(Value::Null));
+    }
+    apply_function(name, &evaluated, ctx)
 }
 
 
@@ -1828,6 +1924,16 @@ pub fn eval_expr(
             ) {
                 let lc = eval_expr_cow(lhs, row, ctx)?;
                 let rc = eval_expr_cow(rhs, row, ctx)?;
+                // v7.39 (enum order knife) — enum-typed operands compare by
+                // member order, not label text. Cold unless both sides are
+                // Text and the catalog has enum types at all.
+                if matches!(lc.as_ref(), Value::Text(_))
+                    && matches!(rc.as_ref(), Value::Text(_))
+                    && let Some(r) =
+                        enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
+                {
+                    return r;
+                }
                 let owned_path = is_owned_compare_value(lc.as_ref())
                     || is_owned_compare_value(rc.as_ref())
                     || compare_is_case_insensitive(lhs, rhs, ctx);
