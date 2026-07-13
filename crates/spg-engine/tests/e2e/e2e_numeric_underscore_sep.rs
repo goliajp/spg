@@ -10,7 +10,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
             spg_storage::Value::BigInt(n) => n.to_string(),
             spg_storage::Value::Float(x) => x.to_string(),
             spg_storage::Value::Text(s) => s.to_string(),
-            v => format!("{v:?}"),
+            v => spg_engine::eval::value_to_text(v),
         },
         _ => panic!("expected rows"),
     }

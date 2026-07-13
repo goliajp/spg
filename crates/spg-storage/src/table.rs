@@ -2597,8 +2597,11 @@ fn validate_row_against_schema(
                 (actual, col.ty),
                 (
                     DataType::Numeric { scale: a, .. },
-                    DataType::Numeric { scale: b, .. },
-                ) if a == b
+                    DataType::Numeric { precision: bp, scale: b },
+                // v7.39 (read01 numeric.c) — same unconstrained-numeric
+                // acceptance as the insert-path check (a NumericBig VALUES
+                // cell carries its own natural scale).
+                ) if a == b || (bp == 0 && b == 0)
             );
         if !compatible {
             return Err(StorageError::TypeMismatch {

@@ -345,6 +345,9 @@ struct AggState {
     /// (aligned on the max input scale, so it stays exact — no f64).
     sum_num_scaled: i128,
     sum_num_scale: u8,
+    /// v7.39 (read01 numeric.c) — bignum spill for a sum that leaves i128;
+    /// see `SumBig`. The i128 lane freezes at zero once this engages.
+    sum_big: SumBig,
     use_numeric: bool,
     /// v7.38 (read01, T6.P3) — the NUMERIC special class of the running sum, so a
     /// NaN / ±Infinity input propagates to sum()/avg() (the finite mantissa keeps
@@ -921,6 +924,8 @@ struct FusedAcc {
     num_scaled: i128,
     num_kind: spg_storage::NumericKind,
     num_scale: u8,
+    /// v7.39 (read01 numeric.c) — bignum spill; see `SumBig`.
+    num_big: SumBig,
     use_numeric: bool,
     sum_iv_months: i64,
     sum_iv_days: i64,
@@ -1010,10 +1015,18 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
     a.sum_float += b.sum_float;
     a.use_float |= b.use_float;
     if b.use_numeric {
-        let (s, sc) =
-            crate::numeric::numeric_add(a.num_scaled, a.num_scale, b.num_scaled, b.num_scale);
-        a.num_scaled = s;
-        a.num_scale = sc;
+        // v7.39 (read01 numeric.c) — fold the shard's bignum spill first,
+        // then its i128 lane (zero if the shard promoted).
+        if let Some(bb) = &b.num_big {
+            sum_add_bignum(&mut a.num_scaled, &mut a.num_scale, &mut a.num_big, bb);
+        }
+        sum_add_exact(
+            &mut a.num_scaled,
+            &mut a.num_scale,
+            &mut a.num_big,
+            b.num_scaled,
+            b.num_scale,
+        );
         a.num_kind = fold_sum_kind(a.num_kind, b.num_kind);
         a.use_numeric = true;
     }
@@ -1047,6 +1060,7 @@ fn fill_states_from_fused(
                 state.sum_num_scaled = a.num_scaled;
                 state.sum_num_kind = a.num_kind;
                 state.sum_num_scale = a.num_scale;
+                state.sum_big = a.num_big.clone();
                 state.use_numeric = a.use_numeric;
                 state.sum_iv_months = a.sum_iv_months;
                 state.sum_iv_days = a.sum_iv_days;
@@ -1057,6 +1071,55 @@ fn fill_states_from_fused(
             }
         }
     }
+}
+
+/// v7.39 (read01 numeric.c) — the bignum spill lane of the NUMERIC sum
+/// tri-state (i128 mantissa + scale + optional BigNumeric). `None` until the
+/// i128 lane would overflow; from then on the sum lives in the spill and the
+/// i128 lane stays frozen at zero (PG's sum(numeric) never saturates).
+type SumBig = Option<alloc::boxed::Box<spg_storage::bignum::BigNumeric>>;
+
+/// Add an exact NUMERIC (mantissa × 10^-scale) into the sum tri-state.
+fn sum_add_exact(scaled: &mut i128, scale: &mut u8, big: &mut SumBig, add_scaled: i128, add_scale: u8) {
+    use spg_storage::bignum::BigNumeric;
+    if let Some(b) = big {
+        **b = b.add(&BigNumeric::from_i128(add_scaled, add_scale));
+        return;
+    }
+    match crate::numeric::numeric_add_checked(*scaled, *scale, add_scaled, add_scale) {
+        Some((s, sc)) => {
+            *scaled = s;
+            *scale = sc;
+        }
+        None => {
+            *big = Some(alloc::boxed::Box::new(
+                BigNumeric::from_i128(*scaled, *scale)
+                    .add(&BigNumeric::from_i128(add_scaled, add_scale)),
+            ));
+            *scaled = 0;
+            *scale = 0;
+        }
+    }
+}
+
+/// Add a BigNumeric input into the sum tri-state (promotes immediately).
+fn sum_add_bignum(
+    scaled: &mut i128,
+    scale: &mut u8,
+    big: &mut SumBig,
+    b_in: &spg_storage::bignum::BigNumeric,
+) {
+    use spg_storage::bignum::BigNumeric;
+    let cur = match big.take() {
+        Some(b) => *b,
+        None => {
+            let c = BigNumeric::from_i128(*scaled, *scale);
+            *scaled = 0;
+            *scale = 0;
+            c
+        }
+    };
+    *big = Some(alloc::boxed::Box::new(cur.add(b_in)));
 }
 
 /// One sum/avg accumulation step — the same variant arms (and the same
@@ -1075,9 +1138,13 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
         }
         // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
         Value::BigInt(n) => {
-            let (s, sc) = crate::numeric::numeric_add(a.num_scaled, a.num_scale, i128::from(*n), 0);
-            a.num_scaled = s;
-            a.num_scale = sc;
+            sum_add_exact(
+                &mut a.num_scaled,
+                &mut a.num_scale,
+                &mut a.num_big,
+                i128::from(*n),
+                0,
+            );
             a.use_numeric = true;
             a.count += 1;
         }
@@ -1096,10 +1163,20 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
             scale,
             kind,
         } => {
-            let (s, sc) = crate::numeric::numeric_add(a.num_scaled, a.num_scale, *scaled, *scale);
-            a.num_scaled = s;
-            a.num_scale = sc;
+            sum_add_exact(
+                &mut a.num_scaled,
+                &mut a.num_scale,
+                &mut a.num_big,
+                *scaled,
+                *scale,
+            );
             a.num_kind = fold_sum_kind(a.num_kind, *kind);
+            a.use_numeric = true;
+            a.count += 1;
+        }
+        // v7.39 (read01 numeric.c) — a NumericBig input promotes to the spill.
+        Value::NumericBig(b) => {
+            sum_add_bignum(&mut a.num_scaled, &mut a.num_scale, &mut a.num_big, b);
             a.use_numeric = true;
             a.count += 1;
         }
@@ -1714,6 +1791,7 @@ fn accumulate_groups(
         let mut num_scaled: i128 = 0;
         let mut num_kind = spg_storage::NumericKind::Finite;
         let mut num_scale: u8 = 0;
+        let mut num_big: SumBig = None;
         let mut use_numeric = false;
         // Interval accumulator (sum/avg over an interval column).
         let mut sum_iv_months: i64 = 0;
@@ -1742,10 +1820,13 @@ fn accumulate_groups(
                     // exact NUMERIC (scale 0), matching PG (sum(bigint)/avg(bigint)
                     // → numeric) and defending the i64 sum against overflow.
                     Value::BigInt(n) => {
-                        let (s, sc) =
-                            crate::numeric::numeric_add(num_scaled, num_scale, i128::from(*n), 0);
-                        num_scaled = s;
-                        num_scale = sc;
+                        sum_add_exact(
+                            &mut num_scaled,
+                            &mut num_scale,
+                            &mut num_big,
+                            i128::from(*n),
+                            0,
+                        );
                         use_numeric = true;
                         count += 1;
                     }
@@ -1764,10 +1845,13 @@ fn accumulate_groups(
                         scale,
                         kind,
                     } => {
-                        let (s, sc) =
-                            crate::numeric::numeric_add(num_scaled, num_scale, *scaled, *scale);
-                        num_scaled = s;
-                        num_scale = sc;
+                        sum_add_exact(
+                            &mut num_scaled,
+                            &mut num_scale,
+                            &mut num_big,
+                            *scaled,
+                            *scale,
+                        );
                         num_kind = fold_sum_kind(num_kind, *kind);
                         use_numeric = true;
                         count += 1;
@@ -1781,6 +1865,13 @@ fn accumulate_groups(
                         sum_iv_days += i64::from(*days);
                         sum_iv_micros += i128::from(*micros);
                         use_interval = true;
+                        count += 1;
+                    }
+                    // v7.39 (read01 numeric.c) — a NumericBig cell promotes
+                    // the running sum to the bignum spill.
+                    Value::NumericBig(b) => {
+                        sum_add_bignum(&mut num_scaled, &mut num_scale, &mut num_big, b);
+                        use_numeric = true;
                         count += 1;
                     }
                     Value::Money(c) => {
@@ -1843,10 +1934,13 @@ fn accumulate_groups(
                     }
                     // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
                     Value::BigInt(n) => {
-                        let (s, sc) =
-                            crate::numeric::numeric_add(num_scaled, num_scale, i128::from(n), 0);
-                        num_scaled = s;
-                        num_scale = sc;
+                        sum_add_exact(
+                            &mut num_scaled,
+                            &mut num_scale,
+                            &mut num_big,
+                            i128::from(n),
+                            0,
+                        );
                         use_numeric = true;
                         count += 1;
                     }
@@ -1865,10 +1959,13 @@ fn accumulate_groups(
                         scale,
                         kind,
                     } => {
-                        let (s, sc) =
-                            crate::numeric::numeric_add(num_scaled, num_scale, scaled, scale);
-                        num_scaled = s;
-                        num_scale = sc;
+                        sum_add_exact(
+                            &mut num_scaled,
+                            &mut num_scale,
+                            &mut num_big,
+                            scaled,
+                            scale,
+                        );
                         num_kind = fold_sum_kind(num_kind, kind);
                         use_numeric = true;
                         count += 1;
@@ -1882,6 +1979,13 @@ fn accumulate_groups(
                         sum_iv_days += i64::from(days);
                         sum_iv_micros += i128::from(micros);
                         use_interval = true;
+                        count += 1;
+                    }
+                    // v7.39 (read01 numeric.c) — a NumericBig cell promotes
+                    // the running sum to the bignum spill.
+                    Value::NumericBig(ref b) => {
+                        sum_add_bignum(&mut num_scaled, &mut num_scale, &mut num_big, b);
+                        use_numeric = true;
                         count += 1;
                     }
                     Value::Money(c) => {
@@ -1905,6 +2009,7 @@ fn accumulate_groups(
         state.sum_num_scaled = num_scaled;
         state.sum_num_kind = num_kind;
         state.sum_num_scale = num_scale;
+        state.sum_big = num_big;
         state.use_numeric = use_numeric;
         state.sum_iv_months = sum_iv_months;
         state.sum_iv_days = sum_iv_days;
@@ -3574,14 +3679,13 @@ fn update_state(
                 // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
                 Value::BigInt(n) => {
                     st.use_numeric = true;
-                    let (s, sc) = crate::numeric::numeric_add(
-                        st.sum_num_scaled,
-                        st.sum_num_scale,
+                    sum_add_exact(
+                        &mut st.sum_num_scaled,
+                        &mut st.sum_num_scale,
+                        &mut st.sum_big,
                         i128::from(*n),
                         0,
                     );
-                    st.sum_num_scaled = s;
-                    st.sum_num_scale = sc;
                 }
                 Value::Float(x) => {
                     st.use_float = true;
@@ -3600,14 +3704,24 @@ fn update_state(
                 } => {
                     st.use_numeric = true;
                     st.sum_num_kind = fold_sum_kind(st.sum_num_kind, *kind);
-                    let (s, sc) = crate::numeric::numeric_add(
-                        st.sum_num_scaled,
-                        st.sum_num_scale,
+                    sum_add_exact(
+                        &mut st.sum_num_scaled,
+                        &mut st.sum_num_scale,
+                        &mut st.sum_big,
                         *scaled,
                         *scale,
                     );
-                    st.sum_num_scaled = s;
-                    st.sum_num_scale = sc;
+                }
+                // v7.39 (read01 numeric.c) — a NumericBig input promotes the
+                // running sum to the bignum spill.
+                Value::NumericBig(b) => {
+                    st.use_numeric = true;
+                    sum_add_bignum(
+                        &mut st.sum_num_scaled,
+                        &mut st.sum_num_scale,
+                        &mut st.sum_big,
+                        b,
+                    );
                 }
                 Value::Interval {
                     months,
@@ -3966,6 +4080,14 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 // v7.38 (read01, T6.P3) — a NaN / ±Infinity input propagates.
                 if st.sum_num_kind != spg_storage::NumericKind::Finite {
                     Value::numeric_special(st.sum_num_kind)
+                } else if let Some(big) = &st.sum_big {
+                    // v7.39 (read01 numeric.c) — the sum spilled past i128;
+                    // fold in the int lane and render exactly.
+                    let tot = big.add(&spg_storage::bignum::BigNumeric::from_i128(
+                        i128::from(st.sum_int),
+                        0,
+                    ));
+                    crate::eval::binop::bignum_to_value(tot)
                 } else {
                     let (scaled, scale) = crate::numeric::numeric_add(
                         st.sum_num_scaled,
@@ -4020,6 +4142,19 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 // (NaN→NaN, ±Inf→±Inf); PG matches.
                 if st.sum_num_kind != spg_storage::NumericKind::Finite {
                     Value::numeric_special(st.sum_num_kind)
+                } else if let Some(big) = &st.sum_big {
+                    // v7.39 (read01 numeric.c) — bignum avg = spilled sum /
+                    // count at PG's division display scale.
+                    use spg_storage::bignum::BigNumeric;
+                    let sum_tot =
+                        big.add(&BigNumeric::from_i128(i128::from(st.sum_int), 0));
+                    let cnt = BigNumeric::from_i128(i128::from(st.count), 0);
+                    let rscale =
+                        crate::numeric::division_display_scale_big(&sum_tot, &cnt);
+                    match sum_tot.div(&cnt, rscale) {
+                        Some(q) => crate::eval::binop::bignum_to_value(q),
+                        None => Value::Null,
+                    }
                 } else {
                     let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
                         st.sum_num_scaled,

@@ -272,6 +272,21 @@ fn check_precision(scaled: i128, precision: u8, col_name: &str) -> Result<(), En
 /// same integral-mantissa arithmetic the `+` binop does, no f64.
 /// Saturates on i128 overflow rather than panicking (extreme
 /// magnitudes are out of scope; representable-range sums are exact).
+/// v7.39 (read01 numeric.c) — overflow-honest sibling of `numeric_add`:
+/// `None` when the scale-aligned sum leaves i128, so the caller can promote
+/// to the bignum accumulator instead of saturating to a wrong value.
+pub(crate) fn numeric_add_checked(a: i128, a_scale: u8, b: i128, b_scale: u8) -> Option<(i128, u8)> {
+    if a_scale == b_scale {
+        a.checked_add(b).map(|s| (s, a_scale))
+    } else if a_scale > b_scale {
+        let f = 10i128.checked_pow(u32::from(a_scale - b_scale))?;
+        a.checked_add(b.checked_mul(f)?).map(|s| (s, a_scale))
+    } else {
+        let f = 10i128.checked_pow(u32::from(b_scale - a_scale))?;
+        a.checked_mul(f)?.checked_add(b).map(|s| (s, b_scale))
+    }
+}
+
 pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, u8) {
     if a_scale == b_scale {
         (a.saturating_add(b), a_scale)

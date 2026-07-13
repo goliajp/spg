@@ -4942,7 +4942,18 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
                 .strip_prefix("unsupported: ")
                 .or_else(|| m.strip_prefix("storage: "))
                 .or_else(|| m.strip_prefix("eval: "))
-                .or_else(|| m.strip_prefix("type mismatch: "));
+                .or_else(|| m.strip_prefix("type mismatch: "))
+                // v7.39 (read01 numeric.c) — a typed literal-overflow error
+                // can surface from the parser ("parse: parse error at token
+                // #N: value overflows numeric format").
+                .or_else(|| {
+                    let r = m.strip_prefix("parse: parse error at token #")?;
+                    let digits = r.bytes().take_while(u8::is_ascii_digit).count();
+                    if digits == 0 {
+                        return None;
+                    }
+                    r[digits..].strip_prefix(": ")
+                });
             match next {
                 Some(n) => m = n,
                 None => break,

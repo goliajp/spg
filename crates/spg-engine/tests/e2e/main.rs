@@ -238,6 +238,7 @@ mod e2e_numeric_dedup;
 mod e2e_numeric_fn_pg_differential;
 mod e2e_numeric_pg_differential;
 mod e2e_numeric_round19;
+mod e2e_numeric_round20_bignum;
 mod e2e_numeric_power;
 mod e2e_numeric_scale;
 mod e2e_numeric_scale_union;
