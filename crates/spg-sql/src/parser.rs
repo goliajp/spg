@@ -18196,7 +18196,7 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
         | "tstzrange" | "int4multirange" | "int8multirange" | "nummultirange"
         | "datemultirange" | "tsmultirange" | "tstzmultirange"
         // v7.39 (read01 round 18) — oid / name / jsonpath literal prefixes.
-        | "oid" | "name" | "jsonpath" | "pg_lsn" | "varchar" => {
+        | "oid" | "name" | "jsonpath" | "pg_lsn" | "varchar" | "text" => {
             CastTarget::Named(alloc::string::String::from(ident))
         }
         _ => return None,

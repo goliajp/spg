@@ -3458,6 +3458,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 varbit.c) — bit-string length mismatch family.
         } else if msg.contains("bit strings of different sizes") {
             "22026"
+        // v7.39 (read01 varlena.c) — 22011 SUBSTRING_ERROR.
+        } else if msg.contains("negative substring length not allowed") {
+            "22011"
         // v7.39 (read01 regexp.c) — 2201B INVALID_REGULAR_EXPRESSION.
         } else if msg.contains("invalid regular expression") {
             "2201B"
@@ -3509,6 +3512,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("ShortWord must be")
             || msg.contains("MaxFragments must be")
             || msg.contains("step size cannot equal zero")
+            || msg.contains("field position must not be zero")
             // v7.39 (read01 numeric.c) — generate_series(numeric) bound /
             // step rejections.
             || msg.contains("start value cannot be")

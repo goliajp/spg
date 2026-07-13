@@ -50,12 +50,15 @@ SELECT split_part('a,b,c', ',', -99)
 ----
 (empty)
 
-# n=0 / empty delim → error.
+# n=0 → error; an empty delimiter returns the whole string as field 1
+# (v7.39 read01 varlena.c — PG behavior; the old error pin was wrong).
 statement error
 SELECT split_part('a,b,c', ',', 0)
 
-statement error
+query T
 SELECT split_part('abc', '', 1)
+----
+abc
 
 # Delim not present.
 query T
