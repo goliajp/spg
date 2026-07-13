@@ -1773,19 +1773,60 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "WITH" | "MERGE" => spg_sql::parser::parse_statement(sql)
             .map(|stmt| command_tag_for_ast(&stmt, affected))
             .unwrap_or(first),
-        // v7.39 (read01 utils/adt, enum.c) — PG's tag for the TYPE
-        // family is two words (CREATE TYPE / ALTER TYPE / DROP TYPE);
-        // the generic first-word fallback would drop the second.
-        first @ ("CREATE" | "ALTER" | "DROP")
-            if sql
-                .trim_start()
-                .split_ascii_whitespace()
-                .nth(1)
-                .is_some_and(|w| w.eq_ignore_ascii_case("type")) =>
-        {
-            format!("{first} TYPE")
+        // v7.39 (read01 utils/adt) — PG's DDL tags are "<VERB> <OBJECT>"
+        // (CREATE TABLE / DROP INDEX / ALTER TYPE ...). Scan past the
+        // modifier words (UNIQUE / OR REPLACE / TEMP / IF EXISTS ...) to
+        // the object keyword; USER tags as ROLE (PG's alias), MATERIALIZED
+        // as MATERIALIZED VIEW. CREATE MATERIALIZED VIEW is a recorded
+        // delta: PG tags it SELECT <n> (the materialised row count).
+        first @ ("CREATE" | "ALTER" | "DROP") => {
+            let object = sql.trim_start().split_ascii_whitespace().skip(1).find(|w| {
+                !w.eq_ignore_ascii_case("unique")
+                    && !w.eq_ignore_ascii_case("or")
+                    && !w.eq_ignore_ascii_case("replace")
+                    && !w.eq_ignore_ascii_case("temp")
+                    && !w.eq_ignore_ascii_case("temporary")
+                    && !w.eq_ignore_ascii_case("unlogged")
+                    && !w.eq_ignore_ascii_case("global")
+                    && !w.eq_ignore_ascii_case("local")
+                    && !w.eq_ignore_ascii_case("recursive")
+                    && !w.eq_ignore_ascii_case("concurrently")
+            });
+            const OBJECTS: &[&str] = &[
+                "TABLE",
+                "INDEX",
+                "VIEW",
+                "SEQUENCE",
+                "SCHEMA",
+                "TYPE",
+                "EXTENSION",
+                "DOMAIN",
+                "TRIGGER",
+                "FUNCTION",
+                "DATABASE",
+                "PUBLICATION",
+                "SUBSCRIPTION",
+                "POLICY",
+                "ROLE",
+            ];
+            match object {
+                Some(w) if w.eq_ignore_ascii_case("user") => format!("{first} ROLE"),
+                Some(w) if w.eq_ignore_ascii_case("materialized") && first != "CREATE" => {
+                    format!("{first} MATERIALIZED VIEW")
+                }
+                Some(w) => match OBJECTS
+                    .iter()
+                    .find(|o| w.eq_ignore_ascii_case(o))
+                {
+                    Some(o) => format!("{first} {o}"),
+                    None => first.to_string(),
+                },
+                None => first.to_string(),
+            }
         }
-        other => other.to_string(), // CREATE TABLE / DROP USER / etc.
+        "TRUNCATE" => "TRUNCATE TABLE".to_string(),
+        "REFRESH" => "REFRESH MATERIALIZED VIEW".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -3011,8 +3052,14 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         // count, no leading OID field.
         Statement::Merge(_) => format!("MERGE {affected}"),
         Statement::CreateTable(_) => "CREATE TABLE".to_string(),
+        Statement::DropTable { .. } => "DROP TABLE".to_string(),
+        Statement::AlterTable(_) => "ALTER TABLE".to_string(),
         Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
         Statement::AlterIndex(_) => "ALTER INDEX".to_string(),
+        Statement::CreateView(_) => "CREATE VIEW".to_string(),
+        Statement::DropView { .. } => "DROP VIEW".to_string(),
+        Statement::CreateSequence(_) => "CREATE SEQUENCE".to_string(),
+        Statement::Truncate { .. } => "TRUNCATE TABLE".to_string(),
         Statement::Begin => "BEGIN".to_string(),
         Statement::Commit => "COMMIT".to_string(),
         Statement::Rollback => "ROLLBACK".to_string(),
@@ -3023,8 +3070,9 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         Statement::CreateType(_) => "CREATE TYPE".to_string(),
         Statement::AlterTypeAddValue { .. } => "ALTER TYPE".to_string(),
         Statement::DropType { .. } => "DROP TYPE".to_string(),
-        Statement::CreateUser(_) => "CREATE USER".to_string(),
-        Statement::DropUser(_) => "DROP USER".to_string(),
+        // PG tags CREATE USER as CREATE ROLE (USER is the role alias).
+        Statement::CreateUser(_) => "CREATE ROLE".to_string(),
+        Statement::DropUser(_) => "DROP ROLE".to_string(),
         // v6.1.2 — PG tag for `CREATE PUBLICATION` / `DROP PUBLICATION`.
         // PG's tag does not include the publication name; we match.
         Statement::CreatePublication(_) => "CREATE PUBLICATION".to_string(),
@@ -5980,7 +6028,37 @@ mod tests {
             "ALTER TYPE"
         );
         assert_eq!(command_tag("DROP TYPE IF EXISTS mood", 0), "DROP TYPE");
-        assert_eq!(command_tag("CREATE TABLE t (id INT)", 0), "CREATE");
+        assert_eq!(command_tag("CREATE TABLE t (id INT)", 0), "CREATE TABLE");
+        assert_eq!(
+            command_tag("CREATE UNIQUE INDEX i ON t (id)", 0),
+            "CREATE INDEX"
+        );
+        assert_eq!(
+            command_tag("CREATE OR REPLACE VIEW v AS SELECT 1", 0),
+            "CREATE VIEW"
+        );
+        assert_eq!(command_tag("CREATE TEMP TABLE t (id INT)", 0), "CREATE TABLE");
+        assert_eq!(command_tag("DROP TABLE IF EXISTS t", 0), "DROP TABLE");
+        assert_eq!(command_tag("ALTER TABLE t ADD COLUMN x INT", 0), "ALTER TABLE");
+        assert_eq!(command_tag("TRUNCATE t", 0), "TRUNCATE TABLE");
+        assert_eq!(command_tag("CREATE USER u", 0), "CREATE ROLE");
+        assert_eq!(
+            command_tag("DROP MATERIALIZED VIEW m", 0),
+            "DROP MATERIALIZED VIEW"
+        );
+        // CREATE MATERIALIZED VIEW is a recorded delta (PG: SELECT <n>).
+        assert_eq!(
+            command_tag("CREATE MATERIALIZED VIEW m AS SELECT 1", 0),
+            "CREATE"
+        );
+        assert_eq!(
+            command_tag("CREATE EXTENSION pgcrypto", 0),
+            "CREATE EXTENSION"
+        );
+        assert_eq!(
+            command_tag("REFRESH MATERIALIZED VIEW m", 0),
+            "REFRESH MATERIALIZED VIEW"
+        );
     }
 
     fn read_cell(buf: &[u8]) -> &[u8] {
