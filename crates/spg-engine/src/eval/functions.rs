@@ -1446,10 +1446,13 @@ fn apply_function_dispatch(
                                 .collect();
                             Ok(Value::TextArray(keys))
                         }
+                        // v7.39 (read01 jsonfuncs.c) — PG splits the
+                        // wording by the actual type (22023).
+                        crate::json::JsonValue::Array(_) => Err(EvalError::TypeMismatch {
+                            detail: format!("cannot call {name} on an array"),
+                        }),
                         _ => Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "{name}(): expected JSON object, got other JSON type"
-                            ),
+                            detail: format!("cannot call {name} on a scalar"),
                         }),
                     }
                 }
@@ -1466,11 +1469,14 @@ fn apply_function_dispatch(
         // into nested objects + arrays). Array items are preserved
         // even if null (matches PG semantics).
         "jsonb_strip_nulls" | "json_strip_nulls" => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                    detail: format!("{name}() takes 1-2 args, got {}", args.len()),
                 });
             }
+            // v7.39 (read01 jsonfuncs.c, PG17) — optional strip_in_arrays:
+            // when true, null ELEMENTS of arrays are removed too.
+            let strip_in_arrays = matches!(args.get(1), Some(Value::Bool(true)));
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 // v7.37 D.49 — accept a TEXT arg (PG casts an unknown-type string
@@ -1480,25 +1486,30 @@ fn apply_function_dispatch(
                         crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
                             detail: format!("{name}(): JSON parse failed: {e}"),
                         })?;
-                    fn strip(v: &mut crate::json::JsonValue) {
+                    fn strip(v: &mut crate::json::JsonValue, in_arrays: bool) {
                         match v {
                             crate::json::JsonValue::Object(members) => {
                                 members.retain(
                                     |(_, val)| !matches!(val, crate::json::JsonValue::Null),
                                 );
                                 for (_, val) in members.iter_mut() {
-                                    strip(val);
+                                    strip(val, in_arrays);
                                 }
                             }
                             crate::json::JsonValue::Array(items) => {
+                                if in_arrays {
+                                    items.retain(
+                                        |it| !matches!(it, crate::json::JsonValue::Null),
+                                    );
+                                }
                                 for it in items.iter_mut() {
-                                    strip(it);
+                                    strip(it, in_arrays);
                                 }
                             }
                             _ => {}
                         }
                     }
-                    strip(&mut parsed);
+                    strip(&mut parsed, strip_in_arrays);
                     fn write_json(v: &crate::json::JsonValue, out: &mut alloc::string::String) {
                         use core::fmt::Write;
                         match v {
@@ -1720,9 +1731,16 @@ fn apply_function_dispatch(
                         crate::json::JsonValue::Array(arr) => {
                             Ok(Value::Int(arr.len() as i32))
                         }
+                        // v7.39 (read01 jsonfuncs.c) — PG: scalar vs
+                        // non-array wording (22023).
+                        crate::json::JsonValue::Object(_) => Err(EvalError::TypeMismatch {
+                            detail: alloc::string::String::from(
+                                "cannot get array length of a non-array",
+                            ),
+                        }),
                         _ => Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "{name}(): expected JSON array, got other JSON type"
+                            detail: alloc::string::String::from(
+                                "cannot get array length of a scalar",
                             ),
                         }),
                     }

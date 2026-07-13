@@ -273,6 +273,14 @@ fn parse_decimal_literal(s: &str) -> Option<(i128, u8)> {
 fn is_json_to_record_name(s: &str) -> bool {
     s.eq_ignore_ascii_case("jsonb_to_recordset")
         || s.eq_ignore_ascii_case("jsonb_to_record")
+        // v7.39 (read01 jsonfuncs.c) — the populate family with an AS
+        // column-definition list desugars identically (the record base
+        // argument only carries the type; a non-NULL base's field
+        // defaults are a recorded delta).
+        || s.eq_ignore_ascii_case("json_populate_record")
+        || s.eq_ignore_ascii_case("jsonb_populate_record")
+        || s.eq_ignore_ascii_case("json_populate_recordset")
+        || s.eq_ignore_ascii_case("jsonb_populate_recordset")
         || s.eq_ignore_ascii_case("json_to_recordset")
         || s.eq_ignore_ascii_case("json_to_record")
 }
@@ -13103,7 +13111,13 @@ impl Parser {
         };
         self.advance(); // fn name
         self.advance(); // (
-        let arg = self.parse_expr(0)?;
+        let mut arg = self.parse_expr(0)?;
+        // populate_record(base, json): the base only carries the record
+        // type here — the JSON argument is the second expression.
+        if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            arg = self.parse_expr(0)?;
+        }
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(alloc::format!(
                 "expected ')' after {fn_name}() argument, got {:?}",
