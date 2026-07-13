@@ -101,8 +101,8 @@ use conversions::*;
 pub use conversions::{
     format_bigint_2d_text_pub, format_bit_string, format_circle, format_hstore_text, format_inet,
     format_int_2d_text_pub, format_line, format_lseg, format_macaddr, format_macaddr8,
-    format_multirange, format_path, format_pg_box, format_point, format_polygon, format_range_text,
-    format_text_2d_text_pub,
+    format_multirange, format_path, format_pg_box, format_pg_lsn, format_point, format_polygon,
+    format_range_text, format_text_2d_text_pub,
 };
 pub(crate) use ddl::{
     canonicalize_set_value, enforce_enum_label, eval_runtime_default_free,

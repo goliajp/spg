@@ -149,6 +149,16 @@ impl Engine {
         // generate_series in a FROM list next to other tables —
         // same row builder as the primary-position executor;
         // ordinality/alias handling mirrors the unnest arm above.
+        // v7.39 (read01 partitionfuncs.c) — FROM-position table functions.
+        if tref.table_fn_call.is_some() {
+            let (rows, mut cols) = self.table_fn_rows(tref)?;
+            for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = cols.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            return Ok((rows, cols));
+        }
         if let Some(args) = tref.generate_series_args.as_ref() {
             let (elem_dtype, rows) =
                 crate::select::generate_series_rows(args, &crate::CancelToken::none())?;
@@ -234,6 +244,7 @@ impl Engine {
         if preds.is_empty()
             || tref.unnest_expr.is_some()
             || tref.generate_series_args.is_some()
+            || tref.table_fn_call.is_some()
             || tref.lateral_subquery.is_some()
             || tref.as_of_segment.is_some()
         {

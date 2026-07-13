@@ -66,3 +66,54 @@ pub fn ancestors_of(catalog: &Catalog, name: &str) -> Vec<String> {
     }
     out
 }
+
+/// v7.39 (read01 partitionfuncs.c) — the `pg_partition_tree(name)` row
+/// set: `(relid, parentrelid, isleaf, level)`, BFS from `name` (levels
+/// relative to it). `parentrelid` is the relation's REAL parent even
+/// when the walk starts mid-tree (PG). A relation outside any
+/// partition tree — or missing — yields no rows.
+#[must_use]
+pub fn tree_of(catalog: &Catalog, name: &str) -> Vec<(String, Option<String>, bool, i64)> {
+    let Some(t) = catalog.get(name) else {
+        return Vec::new();
+    };
+    if t.schema().partition_role.is_none() {
+        return Vec::new();
+    }
+    let parent_of = |n: &str| -> Option<String> {
+        match &catalog.get(n)?.schema().partition_role {
+            Some(
+                PartitionRole::Range { parent_name, .. }
+                | PartitionRole::List { parent_name, .. }
+                | PartitionRole::Hash { parent_name, .. }
+                | PartitionRole::Default { parent_name },
+            ) => Some(parent_name.clone()),
+            _ => None,
+        }
+    };
+    let is_leaf = |n: &str| -> bool {
+        !matches!(
+            catalog.get(n).map(|t| t.schema().partition_role.clone()),
+            Some(Some(PartitionRole::Parent { .. }))
+        )
+    };
+    let all = catalog.table_names();
+    let mut out: Vec<(String, Option<String>, bool, i64)> =
+        alloc::vec![(name.to_string(), parent_of(name), is_leaf(name), 0)];
+    let mut frontier: Vec<String> = alloc::vec![name.to_string()];
+    let mut level: i64 = 0;
+    while !frontier.is_empty() && level < 256 {
+        level += 1;
+        let mut next: Vec<String> = Vec::new();
+        for cand in &all {
+            if let Some(p) = parent_of(cand) {
+                if frontier.iter().any(|f| f == &p) {
+                    out.push((cand.clone(), Some(p), is_leaf(cand), level));
+                    next.push(cand.clone());
+                }
+            }
+        }
+        frontier = next;
+    }
+    out
+}

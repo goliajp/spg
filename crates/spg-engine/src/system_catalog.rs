@@ -179,6 +179,7 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::Cidr => "cidr",
         DataType::Macaddr => "macaddr",
         DataType::Macaddr8 => "macaddr8",
+        DataType::PgLsn => "pg_lsn",
         DataType::Bit => "bit",
         DataType::BitVarying => "bit varying",
         DataType::Xml => "xml",

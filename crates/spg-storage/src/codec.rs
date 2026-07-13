@@ -904,6 +904,8 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Xml => out.push(63),
         DataType::Char1 => out.push(64),
         DataType::MoneyArray => out.push(65),
+        // v7.39 (read01 pg_lsn.c): tag 66. FILE_VERSION unchanged (additive).
+        DataType::PgLsn => out.push(66),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -1081,6 +1083,7 @@ impl Cursor<'_> {
             63 => Ok(DataType::Xml),
             64 => Ok(DataType::Char1),
             65 => Ok(DataType::MoneyArray),
+            66 => Ok(DataType::PgLsn),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1306,6 +1309,7 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         Value::Inet { .. } | Value::Cidr { .. } => 1 + 1 + 16, // family + bits + addr
         Value::Macaddr(_) => 6,
         Value::Macaddr8(_) => 8,
+        Value::PgLsn(_) => 8,
         // BitString: [u32 nbits][packed bytes].
         Value::BitString { bytes, .. } => 4 + bytes.len(),
         Value::Xml(s) => {
@@ -1857,6 +1861,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         }
         (Value::Macaddr(m), DataType::Macaddr) => out.extend_from_slice(&m[..]),
         (Value::Macaddr8(m), DataType::Macaddr8) => out.extend_from_slice(&m[..]),
+        (Value::PgLsn(l), DataType::PgLsn) => out.extend_from_slice(&l.to_le_bytes()),
         // v7.37.5 ζ-A — BitString shared codec for BIT and BIT VARYING.
         // Body: [u32 LE nbits][ceil(nbits/8) bytes packed BE-in-byte].
         (Value::BitString { nbits, bytes }, DataType::Bit)
@@ -2306,6 +2311,7 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         | Value::Cidr { .. }
         | Value::Macaddr(_)
         | Value::Macaddr8(_)
+        | Value::PgLsn(_)
         | Value::BitString { .. }
         | Value::Xml(_)
         | Value::Char1(_)
@@ -3499,6 +3505,11 @@ impl<'a> Cursor<'a> {
                 let mut m = [0u8; 6];
                 m.copy_from_slice(self.take(6)?);
                 Ok(Value::Macaddr(m))
+            }
+            DataType::PgLsn => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(self.take(8)?);
+                Ok(Value::PgLsn(u64::from_le_bytes(b)))
             }
             DataType::Macaddr8 => {
                 let mut m = [0u8; 8];

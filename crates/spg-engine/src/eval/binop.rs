@@ -419,6 +419,49 @@ pub(super) fn apply_binary(
             });
         }
     }
+    // v7.39 (read01 pg_lsn.c) — `pg_lsn ± numeric` shifts the WAL location
+    // by N bytes (commutative for +); `pg_lsn - pg_lsn` is the byte
+    // difference as numeric. Out-of-range shifts are PG's dedicated error.
+    if matches!(op, BinOp::Add | BinOp::Sub) {
+        let as_bytes = |v: &Value| -> Option<i128> {
+            match v {
+                Value::SmallInt(n) => Some(i128::from(*n)),
+                Value::Int(n) => Some(i128::from(*n)),
+                Value::BigInt(n) => Some(i128::from(*n)),
+                Value::Numeric {
+                    scaled,
+                    scale: 0,
+                    kind: spg_storage::NumericKind::Finite,
+                } => Some(*scaled),
+                _ => None,
+            }
+        };
+        if let (Value::PgLsn(a), Value::PgLsn(b)) = (&l, &r) {
+            if op == BinOp::Sub {
+                return Ok(Value::Numeric {
+                    scaled: i128::from(*a) - i128::from(*b),
+                    scale: 0,
+                    kind: spg_storage::NumericKind::Finite,
+                });
+            }
+        }
+        let shift = match (&l, &r) {
+            (Value::PgLsn(a), other) => {
+                as_bytes(other).map(|n| (*a, if op == BinOp::Sub { -n } else { n }))
+            }
+            (other, Value::PgLsn(a)) if op == BinOp::Add => as_bytes(other).map(|n| (*a, n)),
+            _ => None,
+        };
+        if let Some((base, delta)) = shift {
+            let next = i128::from(base) + delta;
+            let Ok(next) = u64::try_from(next) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "pg_lsn out of range".into(),
+                });
+            };
+            return Ok(Value::PgLsn(next));
+        }
+    }
     // PG `path + path` concatenates the two point lists (both taken open);
     // the result is an open path. Verified vs PG18.4.
     if op == BinOp::Add {
@@ -4936,6 +4979,8 @@ pub(super) fn compare(
         // (PG `macaddr_cmp` / `macaddr8_cmp`).
         (Value::Macaddr(a), Value::Macaddr(b)) => a.cmp(b),
         (Value::Macaddr8(a), Value::Macaddr8(b)) => a.cmp(b),
+        // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
+        (Value::PgLsn(a), Value::PgLsn(b)) => a.cmp(b),
         // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is

@@ -2623,6 +2623,11 @@ pub struct TableRef {
     /// `json_each` / `json_each_text`) so the executor picks the
     /// value-column rendering (JSON text vs unwrapped text).
     pub jsonb_each_text_arg: Option<(String, Box<Expr>)>,
+    /// v7.39 (read01 partitionfuncs.c) — generic FROM-position table
+    /// function channel: `(lowercase fn name, args)`. Carries
+    /// `pg_partition_tree` / `pg_partition_ancestors`; the executor
+    /// dispatches by name.
+    pub table_fn_call: Option<Box<(String, Vec<Expr>)>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -5900,6 +5905,7 @@ mod tests {
                     generate_series_args: None,
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
+                    table_fn_call: None,
                 },
                 joins: vec![],
             }),

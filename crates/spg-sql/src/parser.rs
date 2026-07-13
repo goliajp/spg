@@ -8186,6 +8186,7 @@ impl Parser {
                             generate_series_args: None,
                             lateral_subquery: Some(Box::new(head)),
                             jsonb_each_text_arg: None,
+                            table_fn_call: None,
                         },
                         joins: Vec::new(),
                     }),
@@ -8371,6 +8372,7 @@ impl Parser {
                             generate_series_args: gs,
                             lateral_subquery: None,
                             jsonb_each_text_arg: None,
+                            table_fn_call: None,
                         },
                         colname,
                     ));
@@ -12193,6 +12195,7 @@ impl Parser {
                         generate_series_args: None,
                         lateral_subquery: None,
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
+                        table_fn_call: None,
                     },
                     joins: Vec::new(),
                 }),
@@ -12216,6 +12219,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner_select)),
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             });
         }
         // v7.37.43-T4.5 — bare `CROSS JOIN jsonb_each_text(t.col)`
@@ -12267,6 +12271,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(head)),
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             });
         }
         // v7.37.17 (17.6 siblings) — plain derived table:
@@ -12322,6 +12327,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             });
         }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
@@ -12360,6 +12366,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             });
         }
         // v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
@@ -12398,6 +12405,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
+                table_fn_call: None,
             });
         }
         // `jsonb_to_recordset(J) AS t(a int, b text)` / `jsonb_to_record`
@@ -12478,6 +12486,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             });
         }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
@@ -12570,6 +12579,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -12690,6 +12700,7 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -12743,12 +12754,26 @@ impl Parser {
                 generate_series_args: None,
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
             } else {
                 tref
             });
+        }
+        // v7.39 (read01 partitionfuncs.c) — generic FROM-position table
+        // functions dispatched by name (`pg_partition_tree('t')`,
+        // `pg_partition_ancestors('t')`). Same head-detection shape as
+        // unnest; the engine executor owns the row shape per function.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("pg_partition_tree")
+                    || s.eq_ignore_ascii_case("pg_partition_ancestors"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            // Body out-of-line — this parse sits on the FROM/subquery
+            // recursion chain (debug frame-cliff discipline).
+            return self.parse_table_fn_ref();
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
         // [, step])` set-returning source. Same shape as unnest:
@@ -12802,6 +12827,7 @@ impl Parser {
                 generate_series_args: Some(args),
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
+                table_fn_call: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -12958,6 +12984,7 @@ impl Parser {
             generate_series_args: None,
             lateral_subquery: None,
             jsonb_each_text_arg: None,
+            table_fn_call: None,
         })
     }
 
@@ -13064,6 +13091,7 @@ impl Parser {
             generate_series_args: None,
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
+            table_fn_call: None,
         }
     }
 
@@ -13192,6 +13220,7 @@ impl Parser {
                     generate_series_args: None,
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
+                    table_fn_call: None,
                 },
                 joins: Vec::new(),
             }),
@@ -13332,6 +13361,7 @@ impl Parser {
                     generate_series_args: None,
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
+                    table_fn_call: None,
                 },
                 joins: Vec::new(),
             })
@@ -13364,6 +13394,7 @@ impl Parser {
             generate_series_args: None,
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
+            table_fn_call: None,
         })
     }
 
@@ -13382,6 +13413,50 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    /// v7.39 (read01 partitionfuncs.c) — parse a FROM-position table
+    /// function reference (`pg_partition_tree('t') [AS a(c, …)]`).
+    /// Out-of-line: the caller sits on the FROM recursion chain.
+    #[inline(never)]
+    fn parse_table_fn_ref(&mut self) -> Result<TableRef, ParseError> {
+        let fn_name = match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+            _ => unreachable!("caller peeked an ident"),
+        };
+        self.advance(); // (
+        let mut args: Vec<Expr> = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                args.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' after {fn_name}() arguments, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+        let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
+        Ok(TableRef {
+            name,
+            alias: alias_ident,
+            as_of_segment: None,
+            unnest_expr: None,
+            unnest_column_aliases,
+            with_ordinality: false,
+            generate_series_args: None,
+            lateral_subquery: None,
+            jsonb_each_text_arg: None,
+            table_fn_call: Some(Box::new((fn_name, args))),
+        })
     }
 
     fn parse_optional_alias_with_columns(&mut self) -> (Option<String>, Vec<String>) {
@@ -18087,7 +18162,7 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
         | "tstzrange" | "int4multirange" | "int8multirange" | "nummultirange"
         | "datemultirange" | "tsmultirange" | "tstzmultirange"
         // v7.39 (read01 round 18) — oid / name / jsonpath literal prefixes.
-        | "oid" | "name" | "jsonpath" => {
+        | "oid" | "name" | "jsonpath" | "pg_lsn" => {
             CastTarget::Named(alloc::string::String::from(ident))
         }
         _ => return None,

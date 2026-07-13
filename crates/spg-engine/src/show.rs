@@ -403,6 +403,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Cidr => "CIDR".into(),
         DataType::Macaddr => "MACADDR".into(),
         DataType::Macaddr8 => "MACADDR8".into(),
+        DataType::PgLsn => "PG_LSN".into(),
         DataType::Bit => "BIT".into(),
         DataType::BitVarying => "VARBIT".into(),
         DataType::Xml => "XML".into(),

@@ -80,7 +80,8 @@ impl Engine {
             let is_derived = primary.lateral_subquery.is_some()
                 || primary.unnest_expr.is_some()
                 || primary.generate_series_args.is_some()
-                || primary.jsonb_each_text_arg.is_some();
+                || primary.jsonb_each_text_arg.is_some()
+                || primary.table_fn_call.is_some();
             if is_derived {
                 let (drows, dcols) = self.materialise_table_ref(primary)?;
                 schema_cols_owned = dcols;
@@ -2510,6 +2511,22 @@ impl Engine {
         if from.primary.jsonb_each_text_arg.is_some() {
             return self.exec_select_jsonb_each_text(stmt, &from.primary, cancel);
         }
+        // v7.39 (read01 partitionfuncs.c) — FROM-position table functions
+        // (pg_partition_tree / pg_partition_ancestors) dispatched by name.
+        if from.primary.table_fn_call.is_some() {
+            let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
+            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = schema_cols.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
+        }
         // v7.37.17 (17.6 siblings) — plain derived table in primary
         // position: `FROM ( SELECT … ) alias` (no joins). The inner
         // SELECT materialises once (it is uncorrelated by
@@ -2677,6 +2694,91 @@ impl Engine {
     /// e2e pins. Materialises the (key, value) pair stream into a
     /// synthetic two-column TEXT table, then routes through the
     /// regular projection / WHERE / ORDER BY pipeline.
+    /// v7.39 (read01 partitionfuncs.c) — materialise a FROM-position
+    /// table function into (rows, default schema). Dispatch by name.
+    pub(crate) fn table_fn_rows(
+        &self,
+        primary: &TableRef,
+    ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+        let (fn_name, args) = primary
+            .table_fn_call
+            .as_deref()
+            .expect("caller guards table_fn_call.is_some()");
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy_row = Row::new(alloc::vec::Vec::new());
+        let arg0: Option<Value<'static>> = match args.first() {
+            Some(e) => Some(eval::eval_expr(e, &dummy_row, &ctx).map_err(EngineError::Eval)?),
+            None => None,
+        };
+        match fn_name.as_str() {
+            "pg_partition_tree" => {
+                let cols = alloc::vec![
+                    ColumnSchema::new("relid".to_string(), DataType::Text, true),
+                    ColumnSchema::new("parentrelid".to_string(), DataType::Text, true),
+                    ColumnSchema::new("isleaf".to_string(), DataType::Bool, true),
+                    ColumnSchema::new("level".to_string(), DataType::Int, true),
+                ];
+                let Some(Value::Text(name)) = &arg0 else {
+                    // NULL (or missing) argument → zero rows (PG).
+                    return Ok((alloc::vec::Vec::new(), cols));
+                };
+                let entries =
+                    crate::partition_walks::tree_of(self.active_catalog(), name.as_ref());
+                if entries.is_empty() && self.active_catalog().get(name.as_ref()).is_none() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{name}\" does not exist"
+                    )));
+                }
+                let rows = entries
+                    .into_iter()
+                    .map(|(relid, parent, isleaf, level)| {
+                        Row::new(alloc::vec![
+                            Value::text(relid),
+                            parent.map_or(Value::Null, Value::text),
+                            Value::Bool(isleaf),
+                            #[allow(clippy::cast_possible_truncation)]
+                            Value::Int(level as i32),
+                        ])
+                    })
+                    .collect();
+                Ok((rows, cols))
+            }
+            "pg_partition_ancestors" => {
+                let cols = alloc::vec![ColumnSchema::new(
+                    "relid".to_string(),
+                    DataType::Text,
+                    true
+                )];
+                let Some(Value::Text(name)) = &arg0 else {
+                    return Ok((alloc::vec::Vec::new(), cols));
+                };
+                let cat = self.active_catalog();
+                if cat.get(name.as_ref()).is_none() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{name}\" does not exist"
+                    )));
+                }
+                // A relation outside any partition tree yields no rows (PG).
+                let in_tree = cat
+                    .get(name.as_ref())
+                    .is_some_and(|t| t.schema().partition_role.is_some());
+                let rows = if in_tree {
+                    crate::partition_walks::ancestors_of(cat, name.as_ref())
+                        .into_iter()
+                        .map(|n| Row::new(alloc::vec![Value::text(n)]))
+                        .collect()
+                } else {
+                    alloc::vec::Vec::new()
+                };
+                Ok((rows, cols))
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "table function {other}() is not supported in FROM"
+            ))),
+        }
+    }
+
     fn exec_select_jsonb_each_text(
         &self,
         stmt: &SelectStatement,
@@ -2863,7 +2965,22 @@ impl Engine {
                 col.name = new_name.clone();
             }
         }
-        let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
+        self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel)
+    }
+
+    /// v7.39 (read01 partitionfuncs.c) — shared synthetic-source SELECT
+    /// pipeline (WHERE / aggregate / projection / ORDER BY / DISTINCT /
+    /// OFFSET / LIMIT) over a pre-materialised row set. Drives the
+    /// derived-table executor and the FROM-position table functions.
+    fn exec_select_over_rows(
+        &self,
+        stmt: &SelectStatement,
+        rows: alloc::vec::Vec<Row<'static>>,
+        schema_cols: alloc::vec::Vec<ColumnSchema>,
+        alias: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let scan_ctx = self.ev_ctx(&schema_cols, Some(alias));
         // v7.37 D.21 — correlated subqueries in the WHERE / projection may
         // reference this derived table's columns (`… WHERE u.gg = t.g` where t
         // is `(VALUES …) t`). Resolve them per-row via eval_expr_with_correlated
@@ -2908,7 +3025,7 @@ impl Engine {
                 stmt,
                 &filtered_refs,
                 &schema_cols,
-                Some(&alias),
+                Some(alias),
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
@@ -2916,7 +3033,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let projection = build_projection(&stmt.items, &schema_cols, alias)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         for row in &filtered {
@@ -3093,6 +3210,7 @@ impl Engine {
             || from.primary.lateral_subquery.is_some()
             || from.primary.unnest_expr.is_some()
             || from.primary.generate_series_args.is_some()
+            || from.primary.table_fn_call.is_some()
             || from.primary.as_of_segment.is_some()
         {
             return Ok(None);
@@ -3201,6 +3319,7 @@ impl Engine {
                 || inner_from.primary.lateral_subquery.is_some()
                 || inner_from.primary.unnest_expr.is_some()
                 || inner_from.primary.generate_series_args.is_some()
+                || inner_from.primary.table_fn_call.is_some()
             {
                 return false;
             }
@@ -4748,6 +4867,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         generate_series_args: None,
         lateral_subquery: Some(alloc::boxed::Box::new(inner)),
         jsonb_each_text_arg: None,
+        table_fn_call: None,
     };
     // Outer window query over the derived rows: aggregates → __aggN column refs.
     let mut outer_items = stmt.items.clone();
@@ -5089,6 +5209,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         Value::Uuid(u) => return Ok(OrderKey::Bytes(u.to_vec())),
         Value::Macaddr(m) => return Ok(OrderKey::Bytes(m.to_vec())),
         Value::Macaddr8(m) => return Ok(OrderKey::Bytes(m.to_vec())),
+        Value::PgLsn(l) => return Ok(OrderKey::Bytes(l.to_be_bytes().to_vec())),
         Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
             let mut key = alloc::vec::Vec::with_capacity(18);
             key.push(*family);

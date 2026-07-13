@@ -1679,6 +1679,25 @@ pub fn parse_macaddr_text(s: &str) -> Option<[u8; 6]> {
 }
 
 /// v7.37.5 ζ-A — parse PG MACADDR8 text.
+/// v7.39 (read01 pg_lsn.c) — parse PG's `%X/%X` LSN form: two hex halves,
+/// each at most 8 hex digits (u32), joined `hi << 32 | lo`.
+pub fn parse_pg_lsn_text(s: &str) -> Option<u64> {
+    let t = s.trim();
+    let (hi, lo) = t.split_once('/')?;
+    if hi.is_empty() || lo.is_empty() || hi.len() > 8 || lo.len() > 8 {
+        return None;
+    }
+    let hi = u32::from_str_radix(hi, 16).ok()?;
+    let lo = u32::from_str_radix(lo, 16).ok()?;
+    Some((u64::from(hi) << 32) | u64::from(lo))
+}
+
+/// Render an LSN in PG's `%X/%X` form (uppercase hex, no zero-padding).
+#[must_use]
+pub fn format_pg_lsn(l: u64) -> alloc::string::String {
+    alloc::format!("{:X}/{:X}", l >> 32, l & 0xFFFF_FFFF)
+}
+
 pub fn parse_macaddr8_text(s: &str) -> Option<[u8; 8]> {
     let s = s.trim();
     let cleaned: alloc::string::String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
@@ -2057,6 +2076,7 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "cidr" => DataType::Cidr,
         "macaddr" => DataType::Macaddr,
         "macaddr8" => DataType::Macaddr8,
+        "pg_lsn" => DataType::PgLsn,
         "bit" => DataType::Bit,
         "varbit" | "bit varying" => DataType::BitVarying,
         "xml" => DataType::Xml,
@@ -3274,6 +3294,17 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
+        // v7.39 (read01 pg_lsn.c) — `XX/XX` hex pair, each half <= u32.
+        (Value::Text(s), DataType::PgLsn) => match parse_pg_lsn_text(&s) {
+            Some(l) => Some(Value::PgLsn(l)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type pg_lsn: \"{s}\""
+                    ),
+                }));
+            }
+        },
         (Value::Text(s), DataType::Macaddr8) => match parse_macaddr8_text(&s) {
             Some(m) => Some(Value::Macaddr8(m)),
             None => {
@@ -3350,6 +3381,7 @@ pub(crate) fn coerce_value(
         }
         (Value::Macaddr(m), DataType::Text) => Some(Value::text(format_macaddr(&m))),
         (Value::Macaddr8(m), DataType::Text) => Some(Value::text(format_macaddr8(&m))),
+        (Value::PgLsn(l), DataType::Text) => Some(Value::text(format_pg_lsn(l))),
         // MACADDR → MACADDR8: PG widens EUI-48 to EUI-64 by inserting the
         // `ff:fe` marker in the middle (08:00:2b:01:02:03 → 08:00:2b:ff:fe:01:02:03).
         (Value::Macaddr(m), DataType::Macaddr8) => Some(Value::Macaddr8([
