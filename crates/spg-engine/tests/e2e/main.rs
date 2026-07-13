@@ -162,6 +162,7 @@ mod e2e_int_to_bit;
 mod e2e_intersect_except;
 mod e2e_interval_component_arith;
 mod e2e_interval_justify;
+mod e2e_is_precedence;
 mod e2e_ipv4_mapped_ipv6;
 mod e2e_ipv6_canonical;
 mod e2e_is_bool_escape_symmetric;

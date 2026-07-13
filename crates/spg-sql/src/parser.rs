@@ -13632,6 +13632,12 @@ impl Parser {
             Xor,
             RangeAdjacent,
         }
+        // v7.39 (IS-precedence knife) — the low-precedence postfix
+        // predicates ride this existing leaf call (zero new frame slots
+        // on the nesting chain).
+        if let Some(e) = self.parse_postfix_predicate(lhs, min_prec)? {
+            return Ok(Some(e));
+        }
         let (sym, prec): (Sym, u8) = match self.peek() {
             Token::Tilde => (
                 Sym::Regex {
@@ -13744,6 +13750,334 @@ impl Parser {
             },
         };
         Ok(Some(out))
+    }
+
+
+    /// v7.39 (IS-precedence knife) — the LOW-precedence postfix
+    /// predicates, moved out of the tight postfix-cast loop: PG binds
+    /// `IS [NOT] NULL/TRUE/FALSE/UNKNOWN/DISTINCT FROM/JSON/NORMALIZED`
+    /// looser than EVERY binary operator (only NOT/AND/OR are looser),
+    /// and BETWEEN/IN/LIKE/ILIKE/SIMILAR at the comparison rung — so
+    /// `1 + 1 IS NULL` is `(1+1) IS NULL`, not `1 + (1 IS NULL)`.
+    /// Returns Ok(consumed expr) when a predicate fired, Err(expr back)
+    /// when nothing at this position belongs to the family. Out-of-line
+    /// (`inline(never)`): the caller sits on the per-nesting-level frame
+    /// chain that MAX_NEST_DEPTH is tuned against.
+    #[inline(never)]
+    fn parse_postfix_predicate(
+        &mut self,
+        lhs: &Expr,
+        min_prec: u8,
+    ) -> Result<Option<Expr>, ParseError> {
+        // Reached through try_symbol_operator (an existing leaf call of
+        // the binary loop) so NO new stack slots land on the per-nesting
+        // frame chain; the lhs clones only when a predicate actually
+        // consumes it.
+        match self.peek() {
+            Token::Is if min_prec <= 3 => {}
+            Token::Between | Token::In | Token::Like if min_prec <= 4 => {}
+            Token::Not
+                if min_prec <= 4
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Between | Token::In | Token::Like)
+                    ) => {}
+            Token::Not | Token::Ident(_)
+                if min_prec <= 4
+                    && (matches!(self.peek(), Token::Ident(s)
+                            if s.eq_ignore_ascii_case("ilike")
+                                || (s.eq_ignore_ascii_case("similar")
+                                    && matches!(self.tokens.get(self.pos + 1), Some(Token::To))))
+                        || (matches!(self.peek(), Token::Not)
+                            && matches!(self.tokens.get(self.pos + 1),
+                                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+                                    || s.eq_ignore_ascii_case("similar")))) => {}
+            _ => return Ok(None),
+        }
+        let mut expr = lhs.clone();
+        // IS family: rung 3 (NOT parses at 3, so `NOT x IS NULL` still
+        // groups as NOT (x IS NULL); AND/OR at 1-2 stay outside).
+        if min_prec <= 3 {
+        if matches!(self.peek(), Token::Is) {
+            self.advance();
+            let negated = if matches!(self.peek(), Token::Not) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            // v7.9.27b — `IS [NOT] DISTINCT FROM <rhs>`.
+            // mailrs pg_dump.
+            if matches!(self.peek(), Token::Distinct) {
+                self.advance();
+                if !matches!(self.peek(), Token::From) {
+                    return Err(self.err(format!(
+                        "expected FROM after IS{} DISTINCT, got {:?}",
+                        if negated { " NOT" } else { "" },
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                // Right-hand side: parse at the same precedence
+                // tier as comparison so `x IS DISTINCT FROM a + b`
+                // groups as `x IS DISTINCT FROM (a + b)`.
+                let rhs = self.parse_expr(4)?;
+                let op = if negated {
+                    BinOp::IsNotDistinctFrom
+                } else {
+                    BinOp::IsDistinctFrom
+                };
+                expr = Expr::Binary {
+                    op,
+                    lhs: Box::new(expr),
+                    rhs: Box::new(rhs),
+                };
+                { return Ok(Some(expr)); }
+            }
+            // v7.37.17 (17.6 siblings) — SQL:2016 / PG 16
+            // `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]`.
+            // Lowers onto pg_is_json(x, kind); NOT wraps the
+            // call in a logical negation.
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("json"))
+            {
+                self.advance(); // JSON
+                let kind = match self.peek() {
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "value" | "object" | "array" | "scalar"
+                        ) =>
+                    {
+                        let k = s.to_ascii_lowercase();
+                        self.advance();
+                        k
+                    }
+                    _ => "value".to_string(),
+                };
+                let call = Expr::FunctionCall {
+                    name: "pg_is_json".to_string(),
+                    args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
+                };
+                expr = if negated {
+                    Expr::Unary {
+                        op: UnOp::Not,
+                        expr: Box::new(call),
+                    }
+                } else {
+                    call
+                };
+                { return Ok(Some(expr)); }
+            }
+            // v7.38 (read01 sweep) — SQL:2016 `x IS [NOT] [form]
+            // NORMALIZED` (form ∈ NFC/NFD/NFKC/NFKD, default NFC).
+            // Lowers onto is_normalized(x [, 'FORM']); NOT negates.
+            {
+                let form_kw = match self.peek() {
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if matches!(
+                            s.to_ascii_uppercase().as_str(),
+                            "NFC" | "NFD" | "NFKC" | "NFKD"
+                        ) && matches!(
+                            self.tokens.get(self.pos + 1),
+                            Some(Token::Ident(n) | Token::QuotedIdent(n))
+                                if n.eq_ignore_ascii_case("normalized")
+                        ) =>
+                    {
+                        Some(s.to_ascii_uppercase())
+                    }
+                    _ => None,
+                };
+                let bare_normalized = form_kw.is_none()
+                    && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("normalized"));
+                if form_kw.is_some() || bare_normalized {
+                    if form_kw.is_some() {
+                        self.advance(); // form keyword
+                    }
+                    self.advance(); // NORMALIZED
+                    let mut args = alloc::vec![expr];
+                    if let Some(f) = form_kw {
+                        args.push(Expr::Literal(Literal::String(f)));
+                    }
+                    let call = Expr::FunctionCall {
+                        name: "is_normalized".to_string(),
+                        args,
+                    };
+                    expr = if negated {
+                        Expr::Unary {
+                            op: UnOp::Not,
+                            expr: Box::new(call),
+                        }
+                    } else {
+                        call
+                    };
+                    { return Ok(Some(expr)); }
+                }
+            }
+            // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
+            // three-valued boolean tests. IS TRUE/FALSE never
+            // return NULL, so they lower to CASE forms whose
+            // ELSE catches the NULL branch; IS UNKNOWN on a
+            // boolean is exactly IS NULL.
+            if matches!(self.peek(), Token::True | Token::False)
+                || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unknown"))
+            {
+                let tok = self.advance();
+                let test = match tok {
+                    Token::True => Some(true),
+                    Token::False => Some(false),
+                    _ => None, // UNKNOWN
+                };
+                let lowered = match test {
+                    // IS TRUE: CASE WHEN x THEN t ELSE f END —
+                    // NULL and false both land in ELSE.
+                    Some(true) => Expr::Case {
+                        operand: None,
+                        branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
+                        else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                    },
+                    // IS FALSE: CASE WHEN NOT x THEN t ELSE f
+                    // END — NOT NULL is NULL, so NULL lands in
+                    // ELSE alongside true.
+                    Some(false) => Expr::Case {
+                        operand: None,
+                        branches: alloc::vec![(
+                            Expr::Unary {
+                                op: UnOp::Not,
+                                expr: Box::new(expr),
+                            },
+                            Expr::Literal(Literal::Bool(!negated)),
+                        )],
+                        else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                    },
+                    None => Expr::IsNull {
+                        expr: Box::new(expr),
+                        negated,
+                    },
+                };
+                expr = lowered;
+                { return Ok(Some(expr)); }
+            }
+            if !matches!(self.peek(), Token::Null) {
+                return Err(self.err(format!(
+                    "expected NULL, DISTINCT, JSON, TRUE, FALSE or UNKNOWN after IS{}, got {:?}",
+                    if negated { " NOT" } else { "" },
+                    self.peek()
+                )));
+            }
+            self.advance();
+            expr = Expr::IsNull {
+                expr: Box::new(expr),
+                negated,
+            };
+            { return Ok(Some(expr)); }
+        }
+        }
+        // BETWEEN / IN / LIKE / ILIKE / SIMILAR: comparison rung.
+        if min_prec <= 4 {
+        // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
+        // Look one token ahead so a stray `NOT` not followed by any of
+        // these flows through to the early return below untouched.
+        let negated = if matches!(self.peek(), Token::Not) {
+            let next = self.tokens.get(self.pos + 1);
+            matches!(next, Some(Token::Between | Token::In | Token::Like))
+                || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+                    || s.eq_ignore_ascii_case("similar"))
+        } else {
+            false
+        };
+        if negated {
+            self.advance();
+        }
+        if matches!(self.peek(), Token::Between) {
+            expr = self.parse_between_tail(expr, negated)?;
+            { return Ok(Some(expr)); }
+        }
+        if matches!(self.peek(), Token::In) {
+            if self.suppress_in_tail && !negated {
+                // POSITION(sub IN str) — IN belongs to the
+                // enclosing function syntax; stop here.
+                { return Ok(None); }
+            }
+            expr = self.parse_in_tail(expr, negated)?;
+            { return Ok(Some(expr)); }
+        }
+        // `x [NOT] SIMILAR TO p [ESCAPE e]` — lowers onto the
+        // existing pieces: similar_to_escape converts the
+        // SQL-standard pattern to a fully anchored regex and
+        // regexp_like matches it.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
+        {
+            self.advance(); // SIMILAR
+            self.advance(); // TO
+            let pattern = self.parse_expr(5)?;
+            let mut esc_args = alloc::vec![pattern];
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                self.advance();
+                esc_args.push(self.parse_expr(5)?);
+            }
+            let call = Expr::FunctionCall {
+                name: "regexp_like".to_string(),
+                args: alloc::vec![
+                    expr,
+                    Expr::FunctionCall {
+                        name: "similar_to_escape".to_string(),
+                        args: esc_args,
+                    },
+                ],
+            };
+            expr = maybe_not(call, negated);
+            { return Ok(Some(expr)); }
+        }
+        if matches!(self.peek(), Token::Like) {
+            self.advance();
+            // `x [NOT] LIKE ANY/ALL (ARRAY[...])` — quantified LIKE.
+            if let Some(q) = self.try_like_any_all(&expr, negated, false)? {
+                expr = q;
+                { return Ok(Some(expr)); }
+            }
+            // Pattern at the same precedence as other comparison RHSes —
+            // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
+            let mut pattern = self.parse_expr(5)?;
+            // `ESCAPE 'c'` — rewrite a literal pattern to the
+            // default backslash escape at parse time. Custom
+            // escapes on non-literal patterns would need
+            // matcher support; error honestly.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                self.advance();
+                let esc = self.parse_expr(5)?;
+                pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
+            }
+            expr = Expr::Like {
+                expr: Box::new(expr),
+                pattern: Box::new(pattern),
+                negated,
+                case_insensitive: false,
+            };
+            { return Ok(Some(expr)); }
+        }
+        // v7.25 (round-17) — ILIKE: case-insensitive LIKE. The
+        // keyword reaches us as a plain identifier.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
+            self.advance();
+            if let Some(q) = self.try_like_any_all(&expr, negated, true)? {
+                expr = q;
+                { return Ok(Some(expr)); }
+            }
+            let pattern = self.parse_expr(5)?;
+            expr = Expr::Like {
+                expr: Box::new(expr),
+                pattern: Box::new(pattern),
+                negated,
+                case_insensitive: true,
+            };
+            { return Ok(Some(expr)); }
+        }
+        }
+        let _ = expr;
+        Ok(None)
     }
 
     fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
@@ -14487,280 +14821,6 @@ impl Parser {
                 expr = Expr::Cast {
                     expr: Box::new(expr),
                     target,
-                };
-                continue;
-            }
-            if matches!(self.peek(), Token::Is) {
-                self.advance();
-                let negated = if matches!(self.peek(), Token::Not) {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                // v7.9.27b — `IS [NOT] DISTINCT FROM <rhs>`.
-                // mailrs pg_dump.
-                if matches!(self.peek(), Token::Distinct) {
-                    self.advance();
-                    if !matches!(self.peek(), Token::From) {
-                        return Err(self.err(format!(
-                            "expected FROM after IS{} DISTINCT, got {:?}",
-                            if negated { " NOT" } else { "" },
-                            self.peek()
-                        )));
-                    }
-                    self.advance();
-                    // Right-hand side: parse at the same precedence
-                    // tier as comparison so `x IS DISTINCT FROM a + b`
-                    // groups as `x IS DISTINCT FROM (a + b)`.
-                    let rhs = self.parse_expr(20)?;
-                    let op = if negated {
-                        BinOp::IsNotDistinctFrom
-                    } else {
-                        BinOp::IsDistinctFrom
-                    };
-                    expr = Expr::Binary {
-                        op,
-                        lhs: Box::new(expr),
-                        rhs: Box::new(rhs),
-                    };
-                    continue;
-                }
-                // v7.37.17 (17.6 siblings) — SQL:2016 / PG 16
-                // `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]`.
-                // Lowers onto pg_is_json(x, kind); NOT wraps the
-                // call in a logical negation.
-                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("json"))
-                {
-                    self.advance(); // JSON
-                    let kind = match self.peek() {
-                        Token::Ident(s) | Token::QuotedIdent(s)
-                            if matches!(
-                                s.to_ascii_lowercase().as_str(),
-                                "value" | "object" | "array" | "scalar"
-                            ) =>
-                        {
-                            let k = s.to_ascii_lowercase();
-                            self.advance();
-                            k
-                        }
-                        _ => "value".to_string(),
-                    };
-                    let call = Expr::FunctionCall {
-                        name: "pg_is_json".to_string(),
-                        args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
-                    };
-                    expr = if negated {
-                        Expr::Unary {
-                            op: UnOp::Not,
-                            expr: Box::new(call),
-                        }
-                    } else {
-                        call
-                    };
-                    continue;
-                }
-                // v7.38 (read01 sweep) — SQL:2016 `x IS [NOT] [form]
-                // NORMALIZED` (form ∈ NFC/NFD/NFKC/NFKD, default NFC).
-                // Lowers onto is_normalized(x [, 'FORM']); NOT negates.
-                {
-                    let form_kw = match self.peek() {
-                        Token::Ident(s) | Token::QuotedIdent(s)
-                            if matches!(
-                                s.to_ascii_uppercase().as_str(),
-                                "NFC" | "NFD" | "NFKC" | "NFKD"
-                            ) && matches!(
-                                self.tokens.get(self.pos + 1),
-                                Some(Token::Ident(n) | Token::QuotedIdent(n))
-                                    if n.eq_ignore_ascii_case("normalized")
-                            ) =>
-                        {
-                            Some(s.to_ascii_uppercase())
-                        }
-                        _ => None,
-                    };
-                    let bare_normalized = form_kw.is_none()
-                        && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                            if s.eq_ignore_ascii_case("normalized"));
-                    if form_kw.is_some() || bare_normalized {
-                        if form_kw.is_some() {
-                            self.advance(); // form keyword
-                        }
-                        self.advance(); // NORMALIZED
-                        let mut args = alloc::vec![expr];
-                        if let Some(f) = form_kw {
-                            args.push(Expr::Literal(Literal::String(f)));
-                        }
-                        let call = Expr::FunctionCall {
-                            name: "is_normalized".to_string(),
-                            args,
-                        };
-                        expr = if negated {
-                            Expr::Unary {
-                                op: UnOp::Not,
-                                expr: Box::new(call),
-                            }
-                        } else {
-                            call
-                        };
-                        continue;
-                    }
-                }
-                // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
-                // three-valued boolean tests. IS TRUE/FALSE never
-                // return NULL, so they lower to CASE forms whose
-                // ELSE catches the NULL branch; IS UNKNOWN on a
-                // boolean is exactly IS NULL.
-                if matches!(self.peek(), Token::True | Token::False)
-                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unknown"))
-                {
-                    let tok = self.advance();
-                    let test = match tok {
-                        Token::True => Some(true),
-                        Token::False => Some(false),
-                        _ => None, // UNKNOWN
-                    };
-                    let lowered = match test {
-                        // IS TRUE: CASE WHEN x THEN t ELSE f END —
-                        // NULL and false both land in ELSE.
-                        Some(true) => Expr::Case {
-                            operand: None,
-                            branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
-                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                        },
-                        // IS FALSE: CASE WHEN NOT x THEN t ELSE f
-                        // END — NOT NULL is NULL, so NULL lands in
-                        // ELSE alongside true.
-                        Some(false) => Expr::Case {
-                            operand: None,
-                            branches: alloc::vec![(
-                                Expr::Unary {
-                                    op: UnOp::Not,
-                                    expr: Box::new(expr),
-                                },
-                                Expr::Literal(Literal::Bool(!negated)),
-                            )],
-                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                        },
-                        None => Expr::IsNull {
-                            expr: Box::new(expr),
-                            negated,
-                        },
-                    };
-                    expr = lowered;
-                    continue;
-                }
-                if !matches!(self.peek(), Token::Null) {
-                    return Err(self.err(format!(
-                        "expected NULL, DISTINCT, JSON, TRUE, FALSE or UNKNOWN after IS{}, got {:?}",
-                        if negated { " NOT" } else { "" },
-                        self.peek()
-                    )));
-                }
-                self.advance();
-                expr = Expr::IsNull {
-                    expr: Box::new(expr),
-                    negated,
-                };
-                continue;
-            }
-            // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
-            // Look one token ahead so a stray `NOT` not followed by any of
-            // these flows through to the early return below untouched.
-            let negated = if matches!(self.peek(), Token::Not) {
-                let next = self.tokens.get(self.pos + 1);
-                matches!(next, Some(Token::Between | Token::In | Token::Like))
-                    || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
-                        || s.eq_ignore_ascii_case("similar"))
-            } else {
-                false
-            };
-            if negated {
-                self.advance();
-            }
-            if matches!(self.peek(), Token::Between) {
-                expr = self.parse_between_tail(expr, negated)?;
-                continue;
-            }
-            if matches!(self.peek(), Token::In) {
-                if self.suppress_in_tail && !negated {
-                    // POSITION(sub IN str) — IN belongs to the
-                    // enclosing function syntax; stop here.
-                    return Ok(expr);
-                }
-                expr = self.parse_in_tail(expr, negated)?;
-                continue;
-            }
-            // `x [NOT] SIMILAR TO p [ESCAPE e]` — lowers onto the
-            // existing pieces: similar_to_escape converts the
-            // SQL-standard pattern to a fully anchored regex and
-            // regexp_like matches it.
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
-                && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
-            {
-                self.advance(); // SIMILAR
-                self.advance(); // TO
-                let pattern = self.parse_expr(5)?;
-                let mut esc_args = alloc::vec![pattern];
-                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
-                    self.advance();
-                    esc_args.push(self.parse_expr(5)?);
-                }
-                let call = Expr::FunctionCall {
-                    name: "regexp_like".to_string(),
-                    args: alloc::vec![
-                        expr,
-                        Expr::FunctionCall {
-                            name: "similar_to_escape".to_string(),
-                            args: esc_args,
-                        },
-                    ],
-                };
-                expr = maybe_not(call, negated);
-                continue;
-            }
-            if matches!(self.peek(), Token::Like) {
-                self.advance();
-                // `x [NOT] LIKE ANY/ALL (ARRAY[...])` — quantified LIKE.
-                if let Some(q) = self.try_like_any_all(&expr, negated, false)? {
-                    expr = q;
-                    continue;
-                }
-                // Pattern at the same precedence as other comparison RHSes —
-                // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
-                let mut pattern = self.parse_expr(5)?;
-                // `ESCAPE 'c'` — rewrite a literal pattern to the
-                // default backslash escape at parse time. Custom
-                // escapes on non-literal patterns would need
-                // matcher support; error honestly.
-                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
-                    self.advance();
-                    let esc = self.parse_expr(5)?;
-                    pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
-                }
-                expr = Expr::Like {
-                    expr: Box::new(expr),
-                    pattern: Box::new(pattern),
-                    negated,
-                    case_insensitive: false,
-                };
-                continue;
-            }
-            // v7.25 (round-17) — ILIKE: case-insensitive LIKE. The
-            // keyword reaches us as a plain identifier.
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
-                self.advance();
-                if let Some(q) = self.try_like_any_all(&expr, negated, true)? {
-                    expr = q;
-                    continue;
-                }
-                let pattern = self.parse_expr(5)?;
-                expr = Expr::Like {
-                    expr: Box::new(expr),
-                    pattern: Box::new(pattern),
-                    negated,
-                    case_insensitive: true,
                 };
                 continue;
             }
