@@ -2221,6 +2221,8 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "pg_lsn" => DataType::PgLsn,
         // v7.39 (read01 varbit.c) — the B'...' literal's internal target.
         "__bit_literal" => DataType::BitVarying,
+        // v7.39 (read01 xid8funcs.c) — xid/xid8 carried as bigint.
+        "xid" | "xid8" => DataType::BigInt,
         "bit" => DataType::Bit,
         "varbit" | "bit varying" => DataType::BitVarying,
         "xml" => DataType::Xml,

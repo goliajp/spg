@@ -73,14 +73,22 @@ fn ts_filter_invalid_weight_errors() {
 
 #[test]
 fn tsquery_phrase_joins() {
+    // v7.39 (read01 tsquery) — tsquery_phrase returns a tsquery value
+    // that renders as PG's canonical phrase form.
     let mut e = Engine::new();
     assert_eq!(
-        text(&first(&mut e, "SELECT tsquery_phrase('fat', 'cat')")),
-        "fat <-> cat"
+        spg_engine::eval::value_to_text(&first(
+            &mut e,
+            "SELECT tsquery_phrase('fat', 'cat')"
+        )),
+        "'fat' <-> 'cat'"
     );
     assert_eq!(
-        text(&first(&mut e, "SELECT tsquery_phrase('fat', 'cat', 10)")),
-        "fat <10> cat"
+        spg_engine::eval::value_to_text(&first(
+            &mut e,
+            "SELECT tsquery_phrase('fat', 'cat', 10)"
+        )),
+        "'fat' <10> 'cat'"
     );
 }
 
