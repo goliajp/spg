@@ -209,3 +209,79 @@ while the cat watches', to_tsquery('english','absentterm'), 'MinWords=4, MaxWord
     );
     assert_eq!(got, "The quick brown fox");
 }
+
+// v7.39 (read01, ts_headline validation) — PG validates the option list
+// instead of silently defaulting. Error texts differential-locked vs
+// PG18 (22023 for range/unknown, 22P02 for a bad integer, 42601 for a
+// malformed pair); HighlightAll's boolean reader is lenient like PG's.
+#[test]
+fn option_validation_matches_pg() {
+    let mut e = Engine::new();
+    let err = |e: &mut Engine, sql: &str| -> String {
+        format!("{}", e.execute(sql).unwrap_err())
+    };
+    assert!(
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'MinWords=10, MaxWords=5')"
+        )
+        .contains("MinWords must be less than MaxWords")
+    );
+    assert!(
+        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'MinWords=0')")
+            .contains("MinWords must be positive")
+    );
+    assert!(
+        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'ShortWord=-1')")
+            .contains("ShortWord must be >= 0")
+    );
+    assert!(
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'MaxFragments=-1')"
+        )
+        .contains("MaxFragments must be >= 0")
+    );
+    assert!(
+        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'Bogus=1')")
+            .contains("unrecognized headline parameter: \"Bogus\"")
+    );
+    assert!(
+        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'MaxWords=zzz')")
+            .contains("invalid input syntax for type integer: \"zzz\"")
+    );
+    assert!(
+        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'StartSel=')")
+            .contains("invalid parameter list format: \"StartSel=\"")
+    );
+    // Fragment mode validates the same set.
+    assert!(
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'MaxFragments=2, MinWords=0')"
+        )
+        .contains("MinWords must be positive")
+    );
+    // Valid options still work; HighlightAll reads 1/on/t/true/y/yes as
+    // true and anything else as false without erroring (PG).
+    let ok = |e: &mut Engine, sql: &str| match e.execute(sql).unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            spg_engine::eval::value_to_text(&rows[0].values[0])
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        ok(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'StartSel=\"[\", StopSel=\"]\"')"
+        ),
+        "[a] b c"
+    );
+    assert_eq!(
+        ok(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'HighlightAll=zzz')"
+        ),
+        "<b>a</b> b c"
+    );
+}

@@ -948,23 +948,92 @@ pub(super) fn fts_ts_headline(
                 });
             }
         };
+        // v7.39 (read01, ts_headline validation) — PG validates the
+        // option list instead of silently defaulting: malformed pairs
+        // are 42601, unknown keys and out-of-range values are 22023,
+        // non-integer values are 22P02 (all message-locked vs PG18).
+        let parse_int = |v: &str| -> Result<i64, EvalError> {
+            v.parse::<i64>().map_err(|_| EvalError::TypeMismatch {
+                detail: alloc::format!("invalid input syntax for type integer: {v:?}"),
+            })
+        };
+        let mut short_word_i: i64 = short_word as i64;
+        let mut max_fragments_i: i64 = 0;
+        let mut min_words_i: i64 = min_words as i64;
+        let mut max_words_i: i64 = max_words as i64;
         for pair in opts.split(',') {
-            let Some((k, v)) = pair.split_once('=') else {
+            if pair.trim().is_empty() {
                 continue;
+            }
+            let Some((k, v)) = pair.split_once('=') else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid parameter list format: {:?}",
+                        pair.trim()
+                    ),
+                });
             };
             let v = v.trim().trim_matches('"');
+            if v.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid parameter list format: {:?}",
+                        pair.trim()
+                    ),
+                });
+            }
             match k.trim().to_ascii_lowercase().as_str() {
                 "startsel" => start_sel = v.to_string(),
                 "stopsel" => stop_sel = v.to_string(),
-                "maxwords" => max_words = v.parse().unwrap_or(35),
-                "minwords" => min_words = v.parse().unwrap_or(15),
-                "maxfragments" => max_fragments = v.parse().unwrap_or(0),
-                "shortword" => short_word = v.parse().unwrap_or(3),
+                "maxwords" => max_words_i = parse_int(v)?,
+                "minwords" => min_words_i = parse_int(v)?,
+                "maxfragments" => max_fragments_i = parse_int(v)?,
+                "shortword" => short_word_i = parse_int(v)?,
                 "fragmentdelimiter" => frag_delim = v.to_string(),
-                "highlightall" => highlight_all = v.eq_ignore_ascii_case("true"),
-                _ => {}
+                // PG's boolean reader is lenient: the true spellings
+                // flip it on, anything else reads as false (no error).
+                "highlightall" => {
+                    highlight_all = matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "1" | "on" | "t" | "true" | "y" | "yes"
+                    );
+                }
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unrecognized headline parameter: {:?}",
+                            k.trim()
+                        ),
+                    });
+                }
             }
         }
+        // PG's validation order (prsd_headline / mark_hl_fragments
+        // observable behavior, both selector modes).
+        if min_words_i >= max_words_i {
+            return Err(EvalError::TypeMismatch {
+                detail: "MinWords must be less than MaxWords".into(),
+            });
+        }
+        if min_words_i <= 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: "MinWords must be positive".into(),
+            });
+        }
+        if short_word_i < 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: "ShortWord must be >= 0".into(),
+            });
+        }
+        if max_fragments_i < 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: "MaxFragments must be >= 0".into(),
+            });
+        }
+        max_words = max_words_i as usize;
+        min_words = min_words_i as usize;
+        short_word = short_word_i as usize;
+        max_fragments = max_fragments_i as usize;
     }
     // Positive query lexemes — Not subtrees excluded.
     fn collect_positive(ast: &spg_storage::TsQueryAst, out: &mut Vec<String>) {

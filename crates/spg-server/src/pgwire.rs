@@ -3413,8 +3413,18 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if msg.contains("invalid value for parameter")
             || msg.contains("is outside the valid range for parameter")
             || msg.contains("sample size must be between")
+            // v7.39 (ts_headline validation) — PG's headline option
+            // errors are 22023 INVALID_PARAMETER_VALUE.
+            || msg.contains("unrecognized headline parameter")
+            || msg.contains("MinWords must be")
+            || msg.contains("ShortWord must be")
+            || msg.contains("MaxFragments must be")
         {
             "22023"
+        // v7.39 (ts_headline validation) — a malformed key=value list is
+        // PG's 42601 SYNTAX_ERROR.
+        } else if msg.contains("invalid parameter list format") {
+            "42601"
         // v7.39 (read01 utils/adt) — PG's multidim-search refusal is
         // 0A000 FEATURE_NOT_SUPPORTED.
         } else if msg.contains("searching for elements in multidimensional arrays")
