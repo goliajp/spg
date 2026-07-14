@@ -9038,7 +9038,26 @@ impl Parser {
         // column after the function (or its AS alias). Reuses the FROM-SRF
         // machinery. Only fires with no FROM — mixed SRF over a real FROM already
         // works via the targetlist-SRF path.
-        if from.is_none() {
+        // v7.39 (read01 round 67) — the lift moves ONE SRF into FROM. With two
+        // (`SELECT generate_series(1,3), generate_series(10,11)`) PG runs them in
+        // LOCKSTEP, padding the shorter with NULLs — a shape the lift cannot
+        // express, since the lifted one becomes a scan and the other would
+        // expand per its rows (a cross product, not a zip). So when the
+        // projection holds more than one top-level function call, the lift steps
+        // aside and the engine's target-list expansion takes the whole list.
+        let fn_call_items = items
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it,
+                    SelectItem::Expr {
+                        expr: Expr::FunctionCall { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        if from.is_none() && fn_call_items <= 1 {
             let mut found: Option<(usize, TableRef, String)> = None;
             for (i, item) in items.iter().enumerate() {
                 if let SelectItem::Expr {

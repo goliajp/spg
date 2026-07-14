@@ -174,6 +174,7 @@ mod e2e_udf_query_round63;
 mod e2e_plpgsql_scalar_round64;
 mod e2e_setof_round65;
 mod e2e_return_next_round66;
+mod e2e_target_srf_round67;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;
