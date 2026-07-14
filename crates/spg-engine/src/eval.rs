@@ -1283,29 +1283,23 @@ fn eval_array_arm(
     // share a length (PG: "multidimensional arrays must have array
     // expressions with matching dimensions"). Int rows promote to
     // bigint if any row is bigint; a text row makes the whole thing text.
+    // v7.39 (read01 round 73) — a row of ANY array kind counts. Round 72 gave
+    // `ARRAY[true,false]` its real `bool[]` type, and this detector only knew
+    // Int / BigInt / Text rows — so `ARRAY[ARRAY[true,false]]` stopped being a
+    // 2-D array at all and collapsed into a 1-D text[] of rendered rows, with
+    // `[1][2]` failing outright. A regression THIS campaign introduced, caught by
+    // the very sweep that was chasing its own residual. Rows that are not
+    // int/bigint arrays render into the text 2-D form below (SPG has no bool 2-D
+    // storage variant — a recorded residual), but they stay 2-D.
     let all_arrays = !materialised.is_empty()
-        && materialised.iter().all(|v| {
-            matches!(
-                v,
-                Value::IntArray(_) | Value::BigIntArray(_) | Value::TextArray(_)
-            )
-        });
+        && materialised
+            .iter()
+            .all(|v| values::array_len(v).is_some() && !matches!(v, Value::TextArray2D(_) | Value::IntArray2D(_) | Value::BigIntArray2D(_)));
     if all_arrays {
-        let row_len = match &materialised[0] {
-            Value::IntArray(r) => r.len(),
-            Value::BigIntArray(r) => r.len(),
-            Value::TextArray(r) => r.len(),
-            _ => unreachable!(),
-        };
-        let same_len = materialised.iter().all(|v| {
-            let l = match v {
-                Value::IntArray(r) => r.len(),
-                Value::BigIntArray(r) => r.len(),
-                Value::TextArray(r) => r.len(),
-                _ => 0,
-            };
-            l == row_len
-        });
+        let row_len = values::array_len(&materialised[0]).unwrap_or(0);
+        let same_len = materialised
+            .iter()
+            .all(|v| values::array_len(v) == Some(row_len));
         if !same_len {
             return Err(EvalError::TypeMismatch {
                 detail: "multidimensional arrays must have array expressions \
@@ -1315,7 +1309,7 @@ fn eval_array_arm(
         }
         let any_text = materialised
             .iter()
-            .any(|v| matches!(v, Value::TextArray(_)));
+            .any(|v| !matches!(v, Value::IntArray(_) | Value::BigIntArray(_)));
         let any_big = materialised
             .iter()
             .any(|v| matches!(v, Value::BigIntArray(_)));
@@ -1324,13 +1318,22 @@ fn eval_array_arm(
                 .into_iter()
                 .map(|v| match v {
                     Value::TextArray(r) => r,
-                    Value::IntArray(r) => {
-                        r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
+                    // Any other element type renders into the text 2-D form,
+                    // element by element. SPG has no typed 2-D storage beyond
+                    // int / bigint / text, so a bool 2-D array IS text — and the
+                    // SCALAR rendering is the one to use: `(arr)[1][2]::text`
+                    // must read `false`, as in PG. (`pg_typeof` reporting
+                    // `text[]` rather than `boolean[]` is the recorded residual;
+                    // a typed 2-D needs new storage variants.)
+                    other => {
+                        let n = values::array_len(&other).unwrap_or(0);
+                        (0..n)
+                            .map(|i| match values::array_element_at(&other, i) {
+                                None | Some(Value::Null) => None,
+                                Some(v) => Some(value_to_text(&v)),
+                            })
+                            .collect()
                     }
-                    Value::BigIntArray(r) => {
-                        r.into_iter().map(|c| c.map(|n| n.to_string())).collect()
-                    }
-                    _ => unreachable!(),
                 })
                 .collect();
             return Ok(Value::TextArray2D(rows));
@@ -1362,7 +1365,7 @@ fn eval_array_arm(
     // degradation, not a decision: `ARRAY[true, false]` came back as `text[]`.
     // It usually LOOKED right (array_to_string renders `t` either way), which is
     // exactly what let it sit; the array FUNCTIONS are what tripped over it.
-    if let Some(v) = homogeneous_array_of(&materialised) {
+    if let Some(v) = values::homogeneous_typed_array(&materialised) {
         return Ok(v);
     }
     let mut has_text = false;
@@ -3584,51 +3587,3 @@ impl crate::Engine {
 }
 
 
-/// v7.39 (read01 round 72) — an `ARRAY[…]` of one non-numeric, non-text type
-/// (bool / date / timestamp / uuid / bytea / interval / money) keeps that type.
-/// `None` for an empty list or a mix, which falls through to the text[] path
-/// the caller had all along.
-fn homogeneous_array_of(vals: &[Value<'static>]) -> Option<Value<'static>> {
-    let first = vals.iter().find(|v| !matches!(v, Value::Null))?;
-    macro_rules! collect {
-        ($variant:ident, $pat:pat => $val:expr) => {{
-            let mut out = alloc::vec::Vec::with_capacity(vals.len());
-            for v in vals {
-                match v {
-                    Value::Null => out.push(None),
-                    $pat => out.push(Some($val)),
-                    _ => return None,
-                }
-            }
-            Some(Value::$variant(out))
-        }};
-    }
-    match first {
-        Value::Bool(_) => collect!(BoolArray, Value::Bool(b) => *b),
-        Value::Date(_) => collect!(DateArray, Value::Date(d) => *d),
-        Value::Timestamp(_) => collect!(TimestampArray, Value::Timestamp(t) => *t),
-        Value::Uuid(_) => collect!(UuidArray, Value::Uuid(u) => *u),
-        Value::Money(_) => collect!(MoneyArray, Value::Money(m) => *m),
-        Value::Bytes(_) => collect!(BytesArray, Value::Bytes(b) => b.as_ref().to_vec()),
-        Value::Interval { .. } => {
-            let mut out = alloc::vec::Vec::with_capacity(vals.len());
-            for v in vals {
-                match v {
-                    Value::Null => out.push(None),
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    } => out.push(Some(spg_storage::IntervalSpan {
-                        months: *months,
-                        days: *days,
-                        micros: *micros,
-                    })),
-                    _ => return None,
-                }
-            }
-            Some(Value::IntervalArray(out))
-        }
-        _ => None,
-    }
-}

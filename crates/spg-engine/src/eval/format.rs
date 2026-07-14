@@ -438,11 +438,37 @@ fn array_styled<T>(items: &[Option<T>], mut f: impl FnMut(&T) -> String) -> Stri
         }
         match item {
             None => out.push_str("NULL"),
-            Some(v) => out.push_str(&f(v)),
+            Some(v) => push_array_element(&mut out, &f(v)),
         }
     }
     out.push('}');
     out
+}
+
+/// v7.39 (read01 round 73) — PG's array output QUOTES an element whose text
+/// contains a delimiter, a brace, a quote, a backslash or whitespace — so an
+/// interval array reads `{"1 day",02:00:00}`, not `{1 day,02:00:00}`. This lived
+/// only in the text-array renderer; every typed array shared `array_styled`,
+/// which never quoted, because none of the types it rendered had ever produced a
+/// space. `array_agg(interval)` does — and the differential caught it the moment
+/// round 73 gave that aggregate its real element type.
+fn push_array_element(out: &mut String, s: &str) {
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.chars()
+            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        out.push_str(s);
+        return;
+    }
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
 }
 
 /// C `%.{prec}g` over an f64 — what PG's float8out/float4out emit when
