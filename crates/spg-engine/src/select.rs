@@ -2274,13 +2274,16 @@ impl Engine {
             .collect();
         // Re-evaluate ORDER BY against the source schema (pre-projection
         // so col refs by name still resolve through `scan_ctx`).
-        if !stmt.order_by.is_empty() {
+        // v7.39 (read01 round 80) — a positional key means the Nth OUTPUT
+        // column. Evaluated as an expression it is just the constant N: the same
+        // key for every row, so the sort ran and changed nothing.
+        let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
+        if !order_by.is_empty() {
             let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
                 .iter()
                 .enumerate()
                 .map(|(i, r)| -> Result<_, EngineError> {
-                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
-                        .order_by
+                    let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
                         .map(|ob| {
                             eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
@@ -2291,7 +2294,7 @@ impl Engine {
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
-                    let o = &stmt.order_by[idx];
+                    let o = &order_by[idx];
                     let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
@@ -3459,13 +3462,19 @@ impl Engine {
             .collect();
         // ORDER BY over the source rows (same shape as the other
         // synthetic-table executors).
-        if !stmt.order_by.is_empty() {
+        // v7.39 (read01 round 80) — a positional key (`ORDER BY 1`) means the Nth
+        // OUTPUT column. Evaluated as an expression, as it was here, the literal
+        // `1` is just the constant 1: the same sort key for every row, so the
+        // sort ran and changed nothing. `SELECT unnest(ARRAY['B','a','A','b'])
+        // ORDER BY 1` (which the parser turns into `SELECT * FROM unnest(…)`,
+        // landing on this executor) came back in input order.
+        let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
+        if !order_by.is_empty() {
             let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
                 .iter()
                 .enumerate()
                 .map(|(i, r)| -> Result<_, EngineError> {
-                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
-                        .order_by
+                    let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
                         .map(|ob| {
                             // v7.39 (read01 round 54) — this path builds its
@@ -3555,7 +3564,7 @@ impl Engine {
         // v7.39 (read01 round 67) — every SRF in the list, in lockstep.
         let srf_idxs = self.srf_target_idxs(&projection);
         if !srf_idxs.is_empty() {
-            let out_rows = expand_srf_row(self, &projection, &srf_idxs, &dummy_row, &ctx)?;
+            let mut rows = expand_srf_row(self, &projection, &srf_idxs, &dummy_row, &ctx)?;
             let columns: Vec<ColumnSchema> = projection
                 .into_iter()
                 .map(|p| {
@@ -3564,10 +3573,45 @@ impl Engine {
                 c
             })
                 .collect();
-            return Ok(QueryResult::Rows {
-                columns,
-                rows: out_rows,
-            });
+            // v7.39 (read01 round 80) — a FROM-less SELECT still has an ORDER BY,
+            // an OFFSET and a LIMIT, and they apply to the rows the SRF expanded
+            // to. This returned straight out of the expansion, so
+            // `SELECT unnest(ARRAY['B','a','A','b']) ORDER BY 1` came back in
+            // input order — the sort was not wrong, it never ran. (There is
+            // exactly one conceptual input row here, which is why the ordinary
+            // scan pipeline is not on this path at all.)
+            if !stmt.order_by.is_empty() {
+                let synth_ctx =
+                    EvalContext::new(&columns, None).with_catalog(self.active_catalog());
+                let resolved: Vec<spg_sql::ast::OrderBy> = stmt
+                    .order_by
+                    .iter()
+                    .map(|o| {
+                        let mut o = o.clone();
+                        if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
+                            && *n >= 1
+                            && let Ok(idx) = usize::try_from(*n - 1)
+                            && idx < columns.len()
+                        {
+                            o.expr = Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: columns[idx].name.clone(),
+                            });
+                        }
+                        o
+                    })
+                    .collect();
+                let descs: Vec<bool> = resolved.iter().map(|o| o.desc).collect();
+                let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let keys = build_order_keys(&resolved, &r, &synth_ctx)?;
+                    tagged.push((keys, r));
+                }
+                sort_by_keys(&mut tagged, &descs);
+                rows = tagged.into_iter().map(|(_, r)| r).collect();
+            }
+            apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
+            return Ok(QueryResult::Rows { columns, rows });
         }
         let mut values = Vec::with_capacity(projection.len());
         for p in &projection {
@@ -4250,6 +4294,17 @@ impl Engine {
             })
             .collect();
         let any_scalarsq_fast = scalarsq_fast.iter().any(Option::is_some);
+        // v7.39 (read01 round 80) — positional ORDER BY over a WILDCARD
+        // projection. Statement prep (`resolve_order_by_position`) can only map
+        // `ORDER BY 1` onto the first SELECT item when that item is an
+        // expression; a `*` is not one, so the literal survived to here and was
+        // evaluated as the CONSTANT 1 — the same key for every row, i.e. no sort
+        // at all. The parser rewrites `SELECT unnest(a) x` into
+        // `SELECT * FROM unnest(a) x`, so that innocuous-looking shape landed
+        // exactly here: `SELECT unnest(ARRAY['B','a','A','b']) ORDER BY 1` came
+        // back in input order. The projection is built by now, so the Nth output
+        // column is known — resolve against it.
+        let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
         // v7.37.x (docker-fair SCALARSQ attack) — early-limit gate for
         // the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
         // Hoisted above the closure so the projection-eval path can
@@ -4257,7 +4312,7 @@ impl Engine {
         // batch path scans the FULL inner table once (~5 ms for 12.5 k
         // rows) and is only a win when N outer rows is large; for small
         // LIMITed shapes a per-row PK seek (~5 µs × 100 = 500 µs) wins.
-        let early_cap: Option<usize> = if stmt.order_by.is_empty()
+        let early_cap: Option<usize> = if order_by.is_empty()
             && !stmt.distinct
             && !stmt.limit_with_ties
             && srf_position.is_none()
@@ -4276,7 +4331,7 @@ impl Engine {
         // space, not O(rows). `None` = accumulate everything (the prior
         // behaviour). The final `partial_sort_tagged(keep)` below still
         // runs and produces the identical rows.
-        let topk_stream: Option<(usize, Vec<bool>)> = if !stmt.order_by.is_empty()
+        let topk_stream: Option<(usize, Vec<bool>)> = if !order_by.is_empty()
             && !stmt.distinct
             && !stmt.limit_with_ties
             && srf_position.is_none()
@@ -4284,7 +4339,7 @@ impl Engine {
         {
             stmt.limit_literal().and_then(|l| {
                 let keep = (l as usize).saturating_add(stmt.offset_literal().unwrap_or(0) as usize);
-                (keep >= 1).then(|| (keep, stmt.order_by.iter().map(|o| o.desc).collect()))
+                (keep >= 1).then(|| (keep, order_by.iter().map(|o| o.desc).collect()))
             })
         } else {
             None
@@ -4319,14 +4374,14 @@ impl Engine {
             }
             // Under DISTINCT the keys are built AFTER the dup probe
             // (survivors only); the non-distinct order is unchanged.
-            let order_keys = if stmt.order_by.is_empty() || stmt.distinct {
+            let order_keys = if order_by.is_empty() || stmt.distinct {
                 Vec::new()
             } else {
-                build_order_keys(&stmt.order_by, row, &ctx)?
+                build_order_keys(&order_by, row, &ctx)?
             };
             if srf_position.is_some() {
-                let order_keys = if stmt.distinct && !stmt.order_by.is_empty() {
-                    build_order_keys(&stmt.order_by, row, &ctx)?
+                let order_keys = if stmt.distinct && !order_by.is_empty() {
+                    build_order_keys(&order_by, row, &ctx)?
                 } else {
                     order_keys
                 };
@@ -4384,8 +4439,8 @@ impl Engine {
                     }
                     bucket.push(tagged.len());
                 }
-                let order_keys = if stmt.distinct && !stmt.order_by.is_empty() {
-                    build_order_keys(&stmt.order_by, row, &ctx)?
+                let order_keys = if stmt.distinct && !order_by.is_empty() {
+                    build_order_keys(&order_by, row, &ctx)?
                 } else {
                     order_keys
                 };
@@ -4455,7 +4510,7 @@ impl Engine {
         // (DISTINCT already de-duped STREAMING inside process_row, so the
         // sort below only sees the u survivors and the partial-sort
         // budget applies to DISTINCT too.)
-        if !stmt.order_by.is_empty() {
+        if !order_by.is_empty() {
             // Partial-sort fast path: when LIMIT is small relative to
             // the row count, select_nth_unstable + sort just the
             // prefix is O(n + k log k) instead of O(n log n).
@@ -4474,7 +4529,7 @@ impl Engine {
                 stmt.limit_literal()
                     .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
-            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
             partial_sort_tagged(&mut tagged, keep, &descs);
         }
 
@@ -7748,6 +7803,56 @@ fn validate_aggregate_placement(stmt: &SelectStatement) -> Result<(), EngineErro
 /// rewritten to read that column, and the rewritten expression is evaluated once
 /// per output row against the input row extended with the lifted values. The
 /// lift is by VALUE, not by literal: a text[] or a jsonb keeps its type exactly.
+/// v7.39 (read01 round 80) — `ORDER BY <n>` names the Nth OUTPUT column. Three
+/// executors (the single-table scan, the synthetic-table pipeline, and the
+/// unnest FROM path) each evaluated the key as an ordinary expression, where the
+/// literal `n` is just the constant n — the same sort key for every row. The
+/// sort therefore ran and changed nothing, which is why nobody noticed: rows came
+/// back in input order, not in a wrong order. Statement prep resolves the common
+/// case, but only when the SELECT item is an expression — a `*` is not one, and
+/// `SELECT unnest(a) x` becomes `SELECT * FROM unnest(a) x`, so the everyday
+/// spelling landed on exactly the shape prep could not resolve.
+///
+/// A set-returning item is left alone: copying it into ORDER BY would make the
+/// key "the whole set", evaluated once per INPUT row.
+fn resolve_positional_order_by(
+    order_by: &[spg_sql::ast::OrderBy],
+    projection: &[ProjectedItem],
+) -> alloc::vec::Vec<spg_sql::ast::OrderBy> {
+    order_by
+        .iter()
+        .map(|o| {
+            let mut o = o.clone();
+            if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
+                && *n >= 1
+                && let Ok(idx) = usize::try_from(*n - 1)
+                && let Some(item) = projection.get(idx)
+                && !expr_contains_builtin_srf(&item.expr)
+            {
+                o.expr = item.expr.clone();
+            }
+            o
+        })
+        .collect()
+}
+
+/// v7.39 (read01 round 80) — does a BUILTIN set-returning call appear anywhere in
+/// this expression? Statement preparation (`resolve_order_by_position`) runs
+/// before any catalog is in hand, and it only needs to know "is this item's value
+/// a set", which the builtin SRFs answer syntactically.
+pub(crate) fn expr_contains_builtin_srf(e: &spg_sql::ast::Expr) -> bool {
+    let mut found = false;
+    let mut probe = e.clone();
+    crate::expr_analysis::rewrite_nodes_mut(&mut probe, &mut |n| {
+        if is_top_level_unnest(n) {
+            found = true;
+            return true;
+        }
+        false
+    });
+    found
+}
+
 fn expand_srf_row(
     engine: &Engine,
     projection: &[ProjectedItem],
