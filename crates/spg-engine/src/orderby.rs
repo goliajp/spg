@@ -639,6 +639,25 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                     if idx < s.items.len()
                         && let SelectItem::Expr { expr, alias } = &s.items[idx]
                     {
+                        // v7.39 (read01 round 80) — a SET-returning item cannot be
+                        // copied into ORDER BY. Substituting the expression makes
+                        // the sort key "the whole set", evaluated once against the
+                        // INPUT row — the same value for every row the set expands
+                        // to, so the sort silently became a no-op:
+                        // `SELECT unnest(ARRAY['B','a','A','b']) ORDER BY 1` came
+                        // back in input order. The positional key means the Nth
+                        // OUTPUT column, which after expansion is a real column;
+                        // name it instead. (Same reasoning the UNION branch below
+                        // already used, for the same reason.)
+                        if crate::select::expr_contains_builtin_srf(expr) {
+                            if let Some(name) = alias.clone() {
+                                order.expr = Expr::Column(ColumnName {
+                                    qualifier: None,
+                                    name,
+                                });
+                            }
+                            continue;
+                        }
                         order.expr = match (has_unions, alias) {
                             (true, Some(a)) => Expr::Column(ColumnName {
                                 qualifier: None,

@@ -187,6 +187,7 @@ mod e2e_json_family_round76;
 mod e2e_named_args_round77;
 mod e2e_srf_nesting_round78;
 mod e2e_math_and_placement_round79;
+mod e2e_positional_order_round80;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;
