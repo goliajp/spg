@@ -353,6 +353,8 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
         (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
+        // v7.39 (read01 char.c) — "char" orders by byte value.
+        (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
         // v7.39 (read01 ruleutils.c) — regclass orders by oid.
         (Value::RegClass(x, _), Value::RegClass(y, _)) => x.cmp(y),
         (Value::RegClass(x, _), Value::BigInt(y)) => x.cmp(y),

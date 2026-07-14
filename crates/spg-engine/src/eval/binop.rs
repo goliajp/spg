@@ -5098,6 +5098,8 @@ pub(super) fn compare(
         (Value::Macaddr8(a), Value::Macaddr8(b)) => a.cmp(b),
         // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
         (Value::PgLsn(a), Value::PgLsn(b)) => a.cmp(b),
+        // v7.39 (read01 char.c) — "char" compares by byte value.
+        (Value::Char1(a), Value::Char1(b)) => a.cmp(b),
         // v7.39 (read01 ruleutils.c) — regclass compares by oid, including
         // against the synth catalogs' plain integer oid columns.
         (Value::RegClass(a, _), Value::RegClass(b, _)) => a.cmp(b),

@@ -161,6 +161,7 @@ mod e2e_insert_default_values;
 mod e2e_insert_fewer_values;
 mod e2e_int2_arithmetic_type;
 mod e2e_int_to_bit;
+mod e2e_char_bool_round41;
 mod e2e_intersect_except;
 mod e2e_interval_array_round40;
 mod e2e_interval_component_arith;

@@ -3506,6 +3506,11 @@ pub(crate) fn coerce_value(
             }
             Some(Value::xml(s))
         }
+        // v7.39 (read01 char.c) — an integer coerces to "char" by its
+        // low byte (65::"char" = 'A'; PG's i2char/int4char).
+        (Value::Int(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
+        (Value::SmallInt(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
+        (Value::BigInt(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
         (Value::Text(s), DataType::Char1) => {
             // v7.39 (read01 utils/adt, char.c) — charin accepts the
             // `\ooo` octal form charout produces for high bytes
