@@ -297,7 +297,13 @@ impl Engine {
                 }
             }
         }
-        let ctx = EvalContext::new(&cols, Some(alias));
+        // v7.39 (read01 round 53) — carry the catalog: a WHERE conjunct pushed
+        // down into a JOIN peer's scan is evaluated HERE, and a `::regclass` /
+        // enum / composite cast in it needs the catalog to resolve. Without it
+        // `pg_class JOIN pg_index … WHERE indrelid = 't'::regclass` errored on
+        // "comparison between BigInt and Text" while the same predicate on a
+        // bare single-table SELECT worked.
+        let ctx = EvalContext::new(&cols, Some(alias)).with_catalog(self.active_catalog());
         let mut out: Vec<Row<'static>> = Vec::new();
         let push_if =
             |row: &Row<'static>, out: &mut Vec<Row<'static>>| -> Result<(), EngineError> {
@@ -504,7 +510,7 @@ impl Engine {
                 _ => {}
             }
         }
-        let ctx = EvalContext::new(cols, Some(alias));
+        let ctx = EvalContext::new(cols, Some(alias)).with_catalog(self.active_catalog());
         let keep = |row: &Row<'static>| -> Result<bool, EngineError> {
             for (i, p) in preds.iter().enumerate() {
                 // The pred that seeded the index seek is already proven
