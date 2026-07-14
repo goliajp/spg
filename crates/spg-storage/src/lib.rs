@@ -3808,6 +3808,27 @@ impl Catalog {
     /// v7.17.0 — remove a SEQUENCE by name. Returns `true` if a
     /// sequence was removed, `false` if none matched. Caller
     /// surfaces IF EXISTS semantics.
+    /// v7.39 (read01 round 49) — `ALTER SEQUENCE old RENAME TO new`.
+    /// Errors when `old` is missing or `new` is taken; the SequenceDef's own
+    /// `name` field is rewritten so it stays self-describing.
+    pub fn rename_sequence(&mut self, old: &str, new: &str) -> Result<(), StorageError> {
+        if !self.sequences.contains_key(old) {
+            return Err(StorageError::Corrupt(format!(
+                "relation {old:?} does not exist"
+            )));
+        }
+        if self.sequences.contains_key(new) {
+            return Err(StorageError::Corrupt(format!(
+                "relation {new:?} already exists"
+            )));
+        }
+        if let Some(mut def) = self.sequences.remove(old) {
+            def.name = new.to_string();
+            self.sequences.insert(new.to_string(), def);
+        }
+        Ok(())
+    }
+
     pub fn drop_sequence(&mut self, name: &str) -> bool {
         self.sequences.remove(name).is_some()
     }
@@ -4001,6 +4022,34 @@ impl Catalog {
     /// `if_not_exists` makes a duplicate a no-op; otherwise a duplicate errors.
     /// Returns `Ok(true)` if a label was added, `Ok(false)` if it already existed
     /// (only possible under `if_not_exists`).
+    /// v7.39 (read01 round 49) — `ALTER TYPE t RENAME VALUE 'old' TO 'new'`.
+    /// The parser used to swallow this form as a no-op, so the rename was
+    /// accepted and silently ignored. Renaming in place keeps the label's
+    /// sort position, which is what PG does (enumsortorder is untouched).
+    pub fn rename_enum_value(
+        &mut self,
+        type_name: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<(), StorageError> {
+        let def = self
+            .enum_types
+            .get_mut(type_name)
+            .ok_or_else(|| StorageError::Corrupt(format!("type {type_name:?} does not exist")))?;
+        if def.labels.iter().any(|l| l == new) {
+            return Err(StorageError::Corrupt(format!(
+                "enum label {new:?} already exists"
+            )));
+        }
+        let at = def.labels.iter().position(|l| l == old).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "{old:?} is not an existing enum label"
+            ))
+        })?;
+        def.labels[at] = new.to_string();
+        Ok(())
+    }
+
     pub fn add_enum_value(
         &mut self,
         type_name: &str,
@@ -4016,8 +4065,9 @@ impl Catalog {
             if if_not_exists {
                 return Ok(false);
             }
+            // v7.39 (read01 round 49) — PG wording (42710 at the wire).
             return Err(StorageError::Corrupt(format!(
-                "enum label {label:?} already exists in type {type_name:?}"
+                "enum label {label:?} already exists"
             )));
         }
         match position {

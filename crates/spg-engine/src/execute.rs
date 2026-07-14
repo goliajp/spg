@@ -1370,6 +1370,19 @@ impl Engine {
                 self.exec_drop_materialized_view(&names, if_exists)
             }
             Statement::CreateType(s) => self.exec_create_type(s),
+            Statement::AlterTypeRenameValue {
+                type_name,
+                old,
+                new,
+            } => {
+                self.active_catalog_mut()
+                    .rename_enum_value(&type_name, &old, &new)
+                    .map_err(EngineError::Storage)?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: !self.in_transaction(),
+                })
+            }
             Statement::AlterTypeAddValue {
                 type_name,
                 label,

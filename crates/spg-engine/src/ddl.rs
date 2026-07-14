@@ -325,6 +325,13 @@ impl Engine {
     fn alter_column_set_not_null(&mut self, tbl: &str, column: String) -> Result<(), EngineError> {
         // Validate no existing row holds NULL in this column
         // before flipping the flag. PG raises on first NULL hit.
+        // v7.39 (read01 round 49) — scan VISIBLE rows, not physical ones.
+        // Under in-place MVCC a DELETE leaves a tombstoned physical row
+        // behind; counting it made `DELETE FROM t; ALTER TABLE t ALTER c SET
+        // NOT NULL` fail on a table PG sees as empty (the flip-regression
+        // family: same shape as the ATTACH PARTITION empty-check and the
+        // ALTER TYPE rewrite bug).
+        let snap = self.current_snapshot();
         let table = self.active_catalog().get(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -338,11 +345,11 @@ impl Engine {
                     "column {column:?} of relation {tbl:?} does not exist"
                 ))
             })?;
-        for row in table.rows().iter() {
+        for (_, row) in table.scan_visible(&snap) {
             if matches!(row.values.get(pos), Some(spg_storage::Value::Null)) {
+                // v7.39 (read01 round 49) — PG wording (23502 at the wire).
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "ALTER COLUMN SET NOT NULL: column {column:?} contains NULL values; \
-                     run UPDATE to fill them in or drop the column first"
+                    "column {column:?} of relation {tbl:?} contains null values"
                 )));
             }
         }
@@ -3196,6 +3203,16 @@ impl Engine {
         // v7.29 (round-23a) - implicit serial sequences materialise
         // on first address, ALTER SEQUENCE included.
         self.ensure_implicit_sequence(&s.name);
+        // v7.39 (read01 round 49) — RENAME TO is its own form, not an option.
+        if let Some(new) = s.rename_to {
+            self.active_catalog_mut()
+                .rename_sequence(&s.name, &new)
+                .map_err(EngineError::Storage)?;
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: !self.in_transaction(),
+            });
+        }
         let cat = self.active_catalog_mut();
         if !cat.sequences().contains_key(&s.name) {
             if s.if_exists {

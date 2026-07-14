@@ -1936,8 +1936,15 @@ impl Engine {
             };
         // Evaluate the array expression once. Empty schema / empty
         // row — uncorrelated UNNEST cannot reference outer columns.
+        // v7.39 (read01 round 49) — the ctx must carry the catalog: the enum
+        // introspection family (enum_range / enum_first / enum_last) resolves
+        // its labels from the argument's STATIC enum type against the
+        // catalog's enum registry. Without it `unnest(enum_range(NULL::mood))`
+        // fell through to the generic arm, got NULL, and expanded to zero rows
+        // — while the bare `SELECT enum_range(NULL::mood)` (whose ctx does
+        // carry the catalog) worked.
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-        let ctx = EvalContext::new(&empty_schema, None);
+        let ctx = EvalContext::new(&empty_schema, None).with_catalog(self.active_catalog());
         let dummy_row = Row::new(alloc::vec::Vec::new());
         // v7.11.13 — unnest dispatches per array element type so
         // INT[] / BIGINT[] surface their PG types in projection.

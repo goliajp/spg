@@ -3520,6 +3520,14 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42704"
         } else if msg.contains("type \"") && msg.contains("already exists") {
             "42710"
+        // v7.39 (read01 round 49) — ALTER TYPE ADD VALUE / RENAME VALUE.
+        } else if msg.contains("enum label \"") && msg.contains("already exists") {
+            "42710"
+        } else if msg.contains("is not an existing enum label") {
+            "22023"
+        // DROP IDENTITY on a plain column.
+        } else if msg.contains("is not an identity column") {
+            "42703"
         // A duplicate relation (table / index / view / sequence) is 42P07.
         } else if msg.contains("relation \"") && msg.contains("already exists") {
             "42P07"
@@ -3601,7 +3609,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("CHECK constraint violation")
         {
             "23514"
-        } else if msg.contains("violates not-null constraint") || msg.contains("NOT NULL column") {
+        } else if msg.contains("violates not-null constraint")
+            || msg.contains("NOT NULL column")
+            // v7.39 (read01 round 49) — SET NOT NULL over existing NULLs.
+            || msg.contains("contains null values")
+        {
             "23502"
         // v7.39 (SQLSTATE fidelity) — file-access failures map like
         // PG's errcode_for_file_access(): ENOSPC/EDQUOT -> 53100
