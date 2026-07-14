@@ -773,6 +773,15 @@ pub struct Engine {
     /// All other names are accepted + recorded so PG-dump output
     /// loads, but have no behavioural effect.
     pub(crate) session_params: BTreeMap<String, String>,
+    /// v7.39 (read01 round 46) — NOTICEs raised by the statement now
+    /// executing. PG emits a NoticeResponse whenever an `IF EXISTS` /
+    /// `IF NOT EXISTS` clause makes it skip work ("table \"t\" does not
+    /// exist, skipping"). The engine appends the PG-worded text here;
+    /// the caller drains it with [`Engine::take_notices`] after each
+    /// statement (pgwire turns each into an 'N' message, embedded
+    /// callers can ignore or surface them). Cleared at the start of
+    /// every statement so a notice never leaks into the next one.
+    pending_notices: Vec<String>,
     /// v7.38 (read01 P3.12) — cumulative row-write counters feeding
     /// `pg_stat_database` (database-wide `tup_inserted` / `tup_updated` /
     /// `tup_deleted`). Bumped by the affected-row count of each successful
@@ -970,6 +979,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
@@ -1311,6 +1321,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
@@ -1408,6 +1419,7 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
+                    pending_notices: Vec::new(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,

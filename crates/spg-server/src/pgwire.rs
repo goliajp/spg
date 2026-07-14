@@ -810,6 +810,7 @@ fn handle_pg_simple_query(
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    drain_notices(state, wbuf)?;
     // v7.33 (A1) — persist the write (WAL/snapshot + audit)
     // before acking it; a durability failure surfaces as a
     // query error, never a false CommandComplete.
@@ -1045,6 +1046,7 @@ fn handle_pg_simple_query_one_into_wbuf(
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    drain_notices(state, wbuf)?;
     let result = match persist_wire_write(state, sql, &result) {
         Ok(()) => result,
         Err(e) => Err(EngineError::Unsupported(format!(
@@ -4994,6 +4996,46 @@ fn send_command_complete_select_count(out: &mut Vec<u8>, n: usize) -> std::io::R
     out.extend_from_slice(int_text);
     out.push(0);
     Ok(())
+}
+
+/// v7.39 (read01 round 46) — drain the NOTICEs the statement just executed
+/// raised and send one NoticeResponse each, ahead of the row / command reply
+/// (PG's order). Called on every simple-query path, unconditionally, so a
+/// failed statement can't leak its notices into the next one.
+fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()> {
+    let notices = match state.engine.write() {
+        Ok(mut e) => e.take_notices(),
+        Err(_) => return Ok(()),
+    };
+    for n in &notices {
+        send_notice(wbuf, n)?;
+    }
+    Ok(())
+}
+
+/// v7.39 (read01 round 46) — NoticeResponse ('N'). Same field encoding as
+/// ErrorResponse but severity NOTICE and SQLSTATE 00000
+/// (successful_completion), which is what PG sends for the `IF EXISTS` /
+/// `IF NOT EXISTS` "…, skipping" notices. `V` carries the non-localized
+/// severity PG has emitted since 9.6; libpq/psql print `NOTICE:  <msg>`.
+fn send_notice(stream: &mut dyn Write, msg: &str) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    body.push(b'S');
+    body.extend_from_slice(b"NOTICE");
+    body.push(0);
+    body.push(b'V');
+    body.extend_from_slice(b"NOTICE");
+    body.push(0);
+    body.push(b'C');
+    body.extend_from_slice(b"00000");
+    body.push(0);
+    body.push(b'M');
+    body.extend_from_slice(msg.as_bytes());
+    body.push(0);
+    body.push(0);
+    stream.write_all(b"N")?;
+    stream.write_all(&u32::try_from(body.len() + 4).unwrap_or(u32::MAX).to_be_bytes())?;
+    stream.write_all(&body)
 }
 
 fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {

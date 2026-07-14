@@ -164,6 +164,7 @@ mod e2e_int_to_bit;
 mod e2e_char_bool_round41;
 mod e2e_ddl_errors_round45;
 mod e2e_fts_default_config_round44;
+mod e2e_notices_round46;
 mod e2e_fts_tokenizer_round43;
 mod e2e_name_encoding_round42;
 mod e2e_intersect_except;
