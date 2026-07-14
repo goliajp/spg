@@ -4326,57 +4326,18 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         // when the whole group is NULL — PG would surface the
         // declared input type, but SPG hasn't yet wired the
         // aggregate's static input-type from `describe`).
+        // v7.39 (read01 round 73) — ONE builder, shared with the `ARRAY[…]`
+        // literal. This finalize used to dispatch on the first non-NULL element
+        // with arms for int and bigint and a text fallback for everything else,
+        // so `array_agg(bool_col)` came back as text[] — the same fallback-in-
+        // place-of-a-decision that rounds 71/72 dug out of the literal path and
+        // the array functions. Fifth site; now there is only one.
         "array_agg" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
-            let probe = st.items.iter().find(|v| !v.is_null());
-            match probe.and_then(spg_storage::Value::data_type) {
-                Some(DataType::Int) | Some(DataType::SmallInt) => {
-                    let items: Vec<Option<i32>> = st
-                        .items
-                        .iter()
-                        .map(|v| match v {
-                            Value::Int(n) => Some(*n),
-                            Value::SmallInt(n) => Some(i32::from(*n)),
-                            _ => None,
-                        })
-                        .collect();
-                    Value::IntArray(items)
-                }
-                Some(DataType::BigInt) => {
-                    let items: Vec<Option<i64>> = st
-                        .items
-                        .iter()
-                        .map(|v| match v {
-                            Value::BigInt(n) => Some(*n),
-                            _ => None,
-                        })
-                        .collect();
-                    Value::BigIntArray(items)
-                }
-                _ => {
-                    let items: Vec<Option<String>> = st
-                        .items
-                        .iter()
-                        .map(|v| match v {
-                            Value::Text(s) => Some(s.to_string()),
-                            Value::Null => None,
-                            // Date / Numeric / Interval / Timestamp / Uuid /
-                            // … render via the canonical PG-faithful text form
-                            // (TextArray's formatter re-quotes as needed to match
-                            // PG's `{2.5,3.5}` / `{"1 day",02:00:00}`), never a
-                            // Rust debug dump.
-                            other => Some(crate::eval::values::value_to_text(other)),
-                        })
-                        .collect();
-                    Value::TextArray(items)
-                }
-            }
+            crate::eval::values::build_array_from_values(&st.items)
         }
-        // v7.17.0 — bool_and / bool_or finalize: lazy-init pattern
-        // means `None` is exactly "empty group or all-NULL", which
-        // PG surfaces as SQL NULL.
         "bool_and" | "bool_or" => st.bool_acc.map_or(Value::Null, Value::Bool),
         // v7.32 (round-29) — variance / stddev. PG: `variance` ==
         // `var_samp`, `stddev` == `stddev_samp`. samp needs n >= 2
@@ -4627,38 +4588,9 @@ fn percentile_fraction_array(v: Option<&Value>) -> Option<Vec<Option<f64>>> {
 /// form of `percentile_disc`, whose result is an array of the ordered-column
 /// element type.
 fn values_to_array(picked: &[Value<'_>]) -> Value<'static> {
-    let probe = picked.iter().find(|v| !v.is_null());
-    match probe.and_then(spg_storage::Value::data_type) {
-        Some(DataType::Int) | Some(DataType::SmallInt) => Value::IntArray(
-            picked
-                .iter()
-                .map(|v| match v {
-                    Value::Int(n) => Some(*n),
-                    Value::SmallInt(n) => Some(i32::from(*n)),
-                    _ => None,
-                })
-                .collect(),
-        ),
-        Some(DataType::BigInt) => Value::BigIntArray(
-            picked
-                .iter()
-                .map(|v| match v {
-                    Value::BigInt(n) => Some(*n),
-                    _ => None,
-                })
-                .collect(),
-        ),
-        _ => Value::TextArray(
-            picked
-                .iter()
-                .map(|v| match v {
-                    Value::Text(s) => Some(s.to_string()),
-                    Value::Null => None,
-                    other => Some(format!("{other:?}")),
-                })
-                .collect(),
-        ),
-    }
+    let owned: alloc::vec::Vec<Value<'static>> =
+        picked.iter().map(|v| v.clone().into_owned()).collect();
+    crate::eval::values::build_array_from_values(&owned)
 }
 
 /// NUMERIC → f64 for the float-math aggregates (stddev / variance / corr /
@@ -4968,9 +4900,19 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         },
         // v7.17.0 — string_agg always returns TEXT.
         "string_agg" | "group_concat" | "xmlagg" => DataType::Text,
+        // v7.39 (read01 round 73) — the STATIC type follows the same rule the
+        // finalize does, so `pg_typeof(array_agg(b))` is `boolean[]`.
         "array_agg" => match arg_ty {
             Some(DataType::Int | DataType::SmallInt) => DataType::IntArray,
             Some(DataType::BigInt) => DataType::BigIntArray,
+            Some(DataType::Bool) => DataType::BoolArray,
+            Some(DataType::Date) => DataType::DateArray,
+            Some(DataType::Timestamp) => DataType::TimestampArray,
+            Some(DataType::Timestamptz) => DataType::TimestamptzArray,
+            Some(DataType::Uuid) => DataType::UuidArray,
+            Some(DataType::Float) => DataType::FloatArray,
+            Some(DataType::Numeric { .. }) => DataType::NumericArray,
+            Some(DataType::Bytes) => DataType::BytesArray,
             _ => DataType::TextArray,
         },
         // v7.17.0 — boolean aggregates always return BOOL (nullable

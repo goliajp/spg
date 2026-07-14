@@ -552,3 +552,151 @@ pub(super) fn array_rebuild(
         _ => None,
     }
 }
+
+
+/// v7.39 (read01 round 73) — build an array Value from a list of element values,
+/// choosing the element type PG would choose. ONE place, used by the `ARRAY[…]`
+/// literal, by `array_agg`, and by the ordered-set aggregates.
+///
+/// This is the fifth site that had been written variant by variant with a text
+/// fallback for everything it did not know (rounds 71/72 killed the first four).
+/// The rule: a homogeneous non-numeric, non-text list keeps its type; the numeric
+/// ladder unifies (float > numeric > bigint > int); anything mixed or unknown is
+/// `text[]`, which is a DECISION — PG makes the same one.
+pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static> {
+    if let Some(v) = homogeneous_typed_array(vals) {
+        return v;
+    }
+    let mut has_text = false;
+    let mut has_float = false;
+    let mut has_numeric = false;
+    let mut has_bigint = false;
+    let mut has_int = false;
+    for v in vals {
+        match v {
+            Value::Null => {}
+            Value::Int(_) | Value::SmallInt(_) => has_int = true,
+            Value::BigInt(_) => has_bigint = true,
+            Value::Numeric { .. } | Value::NumericBig(_) => has_numeric = true,
+            Value::Float(_) | Value::Real(_) => has_float = true,
+            _ => has_text = true,
+        }
+    }
+    let as_i64 = |v: &Value<'_>| -> Option<i64> {
+        match v {
+            Value::SmallInt(n) => Some(i64::from(*n)),
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            _ => None,
+        }
+    };
+    if !has_text {
+        if has_float {
+            return Value::FloatArray(
+                vals.iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Float(f) => Some(*f),
+                        Value::Real(f) => Some(f64::from(*f)),
+                        #[allow(clippy::cast_precision_loss)]
+                        Value::Numeric { scaled, scale, .. } => {
+                            Some(*scaled as f64 / libm::pow(10.0, f64::from(*scale)))
+                        }
+                        other => as_i64(other).map(|n| n as f64),
+                    })
+                    .collect(),
+            );
+        }
+        if has_numeric {
+            // A NumericBig / non-finite value cannot live in a (i128, scale)
+            // cell, so it falls through to text[] rather than losing precision.
+            if vals.iter().all(|v| {
+                matches!(
+                    v,
+                    Value::Null
+                        | Value::SmallInt(_)
+                        | Value::Int(_)
+                        | Value::BigInt(_)
+                        | Value::Numeric {
+                            kind: spg_storage::NumericKind::Finite,
+                            ..
+                        }
+                )
+            }) {
+                return Value::NumericArray(
+                    vals.iter()
+                        .map(|v| match v {
+                            Value::Null => None,
+                            Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
+                            other => as_i64(other).map(|n| (i128::from(n), 0u8)),
+                        })
+                        .collect(),
+                );
+            }
+        } else if has_bigint {
+            return Value::BigIntArray(vals.iter().map(as_i64).collect());
+        } else if has_int {
+            return Value::IntArray(
+                vals.iter()
+                    .map(|v| as_i64(v).and_then(|n| i32::try_from(n).ok()))
+                    .collect(),
+            );
+        }
+    }
+    Value::TextArray(
+        vals.iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Text(s) | Value::Json(s) => Some(s.as_ref().to_string()),
+                other => Some(crate::eval::value_to_text(other)),
+            })
+            .collect(),
+    )
+}
+
+/// An `ARRAY[…]` / `array_agg` of ONE non-numeric, non-text type keeps that
+/// type. `None` for an empty list or a mix.
+pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'static>> {
+    let first = vals.iter().find(|v| !matches!(v, Value::Null))?;
+    macro_rules! collect {
+        ($variant:ident, $pat:pat => $val:expr) => {{
+            let mut out = alloc::vec::Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => out.push(None),
+                    $pat => out.push(Some($val)),
+                    _ => return None,
+                }
+            }
+            Some(Value::$variant(out))
+        }};
+    }
+    match first {
+        Value::Bool(_) => collect!(BoolArray, Value::Bool(b) => *b),
+        Value::Date(_) => collect!(DateArray, Value::Date(d) => *d),
+        Value::Timestamp(_) => collect!(TimestampArray, Value::Timestamp(t) => *t),
+        Value::Uuid(_) => collect!(UuidArray, Value::Uuid(u) => *u),
+        Value::Money(_) => collect!(MoneyArray, Value::Money(m) => *m),
+        Value::Bytes(_) => collect!(BytesArray, Value::Bytes(b) => b.as_ref().to_vec()),
+        Value::Interval { .. } => {
+            let mut out = alloc::vec::Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => out.push(None),
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => out.push(Some(spg_storage::IntervalSpan {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    })),
+                    _ => return None,
+                }
+            }
+            Some(Value::IntervalArray(out))
+        }
+        _ => None,
+    }
+}

@@ -728,6 +728,13 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::SmallIntArray(_) => "smallint[]",
         Value::NumericArray(_) => "numeric[]",
         Value::FloatArray(_) => "double precision[]",
+        // v7.39 (read01 round 73) — the 2-D forms. Every 1-D element type already
+        // had a name (below); the multidimensional ones read as "unknown", which
+        // drivers take for "no type". PG reports the same name however many
+        // dimensions an array has — `integer[]`, not `integer[][]`.
+        Value::IntArray2D(_) => "integer[]",
+        Value::BigIntArray2D(_) => "bigint[]",
+        Value::TextArray2D(_) => "text[]",
         Value::TsVector(_) => "tsvector",
         Value::TsQuery(_) => "tsquery",
         Value::Uuid(_) => "uuid",
