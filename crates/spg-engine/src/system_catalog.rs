@@ -115,12 +115,18 @@ fn referenced_columns(t: &spg_storage::Table, check: &str) -> Vec<String> {
 pub(crate) fn pg_check_connames(
     t: &spg_storage::Table,
     tname: &str,
-    checks: &[String],
+    checks: &[spg_storage::CheckConstraint],
 ) -> Vec<String> {
     let mut seen: alloc::collections::BTreeMap<String, usize> = alloc::collections::BTreeMap::new();
     let mut out = Vec::with_capacity(checks.len());
     for chk in checks {
-        let cols = referenced_columns(t, chk);
+        // v7.39 (read01 round 48) — a user-supplied name wins; only an
+        // unnamed CHECK gets PG's synthesised `<table>_<col>_check` form.
+        if let Some(n) = &chk.name {
+            out.push(n.clone());
+            continue;
+        }
+        let cols = referenced_columns(t, &chk.expr);
         let base = if cols.len() == 1 {
             alloc::format!("{tname}_{}_check", cols[0])
         } else {
@@ -2904,7 +2910,7 @@ pub(crate) fn synth_info_check_constraints(
                 Value::text("spg"),
                 Value::text("public"),
                 Value::text(check_names[ci].clone()),
-                Value::text(clause.clone()),
+                Value::text(clause.expr.clone()),
             ]));
         }
     }

@@ -1557,8 +1557,9 @@ pub struct TableSchema {
     /// INSERT/UPDATE and evaluated against the candidate row.
     /// A false / NULL result rejects the mutation (PG semantics).
     /// Persisted in catalog FILE_VERSION 23+. Older catalogs
-    /// deserialise with an empty vec.
-    pub checks: Vec<String>,
+    /// deserialise with an empty vec. v7.39 (read01 round 48) — each entry
+    /// now carries the user's constraint name too (FILE_VERSION 60+).
+    pub checks: Vec<CheckConstraint>,
     /// v7.37.6-B — declarative partition role(sentori Epic 2 P0).
     /// `None` = 普通表(后向兼容,< v49 catalog 默认 None)。
     /// `Some(Parent { … })` = `CREATE TABLE p (...) PARTITION BY RANGE (key_col)` 父表 —
@@ -1685,6 +1686,19 @@ impl PartitionBound {
 /// on the table schema. The leading column always has a BTree
 /// index (created at CREATE TABLE time); INSERT enforcement
 /// scans that index for collisions on the full column tuple.
+/// v7.39 (read01 round 48) — a `CHECK` constraint: the SQL name the user
+/// gave it (via `ADD CONSTRAINT <name> CHECK (...)` or the inline
+/// `CONSTRAINT <name> CHECK (...)` form) plus the predicate source. `None`
+/// name = unnamed, in which case `pg_constraint` synthesises PG's
+/// `<table>_<col>_check` form. Names are persisted in the constraint-name
+/// appendix (FILE_VERSION 60+); older catalogs deserialise with `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    /// The AST Expr's `Display` form, re-parsed on every INSERT/UPDATE.
+    pub expr: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniquenessConstraint {
     /// `true` when this constraint was declared as `PRIMARY KEY`
@@ -1703,6 +1717,14 @@ pub struct UniquenessConstraint {
     /// `NULLS DISTINCT` behaviour where any NULL passes.
     /// Persisted in catalog FILE_VERSION 23+.
     pub nulls_not_distinct: bool,
+    /// v7.39 (read01 round 48) — the constraint's SQL name when the user
+    /// supplied one (`ADD CONSTRAINT <name> PRIMARY KEY/UNIQUE (...)`, or
+    /// the inline `CONSTRAINT <name>` form). `None` = unnamed, in which
+    /// case `pg_constraint` synthesises PG's `<table>_pkey` /
+    /// `<table>_<col>_key` form. DROP CONSTRAINT resolves the stored name
+    /// first and falls back to the synthesised one, so catalogs written
+    /// before this field (< FILE_VERSION 60) keep working unchanged.
+    pub name: Option<String>,
 }
 
 /// v7.6.1 — Storage-layer mirror of `spg_sql::ast::ForeignKeyConstraint`.
@@ -6298,7 +6320,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 59;
+const FILE_VERSION: u8 = 60;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -6679,7 +6701,10 @@ impl Catalog {
                 u16::try_from(t.schema.checks.len()).expect("≤ 65k CHECK constraints/table"),
             );
             for c in &t.schema.checks {
-                write_str(&mut out, c.as_str());
+                // v7.39 (read01 round 48) — the expr stays in this v23
+                // appendix (byte layout unchanged for old readers); the
+                // name rides the v60 constraint-name appendix at the tail.
+                write_str(&mut out, c.expr.as_str());
             }
             // v7.17.0 Phase 1.4 — per-table user_enum_type
             // appendix. Layout: [u16 count] then
@@ -6923,6 +6948,41 @@ impl Catalog {
                 out.extend_from_slice(&rid.0.to_le_bytes());
             }
             out.extend_from_slice(&t.next_rowid.to_le_bytes());
+            // v7.39 (read01 round 48) — constraint-name appendix
+            // (FILE_VERSION 60+). Index-aligned to the CHECK and
+            // uniqueness-constraint appendices written above, so the
+            // existing byte layouts stay untouched and a v59 catalog still
+            // decodes (its constraints just come back unnamed).
+            // Layout: [u16 check_count] then per check
+            //         [u8 has_name] ([str name] when has_name)
+            //         [u16 uc_count] then per uc the same pair.
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.checks.len()).expect("≤ 65k CHECK constraints/table"),
+            );
+            for c in &t.schema.checks {
+                match &c.name {
+                    Some(n) => {
+                        out.push(1);
+                        write_str(&mut out, n);
+                    }
+                    None => out.push(0),
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.uniqueness_constraints.len())
+                    .expect("≤ 65k uniqueness constraints/table"),
+            );
+            for uc in &t.schema.uniqueness_constraints {
+                match &uc.name {
+                    Some(n) => {
+                        out.push(1);
+                        write_str(&mut out, n);
+                    }
+                    None => out.push(0),
+                }
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier

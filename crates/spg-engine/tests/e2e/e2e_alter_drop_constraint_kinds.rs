@@ -22,9 +22,12 @@ fn drop_constraint_unique_via_synth_name() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))")
         .unwrap();
-    // pg_constraint synthesises composite UC names as
-    // `<table>_uniq<idx>` — idx is 0 for the first UC.
-    e.execute("ALTER TABLE t DROP CONSTRAINT t_uniq0").unwrap();
+    // v7.39 (read01 round 48) — DROP now resolves through the very
+    // synthesiser pg_constraint reports from, so the name that works is the
+    // name the catalog shows: PG's `<table>_<cols…>_key`. (The old
+    // `<table>_uniq<idx>` this pinned was never printed by any view — DROP
+    // and pg_constraint had simply disagreed; oracle-verified as t_a_b_key.)
+    e.execute("ALTER TABLE t DROP CONSTRAINT t_a_b_key").unwrap();
     e.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     e.execute("INSERT INTO t VALUES (1, 1)").unwrap();
 }
@@ -34,9 +37,9 @@ fn drop_constraint_check_via_synth_name() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, status TEXT, CHECK (status IN ('a', 'b')))")
         .unwrap();
-    // pg_constraint synthesises CHECK names as
-    // `<table>_check<idx>` — idx 0 for the first.
-    e.execute("ALTER TABLE t DROP CONSTRAINT t_check0").unwrap();
+    // v7.39 (read01 round 48) — same fix: PG's `<table>_<col>_check` is what
+    // pg_constraint prints and what DROP now accepts (oracle-verified).
+    e.execute("ALTER TABLE t DROP CONSTRAINT t_status_check").unwrap();
     // The CHECK is gone, so a previously-rejected value lands.
     e.execute("INSERT INTO t VALUES (1, 'z')").unwrap();
 }
