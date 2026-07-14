@@ -161,6 +161,11 @@ impl Engine {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
                 PlPgSqlStmt::Return(_) => {}
+                // v7.39 (read01 round 66) — the set-building statements.
+                PlPgSqlStmt::ReturnNext(e) => {
+                    self.resolve_expr_subqueries(e, cancel)?;
+                }
+                PlPgSqlStmt::ReturnQuery(_) => {}
                 PlPgSqlStmt::If {
                     branches,
                     else_branch,

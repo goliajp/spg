@@ -3434,6 +3434,9 @@ impl crate::Engine {
             dts.as_deref(),
             Some(&select_into),
             Some(&for_query),
+            // A scalar call has no set to build; RETURN NEXT / RETURN QUERY are
+            // errors here, as in PG.
+            None,
         )
         .map_err(|e| EvalError::TypeMismatch {
             detail: alloc::format!("{e}"),
@@ -3459,5 +3462,102 @@ impl crate::Engine {
             spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
         )
         .or_else(|_| Ok(Value::Null))
+    }
+}
+
+impl crate::Engine {
+    /// v7.39 (read01 round 66) — run a `RETURNS SETOF` plpgsql function and
+    /// collect the rows `RETURN NEXT` / `RETURN QUERY` appended. Same
+    /// interpreter, same read-path resolvers as the scalar call — the only
+    /// difference is that a SINK is provided, which is what makes those two
+    /// statements legal.
+    pub(crate) fn call_plpgsql_setof_fn(
+        &self,
+        def: &spg_storage::FunctionDef,
+        arg_names: &[alloc::string::String],
+        args: &[Value<'static>],
+    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>, EvalError> {
+        let block = spg_sql::parse_function_body(def.body.trim()).map_err(|e| {
+            EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?} body does not parse: {e}", def.name),
+            }
+        })?;
+        let mut locals: alloc::collections::BTreeMap<alloc::string::String, Value<'static>> =
+            alloc::collections::BTreeMap::new();
+        for (i, n) in arg_names.iter().enumerate() {
+            if n.is_empty() {
+                continue;
+            }
+            locals.insert(
+                n.to_ascii_lowercase(),
+                args.get(i).cloned().unwrap_or(Value::Null),
+            );
+        }
+        let dts = self
+            .session_param("default_text_search_config")
+            .map(alloc::string::String::from);
+        let run_select = |stmt: &spg_sql::ast::Statement,
+                          what: &str|
+         -> Result<crate::QueryResult, crate::triggers::TriggerError> {
+            let spg_sql::ast::Statement::Select(s) = stmt else {
+                return Err(crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("{what} body must be a SELECT"),
+                    },
+                });
+            };
+            self.exec_select_cancel(s, crate::CancelToken::none()).map_err(|e| {
+                crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("{what} failed: {e}"),
+                    },
+                }
+            })
+        };
+        let select_into = |stmt: &spg_sql::ast::Statement| -> Result<
+            Value<'static>,
+            crate::triggers::TriggerError,
+        > {
+            match run_select(stmt, "SELECT … INTO")? {
+                crate::QueryResult::Rows { rows, .. } => Ok(rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.values.into_iter().next())
+                    .unwrap_or(Value::Null)),
+                _ => Ok(Value::Null),
+            }
+        };
+        let for_query = |stmt: &spg_sql::ast::Statement| -> Result<
+            (
+                alloc::vec::Vec<alloc::string::String>,
+                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            ),
+            crate::triggers::TriggerError,
+        > {
+            match run_select(stmt, "FOR … IN / RETURN QUERY")? {
+                crate::QueryResult::Rows { columns, rows } => Ok((
+                    columns.iter().map(|c| c.name.clone()).collect(),
+                    rows.into_iter().map(|r| r.values).collect(),
+                )),
+                _ => Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new())),
+            }
+        };
+        let sink: core::cell::RefCell<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>> =
+            core::cell::RefCell::new(alloc::vec::Vec::new());
+        crate::triggers::call_plpgsql_scalar(
+            &def.name,
+            &block,
+            locals,
+            dts.as_deref(),
+            Some(&select_into),
+            Some(&for_query),
+            Some(&sink),
+        )
+        .map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("{e}"),
+        })?;
+        Ok(sink.into_inner())
     }
 }
