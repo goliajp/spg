@@ -18065,15 +18065,35 @@ fn parse_interval_clock(tok: &str) -> Option<i64> {
 }
 
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
-    let trimmed = s.trim();
+    // v7.39 (read01 timestamp.c) — PG's postgres_verbose forms: a leading
+    // `@` is decorative; a trailing `ago` negates the whole interval.
+    let mut trimmed = s.trim();
+    trimmed = trimmed.strip_prefix('@').map_or(trimmed, str::trim);
+    let mut negate = false;
+    if let Some(rest) = trimmed
+        .strip_suffix("ago")
+        .filter(|r| r.ends_with(char::is_whitespace) || r.is_empty())
+    {
+        negate = true;
+        trimmed = rest.trim();
+    }
+    let finish = |v: Option<(i32, i32, i64)>| -> Option<(i32, i32, i64)> {
+        let (mo, d, us) = v?;
+        if negate {
+            Some((mo.checked_neg()?, d.checked_neg()?, us.checked_neg()?))
+        } else {
+            Some((mo, d, us))
+        }
+    };
+    let s = trimmed;
     // ISO 8601 duration (`P1Y2M3DT4H`) and PG's year-month shorthand (`1-2`)
     // are single tokens, not the `<n> <unit>` pair form handled below.
     if let Some(rest) = trimmed.strip_prefix(['P', 'p']) {
-        return parse_iso8601_interval(rest);
+        return finish(parse_iso8601_interval(rest));
     }
     if !trimmed.contains(char::is_whitespace) && trimmed.contains('-') {
         if let Some(iv) = parse_year_month_interval(trimmed) {
-            return Some(iv);
+            return finish(Some(iv));
         }
     }
     // v7.39 (GUC knife 3, differential) — PG accepts a bare number as
@@ -18081,12 +18101,12 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     // fractions kept to the microsecond (`'1.5'` = 00:00:01.5).
     if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
         if let Ok(n) = trimmed.parse::<i64>() {
-            return Some((0, 0, n.checked_mul(1_000_000)?));
+            return finish(Some((0, 0, n.checked_mul(1_000_000)?)));
         }
         if let Ok(f) = trimmed.parse::<f64>() {
             if f.is_finite() {
                 #[allow(clippy::cast_possible_truncation)]
-                return Some((0, 0, (f * 1_000_000.0) as i64));
+                return finish(Some((0, 0, (f * 1_000_000.0) as i64)));
             }
         }
     }
@@ -18101,11 +18121,20 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
         parts.remove(pos);
         had_clock = true;
     }
-    if !parts.len().is_multiple_of(2) || (parts.is_empty() && !had_clock) {
+    // v7.39 (read01 timestamp.c) — a lone bare number alongside a clock
+    // time is DAYS (PG: '3 4:05:06' = 3 days 04:05:06).
+    let mut lone_days: i32 = 0;
+    if had_clock && parts.len() == 1 {
+        if let Ok(n) = parts[0].parse::<i64>() {
+            lone_days = i32::try_from(n).ok()?;
+            parts.clear();
+        }
+    }
+    if !parts.len().is_multiple_of(2) || (parts.is_empty() && !had_clock && lone_days == 0) {
         return None;
     }
     let mut months: i32 = 0;
-    let mut days: i32 = 0;
+    let mut days: i32 = lone_days;
     let mut micros: i64 = clock_us;
     let mut i = 0;
     while i < parts.len() {
@@ -18136,6 +18165,27 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
                 "year" => {
                     let n32 = i32::try_from(n).ok()?;
                     months = months.checked_add(n32.checked_mul(12)?)?;
+                }
+                // v7.39 (read01 timestamp.c) — the larger calendar units.
+                "centurie" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(1200)?)?;
+                }
+                "millennia" | "millenniu" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(12000)?)?;
+                }
+                "decade" | "dec" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(120)?)?;
+                }
+                "century" | "cent" | "c" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(1200)?)?;
+                }
+                "millennium" | "mil" => {
+                    let n32 = i32::try_from(n).ok()?;
+                    months = months.checked_add(n32.checked_mul(12000)?)?;
                 }
                 _ => return None,
             }
@@ -18189,7 +18239,7 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
         }
         i += 2;
     }
-    Some((months, days, micros))
+    finish(Some((months, days, micros)))
 }
 
 /// v7.37 — map a scalar type keyword to its [`CastTarget`] for the PG
