@@ -769,6 +769,7 @@ impl Engine {
             lateral_subquery: None,
             jsonb_each_text_arg: None,
             table_fn_call: None,
+            scalar_fn_item: false,
         rows_from: None,
         };
         let where_ = combine_with_and_owned(inner_preds);

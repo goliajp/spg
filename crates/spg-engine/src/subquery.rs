@@ -2099,6 +2099,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             },
             on: Some(Expr::Binary {
                 lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
@@ -2378,6 +2379,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             },
             on: Some(on),
             using_cols: None,
@@ -2910,6 +2912,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             },
             on: Some(on),
             using_cols: None,

@@ -2696,6 +2696,14 @@ pub struct TableRef {
     /// `pg_partition_tree` / `pg_partition_ancestors`; the executor
     /// dispatches by name.
     pub table_fn_call: Option<Box<(String, Vec<Expr>)>>,
+    /// v7.39 (read01 round 78) — this FROM item is a call to a function that
+    /// returns a BASE type, so the item's row type IS that scalar: a whole-row
+    /// reference to it yields the value, not a one-field composite
+    /// (`SELECT j FROM jsonb_array_elements('[1]') AS j` → `1`, PG). The
+    /// desugared shape is indistinguishable from a hand-written
+    /// `FROM (SELECT unnest(…)) s`, which is a subquery and does NOT collapse —
+    /// only the parser knows which one it built, so it says so here.
+    pub scalar_fn_item: bool,
     /// v7.39 (read01 round 74) — `ROWS FROM (f(a), g(b))`: N table functions
     /// zipped in LOCKSTEP, the shorter padded with NULLs (the same rule the
     /// target-list SRFs follow — see round 67). The array-returning family keeps
@@ -6210,6 +6218,7 @@ mod tests {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: None,
+                    scalar_fn_item: false,
                 },
                 joins: vec![],
             }),

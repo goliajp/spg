@@ -8945,6 +8945,7 @@ impl Parser {
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
                         },
                         joins: Vec::new(),
                     }),
@@ -9083,6 +9084,7 @@ impl Parser {
                     inner_args.clone(),
                 ))),
                 rows_from: None,
+                scalar_fn_item: false,
             };
             items = alloc::vec![SelectItem::Wildcard];
             from = Some(FromClause {
@@ -9204,6 +9206,7 @@ impl Parser {
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
                         },
                         colname,
                     ));
@@ -13079,6 +13082,7 @@ impl Parser {
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                         table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
                     },
                     joins: Vec::new(),
                 }),
@@ -13104,6 +13108,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             });
         }
         // v7.37.43-T4.5 — bare `CROSS JOIN jsonb_each_text(t.col)`
@@ -13157,6 +13162,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             });
         }
         // v7.37.17 (17.6 siblings) — plain derived table:
@@ -13214,6 +13220,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             });
         }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
@@ -13254,6 +13261,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             });
         }
         // v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
@@ -13296,6 +13304,7 @@ impl Parser {
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             });
         }
         // `jsonb_to_recordset(J) AS t(a int, b text)` / `jsonb_to_record`
@@ -13336,13 +13345,24 @@ impl Parser {
                 )));
             }
             self.advance();
+            // v7.39 (read01 round 78) — WITH ORDINALITY sits BEFORE the alias
+            // (`f(x) WITH ORDINALITY AS t(v, o)`), and this arm never looked for
+            // it, so it died on the `with` token while every other table function
+            // accepted it.
+            let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let table_alias = alias_ident
                 .clone()
                 .unwrap_or_else(|| "regexp_matches".to_string());
+            // PG names a single-column function's output column after the ALIAS
+            // when one is given (`FROM regexp_matches(…) AS m` → column `m`), so
+            // `m` reads as that column and not as a whole-row composite. Naming
+            // it after the function regardless made `SELECT m[1] FROM … AS m`
+            // subscript a record.
             let col_name = column_aliases
                 .first()
                 .cloned()
+                .or_else(|| alias_ident.clone())
                 .unwrap_or_else(|| "regexp_matches".to_string());
             let inner = crate::ast::SelectStatement {
                 ctes: Vec::new(),
@@ -13371,13 +13391,16 @@ impl Parser {
                 alias: Some(table_alias),
                 as_of_segment: None,
                 unnest_expr: None,
-                unnest_column_aliases: Vec::new(),
-                with_ordinality: false,
+                unnest_column_aliases: column_aliases,
+                with_ordinality,
                 generate_series_args: None,
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        // regexp_matches returns text[], a base type: `SELECT m FROM
+        // regexp_matches(…) AS m` is the array, not a composite wrapping it.
+        scalar_fn_item: true,
             });
         }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
@@ -13472,6 +13495,10 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        // Each of these returns a BASE type (jsonb / text / int), so the item's
+        // row type is that scalar: `SELECT j FROM jsonb_array_elements('[1]') j`
+        // is `1`, not `(1)`. WITH ORDINALITY makes it a real two-column item.
+        scalar_fn_item: !with_ordinality,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13609,6 +13636,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: Some(generic),
+                    scalar_fn_item: false,
                 };
                 return Ok(if correlated {
                     Self::wrap_correlated_srf(tref)
@@ -13637,6 +13665,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13692,6 +13721,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13787,6 +13817,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13945,6 +13976,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
         })
     }
 
@@ -14053,6 +14085,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
         }
     }
 
@@ -14183,6 +14216,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
                 },
                 joins: Vec::new(),
             }),
@@ -14265,6 +14299,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: Some(Box::new((fn_name, alloc::vec![base_expr, arg]))),
                     rows_from: None,
+                    scalar_fn_item: false,
                 });
             }
             return Err(self.err(alloc::format!(
@@ -14350,6 +14385,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
                 },
                 joins: Vec::new(),
             })
@@ -14384,6 +14420,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
         })
     }
 
@@ -14450,6 +14487,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: Some(Box::new((fn_name, args))),
             rows_from: None,
+            scalar_fn_item: false,
         })
     }
 
