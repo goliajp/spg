@@ -1267,44 +1267,23 @@ fn apply_function_dispatch(
             let opener = if pretty { "[\n " } else { "[" };
             let closer = if pretty { "\n]" } else { "]" };
             let mut out = alloc::string::String::from(opener);
-            let items = match &args[0] {
-                Value::TextArray(items) => {
-                    let strs: alloc::vec::Vec<alloc::string::String> = items
-                        .iter()
-                        .map(|o| match o {
-                            None => alloc::string::String::from("null"),
-                            Some(s) => {
-                                let escaped =
-                                    s.replace('\\', "\\\\").replace('"', "\\\"");
-                                alloc::format!("\"{escaped}\"")
-                            }
-                        })
-                        .collect();
-                    strs
-                }
-                Value::IntArray(items) => items
-                    .iter()
-                    .map(|n| match n {
-                        None => alloc::string::String::from("null"),
-                        Some(x) => alloc::format!("{x}"),
-                    })
-                    .collect(),
-                Value::BigIntArray(items) => items
-                    .iter()
-                    .map(|n| match n {
-                        None => alloc::string::String::from("null"),
-                        Some(x) => alloc::format!("{x}"),
-                    })
-                    .collect(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "array_to_json(): needs array, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+            // v7.39 (read01 round 76) — one shared element menu: this used
+            // to carry its own text/int/bigint-only match, so a bool[] or a
+            // 2-D matrix was rejected with "needs array, got IntArray2D" —
+            // an error that accuses the caller of passing a non-array while
+            // naming an array type.
+            let Some(elems) = crate::eval::values::array_elements(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_to_json(): needs array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
+            let items: alloc::vec::Vec<alloc::string::String> = elems
+                .iter()
+                .map(crate::json::value_to_json_text)
+                .collect();
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(sep);

@@ -2572,7 +2572,26 @@ fn encode_value_into(v: &Value, out: &mut String) {
         // Fall-through: every other type (Date / Interval / Uuid / Bytea /
         // Time / Money / …) renders via the canonical PG-faithful text
         // renderer, wrapped as a JSON string — never a Rust debug dump.
+        //
+        // v7.39 (read01 round 76) — but an ARRAY is a JSON array, not a
+        // JSON string. The arms above cover only text/int/bigint arrays;
+        // every other element type (bool / float / numeric / date / uuid /
+        // …) and every 2-D matrix used to reach this fall-through and come
+        // out quoted (`to_jsonb(ARRAY[[1,2]])` → `"{{1,2}}"`). Route them
+        // through the shared element menu, recursing per element so nesting
+        // and per-type spelling both stay canonical.
         other => {
+            if let Some(elems) = crate::eval::values::array_elements(other) {
+                out.push('[');
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    encode_value_into(e, out);
+                }
+                out.push(']');
+                return;
+            }
             let txt = crate::eval::values::value_to_text(other);
             write_json(&JsonValue::String(txt), out);
         }

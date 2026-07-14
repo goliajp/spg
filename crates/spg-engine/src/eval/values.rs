@@ -384,6 +384,39 @@ pub(super) fn array_len(v: &Value) -> Option<usize> {
     }
 }
 
+/// v7.39 (read01 round 76) — every element of an array as an owned `Value`,
+/// or `None` when `v` is not an array at all. A 2-D matrix yields one 1-D
+/// array `Value` per row, so a caller that recurses (JSON encoding) gets the
+/// nesting for free.
+///
+/// This is the *iteration* half of the element menu whose *indexing* half is
+/// `array_element_at`: without it, every consumer that WALKS an array was
+/// written variant by variant, and the variants nobody had needed yet fell
+/// into a `_ =>` that quietly did the wrong thing — `to_jsonb(ARRAY[[1,2]])`
+/// rendered the *text* `"{{1,2}}"` as a JSON string instead of `[[1, 2]]`.
+pub(crate) fn array_elements(v: &Value) -> Option<alloc::vec::Vec<Value<'static>>> {
+    if let Some(n) = array_len(v) {
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(array_element_at(v, i)?);
+        }
+        return Some(out);
+    }
+    // 2-D: one 1-D array per row, same element type.
+    macro_rules! rows {
+        ($m:expr, $variant:ident) => {
+            Some($m.iter().map(|r| Value::$variant(r.clone())).collect())
+        };
+    }
+    match v {
+        Value::IntArray2D(m) => rows!(m, IntArray),
+        Value::BigIntArray2D(m) => rows!(m, BigIntArray),
+        Value::TextArray2D(m) => rows!(m, TextArray),
+        Value::BoolArray2D(m) => rows!(m, BoolArray),
+        _ => None,
+    }
+}
+
 /// v7.38 (read01, T10) — the (rows, cols) dimensions of a 2-D array, or None
 /// for anything that is not a 2-D matrix.
 pub(super) fn array_2d_dims(v: &Value) -> Option<(usize, usize)> {
