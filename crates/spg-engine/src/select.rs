@@ -684,6 +684,11 @@ impl Engine {
                     let (schema, rows) = synth_pg_roles(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (read01 round 58) — role membership.
+                "__spg_pg_auth_members" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_auth_members(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_views. PG's
                 // pg_views surfaces every CREATE VIEW result; SPG
                 // ships one row per declared view from the catalog.

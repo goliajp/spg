@@ -2640,6 +2640,7 @@ pub(crate) fn apply_generated_stored_columns(
                 sequence_resolver: None,
                 catalog: None,
                 session_gucs: None,
+                users: None,
                 sample_rng: None,
                 recursion_base: core::cell::Cell::new(0),
                 render_style: crate::eval::RenderStyle::default(),

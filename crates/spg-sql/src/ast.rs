@@ -144,8 +144,12 @@ pub enum Statement {
     /// `CREATE USER 'name' WITH PASSWORD 'pw' ROLE 'admin'` (v4.1).
     /// Role is optional; defaults to `readonly` when omitted.
     CreateUser(CreateUserStatement),
-    /// `DROP USER 'name'` (v4.1).
-    DropUser(String),
+    /// `DROP USER 'name'` (v4.1). v7.39 (read01 round 58) — `IF EXISTS` is
+    /// carried through: PG skips with a NOTICE rather than erroring.
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
     /// v7.39 (RLS) — `SET ROLE { name | NONE | DEFAULT }` / `RESET ROLE`.
     /// `Some(name)` switches the session's effective role (drives
     /// `current_user` and RLS enforcement); `None` resets to the login
@@ -1027,12 +1031,23 @@ pub struct DropPolicyStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateUserStatement {
     pub name: String,
+    /// Empty when the statement carried no PASSWORD — legal for a bare
+    /// `CREATE ROLE`, which cannot log in anyway.
     pub password: String,
     /// One of `admin` / `readwrite` / `readonly`. Stored verbatim from
     /// the parser; the engine validates against `Role::parse` so a
     /// typo lands as a runtime error with a clear message rather than
     /// a parse failure.
     pub role: String,
+    /// v7.39 (read01 round 58) — the PG role attributes. `None` = the
+    /// statement did not say, so the default for its spelling applies:
+    /// `CREATE USER` is `CREATE ROLE … LOGIN`, `CREATE ROLE` is NOLOGIN;
+    /// both default to INHERIT and NOSUPERUSER.
+    pub login: Option<bool>,
+    pub inherit: Option<bool>,
+    pub superuser: Option<bool>,
+    /// `true` when spelled `CREATE USER` (LOGIN by default).
+    pub is_user: bool,
 }
 
 /// v7.12.4 — `CREATE [OR REPLACE] FUNCTION`. v7.12.4 ships
@@ -3423,7 +3438,7 @@ impl Statement {
             | Statement::RollbackToSavepoint(_)
             | Statement::ReleaseSavepoint(_)
             | Statement::CreateUser(_)
-            | Statement::DropUser(_)
+            | Statement::DropUser { .. }
             | Statement::SetRole(_)
             | Statement::Grant(_)
             | Statement::Revoke(_)
@@ -3492,9 +3507,12 @@ pub struct GrantStatement {
 pub enum GrantObject {
     /// `ON [TABLE] a, b` — the enforced case.
     Tables(Vec<String>),
-    /// `ON SCHEMA / SEQUENCE / DATABASE / FUNCTION / …`, or
-    /// `GRANT role TO role` (role membership, no ON clause at all). Carries
-    /// the object-class word for the error/no-op message.
+    /// v7.39 (read01 round 58) — `GRANT devs TO alice` / `REVOKE devs FROM
+    /// alice`: role MEMBERSHIP, which has no ON clause at all. Carries the
+    /// granted roles; the grantees are the members.
+    Roles(Vec<String>),
+    /// `ON SCHEMA / SEQUENCE / DATABASE / FUNCTION / …`. Carries the
+    /// object-class word for the no-op message.
     Other(String),
 }
 
@@ -3513,6 +3531,10 @@ impl GrantStatement {
                 let names: Vec<_> = t.iter().map(|n| quote_ident(n)).collect();
                 alloc::format!("TABLE {}", names.join(", "))
             }
+            GrantObject::Roles(r) => {
+                let names: Vec<_> = r.iter().map(|n| quote_ident(n)).collect();
+                names.join(", ")
+            }
             GrantObject::Other(k) => k.clone(),
         };
         let who: Vec<_> = self
@@ -3526,6 +3548,14 @@ impl GrantStatement {
                 }
             })
             .collect();
+        if let GrantObject::Roles(_) = &self.object {
+            let _ = if grant {
+                write!(s, "GRANT {obj} TO {}", who.join(", "))
+            } else {
+                write!(s, "REVOKE {obj} FROM {}", who.join(", "))
+            };
+            return s;
+        }
         if grant {
             let _ = write!(s, "GRANT {privs} ON {obj} TO {}", who.join(", "));
             if self.grant_option {
@@ -3705,7 +3735,10 @@ impl fmt::Display for Statement {
                 quote_ident(&s.name),
                 s.role
             ),
-            Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
+            Self::DropUser { name, if_exists } => {
+                let ie = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP USER {ie}{}", quote_ident(name))
+            }
             Self::SetRole(Some(r)) => write!(f, "SET ROLE {}", quote_ident(r)),
             Self::SetRole(None) => f.write_str("RESET ROLE"),
             Self::Grant(g) => write!(f, "{}", g.render(true)),

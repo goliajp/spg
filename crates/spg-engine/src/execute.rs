@@ -1041,10 +1041,16 @@ impl Engine {
             Statement::ShowPublications => Ok(self.exec_show_publications()),
             Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
-            Statement::DropUser(name) => self.exec_drop_user(&name),
+            Statement::DropUser { name, if_exists } => self.exec_drop_user(&name, if_exists),
             Statement::SetRole(role) => {
                 match role {
                     Some(name) => {
+                        // v7.39 (read01 round 58) — PG rejects a SET ROLE to a
+                        // role that does not exist. Before roles were real
+                        // there was nothing to check against, so any name was
+                        // accepted — and a typo silently put the session into
+                        // a role that held nothing.
+                        self.acl_check_role_exists(&name)?;
                         self.session_params.insert(
                             alloc::string::String::from(crate::session::CURRENT_ROLE_KEY),
                             name,

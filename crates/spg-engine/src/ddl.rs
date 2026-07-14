@@ -3070,19 +3070,79 @@ impl Engine {
         // so the SQL path also derives the SCRAM-SHA-256 verifier. Without
         // this, a `CREATE USER … PASSWORD` user had `scram = None` and silently
         // fell back to cleartext pgwire auth.
-        self.create_user(&s.name, &s.password, role, salt)
+        if self.users.contains(&s.name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "role \"{}\" already exists",
+                s.name
+            )));
+        }
+        // v7.39 (read01 round 58) — a bare `CREATE ROLE devs` carries no
+        // password. It cannot log in (NOLOGIN is its default), so it needs no
+        // credential; give it an unguessable one derived from its own salt so
+        // no code path ever sees an empty-password record.
+        let password = if s.password.is_empty() {
+            let digest = spg_crypto::hash(&salt);
+            hex_of(&digest[..16])
+        } else {
+            s.password.clone()
+        };
+        self.create_user(&s.name, &password, role, salt)
             .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE USER: {e}")))?;
+        // PG's attribute defaults: LOGIN iff spelled CREATE USER, INHERIT, and
+        // NOSUPERUSER — but SPG's own coarse `ROLE 'admin'` still means
+        // superuser, which is how the existing admin account keeps working.
+        self.users.set_attributes(
+            &s.name,
+            s.login.unwrap_or(s.is_user),
+            s.inherit.unwrap_or(true),
+            s.superuser
+                .unwrap_or_else(|| matches!(role, users::Role::Admin)),
+        );
         Ok(QueryResult::CommandOk {
             affected: 1,
             modified_catalog: true,
         })
     }
 
-    pub(crate) fn exec_drop_user(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+    pub(crate) fn exec_drop_user(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
         if self.in_transaction() {
             return Err(EngineError::Unsupported(
                 "DROP USER is not allowed inside a transaction".into(),
             ));
+        }
+        // v7.39 (read01 round 58) — PG's IF EXISTS skip NOTICE.
+        if if_exists && !self.users.contains(name) {
+            self.notice(alloc::format!("role {name:?} does not exist, skipping"));
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
+        // v7.39 (read01 round 58) — PG refuses to drop a role that still holds
+        // privileges: they would become dangling aclitems. It names the tables.
+        let depends: alloc::vec::Vec<alloc::string::String> = self
+            .active_catalog()
+            .table_names()
+            .into_iter()
+            .filter(|t| {
+                self.active_catalog().get(t).is_some_and(|tb| {
+                    tb.schema()
+                        .acl
+                        .iter()
+                        .any(|a| a.grantee.eq_ignore_ascii_case(name))
+                        || tb.schema().owner.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(name))
+                })
+            })
+            .collect();
+        if !depends.is_empty() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "role \"{name}\" cannot be dropped because some objects depend on it DETAIL: privileges for table {}",
+                depends.join(", ")
+            )));
         }
         self.users
             .drop(name)
@@ -4347,4 +4407,16 @@ fn constraint_name_taken(table: &spg_storage::Table, name: &str) -> bool {
             .iter()
             .any(|u| u.name.as_deref() == Some(name))
         || sch.checks.iter().any(|c| c.name.as_deref() == Some(name))
+}
+
+/// v7.39 (read01 round 58) — lowercase hex, for the synthetic credential a
+/// passwordless `CREATE ROLE` gets (it can't log in, but the record must not
+/// carry an empty password).
+fn hex_of(bytes: &[u8]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut s = alloc::string::String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

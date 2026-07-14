@@ -30,6 +30,13 @@ pub(crate) const SESSION_USER_KEY: &str = "__spg_session_user";
 /// its default server session both authenticate as this.
 pub(crate) const LOGIN_ROLE: &str = "admin";
 
+/// v7.39 (read01 round 58) — PG's bootstrap superuser. `synth_pg_roles` has
+/// always reported a `postgres` row (admin tools probe for it), so the name has
+/// to BE a role: refusing `SET ROLE postgres` while advertising it in pg_roles
+/// would be the same self-contradiction the ACL work went and fixed. It is a
+/// superuser, like the login role.
+pub(crate) const BOOTSTRAP_ROLE: &str = "postgres";
+
 impl Engine {
     /// v7.39 (read01 round 51) — the login identity: the startup packet's
     /// `user`, else the Admin default. Drives `session_user`.
@@ -63,14 +70,22 @@ impl Engine {
     #[must_use]
     pub(crate) fn is_superuser(&self) -> bool {
         // v7.39 (read01 round 51) — keyed on whether an explicit `SET ROLE` to
-        // a non-admin role is in effect, NOT on the login NAME. The wire now
+        // a non-superuser role is in effect, NOT on the login NAME. The wire
         // reports the startup packet's `user` as current_user / session_user;
         // if superuser-ness followed that name, every connection as e.g.
         // "unmei" would silently become RLS-subject. Reported identity and
-        // privilege semantics stay decoupled (recorded residual: real
-        // per-role enforcement is the RLS epic's own step).
+        // privilege semantics stay decoupled.
+        //
+        // v7.39 (read01 round 58) — the role's own SUPERUSER attribute decides
+        // now. `SET ROLE admin` still is one (the built-in login role), and so
+        // is any role created SUPERUSER. PG never inherits the attribute
+        // through membership, so this reads the role itself, not its set.
         match self.session_params.get(CURRENT_ROLE_KEY) {
-            Some(r) => r.eq_ignore_ascii_case(LOGIN_ROLE),
+            Some(r) => {
+                r.eq_ignore_ascii_case(LOGIN_ROLE)
+                    || r.eq_ignore_ascii_case(BOOTSTRAP_ROLE)
+                    || self.users.get(r).is_some_and(|rec| rec.superuser)
+            }
             None => true,
         }
     }
@@ -341,6 +356,9 @@ impl Engine {
             // Thread the session GUC map so current_setting resolves
             // custom `SET app.foo = …` settings (request-context / RLS).
             .with_session_gucs(&self.session_params)
+            // v7.39 (read01 round 58) — and the role store, so the privilege
+            // builtins can expand role membership.
+            .with_users(&self.users)
             // v7.37.16 (16.12) — thread the read-only catalog so
             // builtins like pg_partition_root can walk partition
             // roles. Other EvalContext call sites (scan paths,

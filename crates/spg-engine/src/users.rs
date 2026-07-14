@@ -14,7 +14,7 @@
 //! enough that the snapshot itself doesn't leak plaintext, and that
 //! an in-memory dump can't trivially reverse a typed password.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -101,6 +101,18 @@ pub struct UserRecord {
     /// path uses this for the SHA256-XOR proof verification —
     /// the public-key-RSA full-auth path is a v7.18 carve-out.
     caching_sha2: Option<[u8; CACHING_SHA2_HASH_LEN]>,
+    /// v7.39 (read01 round 58) — PG role attributes. `CREATE USER` is PG's
+    /// `CREATE ROLE … LOGIN`; `CREATE ROLE` alone cannot log in but can hold
+    /// privileges and have members. Attributes are NEVER inherited through
+    /// membership (that is PG's rule: only privileges flow, not attributes) —
+    /// a member of a superuser role must `SET ROLE` to it to act as one.
+    pub can_login: bool,
+    /// `INHERIT` (the default): this role automatically holds the privileges of
+    /// every role it is a member of. `NOINHERIT` means it must `SET ROLE` to
+    /// them explicitly.
+    pub inherit: bool,
+    /// `SUPERUSER`: bypasses every privilege check.
+    pub superuser: bool,
 }
 
 /// SCRAM-SHA-256 stored credentials per RFC 5802 §5.
@@ -248,6 +260,10 @@ fn sha256_bytes(input: &[u8]) -> [u8; CACHING_SHA2_HASH_LEN] {
 #[derive(Debug, Clone, Default)]
 pub struct UserStore {
     users: BTreeMap<String, UserRecord>,
+    /// v7.39 (read01 round 58) — role membership (PG `pg_auth_members`):
+    /// member name → the roles it belongs to. `GRANT devs TO alice` records
+    /// `alice → {devs}`.
+    memberships: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -334,12 +350,94 @@ impl UserStore {
                 scram: None,
                 mysql_native,
                 caching_sha2,
+                // CREATE USER is PG's `CREATE ROLE … LOGIN`; the caller
+                // overrides these for a bare `CREATE ROLE`.
+                can_login: true,
+                inherit: true,
+                superuser: matches!(role, Role::Admin),
             },
         );
         Ok(())
     }
 
+    /// v7.39 (read01 round 58) — set the PG role attributes on a freshly
+    /// created role. `CREATE ROLE` (no LOGIN) lands here right after `create`.
+    pub fn set_attributes(&mut self, name: &str, can_login: bool, inherit: bool, superuser: bool) {
+        if let Some(r) = self.users.get_mut(name) {
+            r.can_login = can_login;
+            r.inherit = inherit;
+            r.superuser = superuser;
+        }
+    }
+
+    /// v7.39 (read01 round 58) — `GRANT <role> TO <member>`.
+    pub fn add_member(&mut self, role: &str, member: &str) {
+        self.memberships
+            .entry(member.to_string())
+            .or_default()
+            .insert(role.to_string());
+    }
+
+    /// v7.39 (read01 round 58) — `REVOKE <role> FROM <member>`.
+    pub fn drop_member(&mut self, role: &str, member: &str) {
+        if let Some(set) = self.memberships.get_mut(member) {
+            set.remove(role);
+            if set.is_empty() {
+                self.memberships.remove(member);
+            }
+        }
+    }
+
+    /// The roles `member` directly belongs to.
+    #[must_use]
+    pub fn memberships_of(&self, member: &str) -> Vec<String> {
+        self.memberships
+            .get(member)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every (member, role) pair — `pg_auth_members`.
+    pub fn all_memberships(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.memberships
+            .iter()
+            .flat_map(|(m, roles)| roles.iter().map(move |r| (m.as_str(), r.as_str())))
+    }
+
+    /// v7.39 (read01 round 58) — every role whose privileges `role` effectively
+    /// holds: itself, plus (transitively) every role it INHERITs from. A
+    /// NOINHERIT role holds only its own — it must `SET ROLE` to the others.
+    /// Cycles cannot happen (PG rejects them) but the visited set guards anyway.
+    #[must_use]
+    pub fn effective_roles(&self, role: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        out.insert(role.to_string());
+        // The INHERIT attribute of the ROLE ITSELF decides whether its
+        // memberships flow into it. An unknown role (the built-in login) is
+        // treated as inheriting — it has no memberships anyway.
+        let inherits = self.users.get(role).is_none_or(|r| r.inherit);
+        if !inherits {
+            return out;
+        }
+        let mut queue: Vec<String> = self.memberships_of(role);
+        while let Some(r) = queue.pop() {
+            if !out.insert(r.clone()) {
+                continue;
+            }
+            // A role reached through membership contributes its OWN memberships
+            // only when it, too, inherits.
+            if self.users.get(&r).is_none_or(|rec| rec.inherit) {
+                queue.extend(self.memberships_of(&r));
+            }
+        }
+        out
+    }
+
     pub fn drop(&mut self, name: &str) -> Result<(), UserError> {
+        self.memberships.remove(name);
+        for set in self.memberships.values_mut() {
+            set.remove(name);
+        }
         self.users
             .remove(name)
             .map(|_| ())
@@ -461,6 +559,10 @@ const MYSQL_NATIVE_FORMAT_MARKER: u8 = 0xfe;
 /// SHA256(SHA256(pwd)) per user. Writer always emits v4;
 /// reader understands v1 / v2 / v3 / v4.
 const CACHING_SHA2_FORMAT_MARKER: u8 = 0xfd;
+/// v7.39 (read01 round 58) — v5 format marker. v5 extends v4 with the PG role
+/// attributes (login / inherit / superuser) per user and a trailing role
+/// MEMBERSHIP block. Writer always emits v5; reader understands v1 … v5.
+const ROLE_ATTRS_FORMAT_MARKER: u8 = 0xfc;
 
 pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
     let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1 + 1;
@@ -468,7 +570,7 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
     // v7.17.0 Phase 3.P0-72 — bump on-disk format to v4 so the
     // per-user `caching_sha2_password` hash trails the
     // mysql_native block.
-    out.push(CACHING_SHA2_FORMAT_MARKER);
+    out.push(ROLE_ATTRS_FORMAT_MARKER);
     out.extend_from_slice(
         &u32::try_from(store.users.len())
             .expect("≤ 4G users")
@@ -509,6 +611,25 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
                 out.extend_from_slice(h);
             }
         }
+        // v5 — the three role attributes.
+        out.push(u8::from(rec.can_login));
+        out.push(u8::from(rec.inherit));
+        out.push(u8::from(rec.superuser));
+    }
+    // v5 — the membership block, at the tail so a v4 reader stops before it.
+    let pairs: Vec<(&str, &str)> = store.all_memberships().collect();
+    out.extend_from_slice(
+        &u32::try_from(pairs.len())
+            .expect("≤ 4G memberships")
+            .to_le_bytes(),
+    );
+    for (member, role) in pairs {
+        let ml = u16::try_from(member.len()).expect("≤ 65k name");
+        out.extend_from_slice(&ml.to_le_bytes());
+        out.extend_from_slice(member.as_bytes());
+        let rl = u16::try_from(role.len()).expect("≤ 65k name");
+        out.extend_from_slice(&rl.to_le_bytes());
+        out.extend_from_slice(role.as_bytes());
     }
     out
 }
@@ -551,19 +672,28 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
     //      count; per-user payload further adds 1-byte flag +
     //      32-byte SHA256(SHA256(pwd)) tail for
     //      `caching_sha2_password`.
-    let (scram_present_inline, mysql_native_present_inline, caching_sha2_present_inline) =
-        if !buf.is_empty() && buf[0] == CACHING_SHA2_FORMAT_MARKER {
-            p += 1;
-            (true, true, true)
-        } else if !buf.is_empty() && buf[0] == MYSQL_NATIVE_FORMAT_MARKER {
-            p += 1;
-            (true, true, false)
-        } else if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
-            p += 1;
-            (true, false, false)
-        } else {
-            (false, false, false)
-        };
+    // v5 → 0xfc marker: v4 plus three attribute bytes per user and a trailing
+    //      membership block.
+    let (
+        scram_present_inline,
+        mysql_native_present_inline,
+        caching_sha2_present_inline,
+        role_attrs_inline,
+    ) = if !buf.is_empty() && buf[0] == ROLE_ATTRS_FORMAT_MARKER {
+        p += 1;
+        (true, true, true, true)
+    } else if !buf.is_empty() && buf[0] == CACHING_SHA2_FORMAT_MARKER {
+        p += 1;
+        (true, true, true, false)
+    } else if !buf.is_empty() && buf[0] == MYSQL_NATIVE_FORMAT_MARKER {
+        p += 1;
+        (true, true, false, false)
+    } else if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
+        p += 1;
+        (true, false, false, false)
+    } else {
+        (false, false, false, false)
+    };
     let count_bytes = take(&mut p, 4, buf)?;
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     let mut store = UserStore::new();
@@ -632,6 +762,15 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         } else {
             None
         };
+        // v7.39 (read01 round 58) — a pre-v5 blob predates role attributes:
+        // every user in it was a login user that inherits, and Admin was the
+        // superuser role. v5 carries the three bytes explicitly.
+        let (can_login, inherit, superuser) = if role_attrs_inline {
+            let b = take(&mut p, 3, buf)?;
+            (b[0] == 1, b[1] == 1, b[2] == 1)
+        } else {
+            (true, true, matches!(role, Role::Admin))
+        };
         store.users.insert(
             name,
             UserRecord {
@@ -641,8 +780,26 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
                 scram,
                 mysql_native,
                 caching_sha2,
+                can_login,
+                inherit,
+                superuser,
             },
         );
+    }
+    if role_attrs_inline {
+        let count_bytes = take(&mut p, 4, buf)?;
+        let mcount = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+        for _ in 0..mcount {
+            let ml = u16::from_le_bytes(take(&mut p, 2, buf)?.try_into().unwrap()) as usize;
+            let member = core::str::from_utf8(take(&mut p, ml, buf)?)
+                .map_err(|_| UserDeserializeError::InvalidUtf8)?
+                .to_string();
+            let rl = u16::from_le_bytes(take(&mut p, 2, buf)?.try_into().unwrap()) as usize;
+            let role = core::str::from_utf8(take(&mut p, rl, buf)?)
+                .map_err(|_| UserDeserializeError::InvalidUtf8)?
+                .to_string();
+            store.add_member(&role, &member);
+        }
     }
     if p != buf.len() {
         return Err(UserDeserializeError::Truncated);
@@ -817,10 +974,12 @@ mod tests {
 
     #[test]
     fn empty_store_round_trip() {
-        // v7.17.0 Phase 3.P0-72: writer flipped to v4 marker (0xfd).
+        // v7.39 (read01 round 58): writer flipped to the v5 marker (0xfc) —
+        // per-user role attributes plus a trailing membership block, which for
+        // an empty store is a zero u32 count.
         let s = UserStore::new();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes, [0xfd, 0, 0, 0, 0]);
+        assert_eq!(bytes, [0xfc, 0, 0, 0, 0, 0, 0, 0, 0]);
         let s2 = deserialize_users(&bytes).unwrap();
         assert!(s2.is_empty());
     }
@@ -889,7 +1048,7 @@ mod p0_71_tests {
         s.create("alice", "wonderland", Role::Admin, [4u8; SALT_LEN])
             .unwrap();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes[0], 0xfd, "v4 marker advertised");
+        assert_eq!(bytes[0], 0xfc, "v5 marker advertised");
         let s2 = deserialize_users(&bytes).unwrap();
         let r1 = s.get("alice").unwrap();
         let r2 = s2.get("alice").unwrap();

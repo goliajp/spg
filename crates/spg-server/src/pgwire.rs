@@ -3102,7 +3102,7 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         Statement::DropType { .. } => "DROP TYPE".to_string(),
         // PG tags CREATE USER as CREATE ROLE (USER is the role alias).
         Statement::CreateUser(_) => "CREATE ROLE".to_string(),
-        Statement::DropUser(_) => "DROP ROLE".to_string(),
+        Statement::DropUser { .. } => "DROP ROLE".to_string(),
         // v6.1.2 — PG tag for `CREATE PUBLICATION` / `DROP PUBLICATION`.
         // PG's tag does not include the publication name; we match.
         Statement::CreatePublication(_) => "CREATE PUBLICATION".to_string(),
@@ -3662,6 +3662,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42501"
         } else if msg.contains("role \"") && msg.contains("does not exist") {
             "42704"
+        // v7.39 (read01 round 58) — DROP ROLE with grants still pointing at it
+        // (PG 2BP01 dependent_objects_still_exist).
+        } else if msg.contains("cannot be dropped because some objects depend on it") {
+            "2BP01"
         } else {
             "42000"
         };

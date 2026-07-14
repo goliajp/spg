@@ -116,14 +116,23 @@ pub(crate) fn render_relacl(schema: &TableSchema) -> Option<String> {
 
 /// The privileges `role` holds on `schema`, ignoring superuser-ness: the
 /// owner's implicit ALL, plus any explicit grant to the role or to PUBLIC.
-pub(crate) fn privs_of(schema: &TableSchema, owner: &str, role: &str) -> u16 {
-    if role.eq_ignore_ascii_case(owner) {
+///
+/// v7.39 (read01 round 58) — `roles` is the role's EFFECTIVE set: itself plus
+/// every role it inherits from (`UserStore::effective_roles`). A grant to a
+/// group role reaches its members that way, and a NOINHERIT member's set is
+/// just itself, so it does not.
+pub(crate) fn privs_of_roles(
+    schema: &TableSchema,
+    owner: &str,
+    roles: &alloc::collections::BTreeSet<String>,
+) -> u16 {
+    if roles.iter().any(|r| r.eq_ignore_ascii_case(owner)) {
         return priv_bits::ALL;
     }
     let mut held = 0;
     for a in &schema.acl {
         // Empty grantee = PUBLIC: held by every role.
-        if a.grantee.is_empty() || a.grantee.eq_ignore_ascii_case(role) {
+        if a.grantee.is_empty() || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r)) {
             held |= a.privs;
         }
     }
@@ -148,7 +157,8 @@ impl Engine {
             return true;
         };
         let owner = self.table_owner(t.schema()).to_string();
-        privs_of(t.schema(), &owner, self.current_role()) & wanted == wanted
+        let roles = self.users.effective_roles(self.current_role());
+        privs_of_roles(t.schema(), &owner, &roles) & wanted == wanted
     }
 
     /// Enforce `wanted` on `table`, PG's message and all.
@@ -179,11 +189,42 @@ impl Engine {
         }
     }
 
+    /// v7.39 (read01 round 58) — `GRANT devs TO alice` / `REVOKE devs FROM
+    /// alice`. Both the granted roles and the members must exist; PUBLIC cannot
+    /// be a member of anything.
+    fn exec_role_membership(
+        &mut self,
+        roles: &[String],
+        members: &[String],
+        grant: bool,
+    ) -> Result<crate::QueryResult, EngineError> {
+        for r in roles {
+            self.acl_check_role_exists(r)?;
+        }
+        for m in members {
+            self.acl_check_role_exists(m)?;
+        }
+        for r in roles {
+            for m in members {
+                if grant {
+                    self.users.add_member(r, m);
+                } else {
+                    self.users.drop_member(r, m);
+                }
+            }
+        }
+        Ok(crate::QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
     /// A role named in a GRANT must exist. PUBLIC (the empty grantee) always
     /// does; so does the login role, which is not a UserStore entry.
     pub(crate) fn acl_check_role_exists(&self, role: &str) -> Result<(), EngineError> {
         if role.is_empty()
             || role.eq_ignore_ascii_case(LOGIN_ROLE)
+            || role.eq_ignore_ascii_case(crate::session::BOOTSTRAP_ROLE)
             || self.users.contains(role)
         {
             return Ok(());
@@ -480,6 +521,9 @@ impl Engine {
         g: &GrantStatement,
         grant: bool,
     ) -> Result<crate::QueryResult, EngineError> {
+        if let GrantObject::Roles(roles) = &g.object {
+            return self.exec_role_membership(roles, &g.grantees, grant);
+        }
         let GrantObject::Tables(tables) = &g.object else {
             return Ok(crate::QueryResult::CommandOk {
                 affected: 0,
@@ -493,7 +537,12 @@ impl Engine {
         } else {
             for w in &g.privileges {
                 let bit = priv_from_word(w).ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!("unrecognized privilege type: \"{w}\""))
+                    // PG's GRANT wording — no colon, and the unquoted ident is
+                    // downcased, exactly as the parser saw it.
+                    EngineError::Unsupported(alloc::format!(
+                        "unrecognized privilege type \"{}\"",
+                        w.to_ascii_lowercase()
+                    ))
                 })?;
                 mask |= bit;
             }

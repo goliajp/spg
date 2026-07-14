@@ -14154,11 +14154,116 @@ fn apply_function_dispatch(
                 .owner
                 .clone()
                 .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
-            let held = crate::acl::privs_of(t.schema(), &owner, &role);
+            // v7.39 (read01 round 58) — through role MEMBERSHIP: a grant to a
+            // group role answers `true` for its inheriting members. The role
+            // set has to come from the engine's user store, which the eval
+            // context does not carry, so it rides `ctx.role_set` — filled by
+            // `Engine::ev_ctx`. Absent (a bare context) = just the role itself.
+            let roles = ctx.users.map_or_else(
+                || {
+                    let mut s = alloc::collections::BTreeSet::new();
+                    s.insert(role.clone());
+                    s
+                },
+                |u| u.effective_roles(&role),
+            );
+            let held = crate::acl::privs_of_roles(t.schema(), &owner, &roles);
             Ok(Value::Bool(held & bit != 0))
         }
-        "has_column_privilege"
-        | "has_schema_privilege"
+        // v7.39 (read01 round 58) — the COLUMN privilege probes answer from the
+        // TABLE's ACL. SPG has no column-level grants (recorded residual), and
+        // in PG a column privilege is "the table privilege OR a column-specific
+        // grant" — with no column grants, the table privilege IS the answer.
+        // Returning an unconditional `true` here (what round 51 did) would be
+        // the same lie the round-57 ACL work went and killed: a role that
+        // cannot read the table at all would be told it can read the column.
+        "has_column_privilege" | "has_any_column_privilege" => {
+            // Forms: has_column_privilege([user,] table, column, priv)
+            //        has_any_column_privilege([user,] table, priv)
+            let is_any = name.eq_ignore_ascii_case("has_any_column_privilege");
+            let want = if is_any { 2 } else { 3 };
+            let named_role = args.len() == want + 1;
+            let base = usize::from(named_role);
+            let Some(tbl_arg) = args.get(base) else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(priv_arg) = args.get(base + want - 1) else {
+                return Ok(Value::Bool(true));
+            };
+            if matches!(tbl_arg, Value::Null) || matches!(priv_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let (Some(tname), Some(cat)) = (regclass_name_of(tbl_arg), ctx.catalog) else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(t) = cat.get(&tname) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("relation \"{tname}\" does not exist"),
+                });
+            };
+            let Value::Text(p) = priv_arg else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(bit) = crate::acl::priv_from_word(p.as_ref()) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("unrecognized privilege type: \"{}\"", p.as_ref()),
+                });
+            };
+            let role = match args.first() {
+                Some(Value::Text(r)) if named_role => alloc::string::String::from(r.as_ref()),
+                _ => current_role_from_ctx(ctx),
+            };
+            let owner = t
+                .schema()
+                .owner
+                .clone()
+                .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
+            let roles = ctx.users.map_or_else(
+                || {
+                    let mut s = alloc::collections::BTreeSet::new();
+                    s.insert(role.clone());
+                    s
+                },
+                |u| u.effective_roles(&role),
+            );
+            let held = crate::acl::privs_of_roles(t.schema(), &owner, &roles);
+            Ok(Value::Bool(held & bit != 0))
+        }
+        // v7.39 (read01 round 58) — `pg_has_role(member, role, 'MEMBER'|'USAGE')`
+        // is a REAL membership question now. USAGE asks whether the privileges
+        // flow automatically (INHERIT); MEMBER asks whether a `SET ROLE` is
+        // possible at all. SPG lets any member SET ROLE, so MEMBER is direct or
+        // inherited membership and USAGE is the inheriting kind.
+        "pg_has_role" => {
+            let (member, role_arg) = match args.len() {
+                3 => (
+                    match &args[0] {
+                        Value::Text(r) => alloc::string::String::from(r.as_ref()),
+                        _ => current_role_from_ctx(ctx),
+                    },
+                    &args[1],
+                ),
+                2 => (current_role_from_ctx(ctx), &args[0]),
+                _ => return Ok(Value::Bool(true)),
+            };
+            let Value::Text(role) = role_arg else {
+                return Ok(Value::Bool(true));
+            };
+            let role = role.as_ref();
+            if member.eq_ignore_ascii_case(role) {
+                return Ok(Value::Bool(true));
+            }
+            let Some(users) = ctx.users else {
+                return Ok(Value::Bool(true));
+            };
+            Ok(Value::Bool(
+                users
+                    .effective_roles(&member)
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(role)),
+            ))
+        }
+        "has_schema_privilege"
         | "has_function_privilege"
         | "has_sequence_privilege"
         | "has_database_privilege"
@@ -14174,11 +14279,9 @@ fn apply_function_dispatch(
         // return true. `has_parameter_privilege` (PG 15+) probes
         // ALTER SYSTEM permission on a GUC. `pg_has_role` is the
         // role-membership check used by RBAC-aware tooling.
-        | "has_any_column_privilege"
         | "has_server_privilege"
         | "has_foreign_data_wrapper_privilege"
-        | "has_parameter_privilege"
-        | "pg_has_role" => Ok(Value::Bool(true)),
+        | "has_parameter_privilege" => Ok(Value::Bool(true)),
         // v7.39 (read01 pgstatfuncs.c) — pg_backend_pid reports the REAL
         // calling-connection id (the same value pg_stat_activity.pid and
         // BackendKeyData carry), via the host slot; embedded runs → 1.
