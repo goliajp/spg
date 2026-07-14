@@ -1326,6 +1326,16 @@ pub struct ColumnSchema {
     /// + NOT NULL against the cell value. Persisted in catalog
     /// FILE_VERSION 30+; older catalogs deserialise with None.
     pub user_domain_type: Option<String>,
+    /// v7.39 (read01 round 56) — when the column is bound to a user-defined
+    /// COMPOSITE type. `ty` stays `DataType::Jsonb` (the on-disk form), but the
+    /// engine REHYDRATES the stored JSON into a `Value::Composite` on read, so
+    /// field access `(p).x`, `= ROW(…)`, ordering and the canonical `(2,b)`
+    /// text form all work — they were already implemented on Value::Composite;
+    /// what was missing was that the column never recorded WHICH composite type
+    /// it holds (this field's doc comment existed for two releases, the field
+    /// itself did not). Persisted in the composite-column appendix
+    /// (FILE_VERSION 63+); older catalogs deserialise with None.
+    pub user_composite_type: Option<String>,
     /// v7.17.0 Phase 2.1 — MySQL `ON UPDATE CURRENT_TIMESTAMP`
     /// column attribute. When `Some(expr_src)`, an UPDATE that
     /// does NOT bind this column overrides the new value with
@@ -6085,6 +6095,7 @@ impl ColumnSchema {
             auto_increment: false,
             user_enum_type: None,
             user_domain_type: None,
+            user_composite_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,
             is_unsigned: false,
@@ -6429,7 +6440,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 62;
+const FILE_VERSION: u8 = 63;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7096,6 +7107,25 @@ impl Catalog {
                     }
                     None => out.push(0),
                 }
+            }
+            // v7.39 (read01 round 56) — user_composite_type appendix
+            // (FILE_VERSION 63+). Sparse, at the very end of the per-table
+            // block: only composite-typed columns land here, so a v62 reader
+            // stops before it and its composite columns stay plain JSON.
+            let mut comp_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(n) = &c.user_composite_type {
+                    comp_bindings.push((i, n.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(comp_bindings.len())
+                    .expect("≤ 65k composite-typed columns/table"),
+            );
+            for (pos, n) in comp_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, n);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

@@ -48,6 +48,7 @@ pub(crate) fn deserialize_table(
             runtime_default: None,
             auto_increment,
             user_enum_type: None,
+            user_composite_type: None,
             user_domain_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,
@@ -420,6 +421,20 @@ pub(crate) fn deserialize_table(
                 None
             };
             t.schema_mut().uniqueness_constraints[i].name = name;
+        }
+    }
+    // v7.39 (read01 round 56) — per-table user_composite_type appendix
+    // (FILE_VERSION 63+). Same sparse shape as the enum / domain ones: only
+    // composite-typed columns land here. v62-and-below leave every column None,
+    // so their composite columns stay plain JSON (the pre-epic behaviour).
+    if version >= 63 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let cname = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.user_composite_type = Some(cname);
+            }
         }
     }
     let _ = table_name;

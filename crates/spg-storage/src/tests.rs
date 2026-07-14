@@ -931,11 +931,17 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // (no CHECKs, no uniqueness constraints) it is two zero counts:
     // [u16 check_count=0][u16 uc_count=0].
     const EMPTY_CONSTRAINT_NAME_APPENDIX: usize = 4;
-    let mut v52 = Vec::with_capacity(
-        v53.len() - appendix.len() - trailing_v53plus - EMPTY_CONSTRAINT_NAME_APPENDIX,
-    );
+    // v7.39 (read01 round 56) — and the v63 user_composite_type appendix, which
+    // sits after the constraint-name one at the very end of the per-table block.
+    // For `t` (no composite columns) it is a single zero u16 count (2 bytes).
+    // THIRD time this test has caught a new trailing appendix — that is exactly
+    // its job: every one of them has to be stripped here.
+    const EMPTY_COMPOSITE_APPENDIX: usize = 2;
+    let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX + EMPTY_COMPOSITE_APPENDIX;
+    let mut v52 =
+        Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
-    v52.extend_from_slice(&v53[start + appendix.len() + EMPTY_CONSTRAINT_NAME_APPENDIX..]);
+    v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
     // Set the version byte to 52 — the format before the MVCC appendix (v53)
     // and before the CRC trailer (v54): byte-for-byte what the pre-slice
     // released code would have written for this catalog.
@@ -989,6 +995,27 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// real xmax, some alive) and specific non-dense rowids must serialize +
 /// deserialize with headers AND rowids identical, and next_rowid correct
 /// (strictly above every loaded id).
+#[test]
+fn v63_roundtrip_preserves_user_composite_type_binding() {
+    // read01 round 56 — the marker that tells the engine a JSON-stored column
+    // actually holds composite type `pt`. Without it a reopened database goes
+    // back to serving raw JSON, silently.
+    let mut c = Catalog::new();
+    let mut p = ColumnSchema::new("p", DataType::Jsonb, true);
+    p.user_composite_type = Some("pt".into());
+    c.create_table(TableSchema::new(
+        "cp",
+        vec![ColumnSchema::new("id", DataType::Int, false), p],
+    ))
+    .unwrap();
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v63 image loads");
+    let cols = &restored.get("cp").unwrap().schema().columns;
+    assert_eq!(cols[1].user_composite_type.as_deref(), Some("pt"));
+    // The binding is sparse — a plain column carries no marker.
+    assert_eq!(cols[0].user_composite_type, None);
+}
+
 #[test]
 fn v53_roundtrip_preserves_mixed_headers_and_rowids() {
     use crate::row_header::{HEAP_XMIN_FROZEN, RowHeader, RowId, XMAX_ALIVE};

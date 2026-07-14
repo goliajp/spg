@@ -2675,7 +2675,15 @@ impl Engine {
             // for introspection / DROP TYPE / column-type-DDL
             // round-trip.
             if cat.composite_types().contains_key(&name) {
+                // v7.39 (read01 round 56) — the on-disk form stays JSONB, but
+                // the column now RECORDS which composite type it holds. The
+                // engine rehydrates the stored JSON into a Value::Composite on
+                // read, so field access / ROW comparison / ordering / the
+                // canonical `(2,b)` text form all work — every one of those was
+                // already implemented on Value::Composite; the column simply
+                // never remembered its type.
                 col.ty = spg_storage::DataType::Jsonb;
+                col.user_composite_type = Some(name.clone());
                 continue;
             }
             return Err(EngineError::Unsupported(alloc::format!(

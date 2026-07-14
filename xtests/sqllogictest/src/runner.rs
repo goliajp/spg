@@ -367,7 +367,7 @@ mod tests {
             "statement ok\nCREATE TABLE emb (id INT NOT NULL, v VECTOR(3) NOT NULL)\n\n\
              statement ok\nINSERT INTO emb VALUES (1, [1.0, 2.0, 3.0])\n\n\
              statement ok\nINSERT INTO emb VALUES (2, [4.0, 5.0, 6.0])\n\n\
-             query IT nosort\nSELECT * FROM emb ORDER BY id\n----\n1\n[1.000, 2.000, 3.000]\n2\n[4.000, 5.000, 6.000]\n",
+             query IT nosort\nSELECT * FROM emb ORDER BY id\n----\n1\n[1,2,3]\n2\n[4,5,6]\n",
         );
         assert_eq!(out.pass, 4, "outcomes: {:#?}", out.per_record);
     }
