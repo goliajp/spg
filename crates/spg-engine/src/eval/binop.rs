@@ -255,6 +255,13 @@ pub(super) fn apply_binary(
     l: Value<'static>,
     r: Value<'static>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (read01 round 70) — `tags @> '{b}'`. PG reads a bare string literal
+    // beside an ARRAY operand as an array of that type (an "unknown" literal
+    // takes the other side's type). SPG saw a TEXT and routed the operator to
+    // its JSON reading — `@>` / `<@` errored, and `&&` went to the INET one. The
+    // element-typed forms (`tags @> ARRAY['b']`) worked all along, so this was a
+    // pure literal-coercion hole, not a missing operator.
+    let (l, r) = coerce_array_literal_operands(op, l, r);
     // SQL three-valued logic for AND / OR with NULL is special — handle before
     // the general NULL-propagation rule.
     if let BinOp::And = op {
@@ -5487,5 +5494,47 @@ mod tests {
             .unwrap();
         let expected = i64::from(d) * 86_400_000_000 + 3_600_000_000;
         assert_eq!(v, Value::Timestamp(expected));
+    }
+}
+
+
+/// v7.39 (read01 round 70) — for the three ARRAY operators (`@>`, `<@`, `&&`),
+/// read a bare TEXT literal on either side as an array of the OTHER side's
+/// type. PG's unknown-literal resolution, in the one place SPG needed it.
+///
+/// A text that does not parse as an array literal is left alone — it may well be
+/// the JSON or inet reading of the same operator, which the dispatch below still
+/// has to reach.
+fn coerce_array_literal_operands(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> (Value<'static>, Value<'static>) {
+    if !matches!(
+        op,
+        BinOp::JsonContains | BinOp::JsonContainedBy | BinOp::InetOverlap
+    ) {
+        return (l, r);
+    }
+    let as_array_like = |v: &Value<'_>| array_scalar_elems(v).is_some();
+    let cast_like = |text: Value<'static>, model: &Value<'_>| -> Option<Value<'static>> {
+        let target = match model {
+            Value::TextArray(_) => spg_sql::ast::CastTarget::TextArray,
+            Value::IntArray(_) => spg_sql::ast::CastTarget::IntArray,
+            Value::BigIntArray(_) => spg_sql::ast::CastTarget::BigIntArray,
+            _ => return None,
+        };
+        crate::eval::cast::cast_value(text, target).ok()
+    };
+    match (&l, &r) {
+        (_, Value::Text(_)) if as_array_like(&l) => match cast_like(r.clone(), &l) {
+            Some(coerced) => (l, coerced),
+            None => (l, r),
+        },
+        (Value::Text(_), _) if as_array_like(&r) => match cast_like(l.clone(), &r) {
+            Some(coerced) => (coerced, r),
+            None => (l, r),
+        },
+        _ => (l, r),
     }
 }
