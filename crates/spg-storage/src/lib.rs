@@ -3773,8 +3773,9 @@ impl Catalog {
             if if_not_exists {
                 return Ok(());
             }
+            // v7.39 (read01 round 47) — a sequence is a relation to PG (42P07).
             return Err(StorageError::Corrupt(format!(
-                "sequence {:?} already exists",
+                "relation {:?} already exists",
                 def.name
             )));
         }
@@ -3901,8 +3902,9 @@ impl Catalog {
             if if_not_exists {
                 return Ok(());
             }
+            // v7.39 (read01 round 47) — a view is a relation to PG (42P07).
             return Err(StorageError::Corrupt(format!(
-                "view {:?} already exists",
+                "relation {:?} already exists",
                 def.name
             )));
         }
@@ -5905,8 +5907,13 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateTable { name } => write!(f, "table already exists: {name}"),
-            Self::TableNotFound { name } => write!(f, "table not found: {name}"),
+            // v7.39 (read01 round 47) — PG's 42P07 wording.
+            Self::DuplicateTable { name } => write!(f, "relation \"{name}\" already exists"),
+            // v7.39 (read01 round 47) — PG's wording for a missing relation
+            // (42P01). DROP TABLE says "table" and raises its own error at
+            // the engine; every other path (SELECT / ALTER / …) says
+            // "relation", which is what this carries.
+            Self::TableNotFound { name } => write!(f, "relation \"{name}\" does not exist"),
             Self::ArityMismatch { expected, actual } => write!(
                 f,
                 "row arity mismatch: expected {expected} columns, got {actual}"
@@ -5926,7 +5933,8 @@ impl fmt::Display for StorageError {
                 // sites that know the table name).
                 write!(f, "null value in column \"{column}\" violates not-null constraint")
             }
-            Self::DuplicateIndex { name } => write!(f, "index already exists: {name}"),
+            // v7.39 (read01 round 47) — an index is a relation to PG (42P07).
+            Self::DuplicateIndex { name } => write!(f, "relation \"{name}\" already exists"),
             Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
             Self::IndexNotFound { name } => write!(f, "index not found: {name}"),

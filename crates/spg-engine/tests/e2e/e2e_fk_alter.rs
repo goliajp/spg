@@ -68,12 +68,16 @@ fn drop_constraint_removes_enforcement() {
 
 #[test]
 fn drop_unknown_constraint_is_rejected() {
-    // v7.37.18 (18.17) — error message widened from "no FK
-    // named" to "no constraint named" now that DROP CONSTRAINT
-    // also handles PK/UNIQUE/CHECK.
+    // v7.37.18 (18.17) — DROP CONSTRAINT also handles PK/UNIQUE/CHECK.
+    // v7.39 (read01 round 47) — the message is now PG's own wording
+    // (42704 at the wire).
     let mut eng = engine_with(&["CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL)"]);
     let r = eng.execute("ALTER TABLE o DROP CONSTRAINT ghost");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("no constraint named")));
+    assert!(matches!(
+        r,
+        Err(EngineError::Unsupported(ref s))
+            if s.contains("constraint \"ghost\" of relation \"o\" does not exist")
+    ));
 }
 
 #[test]

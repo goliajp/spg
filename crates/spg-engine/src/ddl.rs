@@ -282,7 +282,7 @@ impl Engine {
             .position(|c| c.name.eq_ignore_ascii_case(&column))
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
-                    "ALTER COLUMN SET DEFAULT: column {column:?} not in table {tbl:?}"
+                    "column {column:?} of relation {tbl:?} does not exist"
                 ))
             })?;
         let col = &mut table.schema_mut().columns[pos];
@@ -334,7 +334,7 @@ impl Engine {
             .position(|c| c.name.eq_ignore_ascii_case(&column))
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
-                    "ALTER COLUMN SET NOT NULL: column {column:?} not in table {tbl:?}"
+                    "column {column:?} of relation {tbl:?} does not exist"
                 ))
             })?;
         for row in table.rows().iter() {
@@ -733,8 +733,9 @@ impl Engine {
                 .iter()
                 .any(|f| f.name.as_ref() == Some(name))
         {
+            // v7.39 (read01 round 47) — PG wording (42710).
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER TABLE ADD CONSTRAINT: a constraint named {name:?} already exists"
+                "constraint {name:?} for relation {tbl:?} already exists"
             )));
         }
         table.schema_mut().foreign_keys.push(storage_fk);
@@ -799,8 +800,11 @@ impl Engine {
         if if_exists {
             return Ok(());
         }
+        // v7.39 (read01 round 47) — PG wording (42704). Note PG's own
+        // inconsistency: DROP CONSTRAINT says "of relation" while ADD
+        // CONSTRAINT says "for relation" — both are matched verbatim.
         Err(EngineError::Unsupported(alloc::format!(
-            "ALTER TABLE DROP CONSTRAINT: no constraint named {name:?} on {tbl:?}"
+            "constraint {name:?} of relation {tbl:?} does not exist"
         )))
     }
 
@@ -892,7 +896,7 @@ impl Engine {
             .position(|c| c.name.eq_ignore_ascii_case(&column))
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
-                    "ALTER COLUMN TYPE: column {column:?} not found on {:?}",
+                    "column {column:?} of relation {:?} does not exist",
                     tbl
                 ))
             })?;
@@ -1320,6 +1324,14 @@ impl Engine {
         // dangling FK / trigger references in one
         // atomic step.
         let old = tbl.to_string();
+        // v7.39 (read01 round 47) — PG rejects a rename onto a name that
+        // already names a relation (42P07), including a rename onto the
+        // table's own name. SPG used to accept both silently.
+        if self.active_catalog().get(&new).is_some() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "relation {new:?} already exists"
+            )));
+        }
         self.active_catalog_mut()
             .rename_table(&old, &new)
             .map_err(EngineError::Storage)?;
@@ -1354,9 +1366,11 @@ impl Engine {
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&old))
             .ok_or_else(|| {
+                // v7.39 (read01 round 47) — PG wording (42703). PG omits
+                // the "of relation" qualifier on RENAME COLUMN (unlike the
+                // ALTER COLUMN family below) — match it exactly.
                 EngineError::Unsupported(alloc::format!(
-                    "ALTER TABLE RENAME COLUMN: column {old:?} not found on {:?}",
-                    tbl
+                    "column {old:?} does not exist"
                 ))
             })?;
         // Reject same-name (case-insensitive) collision.
@@ -1367,8 +1381,9 @@ impl Engine {
             .enumerate()
             .any(|(i, c)| i != col_pos && c.name.eq_ignore_ascii_case(&new))
         {
+            // v7.39 (read01 round 47) — PG wording (42701).
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER TABLE RENAME COLUMN: column {new:?} already exists on {:?}",
+                "column {new:?} of relation {:?} already exists",
                 tbl
             )));
         }

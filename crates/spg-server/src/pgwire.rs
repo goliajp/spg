@@ -3501,8 +3501,33 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42701"
         } else if msg.contains("column \"") && msg.contains("does not exist") {
             "42703"
-        // DROP TABLE on a missing table is 42P01 UNDEFINED_TABLE.
-        } else if msg.contains("table \"") && msg.contains("does not exist") {
+        // v7.39 (read01 round 47) — constraint errors must be classified
+        // BEFORE the table/relation patterns below: PG's RENAME CONSTRAINT
+        // wording ("constraint \"c\" for table \"t\" does not exist") also
+        // contains `table "`, which would otherwise steal it for 42P01.
+        // A duplicate object (constraint / type) is 42710; a missing one is
+        // 42704 UNDEFINED_OBJECT.
+        // The dup-constraint pattern must be narrow: PG's 23505 duplicate-key
+        // message also carries `constraint "t_pkey"` and a DETAIL ending in
+        // "already exists.", so key on PG's distinctive "for relation" /
+        // "for table" qualifier, which only the DDL form has.
+        } else if msg.contains("constraint \"")
+            && (msg.contains("\" for relation \"") || msg.contains("\" for table \""))
+            && msg.contains("already exists")
+        {
+            "42710"
+        } else if msg.contains("constraint \"") && msg.contains("does not exist") {
+            "42704"
+        } else if msg.contains("type \"") && msg.contains("already exists") {
+            "42710"
+        // A duplicate relation (table / index / view / sequence) is 42P07.
+        } else if msg.contains("relation \"") && msg.contains("already exists") {
+            "42P07"
+        // DROP TABLE on a missing table is 42P01 UNDEFINED_TABLE; every
+        // other path (SELECT / ALTER / …) says "relation", same state.
+        } else if (msg.contains("table \"") || msg.contains("relation \""))
+            && msg.contains("does not exist")
+        {
             "42P01"
         } else if msg.contains("cannot take logarithm of") {
             "2201E"
@@ -3700,6 +3725,28 @@ mod engine_error_sqlstate_tests {
                  HINT:  Use OVERRIDING SYSTEM VALUE to override."
             ),
             "428C9"
+        );
+        // v7.39 (read01 round 47) — the rest of the DDL object-error surface.
+        assert_eq!(code("relation \"r1\" already exists"), "42P07");
+        assert_eq!(code("relation \"nope_tbl\" does not exist"), "42P01");
+        assert_eq!(code("type \"r_enum\" already exists"), "42710");
+        assert_eq!(
+            code("constraint \"c1\" for relation \"r1\" already exists"),
+            "42710"
+        );
+        assert_eq!(
+            code("constraint \"nope\" of relation \"r1\" does not exist"),
+            "42704"
+        );
+        assert_eq!(code("column \"nope\" does not exist"), "42703");
+        // The 23505 duplicate-key message also mentions a constraint and
+        // "already exists" — it must NOT be stolen by the 42710 pattern.
+        assert_eq!(
+            code(
+                "duplicate key value violates unique constraint \"t_pkey\" on table \"t\" \
+                 DETAIL: Key (id)=(1) already exists."
+            ),
+            "23505"
         );
     }
 }
@@ -5080,6 +5127,13 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
                 .or_else(|| m.strip_prefix("storage: "))
                 .or_else(|| m.strip_prefix("eval: "))
                 .or_else(|| m.strip_prefix("type mismatch: "))
+                // v7.39 (read01 round 47) — duplicate-object errors for
+                // sequences / views / types still ride StorageError::Corrupt,
+                // whose Display adds this banner. A typed state means we
+                // recognised the error, so it is not a corruption report; a
+                // genuine corruption never matches a typed pattern and keeps
+                // its prefix.
+                .or_else(|| m.strip_prefix("corrupt on-disk format: "))
                 // v7.39 (read01 numeric.c) — a typed literal-overflow error
                 // can surface from the parser ("parse: parse error at token
                 // #N: value overflows numeric format").

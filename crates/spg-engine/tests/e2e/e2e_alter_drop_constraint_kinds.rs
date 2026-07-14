@@ -54,5 +54,10 @@ fn drop_constraint_unknown_without_if_exists_errors() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     let err = e.execute("ALTER TABLE t DROP CONSTRAINT nope").unwrap_err();
-    assert!(matches!(err, EngineError::Unsupported(ref s) if s.contains("no constraint named")));
+    // v7.39 (read01 round 47) — PG wording (42704 at the wire).
+    assert!(matches!(
+        err,
+        EngineError::Unsupported(ref s)
+            if s.contains("constraint \"nope\" of relation \"t\" does not exist")
+    ));
 }
