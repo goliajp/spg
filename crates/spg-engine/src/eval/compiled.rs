@@ -389,6 +389,22 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 steps.push(Step::Subtree(e.clone()));
                 return;
             }
+            // v7.39 (read01 round 76) — `<timestamptz>::text` renders the
+            // `+00` offset, and tz-ness lives in the *static* type, not in
+            // the runtime `Value::Timestamp`. `Step::Cast` calls the pure
+            // `cast_value(value, target)`, which cannot see the expression
+            // it came from — so a cast the interpreter renders with an
+            // offset came out without one whenever the compiled VM drove
+            // it (every cast inside an aggregate argument, and every cast
+            // over an aggregate result: `string_agg(x::text, ',')`,
+            // `min(x)::text`). Keep this one shape on Subtree.
+            if matches!(target, spg_sql::ast::CastTarget::Text)
+                && crate::describe::describe_expr(expr, ctx.columns)
+                    .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+            {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             compile_into(expr, ctx, steps);
             steps.push(Step::Cast {
                 target: target.clone(),

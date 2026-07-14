@@ -2867,6 +2867,77 @@ impl Engine {
             None => None,
         };
         match fn_name.as_str() {
+            // v7.39 (read01 round 76) — `jsonb_populate_record(NULL::t, j)` /
+            // `…_recordset` (+ json_ variants). The row shape is the BASE
+            // argument's declared type — a table's or a composite type's
+            // column list — which only the catalog knows, so the parser hands
+            // the raw arguments here rather than desugaring blind.
+            "jsonb_populate_record"
+            | "json_populate_record"
+            | "jsonb_populate_recordset"
+            | "json_populate_recordset" => {
+                let type_name = match args.first() {
+                    Some(Expr::Cast {
+                        target: spg_sql::ast::CastTarget::Named(n),
+                        ..
+                    }) => n.clone(),
+                    _ => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "{fn_name}(): first argument must name a row type, \
+                             e.g. NULL::mytable"
+                        )));
+                    }
+                };
+                let cat = self.active_catalog();
+                let cols: alloc::vec::Vec<ColumnSchema> = if let Some(t) = cat.get(&type_name) {
+                    t.schema().columns.clone()
+                } else if let Some(c) = cat.composite_types().get(&type_name) {
+                    c.fields
+                        .iter()
+                        .map(|(n, ty)| ColumnSchema::new(n.clone(), *ty, true))
+                        .collect()
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "type \"{type_name}\" does not exist"
+                    )));
+                };
+                let json_arg = match args.get(1) {
+                    Some(e) => eval::eval_expr(e, &dummy_row, &ctx).map_err(EngineError::Eval)?,
+                    None => Value::Null,
+                };
+                // The set form iterates the JSON array; the scalar form is
+                // the one-element case of the same walk.
+                let docs: alloc::vec::Vec<Value<'static>> = if fn_name.ends_with("recordset") {
+                    crate::json::array_element_rows(&json_arg, false, fn_name)
+                        .map_err(EngineError::Eval)?
+                        .into_iter()
+                        .map(|s| s.map_or(Value::Null, Value::json))
+                        .collect()
+                } else if matches!(json_arg, Value::Null) {
+                    alloc::vec::Vec::new()
+                } else {
+                    alloc::vec![json_arg]
+                };
+                let mut rows = alloc::vec::Vec::with_capacity(docs.len());
+                for doc in &docs {
+                    let mut vals = alloc::vec::Vec::with_capacity(cols.len());
+                    for c in &cols {
+                        // `->>` semantics: a missing key is NULL, present keys
+                        // arrive as text and cast to the declared column type.
+                        let raw = crate::json::path_get(doc, &Value::text(c.name.clone()), true)
+                            .map_err(EngineError::Eval)?;
+                        let v = if matches!(raw, Value::Null) {
+                            Value::Null
+                        } else {
+                            crate::conversions::coerce_value(raw, c.ty, "", 0)
+                                .map_err(|e| EngineError::Unsupported(alloc::format!("{e:?}")))?
+                        };
+                        vals.push(v);
+                    }
+                    rows.push(Row::new(vals));
+                }
+                Ok((rows, cols))
+            }
             "pg_partition_tree" => {
                 let cols = alloc::vec![
                     ColumnSchema::new("relid".to_string(), DataType::Text, true),
@@ -3081,7 +3152,14 @@ impl Engine {
         };
         let key_col = ColumnSchema::new("key".to_string(), spg_storage::DataType::Text, false);
         let value_col = ColumnSchema::new("value".to_string(), value_dtype, as_text);
-        let schema_cols = alloc::vec![key_col, value_col];
+        let mut schema_cols = alloc::vec![key_col, value_col];
+        // `AS t(k, v)` renames key/value positionally (PG behaviour); the
+        // LATERAL-position form of the same call already honours it.
+        for (i, new_name) in primary.unnest_column_aliases.iter().enumerate() {
+            if let Some(col) = schema_cols.get_mut(i) {
+                col.name = new_name.clone();
+            }
+        }
         // v7.39 (read01 round 54) — `ev_ctx` threads the catalog; a bare
         // `EvalContext::new` drops it and every catalog-dependent cast
         // (regclass / enum / composite / domain) silently degrades.
@@ -6204,6 +6282,19 @@ pub(crate) fn generate_series_rows(
     // bound to its midnight Timestamp (canonical `days *
     // 86_400_000_000`, matching cast.rs `cast_to_timestamp`) before
     // the shape match so the existing timestamp arm drives the walk.
+    // v7.39 (read01 round 76) — WHICH timestamp overload PG picks matters:
+    // `generate_series(date, date, interval)` has no date overload, and among
+    // the two candidates PG prefers the timestamptz one (timestamptz is the
+    // preferred type of the datetime category), so the column comes back
+    // `timestamp with time zone` — the rows render with a `+00` offset. A
+    // timestamptz bound obviously lands there too. Only genuinely
+    // timestamp-typed bounds keep the TZ-naive result type.
+    let empty_cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    let tz = arg_values.iter().any(|v| matches!(v, Value::Date(_)))
+        || args.iter().any(|a| {
+            crate::describe::describe_expr(a, &empty_cols)
+                .is_some_and(|s| matches!(s.ty, DataType::Timestamptz))
+        });
     for v in &mut arg_values {
         if let Value::Date(d) = *v {
             *v = Value::Timestamp(crate::conversions::date_days_to_micros(d));
@@ -6237,7 +6328,14 @@ pub(crate) fn generate_series_rows(
                 }
             };
             let rows = generate_series_timestamps(*start, *stop, interval_step, cancel)?;
-            Ok((DataType::Timestamp, rows))
+            Ok((
+                if tz {
+                    DataType::Timestamptz
+                } else {
+                    DataType::Timestamp
+                },
+                rows,
+            ))
         }
         [start, stop, step]
             if value_is_integer(start) && value_is_integer(stop) && value_is_integer(step) =>

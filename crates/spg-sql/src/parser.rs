@@ -13280,14 +13280,16 @@ impl Parser {
                 )));
             }
             self.advance();
-            let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: None,
-                unnest_column_aliases: Vec::new(),
+                // `AS t(k, v)` renames key/value positionally, same as the
+                // LATERAL-position form already does.
+                unnest_column_aliases: column_aliases,
                 with_ordinality: false,
                 generate_series_args: None,
                 lateral_subquery: None,
@@ -14216,8 +14218,10 @@ impl Parser {
         let mut arg = self.parse_expr(0)?;
         // populate_record(base, json): the base only carries the record
         // type here — the JSON argument is the second expression.
+        let mut base: Option<Expr> = None;
         if matches!(self.peek(), Token::Comma) {
             self.advance();
+            base = Some(arg);
             arg = self.parse_expr(0)?;
         }
         if !matches!(self.peek(), Token::RParen) {
@@ -14228,28 +14232,51 @@ impl Parser {
         }
         self.advance(); // )
         let is_set = fn_name.ends_with("recordset");
-        // Required `[AS] alias ( col type [, …] )` column-definition list.
+        // `[AS] alias ( col type [, …] )` column-definition list.
         if matches!(self.peek(), Token::As) {
             self.advance();
         }
-        let alias = match self.peek() {
+        let alias_opt = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) => {
                 let a = s.clone();
                 self.advance();
-                a
+                Some(a)
             }
-            _ => {
-                return Err(self.err(alloc::format!(
-                    "{fn_name}(...) needs a column-definition list, e.g. AS t(a int, b text)"
-                )));
-            }
+            _ => None,
         };
+        // v7.39 (read01 round 76) — the populate family's canonical PG
+        // spelling carries no column list at all: the row shape comes from
+        // the BASE argument's declared type (`jsonb_populate_record(NULL::t,
+        // j)`). The parser has no catalog, so hand the two arguments to the
+        // engine's table-function channel, which does. Only `*_to_record*`
+        // (whose base is bare `record`) genuinely requires the list.
         if !matches!(self.peek(), Token::LParen) {
+            if let Some(base_expr) = base {
+                let alias = alias_opt.unwrap_or_else(|| fn_name.clone());
+                return Ok(TableRef {
+                    name: alias.clone(),
+                    alias: Some(alias),
+                    as_of_segment: None,
+                    unnest_expr: None,
+                    unnest_column_aliases: Vec::new(),
+                    with_ordinality: false,
+                    generate_series_args: None,
+                    lateral_subquery: None,
+                    jsonb_each_text_arg: None,
+                    table_fn_call: Some(Box::new((fn_name, alloc::vec![base_expr, arg]))),
+                    rows_from: None,
+                });
+            }
             return Err(self.err(alloc::format!(
                 "expected '(' to start the {fn_name} column-definition list, got {:?}",
                 self.peek()
             )));
         }
+        let Some(alias) = alias_opt else {
+            return Err(self.err(alloc::format!(
+                "{fn_name}(...) needs a column-definition list, e.g. AS t(a int, b text)"
+            )));
+        };
         self.advance(); // (
         let mut coldefs: Vec<(String, crate::ast::CastTarget)> = Vec::new();
         loop {

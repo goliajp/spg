@@ -5069,19 +5069,27 @@ pub(super) fn compare(
         }
         // v7.37.16 — `jsonb = jsonb` / `jsonb <> jsonb` structural
         // equality (PG18-compatible: object keys compared order-free,
-        // array elements order-sensitive, numbers by value). PG defines
-        // a total order on jsonb, but the ordering operators (< <= > >=)
-        // are DEFERRED here — only equality is wired. Returns early
-        // because jsonb equality is not expressible as an `Ordering`.
-        (Value::Json(_), Value::Json(_)) => {
-            let eq = crate::json::equals(l, r)?;
-            return match op {
-                BinOp::Eq => Ok(Value::Bool(eq)),
-                BinOp::NotEq => Ok(Value::Bool(!eq)),
-                _ => Err(EvalError::TypeMismatch {
-                    detail: "jsonb ordering (<, <=, >, >=) not supported; only = / <>".into(),
-                }),
-            };
+        // array elements order-sensitive, numbers by value). Equality
+        // returns early because it is not expressible as an `Ordering`
+        // (two unequal jsonb values can still compare `Equal` under no
+        // total order at all).
+        //
+        // v7.39 (read01 round 76) — the ordering operators (< <= > >=)
+        // now route to the same total order ORDER BY already sorts by
+        // (`json::jsonb_compare`: the PG type-class ladder Object >
+        // Array > Boolean > Number > String > Null).
+        (Value::Json(a), Value::Json(b)) => {
+            if matches!(op, BinOp::Eq | BinOp::NotEq) {
+                let eq = crate::json::equals(l, r)?;
+                return Ok(Value::Bool(if matches!(op, BinOp::Eq) { eq } else { !eq }));
+            }
+            let pa = crate::json::parse(a).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("invalid jsonb operand: {e:?}"),
+            })?;
+            let pb = crate::json::parse(b).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("invalid jsonb operand: {e:?}"),
+            })?;
+            crate::json::jsonb_compare(&pa, &pb)
         }
         // v7.37.17 — SMALLINT integer comparison. SmallInt↔Float goes
         // through the Float branch above; SmallInt↔Numeric through
