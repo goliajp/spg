@@ -4866,6 +4866,26 @@ fn inet_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static
     Ok(inet_from_u128(*fa, (*ba).max(*bb), val))
 }
 
+/// v7.39 (read01 round 79) — PG's message for "no operator takes these two
+/// types": `operator does not exist: text >= integer`. SPG used to print
+/// `comparison between Some(Text) and Some(Int)` — a Rust `Option`/`Debug`
+/// dump in a user-facing error, and nothing a driver could match on. The
+/// SQLSTATE (42883) already keyed off PG's phrasing, so the wire class was
+/// right while the text was not.
+fn no_such_operator(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> EvalError {
+    // `pg_typeof_name` is the FULL value→type-name table (the one pg_typeof
+    // itself answers from); `pg_typeof_name_for_datatype` covers only the
+    // numeric/temporal subset and returns None for text, which is exactly the
+    // type this error is most often about.
+    EvalError::TypeMismatch {
+        detail: alloc::format!(
+            "operator does not exist: {} {op} {}",
+            super::strings::pg_typeof_name(a),
+            super::strings::pg_typeof_name(b)
+        ),
+    }
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -4942,13 +4962,10 @@ pub(super) fn compare(
                     _ => None,
                 }
             };
-            let mismatch = || EvalError::TypeMismatch {
-                detail: format!(
-                    "comparison between {:?} and {:?}",
-                    a.data_type(),
-                    b.data_type()
-                ),
-            };
+            // v7.39 (read01 round 79) — PG's wording, and without leaking Rust's
+            // `Some(Text)` debug form into a user-facing error:
+            // "operator does not exist: text >= integer".
+            let mismatch = || no_such_operator(op, a, b);
             let (na, sa) = widen(a).ok_or_else(mismatch)?;
             let (nb, sb) = widen(b).ok_or_else(mismatch)?;
             let target = sa.max(sb);
@@ -5334,13 +5351,7 @@ pub(super) fn compare(
             ord
         }
         (a, b) => {
-            return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "comparison between {:?} and {:?}",
-                    a.data_type(),
-                    b.data_type()
-                ),
-            });
+            return Err(no_such_operator(op, a, b));
         }
     };
     let result = match op {

@@ -151,11 +151,14 @@ fn abs_numeric_returns_numeric() {
 #[test]
 fn prng_functions_accept_numeric() {
     let mut e = eng();
-    // setseed returns void (NULL) — proves acceptance without erroring.
+    // v7.39 (read01 round 79) — this said "setseed returns void (NULL)" and
+    // pinned `IS NULL` = true. Live PG18.4 says **false**: void is not null, it
+    // renders as the empty string (`'x' || setseed(0.5)::text` is `x`, not
+    // NULL). A differential test was pinning SPG's own answer.
     ck(
         &mut e,
         "SELECT (setseed(0.5::numeric) IS NULL)::text",
-        "true",
+        "false",
     );
     ck(
         &mut e,

@@ -3383,6 +3383,24 @@ fn engine_error_to_wire_conn(
     engine_error_to_wire(e)
 }
 
+/// The internal class prefixes `Display for EngineError` (and `EvalError`) add.
+/// Longest first: "eval: type mismatch: " must strip before "eval: ".
+fn strip_error_class(msg: &str) -> String {
+    const CLASSES: &[&str] = &[
+        "eval: type mismatch: ",
+        "eval: ",
+        "unsupported: ",
+        "parse: ",
+        "storage: ",
+    ];
+    for c in CLASSES {
+        if let Some(rest) = msg.strip_prefix(c) {
+            return rest.to_string();
+        }
+    }
+    msg.to_string()
+}
+
 fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::Cancelled = e {
         return (
@@ -3687,6 +3705,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else {
             "42000"
         };
+    // v7.39 (read01 round 79) — PG's ErrorResponse carries the message ALONE.
+    // SPG's `Display for EngineError` prefixes the internal error class
+    // ("eval: type mismatch: …", "unsupported: …", "parse: …"), which is useful
+    // in a Rust backtrace and is noise — and a visible non-PG-ism — on the wire:
+    // every error a client saw was prefixed with SPG's own vocabulary. Strip the
+    // class here, at the boundary, so the Rust-facing Display keeps it. The
+    // SQLSTATE classification above matched on the full string, so it is
+    // unaffected.
+    let msg = strip_error_class(&msg);
     (code, msg)
 }
 
