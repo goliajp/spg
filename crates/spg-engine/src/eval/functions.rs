@@ -12731,6 +12731,60 @@ fn apply_function_dispatch(
             };
             Ok(Value::Bytes(bytes.into()))
         }
+        // v7.39 (read01 round 42, mbutils.c) — convert(bytea, src, dst)
+        // → bytea transcodes between server encodings by decoding the
+        // source bytes to SPG's UTF-8 text and re-encoding to the target,
+        // composing the same tables that back convert_from / convert_to.
+        // UTF8→UTF8 is the identity PG returns for a same-encoding call.
+        // First arg is bytea in PG; an unknown text literal reaches us as
+        // Text whose UTF-8 bytes are the same bytea, so accept both.
+        "convert" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("convert() takes 3 args, got {}", args.len()),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let src_bytes: alloc::borrow::Cow<'_, [u8]> = match &args[0] {
+                Value::Bytes(b) => alloc::borrow::Cow::Borrowed(b.as_ref()),
+                Value::Text(s) => alloc::borrow::Cow::Borrowed(s.as_bytes()),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert(): needs bytea, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let src = match &args[1] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert(): source encoding must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let dst = match &args[2] {
+                Value::Text(s) => s.to_string(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert(): destination encoding must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let utf8 = decode_bytes_to_utf8(&src_bytes, &src)?;
+            let out = encode_utf8_to_bytes(&utf8, &dst)?;
+            Ok(Value::Bytes(out.into()))
+        }
         "error_on_null" => error_on_null(args),
         // v7.12.1 — PG full-text search lexer / tsquery builders.
         // mailrs G-CRIT-3 acceptance path: `to_tsvector('english',
@@ -16064,6 +16118,90 @@ fn win1252_char_to_byte(ch: char) -> Option<u8> {
 /// v7.38 (read01 P6.32) — is `enc` a name for Windows-1252?
 fn is_win1252(enc_up: &str) -> bool {
     matches!(enc_up, "WIN1252" | "CP1252" | "WINDOWS-1252")
+}
+
+/// v7.39 (read01 round 42, mbutils.c) — decode bytes in server encoding
+/// `enc` into SPG's UTF-8 text, sharing the single-byte tables that back
+/// `convert_from`. The composable half of the 3-arg `convert()`.
+fn decode_bytes_to_utf8(b: &[u8], enc: &str) -> Result<alloc::string::String, EvalError> {
+    let enc_up = enc.to_ascii_uppercase();
+    let table = super::encodings::encoding_table(&enc_up)
+        .or_else(|| super::encodings::encoding_table(&enc_up.replace('-', "")));
+    if !matches!(enc_up.as_str(), "UTF8" | "UTF-8" | "SQL_ASCII")
+        && !is_win1252(&enc_up)
+        && table.is_none()
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "convert(): unsupported source encoding {enc:?} — SPG stores UTF-8 only; \
+                 use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1250-1254"
+            ),
+        });
+    }
+    if let Some(t) = table {
+        super::encodings::single_byte_to_utf8(b, t, &enc_up)
+    } else if is_win1252(&enc_up) {
+        let mut out = alloc::string::String::with_capacity(b.len());
+        for &byte in b.iter() {
+            match win1252_byte_to_char(byte) {
+                Some(c) => out.push(c),
+                None => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert(): byte {byte:#04x} is not defined in encoding WIN1252"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    } else {
+        match core::str::from_utf8(b) {
+            Ok(v) => Ok(alloc::string::String::from(v)),
+            Err(e) => Err(EvalError::TypeMismatch {
+                detail: alloc::format!("convert(): input is not valid UTF-8: {e}"),
+            }),
+        }
+    }
+}
+
+/// v7.39 (read01 round 42, mbutils.c) — encode SPG's UTF-8 text into
+/// server encoding `enc`, sharing the tables that back `convert_to`.
+fn encode_utf8_to_bytes(s: &str, enc: &str) -> Result<alloc::vec::Vec<u8>, EvalError> {
+    let enc_up = enc.to_ascii_uppercase();
+    let table = super::encodings::encoding_table(&enc_up)
+        .or_else(|| super::encodings::encoding_table(&enc_up.replace('-', "")));
+    if !matches!(enc_up.as_str(), "UTF8" | "UTF-8" | "SQL_ASCII")
+        && !is_win1252(&enc_up)
+        && table.is_none()
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "convert(): unsupported destination encoding {enc:?} — SPG stores UTF-8 only; \
+                 use UTF8 / SQL_ASCII / LATIN1 / LATIN2 / LATIN9 / KOI8R / KOI8U / WIN1250-1254"
+            ),
+        });
+    }
+    if let Some(t) = table {
+        super::encodings::utf8_to_single_byte(s, t, &enc_up)
+    } else if is_win1252(&enc_up) {
+        let mut out = alloc::vec::Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            match win1252_char_to_byte(ch) {
+                Some(byte) => out.push(byte),
+                None => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "convert(): character {ch:?} has no equivalent in encoding WIN1252"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    } else {
+        Ok(s.as_bytes().to_vec())
+    }
 }
 
 fn expect_text_arg<'a>(
