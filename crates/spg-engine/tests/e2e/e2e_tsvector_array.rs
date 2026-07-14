@@ -46,12 +46,14 @@ fn tsvector_to_array_extracts_sorted_lexemes() {
 #[test]
 fn array_to_tsvector_sorts_and_dedups() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 43) — returns a real tsvector value that
+    // renders canonically with quoted, position-less lexemes.
     assert_eq!(
-        text(&first(
+        spg_engine::eval::value_to_text(&first(
             &mut e,
             "SELECT array_to_tsvector(ARRAY['fat', 'cat', 'rat', 'cat'])"
         )),
-        "cat fat rat"
+        "'cat' 'fat' 'rat'"
     );
 }
 

@@ -12273,6 +12273,10 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{name}(): invalid JSON — {e}"),
                 }
             })?;
+            // v7.39 (read01 round 43) — collect the selected scalars as
+            // raw segments in document order, then run the whole stream
+            // through the config's to_tsvector pipeline so the result is a
+            // real stemmed, positioned tsvector (not bare joined text).
             fn collect(
                 node: &crate::json::JsonValue,
                 want: (bool, bool, bool, bool),
@@ -12280,11 +12284,7 @@ fn apply_function_dispatch(
             ) {
                 let (s, n, b, k) = want;
                 match node {
-                    crate::json::JsonValue::String(v) if s => {
-                        for word in v.split_whitespace() {
-                            out.push(word.to_lowercase());
-                        }
-                    }
+                    crate::json::JsonValue::String(v) if s => out.push(v.clone()),
                     crate::json::JsonValue::Number(v) if n => {
                         out.push(alloc::format!("{v}"));
                     }
@@ -12302,9 +12302,7 @@ fn apply_function_dispatch(
                     crate::json::JsonValue::Object(entries) => {
                         for (key, val) in entries {
                             if k {
-                                for word in key.split_whitespace() {
-                                    out.push(word.to_lowercase());
-                                }
+                                out.push(key.clone());
                             }
                             collect(val, want, out);
                         }
@@ -12312,15 +12310,81 @@ fn apply_function_dispatch(
                     _ => {}
                 }
             }
-            let mut lexemes = alloc::vec::Vec::new();
+            let mut segments = alloc::vec::Vec::new();
             collect(
                 &doc,
                 (want_string, want_numeric, want_boolean, want_key),
-                &mut lexemes,
+                &mut segments,
             );
-            lexemes.sort();
-            lexemes.dedup();
-            Ok(Value::text(lexemes.join(" ")))
+            // Resolve the text-search config (arg 0 in the 3-arg form,
+            // else the session default; unknown → error like the tsquery
+            // builders).
+            let config = if args.len() == 3 {
+                match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(c) => {
+                        crate::fts::TsConfig::from_name(c).ok_or_else(|| EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "text search config not implemented: {c:?} (supported: simple, english)"
+                            ),
+                        })?
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}() config arg must be text, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            } else {
+                match ctx.default_text_search_config {
+                    Some(n) => crate::fts::TsConfig::from_name(n)
+                        .unwrap_or(crate::fts::TsConfig::Simple),
+                    None => crate::fts::TsConfig::Simple,
+                }
+            };
+            // PG runs each selected scalar through to_tsvector separately
+            // and concatenates with a one-position gap between values, so a
+            // phrase can't span two JSON scalars. Replicate that: accumulate
+            // a base offset advanced by each segment's max position + 1.
+            let mut merged: alloc::vec::Vec<spg_storage::TsLexeme> =
+                alloc::vec::Vec::new();
+            let mut base: u16 = 0;
+            for seg in &segments {
+                let lexs = crate::fts::to_tsvector(config, seg);
+                let mut seg_max: u16 = 0;
+                for lex in &lexs {
+                    for p in &lex.positions {
+                        if *p > seg_max {
+                            seg_max = *p;
+                        }
+                        let g = base.saturating_add(*p);
+                        match merged
+                            .binary_search_by(|l| l.word.as_str().cmp(lex.word.as_str()))
+                        {
+                            Ok(idx) => {
+                                if !merged[idx].positions.contains(&g) {
+                                    merged[idx].positions.push(g);
+                                }
+                            }
+                            Err(idx) => {
+                                merged.insert(
+                                    idx,
+                                    spg_storage::TsLexeme {
+                                        word: lex.word.clone(),
+                                        positions: alloc::vec![g],
+                                        weight: 0,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                base = base.saturating_add(seg_max).saturating_add(1);
+            }
+            Ok(Value::TsVector(merged))
         }
         // pg_collation_for(any) — the collation of the argument's
         // type. Text is collatable → PG's '"default"'; everything
@@ -13192,6 +13256,15 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.39 (read01 round 43) — accept a real tsvector value,
+                // not only its text form (mirrors the tsquery_phrase fix).
+                Value::TsVector(lexemes) => {
+                    let mut words: alloc::vec::Vec<alloc::string::String> =
+                        lexemes.iter().map(|l| l.word.clone()).collect();
+                    words.sort();
+                    words.dedup();
+                    Ok(Value::TextArray(words.into_iter().map(Some).collect()))
+                }
                 Value::Text(s) => {
                     let mut words: alloc::vec::Vec<alloc::string::String> = s
                         .split_whitespace()
@@ -13245,7 +13318,18 @@ fn apply_function_dispatch(
                     }
                     words.sort();
                     words.dedup();
-                    Ok(Value::text(words.join(" ")))
+                    // v7.39 (read01 round 43) — return a real tsvector value
+                    // (position-less lexemes) so it renders canonically
+                    // ('brown' 'quick'), not as bare space-joined text.
+                    let lexemes: alloc::vec::Vec<spg_storage::TsLexeme> = words
+                        .into_iter()
+                        .map(|w| spg_storage::TsLexeme {
+                            word: w,
+                            positions: alloc::vec::Vec::new(),
+                            weight: 0,
+                        })
+                        .collect();
+                    Ok(Value::TsVector(lexemes))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
@@ -13260,9 +13344,13 @@ fn apply_function_dispatch(
         "get_current_ts_config" => {
             Ok(Value::text::<String>("english".into()))
         }
-        // ts_lexize(dict, token) — run one token through a
-        // dictionary. SPG ships the 'simple' dictionary semantics:
-        // lowercase the token, return it as a 1-element array.
+        // ts_lexize(dict, token) — run one token through a dictionary.
+        // v7.39 (read01 round 43): the 'english_stem' snowball dict
+        // lowercases, drops english stopwords (→ empty array {}), and
+        // Porter-stems the rest; the 'simple' dict only lowercases.
+        // Both return a 1-element array for a surviving lexeme and the
+        // empty array for a stopword / empty token (PG never returns
+        // NULL from snowball/simple — those always recognise the token).
         "ts_lexize" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -13274,10 +13362,24 @@ fn apply_function_dispatch(
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Text(_dict), Value::Text(token)) => {
-                    Ok(Value::TextArray(alloc::vec![Some(
-                        token.to_lowercase()
-                    )]))
+                (Value::Text(dict), Value::Text(token)) => {
+                    let lower = token.to_lowercase();
+                    let is_english = dict.to_lowercase().contains("english");
+                    if is_english {
+                        if lower.is_empty() || crate::fts::is_english_stopword(&lower) {
+                            return Ok(Value::TextArray(alloc::vec::Vec::new()));
+                        }
+                        let stem = crate::fts::porter_stem(&lower);
+                        if stem.is_empty() {
+                            Ok(Value::TextArray(alloc::vec::Vec::new()))
+                        } else {
+                            Ok(Value::TextArray(alloc::vec![Some(stem)]))
+                        }
+                    } else if lower.is_empty() {
+                        Ok(Value::TextArray(alloc::vec::Vec::new()))
+                    } else {
+                        Ok(Value::TextArray(alloc::vec![Some(lower)]))
+                    }
                 }
                 _ => Err(EvalError::TypeMismatch {
                     detail: "ts_lexize() takes 2 TEXT args".into(),

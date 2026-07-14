@@ -79,29 +79,35 @@ fn set_lax_treatments() {
 #[test]
 fn jsonb_to_tsvector_filters() {
     let mut e = Engine::new();
-    // string filter — only string values, lowercased + split.
+    // v7.39 (read01 round 43) — json(b)_to_tsvector now returns a real
+    // stemmed, positioned tsvector. Byte-locked vs PG18 with the config
+    // spelled explicitly ('english'); the 2-arg default-config form is a
+    // recorded residual (SPG's FTS default resolves to 'simple', PG's to
+    // 'english' — a global default-config gap, see note).
+    // string filter — english drops the stopword 'the'.
     assert_eq!(
-        text_or_json(&first(
+        spg_engine::eval::value_to_text(&first(
             &mut e,
-            r#"SELECT jsonb_to_tsvector('{"a":"The Fat","b":123}', '["string"]')"#
+            r#"SELECT jsonb_to_tsvector('english', '{"a":"The Fat","b":123}', '["string"]')"#
         )),
-        "fat the"
+        "'fat':2"
     );
-    // all — strings + numerics + booleans + keys.
+    // all — strings + numerics + booleans + keys; 'a' is an english
+    // stopword (dropped), and values are joined with a one-position gap.
     assert_eq!(
-        text_or_json(&first(
+        spg_engine::eval::value_to_text(&first(
             &mut e,
-            r#"SELECT jsonb_to_tsvector('{"a":"cat","b":123,"c":true}', '"all"')"#
+            r#"SELECT jsonb_to_tsvector('english', '{"a":"cat","b":123,"c":true}', '"all"')"#
         )),
-        "123 a b c cat true"
+        "'123':6 'b':4 'c':8 'cat':2 'true':10"
     );
     // numeric only.
     assert_eq!(
-        text_or_json(&first(
+        spg_engine::eval::value_to_text(&first(
             &mut e,
-            r#"SELECT json_to_tsvector('{"a":"cat","b":123}', '["numeric"]')"#
+            r#"SELECT json_to_tsvector('english', '{"a":"cat","b":123}', '["numeric"]')"#
         )),
-        "123"
+        "'123':1"
     );
     // Unknown flag errors.
     assert!(

@@ -104,10 +104,13 @@ pub fn plainto_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
 }
 
 /// v7.12.1 — `phraseto_tsquery(config, text)`: same tokenise + stem,
-/// but preserve order — fold into nested `Phrase(_, _, 1)` nodes.
+/// but preserve order — fold into nested phrase nodes whose `<N>`
+/// distance is the position gap between surviving lexemes. Dropped
+/// stopwords still advance the position counter (as in `to_tsvector`),
+/// so `'cats and dogs'` yields `'cat' <2> 'dog'`, matching PG.
 pub fn phraseto_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
-    let lexs = collect_lexemes(config, text);
-    fold_phrase(&lexs)
+    let lexs = collect_lexemes_positioned(config, text);
+    fold_phrase_positioned(&lexs)
 }
 
 /// v7.12.1 — `websearch_to_tsquery(config, text)`: Google-style
@@ -291,6 +294,64 @@ fn fold_phrase(lexs: &[String]) -> TsQueryAst {
         }),
         distance: 1,
     })
+}
+
+/// v7.39 (read01 round 43) — tokenise + stem while tracking each
+/// surviving lexeme's tsvector position. Dropped stopwords advance the
+/// counter without emitting a lexeme, mirroring `to_tsvector`, so the
+/// gap between consecutive survivors is PG's phrase distance.
+fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut position: u16 = 0;
+    for token in tokenize(text) {
+        let lex = match config {
+            TsConfig::Simple => token,
+            TsConfig::English => {
+                if is_english_stopword(&token) {
+                    position = position.saturating_add(1);
+                    continue;
+                }
+                porter_stem(&token)
+            }
+        };
+        if lex.is_empty() {
+            continue;
+        }
+        position = position.saturating_add(1);
+        out.push((lex, position));
+    }
+    out
+}
+
+/// v7.39 (read01 round 43) — fold positioned lexemes into a phrase
+/// chain whose `<N>` distance is the position delta between neighbours.
+fn fold_phrase_positioned(lexs: &[(String, u16)]) -> TsQueryAst {
+    if lexs.is_empty() {
+        return TsQueryAst::Term {
+            word: String::new(),
+            weight_mask: 0,
+        };
+    }
+    let mut it = lexs.iter();
+    let (first_word, first_pos) = it.next().unwrap();
+    let mut acc = TsQueryAst::Term {
+        word: first_word.clone(),
+        weight_mask: 0,
+    };
+    let mut prev_pos = *first_pos;
+    for (word, pos) in it {
+        let distance = pos.saturating_sub(prev_pos);
+        acc = TsQueryAst::Phrase {
+            left: alloc::boxed::Box::new(acc),
+            right: alloc::boxed::Box::new(TsQueryAst::Term {
+                word: word.clone(),
+                weight_mask: 0,
+            }),
+            distance,
+        };
+        prev_pos = *pos;
+    }
+    acc
 }
 
 /// v7.12.2 — evaluate `tsvector @@ tsquery`. Walks the query AST
