@@ -898,7 +898,9 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // block, which sits between the comment store and the CRC: an empty
         // sequence-owner list (u32 = 0) plus an empty schema ACL and an empty
         // database ACL (u16 = 0 each). SIXTH appendix this test has caught.
-        const EMPTY_NONTABLE_ACL_BLOCK: usize = 4 + 2 + 2;
+        // v7.39 (read01 round 61) — the v67 function-ACL list joins it (a u32
+        // zero count). SEVENTH appendix.
+        const EMPTY_NONTABLE_ACL_BLOCK: usize = 4 + 2 + 2 + 4;
         full.truncate(full.len() - 4 - EMPTY_COMMENT_BLOCK - EMPTY_NONTABLE_ACL_BLOCK);
         full
     };
@@ -1011,6 +1013,40 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// real xmax, some alive) and specific non-dense rowids must serialize +
 /// deserialize with headers AND rowids identical, and next_rowid correct
 /// (strictly above every loaded id).
+#[test]
+fn v67_roundtrip_preserves_function_owner_and_acl() {
+    // read01 round 61 — like the sequence block, the function block sits
+    // mid-image, so a function's owner and ACL ride the catalog-wide tail.
+    use crate::{AclItem, FunctionDef, priv_bits};
+
+    let mut c = Catalog::new();
+    c.create_function(
+        FunctionDef {
+            name: "f1".into(),
+            args_repr: "(x INT)".into(),
+            returns: "INT".into(),
+            language: "sql".into(),
+            body: "SELECT x + 1".into(),
+            owner: Some("alice".into()),
+            acl: alloc::vec![AclItem {
+                grantee: "fred".into(),
+                privs: priv_bits::EXECUTE,
+                grantable: 0,
+                grantor: "alice".into(),
+            }],
+        },
+        false,
+    )
+    .unwrap();
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v67 image loads");
+    let f = restored.functions().get("f1").unwrap();
+    assert_eq!(f.owner.as_deref(), Some("alice"));
+    assert_eq!(f.acl.len(), 1);
+    assert_eq!(f.acl[0].grantee, "fred");
+    assert_eq!(f.acl[0].privs, priv_bits::EXECUTE);
+}
+
 #[test]
 fn v66_roundtrip_preserves_sequence_schema_and_database_acls() {
     // read01 round 60 — the non-table ACLs. The sequence block sits mid-image

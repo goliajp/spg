@@ -212,17 +212,23 @@ fn a_grant_on_any_other_object_class_still_restores() {
     // so a dump loads cleanly.
     let mut e = seeded();
     ok(&mut e, "CREATE SEQUENCE some_seq");
+    ok(
+        &mut e,
+        "CREATE FUNCTION f(x int) RETURNS int AS $$ SELECT x $$ LANGUAGE sql",
+    );
     for sql in [
         "GRANT USAGE ON SCHEMA public TO bob",
         "GRANT ALL ON SEQUENCE some_seq TO bob",
         "GRANT EXECUTE ON FUNCTION f(int) TO bob",
         "GRANT ALL ON DATABASE app TO bob",
-        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO bob",
+        "GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO bob",
         "REVOKE ALL ON SCHEMA public FROM PUBLIC",
     ] {
         ok(&mut e, sql);
     }
     // None of them touched the TABLE's ACL — the objects are separate.
+    // (v7.39 round 61: `ALL TABLES IN SCHEMA` DOES reach it now, so this pin
+    // uses ALL SEQUENCES — one of the classes that is still a no-op.)
     assert_eq!(relacl(&mut e), "NULL");
 }
 

@@ -14367,8 +14367,59 @@ fn apply_function_dispatch(
             };
             Ok(Value::Bool(held & bit != 0))
         }
-        "has_function_privilege"
-        | "has_language_privilege"
+        // v7.39 (read01 round 61) — EXECUTE, for real. The default is `true`
+        // because PG grants it to PUBLIC, not because we are guessing.
+        "has_function_privilege" => {
+            let named_role = args.len() == 3;
+            let base = usize::from(named_role);
+            let (Some(fn_arg), Some(priv_arg)) = (args.get(base), args.get(base + 1)) else {
+                return Ok(Value::Bool(true));
+            };
+            if matches!(fn_arg, Value::Null) || matches!(priv_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::Text(fname) = fn_arg else {
+                return Ok(Value::Bool(true));
+            };
+            // PG names a function as `f1(int)`; SPG keys them by name.
+            let bare = fname
+                .as_ref()
+                .split_once('(')
+                .map_or(fname.as_ref(), |(n, _)| n)
+                .trim();
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(def) = cat.functions().get(bare) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("function {} does not exist", fname.as_ref()),
+                });
+            };
+            let role = match args.first() {
+                Some(Value::Text(r)) if named_role => alloc::string::String::from(r.as_ref()),
+                _ => current_role_from_ctx(ctx),
+            };
+            let roles = ctx.users.map_or_else(
+                || {
+                    let mut s = alloc::collections::BTreeSet::new();
+                    s.insert(role.clone());
+                    s
+                },
+                |u| u.effective_roles(&role),
+            );
+            let Value::Text(p) = priv_arg else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(bit) = crate::acl::priv_from_word(p.as_ref()) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("unrecognized privilege type: \"{}\"", p.as_ref()),
+                });
+            };
+            Ok(Value::Bool(
+                crate::acl::function_privs(def, &roles) & bit != 0,
+            ))
+        }
+        "has_language_privilege"
         | "has_tablespace_privilege"
         | "has_type_privilege"
         // v7.37.17 (17.6 siblings) — round out the privilege
@@ -16533,11 +16584,227 @@ fn apply_function_dispatch(
                     spg_sql::ast::CastTarget::Named(other.to_string()),
                 );
             }
+            // v7.39 (read01 round 61) — a USER-DEFINED function. `CREATE
+            // FUNCTION` has stored one since v7.12.4, but only TRIGGERS ever
+            // invoked it: calling `f1(1)` from an expression answered "unknown
+            // function". The scalar call surface `ReturnTarget::Expr`'s own doc
+            // comment promised ("reserved for the scalar UDF surface") is here.
+            //
+            // It lives in eval, not the engine, because `EvalContext` already
+            // carries the catalog — so a body that calls another function
+            // recurses through this very path, and a per-row call
+            // (`SELECT f1(a) FROM t`) works with no engine round-trip.
+            if let Some(cat) = ctx.catalog
+                && let Some(def) = cat.functions().get(other)
+            {
+                // v7.39 (read01 round 61) — EXECUTE. PG grants it to PUBLIC by
+                // default, so this only ever bites after a REVOKE … FROM PUBLIC.
+                let role = current_role_from_ctx(ctx);
+                let roles = ctx.users.map_or_else(
+                    || {
+                        let mut s = alloc::collections::BTreeSet::new();
+                        s.insert(role.clone());
+                        s
+                    },
+                    |u| u.effective_roles(&role),
+                );
+                let superuser = role.eq_ignore_ascii_case(crate::session::LOGIN_ROLE)
+                    || role.eq_ignore_ascii_case(crate::session::BOOTSTRAP_ROLE)
+                    || ctx
+                        .users
+                        .and_then(|u| u.get(&role))
+                        .is_some_and(|r| r.superuser);
+                if !superuser
+                    && crate::acl::function_privs(def, &roles) & spg_storage::priv_bits::EXECUTE
+                        == 0
+                {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("permission denied for function {}", def.name),
+                    });
+                }
+                return call_user_function(def, args, ctx);
+            }
             Err(EvalError::TypeMismatch {
                 detail: format!("unknown function `{other}`"),
             })
         }
     }
+}
+
+/// The maximum depth of nested user-function calls. A function that calls
+/// itself is a stack overflow, which an embed host cannot catch — so it is
+/// bounded, and reported as an error the caller can see.
+const MAX_FN_DEPTH: u16 = 64;
+
+/// v7.39 (read01 round 61) — the argument NAMES of a stored function, out of
+/// its `args_repr` (`"(x INT, y TEXT)"`). The body refers to them as if they
+/// were columns, which is exactly how they are bound below.
+fn user_fn_arg_names(args_repr: &str) -> Vec<String> {
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let p = part.trim();
+            // `OUT x INT` / `x INT` / `INT` (unnamed).
+            let mut words = p.split_whitespace().peekable();
+            let first = words.next().unwrap_or("");
+            let first = if first.eq_ignore_ascii_case("OUT") || first.eq_ignore_ascii_case("INOUT")
+            {
+                words.next().unwrap_or("")
+            } else {
+                first
+            };
+            // A single word is a bare TYPE, not a name.
+            if words.peek().is_none() {
+                String::new()
+            } else {
+                first.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Call a user-defined function: bind the arguments as if they were the columns
+/// of a one-row table, evaluate the body against them, and coerce the result to
+/// the declared return type.
+///
+/// `LANGUAGE sql` bodies are a single expression (`SELECT x + 1`); `plpgsql`
+/// bodies are a block whose only statement is `RETURN <expr>`. Anything richer
+/// (a body with its own FROM, a multi-statement plpgsql block) is an honest
+/// error naming what is unsupported — never a silently wrong answer.
+fn call_user_function<'v>(
+    def: &spg_storage::FunctionDef,
+    args: &[Value<'v>],
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    if ctx.fn_depth >= MAX_FN_DEPTH {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "function {:?} exceeded the maximum call depth of {MAX_FN_DEPTH}",
+                def.name
+            ),
+        });
+    }
+    let names = user_fn_arg_names(&def.args_repr);
+    if names.len() != args.len() {
+        // PG reports an arity mismatch as "no such function with THIS
+        // signature", naming the types it was called with.
+        let sig: Vec<&str> = args
+            .iter()
+            .map(|v| {
+                v.data_type()
+                    .and_then(crate::eval::pg_typeof_name_for_datatype)
+                    .unwrap_or("unknown")
+            })
+            .collect();
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "function {}({}) does not exist",
+                def.name,
+                sig.join(", ")
+            ),
+        });
+    }
+    // The arguments become the columns of a synthetic one-row table, so the
+    // body's `x` resolves through the ordinary column path.
+    let owned: Vec<Value<'static>> = args.iter().map(|v| v.clone().into_owned()).collect();
+    let columns: Vec<spg_storage::ColumnSchema> = names
+        .iter()
+        .zip(&owned)
+        .map(|(n, v)| {
+            spg_storage::ColumnSchema::new(
+                n.clone(),
+                v.data_type().unwrap_or(spg_storage::DataType::Text),
+                true,
+            )
+        })
+        .collect();
+    let row = spg_storage::Row::new(owned);
+
+    let body_expr = user_fn_body_expr(def)?;
+
+    let mut child = EvalContext::new(&columns, None);
+    child.params = ctx.params;
+    child.catalog = ctx.catalog;
+    child.session_gucs = ctx.session_gucs;
+    child.users = ctx.users;
+    child.render_style = ctx.render_style;
+    child.tz_offset_fn = ctx.tz_offset_fn;
+    child.tz_localize_fn = ctx.tz_localize_fn;
+    child.tz_abbrev_fn = ctx.tz_abbrev_fn;
+    child.fn_depth = ctx.fn_depth + 1;
+
+    let out = crate::eval::eval_expr(&body_expr, &row, &child)?;
+    // PG coerces the body's value to the DECLARED return type: a function
+    // `RETURNS text` whose body yields an int returns text.
+    let declared = def.returns.trim();
+    if declared.eq_ignore_ascii_case("VOID") {
+        return Ok(Value::Null);
+    }
+    crate::eval::cast::cast_value(
+        out.into_owned(),
+        spg_sql::ast::CastTarget::Named(declared.to_string()),
+    )
+    .or_else(|_| Ok(Value::Null))
+}
+
+/// The single expression a user function's body evaluates to.
+fn user_fn_body_expr(def: &spg_storage::FunctionDef) -> Result<Expr, EvalError> {
+    let body = def.body.trim();
+    let unsupported = |detail: &str| EvalError::TypeMismatch {
+        detail: format!("function {:?}: {detail}", def.name),
+    };
+    if def.language.eq_ignore_ascii_case("sql") {
+        let stmt = spg_sql::parser::parse_statement(body.trim_end_matches(';')).map_err(|e| {
+            EvalError::TypeMismatch {
+                detail: format!("function {:?} body does not parse: {e}", def.name),
+            }
+        })?;
+        let spg_sql::ast::Statement::Select(s) = stmt else {
+            return Err(unsupported("a LANGUAGE sql body must be a SELECT"));
+        };
+        if s.from.is_some() {
+            return Err(unsupported(
+                "a LANGUAGE sql body with its own FROM is not supported yet —                  the body must be a single expression",
+            ));
+        }
+        if s.items.len() != 1 {
+            return Err(unsupported("a LANGUAGE sql body must select exactly one value"));
+        }
+        let spg_sql::ast::SelectItem::Expr { expr, .. } = &s.items[0] else {
+            return Err(unsupported("a LANGUAGE sql body must select a value, not `*`"));
+        };
+        return Ok(expr.clone());
+    }
+    if def.language.eq_ignore_ascii_case("plpgsql") {
+        let block = spg_sql::parse_function_body(body).map_err(|e| EvalError::TypeMismatch {
+            detail: format!("function {:?} body does not parse: {e}", def.name),
+        })?;
+        if !block.declarations.is_empty() {
+            return Err(unsupported(
+                "a plpgsql body with DECLARE is not supported in a scalar call yet",
+            ));
+        }
+        if block.statements.len() == 1
+            && let spg_sql::ast::PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(e)) =
+                &block.statements[0]
+        {
+            return Ok(e.clone());
+        }
+        return Err(unsupported(
+            "a scalar plpgsql call supports a body of a single `RETURN <expr>;` so far",
+        ));
+    }
+    Err(unsupported(&format!(
+        "LANGUAGE {} is not invocable",
+        def.language
+    )))
 }
 
 // v7.38 P0 元机制 A — SQL-facing handles for the injection_points

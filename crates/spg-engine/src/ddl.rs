@@ -3179,6 +3179,9 @@ impl Engine {
             returns,
             language: s.language.clone(),
             body: body_text,
+            // v7.39 (read01 round 61) — whoever runs CREATE FUNCTION owns it.
+            owner: Some(alloc::string::String::from(self.current_role())),
+            acl: alloc::vec::Vec::new(),
         };
         self.active_catalog_mut()
             .create_function(def, s.or_replace)
