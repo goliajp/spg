@@ -106,7 +106,7 @@ pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
 pub use values::value_to_text;
 pub use values::value_to_text_styled;
 use values::{
-    array_2d_dims, array_element_at, array_len, value_cmp_for_min_max, value_to_f64,
+    array_2d_dims, array_element_at, array_len, array_rebuild, value_cmp_for_min_max, value_to_f64,
     values_equal_for_nullif,
 };
 
@@ -1355,6 +1355,16 @@ fn eval_array_arm(
             .collect();
         return Ok(Value::IntArray2D(rows));
     }
+    // v7.39 (read01 round 72) — a HOMOGENEOUS array of a non-numeric, non-text
+    // type keeps that type, and is unambiguous, so it is decided BEFORE the
+    // numeric/text unification below. Everything outside the numeric ladder and
+    // text used to fall into that loop's `_ => has_text = true` — a silent
+    // degradation, not a decision: `ARRAY[true, false]` came back as `text[]`.
+    // It usually LOOKED right (array_to_string renders `t` either way), which is
+    // exactly what let it sit; the array FUNCTIONS are what tripped over it.
+    if let Some(v) = homogeneous_array_of(&materialised) {
+        return Ok(v);
+    }
     let mut has_text = false;
     let mut has_float = false;
     let mut has_numeric = false;
@@ -2449,7 +2459,7 @@ pub(crate) fn widen_to_common(
     }
 }
 
-fn value_to_text_for_array(v: &Value, style: &format::RenderStyle) -> String {
+pub(crate) fn value_to_text_for_array(v: &Value, style: &format::RenderStyle) -> String {
     match v {
         Value::Text(s) | Value::Json(s) => s.to_string(),
         Value::Int(n) => n.to_string(),
@@ -3570,5 +3580,55 @@ impl crate::Engine {
             detail: alloc::format!("{e}"),
         })?;
         Ok(sink.into_inner())
+    }
+}
+
+
+/// v7.39 (read01 round 72) — an `ARRAY[…]` of one non-numeric, non-text type
+/// (bool / date / timestamp / uuid / bytea / interval / money) keeps that type.
+/// `None` for an empty list or a mix, which falls through to the text[] path
+/// the caller had all along.
+fn homogeneous_array_of(vals: &[Value<'static>]) -> Option<Value<'static>> {
+    let first = vals.iter().find(|v| !matches!(v, Value::Null))?;
+    macro_rules! collect {
+        ($variant:ident, $pat:pat => $val:expr) => {{
+            let mut out = alloc::vec::Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => out.push(None),
+                    $pat => out.push(Some($val)),
+                    _ => return None,
+                }
+            }
+            Some(Value::$variant(out))
+        }};
+    }
+    match first {
+        Value::Bool(_) => collect!(BoolArray, Value::Bool(b) => *b),
+        Value::Date(_) => collect!(DateArray, Value::Date(d) => *d),
+        Value::Timestamp(_) => collect!(TimestampArray, Value::Timestamp(t) => *t),
+        Value::Uuid(_) => collect!(UuidArray, Value::Uuid(u) => *u),
+        Value::Money(_) => collect!(MoneyArray, Value::Money(m) => *m),
+        Value::Bytes(_) => collect!(BytesArray, Value::Bytes(b) => b.as_ref().to_vec()),
+        Value::Interval { .. } => {
+            let mut out = alloc::vec::Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => out.push(None),
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => out.push(Some(spg_storage::IntervalSpan {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    })),
+                    _ => return None,
+                }
+            }
+            Some(Value::IntervalArray(out))
+        }
+        _ => None,
     }
 }
