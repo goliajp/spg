@@ -2759,6 +2759,16 @@ pub enum JoinKind {
 pub enum Expr {
     Literal(Literal),
     Column(ColumnName),
+    /// v7.39 (read01 round 77) — a NAMED call argument (`f(x := 1)`, or the
+    /// older `f(x => 1)` spelling). Which slot the name fills depends on the
+    /// callee's declared parameter names, and a user function's live in the
+    /// catalog — which the parser cannot see. So the name rides along in the
+    /// tree and the evaluator, which has the catalog, does the reordering.
+    /// Appears only inside a `FunctionCall`'s argument list.
+    NamedArg {
+        name: String,
+        expr: Box<Expr>,
+    },
     /// v6.1.1 — `$N` parameter placeholder for the extended query
     /// protocol. The number is 1-based per PostgreSQL convention.
     /// Evaluation looks up `params[N-1]` from the prepared-statement
@@ -5579,6 +5589,8 @@ impl fmt::Display for Expr {
             Self::Literal(l) => write!(f, "{l}"),
             Self::Column(c) => write!(f, "{c}"),
             Self::Placeholder(n) => write!(f, "${n}"),
+            // Round-trips as the spelling PG's docs lead with.
+            Self::NamedArg { name, expr } => write!(f, "{} := {expr}", quote_ident(name)),
             Self::Binary { lhs, op, rhs } => write!(f, "({lhs} {op} {rhs})"),
             Self::Unary { op, expr } => match op {
                 UnOp::Not => write!(f, "(NOT {expr})"),

@@ -1384,6 +1384,7 @@ impl Engine {
             return Ok(());
         }
         match e {
+            Expr::NamedArg { expr, .. } => self.resolve_expr_subqueries(expr, cancel)?,
             Expr::AggregateOrdered { call, order_by, .. } => {
                 self.resolve_expr_subqueries(call, cancel)?;
                 for o in order_by.iter_mut() {

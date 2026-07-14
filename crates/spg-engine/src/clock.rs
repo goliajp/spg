@@ -148,6 +148,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         return;
     }
     match e {
+        Expr::NamedArg { expr, .. } => rewrite_expr_clock(expr, now),
         Expr::AggregateOrdered { call, order_by, .. } => {
             rewrite_expr_clock(call, now);
             for o in order_by.iter_mut() {

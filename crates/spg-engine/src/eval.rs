@@ -1515,6 +1515,118 @@ fn eval_function_call_arm(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (read01 round 77) — named arguments (`f(x := 1)` / `f(x => 1)`).
+    // The parser leaves them in the tree because only the catalog knows a user
+    // function's parameter names; here they become positional, once, for
+    // builtins and user functions alike.
+    if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        let positional = resolve_named_args(name, args, ctx)?;
+        return eval_function_call_arm(name, &positional, row, ctx);
+    }
+    eval_function_call_positional(name, args, row, ctx)
+}
+
+/// The declared parameter names of `fname`, or `None` when it takes none.
+/// Builtins whose parameters PG names live in the table; everything else asks
+/// the catalog, where a user function's `args_repr` has carried its parameter
+/// names since the day CREATE FUNCTION stored them.
+fn declared_param_names(fname: &str, ctx: &EvalContext<'_>) -> Option<alloc::vec::Vec<String>> {
+    let lower = fname.to_ascii_lowercase();
+    let builtin: &[&str] = match lower.as_str() {
+        "make_date" => &["year", "month", "day"],
+        "make_time" => &["hour", "min", "sec"],
+        "make_timestamp" | "make_timestamptz" => {
+            &["year", "month", "mday", "hour", "min", "sec"]
+        }
+        "make_interval" => &["years", "months", "weeks", "days", "hours", "mins", "secs"],
+        _ => &[],
+    };
+    if !builtin.is_empty() {
+        return Some(builtin.iter().map(|s| (*s).to_string()).collect());
+    }
+    let cat = ctx.catalog?;
+    let def = cat
+        .functions()
+        .values()
+        .find(|f| f.name.eq_ignore_ascii_case(&lower))?;
+    let names = spg_storage::function_arg_names(&def.args_repr);
+    if names.iter().all(alloc::string::String::is_empty) {
+        return None;
+    }
+    Some(names)
+}
+
+/// Rewrite a call's arguments into positional order. Positional arguments fill
+/// slots left to right; a named one goes to its declared slot. Slots nobody
+/// filled stay absent for a user function (arity is checked at the call) and
+/// become integer 0 for the `make_*` builtins, whose trailing fields PG
+/// defaults that way.
+fn resolve_named_args(
+    fname: &str,
+    args: &[Expr],
+    ctx: &EvalContext<'_>,
+) -> Result<alloc::vec::Vec<Expr>, EvalError> {
+    let Some(params) = declared_param_names(fname, ctx) else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("function {fname}(...) does not support named arguments"),
+        });
+    };
+    let mut slots: alloc::vec::Vec<Option<Expr>> = (0..params.len()).map(|_| None).collect();
+    let mut next_positional = 0usize;
+    for a in args {
+        let (idx, val) = match a {
+            Expr::NamedArg { name, expr } => {
+                let i = params
+                    .iter()
+                    .position(|p| p.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "{fname}(...) has no argument named \"{name}\""
+                        ),
+                    })?;
+                (i, (**expr).clone())
+            }
+            other => {
+                let i = next_positional;
+                next_positional += 1;
+                (i, other.clone())
+            }
+        };
+        if idx >= slots.len() {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("{fname}(...) got too many arguments"),
+            });
+        }
+        if slots[idx].is_some() {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("{fname}(...) got multiple values for one argument"),
+            });
+        }
+        slots[idx] = Some(val);
+    }
+    let make_family = fname.to_ascii_lowercase().starts_with("make_");
+    let mut out = alloc::vec::Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Some(e) => out.push(e),
+            None if make_family => {
+                out.push(Expr::Literal(spg_sql::ast::Literal::Integer(0)));
+            }
+            // A user function's unfilled slot is simply not passed; the call's
+            // own arity check phrases the error.
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
+fn eval_function_call_positional(
+    name: &str,
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // v7.39 (read01 utils/adt, enum.c) — the enum introspection
     // v7.39 (read01 utils/adt, enum.c) — the enum introspection
     // family needs the ARGUMENT'S STATIC TYPE (the value is
     // usually NULL::enumtype): first/last/range over the
@@ -2230,6 +2342,14 @@ pub fn eval_expr(
     match expr {
         Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
             detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
+        }),
+        // A named argument is only meaningful inside a call, where the callee's
+        // parameter names give it a slot. Anywhere else it is a syntax error,
+        // and saying so beats silently evaluating it as if the name were absent.
+        Expr::NamedArg { name, .. } => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "named argument \"{name}\" is only valid in a function call"
+            ),
         }),
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Column(c) => resolve_column(c, row, ctx),

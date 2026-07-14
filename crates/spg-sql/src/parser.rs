@@ -18441,16 +18441,33 @@ impl Parser {
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     // v7.38 (read01, T14) — `argname => value` names this arg.
+                    // v7.39 (read01 round 77) — `argname := value` is the same
+                    // thing, and it is the spelling PG's own docs lead with. It
+                    // was simply never lexed here, so every `f(x := 1)` died in
+                    // the parser regardless of what `f` was.
                     let this_name = match (&self.tokens[self.pos], self.tokens.get(self.pos + 1)) {
-                        (Token::Ident(n) | Token::QuotedIdent(n), Some(Token::FatArrow)) => {
+                        (
+                            Token::Ident(n) | Token::QuotedIdent(n),
+                            Some(Token::FatArrow | Token::ColonEq),
+                        ) => {
                             let name = n.clone();
                             self.advance(); // name
-                            self.advance(); // =>
+                            self.advance(); // => / :=
                             Some(name)
                         }
                         _ => None,
                     };
-                    args.push(self.parse_expr(0)?);
+                    let arg = self.parse_expr(0)?;
+                    args.push(match &this_name {
+                        // The callee's parameter names decide the slot, and a
+                        // user function's live in the catalog. Carry the name
+                        // to eval rather than guessing here.
+                        Some(n) => Expr::NamedArg {
+                            name: n.clone(),
+                            expr: Box::new(arg),
+                        },
+                        None => arg,
+                    });
                     arg_names.push(this_name);
                     // v7.25 (round-17) — standard `CAST(expr AS type)`.
                     // The `::` cast already worked; this lowers the
@@ -18678,11 +18695,13 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
-            // v7.38 (read01, T14) — resolve any `argname => value` to positional
-            // order (the AST stays positional, so no downstream site changes).
-            if arg_names.iter().any(Option::is_some) {
-                args = reorder_named_args(&first, args, &arg_names).map_err(|msg| self.err(msg))?;
-            }
+            // v7.39 (read01 round 77) — named arguments are NOT reordered here
+            // any more. The parser has no catalog, so it could only ever resolve
+            // the handful of `make_*` builtins whose parameter names were baked
+            // into a table right here — every user function got
+            // "does not support named arguments", though the catalog has been
+            // storing its parameter names all along. Reordering happens in eval,
+            // in one place, for builtins and user functions alike.
             // v7.32 (round-29) — ordered-set aggregate tail
             // `name(direct_args) WITHIN GROUP (ORDER BY …)`
             // (percentile_cont / percentile_disc / mode). The sort spec
@@ -19060,6 +19079,38 @@ fn parse_interval_clock(tok: &str) -> Option<i64> {
     Some(if neg { -total } else { total })
 }
 
+/// v7.39 (read01 round 77) — one canonical name per interval unit, covering
+/// every spelling PG accepts (measured against live PG18.4, not guessed):
+/// `min` / `mins` / `m` are minutes, `mon` / `mons` are months, `y` is years.
+/// Before this, the unit table matched long names only, with an ad-hoc
+/// `strip_suffix('s')` in front of it — so `'15 min'` (and `hrs`, `secs`,
+/// `yrs`, every abbreviation anyone actually types) was "cannot parse as
+/// INTERVAL", and it had also grown arms for the debris that stripping leaves
+/// behind (`centurie`, `millenniu`). Two parallel unit matches (integer and
+/// fractional) both read from this one table now.
+fn canonical_interval_unit(raw: &str) -> Option<&'static str> {
+    let u = raw.to_ascii_lowercase();
+    Some(match u.as_str() {
+        "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "usecond" | "useconds" => {
+            "microsecond"
+        }
+        "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" | "msecond" | "mseconds" => {
+            "millisecond"
+        }
+        "second" | "seconds" | "sec" | "secs" | "s" => "second",
+        "minute" | "minutes" | "min" | "mins" | "m" => "minute",
+        "hour" | "hours" | "hr" | "hrs" | "h" => "hour",
+        "day" | "days" | "d" => "day",
+        "week" | "weeks" | "w" => "week",
+        "month" | "months" | "mon" | "mons" => "month",
+        "year" | "years" | "yr" | "yrs" | "y" => "year",
+        "decade" | "decades" | "dec" | "decs" => "decade",
+        "century" | "centuries" | "cent" | "c" => "century",
+        "millennium" | "millenniums" | "millennia" | "mil" | "mils" => "millennium",
+        _ => return None,
+    })
+}
+
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     // v7.39 (read01 timestamp.c) — PG's postgres_verbose forms: a leading
     // `@` is decorative; a trailing `ago` negates the whole interval.
@@ -19134,8 +19185,7 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
     let mut micros: i64 = clock_us;
     let mut i = 0;
     while i < parts.len() {
-        let unit = parts[i + 1].to_ascii_lowercase();
-        let unit_stripped = unit.strip_suffix('s').unwrap_or(&unit);
+        let unit_stripped = canonical_interval_unit(parts[i + 1])?;
         if let Ok(n) = parts[i].parse::<i64>() {
             match unit_stripped {
                 "microsecond" => micros = micros.checked_add(n)?,
@@ -19151,10 +19201,7 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
                     let n32 = i32::try_from(n).ok()?;
                     days = days.checked_add(n32.checked_mul(7)?)?;
                 }
-                // v7.37.5 ship triage — accept PG's `format_interval`
-                // canonical output (`0 mons 0 days 0 microseconds`) so
-                // a round-trip Display → re-parse stays lossless.
-                "month" | "mon" => {
+                "month" => {
                     let n32 = i32::try_from(n).ok()?;
                     months = months.checked_add(n32)?;
                 }
@@ -19163,23 +19210,15 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
                     months = months.checked_add(n32.checked_mul(12)?)?;
                 }
                 // v7.39 (read01 timestamp.c) — the larger calendar units.
-                "centurie" => {
-                    let n32 = i32::try_from(n).ok()?;
-                    months = months.checked_add(n32.checked_mul(1200)?)?;
-                }
-                "millennia" | "millenniu" => {
-                    let n32 = i32::try_from(n).ok()?;
-                    months = months.checked_add(n32.checked_mul(12000)?)?;
-                }
-                "decade" | "dec" => {
+                "decade" => {
                     let n32 = i32::try_from(n).ok()?;
                     months = months.checked_add(n32.checked_mul(120)?)?;
                 }
-                "century" | "cent" | "c" => {
+                "century" => {
                     let n32 = i32::try_from(n).ok()?;
                     months = months.checked_add(n32.checked_mul(1200)?)?;
                 }
-                "millennium" | "mil" => {
+                "millennium" => {
                     let n32 = i32::try_from(n).ok()?;
                     months = months.checked_add(n32.checked_mul(12000)?)?;
                 }
@@ -19217,7 +19256,7 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
                 "hour" => micros = micros.checked_add(round_i64(f * 3_600_000_000.0))?,
                 "day" => add_days_frac(&mut days, &mut micros, f)?,
                 "week" => add_days_frac(&mut days, &mut micros, f * 7.0)?,
-                "month" | "mon" => {
+                "month" => {
                     let whole = f as i64;
                     months = months.checked_add(i32::try_from(whole).ok()?)?;
                     add_days_frac(&mut days, &mut micros, (f - whole as f64) * 30.0)?;

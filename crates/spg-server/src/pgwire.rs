@@ -3496,6 +3496,13 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42704"
         } else if (msg.contains("function \"") && msg.contains("\" does not exist"))
             || msg.contains("operator does not exist:")
+            // v7.39 (read01 round 77) — a named argument aimed at a function
+            // that declares no such parameter is PG's 42883 too ("function
+            // lpad(string => unknown, …) does not exist"): no candidate matches
+            // the call. SPG names the reason instead of the missing candidate,
+            // but a driver must still read the same class.
+            || msg.contains("does not support named arguments")
+            || msg.contains("has no argument named")
         {
             "42883"
         // v7.39 (read01 round 45, commands/) — DDL object errors.

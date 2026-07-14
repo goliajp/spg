@@ -63,6 +63,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::FunctionCall { name, args } => {
             is_aggregate_name(name) || args.iter().any(contains_aggregate)
         }
+        Expr::NamedArg { expr, .. } => contains_aggregate(expr),
         Expr::AggregateOrdered { .. } => true,
         Expr::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
         Expr::Unary { expr, .. }
@@ -3507,6 +3508,7 @@ fn first_ordered_array_agg(e: &Expr) -> Option<(&Expr, &[spg_sql::ast::OrderBy],
 
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
+        Expr::NamedArg { expr, .. } => collect_aggregates(expr, out),
         // v7.24 (round-16 A) — ordered aggregate: register the inner
         // call's spec with the ordering attached.
         Expr::AggregateOrdered {
@@ -5090,6 +5092,10 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     }
     // Recurse into children.
     match e {
+        Expr::NamedArg { name, expr } => Expr::NamedArg {
+            name: name.clone(),
+            expr: alloc::boxed::Box::new(rewrite_expr(expr, group_exprs, aggs)),
+        },
         Expr::AggregateOrdered {
             call,
             order_by,
