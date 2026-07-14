@@ -3271,7 +3271,52 @@ impl Parser {
     }
 
     fn parse_function_return(&mut self) -> Result<FunctionReturn, ParseError> {
+        // v7.39 (read01 round 65) — `RETURNS TABLE(col type, …)`: a set-returning
+        // function whose row shape is named inline.
+        if matches!(self.peek(), Token::Table)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // TABLE
+            self.advance(); // (
+            let mut cols: Vec<String> = Vec::new();
+            loop {
+                let cname = self.expect_ident_like()?;
+                let mut ty: Vec<String> = Vec::new();
+                loop {
+                    match self.peek() {
+                        Token::Comma | Token::RParen | Token::Eof => break,
+                        _ => {}
+                    }
+                    match self.advance() {
+                        Token::Ident(w) | Token::QuotedIdent(w) => ty.push(w),
+                        other => {
+                            if let Some(w) = unreserved_keyword_text(&other) {
+                                ty.push(w);
+                            }
+                        }
+                    }
+                }
+                cols.push(alloc::format!("{cname} {}", ty.join(" ")));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+            }
+            return Ok(FunctionReturn::Other(alloc::format!(
+                "TABLE({})",
+                cols.join(", ")
+            )));
+        }
         let ident = self.expect_ident_like()?;
+        // v7.39 (read01 round 65) — `RETURNS SETOF <type>`.
+        if ident.eq_ignore_ascii_case("setof") {
+            let inner = self.expect_ident_like()?;
+            return Ok(FunctionReturn::Other(alloc::format!("SETOF {inner}")));
+        }
         if ident.eq_ignore_ascii_case("trigger") {
             return Ok(FunctionReturn::Trigger);
         }
@@ -13492,9 +13537,17 @@ impl Parser {
         // functions dispatched by name (`pg_partition_tree('t')`,
         // `pg_partition_ancestors('t')`). Same head-detection shape as
         // unnest; the engine executor owns the row shape per function.
+        // v7.39 (read01 round 65) — and a USER function in FROM position
+        // (`FROM rows_of(2)`). The SRFs with their own FROM pipeline
+        // (generate_series / unnest / the json_each family) keep it — their arms
+        // sit further down, so they are excluded here by name rather than by
+        // ordering. Anything else that is an ident followed by `(` is a table
+        // function; the engine executor decides whether it is a builtin, a
+        // set-returning user function, or an error.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("pg_partition_tree")
-                    || s.eq_ignore_ascii_case("pg_partition_ancestors"))
+                if !s.eq_ignore_ascii_case("generate_series")
+                    && !s.eq_ignore_ascii_case("unnest")
+                    && !is_json_each_name(s))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             // Body out-of-line — this parse sits on the FROM/subquery
