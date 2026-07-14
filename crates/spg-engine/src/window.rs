@@ -32,6 +32,7 @@ pub(crate) fn select_has_window(stmt: &SelectStatement) -> bool {
 
 fn expr_has_window(e: &Expr) -> bool {
     match e {
+        Expr::NamedArg { expr, .. } => expr_has_window(expr),
         Expr::WindowFunction { .. } => true,
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_window(call) || order_by.iter().any(|o| expr_has_window(&o.expr))

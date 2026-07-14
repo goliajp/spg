@@ -184,6 +184,7 @@ mod e2e_array_agg_typing_round73;
 mod e2e_rows_from_round74;
 mod e2e_bool_2d_round75;
 mod e2e_json_family_round76;
+mod e2e_named_args_round77;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;

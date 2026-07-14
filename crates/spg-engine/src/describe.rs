@@ -22,7 +22,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, SelectItem, SelectStatement, Statement, UnOp};
+use spg_sql::ast::{Expr, Literal, SelectItem, SelectStatement, Statement, UnOp};
 use spg_storage::{Catalog, ColumnSchema, DataType};
 
 /// One-shot describe of a prepared `Statement`.
@@ -548,7 +548,20 @@ fn function_return_shape(
         // Timestamp-returning. `from_unixtime` switches to TEXT
         // when called with a format-string second arg — handled
         // below via arity check.
-        "date_trunc" | "make_timestamp" => (DataType::Timestamp, true),
+        "make_timestamp" => (DataType::Timestamp, true),
+        // v7.39 (read01 round 77) — date_trunc / date_bin return the type of
+        // the timestamp they were HANDED (PG has a timestamptz overload of
+        // each), so a truncated timestamptz keeps its `+00` on the way out.
+        // Pinning them to Timestamp silently dropped the offset.
+        "date_trunc" | "date_bin" => {
+            let src = args.get(1)?;
+            let ty = describe_expr(src, schema_cols)
+                .map_or(DataType::Timestamp, |s| match s.ty {
+                    DataType::Timestamptz => DataType::Timestamptz,
+                    _ => DataType::Timestamp,
+                });
+            (ty, true)
+        }
         "from_unixtime" => {
             if args.len() >= 2 {
                 (DataType::Text, true)
@@ -583,11 +596,29 @@ fn function_return_shape(
             };
             (ty, true)
         }
-        // Pass-through aggregates / conditionals: derive the type
-        // from the first arg.
+        // v7.39 (read01 round 77) — the conditional family resolves a COMMON
+        // type across its arguments, and an untyped NULL literal contributes
+        // nothing to it. Taking `args[0]` unconditionally meant
+        // `coalesce(NULL, <timestamptz>)` described as "no shape at all", so
+        // the timestamptz lost its `+00` — the type was decided by argument
+        // POSITION rather than by the arguments.
+        "coalesce" | "greatest" | "least" | "ifnull" | "isnull" | "nullif" => {
+            let shapes: Vec<ExprShape> = args
+                .iter()
+                .filter(|a| !matches!(a, Expr::Literal(Literal::Null)))
+                .filter_map(|a| describe_expr(a, schema_cols))
+                .collect();
+            let first = shapes.first()?;
+            let types: Vec<DataType> = shapes.iter().map(|s| s.ty).collect();
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: common_type(&types).unwrap_or(first.ty),
+                nullable: true,
+            });
+        }
+        // Pass-through math: derive the type from the first arg.
         "sum" | "avg" | "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round"
-        | "trunc" | "mod" | "power" | "pow" | "sqrt" | "sign" | "coalesce" | "nullif"
-        | "greatest" | "least" | "ifnull" | "isnull" => {
+        | "trunc" | "mod" | "power" | "pow" | "sqrt" | "sign" => {
             // Use the first arg's shape; fall back to Float for math
             // that can promote (e.g. mod(2, 3) → Float? No — keep
             // Int. The caller's coerce_value handles promotion at
@@ -835,6 +866,7 @@ fn walk_select(s: &SelectStatement, f: &mut impl FnMut(&Expr)) {
 fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     match e {
+        Expr::NamedArg { expr, .. } => walk_expr(expr, f),
         Expr::AggregateOrdered { call, order_by, .. } => {
             walk_expr(call, f);
             for o in order_by {

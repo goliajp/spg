@@ -288,6 +288,7 @@ pub(crate) fn collect_column_qualifiers<'e>(
 
 pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
     match e {
+        Expr::NamedArg { expr, .. } => expr_refers_to(expr, target),
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_refers_to(call, target) || order_by.iter().any(|o| expr_refers_to(&o.expr, target))
         }

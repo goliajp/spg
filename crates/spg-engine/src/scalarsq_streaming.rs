@@ -121,6 +121,7 @@ pub fn is_scalarsq_streaming_shape(stmt: &SelectStatement) -> bool {
 /// disqualifier`).
 fn expr_has_scalar_subquery(e: &Expr) -> bool {
     match e {
+        Expr::NamedArg { expr, .. } => expr_has_scalar_subquery(expr),
         Expr::ScalarSubquery(_) => true,
         Expr::Exists { .. }
         | Expr::InSubquery { .. }
@@ -195,6 +196,7 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
 /// { name = "unnest", ... }` as a disqualifier.
 fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
     match e {
+        Expr::NamedArg { expr, .. } => expr_has_streaming_disqualifier(expr),
         Expr::WindowFunction { .. } => true,
         Expr::Exists { .. }
         | Expr::InSubquery { .. }
