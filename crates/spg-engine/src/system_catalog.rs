@@ -938,6 +938,19 @@ pub(crate) fn synth_pg_stat_user_functions(
     (schema, rows)
 }
 
+/// v7.39 (read01 round 53) — the pg_am oid backing an index, derived from what
+/// the index ACTUALLY is. `USING hash` / `USING gist` are accepted but built as
+/// btree, so they report btree — the catalog never claims an AM SPG lacks.
+pub(crate) const fn am_oid_of(kind: &spg_storage::IndexKind) -> i64 {
+    use spg_storage::IndexKind as K;
+    match kind {
+        K::Nsw(_) => 0,          // hnsw is an extension AM; no core oid
+        K::Brin { .. } => 3580,
+        K::Gin(_) | K::GinTrgm(_) | K::GinFulltext(_) | K::GinJsonb(_) => 2742,
+        _ => 403,                // btree
+    }
+}
+
 /// v7.37.24 (24.13) — synthesise `pg_catalog.pg_am`.
 /// PG index/table access methods (heap, btree, hash, gist,
 /// gin, spgist, brin). pg_dump queries this to validate the AM
@@ -954,6 +967,11 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
         ColumnSchema::new("amhandler", DataType::BigInt, false),
         ColumnSchema::new("amtype", DataType::Text, false), // 't' table / 'i' index
     ];
+    // v7.39 (read01 round 52/53) — every AM PG ships, at PG's own oids, so a
+    // join through pg_class.relam lands on the right name. SPG implements
+    // btree / gin / brin / hnsw for real; `USING hash` and `USING gist` are
+    // ACCEPTED but backed by the btree kind, and the catalog reports what the
+    // index actually IS (btree) rather than claiming an AM SPG doesn't have.
     let rows = alloc::vec![
         Row::new(alloc::vec![
             Value::BigInt(2),
@@ -964,6 +982,36 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
         Row::new(alloc::vec![
             Value::BigInt(403),
             Value::text("btree"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(405),
+            Value::text("hash"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(783),
+            Value::text("gist"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(2742),
+            Value::text("gin"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(4000),
+            Value::text("spgist"),
+            Value::BigInt(0),
+            Value::text("i"),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(3580),
+            Value::text("brin"),
             Value::BigInt(0),
             Value::text("i"),
         ]),
@@ -2104,6 +2152,53 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::Null,
         ]));
         oid = oid.saturating_add(1);
+    }
+    // v7.39 (read01 round 53) — pg_class also holds a row PER INDEX
+    // (relkind 'i'), which is what makes PG's canonical
+    // `pg_class JOIN pg_index ON indexrelid = oid JOIN pg_am ON relam = am.oid`
+    // join resolve. It used to emit tables only, so that join — the one psql
+    // \d and every ORM use to learn an index's access method — came back empty.
+    // Index oids follow the SAME sequence synth_pg_index_raw uses (from
+    // 100_000, tables in table_names() order, indices in catalog order), so
+    // indexrelid and pg_class.oid agree.
+    let mut idx_oid: i64 = 100_000;
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            let relnatts =
+                i16::try_from(1 + idx.extra_column_positions.len()).unwrap_or(i16::MAX);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(idx_oid),
+                Value::text(idx.name.clone()),
+                Value::BigInt(2200), // relnamespace — public
+                Value::BigInt(0),    // reltype (indexes have none)
+                Value::BigInt(0),    // reloftype
+                Value::BigInt(10),   // relowner
+                Value::BigInt(am_oid_of(&idx.kind)), // relam — the real AM
+                Value::BigInt(idx_oid),
+                Value::BigInt(0),
+                Value::Int(0),
+                Value::Float(0.0),
+                Value::Int(0),
+                Value::BigInt(0),
+                Value::Bool(false), // relhasindex (an index has none)
+                Value::Bool(false),
+                Value::text("p"),
+                Value::text("i"), // relkind — index
+                Value::SmallInt(relnatts),
+                Value::SmallInt(0),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::text("n"), // relreplident — 'n' for an index
+                Value::Bool(false),
+                Value::Null,
+            ]));
+        }
     }
     (schema, rows)
 }

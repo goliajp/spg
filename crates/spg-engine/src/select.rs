@@ -4270,7 +4270,9 @@ impl Engine {
             )?
         };
         let combined_schema = &deferred.combined_schema;
-        let ctx = EvalContext::new(combined_schema, None);
+        // v7.39 (read01 round 53) — carry the catalog (see join.rs): a
+        // `::regclass` / enum cast in a joined projection or HAVING needs it.
+        let ctx = EvalContext::new(combined_schema, None).with_catalog(self.active_catalog());
         let projection = build_projection(&stmt.items, combined_schema, "")?;
         // Every projection item must be a bound qualified column —
         // anything that needs `eval_expr_with_correlated` keeps the
@@ -4397,7 +4399,9 @@ impl Engine {
             )?
         };
         let combined_schema = &deferred.combined_schema;
-        let ctx = EvalContext::new(combined_schema, None);
+        // v7.39 (read01 round 53) — carry the catalog (see join.rs): a
+        // `::regclass` / enum cast in a joined projection or HAVING needs it.
+        let ctx = EvalContext::new(combined_schema, None).with_catalog(self.active_catalog());
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {

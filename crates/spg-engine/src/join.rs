@@ -919,7 +919,14 @@ impl Engine {
         };
         let mut joined = self.build_join_peers(from, &peer_preds, needed, budget)?;
         let combined_schema = build_combined_schema(&primary_alias, &primary_cols, &joined);
-        let ctx = EvalContext::new(&combined_schema, None);
+        // v7.39 (read01 round 53) — the join's EvalContext must carry the
+        // catalog. Without it a `::regclass` / enum / composite cast inside a
+        // joined WHERE or ON falls back to plain text, so the canonical
+        // `pg_class JOIN pg_index … WHERE indrelid = 't'::regclass` shape
+        // errored on "comparison between BigInt and Text" — while the very
+        // same predicate worked on a single-table SELECT (whose ctx does carry
+        // the catalog). Same root as round 49's unnest(enum_range(…)).
+        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
         if joined.is_empty() {
             // Joinless FROM: the primary rows ARE the combined rows —
             // filter and hand them back without any re-clone.
@@ -2241,7 +2248,14 @@ impl Engine {
                 col.nullable,
             ));
         }
-        let ctx = EvalContext::new(&combined_schema, None);
+        // v7.39 (read01 round 53) — the join's EvalContext must carry the
+        // catalog. Without it a `::regclass` / enum / composite cast inside a
+        // joined WHERE or ON falls back to plain text, so the canonical
+        // `pg_class JOIN pg_index … WHERE indrelid = 't'::regclass` shape
+        // errored on "comparison between BigInt and Text" — while the very
+        // same predicate worked on a single-table SELECT (whose ctx does carry
+        // the catalog). Same root as round 49's unnest(enum_range(…)).
+        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
         let left_arity = primary_cols.len();
         let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
         let mut residual: Vec<&Expr> = Vec::new();
@@ -2328,7 +2342,7 @@ impl Engine {
         //   unknown / subquery node is present; `expr_references_alias`
         //   is conservative).
         let outer_schema: &[ColumnSchema] = &combined_schema[..left_arity];
-        let outer_ctx = EvalContext::new(outer_schema, None);
+        let outer_ctx = EvalContext::new(outer_schema, None).with_catalog(self.active_catalog());
         let where_conjuncts: Vec<&Expr> = stmt
             .where_
             .as_ref()
@@ -2605,7 +2619,14 @@ impl Engine {
                 col.nullable,
             ));
         }
-        let ctx = EvalContext::new(&combined_schema, None);
+        // v7.39 (read01 round 53) — the join's EvalContext must carry the
+        // catalog. Without it a `::regclass` / enum / composite cast inside a
+        // joined WHERE or ON falls back to plain text, so the canonical
+        // `pg_class JOIN pg_index … WHERE indrelid = 't'::regclass` shape
+        // errored on "comparison between BigInt and Text" — while the very
+        // same predicate worked on a single-table SELECT (whose ctx does carry
+        // the catalog). Same root as round 49's unnest(enum_range(…)).
+        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
         // Hash-joinable left = right equality pairs from ON; anything
         // else stays as a residual conjunct on the candidate row.
         let left_arity = primary_cols.len();
