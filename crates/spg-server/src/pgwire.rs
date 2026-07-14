@@ -3485,6 +3485,23 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("operator does not exist:")
         {
             "42883"
+        // v7.39 (read01 round 45, commands/) — DDL object errors.
+        // A second PRIMARY KEY is PG's 42P16 INVALID_TABLE_DEFINITION.
+        } else if msg.contains("multiple primary keys for table") {
+            "42P16"
+        // A GENERATED ALWAYS identity/column explicit-value insert is PG's
+        // 428C9 GENERATED_ALWAYS.
+        } else if msg.contains("cannot insert a non-DEFAULT value into column") {
+            "428C9"
+        // A duplicate column on ALTER TABLE ADD COLUMN is 42701
+        // DUPLICATE_COLUMN; a missing column is 42703 UNDEFINED_COLUMN.
+        } else if msg.contains("column \"") && msg.contains("already exists") {
+            "42701"
+        } else if msg.contains("column \"") && msg.contains("does not exist") {
+            "42703"
+        // DROP TABLE on a missing table is 42P01 UNDEFINED_TABLE.
+        } else if msg.contains("table \"") && msg.contains("does not exist") {
+            "42P01"
         } else if msg.contains("cannot take logarithm of") {
             "2201E"
         } else if msg.contains("zero raised to a negative power is undefined")
@@ -3659,6 +3676,28 @@ mod engine_error_sqlstate_tests {
         assert_eq!(
             code("durability append failed: broken pipe"),
             "58030"
+        );
+        // v7.39 (read01 round 45, commands/) — DDL object errors.
+        assert_eq!(
+            code("multiple primary keys for table \"t3\" are not allowed"),
+            "42P16"
+        );
+        assert_eq!(
+            code("column \"a\" of relation \"t2\" already exists"),
+            "42701"
+        );
+        assert_eq!(
+            code("column \"nonexist\" of relation \"t2\" does not exist"),
+            "42703"
+        );
+        assert_eq!(code("table \"nonexist_tbl\" does not exist"), "42P01");
+        assert_eq!(
+            code(
+                "cannot insert a non-DEFAULT value into column \"a\" \
+                 DETAIL: Column \"a\" is an identity column defined as GENERATED ALWAYS.\n\
+                 HINT:  Use OVERRIDING SYSTEM VALUE to override."
+            ),
+            "428C9"
         );
     }
 }

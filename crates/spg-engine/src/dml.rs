@@ -2759,10 +2759,14 @@ fn parse_insert_rows(
                 .iter()
                 .any(|row| row.get(j).is_some_and(|e| !is_column_default_marker(e)));
             if has_explicit_value {
+                // v7.39 (read01 round 45) — PG's three-part message
+                // (428C9 at the wire): the DETAIL/HINT tail splits into
+                // its own PG_DIAG fields on the wire.
+                let name = &col.name;
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "cannot insert a non-DEFAULT value into column {:?} — column is an identity \
-                     column defined as GENERATED ALWAYS; use OVERRIDING SYSTEM VALUE to override",
-                    col.name
+                    "cannot insert a non-DEFAULT value into column {name:?} \
+                     DETAIL: Column {name:?} is an identity column defined as GENERATED ALWAYS.\n\
+                     HINT:  Use OVERRIDING SYSTEM VALUE to override."
                 )));
             }
         }

@@ -827,8 +827,9 @@ impl Engine {
             if if_not_exists {
                 return Ok(());
             }
+            // v7.39 (read01 round 45) — PG wording (42701 at the wire).
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER TABLE ADD COLUMN: column {:?} already exists on {:?}",
+                "column {:?} of relation {:?} already exists",
                 column.name,
                 tbl
             )));
@@ -989,6 +990,21 @@ impl Engine {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
         let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
+        // v7.39 (read01 round 45) — a table may have at most one PRIMARY
+        // KEY. PG rejects a second one (even on the same column) with
+        // 42P16; SPG used to install it silently. SPG's own dumps emit PK
+        // inline, so restore never reaches this ALTER path.
+        if is_pk
+            && table
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .any(|u| u.is_primary_key)
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "multiple primary keys for table {tbl:?} are not allowed"
+            )));
+        }
         // v7.22 (mailrs round-13 gap 6) — carry the parsed
         // NULLS NOT DISTINCT flag through the ALTER path;
         // it was hardcoded false here while the CREATE
@@ -1135,8 +1151,9 @@ impl Engine {
                 if if_exists {
                     return Ok(());
                 }
+                // v7.39 (read01 round 45) — PG wording (42703 at the wire).
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "ALTER TABLE DROP COLUMN: column {column:?} not found on {:?}",
+                    "column {column:?} of relation {:?} does not exist",
                     tbl
                 )));
             }
@@ -1928,7 +1945,11 @@ impl Engine {
             }
             let dropped = self.active_catalog_mut().drop_table(&name);
             if !dropped && !if_exists {
-                return Err(EngineError::Storage(StorageError::TableNotFound { name }));
+                // v7.39 (read01 round 45) — PG wording (42P01 at the wire);
+                // PG says "table", not "relation", for DROP TABLE.
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "table {name:?} does not exist"
+                )));
             }
         }
         Ok(QueryResult::CommandOk {
