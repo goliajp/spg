@@ -73,7 +73,10 @@ impl Engine {
         // v7.37.20 (20.5) — FOR IN SELECT resolver: run the SELECT
         // once, return every row's values.
         let for_query_fn = |stmt: &spg_sql::ast::Statement| -> Result<
-            alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            (
+                alloc::vec::Vec<alloc::string::String>,
+                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            ),
             triggers::TriggerError,
         > {
             let mut eng = engine_cell.borrow_mut();
@@ -86,7 +89,10 @@ impl Engine {
                     },
                 })?;
             match r {
-                QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
+                QueryResult::Rows { columns, rows } => Ok((
+                    columns.iter().map(|c| c.name.clone()).collect(),
+                    rows.into_iter().map(|r| r.values).collect(),
+                )),
                 _ => Err(triggers::TriggerError::EvalFailed {
                     function: "DO".into(),
                     cause: eval::EvalError::TypeMismatch {

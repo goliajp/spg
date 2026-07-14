@@ -16799,6 +16799,22 @@ fn call_user_function<'v>(
     // expression: it runs through the real executor, with the arguments
     // substituted in as literals. Reading the catalog's rows from here would
     // bypass the visibility filter and hand back dead rows under MVCC.
+    // v7.39 (read01 round 64) — a plpgsql body is a PROGRAM: locals, IF, loops,
+    // SELECT … INTO, EXCEPTION. It runs on the interpreter the DO block and
+    // triggers already use. The single-`RETURN <expr>` shape stays on the pure
+    // expression path below (no interpreter, no engine needed).
+    if def.language.eq_ignore_ascii_case("plpgsql") && !plpgsql_is_single_return(def) {
+        let Some(engine) = ctx.engine else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "function {:?}: a multi-statement plpgsql body needs the engine \
+                     (this context has none)",
+                    def.name
+                ),
+            });
+        };
+        return engine.call_plpgsql_scalar_fn(def, &names, &row);
+    }
     if let Some(stmt) = user_fn_body_query(def)? {
         let Some(engine) = ctx.engine else {
             return Err(EvalError::TypeMismatch {
@@ -16838,6 +16854,22 @@ fn call_user_function<'v>(
         spg_sql::ast::CastTarget::Named(declared.to_string()),
     )
     .or_else(|_| Ok(Value::Null))
+}
+
+/// v7.39 (read01 round 64) — is this plpgsql body just `BEGIN RETURN <expr>; END`?
+/// That shape needs no interpreter and no engine, so it stays on the pure
+/// expression path — which is also what lets it work in a bare context.
+fn plpgsql_is_single_return(def: &spg_storage::FunctionDef) -> bool {
+    let Ok(block) = spg_sql::parse_function_body(def.body.trim()) else {
+        return false;
+    };
+    block.declarations.is_empty()
+        && block.exception_handlers.is_empty()
+        && block.statements.len() == 1
+        && matches!(
+            &block.statements[0],
+            spg_sql::ast::PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(_))
+        )
 }
 
 /// v7.39 (read01 round 63) — the body as a QUERY, when it has its own FROM.

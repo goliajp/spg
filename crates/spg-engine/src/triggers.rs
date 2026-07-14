@@ -300,10 +300,17 @@ pub type SelectIntoResolver<'a> =
 /// v7.37.20 (20.5) — callback shape the DO-block executor registers
 /// on `BodyCtx` for FOR-IN-SELECT loops. Runs the supplied SELECT
 /// statement against the engine and returns every row's values.
+/// v7.39 (read01 round 64) — the COLUMN NAMES ride along now, so the loop can
+/// bind a record variable's fields (`rec.v`), not just its first cell.
 pub type ForQueryResolver<'a> = dyn Fn(
         &spg_sql::ast::Statement,
-    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>, TriggerError>
-    + 'a;
+    ) -> Result<
+        (
+            alloc::vec::Vec<String>,
+            alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+        ),
+        TriggerError,
+    > + 'a;
 
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
@@ -678,8 +685,22 @@ fn execute_stmts(
                         ),
                     }
                 })?;
-                let rows = resolver(&stmt)?;
+                let (col_names, rows) = resolver(&stmt)?;
                 for row_values in rows {
+                    // v7.39 (read01 round 64) — bind the whole ROW: `rec` still
+                    // carries the first cell (what a scalar loop variable
+                    // means), and each column also lands as `rec.<col>` so a
+                    // record variable's fields resolve.
+                    for (i, cname) in col_names.iter().enumerate() {
+                        locals.insert(
+                            alloc::format!(
+                                "{}.{}",
+                                var.to_ascii_lowercase(),
+                                cname.to_ascii_lowercase()
+                            ),
+                            row_values.get(i).cloned().unwrap_or(spg_storage::Value::Null),
+                        );
+                    }
                     let first_cell = row_values
                         .into_iter()
                         .next()
@@ -719,8 +740,19 @@ fn execute_stmts(
                     function: ctx.function.into(),
                     cause,
                 })?;
-                let rows = resolver(&stmt)?;
+                let (col_names, rows) = resolver(&stmt)?;
                 for row_values in rows {
+                    // Same record binding as FOR … IN <SELECT>.
+                    for (i, cname) in col_names.iter().enumerate() {
+                        locals.insert(
+                            alloc::format!(
+                                "{}.{}",
+                                var.to_ascii_lowercase(),
+                                cname.to_ascii_lowercase()
+                            ),
+                            row_values.get(i).cloned().unwrap_or(spg_storage::Value::Null),
+                        );
+                    }
                     let first_cell = row_values
                         .into_iter()
                         .next()
@@ -1046,6 +1078,134 @@ pub fn execute_do_block_top_level<'a>(
     Ok(deferred.into_iter().map(|d| d.stmt).collect())
 }
 
+/// v7.39 (read01 round 64) — run a plpgsql body as a SCALAR function: the same
+/// interpreter the DO block and the triggers use, with no NEW / OLD, the
+/// arguments pre-bound as locals, and `RETURN <expr>` actually EVALUATED (the
+/// trigger path discards it — `resolve_return`'s own comment said "the scalar
+/// UDF surface in a later release handles RETURN <expr> properly").
+///
+/// `Ok(None)` means the body fell out of the bottom without returning, which PG
+/// reports as an error for a non-void function; the caller phrases it.
+///
+/// A body that WRITES (an embedded INSERT / UPDATE / DELETE) cannot run here:
+/// the call arrives through expression evaluation, which holds the engine
+/// immutably. Those `deferred` statements are refused rather than dropped —
+/// silently discarding a write would be the worst possible answer.
+pub fn call_plpgsql_scalar<'a>(
+    function: &str,
+    block: &spg_sql::ast::PlPgSqlBlock,
+    args: BTreeMap<String, Value<'static>>,
+    default_text_search_config: Option<&'a str>,
+    select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+) -> Result<Option<Value<'static>>, TriggerError> {
+    let mut locals: BTreeMap<String, Value<'static>> = args;
+    let empty_cols: &[ColumnSchema] = &[];
+    // The DECLARE block runs AFTER the arguments are bound, so an initialiser
+    // may reference them (`DECLARE y int := x * 2;`).
+    init_locals_from_declarations(
+        &block.declarations,
+        &mut locals,
+        None,
+        None,
+        empty_cols,
+        "",
+        &[],
+        default_text_search_config,
+        function,
+    )?;
+    let ctx = BodyCtx {
+        function,
+        table_name: "",
+        columns: empty_cols,
+        params: &[],
+        default_text_search_config,
+        is_after: false,
+        select_into_resolver,
+        for_query_resolver,
+    };
+    let mut current_new: Option<Row> = None;
+    let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
+    let mut outcome = execute_stmts(
+        &block.statements,
+        &mut current_new,
+        None,
+        &mut locals,
+        &ctx,
+        &mut deferred,
+    );
+    // An EXCEPTION handler catches a RAISE, exactly as in a DO block.
+    if let Err(err) = outcome {
+        let mut handled = None;
+        if !block.exception_handlers.is_empty()
+            && let TriggerError::RaiseException { message, .. } = &err
+        {
+            for handler in &block.exception_handlers {
+                let matches = handler.conditions.iter().any(|c| {
+                    c.eq_ignore_ascii_case("others")
+                        || message
+                            .to_ascii_lowercase()
+                            .contains(&c.to_ascii_lowercase())
+                });
+                if matches {
+                    locals.insert("sqlerrm".into(), Value::text(message.clone()));
+                    locals.insert(
+                        "sqlstate".into(),
+                        Value::text(alloc::string::String::from("P0001")),
+                    );
+                    handled = Some(execute_stmts(
+                        &handler.body,
+                        &mut current_new,
+                        None,
+                        &mut locals,
+                        &ctx,
+                        &mut deferred,
+                    )?);
+                    break;
+                }
+            }
+        }
+        match handled {
+            Some(o) => outcome = Ok(o),
+            None => return Err(err),
+        }
+    }
+    if !deferred.is_empty() {
+        return Err(TriggerError::UnsupportedConstruct {
+            function: function.into(),
+            detail: alloc::string::String::from(
+                "a plpgsql function body that writes (INSERT / UPDATE / DELETE) \
+                 cannot be called from an expression",
+            ),
+        });
+    }
+    match outcome.expect("error paths returned above") {
+        BodyOutcome::Return(ReturnTarget::Expr(e)) => {
+            let v = eval_with_new_old_and_locals(
+                &e,
+                None,
+                None,
+                &locals,
+                empty_cols,
+                "",
+                &[],
+                default_text_search_config,
+            )
+            .map_err(|cause| TriggerError::EvalFailed {
+                function: function.into(),
+                cause,
+            })?;
+            Ok(Some(v))
+        }
+        BodyOutcome::Return(ReturnTarget::Null) => Ok(Some(Value::Null)),
+        BodyOutcome::Return(_) => Err(TriggerError::UnsupportedConstruct {
+            function: function.into(),
+            detail: alloc::string::String::from("RETURN NEW / OLD is only meaningful in a trigger"),
+        }),
+        _ => Ok(None),
+    }
+}
+
 fn resolve_return(
     target: ReturnTarget,
     current_new: Option<Row<'static>>,
@@ -1191,6 +1351,16 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
         {
             *expr = value_to_literal_expr(&[], 0, v.clone());
             return;
+        }
+        // v7.39 (read01 round 64) — a RECORD variable's field: `rec.v` inside a
+        // `FOR rec IN SELECT … LOOP`. The loop binds each row's columns as
+        // `rec.<col>` locals, so the qualified reference resolves here.
+        if let Some(q) = &c.qualifier {
+            let key = alloc::format!("{}.{}", q.to_ascii_lowercase(), c.name.to_ascii_lowercase());
+            if let Some(v) = locals.get(&key) {
+                *expr = value_to_literal_expr(&[], 0, v.clone());
+                return;
+            }
         }
     }
     match expr {
