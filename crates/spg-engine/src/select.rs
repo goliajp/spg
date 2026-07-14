@@ -5444,6 +5444,16 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     if let Some(elements) = arr {
         return Ok(OrderKey::Array(elements));
     }
+    // v7.39 (read01 round 56) — a COMPOSITE sorts field by field, left to
+    // right, which is exactly the lexicographic element order an Array key
+    // already gives: `(2,'b') < (9,'a')` because the leading field decides.
+    if let Value::Composite(fields) = v {
+        let elements = fields
+            .iter()
+            .map(|(_, fv)| value_to_order_key(fv))
+            .collect::<Result<alloc::vec::Vec<_>, _>>()?;
+        return Ok(OrderKey::Array(elements));
+    }
     // v7.38 (read01 U31) — the integer-valued types carry an EXACT i128 key.
     // Projecting these to f64 (the historic path) silently collapses BigInt /
     // Timestamp / Time / TimeTz / Money values past 2^53, so `ORDER BY` gave

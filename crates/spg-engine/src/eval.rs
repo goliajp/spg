@@ -1531,6 +1531,21 @@ fn eval_function_call_arm(
             "timestamp with time zone".into(),
         ));
     }
+    // v7.39 (read01 round 56) — a COMPOSITE column reports its type NAME, not
+    // the generic `record` the runtime value would give. Composite-ness lives
+    // outside the DataType lattice (the stored form is JSON), so the witness is
+    // the column's `user_composite_type` — the same shape as the enum witness.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && let Expr::Column(c) = &args[0]
+        && let Some(cname) = ctx
+            .columns
+            .iter()
+            .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+            .and_then(|sc| sc.user_composite_type.as_deref())
+    {
+        return Ok(Value::text::<alloc::string::String>(cname.into()));
+    }
     // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
     // static type when it has one (PG: `VALUES (NULL),(1.5)`
     // types the column numeric and its NULL row's pg_typeof says

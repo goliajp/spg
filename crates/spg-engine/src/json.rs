@@ -62,7 +62,7 @@ impl JsonValue {
         }
     }
 
-    fn to_json_text(&self) -> String {
+    pub(crate) fn to_json_text(&self) -> String {
         let mut out = String::new();
         write_json(self, &mut out);
         out

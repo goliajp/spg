@@ -163,6 +163,7 @@ mod e2e_int2_arithmetic_type;
 mod e2e_int_to_bit;
 mod e2e_char_bool_round41;
 mod e2e_ddl_errors_round45;
+mod e2e_composite_round56;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;

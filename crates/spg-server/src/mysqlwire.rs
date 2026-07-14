@@ -761,6 +761,7 @@ fn handle_com_stmt_prepare(
             // wire-correct. EXECUTE then dispatches on the
             // type byte the client sent.
             let placeholder = ColumnSchema {
+                user_composite_type: None,
                 name: "?".to_string(),
                 ty: DataType::Text,
                 nullable: true,

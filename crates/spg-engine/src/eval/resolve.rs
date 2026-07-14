@@ -180,16 +180,37 @@ pub(super) fn resolve_column_borrowed<'r, 'a>(
     row: &'r Row<'a>,
     ctx: &EvalContext<'_>,
 ) -> Result<Option<&'r Value<'a>>, EvalError> {
+    // v7.39 (read01 round 56) — a COMPOSITE column cannot be served through the
+    // borrow channel: it is stored as JSON and has to be REHYDRATED into a
+    // `Value::Composite`, which produces a new value and so cannot be borrowed
+    // out of the row. Returning None here makes `eval_expr_cow` fall back to
+    // the owned `resolve_column`, which rehydrates.
+    //
+    // This was the last hole: the comparison fast path (v7.32's borrow channel)
+    // reads its operands through here, so `WHERE p = ROW(2,'b')::pt` compared
+    // the raw stored Json against a Composite and errored — while `(p).x`, which
+    // is not a bare comparison operand, went through the owned path and worked.
+    let is_composite = |pos: usize| {
+        ctx.columns
+            .get(pos)
+            .is_some_and(|s| s.user_composite_type.is_some())
+    };
     if let Some(q) = &c.qualifier {
         if let Some(pos) = ctx
             .columns
             .iter()
             .position(|s| composite_eq(&s.name, q, &c.name))
         {
+            if is_composite(pos) {
+                return Ok(None);
+            }
             return Ok(row.values.get(pos));
         }
     }
     if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+        if is_composite(pos) {
+            return Ok(None);
+        }
         return Ok(row.values.get(pos));
     }
     Ok(None)
@@ -232,7 +253,7 @@ pub(super) fn resolve_column(
             .iter()
             .position(|s| composite_eq(&s.name, q, &c.name))
         {
-            return Ok(row.values[pos].clone().into_owned());
+            return rehydrate_cell(pos, row, ctx);
         }
         // v7.26 (round-20 B) — when the qualifier IS a known table
         // alias in a joined schema (composite "alias.x" columns
@@ -256,7 +277,7 @@ pub(super) fn resolve_column(
         }
     }
     if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
-        return Ok(row.values[pos].clone().into_owned());
+        return rehydrate_cell(pos, row, ctx);
     }
     // Bare-name fallback for joined schemas: match any single composite
     // column ending in ".<name>"; ambiguity is an error.
@@ -269,7 +290,7 @@ pub(super) fn resolve_column(
     let first = matches.next();
     let extra = matches.next();
     match (first, extra) {
-        (Some((pos, _)), None) => Ok(row.values[pos].clone().into_owned()),
+        (Some((pos, _)), None) => rehydrate_cell(pos, row, ctx),
         (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
             detail: alloc::format!("ambiguous column reference: {}", c.name),
         }),
@@ -317,4 +338,81 @@ fn whole_row_composite(row: &Row<'_>, ctx: &EvalContext<'_>, alias: &str) -> Val
             .collect()
     };
     Value::Composite(fields)
+}
+
+/// v7.39 (read01 round 56) — read a cell, rehydrating a composite-typed column
+/// from its stored JSON into a real `Value::Composite`.
+///
+/// SPG stores a composite column as JSONB (the on-disk form). Every composite
+/// OPERATION — field access `(p).x`, `= ROW(…)`, ordering, the canonical
+/// `(2,b)` text form — was already implemented on `Value::Composite`; what was
+/// missing is that the value coming out of storage was a `Json`, so all of them
+/// failed. Rehydrating here, at the one place a column becomes a Value, makes
+/// the whole surface work at once.
+///
+/// The catalog's type definition supplies the FIELD ORDER (a JSON object is
+/// keyed, a composite is positional), which is what PG sorts and renders by.
+/// Gated on `user_composite_type.is_some()`, so non-composite columns — every
+/// column in almost every schema — pay one Option check.
+fn rehydrate_cell(
+    pos: usize,
+    row: &Row<'_>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = row.values[pos].clone().into_owned();
+    let Some(cname) = ctx
+        .columns
+        .get(pos)
+        .and_then(|c| c.user_composite_type.as_deref())
+    else {
+        return Ok(v);
+    };
+    Ok(json_to_composite(&v, cname, ctx).unwrap_or(v))
+}
+
+/// v7.39 (read01 round 56) — rebuild a `Value::Composite` from a stored JSON
+/// object, in the composite type's declared field order. `None` when the value
+/// isn't a JSON object or the type isn't in the catalog (the caller keeps the
+/// raw value, so a pre-FILE_VERSION-63 catalog degrades to the old behaviour
+/// rather than erroring).
+pub(crate) fn json_to_composite(
+    v: &Value<'_>,
+    type_name: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<Value<'static>> {
+    let (Value::Json(src) | Value::Text(src)) = v else {
+        return None;
+    };
+    let def = ctx.catalog?.composite_types().get(type_name)?;
+    let parsed = crate::json::parse(src.as_ref()).ok()?;
+    let crate::json::JsonValue::Object(entries) = parsed else {
+        return None;
+    };
+    let mut fields: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
+        alloc::vec::Vec::with_capacity(def.fields.len());
+    for (fname, fty) in &def.fields {
+        let cell = entries
+            .iter()
+            .find(|(k, _)| k == fname)
+            .map_or(Value::Null, |(_, jv)| json_cell_to_value(jv, *fty));
+        fields.push((fname.clone(), cell));
+    }
+    Some(Value::Composite(fields))
+}
+
+/// v7.39 (read01 round 56) — one JSON field of a stored composite, coerced to
+/// the field's declared type so `(p).x + 10` is integer arithmetic, not text.
+fn json_cell_to_value(jv: &crate::json::JsonValue, ty: spg_storage::DataType) -> Value<'static> {
+    use crate::json::JsonValue as J;
+    let raw: Value<'static> = match jv {
+        J::Null => return Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::String(s) => Value::text(s.clone()),
+        J::Number(n) => Value::Float(*n),
+        J::NumberText(t) => Value::text(t.clone()),
+        // A nested object / array stays JSON — nested composites and arrays of
+        // composites are a recorded residual of this epic.
+        other => Value::Json(alloc::borrow::Cow::Owned(other.to_json_text())),
+    };
+    crate::conversions::coerce_value(raw.clone(), ty, "", 0).unwrap_or(raw)
 }

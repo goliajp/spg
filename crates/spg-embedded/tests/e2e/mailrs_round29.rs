@@ -410,9 +410,13 @@ fn json_aggregates() {
     let r = rows_of(&mut db, "SELECT json_agg(x) FROM p");
     assert_eq!(r[0][0], Value::json("[1, 2, 3]"));
     let r = rows_of(&mut db, "SELECT json_object_agg(x, y) FROM p");
+    // PG spaces `json` (not `jsonb`) object output out exactly like this —
+    // `{ "1" : 3, ... }`. This expectation went stale at read01 round 14
+    // (`d8a861bf`), which is what made the output PG-faithful in the first
+    // place; the embedded e2e simply never got re-run against it.
     assert_eq!(
         r[0][0],
-        Value::Json("{\"1\": 3, \"2\": 5, \"3\": 7}".into())
+        Value::Json("{ \"1\" : 3, \"2\" : 5, \"3\" : 7 }".into())
     );
     // empty → NULL (PG)
     let r = rows_of(&mut db, "SELECT json_agg(x) FROM p WHERE x > 99");

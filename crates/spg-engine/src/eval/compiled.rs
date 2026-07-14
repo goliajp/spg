@@ -211,6 +211,21 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
     match e {
         Expr::Literal(l) => steps.push(Step::Lit(literal_to_value(l))),
         Expr::Column(c) => match compile_column_pos(c, ctx) {
+            // v7.39 (read01 round 56) — a COMPOSITE column must not compile to
+            // a raw `Step::Column`: that loads the stored JSON straight off the
+            // row and skips the rehydration into `Value::Composite` that
+            // `resolve_column` does. `p = ROW(2,'b')::pt` in a WHERE then
+            // compared Json against Composite and errored, while the same
+            // predicate in a projection worked. Route it through eval instead.
+            // The check is COMPILE-time, so the hot column path pays nothing.
+            Some(pos)
+                if ctx
+                    .columns
+                    .get(pos)
+                    .is_some_and(|sc| sc.user_composite_type.is_some()) =>
+            {
+                steps.push(Step::Subtree(e.clone()));
+            }
             Some(pos) => steps.push(Step::Column(pos)),
             None => steps.push(Step::Subtree(e.clone())),
         },
